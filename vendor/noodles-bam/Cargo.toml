@@ -170,7 +170,7 @@ version = "0.44.0"
 version = "0.18.0"
 
 [dependencies.noodles-csi]
-version = "0.52.0"
+version = "0.53.0"
 
 [dependencies.noodles-sam]
 version = "0.80.0"

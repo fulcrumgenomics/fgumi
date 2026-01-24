@@ -48,7 +48,7 @@ rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"
 bytemuck = { version = "1.14", features = ["derive"] }
-noodles-csi = "0.52.0"
+noodles-csi = "0.53.0"
 bgzf = { git = "https://github.com/fulcrumgenomics/bgzf.git", branch = "main" }
 wide = "0.7"
 rand_distr = "0.5"
