@@ -50,7 +50,7 @@ ahash = "0.8"
 bytemuck = { version = "1.14", features = ["derive"] }
 noodles-csi = "0.52.0"
 bgzf = { git = "https://github.com/fulcrumgenomics/bgzf.git", branch = "main" }
-wide = "0.7"
+wide = "1.1"
 rand_distr = "0.5"
 flate2 = "1.1"
 
