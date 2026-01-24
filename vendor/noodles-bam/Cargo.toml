@@ -173,7 +173,7 @@ version = "0.18.0"
 version = "0.52.0"
 
 [dependencies.noodles-sam]
-version = "0.80.0"
+version = "0.81.0"
 
 [dependencies.pin-project-lite]
 version = "0.2.6"

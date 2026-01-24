@@ -705,7 +705,7 @@ dependencies = [
  "murmur3",
  "noodles",
  "noodles-bgzf 0.45.0",
- "noodles-csi",
+ "noodles-csi 0.52.0",
  "noodles-util",
  "parking_lot",
  "proptest",
@@ -1473,7 +1473,7 @@ dependencies = [
  "noodles-bgzf 0.44.0",
  "noodles-core",
  "noodles-fasta",
- "noodles-sam",
+ "noodles-sam 0.80.0",
  "noodles-vcf",
 ]
 
@@ -1486,8 +1486,8 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
- "noodles-sam",
+ "noodles-csi 0.52.0",
+ "noodles-sam 0.81.0",
 ]
 
 [[package]]
@@ -1537,7 +1537,7 @@ dependencies = [
  "noodles-bam",
  "noodles-core",
  "noodles-fasta",
- "noodles-sam",
+ "noodles-sam 0.80.0",
 ]
 
 [[package]]
@@ -1550,6 +1550,19 @@ dependencies = [
  "bstr 1.12.1",
  "indexmap",
  "noodles-bgzf 0.44.0",
+ "noodles-core",
+]
+
+[[package]]
+name = "noodles-csi"
+version = "0.53.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0646c79753d5f5c2b366b74a01b8309c8b41fec49cd417972f0b5d8c2ff12c67"
+dependencies = [
+ "bit-vec",
+ "bstr 1.12.1",
+ "indexmap",
+ "noodles-bgzf 0.45.0",
  "noodles-core",
 ]
 
@@ -1578,7 +1591,23 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.52.0",
+]
+
+[[package]]
+name = "noodles-sam"
+version = "0.81.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fff8d583bf68623f2ebc6168a75576135bd18bc9d877e8275c0130230e146bea"
+dependencies = [
+ "bitflags",
+ "bstr 1.12.1",
+ "indexmap",
+ "lexical-core",
+ "memchr",
+ "noodles-bgzf 0.45.0",
+ "noodles-core",
+ "noodles-csi 0.53.0",
 ]
 
 [[package]]
@@ -1591,7 +1620,7 @@ dependencies = [
  "indexmap",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.52.0",
 ]
 
 [[package]]
@@ -1606,9 +1635,9 @@ dependencies = [
  "noodles-bgzf 0.44.0",
  "noodles-core",
  "noodles-cram",
- "noodles-csi",
+ "noodles-csi 0.52.0",
  "noodles-fasta",
- "noodles-sam",
+ "noodles-sam 0.80.0",
 ]
 
 [[package]]
@@ -1621,7 +1650,7 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.52.0",
  "noodles-tabix",
  "percent-encoding",
 ]
