@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 145" width="4200" height="1450">
+  <defs>
+    <style>
+      /* nf-core inspired color palette */
+      .simplex { stroke: #d54e43; fill: none; }
+      .duplex { stroke: #2e7cbd; fill: none; }
+      .codec { stroke: #24b064; fill: none; }
+      .fixed-umi { stroke: #f18046; fill: none; }
+      .optional { stroke-dasharray: 4,6; }
+
+      .line { stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .station { fill: white; stroke: #1a1a1a; stroke-width: 2; }
+      .station-small { fill: white; stroke: #1a1a1a; stroke-width: 1.5; }
+
+      .tool-label {
+        font-family: 'Maven Pro', 'Helvetica Neue', Arial, sans-serif;
+        font-size: 4.2px;
+        font-weight: bold;
+        fill: #1a1a1a;
+      }
+      .tool-label-sub {
+        font-family: 'Maven Pro', 'Helvetica Neue', Arial, sans-serif;
+        font-size: 3.2px;
+        fill: #555;
+      }
+      .file-label {
+        font-family: 'Maven Pro', 'Helvetica Neue', Arial, sans-serif;
+        font-size: 4px;
+        font-weight: bold;
+        fill: #1a1a1a;
+      }
+      .legend-label {
+        font-family: 'Maven Pro', 'Helvetica Neue', Arial, sans-serif;
+        font-size: 4.5px;
+        font-weight: bold;
+        fill: #1a1a1a;
+      }
+
+      /* File icons */
+      .file-icon { fill: white; stroke: #555; stroke-width: 0.6; }
+      .file-fold { fill: #e8e8e8; stroke: #555; stroke-width: 0.4; }
+
+      /* Category arrows */
+      .category-arrow {
+        fill: none;
+        stroke: #666;
+        stroke-width: 1;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .category-label {
+        font-family: 'Maven Pro', 'Helvetica Neue', Arial, sans-serif;
+        font-size: 4px;
+        font-weight: bold;
+        fill: #666;
+      }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="100%" height="100%" fill="white"/>
+
+  <!-- ==================== CATEGORY ARROWS ==================== -->
+  <!-- Arrow shape: horizontal line with arrowhead -->
+
+  <!-- UMI EXTRACTION: left=20, corners at 75, tip=85 (flat left, no notch) -->
+  <g>
+    <path d="M 20 8 L 75 8 L 85 16 L 75 24 L 20 24 Z" class="category-arrow"/>
+    <text x="47.5" y="18" text-anchor="middle" class="category-label">UMI EXTRACTION</text>
+  </g>
+
+  <!-- RAW READ ALIGNMENT: corners at 75/135, notch=85, tip=145 (interlocks with previous) -->
+  <g>
+    <path d="M 75 8 L 135 8 L 145 16 L 135 24 L 75 24 L 85 16 Z" class="category-arrow"/>
+    <text x="110" y="14" text-anchor="middle" class="category-label">RAW READ</text>
+    <text x="110" y="20" text-anchor="middle" class="category-label">ALIGNMENT</text>
+  </g>
+
+  <!-- GROUP BY UMI: corners at 135/195, notch=145, tip=205 -->
+  <g>
+    <path d="M 135 8 L 195 8 L 205 16 L 195 24 L 135 24 L 145 16 Z" class="category-arrow"/>
+    <text x="170" y="18" text-anchor="middle" class="category-label">GROUP BY UMI</text>
+  </g>
+
+  <!-- CONSENSUS CALLING: corners at 195/260, notch=205, tip=270 -->
+  <g>
+    <path d="M 195 8 L 260 8 L 270 16 L 260 24 L 195 24 L 205 16 Z" class="category-arrow"/>
+    <text x="232.5" y="14" text-anchor="middle" class="category-label">CONSENSUS</text>
+    <text x="232.5" y="20" text-anchor="middle" class="category-label">CALLING</text>
+  </g>
+
+  <!-- POST-CONSENSUS: corners at 260/320, notch=270, tip=330 -->
+  <g>
+    <path d="M 260 8 L 320 8 L 330 16 L 320 24 L 260 24 L 270 16 Z" class="category-arrow"/>
+    <text x="295" y="18" text-anchor="middle" class="category-label">POST-CONSENSUS</text>
+  </g>
+
+  <!-- CONSENSUS ALIGNMENT: corners at 320/385, notch=330, tip=395 -->
+  <g>
+    <path d="M 320 8 L 385 8 L 395 16 L 385 24 L 320 24 L 330 16 Z" class="category-arrow"/>
+    <text x="357.5" y="14" text-anchor="middle" class="category-label">CONSENSUS</text>
+    <text x="357.5" y="20" text-anchor="middle" class="category-label">ALIGNMENT</text>
+  </g>
+
+  <!--
+    Pipeline flow:
+    FASTQ -> extract -> (correct) -> fastq|bwa|zipper|sort -> group -> consensus -> (duplex-metrics) -> filter -> fastq|bwa|zipper|sort -> BAM
+
+    Stations (x positions):
+    - extract:     x=35
+    - correct:     x=70 (on arc, optional)
+    - align1:      x=105 (fastq|bwa|zipper|sort)
+    - group:       x=165 (duplex at y=50, simplex/codec share at y=85)
+    - consensus:   x=225 (duplex y=50, simplex y=70, codec y=100)
+    - filter:      x=290 (converged)
+    - align2:      x=350 (fastq|bwa|zipper|sort)
+  -->
+
+  <!-- ==================== LINES ==================== -->
+
+  <!-- CODEC (bottom layer) -->
+  <line x1="22" y1="74" x2="35" y2="74" class="codec line"/>
+  <line x1="35" y1="74" x2="105" y2="74" class="codec line"/>
+  <line x1="105" y1="74" x2="135" y2="88" class="codec line"/>
+  <line x1="135" y1="88" x2="165" y2="88" class="codec line"/>
+  <line x1="165" y1="88" x2="225" y2="88" class="codec line"/>
+  <line x1="225" y1="88" x2="260" y2="74" class="codec line"/>
+  <line x1="260" y1="74" x2="290" y2="74" class="codec line"/>
+  <line x1="290" y1="74" x2="350" y2="74" class="codec line"/>
+  <line x1="350" y1="74" x2="395" y2="74" class="codec line"/>
+
+  <!-- SIMPLEX (middle layer) -->
+  <line x1="22" y1="70" x2="35" y2="70" class="simplex line"/>
+  <line x1="35" y1="70" x2="105" y2="70" class="simplex line"/>
+  <line x1="105" y1="70" x2="135" y2="84" class="simplex line"/>
+  <line x1="135" y1="84" x2="165" y2="84" class="simplex line"/>
+  <line x1="165" y1="84" x2="195" y2="70" class="simplex line"/>
+  <line x1="195" y1="70" x2="225" y2="70" class="simplex line"/>
+  <line x1="225" y1="70" x2="260" y2="70" class="simplex line"/>
+  <line x1="260" y1="70" x2="290" y2="70" class="simplex line"/>
+  <line x1="290" y1="70" x2="350" y2="70" class="simplex line"/>
+  <line x1="350" y1="70" x2="395" y2="70" class="simplex line"/>
+
+  <!-- DUPLEX (top layer) -->
+  <line x1="22" y1="66" x2="35" y2="66" class="duplex line"/>
+  <line x1="35" y1="66" x2="105" y2="66" class="duplex line"/>
+  <line x1="105" y1="66" x2="135" y2="50" class="duplex line"/>
+  <line x1="135" y1="50" x2="165" y2="50" class="duplex line"/>
+  <line x1="165" y1="50" x2="225" y2="50" class="duplex line"/>
+  <line x1="225" y1="50" x2="260" y2="66" class="duplex line"/>
+  <line x1="260" y1="66" x2="290" y2="66" class="duplex line"/>
+  <line x1="290" y1="66" x2="350" y2="66" class="duplex line"/>
+  <line x1="350" y1="66" x2="395" y2="66" class="duplex line"/>
+
+  <!-- Optional correct arc (from extract station to align station, arc above) -->
+  <path d="M 35 70 A 35 20 0 0 1 105 70" class="fixed-umi line optional"/>
+
+  <!-- Optional duplex-metrics (horizontal, same height as duplex) -->
+  <line x1="225" y1="50" x2="290" y2="50" class="duplex line optional"/>
+
+  <!-- ==================== FILE ICONS ==================== -->
+
+  <!-- FASTQ input icons (layered) -->
+  <g transform="translate(6, 55)">
+    <path d="M 0 2 L 0 18 Q 0 20 2 20 L 11 20 Q 13 20 13 18 L 13 5 L 9 2 L 2 2 Q 0 2 0 4 Z" class="file-icon"/>
+    <path d="M 9 2 L 9 5 L 13 5" class="file-fold"/>
+  </g>
+  <g transform="translate(2, 59)">
+    <path d="M 0 2 L 0 18 Q 0 20 2 20 L 11 20 Q 13 20 13 18 L 13 5 L 9 2 L 2 2 Q 0 2 0 4 Z" class="file-icon"/>
+    <path d="M 9 2 L 9 5 L 13 5" class="file-fold"/>
+    <text x="6.5" y="14" text-anchor="middle" class="file-label">FASTQ</text>
+  </g>
+
+  <!-- BAM output icon -->
+  <g transform="translate(398, 58)">
+    <path d="M 0 2 L 0 18 Q 0 20 2 20 L 11 20 Q 13 20 13 18 L 13 5 L 9 2 L 2 2 Q 0 2 0 4 Z" class="file-icon"/>
+    <path d="M 9 2 L 9 5 L 13 5" class="file-fold"/>
+    <text x="6.5" y="14" text-anchor="middle" class="file-label">BAM</text>
+  </g>
+
+  <!-- ==================== STATIONS ==================== -->
+
+  <!-- extract (x=35) -->
+  <circle cx="35" cy="70" r="5" class="station"/>
+
+  <!-- correct (x=70, on arc above) -->
+  <circle cx="70" cy="50" r="5" class="station"/>
+
+  <!-- align1 (x=105) -->
+  <circle cx="105" cy="70" r="5" class="station"/>
+
+  <!-- group duplex (x=165, y=50) -->
+  <circle cx="165" cy="50" r="5" class="station"/>
+
+  <!-- group simplex/codec shared (x=165, y=88) -->
+  <circle cx="165" cy="88" r="5" class="station"/>
+
+  <!-- consensus duplex (x=225, y=50) -->
+  <circle cx="225" cy="50" r="5" class="station"/>
+
+  <!-- consensus simplex (x=225, y=70) -->
+  <circle cx="225" cy="70" r="5" class="station"/>
+
+  <!-- consensus codec (x=225, y=88) -->
+  <circle cx="225" cy="88" r="5" class="station"/>
+
+  <!-- duplex-metrics terminal (same height as duplex) -->
+  <circle cx="290" cy="50" r="5" class="station"/>
+
+  <!-- filter (x=290) -->
+  <circle cx="290" cy="70" r="5" class="station"/>
+
+  <!-- align2 (x=350) -->
+  <circle cx="350" cy="70" r="5" class="station"/>
+
+  <!-- ==================== LABELS (centered on stations) ==================== -->
+
+  <!-- extract -->
+  <text x="35" y="86" text-anchor="middle" class="tool-label">fgumi</text>
+  <text x="35" y="91" text-anchor="middle" class="tool-label">extract</text>
+
+  <!-- correct (on arc) -->
+  <text x="70" y="38" text-anchor="middle" class="tool-label">fgumi correct</text>
+
+  <!-- align1 -->
+  <text x="105" y="86" text-anchor="middle" class="tool-label">fgumi fastq |</text>
+  <text x="105" y="91" text-anchor="middle" class="tool-label">bwa mem |</text>
+  <text x="105" y="96" text-anchor="middle" class="tool-label">fgumi zipper |</text>
+  <text x="105" y="101" text-anchor="middle" class="tool-label">fgumi sort</text>
+  <text x="105" y="106" text-anchor="middle" class="tool-label-sub">--order template-coordinate</text>
+
+  <!-- group duplex -->
+  <text x="165" y="38" text-anchor="middle" class="tool-label">fgumi group</text>
+  <text x="165" y="43" text-anchor="middle" class="tool-label-sub">--strategy paired</text>
+
+  <!-- group simplex/codec -->
+  <text x="165" y="103" text-anchor="middle" class="tool-label">fgumi group</text>
+  <text x="165" y="108" text-anchor="middle" class="tool-label-sub">--strategy adjacency</text>
+
+  <!-- consensus duplex -->
+  <text x="225" y="38" text-anchor="middle" class="tool-label">fgumi duplex</text>
+
+  <!-- consensus simplex -->
+  <text x="225" y="63" text-anchor="middle" class="tool-label">fgumi simplex</text>
+
+  <!-- consensus codec -->
+  <text x="225" y="100" text-anchor="middle" class="tool-label">fgumi codec</text>
+
+  <!-- duplex-metrics -->
+  <text x="290" y="38" text-anchor="middle" class="tool-label">fgumi duplex-metrics</text>
+
+  <!-- filter -->
+  <text x="290" y="86" text-anchor="middle" class="tool-label">fgumi</text>
+  <text x="290" y="91" text-anchor="middle" class="tool-label">filter</text>
+
+  <!-- align2 -->
+  <text x="350" y="86" text-anchor="middle" class="tool-label">fgumi fastq |</text>
+  <text x="350" y="91" text-anchor="middle" class="tool-label">bwa mem |</text>
+  <text x="350" y="96" text-anchor="middle" class="tool-label">fgumi zipper |</text>
+  <text x="350" y="101" text-anchor="middle" class="tool-label">fgumi sort</text>
+  <text x="350" y="106" text-anchor="middle" class="tool-label-sub">--order coordinate</text>
+
+  <!-- ==================== LEGEND ==================== -->
+  <g transform="translate(100, 120)">
+    <rect x="0" y="0" width="180" height="22" fill="#f8f9fa" stroke="#dee2e6" stroke-width="0.4" rx="2"/>
+
+    <line x1="8" y1="7" x2="36" y2="7" class="duplex line"/>
+    <text x="22" y="16" text-anchor="middle" class="legend-label">Duplex</text>
+
+    <line x1="53" y1="7" x2="81" y2="7" class="simplex line"/>
+    <text x="67" y="16" text-anchor="middle" class="legend-label">Simplex</text>
+
+    <line x1="98" y1="7" x2="126" y2="7" class="codec line"/>
+    <text x="112" y="16" text-anchor="middle" class="legend-label">CODEC</text>
+
+    <line x1="140" y1="7" x2="174" y2="7" class="fixed-umi line optional"/>
+    <text x="157" y="16" text-anchor="middle" class="legend-label">UMI Correction</text>
+  </g>
+
+</svg>
