@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - released
+      - prereleased
+
+jobs:
+  test-cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - s390x-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Remove benches/
+        run: rm -rf benches/
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 6d097fb
+
+      - name: Build
+        run: cross build --target ${{ matrix.target }} --release -vv
+
+      - name: Test
+        run: cross test --target ${{ matrix.target }} --release -vv
+
+  test-wasm32-emscripten:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [static, shared]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: wasm32-unknown-emscripten
+
+      - name: Install build deps
+        run: sudo apt install nasm gcc-multilib
+
+      - name: Install Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build
+        run: cargo build --release --target wasm32-unknown-emscripten --no-default-features --features ${{ matrix.build }}
+
+  test-native:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-13  # x86_64
+          - macos-14  # arm
+          - windows-latest
+          - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Remove benches/
+        shell: bash
+        run: rm -rf benches/
+
+      - name: Install nasm
+        if: runner.os != 'macOS'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Set MSVC developer prompt
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.6.0
+
+      - name: Install build deps (OSX)
+        if: runner.os == 'macOS'
+        run: brew install automake autoconf coreutils libtool nasm
+
+      - name: Test (shared)
+        run: cargo test --release --no-default-features --features shared --lib -vv
+
+      - name: Test (static)
+        run: |
+          cargo clean  # ensure we're starting fresh, no funny business
+          cargo test --release --no-default-features --features static -vv

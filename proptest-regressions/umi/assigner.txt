@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e4e310821e998d8a903ce9e66cbe967a20e76a69e8882ac0466dcf0618d9ba10 # shrinks to umis = ["GGAG", "TGCGG"]
+cc a2b2d6d1a65c14d47b21e3087159e5743aa1b2efefa507e02155b979fb619700 # shrinks to umis = ["CAGCGG", "CAGCGG"]

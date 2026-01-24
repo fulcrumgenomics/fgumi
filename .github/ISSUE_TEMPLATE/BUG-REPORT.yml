@@ -1,0 +1,108 @@
+name: "🐛 Bug Report"
+description: Create a new Issue for a bug.
+title: "A short summary of the bug..."
+labels: [
+  "bug"
+]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Please enter an explicit description of your issue.
+      value: |
+        Short and explicit description of the bug...
+
+        The expected behavior is...
+
+        The actual behavior is...
+
+        The cause of this issue might be...
+
+        The fix for this issue might be...
+    validations:
+      required: true
+  - type: input
+    id: related
+    attributes:
+      label: Related Issues
+      description: Related issue IDs
+      placeholder: "#XXXX"
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The package version you are using.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Please provide all steps to reproduce your issue.
+      placeholder: |
+        1. Go to '...'
+        2. Click on '....'
+        3. Scroll down to '....'
+        4. See error
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: input
+    attributes:
+      label: Input
+      description: Minimal input data that reproduces thie issue.
+      placeholder: If the input is a single small file paste it here, otherwise make the inputs publicly downloadable and put the URL(s) here.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs/Error messages
+      description: Paste any relevant log/error output if it is small, otherwise make it publicly downloadable and put the URL(s) here.
+      render: bash
+    validations:
+      required: false
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshots
+      description: If applicable, add screenshots to help explain your problem.
+      value: |
+        ![DESCRIPTION](LINK.png)
+      render: bash
+    validations:
+      required: false
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      description: What is the impacted OS/architecture?
+      multiple: true
+      options:
+        - Linux (x86)
+        - Linux (ARM)
+        - Mac (x86)
+        - Mac (ARM)
+        - Windows
+        - Other (describe in "Reproduction Steps")
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      description: Have you completed all these steps?
+      options:
+        - label: Read the `CONTRIBUTING` guide
+        - label: Checked there are no existing Issues for this bug
+        - label: Checked there are no Discussions that explain this issue
+        - label: Checked you have installed at least the minimum required version of Rust
+        - label: Tried reproducing this issue using the latest release
+        - label: Provided all information necessary to reproduce this issue
+    validations:
+      required: true

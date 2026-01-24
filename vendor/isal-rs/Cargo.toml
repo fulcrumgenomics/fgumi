@@ -1,0 +1,45 @@
+[package]
+name = "isal-rs"
+version = "0.5.3+496255c"
+edition = "2021"
+description = "isa-l Rust bindings"
+readme = "README.md"
+license = "BSD-3-Clause"
+authors = ["Miles Granger <miles59923@gmail.com>"]
+documentation = "https://docs.rs/isal-rs"
+homepage = "https://github.com/milesgranger/isal-rs"
+repository = "https://github.com/milesgranger/isal-rs"
+keywords = ["isal", "isa-l", "igzip", "deflate", "zlib"]
+exclude = [
+  ".gitignore",
+  ".gitmodules",
+  ".github/",
+  "benches/",
+  "test-data/",
+]
+
+[lib]
+name = "isal"
+
+[features]
+default = ["static"]
+static = ["isal-sys/static"]
+shared = ["isal-sys/shared"]
+use-system-isal = ["isal-sys/use-system-isal"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+isal-sys = { path = "isal-sys", version = "0.5.3+496255c", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+md5 = "0.7.0"
+flate2 = { version = "^1", features = ["zlib-ng"], default-features = false }
+rand = "^0.8"
+
+[[bench]]
+name = "igzip"
+path = "benches/igzip.rs"
+harness = false
+html = true
+

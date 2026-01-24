@@ -1,0 +1,7 @@
+[alias]
+ci-test = "nextest run --features compare,simulate,profile-adjacency --locked --no-tests=pass"
+ci-fmt = "fmt --package fgumi -- --check"
+ci-lint = "clippy --package fgumi --all-targets --features compare,simulate,profile-adjacency -- -D warnings -W clippy::pedantic"
+# Run tests with test-utils feature enabled (allows binary tests to use library test utilities)
+t = "test --features test-utils"
+[build]

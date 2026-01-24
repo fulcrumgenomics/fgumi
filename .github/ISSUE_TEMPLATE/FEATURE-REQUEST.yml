@@ -1,0 +1,82 @@
+name: "💡 Feature Request"
+description: Create a new Issue for a feature request.
+title: "A short summary of the feature request..."
+labels: [
+  "enhancement"
+]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Provide a brief explanation of the feature you are requesting.
+      value: |
+        Short and explicit description of the feature request...
+        
+        The current behavior is...
+        
+        The desired behavior is...
+    validations:
+      required: true
+  - type: input
+    id: related
+    attributes:
+      label: Related Issues
+      description: Related issue IDs
+      placeholder: "#XXXX"
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The package version you are using that is missing this feature.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: What are the impacts of your feature request?
+      value: |
+        Adding this feature could have the following drawbacks...
+
+        Adding this feature will introduce a breaking change...
+
+        Adding this feature will require updating the documentation...
+    validations:
+      required: true
+  - type: textarea
+    id: suggestions
+    attributes:
+      label: Suggestions
+      description: Provide any guidance for how this feature could/should be implemented.
+      value: |
+        This feature could be implemented in a few different ways...
+
+        This feature should be tested in the following ways...
+    validations:
+      required: false
+  - type: textarea
+    id: input
+    attributes:
+      label: Test input
+      description: Input data that can be used to test the feature
+      placeholder: If the input is a single small file paste it here, otherwise make the inputs publicly downloadable and put the URL(s) here.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      description: Have you completed all these steps?
+      options:
+        - label: Read the `CONTRIBUTING` guide
+        - label: Checked there are no existing Issues for this feature request
+        - label: Checked there are no Discussions that address this issue
+        - label: Checked you have installed at least the minimum required version of Rust
+        - label: Ensured that the latest release does not contain this feature
+        - label: Provided all information necessary to reproduce the current behavior
+    validations:
+      required: true

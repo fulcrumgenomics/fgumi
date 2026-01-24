@@ -1,0 +1,116 @@
+[package]
+name = "fgumi"
+version = "0.1.0"
+authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+description = "Fulcrum Genomics Unique Molecular Indexing Tools"
+repository = "https://github.com/fulcrumgenomics/fgumi"
+homepage = "https://github.com/fulcrumgenomics/fgumi"
+categories = ["science"]
+keywords = ["bioinformatics"]
+license = "MIT"
+edition = "2024"
+rust-version = "1.87.0"
+resolver = "2"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "string"] }
+log = "0"
+thiserror = "2"
+noodles = { version = "0.102.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { version = "0.45.0", features = ["libdeflate"] }
+noodles-util = { version = "0.71.0", features = ["alignment"] }
+mimalloc = { version = "0.1.48", default-features = false }
+env_logger = "0.11.8"
+enum_dispatch = "0.3.13"
+anyhow = "1.0.100"
+read-structure = "0.2.0"
+seq_io = "0.3.4"
+bstr = "1.12.1"
+fgoxide = "0.6.0"
+tempfile = "3.3.0"
+lru = "0.16.2"
+scoped_threadpool = "0.1.9"
+crc32fast = "1.4"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8.21"
+parking_lot = "0.12"
+libdeflater = "1.22"
+isal-rs = { path = "vendor/isal-rs", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+itertools = "0.14.0"
+indexmap = "2"
+rand = "0.9"
+csv = "1.1"
+murmur3 = "0.5"
+statrs = "0.18"
+rayon = "1.10"
+approx = "0.5.1"
+ahash = "0.8"
+bytemuck = { version = "1.14", features = ["derive"] }
+noodles-csi = "0.52.0"
+bgzf = { git = "https://github.com/fulcrumgenomics/bgzf.git", branch = "main" }
+wide = "0.7"
+rand_distr = "0.5"
+flate2 = "1.1"
+
+[features]
+default = []
+# Enable compare subcommand with bams and metrics (developer tools)
+compare = []
+# Enable simulate commands for generating synthetic test data
+simulate = []
+# Enable profiling output for adjacency UMI assigner
+profile-adjacency = []
+# Use ISA-L/igzip for BGZF compression instead of libdeflate
+isal = ["dep:isal-rs"]
+
+[dev-dependencies]
+rstest = "0"
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "core_functions"
+harness = false
+
+[build-dependencies]
+built = { version = "0", features = ["git2"] }
+
+[profile.release]
+#lto = true
+lto = "fat"
+codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
+# Local patch to expose BAM record decoding for the 7-step pipeline
+[patch.crates-io]
+noodles-bam = { path = "vendor/noodles-bam" }
+noodles-bgzf = { git = "https://github.com/nh13/noodles.git", branch = "bgzf-position-tracking" }
+
+# Config for 'cargo dist'
+[workspace.metadata.dist]
+cargo-dist-version = "0.4.3"
+ci = ["github"]
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    
+]
+# Necessary to be able to modify the release workflow
+allow-dirty = ["ci"]
+
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[lib]
+name = "fgumi_lib"
+path = "src/lib/mod.rs"

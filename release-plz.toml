@@ -1,0 +1,11 @@
+[workspace]
+# path of the git-cliff configuration
+changelog_config = "cliff.toml"
+# update dependencies with `cargo update`
+dependencies_update = true
+# labels for the release PR
+pr_labels = ["release"]
+# disable GitHub releases - this is handled by cargo-dist
+git_release_enable = false
+# disable running `cargo-semver-checks`
+semver_check = false
