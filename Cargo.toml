@@ -2,11 +2,13 @@
 name = "fgumi"
 version = "0.1.0"
 authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
-description = "Fulcrum Genomics Unique Molecular Indexing Tools"
+description = "High-performance tools for UMI-tagged sequencing data: extraction, grouping, and consensus calling"
 repository = "https://github.com/fulcrumgenomics/fgumi"
 homepage = "https://github.com/fulcrumgenomics/fgumi"
-categories = ["science"]
-keywords = ["bioinformatics"]
+documentation = "https://docs.rs/fgumi"
+readme = "README.md"
+categories = ["command-line-utilities", "science"]
+keywords = ["bioinformatics", "umi", "consensus", "sequencing", "ngs"]
 license = "MIT"
 edition = "2024"
 rust-version = "1.87.0"

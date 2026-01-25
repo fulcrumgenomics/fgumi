@@ -731,6 +731,31 @@ pub fn mean_base_quality(record: &RecordBuf) -> f64 {
     if count == 0 { 0.0 } else { sum as f64 / count as f64 }
 }
 
+/// Computes both no-call count and mean base quality in a single pass.
+///
+/// This is more efficient than calling `count_no_calls()` and `mean_base_quality()`
+/// separately when both values are needed, as it only iterates over the sequence once.
+///
+/// # Returns
+/// A tuple of (`no_call_count`, `mean_base_quality`)
+#[must_use]
+pub fn compute_read_stats(record: &RecordBuf) -> (usize, f64) {
+    let (qual_sum, non_n_count, n_count) = record
+        .sequence()
+        .iter()
+        .zip(record.quality_scores().iter())
+        .fold((0u64, 0usize, 0usize), |(sum, non_n, n), (base, qual)| {
+            if base == NO_CALL_BASE {
+                (sum, non_n, n + 1)
+            } else {
+                (sum + u64::from(qual), non_n + 1, n)
+            }
+        });
+
+    let mean_qual = if non_n_count == 0 { 0.0 } else { qual_sum as f64 / non_n_count as f64 };
+    (n_count, mean_qual)
+}
+
 /// Checks if all reads in a template pass filtering
 ///
 /// For template-aware filtering, all primary reads (R1/R2) must pass for the template to pass.
@@ -1019,6 +1044,46 @@ mod tests {
         let mean = mean_base_quality(&record);
         // Only non-N bases: 10+20+30+40+10+20 = 130 / 6 = 21.666...
         assert!((mean - 21.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_read_stats() {
+        let mut record = create_test_record();
+        *record.sequence_mut() = Sequence::from(b"ACNNACGT".to_vec());
+        *record.quality_scores_mut() = QualityScores::from(vec![10, 20, 0, 0, 30, 40, 10, 20]);
+
+        let (n_count, mean_qual) = compute_read_stats(&record);
+
+        // Should match individual functions
+        assert_eq!(n_count, count_no_calls(&record));
+        assert!((mean_qual - mean_base_quality(&record)).abs() < f64::EPSILON);
+
+        // Verify expected values: 2 Ns, mean of non-N quals = 130/6 = 21.666...
+        assert_eq!(n_count, 2);
+        assert!((mean_qual - 21.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_read_stats_all_n() {
+        let mut record = create_test_record();
+        *record.sequence_mut() = Sequence::from(b"NNNNNNNN".to_vec());
+        *record.quality_scores_mut() = QualityScores::from(vec![0; 8]);
+
+        let (n_count, mean_qual) = compute_read_stats(&record);
+
+        assert_eq!(n_count, 8);
+        assert!((mean_qual - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_read_stats_no_n() {
+        let mut record = create_test_record();
+        *record.quality_scores_mut() = QualityScores::from(vec![30, 30, 30, 30, 30, 30, 30, 30]);
+
+        let (n_count, mean_qual) = compute_read_stats(&record);
+
+        assert_eq!(n_count, 0);
+        assert!((mean_qual - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
