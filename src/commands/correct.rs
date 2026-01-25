@@ -872,20 +872,23 @@ impl CorrectUmis {
                                 &mut cache_ref,
                             );
 
+                            // Count records for per-read metrics (matches fgbio behavior)
+                            let num_records = records.len() as u64;
+
                             if correction.matched {
-                                // Update metrics for matched UMIs
+                                // Update metrics for matched UMIs (count per-read, not per-template)
                                 for m in &correction.matches {
                                     if m.matched {
                                         let entry =
                                             umi_matches_map.entry(m.umi.clone()).or_insert_with(
                                                 || UmiCorrectionMetrics::new(m.umi.clone()),
                                             );
-                                        entry.total_matches += 1;
+                                        entry.total_matches += num_records;
                                         match m.mismatches {
-                                            0 => entry.perfect_matches += 1,
-                                            1 => entry.one_mismatch_matches += 1,
-                                            2 => entry.two_mismatch_matches += 1,
-                                            _ => entry.other_matches += 1,
+                                            0 => entry.perfect_matches += num_records,
+                                            1 => entry.one_mismatch_matches += num_records,
+                                            2 => entry.two_mismatch_matches += num_records,
+                                            _ => entry.other_matches += num_records,
                                         }
                                     }
                                 }
@@ -902,7 +905,6 @@ impl CorrectUmis {
                                 }
                             } else {
                                 // Rejection - update counters based on reason
-                                let num_records = records.len() as u64;
                                 match correction.rejection_reason {
                                     RejectionReason::WrongLength => wrong_length += num_records,
                                     RejectionReason::Mismatched => mismatched += num_records,
@@ -1169,16 +1171,16 @@ impl CorrectUmis {
                     );
 
                     if correction.matched {
-                        // Update metrics for matched UMIs
+                        // Update metrics for matched UMIs (count per-read, not per-template)
                         for m in &correction.matches {
                             if m.matched {
                                 let entry = umi_metrics.get_mut(&m.umi).unwrap();
-                                entry.total_matches += 1;
+                                entry.total_matches += num_records;
                                 match m.mismatches {
-                                    0 => entry.perfect_matches += 1,
-                                    1 => entry.one_mismatch_matches += 1,
-                                    2 => entry.two_mismatch_matches += 1,
-                                    _ => entry.other_matches += 1,
+                                    0 => entry.perfect_matches += num_records,
+                                    1 => entry.one_mismatch_matches += num_records,
+                                    2 => entry.two_mismatch_matches += num_records,
+                                    _ => entry.other_matches += num_records,
                                 }
                             }
                         }
