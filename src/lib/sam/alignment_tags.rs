@@ -71,12 +71,38 @@ pub fn regenerate_alignment_tags(
     let seq = record.sequence();
     let qual = record.quality_scores();
 
+    // Calculate total reference span from CIGAR and fetch entire alignment span once
+    // This is a key optimization - instead of fetching per CIGAR operation, we fetch once
+    // Note: Skip (N in CIGAR) is NOT included - it doesn't affect NM/MD/UQ calculation
+    let ref_span: usize = cigar
+        .iter()
+        .filter_map(|op| op.ok())
+        .map(|op| match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => op.len(),
+            _ => 0,
+        })
+        .sum();
+
+    // Handle edge case: CIGAR with no reference-consuming operations (e.g., pure insertion "4I")
+    // Set tags to sensible defaults and return early
+    if ref_span == 0 {
+        record.data_mut().insert(nm_tag(), Value::from(0u32));
+        record.data_mut().insert(md_tag(), Value::String("0".to_owned().into()));
+        record.data_mut().insert(uq_tag(), Value::from(0u32));
+        return Ok(false);
+    }
+
+    // Fetch entire reference span in one call
+    let ref_end = Position::new(usize::from(ref_start) + ref_span - 1)
+        .context("Invalid reference end position")?;
+    let all_ref_bases = reference.fetch(ref_name, ref_start, ref_end)?;
+
     // Calculate edit distance and mismatch quality
     let mut nm = 0; // Edit distance
     let mut uq = 0u32; // Mismatch quality sum
     let mut md_string = String::new();
 
-    let mut ref_pos = ref_start;
+    let mut ref_offset = 0; // Offset into all_ref_bases
     let mut seq_pos = 0;
     let mut match_count = 0;
 
@@ -87,13 +113,11 @@ pub fn regenerate_alignment_tags(
 
         match kind {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                // Fetch reference bases for this region
-                let ref_end = Position::new(usize::from(ref_pos) + len - 1)
-                    .context("Invalid reference end position")?;
-                let ref_bases = reference.fetch(ref_name, ref_pos, ref_end)?;
+                // Use slice of pre-fetched reference bases
+                let ref_bases = &all_ref_bases[ref_offset..ref_offset + len];
 
                 // Compare each base
-                for (_i, &ref_base) in ref_bases.iter().enumerate().take(len) {
+                for &ref_base in ref_bases.iter() {
                     let seq_base = seq
                         .as_ref()
                         .get(seq_pos)
@@ -133,8 +157,7 @@ pub fn regenerate_alignment_tags(
                     seq_pos += 1;
                 }
 
-                ref_pos = Position::new(usize::from(ref_pos) + len)
-                    .context("Invalid reference position")?;
+                ref_offset += len;
             }
             Kind::Insertion => {
                 // Insertion: counts toward NM, but NOT UQ (UQ only counts mismatches)
@@ -156,25 +179,24 @@ pub fn regenerate_alignment_tags(
 
                 md_string.push('^');
 
-                // Fetch deleted reference bases
-                let ref_end = Position::new(usize::from(ref_pos) + len - 1)
-                    .context("Invalid reference end position")?;
-                let ref_bases = reference.fetch(ref_name, ref_pos, ref_end)?;
+                // Use slice of pre-fetched reference bases
+                let ref_bases = &all_ref_bases[ref_offset..ref_offset + len];
 
                 // Preserve reference case (matches fgbio behavior)
-                for base in ref_bases {
+                for &base in ref_bases {
                     md_string.push(base as char);
                 }
 
-                ref_pos = Position::new(usize::from(ref_pos) + len)
-                    .context("Invalid reference position")?;
+                ref_offset += len;
             }
             Kind::SoftClip => {
                 // Soft clip: advance sequence position only
                 seq_pos += len;
             }
             Kind::HardClip | Kind::Pad | Kind::Skip => {
-                // These don't consume sequence or reference
+                // These don't consume sequence or reference for tag calculation
+                // Note: Skip (N in CIGAR) represents spliced alignments - the skipped
+                // reference region doesn't affect NM/MD/UQ calculation
             }
         }
     }

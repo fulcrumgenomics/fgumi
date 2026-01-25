@@ -31,9 +31,9 @@ pub use caller::{
 pub use codec_caller::{CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats};
 pub use duplex_caller::{DuplexConsensusCaller, DuplexConsensusRead};
 pub use filter::{
-    ConsensusType, FilterConfig, FilterResult, FilterThresholds, count_no_calls,
-    filter_duplex_read, filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
-    mean_base_quality, template_passes,
+    ConsensusType, FilterConfig, FilterResult, FilterThresholds, compute_read_stats,
+    count_no_calls, filter_duplex_read, filter_read, is_duplex_consensus, mask_bases,
+    mask_duplex_bases, mean_base_quality, template_passes,
 };
 pub use overlapping::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
