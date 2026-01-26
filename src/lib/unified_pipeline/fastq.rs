@@ -597,6 +597,10 @@ pub struct FastqPipelineConfig {
     /// When true, parsing is done in parallel before the Group step.
     /// When false, parsing is done under the Group step's lock (original behavior).
     pub use_parallel_parse: bool,
+    /// Whether input FASTQs are synchronized (records at same position match).
+    /// When true, skips name validation in Group step (done in Process instead).
+    /// This eliminates lock contention for synchronized FASTQs.
+    pub synchronized: bool,
 }
 
 impl FastqPipelineConfig {
@@ -624,6 +628,7 @@ impl FastqPipelineConfig {
             deadlock_timeout_secs: 10,                  // Default 10s
             deadlock_recover_enabled: false,
             use_parallel_parse: false, // Disabled - overhead hurts t4 performance
+            synchronized: false,       // Not synchronized by default
         }
     }
 
@@ -682,6 +687,24 @@ impl FastqPipelineConfig {
     #[must_use]
     pub fn with_deadlock_recovery(mut self, enabled: bool) -> Self {
         self.deadlock_recover_enabled = enabled;
+        self
+    }
+
+    /// Enable synchronized mode for FASTQs known to be in sync.
+    ///
+    /// In synchronized mode, records are zipped by position without name validation
+    /// in the Group step. Name validation is done in the Process step instead.
+    /// This eliminates lock contention for synchronized FASTQs.
+    ///
+    /// Enabling synchronized mode automatically enables parallel parse, as the
+    /// synchronized optimization requires the parallel parse pipeline.
+    #[must_use]
+    pub fn with_synchronized(mut self, enabled: bool) -> Self {
+        self.synchronized = enabled;
+        // Synchronized mode requires parallel parse to work
+        if enabled {
+            self.use_parallel_parse = true;
+        }
         self
     }
 }
@@ -1035,6 +1058,10 @@ fn decompress_bgzf_chunk(raw_data: &[u8], decompressor: &mut Decompressor) -> io
 ///
 /// This wraps the existing `FastqGrouper` from grouper.rs and provides
 /// a simpler interface for the 7-step pipeline.
+///
+/// Note: For synchronized FASTQs, the grouper is bypassed entirely -
+/// templates are created directly in the Parse step. This struct is only
+/// used for non-synchronized mode.
 pub struct FastqMultiStreamGrouper {
     /// The underlying grouper
     inner: FastqGrouper,
@@ -1058,7 +1085,7 @@ impl FastqMultiStreamGrouper {
     /// # Returns
     /// All templates that are complete (have records from all streams)
     pub fn add_batch(&mut self, batch: FastqReadBatch) -> io::Result<Vec<FastqTemplate>> {
-        // Feed each chunk to the appropriate stream
+        // Feed each chunk to the appropriate stream (parses and accumulates)
         for chunk in batch.chunks {
             debug_assert!(chunk.is_decompressed, "Step 3 expects decompressed data, got raw BGZF");
             self.inner.add_bytes_for_stream(chunk.stream_idx, &chunk.data)?;
@@ -1082,7 +1109,7 @@ impl FastqMultiStreamGrouper {
         &mut self,
         streams: Vec<Vec<FastqRecord>>,
     ) -> io::Result<Vec<FastqTemplate>> {
-        // Feed each stream's records to the grouper
+        // Feed to grouper and drain with name validation
         for (stream_idx, records) in streams.into_iter().enumerate() {
             self.inner.add_records_for_stream(stream_idx, records)?;
         }
@@ -1383,6 +1410,8 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             q2_75_parsed: ArrayQueue::new(cap),
             q2_75_reorder: Mutex::new(ReorderBuffer::new()),
             q2_75_reorder_state: ReorderBufferState::new(memory_limit),
+            // Note: For synchronized mode, the grouper is bypassed entirely -
+            // templates are created directly in the Parse step.
             grouper: Mutex::new(FastqMultiStreamGrouper::new(num_streams)),
             batches_grouped: AtomicU64::new(0),
             group_done: AtomicBool::new(false),
@@ -2180,6 +2209,10 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
 /// **This is the KEY PARALLEL STEP** that fixes the t8 scaling bottleneck.
 ///
 /// Only used when `config.use_parallel_parse` is true.
+///
+/// For synchronized FASTQs, this step also creates templates and pushes them
+/// directly to Q3, bypassing the Group step entirely. This eliminates all lock
+/// contention since each worker can create templates independently.
 fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
@@ -2191,8 +2224,12 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 
     // CRITICAL: Check output queue capacity BEFORE popping input to prevent data loss
-    // We check both the ArrayQueue and estimate reorder buffer pressure
-    if state.q2_75_parsed.is_full() {
+    // For synchronized mode, check Q3 (templates) instead of Q2.75 (parsed)
+    if state.config.synchronized {
+        if state.output.groups.is_full() {
+            return false; // Output queue full
+        }
+    } else if state.q2_75_parsed.is_full() {
         return false; // Output queue full, wait for Group step to drain it
     }
 
@@ -2218,6 +2255,56 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
             // Only decrement input memory AFTER successful parse
             state.q2_5_boundaries_heap_bytes.fetch_sub(input_heap_size as u64, Ordering::Relaxed);
 
+            // SYNCHRONIZED FAST PATH: Create templates directly, bypass Group step
+            if state.config.synchronized {
+                // Create templates by zipping records at matching positions
+                let templates = match create_templates_from_streams(parsed_batch.streams) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        state.set_error(e);
+                        return false;
+                    }
+                };
+
+                if templates.is_empty() {
+                    // Empty batch - just count it as parsed and grouped
+                    state.batches_parsed.fetch_add(1, Ordering::Release);
+                    state.batches_grouped.fetch_add(1, Ordering::Release);
+                    return true;
+                }
+
+                let count = templates.len();
+                // Use atomic serial assignment (no lock needed!)
+                // Note: Serial order may differ from input order due to parallel completion,
+                // but this is acceptable for unmapped BAM output where record order is irrelevant.
+                let template_serial = state.next_template_serial.fetch_add(1, Ordering::Relaxed);
+
+                // Push templates directly to Q3 with spin-wait
+                let mut templates_to_push = templates;
+                loop {
+                    match state.output.groups.push((template_serial, templates_to_push)) {
+                        Ok(()) => {
+                            state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
+                            if let Some(stats) = state.stats() {
+                                stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
+                            }
+                            state.deadlock_state.record_q4_push();
+                            state.batches_parsed.fetch_add(1, Ordering::Release);
+                            state.batches_grouped.fetch_add(1, Ordering::Release);
+                            return true;
+                        }
+                        Err(returned) => {
+                            templates_to_push = returned.1;
+                            if state.has_error() {
+                                return false;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+            }
+
+            // NON-SYNCHRONIZED PATH: Push to Q2.75 for Group step
             let parsed_heap_size = parsed_batch.estimate_heap_size();
 
             // Try to insert into Q2.75 reorder buffer first
@@ -2261,12 +2348,73 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 }
 
+/// Create templates by zipping records from synchronized FASTQ streams.
+///
+/// For single-end: each record becomes its own template.
+/// For paired-end: R1[i] and R2[i] are zipped into a single template.
+fn create_templates_from_streams(
+    mut streams: Vec<Vec<FastqRecord>>,
+) -> io::Result<Vec<FastqTemplate>> {
+    let num_streams = streams.len();
+
+    match num_streams {
+        0 => Ok(Vec::new()),
+        1 => {
+            // Single-end: each record becomes its own template
+            let records = streams.pop().unwrap_or_default();
+            Ok(records
+                .into_iter()
+                .map(|r| {
+                    let name = r.name.clone();
+                    FastqTemplate { name, records: vec![r] }
+                })
+                .collect())
+        }
+        2 => {
+            // Paired-end: zip R1 and R2 by position
+            let r2_records = streams.pop().unwrap();
+            let r1_records = streams.pop().unwrap();
+
+            // Validate batch sizes match
+            if r1_records.len() != r2_records.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FASTQ batch size mismatch: R1 has {} records, R2 has {} records",
+                        r1_records.len(),
+                        r2_records.len()
+                    ),
+                ));
+            }
+
+            // Zip directly by position - no name validation here (done in Process step)
+            let templates: Vec<FastqTemplate> = r1_records
+                .into_iter()
+                .zip(r2_records)
+                .map(|(r1, r2)| {
+                    let name = r1.name.clone();
+                    FastqTemplate { name, records: vec![r1, r2] }
+                })
+                .collect();
+
+            Ok(templates)
+        }
+        n => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Synchronized mode not supported for {} streams (max 2)", n),
+        )),
+    }
+}
+
 /// Try to group parsed records (Step 3 with parallel parse - exclusive).
 ///
 /// This version receives pre-parsed records from the Parse step instead of
 /// parsing under the lock. This is much faster since parsing is the bottleneck.
 ///
 /// Only used when `config.use_parallel_parse` is true.
+///
+/// For synchronized FASTQs, this step is a no-op since templates are created
+/// directly in the Parse step. It only handles completion detection.
 fn fastq_try_step_group_parsed<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
@@ -2277,6 +2425,21 @@ fn fastq_try_step_group_parsed<R: BufRead + Send, P: Send + MemoryEstimate>(
         return false;
     }
 
+    // SYNCHRONIZED FAST PATH: Templates are created in Parse step, no grouping needed
+    if state.config.synchronized {
+        // Check if grouping is complete (all parsed batches have been grouped)
+        let parse_done = state.parse_done.load(Ordering::Acquire);
+        let all_grouped = state.batches_parsed.load(Ordering::Acquire)
+            == state.batches_grouped.load(Ordering::Acquire);
+
+        if parse_done && all_grouped {
+            state.group_done.store(true, Ordering::Release);
+            log::trace!("fastq_try_step_group_parsed: synchronized mode - set group_done=true");
+        }
+        return false; // No work to do - Parse step handles everything
+    }
+
+    // NON-SYNCHRONIZED PATH: Group templates under lock
     // Try to acquire grouper
     let Some(mut grouper_guard) = state.grouper.try_lock() else {
         if let Some(stats) = state.stats() {
@@ -3365,6 +3528,8 @@ where
     let q1_raw: ArrayQueue<(u64, FastqReadBatch)> = ArrayQueue::new(cap);
     let q2_decompressed: ArrayQueue<(u64, FastqReadBatch)> = ArrayQueue::new(cap);
     let q2_reorder = Mutex::new(ReorderBuffer::new());
+    // Note: The BGZF path does not use parallel parse, so the synchronized
+    // bypass optimization is not available here. The grouper is always used.
     let grouper = Mutex::new(FastqMultiStreamGrouper::new(num_streams));
     let group_done = AtomicBool::new(false);
     let next_template_serial = AtomicU64::new(0);
