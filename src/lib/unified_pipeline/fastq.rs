@@ -698,11 +698,18 @@ impl FastqPipelineConfig {
     ///
     /// Enabling synchronized mode automatically enables parallel parse, as the
     /// synchronized optimization requires the parallel parse pipeline.
+    ///
+    /// Note: Synchronized mode is automatically disabled for single-threaded execution
+    /// because the optimization relies on multiple threads to avoid deadlock. With one
+    /// thread, there is no lock contention to optimize away.
     #[must_use]
     pub fn with_synchronized(mut self, enabled: bool) -> Self {
-        self.synchronized = enabled;
+        // Synchronized mode uses spin-wait which requires multiple threads to drain
+        // queues. With a single thread, this causes deadlock. Additionally, the
+        // optimization eliminates lock contention which doesn't exist with one thread.
+        self.synchronized = enabled && self.num_threads > 1;
         // Synchronized mode requires parallel parse to work
-        if enabled {
+        if self.synchronized {
             self.use_parallel_parse = true;
         }
         self
