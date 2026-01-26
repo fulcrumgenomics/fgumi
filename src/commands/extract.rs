@@ -695,16 +695,15 @@ impl Extract {
             first_header.as_slice()
         };
 
-        // Split on space to get just the name part (before any comments)
-        let first_name_part =
-            first_name.find_byte(b' ').map_or(first_name, |pos| &first_name[..pos]);
+        // Strip space comments and /1, /2 suffixes for comparison
+        let first_name_part = strip_read_suffix_extract(first_name);
 
         // Check that all other read sets have the same name
         for (i, read_set) in read_sets.iter().enumerate().skip(1) {
             let header = &read_set.header;
             let name = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
 
-            let name_part = name.find_byte(b' ').map_or(name, |pos| &name[..pos]);
+            let name_part = strip_read_suffix_extract(name);
 
             if name_part != first_name_part {
                 bail!(
@@ -950,7 +949,8 @@ impl Extract {
                 .with_stats(self.scheduler_opts.collect_stats())
                 .with_scheduler_strategy(self.scheduler_opts.strategy())
                 .with_deadlock_timeout(self.scheduler_opts.deadlock_timeout_secs())
-                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled());
+                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled())
+                .with_synchronized(true); // Extract always uses synchronized FASTQs
 
         info!(
             "Using unified 7-step pipeline: threads={}, bgzf={}, stats={}, scheduler={:?}",
@@ -992,6 +992,25 @@ impl Extract {
                         template.records.len(),
                         read_structures.len()
                     );
+                }
+
+                // Validate read names match (synchronized mode defers this from Group step)
+                if template.records.len() >= 2 {
+                    let base_name = strip_read_suffix_extract(&template.records[0].name);
+                    for (i, record) in template.records.iter().enumerate().skip(1) {
+                        let other_base = strip_read_suffix_extract(&record.name);
+                        if base_name != other_base {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "FASTQ files out of sync: R1 has '{}', R{} has '{}'",
+                                    String::from_utf8_lossy(base_name),
+                                    i + 1,
+                                    String::from_utf8_lossy(other_base),
+                                ),
+                            ));
+                        }
+                    }
                 }
                 // Convert each FastqRecord to a FastqSet using its read structure
                 let mut fastq_sets: Vec<FastqSet> = Vec::with_capacity(template.records.len());
@@ -1216,6 +1235,32 @@ impl Command for Extract {
         timer.log_completion(records_written);
         Ok(())
     }
+}
+
+/// Strip /1, /2, or other read pair suffixes from a read name.
+///
+/// This is used to validate that reads at the same position in synchronized FASTQs
+/// have matching names. Returns a slice of the name without the suffix.
+fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
+    // First strip any space-separated comment suffix (e.g., "read/1 extra" -> "read/1")
+    let name = if let Some(space_pos) = name.iter().position(|&b| b == b' ') {
+        &name[..space_pos]
+    } else {
+        name
+    };
+
+    // Then strip common pair suffixes: /1, /2, .1, .2, _1, _2, :1, :2
+    if name.len() >= 2 {
+        let last = name[name.len() - 1];
+        let sep = name[name.len() - 2];
+        if (last == b'1' || last == b'2')
+            && (sep == b'/' || sep == b'.' || sep == b'_' || sep == b':')
+        {
+            return &name[..name.len() - 2];
+        }
+    }
+
+    name
 }
 
 #[cfg(test)]
