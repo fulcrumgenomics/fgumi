@@ -927,6 +927,21 @@ impl GroupKey {
             self.cell_hash,
         )
     }
+
+    /// Returns the coordinate-only key for CS family counting.
+    ///
+    /// This groups by genomic position only (R1 + R2 unclipped 5' positions and strands),
+    /// ignoring library, cell, and name. Used for Coordinate & Strand (CS) family metrics.
+    #[must_use]
+    pub fn coordinate_key(&self) -> (i32, i32, u8, i32, i32, u8) {
+        (self.ref_id1, self.pos1, self.strand1, self.ref_id2, self.pos2, self.strand2)
+    }
+
+    /// Returns true if this represents a valid paired-end coordinate.
+    #[must_use]
+    pub fn is_valid_paired(&self) -> bool {
+        self.ref_id1 != Self::UNKNOWN_REF && self.ref_id2 != Self::UNKNOWN_REF
+    }
 }
 
 impl PartialOrd for GroupKey {
