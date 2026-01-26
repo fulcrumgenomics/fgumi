@@ -563,6 +563,278 @@ impl Grouper for PositionGrouper {
 }
 
 // ============================================================================
+// PositionMiGrouper - Groups by position then by MI for duplex metrics
+// ============================================================================
+
+use crate::umi::extract_mi_base;
+use std::collections::HashMap;
+
+/// A position-MI group containing records at the same position, organized by MI.
+///
+/// This structure is used for collecting duplex metrics during consensus calling.
+/// It groups records first by genomic position, then by molecular identifier (MI).
+///
+/// Family size definitions:
+/// - **CS** (Coordinate & Strand): Total templates at this position (`total_templates`)
+/// - **SS** (Single Strand): Templates with same position AND full MI tag (including /A or /B)
+/// - **DS** (Double Strand): Templates with same position AND base MI (without /A, /B)
+#[derive(Debug)]
+pub struct PositionMiGroup {
+    /// The position key for this group (pre-computed from first record).
+    pub group_key: GroupKey,
+    /// Records organized by base MI (without /A, /B suffix).
+    /// Each entry maps base_mi -> records with that MI.
+    pub mi_groups: HashMap<String, Vec<RecordBuf>>,
+    /// Total number of templates at this position (CS family size).
+    pub total_templates: usize,
+    /// Total number of records at this position.
+    pub total_records: usize,
+}
+
+impl BatchWeight for PositionMiGroup {
+    /// Returns the number of templates in this group.
+    fn batch_weight(&self) -> usize {
+        self.total_templates
+    }
+}
+
+impl MemoryEstimate for PositionMiGroup {
+    fn estimate_heap_size(&self) -> usize {
+        // group_key: GroupKey is a Copy type (no heap allocation)
+        // mi_groups: HashMap<String, Vec<RecordBuf>>
+        let mi_groups_size: usize = self
+            .mi_groups
+            .iter()
+            .map(|(k, v)| {
+                let key_size = k.capacity();
+                let vec_size: usize = v.iter().map(MemoryEstimate::estimate_heap_size).sum();
+                let vec_overhead = v.capacity() * std::mem::size_of::<RecordBuf>();
+                key_size + vec_size + vec_overhead
+            })
+            .sum();
+        let hashmap_overhead = self.mi_groups.capacity() * 48; // rough estimate
+        mi_groups_size + hashmap_overhead
+    }
+}
+
+/// A batch of position-MI groups for parallel processing.
+#[derive(Default)]
+pub struct PositionMiGroupBatch {
+    /// The position-MI groups in this batch.
+    pub groups: Vec<PositionMiGroup>,
+}
+
+impl PositionMiGroupBatch {
+    /// Creates a new empty batch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { groups: Vec::new() }
+    }
+
+    /// Returns the number of groups in the batch.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Returns true if the batch is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+}
+
+impl BatchWeight for PositionMiGroupBatch {
+    fn batch_weight(&self) -> usize {
+        self.groups.iter().map(|g| g.total_templates).sum()
+    }
+}
+
+impl MemoryEstimate for PositionMiGroupBatch {
+    fn estimate_heap_size(&self) -> usize {
+        let groups_size: usize = self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum();
+        let groups_vec_overhead = self.groups.capacity() * std::mem::size_of::<PositionMiGroup>();
+        groups_size + groups_vec_overhead
+    }
+}
+
+/// A grouper that groups records by position, then by MI.
+///
+/// Used by the `duplex` command with `--metrics-output` to collect duplex metrics
+/// during consensus calling. Groups records first by genomic position (for CS
+/// family size), then organizes them by base MI (for SS and DS family sizes).
+///
+/// Expects input sorted by template-coordinate with MI tags already assigned
+/// (output from `group` command).
+pub struct PositionMiGrouper {
+    /// MI tag name (e.g., "MI").
+    mi_tag: Tag,
+    /// Number of position groups per batch.
+    batch_size: usize,
+    /// Current position group key being accumulated.
+    current_position_key: Option<GroupKey>,
+    /// Records at current position, organized by base MI.
+    current_mi_groups: HashMap<String, Vec<RecordBuf>>,
+    /// Set of unique query names seen at current position (for template counting).
+    current_qnames: std::collections::HashSet<u64>,
+    /// Total records at current position.
+    current_record_count: usize,
+    /// Completed groups waiting to be batched.
+    pending_groups: VecDeque<PositionMiGroup>,
+    /// Whether `finish()` has been called.
+    finished: bool,
+}
+
+impl PositionMiGrouper {
+    /// Create a new `PositionMiGrouper`.
+    ///
+    /// # Arguments
+    /// * `mi_tag_name` - The MI tag name (e.g., "MI")
+    /// * `batch_size` - Number of position groups per batch
+    ///
+    /// # Panics
+    /// Panics if `mi_tag_name` is not exactly 2 characters.
+    #[must_use]
+    pub fn new(mi_tag_name: &str, batch_size: usize) -> Self {
+        assert!(mi_tag_name.len() == 2, "Tag name must be exactly 2 characters");
+        let tag_bytes = mi_tag_name.as_bytes();
+        let mi_tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
+
+        Self {
+            mi_tag,
+            batch_size: batch_size.max(1),
+            current_position_key: None,
+            current_mi_groups: HashMap::new(),
+            current_qnames: std::collections::HashSet::new(),
+            current_record_count: 0,
+            pending_groups: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    /// Extract the MI tag value from a record.
+    fn get_record_mi(&self, record: &RecordBuf) -> String {
+        if let Some(val) = record.data().get(&self.mi_tag) {
+            use noodles::sam::alignment::record_buf::data::field::Value;
+            if let Value::String(s) = val {
+                return s.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Flush current position group to pending queue.
+    fn flush_current_position_group(&mut self) {
+        if let Some(key) = self.current_position_key.take() {
+            if !self.current_mi_groups.is_empty() || self.current_record_count > 0 {
+                let mi_groups = std::mem::take(&mut self.current_mi_groups);
+                let total_templates = self.current_qnames.len();
+                let total_records = self.current_record_count;
+                self.current_qnames.clear();
+                self.current_record_count = 0;
+
+                self.pending_groups.push_back(PositionMiGroup {
+                    group_key: key,
+                    mi_groups,
+                    total_templates,
+                    total_records,
+                });
+            }
+        }
+    }
+
+    /// Add a record to the current position group.
+    fn add_record_to_position(&mut self, record: RecordBuf, record_key: GroupKey) {
+        let record_pos_key = record_key.position_key();
+
+        match &self.current_position_key {
+            Some(current_key) if current_key.position_key() == record_pos_key => {
+                // Same position - add to current MI group
+                let full_mi = self.get_record_mi(&record);
+                let base_mi = extract_mi_base(&full_mi).to_string();
+                self.current_qnames.insert(record_key.name_hash);
+                self.current_record_count += 1;
+                self.current_mi_groups.entry(base_mi).or_default().push(record);
+            }
+            Some(_) => {
+                // Different position - flush current and start new
+                self.flush_current_position_group();
+                let full_mi = self.get_record_mi(&record);
+                let base_mi = extract_mi_base(&full_mi).to_string();
+                self.current_position_key = Some(record_key);
+                self.current_qnames.insert(record_key.name_hash);
+                self.current_record_count = 1;
+                self.current_mi_groups.entry(base_mi).or_default().push(record);
+            }
+            None => {
+                // First record - start new position group
+                let full_mi = self.get_record_mi(&record);
+                let base_mi = extract_mi_base(&full_mi).to_string();
+                self.current_position_key = Some(record_key);
+                self.current_qnames.insert(record_key.name_hash);
+                self.current_record_count = 1;
+                self.current_mi_groups.entry(base_mi).or_default().push(record);
+            }
+        }
+    }
+
+    /// Try to form complete batches from pending groups.
+    fn drain_batches(&mut self) -> Vec<PositionMiGroupBatch> {
+        let mut batches = Vec::new();
+        while self.pending_groups.len() >= self.batch_size {
+            let groups: Vec<PositionMiGroup> =
+                self.pending_groups.drain(..self.batch_size).collect();
+            batches.push(PositionMiGroupBatch { groups });
+        }
+        batches
+    }
+}
+
+impl Grouper for PositionMiGrouper {
+    type Group = PositionMiGroupBatch;
+
+    fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+        for decoded in records {
+            let record = decoded.record;
+            let key = decoded.key;
+
+            // Skip secondary and supplementary reads
+            let flags = record.flags();
+            if flags.is_secondary() || flags.is_supplementary() {
+                continue;
+            }
+
+            // Add record to position group
+            self.add_record_to_position(record, key);
+        }
+
+        Ok(self.drain_batches())
+    }
+
+    fn finish(&mut self) -> io::Result<Option<Self::Group>> {
+        if self.finished {
+            return Ok(None);
+        }
+        self.finished = true;
+
+        // Flush any remaining position group
+        self.flush_current_position_group();
+
+        // Return remaining groups as final batch
+        if self.pending_groups.is_empty() {
+            Ok(None)
+        } else {
+            let groups: Vec<PositionMiGroup> = self.pending_groups.drain(..).collect();
+            Ok(Some(PositionMiGroupBatch { groups }))
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.current_mi_groups.is_empty() || !self.pending_groups.is_empty()
+    }
+}
+
+// ============================================================================
 // FASTQ Record Parsing Utilities
 // ============================================================================
 

@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use super::command::Command;
+use super::common::ThreadingOptions;
 
 /// Embedded R script for PDF plot generation (bundled with binary)
 const R_SCRIPT: &str = include_str!("../../resources/CollectDuplexSeqMetrics.R");
@@ -211,6 +212,10 @@ pub struct DuplexMetrics {
     /// Optional SAM tag for cell barcode (for single-cell data)
     #[arg(long = "cell-tag")]
     pub cell_tag: Option<String>,
+
+    /// Threading options for parallel BAM decompression
+    #[command(flatten)]
+    pub threading: ThreadingOptions,
 }
 
 impl Command for DuplexMetrics {
@@ -221,6 +226,7 @@ impl Command for DuplexMetrics {
         info!("  Min AB reads: {}", self.min_ab_reads);
         info!("  Min BA reads: {}", self.min_ba_reads);
         info!("  Collect duplex UMI counts: {}", self.duplex_umi_counts);
+        info!("  Threads: {}", self.threading.num_threads());
 
         let timer = OperationTimer::new("Computing duplex metrics");
 
@@ -400,7 +406,7 @@ impl DuplexMetrics {
     fn validate_not_consensus_bam(&self) -> Result<()> {
         use fgumi_lib::consensus_tags::is_consensus;
 
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
+        let (mut reader, header) = create_bam_reader(&self.input, self.threading.num_threads())?;
 
         // Look at the first valid R1 record
         for result in reader.record_bufs(&header) {
@@ -564,7 +570,7 @@ impl DuplexMetrics {
         collectors: &mut [DuplexMetricsCollector],
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
     ) -> Result<(usize, Vec<usize>)> {
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
+        let (mut reader, header) = create_bam_reader(&self.input, self.threading.num_threads())?;
 
         let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
         let template_iter = TemplateIterator::new(record_iter);
@@ -1313,6 +1319,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1379,6 +1386,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1468,6 +1476,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1595,6 +1604,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1750,6 +1760,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1876,6 +1887,7 @@ mod tests {
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
                 cell_tag: None,
+                threading: ThreadingOptions::none(),
             };
 
             cmd.execute("test")?;
@@ -1906,6 +1918,7 @@ mod tests {
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
                 cell_tag: None,
+                threading: ThreadingOptions::none(),
             };
 
             cmd.execute("test")?;
@@ -1936,6 +1949,7 @@ mod tests {
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
                 cell_tag: None,
+                threading: ThreadingOptions::none(),
             };
 
             cmd.execute("test")?;
@@ -2073,6 +2087,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -2137,6 +2152,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -2342,6 +2358,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         // This should fail with an error about consensus BAM
@@ -2369,6 +2386,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         assert_eq!(metrics.min_ab_reads, 1);
@@ -2391,6 +2409,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         assert_eq!(metrics.min_ab_reads, 3);
@@ -2412,6 +2431,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         // The validation happens in execute(), check during command construction would be ideal
@@ -2553,6 +2573,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         // Should complete without panicking or errors

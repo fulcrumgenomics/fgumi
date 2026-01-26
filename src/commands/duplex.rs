@@ -25,6 +25,7 @@ use fgumi_lib::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, make_prefix_from_header,
 };
 use fgumi_lib::duplex_consensus_caller::DuplexConsensusCaller;
+use fgumi_lib::grouper::{PositionMiGroup, PositionMiGroupBatch, PositionMiGrouper};
 use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
 use fgumi_lib::mi_group::{MiGroup, MiGroupBatch, MiGroupIteratorWithTransform, MiGrouper};
 use fgumi_lib::overlapping_consensus::{
@@ -86,6 +87,72 @@ struct CollectedDuplexMetrics {
     groups_processed: u64,
     /// Rejected reads for deferred writing
     rejects: Vec<RecordBuf>,
+}
+
+/// Family size metrics collected from each batch during parallel processing.
+///
+/// This struct collects metrics about family sizes for duplex sequencing QC.
+/// It is used for lock-free aggregation across threads via SegQueue.
+#[derive(Default, Clone)]
+struct CollectedDuplexFamilyMetrics {
+    /// CS (Coordinate+Strand) family size histogram.
+    /// Maps family_size -> count of families with that size.
+    cs_family_sizes: std::collections::HashMap<usize, u64>,
+    /// SS (Single-Strand) family size histogram.
+    /// Maps family_size -> count of families with that size.
+    ss_family_sizes: std::collections::HashMap<usize, u64>,
+    /// DS (Double-Strand) family size histogram.
+    /// Maps family_size -> count of families with that size.
+    ds_family_sizes: std::collections::HashMap<usize, u64>,
+    /// Duplex family size histogram.
+    /// Maps (ab_size, ba_size) -> count of families with those sizes.
+    duplex_family_sizes: std::collections::HashMap<(usize, usize), u64>,
+    /// Number of read pairs processed.
+    read_pairs: u64,
+    /// Number of DS families that qualify as duplexes (meet min reads thresholds).
+    ds_duplexes: u64,
+}
+
+impl CollectedDuplexFamilyMetrics {
+    /// Merge another set of family metrics into this one.
+    fn merge(&mut self, other: &CollectedDuplexFamilyMetrics) {
+        for (size, count) in &other.cs_family_sizes {
+            *self.cs_family_sizes.entry(*size).or_insert(0) += count;
+        }
+        for (size, count) in &other.ss_family_sizes {
+            *self.ss_family_sizes.entry(*size).or_insert(0) += count;
+        }
+        for (size, count) in &other.ds_family_sizes {
+            *self.ds_family_sizes.entry(*size).or_insert(0) += count;
+        }
+        for (sizes, count) in &other.duplex_family_sizes {
+            *self.duplex_family_sizes.entry(*sizes).or_insert(0) += count;
+        }
+        self.read_pairs += other.read_pairs;
+        self.ds_duplexes += other.ds_duplexes;
+    }
+
+    /// Record a CS (Coordinate+Strand) family.
+    fn record_cs_family(&mut self, size: usize) {
+        *self.cs_family_sizes.entry(size).or_insert(0) += 1;
+    }
+
+    /// Record an SS (Single-Strand) family.
+    fn record_ss_family(&mut self, size: usize) {
+        *self.ss_family_sizes.entry(size).or_insert(0) += 1;
+    }
+
+    /// Record a DS (Double-Strand) family.
+    fn record_ds_family(&mut self, size: usize) {
+        *self.ds_family_sizes.entry(size).or_insert(0) += 1;
+    }
+
+    /// Record a duplex family with AB and BA sizes.
+    /// Normalizes so ab_size >= ba_size.
+    fn record_duplex_family(&mut self, ab_size: usize, ba_size: usize) {
+        let (ab, ba) = if ab_size >= ba_size { (ab_size, ba_size) } else { (ba_size, ab_size) };
+        *self.duplex_family_sizes.entry((ab, ba)).or_insert(0) += 1;
+    }
 }
 
 /// Call duplex consensus reads from grouped reads with /A and /B MI tags
@@ -193,6 +260,18 @@ pub struct Duplex {
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Output prefix for duplex metrics files. When specified, collects family size
+    /// distributions, yield metrics, and UMI statistics during consensus calling.
+    /// Generates: PREFIX.family_sizes.txt, PREFIX.duplex_family_sizes.txt,
+    /// PREFIX.duplex_yield_metrics.txt, PREFIX.umi_counts.txt, and PREFIX.duplex_qc.pdf
+    #[arg(long = "metrics-output")]
+    pub metrics_output: Option<std::path::PathBuf>,
+
+    /// Sample description for metric plots (used in PDF titles).
+    /// Defaults to the output BAM filename if not specified.
+    #[arg(long = "description")]
+    pub description: Option<String>,
 }
 
 impl Command for Duplex {
@@ -254,6 +333,8 @@ impl Command for Duplex {
     ///     max_reads_per_strand: None,
     ///     cell_tag: None,
     ///     scheduler_opts: SchedulerOptions::default(),
+    ///     metrics_output: None,
+    ///     description: None,
     /// };
     ///
     /// duplex.execute("test")?;
@@ -325,7 +406,19 @@ impl Command for Duplex {
         // ============================================================
         // IMPORTANT: Check this BEFORE creating any output file handles to avoid
         // file handle conflicts that can corrupt the output.
-        if let Some(threads) = self.threading.threads {
+
+        // If metrics output is requested but threading is not enabled,
+        // automatically enable threading (default to 4 threads) since
+        // metrics collection requires position-based grouping
+        let effective_threads = if self.metrics_output.is_some() && self.threading.threads.is_none()
+        {
+            info!("Metrics collection requires threading; using 4 threads");
+            Some(4)
+        } else {
+            self.threading.threads
+        };
+
+        if let Some(threads) = effective_threads {
             let result = self.execute_threads_mode(
                 threads,
                 reader,
@@ -504,6 +597,18 @@ impl Duplex {
         track_rejects: bool,
         command_line: &str,
     ) -> Result<()> {
+        // If metrics output is requested, use the metrics-enabled pipeline path
+        if self.metrics_output.is_some() {
+            return self.execute_threads_mode_with_metrics(
+                num_threads,
+                reader,
+                input_header,
+                read_name_prefix,
+                track_rejects,
+                command_line,
+            );
+        }
+
         info!("Using 7-step unified pipeline with {num_threads} threads");
 
         // Create output header (for duplex, output is unmapped like simplex)
@@ -741,6 +846,416 @@ impl Duplex {
 
         Ok(())
     }
+
+    /// Execute using 7-step unified pipeline with metrics collection.
+    ///
+    /// This method is called when `--metrics-output` is specified.
+    /// It uses `PositionMiGrouper` to group by position first, enabling
+    /// collection of CS, SS, and DS family size metrics.
+    #[allow(clippy::too_many_lines)]
+    fn execute_threads_mode_with_metrics(
+        &self,
+        num_threads: usize,
+        reader: Box<dyn std::io::Read + Send>,
+        input_header: Header,
+        read_name_prefix: String,
+        track_rejects: bool,
+        command_line: &str,
+    ) -> Result<()> {
+        info!("Using 7-step unified pipeline with {num_threads} threads (with metrics collection)");
+
+        // Create output header (for duplex, output is unmapped like simplex)
+        let output_header = create_unmapped_consensus_header(
+            &input_header,
+            &self.read_group.read_group_id,
+            "Read group",
+            crate::version::VERSION.as_str(),
+            command_line,
+        )?;
+
+        // Configure pipeline
+        let mut pipeline_config =
+            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
+        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
+        if self.scheduler_opts.collect_stats() {
+            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
+        }
+        pipeline_config.pipeline.deadlock_timeout_secs =
+            self.scheduler_opts.deadlock_timeout_secs();
+        pipeline_config.pipeline.deadlock_recover_enabled =
+            self.scheduler_opts.deadlock_recover_enabled();
+
+        // Lock-free metrics collection
+        let collected_metrics: Arc<SegQueue<CollectedDuplexMetrics>> = Arc::new(SegQueue::new());
+        let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
+
+        // Lock-free family metrics collection
+        let collected_family_metrics: Arc<SegQueue<CollectedDuplexFamilyMetrics>> =
+            Arc::new(SegQueue::new());
+        let collected_family_metrics_for_serialize = Arc::clone(&collected_family_metrics);
+
+        // Capture configuration for closures
+        let min_reads = self.min_reads.clone();
+        let min_input_base_quality = self.consensus.min_input_base_quality;
+        let output_per_base_tags = self.consensus.output_per_base_tags;
+        let trim = self.consensus.trim;
+        let max_reads_per_strand = self.max_reads_per_strand;
+        let error_rate_pre_umi = self.consensus.error_rate_pre_umi;
+        let error_rate_post_umi = self.consensus.error_rate_post_umi;
+        let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
+        let read_group_id = self.read_group.read_group_id.clone();
+        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        let batch_size = 100; // Position groups per batch
+
+        // Clone input_header before pipeline (needed for rejects writing)
+        let rejects_header = input_header.clone();
+
+        // MI tag for extracting strand info
+        let mi_tag = noodles::sam::alignment::record::data::field::Tag::from([b'M', b'I']);
+
+        // Run the 7-step pipeline with PositionMiGrouper
+        let groups_processed = run_bam_pipeline_from_reader(
+            pipeline_config,
+            reader,
+            input_header,
+            &self.io.output,
+            Some(output_header.clone()),
+            // ========== grouper_fn: Create PositionMiGrouper ==========
+            move |_header: &Header| {
+                Box::new(PositionMiGrouper::new("MI", batch_size))
+                    as Box<dyn Grouper<Group = PositionMiGroupBatch> + Send>
+            },
+            // ========== process_fn: Duplex consensus calling with metrics ==========
+            move |batch: PositionMiGroupBatch| -> io::Result<DuplexProcessedBatchWithMetrics> {
+                // Create per-thread duplex consensus caller
+                let mut caller = DuplexConsensusCaller::new(
+                    read_name_prefix.clone(),
+                    read_group_id.clone(),
+                    min_reads.clone(),
+                    min_input_base_quality,
+                    output_per_base_tags,
+                    trim,
+                    max_reads_per_strand,
+                    cell_tag,
+                    track_rejects,
+                    error_rate_pre_umi,
+                    error_rate_post_umi,
+                )
+                .map_err(|e| {
+                    io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
+                })?;
+
+                // Create overlapping caller if enabled
+                let mut overlapping_caller = if overlapping_enabled {
+                    Some(OverlappingBasesConsensusCaller::new(
+                        AgreementStrategy::Consensus,
+                        DisagreementStrategy::Consensus,
+                    ))
+                } else {
+                    None
+                };
+
+                let mut all_consensus = Vec::new();
+                let mut all_rejects = Vec::new();
+                let mut batch_stats = ConsensusCallingStats::new();
+                let mut batch_overlapping = CorrectionStats::new();
+                let mut family_metrics = CollectedDuplexFamilyMetrics::default();
+                let mut groups_count = 0u64;
+
+                for PositionMiGroup { mi_groups, total_templates, .. } in batch.groups {
+                    // Record CS family (all templates at this position)
+                    family_metrics.record_cs_family(total_templates);
+
+                    // Process each DS family (grouped by base MI)
+                    for (_base_mi, group_records) in mi_groups {
+                        groups_count += 1;
+                        caller.clear();
+
+                        // Count SS families (by strand suffix /A or /B)
+                        let mut a_qnames = std::collections::HashSet::new();
+                        let mut b_qnames = std::collections::HashSet::new();
+
+                        for record in &group_records {
+                            if let Some(val) = record.data().get(&mi_tag) {
+                                use noodles::sam::alignment::record_buf::data::field::Value;
+                                if let Value::String(s) = val {
+                                    let qname_hash = record
+                                        .name()
+                                        .map(|n| {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut hasher =
+                                                std::collections::hash_map::DefaultHasher::new();
+                                            <_ as AsRef<[u8]>>::as_ref(n).hash(&mut hasher);
+                                            hasher.finish()
+                                        })
+                                        .unwrap_or(0);
+                                    if s.ends_with(b"/A") {
+                                        a_qnames.insert(qname_hash);
+                                    } else if s.ends_with(b"/B") {
+                                        b_qnames.insert(qname_hash);
+                                    }
+                                }
+                            }
+                        }
+
+                        let a_count = a_qnames.len();
+                        let b_count = b_qnames.len();
+                        let ds_size = a_count + b_count;
+
+                        // Record DS family size
+                        if ds_size > 0 {
+                            family_metrics.record_ds_family(ds_size);
+                        }
+
+                        // Record SS family sizes
+                        if a_count > 0 {
+                            family_metrics.record_ss_family(a_count);
+                        }
+                        if b_count > 0 {
+                            family_metrics.record_ss_family(b_count);
+                        }
+
+                        // Record duplex family sizes (AB x BA)
+                        if a_count > 0 && b_count > 0 {
+                            family_metrics.record_duplex_family(a_count, b_count);
+                            family_metrics.ds_duplexes += 1;
+                        }
+
+                        // Track read pairs
+                        family_metrics.read_pairs += (a_count + b_count) as u64;
+
+                        // Apply overlapping consensus if enabled
+                        let mut group_reads = group_records;
+                        if let Some(ref mut oc) = overlapping_caller {
+                            if DuplexConsensusCaller::has_both_strands(&group_reads) {
+                                oc.reset_stats();
+                                if apply_overlapping_consensus(&mut group_reads, oc).is_err() {
+                                    continue;
+                                }
+                                batch_overlapping.merge(oc.stats());
+                            }
+                        }
+
+                        // Call duplex consensus
+                        match caller.consensus_reads_from_sam_records(group_reads) {
+                            Ok(consensus_reads) => {
+                                all_consensus.extend(consensus_reads);
+                                batch_stats.merge(&caller.statistics());
+                                if track_rejects {
+                                    all_rejects.extend(caller.take_rejected_reads());
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Duplex consensus error: {e}");
+                            }
+                        }
+                    }
+                }
+
+                Ok(DuplexProcessedBatchWithMetrics {
+                    consensus_reads: all_consensus,
+                    rejects: all_rejects,
+                    groups_count,
+                    stats: batch_stats,
+                    overlapping_stats: if overlapping_enabled {
+                        Some(batch_overlapping)
+                    } else {
+                        None
+                    },
+                    family_metrics,
+                })
+            },
+            // ========== serialize_fn: Serialize + collect metrics ==========
+            move |processed: DuplexProcessedBatchWithMetrics,
+                  header: &Header,
+                  output: &mut Vec<u8>|
+                  -> io::Result<u64> {
+                // Collect consensus metrics (lock-free)
+                collected_metrics_for_serialize.push(CollectedDuplexMetrics {
+                    stats: processed.stats,
+                    overlapping_stats: processed.overlapping_stats,
+                    groups_processed: processed.groups_count,
+                    rejects: processed.rejects,
+                });
+
+                // Collect family metrics (lock-free)
+                collected_family_metrics_for_serialize.push(processed.family_metrics);
+
+                // Serialize consensus reads
+                serialize_bam_records_into(&processed.consensus_reads, header, output)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?;
+
+        // ========== Post-pipeline: Aggregate metrics ==========
+        let mut total_groups = 0u64;
+        let mut merged_stats = ConsensusCallingStats::new();
+        let mut merged_overlapping_stats = CorrectionStats::new();
+        let mut all_rejects: Vec<RecordBuf> = Vec::new();
+
+        while let Some(metrics) = collected_metrics.pop() {
+            total_groups += metrics.groups_processed;
+            merged_stats.merge(&metrics.stats);
+            if let Some(ref ocs) = metrics.overlapping_stats {
+                merged_overlapping_stats.merge(ocs);
+            }
+            if track_rejects {
+                all_rejects.extend(metrics.rejects);
+            }
+        }
+
+        // Aggregate family metrics
+        let mut merged_family_metrics = CollectedDuplexFamilyMetrics::default();
+        while let Some(family_metrics) = collected_family_metrics.pop() {
+            merged_family_metrics.merge(&family_metrics);
+        }
+
+        // Write deferred rejects
+        if track_rejects && !all_rejects.is_empty() {
+            if let Some(rejects_path) = &self.rejects_opts.rejects {
+                let writer_threads = self.threading.num_threads();
+                let mut rejects_writer = create_optional_bam_writer(
+                    Some(rejects_path),
+                    &rejects_header,
+                    writer_threads,
+                    self.compression.compression_level,
+                )?;
+                if let Some(ref mut rw) = rejects_writer {
+                    for record in &all_rejects {
+                        rw.write_alignment_record(&rejects_header, record)
+                            .context("Failed to write rejected read")?;
+                    }
+                    rw.finish(&rejects_header).context("Failed to finish rejects file")?;
+                    info!("Wrote {} rejected reads", all_rejects.len());
+                }
+            }
+        }
+
+        // Log overlapping consensus statistics if enabled
+        if self.overlapping.consensus_call_overlapping_bases {
+            log_overlapping_stats(&merged_overlapping_stats);
+        }
+
+        // Log statistics
+        info!("Duplex consensus calling complete");
+        info!("Total MI groups processed: {total_groups}");
+        info!("Total groups processed by pipeline: {groups_processed}");
+
+        let metrics = merged_stats.to_metrics();
+        let consensus_count = metrics.consensus_reads;
+        log_consensus_summary(&metrics);
+
+        // Write statistics file if requested
+        if let Some(stats_path) = &self.stats_opts.stats {
+            let kv_metrics = metrics.to_kv_metrics();
+            DelimFile::default()
+                .write_tsv(stats_path, kv_metrics)
+                .with_context(|| format!("Failed to write statistics: {}", stats_path.display()))?;
+            info!("Wrote statistics to: {}", stats_path.display());
+        }
+
+        // Write family metrics files
+        if let Some(ref metrics_prefix) = self.metrics_output {
+            self.write_family_metrics(metrics_prefix, &merged_family_metrics)?;
+        }
+
+        info!("Wrote {consensus_count} duplex consensus reads");
+
+        Ok(())
+    }
+
+    /// Write family metrics files.
+    fn write_family_metrics(
+        &self,
+        prefix: &std::path::Path,
+        metrics: &CollectedDuplexFamilyMetrics,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        // Write family_sizes.txt
+        let family_sizes_path = prefix.with_extension("family_sizes.txt");
+        let mut file = std::fs::File::create(&family_sizes_path)
+            .with_context(|| format!("Failed to create {}", family_sizes_path.display()))?;
+        writeln!(file, "family_type\tfamily_size\tcount")?;
+
+        // Sort and write CS family sizes
+        let mut cs_sizes: Vec<_> = metrics.cs_family_sizes.iter().collect();
+        cs_sizes.sort_by_key(|(k, _)| *k);
+        for (size, count) in cs_sizes {
+            writeln!(file, "CS\t{size}\t{count}")?;
+        }
+
+        // Sort and write SS family sizes
+        let mut ss_sizes: Vec<_> = metrics.ss_family_sizes.iter().collect();
+        ss_sizes.sort_by_key(|(k, _)| *k);
+        for (size, count) in ss_sizes {
+            writeln!(file, "SS\t{size}\t{count}")?;
+        }
+
+        // Sort and write DS family sizes
+        let mut ds_sizes: Vec<_> = metrics.ds_family_sizes.iter().collect();
+        ds_sizes.sort_by_key(|(k, _)| *k);
+        for (size, count) in ds_sizes {
+            writeln!(file, "DS\t{size}\t{count}")?;
+        }
+
+        info!("Wrote family sizes to: {}", family_sizes_path.display());
+
+        // Write duplex_family_sizes.txt
+        let duplex_sizes_path = prefix.with_extension("duplex_family_sizes.txt");
+        let mut file = std::fs::File::create(&duplex_sizes_path)
+            .with_context(|| format!("Failed to create {}", duplex_sizes_path.display()))?;
+        writeln!(file, "ab_size\tba_size\tcount")?;
+
+        let mut duplex_sizes: Vec<_> = metrics.duplex_family_sizes.iter().collect();
+        duplex_sizes.sort_by_key(|((a, b), _)| (*a, *b));
+        for ((ab, ba), count) in duplex_sizes {
+            writeln!(file, "{ab}\t{ba}\t{count}")?;
+        }
+
+        info!("Wrote duplex family sizes to: {}", duplex_sizes_path.display());
+
+        // Log summary
+        let total_cs: u64 = metrics.cs_family_sizes.values().sum();
+        let total_ss: u64 = metrics.ss_family_sizes.values().sum();
+        let total_ds: u64 = metrics.ds_family_sizes.values().sum();
+        let total_duplexes: u64 = metrics.duplex_family_sizes.values().sum();
+
+        info!("Family metrics summary:");
+        info!("  CS families: {total_cs}");
+        info!("  SS families: {total_ss}");
+        info!("  DS families: {total_ds}");
+        info!("  Duplex families: {total_duplexes}");
+        info!("  Read pairs: {}", metrics.read_pairs);
+
+        Ok(())
+    }
+}
+
+/// Result from processing a batch of position groups with metrics.
+struct DuplexProcessedBatchWithMetrics {
+    /// Consensus reads to write to output BAM
+    consensus_reads: Vec<RecordBuf>,
+    /// Rejected reads (written to rejects file if enabled)
+    rejects: Vec<RecordBuf>,
+    /// Number of MI groups in this batch
+    groups_count: u64,
+    /// Consensus calling statistics for this batch
+    stats: ConsensusCallingStats,
+    /// Overlapping correction stats for this batch (if enabled)
+    overlapping_stats: Option<CorrectionStats>,
+    /// Family metrics collected from this batch
+    family_metrics: CollectedDuplexFamilyMetrics,
+}
+
+impl MemoryEstimate for DuplexProcessedBatchWithMetrics {
+    fn estimate_heap_size(&self) -> usize {
+        self.consensus_reads
+            .iter()
+            .chain(self.rejects.iter())
+            .map(MemoryEstimate::estimate_heap_size)
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +1316,8 @@ mod tests {
             max_reads_per_strand: None,
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
+            metrics_output: None,
+            description: None,
         }
     }
 
