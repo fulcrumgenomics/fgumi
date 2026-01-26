@@ -8,19 +8,17 @@
 //!
 //! Uses FAI index for fast raw-byte reading (htsjdk-style) instead of line-by-line parsing.
 //!
-//! # Memory Efficiency
+//! # Memory Usage
 //!
-//! Reference sequences are stored using 2-bit encoding with separate tracking for N bases
-//! and case information. This reduces memory usage by approximately 2.7x compared to
-//! storing raw bytes (from ~3GB to ~1.1GB for a human genome).
+//! Reference sequences are stored as raw bytes, matching htsjdk's approach.
+//! For a typical human reference (~3GB), this uses approximately 3GB of memory
+//! but provides the fastest possible load times (~9s vs ~22s for compressed storage).
 //!
 //! # Future improvement
 //!
 //! The custom FAI-based raw-byte reading (`read_sequence_raw`) could be replaced with
 //! noodles' built-in indexed reader once <https://github.com/zaeleus/noodles/pull/365>
 //! is merged and released, which adds the same optimization to noodles.
-
-use crate::compressed_seq::CompressedSequence;
 use crate::errors::FgumiError;
 use anyhow::{Context, Result};
 use log::debug;
@@ -115,12 +113,11 @@ fn find_fai_path(fasta_path: &Path) -> Option<PathBuf> {
 /// fgbio's `nmUqMdTagRegeneratingWriter` which reads all contigs into a Map upfront.
 ///
 /// For a typical human reference (e.g., hs38DH at ~3GB), this uses approximately
-/// 1.1GB of memory (using compressed 2-bit encoding) and provides dramatic speedup
-/// for operations that access many reads across different chromosomes.
+/// 3GB of memory (raw byte storage like htsjdk) and provides the fastest load times.
 #[derive(Clone)]
 pub struct ReferenceReader {
-    /// All sequences loaded into memory using compressed storage, keyed by sequence name
-    sequences: Arc<HashMap<String, CompressedSequence>>,
+    /// All sequences loaded into memory as raw bytes, keyed by sequence name
+    sequences: Arc<HashMap<String, Vec<u8>>>,
 }
 
 impl ReferenceReader {
@@ -183,12 +180,11 @@ impl ReferenceReader {
 
         for record in records {
             let raw_sequence = read_sequence_raw(&mut file, record)?;
-            let compressed = CompressedSequence::from_bytes(&raw_sequence);
             let name = String::from_utf8_lossy(record.name().as_ref()).into_owned();
-            sequences.insert(name, compressed);
+            sequences.insert(name, raw_sequence);
         }
 
-        debug!("Loaded {} contigs into memory (FAI-indexed, compressed)", sequences.len());
+        debug!("Loaded {} contigs into memory (FAI-indexed)", sequences.len());
         Ok(Self { sequences: Arc::new(sequences) })
     }
 
@@ -202,12 +198,11 @@ impl ReferenceReader {
         for result in reader.records() {
             let record = result?;
             let name = std::str::from_utf8(record.name())?.to_string();
-            let raw_sequence: &[u8] = record.sequence().as_ref();
-            let compressed = CompressedSequence::from_bytes(raw_sequence);
-            sequences.insert(name, compressed);
+            let raw_sequence: Vec<u8> = record.sequence().as_ref().to_vec();
+            sequences.insert(name, raw_sequence);
         }
 
-        debug!("Loaded {} contigs into memory (sequential, compressed)", sequences.len());
+        debug!("Loaded {} contigs into memory (sequential)", sequences.len());
         Ok(Self { sequences: Arc::new(sequences) })
     }
 
@@ -251,8 +246,8 @@ impl ReferenceReader {
         let start_idx = usize::from(start) - 1;
         let end_idx = usize::from(end);
 
-        sequence.fetch(start_idx, end_idx).ok_or_else(|| {
-            FgumiError::InvalidParameter {
+        if end_idx > sequence.len() || start_idx > end_idx {
+            return Err(FgumiError::InvalidParameter {
                 parameter: "region".to_string(),
                 reason: format!(
                     "Requested region {}:{}-{} exceeds sequence length {}",
@@ -262,8 +257,10 @@ impl ReferenceReader {
                     sequence.len()
                 ),
             }
-            .into()
-        })
+            .into());
+        }
+
+        Ok(sequence[start_idx..end_idx].to_vec())
     }
 
     /// Gets a single base from the reference at the specified position.
@@ -303,7 +300,7 @@ impl ReferenceReader {
         // Convert from 1-based to 0-based indexing
         let pos_idx = usize::from(pos) - 1;
 
-        sequence.base_at(pos_idx).ok_or_else(|| {
+        sequence.get(pos_idx).copied().ok_or_else(|| {
             FgumiError::InvalidParameter {
                 parameter: "position".to_string(),
                 reason: format!(

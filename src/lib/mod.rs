@@ -155,7 +155,6 @@ pub mod bgzf_reader;
 pub mod bgzf_writer;
 pub mod bitenc;
 pub mod clipper;
-pub mod compressed_seq;
 pub mod consensus;
 pub mod dna;
 pub mod errors;
