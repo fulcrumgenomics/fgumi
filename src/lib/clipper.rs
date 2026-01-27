@@ -754,59 +754,26 @@ impl SamRecordClipper {
         }
     }
 
-    /// Get unclipped start position (alignment start minus leading clips)
+    /// Get unclipped start position (delegates to `record_utils`)
     fn unclipped_start(rec: &RecordBuf) -> Option<usize> {
-        let start = usize::from(rec.alignment_start()?);
-        let (soft, hard) = Self::leading_clips(rec.cigar());
-        Some(start.saturating_sub(soft + hard))
+        record_utils::unclipped_start(rec)
     }
 
-    /// Count leading clips (soft, hard) in a single pass using direct slice access
-    fn leading_clips(cigar: &noodles::sam::alignment::record_buf::Cigar) -> (usize, usize) {
-        let ops = cigar.as_ref();
-        let mut soft = 0;
-        let mut hard = 0;
-        for op in ops {
-            match op.kind() {
-                Kind::SoftClip => soft += op.len(),
-                Kind::HardClip => hard += op.len(),
-                _ => break,
-            }
-        }
-        (soft, hard)
-    }
-
-    /// Get unclipped end position (alignment end plus trailing clips)
+    /// Get unclipped end position (delegates to `record_utils`)
     fn unclipped_end(rec: &RecordBuf) -> Option<usize> {
-        let start = usize::from(rec.alignment_start()?);
-        let ref_len = cigar_utils::reference_length(&rec.cigar());
-        let (soft, hard) = Self::trailing_clips(rec.cigar());
-        Some(start + ref_len.saturating_sub(1) + soft + hard)
+        record_utils::unclipped_end(rec)
     }
 
-    /// Count leading soft clips (delegates to `leading_clips`)
+    /// Count leading soft clips
     fn leading_soft_clips(cigar: &noodles::sam::alignment::record_buf::Cigar) -> usize {
-        Self::leading_clips(cigar).0
+        let ops: Vec<_> = cigar.as_ref().iter().map(|op| (op.kind(), op.len())).collect();
+        record_utils::leading_soft_clipping(&ops)
     }
 
-    /// Count trailing clips (soft, hard) in a single pass using direct slice access
-    fn trailing_clips(cigar: &noodles::sam::alignment::record_buf::Cigar) -> (usize, usize) {
-        let ops = cigar.as_ref();
-        let mut soft = 0;
-        let mut hard = 0;
-        for op in ops.iter().rev() {
-            match op.kind() {
-                Kind::SoftClip => soft += op.len(),
-                Kind::HardClip => hard += op.len(),
-                _ => break,
-            }
-        }
-        (soft, hard)
-    }
-
-    /// Count trailing soft clips (delegates to `trailing_clips`)
+    /// Count trailing soft clips
     fn trailing_soft_clips(cigar: &noodles::sam::alignment::record_buf::Cigar) -> usize {
-        Self::trailing_clips(cigar).0
+        let ops: Vec<_> = cigar.as_ref().iter().map(|op| (op.kind(), op.len())).collect();
+        record_utils::trailing_soft_clipping(&ops)
     }
 
     /// Helper function to calculate query bases corresponding to a reference region

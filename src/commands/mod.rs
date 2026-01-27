@@ -50,6 +50,7 @@ pub mod common;
 pub mod compare;
 pub mod consensus_runner;
 pub mod correct;
+pub mod dedup;
 pub mod downsample;
 pub mod duplex;
 pub mod duplex_metrics;

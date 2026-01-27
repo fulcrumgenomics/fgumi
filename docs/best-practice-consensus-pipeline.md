@@ -309,6 +309,60 @@ Note: The high-throughput pipeline is more complex due to the re-alignment step.
 
 ---
 
+## Alternative: Deduplication Without Consensus
+
+For workflows that need UMI-aware duplicate marking without consensus calling (e.g., when downstream tools handle deduplication differently, or for QC purposes), use `fgumi dedup`:
+
+```mermaid
+graph TD;
+A["fgumi extract"]-->B["fgumi fastq | bwa mem | fgumi zipper"];
+B-->C["fgumi sort --order template-coordinate"];
+C-->D["fgumi dedup"];
+```
+
+### Dedup Pipeline
+
+```bash
+# Step 1: Extract UMIs from FASTQ
+fgumi extract \
+  --inputs r1.fq.gz r2.fq.gz \
+  --read-structures 8M+T 8M+T \
+  --output unmapped.bam
+
+# Step 2: Align reads (fgumi zipper adds required `pa` tag)
+fgumi fastq --input unmapped.bam \
+  | bwa mem -t 16 -p -K 150000000 -Y ref.fa - \
+  | fgumi zipper --unmapped unmapped.bam --reference ref.fa --output aligned.bam
+
+# Step 3: Sort with fgumi (required - samtools sort won't work)
+fgumi sort --input aligned.bam --output sorted.bam --order template-coordinate
+
+# Step 4: Mark duplicates
+fgumi dedup --input sorted.bam --output deduped.bam --metrics metrics.txt
+```
+
+**Important:** You MUST use `fgumi zipper` and `fgumi sort` before `fgumi dedup`:
+- `fgumi zipper` adds the `pa` (primary alignment) tag to secondary/supplementary reads
+- `fgumi sort --order template-coordinate` uses this tag to keep all alignments for a template together
+- `samtools sort --template-coordinate` does NOT understand the `pa` tag and will produce incorrect results
+
+### Dedup Options
+
+```bash
+# Remove duplicates instead of marking
+fgumi dedup --input sorted.bam --output deduped.bam --remove-duplicates
+
+# Use a different UMI strategy (default: adjacency)
+fgumi dedup --input sorted.bam --output deduped.bam --strategy paired --edits 1
+
+# Write family size histogram
+fgumi dedup --input sorted.bam --output deduped.bam \
+  --metrics metrics.txt \
+  --family-size-histogram histogram.txt
+```
+
+---
+
 ## Recommended Parameters by Application
 
 ### Variant Calling (High Sensitivity)

@@ -27,6 +27,7 @@ use commands::command::Command;
 #[cfg(feature = "compare")]
 use commands::compare::Compare;
 use commands::correct::CorrectUmis;
+use commands::dedup::MarkDuplicates;
 use commands::downsample::Downsample;
 use commands::duplex::Duplex;
 use commands::duplex_metrics::DuplexMetrics;
@@ -86,32 +87,36 @@ enum Subcommand {
     #[command(display_order = 6)]
     Group(GroupReadsByUmi),
 
-    // Consensus Calling
+    // Deduplication
     #[command(display_order = 7)]
-    Simplex(Simplex),
+    Dedup(MarkDuplicates),
+
+    // Consensus Calling
     #[command(display_order = 8)]
-    Duplex(Duplex),
+    Simplex(Simplex),
     #[command(display_order = 9)]
+    Duplex(Duplex),
+    #[command(display_order = 10)]
     Codec(Codec),
 
     // Post-consensus
-    #[command(display_order = 10)]
-    Filter(Filter),
     #[command(display_order = 11)]
-    Clip(Clip),
+    Filter(Filter),
     #[command(display_order = 12)]
-    DuplexMetrics(DuplexMetrics),
+    Clip(Clip),
     #[command(display_order = 13)]
+    DuplexMetrics(DuplexMetrics),
+    #[command(display_order = 14)]
     Review(Review),
 
     // Utilities
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Downsample(Downsample),
     #[cfg(feature = "compare")]
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Simulate(Simulate),
 }
 

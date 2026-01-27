@@ -35,8 +35,9 @@ pub mod read_ahead;
 pub use external::ExternalSorter;
 pub use inline_buffer::TemplateKey;
 pub use keys::{
-    CoordinateKey, QuerynameKey, RawCoordinateKey, RawQuerynameKey, RawSortKey, SortContext,
-    SortKey, SortOrder, TemplateCoordinateKey,
+    CoordinateKey, PA_TAG, PrimaryAlignmentInfo, QuerynameKey, RawCoordinateKey, RawQuerynameKey,
+    RawSortKey, SortContext, SortKey, SortOrder, TemplateCoordinateKey,
+    get_unclipped_5prime_position,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
 pub use raw::RawExternalSorter;

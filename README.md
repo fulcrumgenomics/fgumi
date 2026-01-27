@@ -29,6 +29,7 @@ Fulcrum Genomics Unique Molecular Indexing (UMI) Tools - a suite of high-perform
 fgumi provides comprehensive functionality for:
 - **UMI extraction** from FASTQ files
 - **Read grouping** by UMI with multiple assignment strategies
+- **UMI-aware deduplication** for marking/removing PCR duplicates
 - **Consensus calling** (simplex, duplex, and vanilla)
 - **Quality filtering** of consensus reads
 - **Read clipping** for overlapping pairs
@@ -110,21 +111,22 @@ Or initialize after cloning: `git submodule update --init`
 
 ## Available Tools
 
-| Command | Description | fgbio Equivalent |
+| Command | Description | Equivalent Tool(s) |
 |---------|-------------|------------------|
-| `extract` | Extract UMIs from FASTQ files | `ExtractUmisFromBam` |
-| `correct` | Correct UMIs based on sequence similarity | `CorrectUmis` |
-| `zipper` | Restore original FASTQ from unaligned BAM | `ZipperBams` |
+| `extract` | Extract UMIs from FASTQ files | `fgbio ExtractUmisFromBam` |
+| `correct` | Correct UMIs based on sequence similarity | `fgbio CorrectUmis` |
+| `zipper` | Restore original FASTQ from unaligned BAM | `fgbio ZipperBams`, `picard MergeBamAlignment` |
 | `fastq` | Convert BAM to FASTQ format | `samtools fastq` |
 | `sort` | Sort BAM by coordinate/queryname/template | `samtools sort` |
-| `group` | Group reads by UMI | `GroupReadsByUmi` |
-| `simplex` | Call single-strand consensus reads | `CallMolecularConsensusReads` |
-| `duplex` | Call duplex consensus reads | `CallDuplexConsensusReads` |
-| `codec` | Call CODEC consensus | `CallCodecConsensusReads` |
-| `filter` | Filter consensus reads | `FilterConsensusReads` |
-| `clip` | Clip overlapping read pairs | `ClipBam` |
-| `duplex-metrics` | Collect duplex metrics | `CollectDuplexSeqMetrics` |
-| `review` | Review consensus variants | `ReviewConsensusVariants` |
+| `group` | Group reads by UMI | `fgbio GroupReadsByUmi` |
+| `dedup` | Mark/remove UMI-aware duplicates | `gatk UmiAwareMarkDuplicatesWithMateCigar`, `umi-tools dedup` |
+| `simplex` | Call single-strand consensus reads | `fgbio CallMolecularConsensusReads` |
+| `duplex` | Call duplex consensus reads | `fgbio CallDuplexConsensusReads` |
+| `codec` | Call CODEC consensus | `fgbio CallCodecConsensusReads` |
+| `filter` | Filter consensus reads | `fgbio FilterConsensusReads` |
+| `clip` | Clip overlapping read pairs | `fgbio ClipBam` |
+| `duplex-metrics` | Collect duplex metrics | `fgbio CollectDuplexSeqMetrics` |
+| `review` | Review consensus variants | `fgbio ReviewConsensusVariants` |
 | `downsample` | Downsample BAM by UMI family | N/A |
 | `compare <cmd>` | Compare files (feature-gated) | N/A |
 | `simulate <cmd>` | Generate test data (feature-gated) | N/A |

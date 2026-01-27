@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use bstr::ByteSlice;
 
-use crate::sam::record_utils::{mate_unclipped_end, mate_unclipped_start};
+use crate::sam::record_utils::{
+    mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
+};
 use crate::template::Template;
 use crate::unified_pipeline::GroupKey;
 use noodles::sam;
@@ -294,79 +296,15 @@ pub fn compute_group_key(
 
 /// Get unclipped 5' position for `GroupKey` computation.
 ///
-/// # Note: Why Two Unclipped Position Functions Exist
-///
-/// This function and [`get_unclipped_position`] share similar CIGAR parsing logic
-/// but serve different use cases:
-///
-/// - `get_unclipped_position_for_groupkey`: Returns `i32` directly, returning 0
-///   on any error. Used in [`compute_group_key`] hot path where we need a numeric
-///   value for grouping and can't propagate errors.
-/// - [`get_unclipped_position`]: Returns `Result<i32>`, propagating errors when
-///   a mapped read is missing alignment data. Used by [`ReadInfo::from`] where
-///   proper error handling is needed.
-///
-/// The duplication is intentional to avoid error-handling overhead in the hot path.
+/// Returns 0 for unmapped reads. Returns `i32::MAX` for malformed mapped reads
+/// (those missing alignment start) to avoid incorrectly grouping them at position 0.
+/// Used in the hot path where we need a numeric value for grouping.
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn get_unclipped_position_for_groupkey(record: &sam::alignment::RecordBuf) -> i32 {
-    use noodles::sam::alignment::record::cigar::op::Kind;
-
     if record.flags().is_unmapped() {
         return 0;
     }
-
-    let Some(alignment_start) = record.alignment_start() else {
-        return 0;
-    };
-
-    let alignment_start_i32 = usize::from(alignment_start) as i32;
-    let cigar = record.cigar();
-    let ops = cigar.as_ref();
-
-    if record.flags().is_reverse_complemented() {
-        // Negative strand: calculate unclipped end (5' position)
-        let mut alignment_span: i32 = 0;
-        let mut trailing_clips: i32 = 0;
-        let mut in_trailing = true;
-
-        for op in ops.iter().rev() {
-            let len = op.len() as i32;
-            match op.kind() {
-                Kind::SoftClip | Kind::HardClip => {
-                    if in_trailing {
-                        trailing_clips += len;
-                    }
-                }
-                Kind::Match
-                | Kind::Deletion
-                | Kind::Skip
-                | Kind::SequenceMatch
-                | Kind::SequenceMismatch => {
-                    in_trailing = false;
-                    alignment_span += len;
-                }
-                _ => {
-                    in_trailing = false;
-                }
-            }
-        }
-
-        alignment_start_i32 + alignment_span - 1 + trailing_clips
-    } else {
-        // Positive strand: calculate unclipped start
-        let mut leading_clips: i32 = 0;
-
-        for op in ops.iter() {
-            match op.kind() {
-                Kind::SoftClip | Kind::HardClip => {
-                    leading_clips += op.len() as i32;
-                }
-                _ => break,
-            }
-        }
-
-        alignment_start_i32 - leading_clips
-    }
+    unclipped_five_prime_position(record).map_or(i32::MAX, |pos| pos as i32)
 }
 
 /// Information about read positions needed for grouping and ordering.
@@ -690,87 +628,17 @@ impl Ord for ReadInfo {
 /// # Errors
 ///
 /// Returns an error if the record is mapped but missing required alignment information
-///
-/// # See Also
-///
-/// [`get_unclipped_position_for_groupkey`] - Similar function optimized for hot path
-/// that returns 0 instead of an error.
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn get_unclipped_position(record: &sam::alignment::RecordBuf) -> Result<i32> {
-    use noodles::sam::alignment::record::cigar::op::Kind;
-
     if record.flags().is_unmapped() {
         return Ok(0);
     }
 
-    // Defer error message allocation - only build read_name if we actually need it
-    let alignment_start = record.alignment_start().ok_or_else(|| {
+    unclipped_five_prime_position(record).map(|pos| pos as i32).ok_or_else(|| {
         let read_name =
             record.name().map_or_else(|| "unknown".into(), |n| String::from_utf8_lossy(n.as_ref()));
         anyhow::anyhow!("Mapped read '{read_name}' missing alignment start position")
-    })?;
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let alignment_start_i32 = usize::from(alignment_start) as i32;
-
-    let cigar = record.cigar();
-    let ops = cigar.as_ref();
-
-    if record.flags().is_reverse_complemented() {
-        // Negative strand: calculate unclipped end (5' position)
-        // This matches htsjdk/fgbio's calculation:
-        //   alignmentEnd = alignmentStart + alignmentSpan - 1  (1-based inclusive)
-        //   unclippedEnd = alignmentEnd + trailingClips (soft + hard)
-        //
-        // Single-pass: iterate once to compute both alignment_span and trailing_clips
-        let mut alignment_span: i32 = 0;
-        let mut trailing_clips: i32 = 0;
-        let mut in_trailing = true;
-
-        // Iterate in reverse to find trailing clips and accumulate alignment span
-        for op in ops.iter().rev() {
-            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            let len = op.len() as i32;
-            match op.kind() {
-                Kind::SoftClip | Kind::HardClip => {
-                    if in_trailing {
-                        trailing_clips += len;
-                    }
-                }
-                Kind::Match
-                | Kind::Deletion
-                | Kind::Skip
-                | Kind::SequenceMatch
-                | Kind::SequenceMismatch => {
-                    in_trailing = false;
-                    alignment_span += len;
-                }
-                _ => {
-                    in_trailing = false;
-                }
-            }
-        }
-
-        // unclippedEnd = alignmentStart + alignmentSpan - 1 + trailingClips
-        Ok(alignment_start_i32 + alignment_span - 1 + trailing_clips)
-    } else {
-        // Positive strand: calculate unclipped start
-        // unclipped_start = alignment_start - leading_clips (soft + hard)
-        let mut leading_clips: i32 = 0;
-
-        for op in ops.iter() {
-            match op.kind() {
-                Kind::SoftClip | Kind::HardClip => {
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                    {
-                        leading_clips += op.len() as i32;
-                    }
-                }
-                _ => break, // Stop at first non-clip
-            }
-        }
-
-        Ok(alignment_start_i32 - leading_clips)
-    }
+    })
 }
 
 #[cfg(test)]

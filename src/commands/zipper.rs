@@ -57,6 +57,7 @@ use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::sam::{
     buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
 };
+use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo, get_unclipped_5prime_position};
 use fgumi_lib::template::{Template, TemplateIterator};
 use fgumi_lib::umi::TagInfo;
 use fgumi_lib::validation::validate_file_exists;
@@ -161,6 +162,13 @@ pub struct Zipper {
     /// Useful when reads were intentionally removed (e.g., by adapter trimming) prior to alignment.
     #[arg(long = "exclude-missing-reads", default_value = "false")]
     pub exclude_missing_reads: bool,
+
+    /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
+    /// By default, zipper adds a `pa` tag containing the primary alignment's template
+    /// sort key coordinates, which enables correct template-coordinate sorting and
+    /// deduplication of these reads. Use this flag if you don't need this functionality.
+    #[arg(long = "skip-pa-tags", default_value = "false")]
+    pub skip_pa_tags: bool,
 }
 
 /// Builds the output BAM header from unmapped and mapped headers
@@ -269,6 +277,96 @@ pub fn copy_tags(src: &RecordBuf, dest: &mut Data, tag_info: &TagInfo) -> Result
     Ok(())
 }
 
+/// Adds the `pa` tag to secondary and supplementary reads, storing the template
+/// sort key from the primary alignments.
+///
+/// This enables downstream tools (sort, dedup) to properly handle these reads
+/// by ensuring they sort adjacent to their primary alignments.
+///
+/// # Arguments
+///
+/// * `template` - The template containing all reads (primary, secondary, supplementary)
+///
+/// # Format
+///
+/// The `pa` tag is a B:i array with 6 int32 elements: `[tid1, pos1, neg1, tid2, pos2, neg2]`
+/// where "1" is the earlier position (lower (tid, pos)) and neg is 0/1 for forward/reverse.
+///
+/// This matches the template-coordinate sort key format used by `fgumi sort`.
+///
+/// Optimized to skip all computation when there are no secondary/supplementary reads.
+fn add_primary_alignment_tags(template: &mut Template) {
+    // Fast path: check if there are any secondary/supplementary reads before doing work
+    let has_sec_supp =
+        template.records.iter().any(|r| r.flags().is_secondary() || r.flags().is_supplementary());
+
+    if !has_sec_supp {
+        return; // No secondary/supplementary reads - nothing to do
+    }
+
+    // Get R1 primary alignment info: (ref_id, unclipped_5prime_pos, is_reverse)
+    // Uses unclipped 5' position to match template-coordinate sort key calculation
+    let r1_primary_info: Option<(i32, i32, bool)> = template.r1().and_then(|r| {
+        if r.flags().is_unmapped() {
+            return None;
+        }
+        let ref_id: i32 = r.reference_sequence_id()?.try_into().ok()?;
+        // Use unclipped 5' position to match sort key calculation
+        let pos: i32 = get_unclipped_5prime_position(r).ok()?.try_into().ok()?;
+        let is_reverse = r.flags().is_reverse_complemented();
+        Some((ref_id, pos, is_reverse))
+    });
+
+    // Get R2 primary alignment info: (ref_id, unclipped_5prime_pos, is_reverse)
+    let r2_primary_info: Option<(i32, i32, bool)> = template.r2().and_then(|r| {
+        if r.flags().is_unmapped() {
+            return None;
+        }
+        let ref_id: i32 = r.reference_sequence_id()?.try_into().ok()?;
+        // Use unclipped 5' position to match sort key calculation
+        let pos: i32 = get_unclipped_5prime_position(r).ok()?.try_into().ok()?;
+        let is_reverse = r.flags().is_reverse_complemented();
+        Some((ref_id, pos, is_reverse))
+    });
+
+    // Compute the template sort key (tid1, pos1, neg1, tid2, pos2, neg2)
+    // where "1" is the earlier position (lower (tid, pos))
+    let pa_info: Option<PrimaryAlignmentInfo> = match (r1_primary_info, r2_primary_info) {
+        (Some((tid1, pos1, neg1)), Some((tid2, pos2, neg2))) => {
+            // Both mapped - determine which is earlier
+            if (tid1, pos1) <= (tid2, pos2) {
+                Some(PrimaryAlignmentInfo::new(tid1, pos1, neg1, tid2, pos2, neg2))
+            } else {
+                Some(PrimaryAlignmentInfo::new(tid2, pos2, neg2, tid1, pos1, neg1))
+            }
+        }
+        (Some((tid, pos, neg)), None) | (None, Some((tid, pos, neg))) => {
+            // Only one mapped - use same values for both positions
+            Some(PrimaryAlignmentInfo::new(tid, pos, neg, tid, pos, neg))
+        }
+        (None, None) => None,
+    };
+
+    // If we have template sort key info, add it to all secondary/supplementary reads
+    let Some(pa_info) = pa_info else {
+        return;
+    };
+
+    let pa_value = pa_info.to_tag_value();
+
+    for record in &mut template.records {
+        let flags = record.flags();
+
+        // Skip primary alignments - they don't need the pa tag
+        if !flags.is_secondary() && !flags.is_supplementary() {
+            continue;
+        }
+
+        // Add the pa tag with the template sort key
+        record.data_mut().insert(PA_TAG, pa_value.clone());
+    }
+}
+
 /// Merges tags from unmapped template into mapped template
 ///
 /// This is the core merge function that:
@@ -293,7 +391,12 @@ pub fn copy_tags(src: &RecordBuf, dest: &mut Data, tag_info: &TagInfo) -> Result
 /// # Errors
 ///
 /// Returns an error if tag copying fails (currently never happens)
-pub fn merge(unmapped: &Template, mapped: &mut Template, tag_info: &TagInfo) -> Result<()> {
+pub fn merge(
+    unmapped: &Template,
+    mapped: &mut Template,
+    tag_info: &TagInfo,
+    skip_pa_tags: bool,
+) -> Result<()> {
     // Fix mate info first
     mapped.fix_mate_info()?;
 
@@ -404,6 +507,12 @@ pub fn merge(unmapped: &Template, mapped: &mut Template, tag_info: &TagInfo) -> 
         }
     }
 
+    // Add primary alignment tags to secondary and supplementary reads
+    // This enables proper template-coordinate sorting and duplicate marking
+    if !skip_pa_tags {
+        add_primary_alignment_tags(mapped);
+    }
+
     Ok(())
 }
 
@@ -435,7 +544,7 @@ impl Zipper {
 
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
-                    merge(&unmapped_template, mapped_template, tag_info)?;
+                    merge(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
                     for rec in mapped_template.all_reads() {
                         writer.write_alignment_record(output_header, rec)?;
                         progress.log_if_needed(1);
@@ -544,7 +653,7 @@ impl Zipper {
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
                     // Merge tags from unmapped to mapped (no cloning needed!)
-                    merge(&unmapped_template, mapped_template, tag_info)?;
+                    merge(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
 
                     // Write merged records
                     for rec in mapped_template.all_reads() {
@@ -847,6 +956,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
+            skip_pa_tags: false,
         };
 
         zipper.execute("test")?;
@@ -1574,6 +1684,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
+            skip_pa_tags: false,
         };
 
         zipper.execute("test")?;
@@ -1837,6 +1948,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads,
+            skip_pa_tags: false,
         };
 
         zipper.execute("test")?;
@@ -1939,6 +2051,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
+            skip_pa_tags: false,
         };
 
         let result = zipper.execute("test");
@@ -1948,6 +2061,487 @@ mod tests {
             err_msg.contains("does not exist") || err_msg.contains("not found"),
             "Error should mention file not found: {err_msg}"
         );
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Primary Alignment Tag (pa) Tests
+    // =========================================================================
+
+    // Helper for creating records with specific flags
+    const FLAG_PAIRED: u16 = 0x1;
+    const FLAG_READ1: u16 = 0x40;
+    const FLAG_READ2: u16 = 0x80;
+    const FLAG_SECONDARY: u16 = 0x100;
+    const FLAG_SUPPLEMENTARY: u16 = 0x800;
+    const FLAG_REVERSE: u16 = 0x10;
+
+    /// Tests that the pa tag is added to supplementary reads with template sort key
+    #[test]
+    fn test_add_pa_tag_to_supplementary_r1() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        // Build a template with primary R1 and supplementary R1
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        let supplementary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
+
+        // Call add_primary_alignment_tags
+        add_primary_alignment_tags(&mut template);
+
+        // Check that supplementary has pa tag
+        let supp = template
+            .records
+            .iter()
+            .find(|r| r.flags().is_supplementary())
+            .expect("Should have supplementary");
+
+        let pa_value = supp.data().get(&PA_TAG).expect("Supplementary should have pa tag");
+
+        // Parse and verify the pa tag
+        let pa_info =
+            PrimaryAlignmentInfo::from_tag_value(pa_value).expect("Should be able to parse pa tag");
+
+        // Only R1 mapped, so both positions should be the same
+        assert_eq!(pa_info.tid1, 0, "tid1 should be R1's reference");
+        assert_eq!(pa_info.pos1, 100, "pos1 should be R1's position");
+        assert!(!pa_info.neg1, "neg1 should be false (forward strand)");
+        assert_eq!(pa_info.tid2, 0, "tid2 should equal tid1 (single read)");
+        assert_eq!(pa_info.pos2, 100, "pos2 should equal pos1 (single read)");
+        assert!(!pa_info.neg2, "neg2 should equal neg1 (single read)");
+
+        // Check that primary does NOT have pa tag
+        let primary = template.r1().expect("Should have primary R1");
+        assert!(primary.data().get(&PA_TAG).is_none(), "Primary should not have pa tag");
+
+        Ok(())
+    }
+
+    /// Tests that the pa tag is added to secondary reads with correct strand info
+    #[test]
+    fn test_add_pa_tag_to_secondary_reverse_strand() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        // Build a template with primary R1 on reverse strand and secondary R1
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE))
+            .build();
+
+        let secondary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(3)
+            .alignment_start(3000)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SECONDARY))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
+
+        add_primary_alignment_tags(&mut template);
+
+        let secondary = template
+            .records
+            .iter()
+            .find(|r| r.flags().is_secondary())
+            .expect("Should have secondary");
+
+        let pa_value = secondary.data().get(&PA_TAG).expect("Secondary should have pa tag");
+
+        // Parse and verify the pa tag
+        let pa_info =
+            PrimaryAlignmentInfo::from_tag_value(pa_value).expect("Should be able to parse pa tag");
+
+        // Primary is on reverse strand with 8M cigar
+        // Unclipped 5' position for reverse strand = alignment_start + alignment_span - 1
+        // = 200 + 8 - 1 = 207
+        assert_eq!(pa_info.tid1, 0, "tid1 should be R1's reference");
+        assert_eq!(pa_info.pos1, 207, "pos1 should be R1's unclipped 5' position");
+        assert!(pa_info.neg1, "neg1 should be true (reverse strand)");
+
+        Ok(())
+    }
+
+    /// Tests that pa tag contains full template sort key for paired-end data
+    #[test]
+    fn test_add_pa_tag_paired_end_r2_supplementary() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        // Primary R1 at position 100 (forward strand, 8M cigar)
+        // Unclipped 5' = 100 (no soft clips)
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        // Primary R2 at position 300 (reverse strand, 8M cigar)
+        // Unclipped 5' for reverse strand = 300 + 8 - 1 = 307
+        let primary_r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(300)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE))
+            .build();
+
+        // Supplementary R2
+        let supplementary_r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_SUPPLEMENTARY))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, primary_r2, supplementary_r2])?;
+
+        add_primary_alignment_tags(&mut template);
+
+        let supp = template
+            .records
+            .iter()
+            .find(|r| r.flags().is_supplementary())
+            .expect("Should have supplementary");
+
+        let pa_value = supp.data().get(&PA_TAG).expect("Supplementary R2 should have pa tag");
+
+        // Parse and verify the pa tag
+        let pa_info =
+            PrimaryAlignmentInfo::from_tag_value(pa_value).expect("Should be able to parse pa tag");
+
+        // pa tag should contain BOTH primaries' unclipped 5' positions (sorted by position)
+        // R1 forward strand at 100 with 8M -> unclipped 5' = 100
+        // R2 reverse strand at 300 with 8M -> unclipped 5' = 300 + 8 - 1 = 307
+        assert_eq!(pa_info.tid1, 0, "tid1 should be R1's reference (earlier)");
+        assert_eq!(pa_info.pos1, 100, "pos1 should be R1's unclipped 5' position (earlier)");
+        assert!(!pa_info.neg1, "neg1 should be false (R1 forward strand)");
+        assert_eq!(pa_info.tid2, 0, "tid2 should be R2's reference (later)");
+        assert_eq!(pa_info.pos2, 307, "pos2 should be R2's unclipped 5' position (later)");
+        assert!(pa_info.neg2, "neg2 should be true (R2 reverse strand)");
+
+        Ok(())
+    }
+
+    /// Tests that no pa tag is added when there's no corresponding primary
+    #[test]
+    fn test_no_pa_tag_when_no_primary() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        // Only supplementary, no primary
+        let supplementary = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
+            .build();
+
+        let mut template = Template::from_records(vec![supplementary])?;
+
+        add_primary_alignment_tags(&mut template);
+
+        let supp = template
+            .records
+            .iter()
+            .find(|r| r.flags().is_supplementary())
+            .expect("Should have supplementary");
+
+        // Should NOT have pa tag since there's no primary
+        assert!(
+            supp.data().get(&PA_TAG).is_none(),
+            "Supplementary without primary should not have pa tag"
+        );
+
+        Ok(())
+    }
+
+    /// Tests that pa tag is added during full merge operation
+    #[test]
+    fn test_pa_tag_added_during_merge() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        // Add unmapped pair with tags
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        // Add mapped primary pair using the builder pattern
+        // R1 at 100, R2 at 200
+        let _ = mapped.add_pair().name("q1").start1(100).start2(200).build();
+
+        // Add supplementary R1 (same ref but different pos to test pa tag)
+        let supp = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGTACGTACGT")
+            .qualities(&[30; 12])
+            .reference_sequence_id(0)
+            .alignment_start(5000)
+            .cigar("12M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
+            .build();
+        mapped.push_record(supp);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+
+        // Find supplementary in output
+        let supp_record = records
+            .iter()
+            .find(|r| r.flags().is_supplementary())
+            .expect("Should have supplementary in output");
+
+        // Check pa tag was added
+        let pa_value =
+            supp_record.data().get(&PA_TAG).expect("Supplementary should have pa tag after merge");
+
+        // Parse and verify the pa tag
+        let pa_info =
+            PrimaryAlignmentInfo::from_tag_value(pa_value).expect("Should be able to parse pa tag");
+
+        // pa tag should contain both primaries' unclipped 5' positions
+        // R1: forward strand at 100 with 100M -> unclipped 5' = 100
+        // R2: reverse strand at 200 with 100M -> unclipped 5' = 200 + 100 - 1 = 299
+        assert_eq!(pa_info.tid1, 0, "tid1 should be 0");
+        assert_eq!(pa_info.pos1, 100, "pos1 should be R1's unclipped 5' position");
+        assert_eq!(pa_info.tid2, 0, "tid2 should be 0");
+        assert_eq!(pa_info.pos2, 299, "pos2 should be R2's unclipped 5' position (reverse strand)");
+
+        // Verify RX tag was also copied
+        let rx_tag = Tag::new(b'R', b'X');
+        assert!(
+            supp_record.data().get(&rx_tag).is_some(),
+            "Supplementary should also have RX tag copied from unmapped"
+        );
+
+        Ok(())
+    }
+
+    /// Tests that `add_primary_alignment_tags` returns early when there are no
+    /// secondary/supplementary reads (the early exit optimization).
+    #[test]
+    fn test_add_pa_tag_early_exit_no_secondary_supplementary() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        // Create a template with only primary reads (no secondary/supplementary)
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        let primary_r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, primary_r2])?;
+
+        // Call add_primary_alignment_tags - should return early
+        add_primary_alignment_tags(&mut template);
+
+        // Verify no pa tags were added (primaries don't get pa tags)
+        for record in &template.records {
+            assert!(record.data().get(&PA_TAG).is_none(), "Primary reads should not have pa tag");
+        }
+
+        Ok(())
+    }
+
+    /// Tests that `add_primary_alignment_tags` only adds pa tag to secondary/supplementary,
+    /// not to primary reads, even when secondary/supplementary are present.
+    #[test]
+    fn test_add_pa_tag_only_to_secondary_supplementary() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        // Create a template with primary + secondary
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        let secondary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SECONDARY))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
+
+        add_primary_alignment_tags(&mut template);
+
+        // Check each record
+        for record in &template.records {
+            if record.flags().is_secondary() {
+                assert!(record.data().get(&PA_TAG).is_some(), "Secondary should have pa tag");
+            } else {
+                assert!(record.data().get(&PA_TAG).is_none(), "Primary should not have pa tag");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_pa_tags_parameter() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        const FLAG_UNMAPPED: u16 = 0x4;
+
+        // Create a template with primary + supplementary
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        let supplementary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
+
+        // Create unmapped template
+        let unmapped_record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED))
+            .tag("RX", "AAAA")
+            .build();
+        let unmapped = Template::from_records(vec![unmapped_record])?;
+
+        let tag_info = TagInfo::new(vec![], vec![], vec![]);
+
+        // Test with skip_pa_tags = true
+        merge(&unmapped, &mut template, &tag_info, true)?;
+
+        // Supplementary should NOT have pa tag when skip_pa_tags is true
+        for record in &template.records {
+            assert!(
+                record.data().get(&PA_TAG).is_none(),
+                "No records should have pa tag when skip_pa_tags=true"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_pa_tags_false_adds_tags() -> Result<()> {
+        use fgumi_lib::template::Template;
+
+        const FLAG_UNMAPPED: u16 = 0x4;
+
+        // Create a template with primary + supplementary
+        let primary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        let supplementary_r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .cigar("4M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
+            .build();
+
+        let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
+
+        // Create unmapped template
+        let unmapped_record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED))
+            .tag("RX", "AAAA")
+            .build();
+        let unmapped = Template::from_records(vec![unmapped_record])?;
+
+        let tag_info = TagInfo::new(vec![], vec![], vec![]);
+
+        // Test with skip_pa_tags = false
+        merge(&unmapped, &mut template, &tag_info, false)?;
+
+        // Supplementary SHOULD have pa tag when skip_pa_tags is false
+        let has_pa_tag = template
+            .records
+            .iter()
+            .any(|r| r.flags().is_supplementary() && r.data().get(&PA_TAG).is_some());
+
+        assert!(has_pa_tag, "Supplementary should have pa tag when skip_pa_tags=false");
 
         Ok(())
     }
