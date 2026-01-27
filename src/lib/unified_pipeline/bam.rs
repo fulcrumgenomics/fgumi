@@ -1562,7 +1562,7 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
         if let Some(stats) = state.stats() {
             stats.record_contention(PipelineStep::FindBoundaries);
         }
-        return (false, true); // Contention!
+        return (did_work, true); // Contention (but may have advanced held item)
     };
 
     // Process multiple batches per lock acquisition to reduce contention

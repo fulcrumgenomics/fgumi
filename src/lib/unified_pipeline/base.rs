@@ -3253,9 +3253,14 @@ pub trait HasHeldCompressed {
 ///
 /// The pattern:
 /// 1. Check/advance held item first (priority 1)
-/// 2. Brief blocking lock for reorder buffer insert/pop
-/// 3. Do boundary work OUTSIDE the reorder lock
-/// 4. Hold result if output queue full
+/// 2. Acquire ordering lock (BAM: `boundary_state`, FASTQ: `boundary_lock`)
+/// 3. Brief lock for reorder buffer insert/pop
+/// 4. Do boundary work (under ordering lock to ensure sequential processing)
+/// 5. Push result or hold if output queue full
+///
+/// Note: FASTQ requires strict ordering due to per-stream leftover state, so it
+/// uses a separate `boundary_lock`. BAM uses `boundary_state` which serves both
+/// as the ordering lock and contains the boundary-finding state.
 pub trait HasHeldBoundaries<B> {
     fn held_boundaries_mut(&mut self) -> &mut Option<(u64, B)>;
 }
