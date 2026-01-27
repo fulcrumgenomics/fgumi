@@ -25,13 +25,12 @@ use crate::sort::read_ahead::ReadAheadReader;
 use anyhow::{Context, Result};
 use bstr::BString;
 use crossbeam_channel::{Receiver, bounded};
-use flate2::read::GzDecoder;
 use log::info;
-use noodles_bgzf::io::Writer as BgzfWriter;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+use noodles_bgzf::io::{Reader as BgzfReader, Writer as BgzfWriter};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -306,8 +305,8 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 
             // Read using appropriate decoder
             if is_compressed {
-                let decoder = GzDecoder::new(buf_reader);
-                Self::read_records(decoder, tx);
+                let bgzf_reader = BgzfReader::new(buf_reader);
+                Self::read_records(bgzf_reader, tx);
             } else {
                 Self::read_records(buf_reader, tx);
             }
@@ -458,8 +457,8 @@ impl KeyedChunkReader {
 
             // Read using appropriate decoder
             if is_compressed {
-                let decoder = GzDecoder::new(buf_reader);
-                Self::read_records(decoder, tx);
+                let bgzf_reader = BgzfReader::new(buf_reader);
+                Self::read_records(bgzf_reader, tx);
             } else {
                 Self::read_records(buf_reader, tx);
             }
@@ -469,7 +468,10 @@ impl KeyedChunkReader {
     }
 
     /// Read records from a reader and send them through the channel.
-    fn read_records<R: Read>(mut reader: R, tx: crossbeam_channel::Sender<Option<(TemplateKey, Vec<u8>)>>) {
+    fn read_records<R: Read>(
+        mut reader: R,
+        tx: crossbeam_channel::Sender<Option<(TemplateKey, Vec<u8>)>>,
+    ) {
         let mut key_buf = [0u8; 32];
         let mut len_buf = [0u8; 4];
 
@@ -709,7 +711,10 @@ impl RawExternalSorter {
                 }
 
                 // Write keyed temp file (stores sort key with each record for O(1) merge)
-                let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(&chunk_path, self.temp_compression)?;
+                let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(
+                    &chunk_path,
+                    self.temp_compression,
+                )?;
                 for r in buffer.refs() {
                     let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
                     let record_bytes = buffer.get_record(r);
@@ -830,7 +835,10 @@ impl RawExternalSorter {
                     buffer.sort();
                 }
 
-                let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(&chunk_path, self.temp_compression)?;
+                let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(
+                    &chunk_path,
+                    self.temp_compression,
+                )?;
                 for r in buffer.refs() {
                     let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
                     let record_bytes = buffer.get_record(r);
@@ -976,7 +984,10 @@ impl RawExternalSorter {
                 }
 
                 // Write keyed temp file
-                let mut writer = GenericKeyedChunkWriter::<RawQuerynameKey>::create(&chunk_path, self.temp_compression)?;
+                let mut writer = GenericKeyedChunkWriter::<RawQuerynameKey>::create(
+                    &chunk_path,
+                    self.temp_compression,
+                )?;
                 for (key, record) in entries.drain(..) {
                     writer.write_record(&key, &record)?;
                 }
@@ -1096,7 +1107,8 @@ impl RawExternalSorter {
                 }
 
                 // Write keyed chunk preserving sort keys for O(1) merge comparisons
-                let mut keyed_writer = KeyedChunkWriter::create(&chunk_path, self.temp_compression)?;
+                let mut keyed_writer =
+                    KeyedChunkWriter::create(&chunk_path, self.temp_compression)?;
                 for (key, record) in buffer.iter_sorted_keyed() {
                     keyed_writer.write_record(&key, record)?;
                 }
