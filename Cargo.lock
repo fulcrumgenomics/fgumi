@@ -705,7 +705,7 @@ dependencies = [
  "murmur3",
  "noodles",
  "noodles-bgzf 0.45.0",
- "noodles-csi",
+ "noodles-csi 0.52.0",
  "noodles-util",
  "parking_lot",
  "proptest",
@@ -1469,11 +1469,11 @@ version = "0.102.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "443a31c94fda859fad991e1cc21978b49d42462d868e232970cd9525cc9875ee"
 dependencies = [
- "noodles-bam",
+ "noodles-bam 0.84.0",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-fasta",
- "noodles-sam",
+ "noodles-fasta 0.57.0",
+ "noodles-sam 0.80.0",
  "noodles-vcf",
 ]
 
@@ -1486,8 +1486,23 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
- "noodles-sam",
+ "noodles-csi 0.52.0",
+ "noodles-sam 0.80.0",
+]
+
+[[package]]
+name = "noodles-bam"
+version = "0.85.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0fe3bc8e8002c60ed50b2c0ac9f05e5d2506c1b3eff32d8dc99501baa2de687"
+dependencies = [
+ "bstr 1.12.1",
+ "indexmap",
+ "memchr",
+ "noodles-bgzf 0.45.0",
+ "noodles-core",
+ "noodles-csi 0.53.0",
+ "noodles-sam 0.81.0",
 ]
 
 [[package]]
@@ -1523,9 +1538,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-cram"
-version = "0.87.0"
+version = "0.88.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d9239bddd3f4416b7754e08ad79ebfa14c021074db3b491c7552fbe5c826d5"
+checksum = "088e2072500300c9d94c455ef7aa6972a63d1471af250e7b7f0cf5d79559a44d"
 dependencies = [
  "bitflags",
  "bstr 1.12.1",
@@ -1534,10 +1549,10 @@ dependencies = [
  "indexmap",
  "lzma-rust2",
  "md-5",
- "noodles-bam",
+ "noodles-bam 0.85.0",
  "noodles-core",
- "noodles-fasta",
- "noodles-sam",
+ "noodles-fasta 0.58.0",
+ "noodles-sam 0.81.0",
 ]
 
 [[package]]
@@ -1554,6 +1569,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-csi"
+version = "0.53.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0646c79753d5f5c2b366b74a01b8309c8b41fec49cd417972f0b5d8c2ff12c67"
+dependencies = [
+ "bit-vec",
+ "bstr 1.12.1",
+ "indexmap",
+ "noodles-bgzf 0.45.0",
+ "noodles-core",
+]
+
+[[package]]
 name = "noodles-fasta"
 version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1562,6 +1590,18 @@ dependencies = [
  "bstr 1.12.1",
  "memchr",
  "noodles-bgzf 0.44.0",
+ "noodles-core",
+]
+
+[[package]]
+name = "noodles-fasta"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e929a025d64f44c5e063cd8fc370fd002eb771942a458205d4fd6836fb22fe6"
+dependencies = [
+ "bstr 1.12.1",
+ "memchr",
+ "noodles-bgzf 0.45.0",
  "noodles-core",
 ]
 
@@ -1578,7 +1618,23 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.52.0",
+]
+
+[[package]]
+name = "noodles-sam"
+version = "0.81.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fff8d583bf68623f2ebc6168a75576135bd18bc9d877e8275c0130230e146bea"
+dependencies = [
+ "bitflags",
+ "bstr 1.12.1",
+ "indexmap",
+ "lexical-core",
+ "memchr",
+ "noodles-bgzf 0.45.0",
+ "noodles-core",
+ "noodles-csi 0.53.0",
 ]
 
 [[package]]
@@ -1591,24 +1647,24 @@ dependencies = [
  "indexmap",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.52.0",
 ]
 
 [[package]]
 name = "noodles-util"
-version = "0.71.0"
+version = "0.73.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b620da90adf7195ee166856bece73c80fe53ed03076997078348e1acbe7e6e5d"
+checksum = "e1bc3fe88901262735dc4b4861c87d097d875263bb11a4db85d9ea0f5fc1439d"
 dependencies = [
  "bstr 1.12.1",
  "flate2",
- "noodles-bam",
- "noodles-bgzf 0.44.0",
+ "noodles-bam 0.85.0",
+ "noodles-bgzf 0.45.0",
  "noodles-core",
  "noodles-cram",
- "noodles-csi",
- "noodles-fasta",
- "noodles-sam",
+ "noodles-csi 0.53.0",
+ "noodles-fasta 0.58.0",
+ "noodles-sam 0.81.0",
 ]
 
 [[package]]
@@ -1621,7 +1677,7 @@ dependencies = [
  "memchr",
  "noodles-bgzf 0.44.0",
  "noodles-core",
- "noodles-csi",
+ "noodles-csi 0.52.0",
  "noodles-tabix",
  "percent-encoding",
 ]
