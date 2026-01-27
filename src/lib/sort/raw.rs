@@ -30,7 +30,11 @@ use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
-use noodles_bgzf::io::{Reader as BgzfReader, Writer as BgzfWriter};
+use noodles_bgzf::io::{
+    MultithreadedWriter, Reader as BgzfReader, Writer as BgzfWriter, multithreaded_writer,
+    writer::CompressionLevel,
+};
+use std::num::NonZero;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -182,22 +186,26 @@ use std::marker::PhantomData;
 enum ChunkWriterInner {
     /// Uncompressed raw output (fastest).
     Raw(BufWriter<std::fs::File>),
-    /// BGZF-compressed output (saves disk space, single-threaded).
-    Compressed(BgzfWriter<BufWriter<std::fs::File>>),
+    /// Single-threaded BGZF-compressed output.
+    SingleThreaded(BgzfWriter<BufWriter<std::fs::File>>),
+    /// Multi-threaded BGZF-compressed output (faster for large chunks).
+    MultiThreaded(MultithreadedWriter<BufWriter<std::fs::File>>),
 }
 
 impl Write for ChunkWriterInner {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             ChunkWriterInner::Raw(w) => w.write(buf),
-            ChunkWriterInner::Compressed(w) => w.write(buf),
+            ChunkWriterInner::SingleThreaded(w) => w.write(buf),
+            ChunkWriterInner::MultiThreaded(w) => w.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             ChunkWriterInner::Raw(w) => w.flush(),
-            ChunkWriterInner::Compressed(w) => w.flush(),
+            ChunkWriterInner::SingleThreaded(w) => w.flush(),
+            ChunkWriterInner::MultiThreaded(w) => w.flush(),
         }
     }
 }
@@ -209,7 +217,11 @@ impl ChunkWriterInner {
                 w.flush()?;
                 Ok(())
             }
-            ChunkWriterInner::Compressed(w) => {
+            ChunkWriterInner::SingleThreaded(w) => {
+                w.finish()?;
+                Ok(())
+            }
+            ChunkWriterInner::MultiThreaded(mut w) => {
                 w.finish()?;
                 Ok(())
             }
@@ -229,18 +241,28 @@ pub struct GenericKeyedChunkWriter<K: RawSortKey> {
 impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
     /// Create a new keyed chunk writer with optional compression.
     ///
-    /// Compression level 0 = uncompressed (fastest, uses most disk).
-    /// Compression level > 0 = BGZF compression (uses default compression level).
-    pub fn create(path: &Path, compression_level: u32) -> Result<Self> {
+    /// - `compression_level` 0 = uncompressed (fastest, uses most disk).
+    /// - `compression_level` > 0 = BGZF compression at specified level.
+    /// - `threads` > 1 enables multi-threaded compression.
+    pub fn create(path: &Path, compression_level: u32, threads: usize) -> Result<Self> {
         let file = std::fs::File::create(path)?;
         let buf = BufWriter::with_capacity(256 * 1024, file);
 
         let writer = if compression_level == 0 {
             ChunkWriterInner::Raw(buf)
+        } else if threads > 1 {
+            // Use multi-threaded BGZF for faster compression
+            let worker_count = NonZero::new(threads).expect("threads > 1");
+            let mut builder =
+                multithreaded_writer::Builder::default().set_worker_count(worker_count);
+            #[allow(clippy::cast_possible_truncation)]
+            if let Some(level) = CompressionLevel::new(compression_level as u8) {
+                builder = builder.set_compression_level(level);
+            }
+            ChunkWriterInner::MultiThreaded(builder.build_from_writer(buf))
         } else {
-            // Use single-threaded BGZF to avoid competing with parallel sorting
-            // Note: Single-threaded BGZF writer uses default compression level
-            ChunkWriterInner::Compressed(BgzfWriter::new(buf))
+            // Single-threaded BGZF
+            ChunkWriterInner::SingleThreaded(BgzfWriter::new(buf))
         };
 
         Ok(Self { writer, _marker: PhantomData })
@@ -383,18 +405,28 @@ struct KeyedChunkWriter {
 impl KeyedChunkWriter {
     /// Create a new keyed chunk writer with optional compression.
     ///
-    /// Compression level 0 = uncompressed (fastest, uses most disk).
-    /// Compression level > 0 = BGZF compression (uses default compression level).
-    fn create(path: &Path, compression_level: u32) -> Result<Self> {
+    /// - `compression_level` 0 = uncompressed (fastest, uses most disk).
+    /// - `compression_level` > 0 = BGZF compression at specified level.
+    /// - `threads` > 1 enables multi-threaded compression.
+    fn create(path: &Path, compression_level: u32, threads: usize) -> Result<Self> {
         let file = std::fs::File::create(path)?;
         let buf = BufWriter::with_capacity(256 * 1024, file);
 
         let writer = if compression_level == 0 {
             ChunkWriterInner::Raw(buf)
+        } else if threads > 1 {
+            // Use multi-threaded BGZF for faster compression
+            let worker_count = NonZero::new(threads).expect("threads > 1");
+            let mut builder =
+                multithreaded_writer::Builder::default().set_worker_count(worker_count);
+            #[allow(clippy::cast_possible_truncation)]
+            if let Some(level) = CompressionLevel::new(compression_level as u8) {
+                builder = builder.set_compression_level(level);
+            }
+            ChunkWriterInner::MultiThreaded(builder.build_from_writer(buf))
         } else {
-            // Use single-threaded BGZF to avoid competing with parallel sorting
-            // Note: Single-threaded BGZF writer uses default compression level
-            ChunkWriterInner::Compressed(BgzfWriter::new(buf))
+            // Single-threaded BGZF
+            ChunkWriterInner::SingleThreaded(BgzfWriter::new(buf))
         };
 
         Ok(Self { writer })
@@ -714,6 +746,7 @@ impl RawExternalSorter {
                 let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(
                     &chunk_path,
                     self.temp_compression,
+                    self.threads,
                 )?;
                 for r in buffer.refs() {
                     let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
@@ -838,6 +871,7 @@ impl RawExternalSorter {
                 let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(
                     &chunk_path,
                     self.temp_compression,
+                    self.threads,
                 )?;
                 for r in buffer.refs() {
                     let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
@@ -987,6 +1021,7 @@ impl RawExternalSorter {
                 let mut writer = GenericKeyedChunkWriter::<RawQuerynameKey>::create(
                     &chunk_path,
                     self.temp_compression,
+                    self.threads,
                 )?;
                 for (key, record) in entries.drain(..) {
                     writer.write_record(&key, &record)?;
@@ -1108,7 +1143,7 @@ impl RawExternalSorter {
 
                 // Write keyed chunk preserving sort keys for O(1) merge comparisons
                 let mut keyed_writer =
-                    KeyedChunkWriter::create(&chunk_path, self.temp_compression)?;
+                    KeyedChunkWriter::create(&chunk_path, self.temp_compression, self.threads)?;
                 for (key, record) in buffer.iter_sorted_keyed() {
                     keyed_writer.write_record(&key, record)?;
                 }
