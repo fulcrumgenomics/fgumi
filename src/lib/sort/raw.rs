@@ -34,10 +34,10 @@ use noodles_bgzf::io::{
     MultithreadedWriter, Reader as BgzfReader, Writer as BgzfWriter, multithreaded_writer,
     writer::CompressionLevel,
 };
-use std::num::NonZero;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use tempfile::TempDir;
@@ -261,8 +261,14 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
             }
             ChunkWriterInner::MultiThreaded(builder.build_from_writer(buf))
         } else {
-            // Single-threaded BGZF
-            ChunkWriterInner::SingleThreaded(BgzfWriter::new(buf))
+            // Single-threaded BGZF with specified compression level
+            #[allow(clippy::cast_possible_truncation)]
+            let level = CompressionLevel::new(compression_level as u8)
+                .unwrap_or_else(|| CompressionLevel::new(6).unwrap());
+            let writer = noodles_bgzf::io::writer::Builder::default()
+                .set_compression_level(level)
+                .build_from_writer(buf);
+            ChunkWriterInner::SingleThreaded(writer)
         };
 
         Ok(Self { writer, _marker: PhantomData })
@@ -380,174 +386,6 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 
     /// Read the next keyed record from the prefetch buffer.
     pub fn next_record(&mut self) -> Option<(K, Vec<u8>)> {
-        match self.receiver.recv() {
-            Ok(Some(entry)) => Some(entry),
-            Ok(None) | Err(_) => None,
-        }
-    }
-}
-
-// ============================================================================
-// Specialized Keyed Temp File I/O for Template-Coordinate Sort
-// ============================================================================
-//
-// Stores pre-computed TemplateKey alongside each record so merge comparisons
-// are O(1) integer comparisons instead of O(CIGAR_len + aux_scan) parsing.
-//
-// Format: [key: 32 bytes][len: 4 bytes][record: len bytes] per record
-
-/// Writer for keyed temp chunks with pre-computed sort keys.
-/// Supports optional BGZF compression for reduced disk usage.
-struct KeyedChunkWriter {
-    writer: ChunkWriterInner,
-}
-
-impl KeyedChunkWriter {
-    /// Create a new keyed chunk writer with optional compression.
-    ///
-    /// - `compression_level` 0 = uncompressed (fastest, uses most disk).
-    /// - `compression_level` > 0 = BGZF compression at specified level.
-    /// - `threads` > 1 enables multi-threaded compression.
-    fn create(path: &Path, compression_level: u32, threads: usize) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
-        let buf = BufWriter::with_capacity(256 * 1024, file);
-
-        let writer = if compression_level == 0 {
-            ChunkWriterInner::Raw(buf)
-        } else if threads > 1 {
-            // Use multi-threaded BGZF for faster compression
-            let worker_count = NonZero::new(threads).expect("threads > 1");
-            let mut builder =
-                multithreaded_writer::Builder::default().set_worker_count(worker_count);
-            #[allow(clippy::cast_possible_truncation)]
-            if let Some(level) = CompressionLevel::new(compression_level as u8) {
-                builder = builder.set_compression_level(level);
-            }
-            ChunkWriterInner::MultiThreaded(builder.build_from_writer(buf))
-        } else {
-            // Single-threaded BGZF
-            ChunkWriterInner::SingleThreaded(BgzfWriter::new(buf))
-        };
-
-        Ok(Self { writer })
-    }
-
-    /// Write a keyed record.
-    #[inline]
-    fn write_record(&mut self, key: &TemplateKey, record: &[u8]) -> Result<()> {
-        self.writer.write_all(&key.to_bytes())?;
-        self.writer.write_all(&(record.len() as u32).to_le_bytes())?;
-        self.writer.write_all(record)?;
-        Ok(())
-    }
-
-    /// Finish writing and flush.
-    fn finish(self) -> Result<()> {
-        self.writer.finish()
-    }
-}
-
-/// Reader for keyed temp chunks - returns pre-computed keys with records.
-/// Auto-detects BGZF compression via magic bytes.
-struct KeyedChunkReader {
-    receiver: Receiver<Option<(TemplateKey, Vec<u8>)>>,
-    _handle: JoinHandle<()>,
-}
-
-impl KeyedChunkReader {
-    /// Open a keyed chunk file for reading with background prefetching.
-    /// Auto-detects BGZF/gzip compression via magic bytes (0x1f 0x8b).
-    fn open(path: &Path) -> Result<Self> {
-        let (tx, rx) = bounded(MERGE_PREFETCH_SIZE);
-        let path = path.to_path_buf();
-
-        let handle = thread::spawn(move || {
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::error!("Failed to open keyed chunk {}: {}", path.display(), e);
-                    let _ = tx.send(None);
-                    return;
-                }
-            };
-            let mut buf_reader = BufReader::with_capacity(256 * 1024, file);
-
-            // Check for gzip/BGZF magic bytes: 0x1f 0x8b
-            let mut magic = [0u8; 2];
-            let is_compressed = if buf_reader.read_exact(&mut magic).is_ok() {
-                magic == [0x1f, 0x8b]
-            } else {
-                false
-            };
-
-            // Seek back to start
-            if buf_reader.seek(SeekFrom::Start(0)).is_err() {
-                log::error!("Failed to seek in keyed chunk {}", path.display());
-                let _ = tx.send(None);
-                return;
-            }
-
-            // Read using appropriate decoder
-            if is_compressed {
-                let bgzf_reader = BgzfReader::new(buf_reader);
-                Self::read_records(bgzf_reader, tx);
-            } else {
-                Self::read_records(buf_reader, tx);
-            }
-        });
-
-        Ok(Self { receiver: rx, _handle: handle })
-    }
-
-    /// Read records from a reader and send them through the channel.
-    fn read_records<R: Read>(
-        mut reader: R,
-        tx: crossbeam_channel::Sender<Option<(TemplateKey, Vec<u8>)>>,
-    ) {
-        let mut key_buf = [0u8; 32];
-        let mut len_buf = [0u8; 4];
-
-        loop {
-            // Read key
-            match reader.read_exact(&mut key_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Normal EOF
-                    let _ = tx.send(None);
-                    break;
-                }
-                Err(e) => {
-                    log::error!("Error reading keyed chunk key: {}", e);
-                    let _ = tx.send(None);
-                    break;
-                }
-            }
-
-            // Read length
-            if reader.read_exact(&mut len_buf).is_err() {
-                log::error!("Error reading keyed chunk length");
-                let _ = tx.send(None);
-                break;
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-
-            // Read record
-            let mut record = vec![0u8; len];
-            if reader.read_exact(&mut record).is_err() {
-                log::error!("Error reading keyed chunk record");
-                let _ = tx.send(None);
-                break;
-            }
-
-            let key = TemplateKey::from_bytes(&key_buf);
-            if tx.send(Some((key, record))).is_err() {
-                break; // Receiver dropped
-            }
-        }
-    }
-
-    /// Read the next keyed record from the prefetch buffer.
-    fn next_record(&mut self) -> Option<(TemplateKey, Vec<u8>)> {
         match self.receiver.recv() {
             Ok(Some(entry)) => Some(entry),
             Ok(None) | Err(_) => None,
@@ -1142,8 +980,11 @@ impl RawExternalSorter {
                 }
 
                 // Write keyed chunk preserving sort keys for O(1) merge comparisons
-                let mut keyed_writer =
-                    KeyedChunkWriter::create(&chunk_path, self.temp_compression, self.threads)?;
+                let mut keyed_writer = GenericKeyedChunkWriter::<TemplateKey>::create(
+                    &chunk_path,
+                    self.temp_compression,
+                    self.threads,
+                )?;
                 for (key, record) in buffer.iter_sorted_keyed() {
                     keyed_writer.write_record(&key, record)?;
                 }
@@ -1231,7 +1072,7 @@ impl RawExternalSorter {
         /// Source for keyed chunks during merge.
         enum KeyedChunkSource {
             /// Disk-based chunk with prefetching reader.
-            Disk(KeyedChunkReader),
+            Disk(GenericKeyedChunkReader<TemplateKey>),
             /// In-memory sorted records.
             Memory { records: Vec<(TemplateKey, Vec<u8>)>, idx: usize },
         }
@@ -1260,7 +1101,8 @@ impl RawExternalSorter {
 
         // Add disk-based chunks with keyed readers
         for path in chunk_files {
-            sources.push(KeyedChunkSource::Disk(KeyedChunkReader::open(path)?));
+            sources
+                .push(KeyedChunkSource::Disk(GenericKeyedChunkReader::<TemplateKey>::open(path)?));
         }
 
         // Add in-memory keyed chunk

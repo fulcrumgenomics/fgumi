@@ -136,12 +136,12 @@ pub struct Sort {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// Compression level for temporary chunk files (0-12).
+    /// Compression level for temporary chunk files (0-9).
     ///
     /// Level 0 disables compression (fastest, uses most disk space).
     /// Level 1 (default) provides fast compression with reasonable space savings.
-    /// Higher levels provide better compression but are slower.
-    #[arg(long = "temp-compression", default_value = "1")]
+    /// Higher levels (up to 9) provide better compression but are slower.
+    #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
 
     /// Write BAM index (.bai) alongside output.
