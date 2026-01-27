@@ -20,7 +20,7 @@ log = "0"
 thiserror = "2"
 noodles = { version = "0.102.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.45.0", features = ["libdeflate"] }
-noodles-util = { version = "0.71.0", features = ["alignment"] }
+noodles-util = { version = "0.73.0", features = ["alignment"] }
 mimalloc = { version = "0.1.48", default-features = false }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
