@@ -28,10 +28,146 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+
+use crate::sam::record_utils::{mate_unclipped_end, mate_unclipped_start};
 use std::io::{Read, Write};
 
 /// The MI (Molecular Identifier) tag.
 const MI_TAG: Tag = Tag::new(b'M', b'I');
+
+/// The PA (Primary Alignment) tag for secondary/supplementary reads.
+/// Stores template-coordinate sort key as B:i array (6 int32s).
+/// Added by `fgumi zipper` to enable proper template-coordinate sorting.
+pub const PA_TAG: Tag = Tag::new(b'p', b'a');
+
+// ============================================================================
+// Primary Alignment Info (PA tag)
+// ============================================================================
+
+/// Primary alignment info for secondary/supplementary reads.
+///
+/// Stores the template-coordinate sort key from the primary alignments,
+/// enabling secondary/supplementary reads to sort adjacent to their primaries.
+///
+/// # Binary Format
+///
+/// Stored as a `B:i` (int32 array) BAM tag with 6 elements:
+/// `[tid1, pos1, neg1, tid2, pos2, neg2]`
+/// where `neg1`/`neg2` are 0 for forward, 1 for reverse strand.
+///
+/// This format is faster to parse than a string representation and ensures
+/// supplementary reads get the exact same sort key as their primary reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryAlignmentInfo {
+    /// Reference ID of the earlier mate (lower position).
+    pub tid1: i32,
+    /// Unclipped 5' position of the earlier mate.
+    pub pos1: i32,
+    /// True if earlier mate is on reverse strand.
+    pub neg1: bool,
+    /// Reference ID of the later mate.
+    pub tid2: i32,
+    /// Unclipped 5' position of the later mate.
+    pub pos2: i32,
+    /// True if later mate is on reverse strand.
+    pub neg2: bool,
+}
+
+impl PrimaryAlignmentInfo {
+    /// Creates a new `PrimaryAlignmentInfo`.
+    #[must_use]
+    pub const fn new(tid1: i32, pos1: i32, neg1: bool, tid2: i32, pos2: i32, neg2: bool) -> Self {
+        Self { tid1, pos1, neg1, tid2, pos2, neg2 }
+    }
+
+    /// Serializes to a BAM tag value (B:i array with 6 elements).
+    #[must_use]
+    pub fn to_tag_value(&self) -> noodles::sam::alignment::record_buf::data::field::Value {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        let values: Vec<i32> = vec![
+            self.tid1,
+            self.pos1,
+            i32::from(self.neg1),
+            self.tid2,
+            self.pos2,
+            i32::from(self.neg2),
+        ];
+        Value::Array(Array::Int32(values))
+    }
+
+    /// Deserializes from a BAM tag value (B:i array with 6 int32 elements).
+    ///
+    /// Optimized with a fast path for Int32 arrays (the expected format) that
+    /// avoids heap allocation by directly indexing the array.
+    #[must_use]
+    pub fn from_tag_value(
+        value: &noodles::sam::alignment::record_buf::data::field::Value,
+    ) -> Option<Self> {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        match value {
+            Value::Array(arr) => {
+                // Fast path: Int32 array (expected format from zipper) - no allocation
+                if let Array::Int32(v) = arr {
+                    if v.len() == 6 {
+                        return Some(Self {
+                            tid1: v[0],
+                            pos1: v[1],
+                            neg1: v[2] != 0,
+                            tid2: v[3],
+                            pos2: v[4],
+                            neg2: v[5] != 0,
+                        });
+                    }
+                    return None;
+                }
+
+                // Slow path: other array types (rare) - requires allocation
+                let values: Vec<i32> = match arr {
+                    Array::Int8(v) => v.iter().map(|&x| i32::from(x)).collect(),
+                    Array::UInt8(v) => v.iter().map(|&x| i32::from(x)).collect(),
+                    Array::Int16(v) => v.iter().map(|&x| i32::from(x)).collect(),
+                    Array::UInt16(v) => v.iter().map(|&x| i32::from(x)).collect(),
+                    Array::Int32(_) => unreachable!(), // Handled above
+                    Array::UInt32(v) => {
+                        // Use try_from to avoid wrapping for values > i32::MAX
+                        let result: Result<Vec<i32>, _> =
+                            v.iter().map(|&x| i32::try_from(x)).collect();
+                        match result {
+                            Ok(vals) => vals,
+                            Err(_) => return None,
+                        }
+                    }
+                    Array::Float(_) => return None,
+                };
+
+                if values.len() != 6 {
+                    return None;
+                }
+
+                Some(Self {
+                    tid1: values[0],
+                    pos1: values[1],
+                    neg1: values[2] != 0,
+                    tid2: values[3],
+                    pos2: values[4],
+                    neg2: values[5] != 0,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts from a BAM record's PA tag.
+    #[must_use]
+    pub fn from_record(record: &RecordBuf) -> Option<Self> {
+        let value = record.data().get(&PA_TAG)?;
+        Self::from_tag_value(value)
+    }
+}
 
 // ============================================================================
 // Generic Sorting Abstraction (Trait-based, inspired by fgbio/samtools)
@@ -670,6 +806,27 @@ impl SortKey for TemplateCoordinateKey {
         }
 
         let flags = record.flags();
+
+        // For secondary/supplementary reads, check for pa tag to get template sort key
+        // This ensures they sort with their primary alignment
+        if flags.is_secondary() || flags.is_supplementary() {
+            if let Some(pa_info) = PrimaryAlignmentInfo::from_record(record) {
+                // Use primary alignment's template sort key
+                return Ok(Self {
+                    tid1: pa_info.tid1,
+                    tid2: pa_info.tid2,
+                    pos1: i64::from(pa_info.pos1),
+                    pos2: i64::from(pa_info.pos2),
+                    neg1: pa_info.neg1,
+                    neg2: pa_info.neg2,
+                    mid,
+                    name,
+                    is_upper: false,
+                });
+            }
+            // If no pa tag, fall through to use the read's own coordinates
+        }
+
         let is_reverse = flags.is_reverse_complemented();
 
         // Get reference ID
@@ -683,10 +840,24 @@ impl SortKey for TemplateCoordinateKey {
         #[allow(clippy::cast_possible_wrap)]
         let mate_tid = record.mate_reference_sequence_id().map_or(i32::MAX, |id| id as i32);
 
-        #[allow(clippy::cast_possible_wrap)]
-        let mate_pos = record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64);
-
         let mate_reverse = flags.is_mate_reverse_complemented();
+
+        // Calculate mate's unclipped 5' position from MC tag
+        // This ensures R1 and R2 compute the same template sort key
+        #[allow(clippy::cast_possible_wrap)]
+        let mate_pos: i64 = if mate_reverse {
+            // Reverse strand - 5' is at the end
+            mate_unclipped_end(record).map(|p| p as i64).unwrap_or_else(|| {
+                // Fallback to raw mate position if MC tag missing
+                record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64)
+            })
+        } else {
+            // Forward strand - 5' is at the start
+            mate_unclipped_start(record).map(|p| p as i64).unwrap_or_else(|| {
+                // Fallback to raw mate position if MC tag missing
+                record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64)
+            })
+        };
 
         // Determine which read is "earlier" (lower position)
         // For single-end reads or unmapped mates, use this read's position
@@ -713,7 +884,9 @@ impl SortKey for TemplateCoordinateKey {
 ///
 /// For forward strand: unclipped start = alignment start - leading soft clips
 /// For reverse strand: unclipped end = alignment start + alignment span + trailing soft clips
-fn get_unclipped_5prime_position(record: &RecordBuf) -> Result<i64> {
+///
+/// This is the position used by template-coordinate sorting to determine read order.
+pub fn get_unclipped_5prime_position(record: &RecordBuf) -> Result<i64> {
     if record.flags().is_unmapped() {
         return Ok(0);
     }
@@ -922,5 +1095,269 @@ mod tests {
         };
 
         assert!(k_rev < k_fwd);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_roundtrip() {
+        let info = PrimaryAlignmentInfo::new(5, 1000, false, 3, 2000, true);
+        let value = info.to_tag_value();
+        let parsed = PrimaryAlignmentInfo::from_tag_value(&value);
+
+        assert!(parsed.is_some());
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.tid1, 5);
+        assert_eq!(parsed.pos1, 1000);
+        assert!(!parsed.neg1);
+        assert_eq!(parsed.tid2, 3);
+        assert_eq!(parsed.pos2, 2000);
+        assert!(parsed.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_from_record() {
+        use crate::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::record::Flags;
+
+        // Create a supplementary record with pa tag
+        let info = PrimaryAlignmentInfo::new(0, 100, false, 0, 200, true);
+        let record = RecordBuilder::new()
+            .name("test")
+            .sequence("ACGT")
+            .flags(Flags::SUPPLEMENTARY)
+            .pa_tag(info)
+            .build();
+
+        let result = PrimaryAlignmentInfo::from_record(&record);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(result.tid1, 0);
+        assert_eq!(result.pos1, 100);
+        assert!(!result.neg1);
+        assert_eq!(result.tid2, 0);
+        assert_eq!(result.pos2, 200);
+        assert!(result.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_missing() {
+        use crate::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::record::Flags;
+
+        let record =
+            RecordBuilder::new().name("test").sequence("ACGT").flags(Flags::SUPPLEMENTARY).build();
+
+        let result = PrimaryAlignmentInfo::from_record(&record);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_template_coord_key_uses_pa_tag_for_supplementary() {
+        use crate::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::record::Flags;
+
+        // Create a supplementary record at chr5:5000 with pa tag pointing to chr0:100/200
+        let pa_info = PrimaryAlignmentInfo::new(0, 100, false, 0, 200, true);
+        let record = RecordBuilder::mapped_read()
+            .name("test")
+            .sequence("ACGT")
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .flags(Flags::SUPPLEMENTARY)
+            .pa_tag(pa_info)
+            .build();
+
+        let header = Header::default();
+        let key = TemplateCoordinateKey::from_record(&record, &header).unwrap();
+
+        // Key should use pa tag coordinates, not actual coordinates (chr5:5000)
+        assert_eq!(key.tid1, 0);
+        assert_eq!(key.tid2, 0);
+        assert_eq!(key.pos1, 100);
+        assert_eq!(key.pos2, 200);
+        assert!(!key.neg1);
+        assert!(key.neg2);
+    }
+
+    #[test]
+    fn test_template_coord_key_supplementary_without_pa_tag_uses_own_coords() {
+        use crate::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::record::Flags;
+
+        // Create a supplementary record without pa tag
+        let record = RecordBuilder::mapped_read()
+            .name("test")
+            .sequence("ACGT")
+            .reference_sequence_id(5)
+            .alignment_start(5000)
+            .flags(Flags::SUPPLEMENTARY)
+            .build();
+
+        let header = Header::default();
+        let key = TemplateCoordinateKey::from_record(&record, &header).unwrap();
+
+        // Key should use own coordinates since no pa tag
+        assert_eq!(key.tid1, 5);
+        // pos1 should be the unclipped position (5000 with 4M cigar = still 5000)
+        assert_eq!(key.pos1, 5000);
+    }
+
+    // ========================================================================
+    // from_tag_value tests (fast path coverage)
+    // ========================================================================
+
+    #[test]
+    fn test_from_tag_value_int32_fast_path() {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        // Create Int32 array (the expected format from zipper)
+        let values: Vec<i32> = vec![5, 1000, 0, 3, 2000, 1];
+        let value = Value::Array(Array::Int32(values));
+
+        let result = PrimaryAlignmentInfo::from_tag_value(&value);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.tid1, 5);
+        assert_eq!(info.pos1, 1000);
+        assert!(!info.neg1);
+        assert_eq!(info.tid2, 3);
+        assert_eq!(info.pos2, 2000);
+        assert!(info.neg2);
+    }
+
+    #[test]
+    fn test_from_tag_value_int32_wrong_length() {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        // Int32 array with wrong number of elements
+        let values: Vec<i32> = vec![5, 1000, 0]; // Only 3 elements
+        let value = Value::Array(Array::Int32(values));
+
+        let result = PrimaryAlignmentInfo::from_tag_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_tag_value_int16_fallback() {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        // Int16 array (rare, but should work via fallback path)
+        let values: Vec<i16> = vec![5, 1000, 0, 3, 2000, 1];
+        let value = Value::Array(Array::Int16(values));
+
+        let result = PrimaryAlignmentInfo::from_tag_value(&value);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.tid1, 5);
+        assert_eq!(info.pos1, 1000);
+    }
+
+    #[test]
+    fn test_from_tag_value_non_array_returns_none() {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+
+        // String value instead of array
+        let value = Value::String("not_an_array".into());
+
+        let result = PrimaryAlignmentInfo::from_tag_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_tag_value_float_array_returns_none() {
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+        // Float array is not supported
+        let values: Vec<f32> = vec![5.0, 1000.0, 0.0, 3.0, 2000.0, 1.0];
+        let value = Value::Array(Array::Float(values));
+
+        let result = PrimaryAlignmentInfo::from_tag_value(&value);
+        assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // PrimaryAlignmentInfo::new edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_primary_alignment_info_new_stores_values_unchanged() {
+        // Verify new() stores values exactly as provided (no normalization)
+        let info = PrimaryAlignmentInfo::new(5, 1000, true, 3, 500, false);
+
+        // Values should be stored exactly as provided
+        assert_eq!(info.tid1, 5);
+        assert_eq!(info.pos1, 1000);
+        assert!(info.neg1);
+        assert_eq!(info.tid2, 3);
+        assert_eq!(info.pos2, 500);
+        assert!(!info.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_new_with_negative_positions() {
+        // Edge case: negative positions (can happen with soft clips before position 0)
+        let info = PrimaryAlignmentInfo::new(0, -5, false, 0, -10, true);
+
+        assert_eq!(info.tid1, 0);
+        assert_eq!(info.pos1, -5);
+        assert!(!info.neg1);
+        assert_eq!(info.tid2, 0);
+        assert_eq!(info.pos2, -10);
+        assert!(info.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_new_with_max_values() {
+        // Edge case: maximum i32 values
+        let info = PrimaryAlignmentInfo::new(i32::MAX, i32::MAX, true, i32::MAX, i32::MAX, true);
+
+        assert_eq!(info.tid1, i32::MAX);
+        assert_eq!(info.pos1, i32::MAX);
+        assert!(info.neg1);
+        assert_eq!(info.tid2, i32::MAX);
+        assert_eq!(info.pos2, i32::MAX);
+        assert!(info.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_new_with_zero_values() {
+        // Edge case: all zeros (unmapped or start of reference)
+        let info = PrimaryAlignmentInfo::new(0, 0, false, 0, 0, false);
+
+        assert_eq!(info.tid1, 0);
+        assert_eq!(info.pos1, 0);
+        assert!(!info.neg1);
+        assert_eq!(info.tid2, 0);
+        assert_eq!(info.pos2, 0);
+        assert!(!info.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_roundtrip_with_negative_positions() {
+        // Verify negative positions survive roundtrip
+        let info = PrimaryAlignmentInfo::new(0, -10, false, 0, -5, true);
+        let value = info.to_tag_value();
+        let parsed = PrimaryAlignmentInfo::from_tag_value(&value).unwrap();
+
+        assert_eq!(parsed.tid1, 0);
+        assert_eq!(parsed.pos1, -10);
+        assert!(!parsed.neg1);
+        assert_eq!(parsed.tid2, 0);
+        assert_eq!(parsed.pos2, -5);
+        assert!(parsed.neg2);
+    }
+
+    #[test]
+    fn test_primary_alignment_info_position_order_is_caller_responsibility() {
+        // Verify that new() does NOT enforce pos1 < pos2 ordering
+        // (ordering is done by the caller in zipper.rs)
+        let info = PrimaryAlignmentInfo::new(0, 2000, false, 0, 1000, false);
+
+        // Values are stored as provided, even if "out of order"
+        assert_eq!(info.pos1, 2000); // pos1 > pos2 is allowed
+        assert_eq!(info.pos2, 1000);
     }
 }

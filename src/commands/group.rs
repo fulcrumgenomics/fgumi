@@ -22,7 +22,7 @@ use fgumi_lib::metrics::group::UmiGroupingMetrics;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
-use fgumi_lib::sam::is_template_coordinate_sorted;
+use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
 use fgumi_lib::unified_pipeline::DecodedRecord;
 use fgumi_lib::unified_pipeline::{
@@ -274,70 +274,9 @@ fn is_r1_genomically_earlier_impl(
     r1: &sam::alignment::RecordBuf,
     r2: &sam::alignment::RecordBuf,
 ) -> Result<bool> {
-    let r1_pos = get_unclipped_position_impl(r1)?;
-    let r2_pos = get_unclipped_position_impl(r2)?;
+    let r1_pos = unclipped_five_prime_position(r1).unwrap_or(0);
+    let r2_pos = unclipped_five_prime_position(r2).unwrap_or(0);
     Ok(r1_pos <= r2_pos)
-}
-
-/// Get the unclipped 5' position of a read (static implementation).
-fn get_unclipped_position_impl(record: &sam::alignment::RecordBuf) -> Result<i32> {
-    if record.flags().is_unmapped() {
-        return Ok(0);
-    }
-
-    let alignment_start = record
-        .alignment_start()
-        .ok_or_else(|| anyhow::anyhow!("Mapped read missing alignment start"))?;
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let alignment_start_i32 = usize::from(alignment_start) as i32;
-
-    if record.flags().is_reverse_complemented() {
-        // Negative strand: calculate unclipped end
-        let cigar = record.cigar();
-
-        let alignment_span: i32 = cigar
-            .as_ref()
-            .iter()
-            .filter(|op| {
-                matches!(
-                    op.kind(),
-                    noodles::sam::alignment::record::cigar::op::Kind::Match
-                        | noodles::sam::alignment::record::cigar::op::Kind::Deletion
-                        | noodles::sam::alignment::record::cigar::op::Kind::Skip
-                        | noodles::sam::alignment::record::cigar::op::Kind::SequenceMatch
-                        | noodles::sam::alignment::record::cigar::op::Kind::SequenceMismatch
-                )
-            })
-            .map(|op| i32::try_from(op.len()).unwrap())
-            .sum();
-
-        let trailing_soft_clips: i32 = cigar
-            .as_ref()
-            .iter()
-            .rev()
-            .take_while(|op| {
-                matches!(op.kind(), noodles::sam::alignment::record::cigar::op::Kind::SoftClip)
-            })
-            .map(|op| i32::try_from(op.len()).unwrap())
-            .sum();
-
-        Ok(alignment_start_i32 + alignment_span + trailing_soft_clips)
-    } else {
-        // Positive strand: calculate unclipped start
-        let cigar = record.cigar();
-
-        let leading_soft_clips: i32 = cigar
-            .as_ref()
-            .iter()
-            .take_while(|op| {
-                matches!(op.kind(), noodles::sam::alignment::record::cigar::op::Kind::SoftClip)
-            })
-            .map(|op| i32::try_from(op.len()).unwrap())
-            .sum();
-
-        Ok(alignment_start_i32 - leading_soft_clips)
-    }
 }
 
 /// Get pair orientation for a template (static implementation).

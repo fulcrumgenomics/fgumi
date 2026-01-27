@@ -120,14 +120,14 @@ pub struct FamilySizeMetrics {
     pub fraction: f64,
 
     /// Cumulative fraction (families with size >= this value)
-    pub cumulative_fraction: f64,
+    pub fraction_gt_or_eq_family_size: f64,
 }
 
 impl FamilySizeMetrics {
     /// Creates a new family size metric.
     #[must_use]
     pub fn new(family_size: usize) -> Self {
-        Self { family_size, count: 0, fraction: 0.0, cumulative_fraction: 0.0 }
+        Self { family_size, count: 0, fraction: 0.0, fraction_gt_or_eq_family_size: 0.0 }
     }
 }
 

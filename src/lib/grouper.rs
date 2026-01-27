@@ -323,13 +323,25 @@ pub struct PositionGrouperConfig {
     pub cell_tag: Tag,
     /// Library lookup from read group to library.
     pub library_lookup: LibraryLookup,
+    /// Whether to include secondary and supplementary reads in templates.
+    /// When true, secondary/supplementary reads are included in the template
+    /// that contains their corresponding primary read. Requires the input to be
+    /// template-coordinate sorted with `pa` tags on secondary/supplementary reads.
+    /// Default: false (secondary/supplementary reads are skipped).
+    pub include_secondary_supplementary: bool,
 }
 
 impl PositionGrouperConfig {
     /// Creates a new configuration.
     #[must_use]
     pub fn new(cell_tag: Tag, library_lookup: LibraryLookup) -> Self {
-        Self { cell_tag, library_lookup }
+        Self { cell_tag, library_lookup, include_secondary_supplementary: false }
+    }
+
+    /// Creates a new configuration that includes secondary/supplementary reads.
+    #[must_use]
+    pub fn with_secondary_supplementary(cell_tag: Tag, library_lookup: LibraryLookup) -> Self {
+        Self { cell_tag, library_lookup, include_secondary_supplementary: true }
     }
 }
 
@@ -342,8 +354,7 @@ impl PositionGrouperConfig {
 /// Groups records by query name into Templates, then groups Templates by
 /// position (using pre-computed `GroupKey`) into position groups.
 pub struct PositionGrouper {
-    /// Configuration for grouping (retained for API compatibility).
-    #[allow(dead_code)]
+    /// Configuration for grouping.
     config: PositionGrouperConfig,
     /// Current template name hash being accumulated.
     current_name_hash: Option<u64>,
@@ -379,43 +390,85 @@ impl PositionGrouper {
     ///
     /// For paired-end reads without MC tag, each record only has its own position.
     /// We combine them to get the full position info.
+    ///
+    /// Secondary and supplementary reads have default UNKNOWN position values in their keys
+    /// (because `compute_group_key` skips them). We filter these out before combining
+    /// to avoid corrupting the template's position key.
+    ///
+    /// This implementation avoids allocation by finding valid keys through iteration
+    /// rather than collecting into a Vec.
     fn combine_keys(keys: &[GroupKey]) -> GroupKey {
         if keys.is_empty() {
             return GroupKey::default();
         }
+
+        // Fast path: single key (very common case)
         if keys.len() == 1 {
-            return keys[0];
+            return if keys[0].ref_id1 == GroupKey::UNKNOWN_REF {
+                // Preserve library/cell metadata to avoid merging across libraries
+                let k = keys[0];
+                GroupKey {
+                    library_idx: k.library_idx,
+                    cell_hash: k.cell_hash,
+                    name_hash: k.name_hash,
+                    ..GroupKey::default()
+                }
+            } else {
+                keys[0]
+            };
         }
 
-        // For paired-end, combine positions from both records.
-        // Each record has its own position (ref_id1, pos1, strand1) and potentially
-        // mate info (ref_id2, pos2, strand2) from MC tag.
+        // Find first two valid keys without allocation.
+        // Valid keys have ref_id1 != UNKNOWN_REF (i.e., not secondary/supplementary).
+        let mut first: Option<&GroupKey> = None;
+        let mut second: Option<&GroupKey> = None;
 
-        // If any key has valid mate info (not UNKNOWN), use it directly
         for key in keys {
-            if key.ref_id2 != GroupKey::UNKNOWN_REF {
-                // This key has mate info, use it as-is
-                return *key;
+            if key.ref_id1 != GroupKey::UNKNOWN_REF {
+                if first.is_none() {
+                    // Check if this key has valid mate info - if so, use it directly
+                    if key.ref_id2 != GroupKey::UNKNOWN_REF {
+                        return *key;
+                    }
+                    first = Some(key);
+                } else if second.is_none() {
+                    second = Some(key);
+                    break; // We have two valid keys, no need to continue
+                }
             }
         }
 
-        // No key has mate info - combine own positions from multiple records
-        // Take the first key as base and add the second record's position as mate info
-        let first = &keys[0];
-        let second = &keys[1];
-
-        // Combine: first record's own position + second record's own position
-        GroupKey::paired(
-            first.ref_id1,
-            first.pos1,
-            first.strand1,
-            second.ref_id1,
-            second.pos1,
-            second.strand1,
-            first.library_idx,
-            first.cell_hash,
-            first.name_hash,
-        )
+        // Handle cases based on how many valid keys we found
+        match (first, second) {
+            (None, _) => {
+                // No valid keys - preserve library/cell/name metadata for template grouping
+                let k = keys[0];
+                GroupKey {
+                    library_idx: k.library_idx,
+                    cell_hash: k.cell_hash,
+                    name_hash: k.name_hash,
+                    ..GroupKey::default()
+                }
+            }
+            (Some(f), None) => {
+                // Single valid key
+                *f
+            }
+            (Some(f), Some(s)) => {
+                // Two valid keys without mate info - combine their positions
+                GroupKey::paired(
+                    f.ref_id1,
+                    f.pos1,
+                    f.strand1,
+                    s.ref_id1,
+                    s.pos1,
+                    s.strand1,
+                    f.library_idx,
+                    f.cell_hash,
+                    f.name_hash,
+                )
+            }
+        }
     }
 
     /// Build a Template from accumulated records.
@@ -440,9 +493,11 @@ impl PositionGrouper {
         let record = decoded.record;
         let key = decoded.key;
 
-        // Skip secondary and supplementary reads - they should not be grouped into templates
+        // Skip secondary and supplementary reads unless configured to include them
         let flags = record.flags();
-        if flags.is_secondary() || flags.is_supplementary() {
+        if !self.config.include_secondary_supplementary
+            && (flags.is_secondary() || flags.is_supplementary())
+        {
             return Ok(Vec::new());
         }
 
@@ -1059,5 +1114,105 @@ mod tests {
         let result = grouper.drain_complete_templates();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of sync"));
+    }
+
+    // ========================================================================
+    // combine_keys tests
+    // ========================================================================
+
+    #[test]
+    fn test_combine_keys_empty() {
+        let keys: Vec<GroupKey> = vec![];
+        let result = PositionGrouper::combine_keys(&keys);
+        assert_eq!(result.ref_id1, GroupKey::UNKNOWN_REF);
+    }
+
+    #[test]
+    fn test_combine_keys_single_valid() {
+        let key = GroupKey::single(5, 1000, 0, 0, 0, 12345);
+        let keys = vec![key];
+        let result = PositionGrouper::combine_keys(&keys);
+        assert_eq!(result.ref_id1, 5);
+        assert_eq!(result.pos1, 1000);
+        assert_eq!(result.name_hash, 12345);
+    }
+
+    #[test]
+    fn test_combine_keys_single_unknown() {
+        // Secondary/supplementary reads have UNKNOWN ref_id1
+        let key = GroupKey { name_hash: 99999, ..GroupKey::default() };
+        let keys = vec![key];
+        let result = PositionGrouper::combine_keys(&keys);
+        // Should return default with preserved name_hash
+        assert_eq!(result.ref_id1, GroupKey::UNKNOWN_REF);
+        assert_eq!(result.name_hash, 99999);
+    }
+
+    #[test]
+    fn test_combine_keys_two_valid_without_mate_info() {
+        // R1 and R2 each have their own position but no mate info
+        let r1_key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let r2_key = GroupKey::single(0, 300, 1, 0, 0, 12345);
+        let keys = vec![r1_key, r2_key];
+        let result = PositionGrouper::combine_keys(&keys);
+
+        // Should combine: r1's position as pos1, r2's position as pos2
+        assert_eq!(result.ref_id1, 0);
+        assert_eq!(result.pos1, 100);
+        assert_eq!(result.strand1, 0);
+        assert_eq!(result.ref_id2, 0);
+        assert_eq!(result.pos2, 300);
+        assert_eq!(result.strand2, 1);
+    }
+
+    #[test]
+    fn test_combine_keys_key_with_mate_info() {
+        // Key that already has mate info should be returned directly
+        let key = GroupKey::paired(0, 100, 0, 0, 300, 1, 0, 0, 12345);
+        let keys = vec![key];
+        let result = PositionGrouper::combine_keys(&keys);
+
+        assert_eq!(result.ref_id1, 0);
+        assert_eq!(result.pos1, 100);
+        assert_eq!(result.ref_id2, 0);
+        assert_eq!(result.pos2, 300);
+    }
+
+    #[test]
+    fn test_combine_keys_mixed_valid_and_unknown() {
+        // Mix of valid key (primary) and UNKNOWN key (secondary/supplementary)
+        let valid_key = GroupKey::single(5, 500, 0, 0, 0, 12345);
+        let unknown_key = GroupKey { name_hash: 12345, ..GroupKey::default() };
+        let keys = vec![unknown_key, valid_key];
+        let result = PositionGrouper::combine_keys(&keys);
+
+        // Should skip unknown and use valid key
+        assert_eq!(result.ref_id1, 5);
+        assert_eq!(result.pos1, 500);
+    }
+
+    #[test]
+    fn test_combine_keys_all_unknown() {
+        // All secondary/supplementary - no valid primary
+        let unknown_key1 = GroupKey { name_hash: 12345, ..GroupKey::default() };
+        let unknown_key2 = GroupKey { name_hash: 12345, ..GroupKey::default() };
+        let keys = vec![unknown_key1, unknown_key2];
+        let result = PositionGrouper::combine_keys(&keys);
+
+        // Should return default with preserved name_hash
+        assert_eq!(result.ref_id1, GroupKey::UNKNOWN_REF);
+        assert_eq!(result.name_hash, 12345);
+    }
+
+    #[test]
+    fn test_combine_keys_first_has_mate_info() {
+        // First valid key has mate info - should return it directly
+        let key_with_mate = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        let key_without_mate = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let keys = vec![key_with_mate, key_without_mate];
+        let result = PositionGrouper::combine_keys(&keys);
+
+        assert_eq!(result.ref_id2, 0);
+        assert_eq!(result.pos2, 200);
     }
 }

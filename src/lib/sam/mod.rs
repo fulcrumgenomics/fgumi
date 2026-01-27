@@ -45,7 +45,8 @@ pub use record_utils::{
     PairOrientation, alignment_end, cigar_reference_length, get_pair_orientation, is_fr_pair,
     is_fr_pair_from_tags, leading_clipping, leading_soft_clipping, mate_unclipped_end,
     mate_unclipped_start, num_bases_extending_past_mate, parse_cigar_string, read_pos_at_ref_pos,
-    reference_length, trailing_clipping, trailing_soft_clipping,
+    reference_length, trailing_clipping, trailing_soft_clipping, unclipped_end,
+    unclipped_five_prime_position, unclipped_start,
 };
 
 use bstr::ByteSlice;

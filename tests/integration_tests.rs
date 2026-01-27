@@ -176,15 +176,15 @@ fn test_family_size_metrics_distribution() {
 
     size_1.count = 100;
     size_1.fraction = 0.5;
-    size_1.cumulative_fraction = 1.0;
+    size_1.fraction_gt_or_eq_family_size = 1.0;
 
     size_2.count = 50;
     size_2.fraction = 0.25;
-    size_2.cumulative_fraction = 0.5;
+    size_2.fraction_gt_or_eq_family_size = 0.5;
 
     size_5.count = 50;
     size_5.fraction = 0.25;
-    size_5.cumulative_fraction = 0.25;
+    size_5.fraction_gt_or_eq_family_size = 0.25;
 
     assert_eq!(size_1.family_size, 1);
     assert_eq!(size_2.family_size, 2);

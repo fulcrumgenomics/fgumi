@@ -432,6 +432,67 @@ pub fn trailing_soft_clipping(ops: &[(Kind, usize)]) -> usize {
         .sum()
 }
 
+/// Collects CIGAR operations from a record into a Vec for use with clipping functions.
+#[must_use]
+fn cigar_to_ops(record: &RecordBuf) -> Vec<(Kind, usize)> {
+    record.cigar().as_ref().iter().map(|op| (op.kind(), op.len())).collect()
+}
+
+/// Gets the unclipped start position of a read (alignment start minus leading clips).
+///
+/// This matches HTSJDK's `SAMRecord.getUnclippedStart()` behavior, which includes
+/// both soft clips and hard clips.
+///
+/// Returns `None` for unmapped reads.
+#[must_use]
+pub fn unclipped_start(record: &RecordBuf) -> Option<usize> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    let start = usize::from(record.alignment_start()?);
+    let leading = leading_clipping(&cigar_to_ops(record));
+    Some(start.saturating_sub(leading))
+}
+
+/// Gets the unclipped end position of a read (alignment end plus trailing clips).
+///
+/// This matches HTSJDK's `SAMRecord.getUnclippedEnd()` behavior, which includes
+/// both soft clips and hard clips.
+///
+/// Returns `None` for unmapped reads.
+#[must_use]
+pub fn unclipped_end(record: &RecordBuf) -> Option<usize> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    let start = usize::from(record.alignment_start()?);
+    let ref_len = reference_length(&record.cigar());
+    let trailing = trailing_clipping(&cigar_to_ops(record));
+    // alignment_end = start + ref_len - 1
+    // unclipped_end = alignment_end + trailing_clips
+    Some(start + ref_len.saturating_sub(1) + trailing)
+}
+
+/// Gets the unclipped 5' position of a read.
+///
+/// For forward strand reads, returns the unclipped start position.
+/// For reverse strand reads, returns the unclipped end position (the 5' end).
+///
+/// This matches fgbio's `positionOf` behavior in `GroupReadsByUmi`.
+///
+/// Returns `None` for unmapped reads.
+#[must_use]
+pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<usize> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    if record.flags().is_reverse_complemented() {
+        unclipped_end(record)
+    } else {
+        unclipped_start(record)
+    }
+}
+
 /// Counts reference-consuming operations from a CIGAR.
 #[allow(clippy::redundant_closure_for_method_calls)]
 #[must_use]
@@ -1252,5 +1313,133 @@ mod tests {
         assert_eq!(read_pos_at_ref_pos(&read, 100, false), 1);
         assert_eq!(read_pos_at_ref_pos(&read, 105, false), 6); // in mismatch block
         assert_eq!(read_pos_at_ref_pos(&read, 108, false), 9); // in second match block
+    }
+
+    // =========================================================================
+    // Tests for unclipped_start, unclipped_end, unclipped_five_prime_position
+    // These match HTSJDK/fgbio behavior including both soft AND hard clips
+    // =========================================================================
+
+    #[test]
+    fn test_unclipped_start_no_clips() {
+        // Simple 50M at position 100 → unclipped_start = 100
+        let read = create_cigar_test_read("simple", 100, "50M");
+        assert_eq!(unclipped_start(&read), Some(100));
+    }
+
+    #[test]
+    fn test_unclipped_start_with_leading_soft_clip() {
+        // 5S45M at position 100 → unclipped_start = 100 - 5 = 95
+        let read = create_cigar_test_read("soft", 100, "5S45M");
+        assert_eq!(unclipped_start(&read), Some(95));
+    }
+
+    #[test]
+    fn test_unclipped_start_with_leading_hard_clip() {
+        // 10H50M at position 100 → unclipped_start = 100 - 10 = 90
+        let read = create_cigar_test_read("hard", 100, "10H50M");
+        assert_eq!(unclipped_start(&read), Some(90));
+    }
+
+    #[test]
+    fn test_unclipped_start_with_soft_and_hard_clips() {
+        // Matches fgbio test: 5S45M10H at position 10 → unclipped_start = 10 - 5 = 5
+        // (trailing hard clip doesn't affect unclipped_start)
+        let read = create_cigar_test_read("both", 10, "5S45M10H");
+        assert_eq!(unclipped_start(&read), Some(5));
+    }
+
+    #[test]
+    fn test_unclipped_start_with_leading_hard_and_soft() {
+        // 3H5S42M at position 100 → unclipped_start = 100 - 5 - 3 = 92
+        let read = create_cigar_test_read("hard_soft", 100, "3H5S42M");
+        assert_eq!(unclipped_start(&read), Some(92));
+    }
+
+    #[test]
+    fn test_unclipped_end_no_clips() {
+        // Simple 50M at position 100 → alignment_end = 149, unclipped_end = 149
+        let read = create_cigar_test_read("simple", 100, "50M");
+        assert_eq!(unclipped_end(&read), Some(149));
+    }
+
+    #[test]
+    fn test_unclipped_end_with_trailing_soft_clip() {
+        // 45M5S at position 100 → alignment_end = 144, unclipped_end = 144 + 5 = 149
+        let read = create_cigar_test_read("soft", 100, "45M5S");
+        assert_eq!(unclipped_end(&read), Some(149));
+    }
+
+    #[test]
+    fn test_unclipped_end_with_trailing_hard_clip() {
+        // 50M10H at position 100 → alignment_end = 149, unclipped_end = 149 + 10 = 159
+        let read = create_cigar_test_read("hard", 100, "50M10H");
+        assert_eq!(unclipped_end(&read), Some(159));
+    }
+
+    #[test]
+    fn test_unclipped_end_with_soft_and_hard_clips() {
+        // Matches fgbio test: 5S45M10H at position 10
+        // alignment_end = 10 + 45 - 1 = 54
+        // unclipped_end = 54 + 10 = 64
+        let read = create_cigar_test_read("both", 10, "5S45M10H");
+        assert_eq!(unclipped_end(&read), Some(64));
+    }
+
+    #[test]
+    fn test_unclipped_end_with_trailing_soft_and_hard() {
+        // 42M5S3H at position 100 → alignment_end = 141, unclipped_end = 141 + 5 + 3 = 149
+        let read = create_cigar_test_read("soft_hard", 100, "42M5S3H");
+        assert_eq!(unclipped_end(&read), Some(149));
+    }
+
+    #[test]
+    fn test_unclipped_five_prime_forward_strand() {
+        // Forward strand: 5' is at unclipped_start
+        // 5S45M10H at position 10 → unclipped_start = 5
+        let read = create_cigar_test_read("fwd", 10, "5S45M10H");
+        assert_eq!(unclipped_five_prime_position(&read), Some(5));
+    }
+
+    #[test]
+    fn test_unclipped_five_prime_reverse_strand() {
+        // Reverse strand: 5' is at unclipped_end
+        // 5S45M10H at position 10 → unclipped_end = 64
+        let read = RecordBuilder::new()
+            .name("rev")
+            .sequence(&"A".repeat(60))
+            .reference_sequence_id(0)
+            .alignment_start(10)
+            .cigar("5S45M10H")
+            .flags(Flags::REVERSE_COMPLEMENTED)
+            .build();
+        assert_eq!(unclipped_five_prime_position(&read), Some(64));
+    }
+
+    #[test]
+    fn test_unclipped_positions_unmapped_returns_none() {
+        let read =
+            RecordBuilder::new().name("unmapped").sequence("ACGT").flags(Flags::UNMAPPED).build();
+        assert_eq!(unclipped_start(&read), None);
+        assert_eq!(unclipped_end(&read), None);
+        assert_eq!(unclipped_five_prime_position(&read), None);
+    }
+
+    #[test]
+    fn test_unclipped_end_with_deletion() {
+        // 25M5D25M at position 100
+        // ref_len = 25 + 5 + 25 = 55
+        // alignment_end = 100 + 55 - 1 = 154
+        let read = create_cigar_test_read("del", 100, "25M5D25M");
+        assert_eq!(unclipped_end(&read), Some(154));
+    }
+
+    #[test]
+    fn test_unclipped_end_with_insertion() {
+        // 25M5I25M at position 100
+        // ref_len = 25 + 25 = 50 (insertion doesn't consume reference)
+        // alignment_end = 100 + 50 - 1 = 149
+        let read = create_cigar_test_read("ins", 100, "25M5I25M");
+        assert_eq!(unclipped_end(&read), Some(149));
     }
 }

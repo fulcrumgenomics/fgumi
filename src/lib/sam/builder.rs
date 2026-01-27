@@ -1241,6 +1241,26 @@ impl RecordBuilder {
         self
     }
 
+    /// Adds the `pa` (primary alignment) tag with template sort key info.
+    ///
+    /// This tag stores the template-coordinate sort key from the primary alignments,
+    /// enabling secondary/supplementary reads to sort adjacent to their primaries.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fgumi_lib::sam::builder::RecordBuilder;
+    /// use fgumi_lib::sort::PrimaryAlignmentInfo;
+    /// let record = RecordBuilder::new()
+    ///     .pa_tag(PrimaryAlignmentInfo::new(0, 100, false, 0, 200, true))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn pa_tag(mut self, info: crate::sort::PrimaryAlignmentInfo) -> Self {
+        self.tags.push((crate::sort::PA_TAG, info.to_tag_value()));
+        self
+    }
+
     /// Builds the `RecordBuf`.
     ///
     /// # Panics
