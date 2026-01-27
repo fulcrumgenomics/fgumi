@@ -3246,6 +3246,20 @@ pub trait HasHeldCompressed {
     fn held_compressed_mut(&mut self) -> &mut Option<(u64, CompressedBlockBatch, usize)>;
 }
 
+/// Trait for workers that hold boundary batches when output queue is full.
+///
+/// IMPORTANT: This pattern must be kept in sync between BAM and FASTQ pipelines.
+/// See: bam.rs `try_step_find_boundaries()` and fastq.rs `fastq_try_step_find_boundaries()`
+///
+/// The pattern:
+/// 1. Check/advance held item first (priority 1)
+/// 2. Brief blocking lock for reorder buffer insert/pop
+/// 3. Do boundary work OUTSIDE the reorder lock
+/// 4. Hold result if output queue full
+pub trait HasHeldBoundaries<B> {
+    fn held_boundaries_mut(&mut self) -> &mut Option<(u64, B)>;
+}
+
 // ============================================================================
 // Shared Step Functions (used by both BAM and FASTQ pipelines)
 // ============================================================================

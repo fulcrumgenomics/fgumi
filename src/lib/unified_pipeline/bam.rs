@@ -23,11 +23,11 @@ use crate::reorder_buffer::ReorderBuffer;
 
 use super::base::{
     BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch, GroupKeyConfig,
-    HasCompressor, HasHeldCompressed, HasHeldProcessed, HasHeldSerialized, MemoryEstimate,
-    MonitorableState, OutputPipelineQueues, OutputPipelineState, PROGRESS_LOG_INTERVAL,
-    PipelineConfig, PipelineLifecycle, PipelineStats, PipelineStep, ProcessPipelineState,
-    QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState, SerializedBatch,
-    WorkerCoreState, WritePipelineState, finalize_pipeline, handle_worker_panic,
+    HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed, HasHeldSerialized,
+    MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
+    PROGRESS_LOG_INTERVAL, PipelineConfig, PipelineLifecycle, PipelineStats, PipelineStep,
+    ProcessPipelineState, QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState,
+    SerializedBatch, WorkerCoreState, WritePipelineState, finalize_pipeline, handle_worker_panic,
     join_monitor_thread, join_worker_threads, shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
@@ -1253,6 +1253,12 @@ impl<P: Send> HasHeldCompressed for WorkerState<P> {
     }
 }
 
+impl<P: Send> HasHeldBoundaries<BoundaryBatch> for WorkerState<P> {
+    fn held_boundaries_mut(&mut self) -> &mut Option<(u64, BoundaryBatch)> {
+        &mut self.held_boundaries
+    }
+}
+
 impl<P: Send> HasHeldProcessed<P> for WorkerState<P> {
     fn held_processed_mut(&mut self) -> &mut Option<(u64, Vec<P>, usize)> {
         &mut self.held_processed
@@ -1505,6 +1511,10 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
 
 /// Try to execute Step 3: Find record boundaries in decompressed data.
 ///
+/// SYNC WITH: fastq.rs `fastq_try_step_find_boundaries()`
+/// Both implementations use the "held boundaries" pattern for parallelism.
+/// See base.rs `HasHeldBoundaries` trait for pattern documentation.
+///
 /// This step is exclusive but FAST (~0.1μs per block) - only scans 4-byte integers.
 /// Processes multiple batches per lock acquisition to reduce contention.
 /// Result of attempting an exclusive step.
@@ -1521,12 +1531,14 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     // =========================================================================
     // Priority 1: Try to advance any held boundary batch first
     // =========================================================================
+    let mut did_work = false;
     if let Some((serial, held)) = worker.held_boundaries.take() {
         match state.q2b_boundaries.push((serial, held)) {
             Ok(()) => {
                 // Successfully advanced held item, increment completion counter
                 state.batches_boundary_found.fetch_add(1, Ordering::Release);
                 state.deadlock_state.record_q2b_push();
+                did_work = true;
             }
             Err((serial, held)) => {
                 // Still can't push - put it back and signal backpressure
@@ -1556,7 +1568,6 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     // Process multiple batches per lock acquisition to reduce contention
     // Max batches per acquisition (tune for balance between throughput and latency)
     const MAX_BATCHES_PER_LOCK: usize = 8;
-    let mut did_work = false;
 
     for _ in 0..MAX_BATCHES_PER_LOCK {
         // Check if output queue still has space

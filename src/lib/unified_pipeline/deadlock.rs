@@ -75,10 +75,14 @@ pub struct DeadlockState {
     pub q2_last_push: AtomicU64,
     /// Q2 -> `FindBoundaries` pop timestamp
     pub q2_last_pop: AtomicU64,
-    /// `FindBoundaries` -> Q2b push timestamp
+    /// `FindBoundaries` -> Q2b push timestamp (BAM pipeline)
     pub q2b_last_push: AtomicU64,
-    /// Q2b -> Decode pop timestamp
+    /// Q2b -> Decode pop timestamp (BAM pipeline)
     pub q2b_last_pop: AtomicU64,
+    /// `FindBoundaries` -> Q2.5 push timestamp (FASTQ pipeline)
+    pub q2_5_last_push: AtomicU64,
+    /// Q2.5 -> Parse pop timestamp (FASTQ pipeline)
+    pub q2_5_last_pop: AtomicU64,
     /// Decode -> Q3 push timestamp
     pub q3_last_push: AtomicU64,
     /// Q3 -> Group pop timestamp
@@ -135,6 +139,8 @@ impl DeadlockState {
             q2_last_pop: AtomicU64::new(now),
             q2b_last_push: AtomicU64::new(now),
             q2b_last_pop: AtomicU64::new(now),
+            q2_5_last_push: AtomicU64::new(now),
+            q2_5_last_pop: AtomicU64::new(now),
             q3_last_push: AtomicU64::new(now),
             q3_last_pop: AtomicU64::new(now),
             q4_last_push: AtomicU64::new(now),
@@ -232,6 +238,26 @@ impl DeadlockState {
         if self.is_enabled() {
             let now = now_secs();
             self.q2b_last_pop.store(now, Ordering::Relaxed);
+            self.last_progress_time.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// Record Q2.5 push progress (FASTQ boundaries queue).
+    #[inline]
+    pub fn record_q2_5_push(&self) {
+        if self.is_enabled() {
+            let now = now_secs();
+            self.q2_5_last_push.store(now, Ordering::Relaxed);
+            self.last_progress_time.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// Record Q2.5 pop progress (FASTQ boundaries queue).
+    #[inline]
+    pub fn record_q2_5_pop(&self) {
+        if self.is_enabled() {
+            let now = now_secs();
+            self.q2_5_last_pop.store(now, Ordering::Relaxed);
             self.last_progress_time.store(now, Ordering::Relaxed);
         }
     }
@@ -539,6 +565,11 @@ fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
         "  Q2b: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q2b_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q2b_last_pop.load(Ordering::Relaxed))
+    );
+    log::warn!(
+        "  Q2.5: push={}s ago, pop={}s ago",
+        now.saturating_sub(deadlock_state.q2_5_last_push.load(Ordering::Relaxed)),
+        now.saturating_sub(deadlock_state.q2_5_last_pop.load(Ordering::Relaxed))
     );
     log::warn!(
         "  Q3: push={}s ago, pop={}s ago",
