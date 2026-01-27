@@ -1793,6 +1793,10 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
     fn record_q7_push_progress(&self) {
         self.deadlock_state.record_q7_push();
     }
+
+    fn stats(&self) -> Option<&PipelineStats> {
+        self.output.stats.as_ref()
+    }
 }
 
 // ============================================================================
@@ -2057,6 +2061,9 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
     // Priority 4: Pop from input queue
     // =========================================================================
     let Some((serial, batch)) = state.q1_raw.pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(1);
+        }
         return false;
     };
     state.deadlock_state.record_q1_pop();
@@ -2292,6 +2299,9 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 
     // Pop from Q2.5 boundaries queue
     let Some((serial, boundary_batch)) = state.q2_5_boundaries.pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(25); // Q2b/Q2.5 (boundaries queue)
+        }
         // Check if parsing is complete
         let boundaries_done = state.boundaries_done.load(Ordering::Acquire);
         let all_parsed = state.batches_boundaries_found.load(Ordering::Acquire)
@@ -2881,6 +2891,9 @@ where
         }
 
         let Some((serial, batch)) = state.output.groups.pop() else {
+            if let Some(stats) = state.stats() {
+                stats.record_queue_empty(4);
+            }
             break;
         };
         state.deadlock_state.record_q4_pop();
@@ -2977,6 +2990,9 @@ where
     // Priority 4: Pop batch from input queue
     // =========================================================================
     let Some((serial, batch)) = state.output.processed.pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(5);
+        }
         return false;
     };
     state.deadlock_state.record_q5_pop();
@@ -3082,6 +3098,7 @@ fn fastq_try_step_write<R: BufRead + Send, P: Send + MemoryEstimate>(
 
     // Drain Q6 into reorder buffer AND write all ready batches in single lock scope
     let mut wrote_any = false;
+    let q7_truly_empty;
     {
         let mut reorder = state.output.write_reorder.lock();
 
@@ -3111,6 +3128,17 @@ fn fastq_try_step_write<R: BufRead + Send, P: Send + MemoryEstimate>(
             state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
             state.output.progress.log_if_needed(records_in_batch);
             wrote_any = true;
+        }
+
+        // Check if truly empty (queue drained and reorder buffer has no pending items)
+        q7_truly_empty = reorder.is_empty();
+    }
+
+    // Record queue empty only if both Q7 queue AND reorder buffer are empty
+    // (not when items are waiting out-of-order in the reorder buffer)
+    if !wrote_any && q7_truly_empty {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(7);
         }
     }
 
@@ -3196,6 +3224,7 @@ fn fastq_worker_loop_reader<
     SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64>,
 {
     let cap = state.config.queue_capacity;
+    let collect_stats = state.stats().is_some();
 
     loop {
         if state.has_error() {
@@ -3223,7 +3252,25 @@ fn fastq_worker_loop_reader<
             if let Some(stats) = state.stats() {
                 stats.record_step_attempt(worker.core.scheduler.thread_id(), PipelineStep::Read);
             }
-            if fastq_try_step_read(state, worker) {
+
+            let success = if collect_stats {
+                let start = std::time::Instant::now();
+                let success = fastq_try_step_read(state, worker);
+                if success {
+                    if let Some(stats) = state.stats() {
+                        stats.record_step_for_thread(
+                            PipelineStep::Read,
+                            start.elapsed().as_nanos() as u64,
+                            Some(worker.core.scheduler.thread_id()),
+                        );
+                    }
+                }
+                success
+            } else {
+                fastq_try_step_read(state, worker)
+            };
+
+            if success {
                 did_work = true;
             } else {
                 break;
@@ -3267,13 +3314,30 @@ fn fastq_worker_loop_reader<
                 stats.record_step_attempt(worker.core.scheduler.thread_id(), step);
             }
 
-            let (success, was_contention) =
-                fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
+            // Execute with optional timing
+            let (success, elapsed_ns, was_contention) = if collect_stats {
+                let start = std::time::Instant::now();
+                let (success, was_contention) =
+                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                (success, elapsed, was_contention)
+            } else {
+                let (success, was_contention) =
+                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
+                (success, 0, was_contention)
+            };
 
             // Record outcome for adaptive schedulers
             worker.core.scheduler.record_outcome(step, success, was_contention);
 
             if success {
+                if let Some(stats) = state.stats() {
+                    stats.record_step_for_thread(
+                        step,
+                        elapsed_ns,
+                        Some(worker.core.scheduler.thread_id()),
+                    );
+                }
                 did_work = true;
                 break; // Restart priority evaluation
             }
@@ -3283,7 +3347,16 @@ fn fastq_worker_loop_reader<
         if did_work {
             worker.core.reset_backoff();
         } else {
-            worker.core.sleep_backoff();
+            if let Some(stats) = state.stats() {
+                let idle_start = std::time::Instant::now();
+                worker.core.sleep_backoff();
+                stats.record_idle_for_thread(
+                    worker.core.scheduler.thread_id(),
+                    idle_start.elapsed().as_nanos() as u64,
+                );
+            } else {
+                worker.core.sleep_backoff();
+            }
             // Exponential backoff up to max
             worker.core.increase_backoff();
         }
@@ -3307,6 +3380,7 @@ fn fastq_worker_loop_worker<
     SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64>,
 {
     let cap = state.config.queue_capacity;
+    let collect_stats = state.stats().is_some();
 
     loop {
         // CRITICAL: Don't exit while holding items - they would be lost!
@@ -3353,13 +3427,30 @@ fn fastq_worker_loop_worker<
                 stats.record_step_attempt(worker.core.scheduler.thread_id(), step);
             }
 
-            let (success, was_contention) =
-                fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
+            // Execute with optional timing
+            let (success, elapsed_ns, was_contention) = if collect_stats {
+                let start = std::time::Instant::now();
+                let (success, was_contention) =
+                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
+                let elapsed = start.elapsed().as_nanos() as u64;
+                (success, elapsed, was_contention)
+            } else {
+                let (success, was_contention) =
+                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
+                (success, 0, was_contention)
+            };
 
             // Record outcome for adaptive schedulers
             worker.core.scheduler.record_outcome(step, success, was_contention);
 
             if success {
+                if let Some(stats) = state.stats() {
+                    stats.record_step_for_thread(
+                        step,
+                        elapsed_ns,
+                        Some(worker.core.scheduler.thread_id()),
+                    );
+                }
                 did_work = true;
                 break; // Restart priority evaluation
             }
@@ -3369,7 +3460,16 @@ fn fastq_worker_loop_worker<
         if did_work {
             worker.core.reset_backoff();
         } else {
-            worker.core.sleep_backoff();
+            if let Some(stats) = state.stats() {
+                let idle_start = std::time::Instant::now();
+                worker.core.sleep_backoff();
+                stats.record_idle_for_thread(
+                    worker.core.scheduler.thread_id(),
+                    idle_start.elapsed().as_nanos() as u64,
+                );
+            } else {
+                worker.core.sleep_backoff();
+            }
             // Exponential backoff up to max
             worker.core.increase_backoff();
         }
@@ -3780,6 +3880,9 @@ where
         fn increment_written(&self) -> u64 {
             self.templates_written.fetch_add(1, Ordering::Release)
         }
+        fn stats(&self) -> Option<&PipelineStats> {
+            self.stats.as_ref()
+        }
     }
 
     impl<P: Send> WritePipelineState for BgzfPipelineState<P> {
@@ -3912,7 +4015,7 @@ where
                                 }
                             }
                         }
-                    } else if let Some(stats) = state.stats() {
+                    } else if let Some(ref stats) = state.stats {
                         stats.record_contention(PipelineStep::Read);
                     }
                 }
@@ -4080,7 +4183,7 @@ where
                             state.group_done.store(true, Ordering::SeqCst);
                         }
                     }
-                } else if let Some(stats) = state.stats() {
+                } else if let Some(ref stats) = state.stats {
                     stats.record_contention(PipelineStep::Group);
                 }
             }
@@ -4175,7 +4278,7 @@ where
     }
 
     // Log pipeline statistics if enabled
-    if let Some(stats) = state.stats() {
+    if let Some(ref stats) = state.stats {
         stats.log_summary();
     }
 
