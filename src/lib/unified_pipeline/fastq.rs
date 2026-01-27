@@ -292,15 +292,26 @@ impl MemoryEstimate for FastqParsedBatch {
 
 /// State for finding FASTQ record boundaries across chunks.
 ///
+/// Per-stream state for finding FASTQ record boundaries.
+#[derive(Debug, Clone, Default)]
+pub struct StreamBoundaryState {
+    /// Leftover bytes (incomplete record from previous chunk).
+    pub leftover: Vec<u8>,
+    /// Reusable work buffer to reduce allocations.
+    pub work_buffer: Vec<u8>,
+}
+
 /// Since chunks may split in the middle of a record, we need to:
 /// 1. Save leftover bytes from incomplete records
 /// 2. Prepend them to the next chunk's data
-#[derive(Debug, Clone, Default)]
+///
+/// This struct uses per-stream locks to allow parallel processing of
+/// different streams. For synchronized FASTQs, this eliminates lock
+/// contention since each stream can be processed independently.
+#[derive(Debug, Default)]
 pub struct FastqBoundaryState {
-    /// Leftover bytes per stream (incomplete record from previous chunk).
-    pub leftovers: Vec<Vec<u8>>,
-    /// Reusable work buffers per stream to reduce allocations.
-    work_buffers: Vec<Vec<u8>>,
+    /// Per-stream state, each with its own lock for parallel access.
+    pub stream_states: Vec<parking_lot::Mutex<StreamBoundaryState>>,
 }
 
 impl FastqBoundaryState {
@@ -308,18 +319,9 @@ impl FastqBoundaryState {
     #[must_use]
     pub fn new(num_streams: usize) -> Self {
         Self {
-            leftovers: vec![Vec::new(); num_streams],
-            work_buffers: vec![Vec::new(); num_streams],
-        }
-    }
-
-    /// Ensure we have state for at least `num_streams` streams.
-    pub fn ensure_streams(&mut self, num_streams: usize) {
-        while self.leftovers.len() < num_streams {
-            self.leftovers.push(Vec::new());
-        }
-        while self.work_buffers.len() < num_streams {
-            self.work_buffers.push(Vec::new());
+            stream_states: (0..num_streams)
+                .map(|_| parking_lot::Mutex::new(StreamBoundaryState::default()))
+                .collect(),
         }
     }
 }
@@ -332,40 +334,50 @@ pub struct FastqFormat;
 impl FastqFormat {
     /// Find record boundaries in decompressed data.
     ///
-    /// This step is sequential because it needs to maintain state for
-    /// records that span chunk boundaries. It should be fast (just
-    /// scanning for delimiters) so it doesn't become a bottleneck.
+    /// Each stream is processed independently with its own lock, allowing
+    /// parallel processing of different streams. Within a stream, chunks
+    /// must be processed in order (due to leftover handling).
     ///
     /// Uses reusable work buffers per stream to minimize allocations.
     pub fn find_boundaries(
-        state: &mut FastqBoundaryState,
+        state: &FastqBoundaryState,
         batch: FastqDecompressedBatch,
     ) -> io::Result<FastqBoundaryBatch> {
         let max_stream = batch.chunks.iter().map(|c| c.stream_idx).max().unwrap_or(0);
-        state.ensure_streams(max_stream + 1);
+        // Streams must be pre-allocated since we take &self (not &mut self)
+        assert!(
+            state.stream_states.len() > max_stream,
+            "FastqBoundaryState not initialized for stream {}",
+            max_stream
+        );
 
         let mut streams = Vec::with_capacity(batch.chunks.len());
 
         for chunk in batch.chunks {
             let stream_idx = chunk.stream_idx;
 
+            // Lock only this stream's state - other streams can be processed in parallel
+            let mut stream_state = state.stream_states[stream_idx].lock();
+
             // Use reusable work buffer to combine leftover with new data
-            let work_buffer = &mut state.work_buffers[stream_idx];
-            work_buffer.clear();
-            if !state.leftovers[stream_idx].is_empty() {
-                work_buffer.append(&mut state.leftovers[stream_idx]);
+            stream_state.work_buffer.clear();
+            // Move leftover to work buffer (avoids double borrow)
+            let leftover = std::mem::take(&mut stream_state.leftover);
+            if !leftover.is_empty() {
+                stream_state.work_buffer.extend_from_slice(&leftover);
             }
-            work_buffer.extend_from_slice(&chunk.data);
+            stream_state.work_buffer.extend_from_slice(&chunk.data);
             // chunk.data is consumed here, freeing its allocation
 
             // Find complete FASTQ records
-            let (data, offsets, leftover_start) = find_fastq_boundaries_inplace(work_buffer)?;
+            let (data, offsets, leftover_start) =
+                find_fastq_boundaries_inplace(&stream_state.work_buffer)?;
 
-            // Save leftover for next chunk (reuse allocation)
-            state.leftovers[stream_idx].clear();
-            state.leftovers[stream_idx].extend_from_slice(&work_buffer[leftover_start..]);
+            // Save leftover for next chunk
+            stream_state.leftover = stream_state.work_buffer[leftover_start..].to_vec();
 
             streams.push(FastqStreamBoundaries { stream_idx, data, offsets });
+            // stream_state lock is dropped here, allowing other threads to access this stream
         }
 
         Ok(FastqBoundaryBatch { streams, serial: batch.serial })
@@ -1325,7 +1337,8 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
 
     // ========== Queue 2.5: FindBoundaries → Parse (parallel parse only) ==========
     /// State for finding FASTQ record boundaries (only used when `use_parallel_parse=true`).
-    pub boundary_state: Mutex<FastqBoundaryState>,
+    /// Uses per-stream internal locks for parallel access - no outer lock needed.
+    pub boundary_state: FastqBoundaryState,
     /// Flag indicating boundary finding is complete.
     pub boundaries_done: AtomicBool,
     /// Count of batches that have had boundaries found.
@@ -1406,7 +1419,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             // Q2 reorder buffer atomic state (for lock-free admission control)
             q2_reorder_state: ReorderBufferState::new(memory_limit),
             // Parallel Parse step state (Q2.5: FindBoundaries → Parse)
-            boundary_state: Mutex::new(FastqBoundaryState::new(num_streams)),
+            boundary_state: FastqBoundaryState::new(num_streams),
             boundaries_done: AtomicBool::new(false),
             batches_boundaries_found: AtomicU64::new(0),
             q2_5_boundaries: ArrayQueue::new(cap),
@@ -2079,11 +2092,10 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
 // Parallel Parse Step Functions (for use_parallel_parse=true)
 // ============================================================================
 
-/// Try to find FASTQ record boundaries (Step 2.5 - exclusive).
+/// Try to find FASTQ record boundaries (Step 2.5).
 ///
 /// This step scans decompressed data for record boundaries (@ characters at
-/// line starts). It's sequential because it needs to maintain state for
-/// records spanning chunk boundaries, but it's fast (just scanning).
+/// line starts). Uses per-stream internal locks for parallel access.
 ///
 /// Only used when `config.use_parallel_parse` is true.
 fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
@@ -2096,21 +2108,12 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
         return false;
     }
 
-    // CRITICAL: Check output queue capacity BEFORE popping input to prevent data loss
-    if state.q2_5_boundaries.is_full() {
-        return false; // Output queue full, wait for Parse step to drain it
-    }
-
-    // Try to acquire boundary state
-    let Some(mut boundary_guard) = state.boundary_state.try_lock() else {
+    // Acquire the Q2 reorder buffer (this serializes batch processing for ordering)
+    let Some(mut reorder) = state.q2_reorder.try_lock() else {
+        // Record contention on the reorder buffer lock
         if let Some(stats) = state.stats() {
             stats.record_contention(PipelineStep::FindBoundaries);
         }
-        return false;
-    };
-
-    // Also acquire the Q2 reorder buffer
-    let Some(mut reorder) = state.q2_reorder.try_lock() else {
         return false;
     };
 
@@ -2121,9 +2124,13 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
         state.deadlock_state.record_q2_pop();
     }
 
-    // Process ALL available batches in order from reorder buffer (matching old Group pattern)
+    // Process batches in order from reorder buffer (matching old Group pattern)
+    // Check output queue capacity BEFORE each pop to prevent data loss
     let mut processed_any = false;
-    while let Some(batch) = reorder.try_pop_next() {
+    while !state.q2_5_boundaries.is_full() {
+        let Some(batch) = reorder.try_pop_next() else {
+            break;
+        };
         let serial = batch.serial;
         let heap_size = batch.estimate_heap_size();
 
@@ -2141,34 +2148,25 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
             serial,
         };
 
-        // Find boundaries
-        match FastqFormat::find_boundaries(&mut boundary_guard, decompressed) {
+        // Find boundaries (uses per-stream internal locks)
+        match FastqFormat::find_boundaries(&state.boundary_state, decompressed) {
             Ok(boundary_batch) => {
-                // Push to Q2.5 boundaries queue - spin-wait if needed since we already
-                // consumed the input and MUST NOT lose data
+                // Push to Q2.5 boundaries queue
                 let boundary_heap_size = boundary_batch.estimate_heap_size();
-                let mut batch_to_push = boundary_batch;
-                loop {
-                    match state.q2_5_boundaries.push((serial, batch_to_push)) {
-                        Ok(()) => {
-                            state
-                                .q2_5_boundaries_heap_bytes
-                                .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
-                            state.batches_boundaries_found.fetch_add(1, Ordering::Release);
-                            state.deadlock_state.record_q2_pop();
-                            processed_any = true;
-                            break; // Successfully pushed, continue to next batch
-                        }
-                        Err(returned) => {
-                            // Queue full - spin-wait (this should be rare due to pre-check)
-                            batch_to_push = returned.1;
-                            if state.has_error() {
-                                // Don't spin forever if there's an error
-                                return false;
-                            }
-                            std::hint::spin_loop();
-                        }
-                    }
+                if let Ok(()) = state.q2_5_boundaries.push((serial, boundary_batch)) {
+                    state
+                        .q2_5_boundaries_heap_bytes
+                        .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
+                    state.batches_boundaries_found.fetch_add(1, Ordering::Release);
+                    state.deadlock_state.record_q2_pop();
+                    processed_any = true;
+                } else {
+                    // Queue full after capacity check - should be unreachable
+                    // Fail with error to avoid silent data loss
+                    state.set_error(io::Error::other(
+                        "Q2.5 boundaries queue unexpectedly full after capacity check",
+                    ));
+                    return processed_any;
                 }
             }
             Err(e) => {
@@ -4515,7 +4513,7 @@ mod tests {
     #[test]
     fn test_parallel_parse_boundary_finding_integration() {
         // Test the full boundary finding -> parse flow
-        let mut boundary_state = FastqBoundaryState::new(2);
+        let boundary_state = FastqBoundaryState::new(2);
 
         // Create a batch with data for 2 streams
         let batch = FastqDecompressedBatch {
@@ -4533,7 +4531,7 @@ mod tests {
         };
 
         // Step 1: Find boundaries
-        let boundary_batch = FastqFormat::find_boundaries(&mut boundary_state, batch).unwrap();
+        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
         assert_eq!(boundary_batch.streams.len(), 2);
         // Each stream should have 2 complete records (offsets at 0, 19, 38)
         assert_eq!(boundary_batch.streams[0].offsets.len(), 3);
@@ -4565,7 +4563,7 @@ mod tests {
     #[test]
     fn test_parallel_parse_records_spanning_chunks() {
         // Test records that span chunk boundaries
-        let mut boundary_state = FastqBoundaryState::new(1);
+        let boundary_state = FastqBoundaryState::new(1);
 
         // First chunk: one complete record + incomplete record
         let batch1 = FastqDecompressedBatch {
@@ -4576,9 +4574,9 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch1 = FastqFormat::find_boundaries(&mut boundary_state, batch1).unwrap();
+        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
         assert_eq!(boundary_batch1.streams[0].offsets.len(), 2); // One complete record
-        assert!(!boundary_state.leftovers[0].is_empty()); // Leftover from incomplete
+        assert!(!boundary_state.stream_states[0].lock().leftover.is_empty()); // Leftover from incomplete
 
         // Second chunk: completes the record
         let batch2 = FastqDecompressedBatch {
@@ -4586,10 +4584,10 @@ mod tests {
             serial: 1,
         };
 
-        let boundary_batch2 = FastqFormat::find_boundaries(&mut boundary_state, batch2).unwrap();
+        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
         // Leftover + new data should form complete record
         assert!(boundary_batch2.streams[0].offsets.len() >= 2);
-        assert!(boundary_state.leftovers[0].is_empty()); // No more leftover
+        assert!(boundary_state.stream_states[0].lock().leftover.is_empty()); // No more leftover
 
         // Parse both batches
         let parsed1 = FastqFormat::parse_records(boundary_batch1).unwrap();
