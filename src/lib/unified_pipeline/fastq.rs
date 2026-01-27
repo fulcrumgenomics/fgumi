@@ -25,12 +25,13 @@ use libdeflater::Decompressor;
 
 use super::base::{
     CompressedBlockBatch, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
-    HasHeldSerialized, MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
-    PROGRESS_LOG_INTERVAL, PipelineLifecycle, PipelineStats, PipelineStep, ProcessPipelineState,
-    ReorderBufferState, SerializePipelineState, SerializedBatch, WorkerCoreState,
-    WritePipelineState, finalize_pipeline, handle_worker_panic, join_monitor_thread,
-    join_worker_threads, run_monitor_loop, shared_try_step_compress, shared_try_step_process,
-    shared_try_step_serialize, shared_try_step_write_new,
+    HasHeldSerialized, HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues,
+    OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineLifecycle, PipelineStats, PipelineStep,
+    ProcessPipelineState, ReorderBufferState, SerializePipelineState, SerializedBatch, StepContext,
+    WorkerCoreState, WorkerStateCommon, WritePipelineState, finalize_pipeline, generic_worker_loop,
+    handle_worker_panic, join_monitor_thread, join_worker_threads, run_monitor_loop,
+    shared_try_step_compress, shared_try_step_process, shared_try_step_serialize,
+    shared_try_step_write_new,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -1316,6 +1317,26 @@ impl<P: Send> HasHeldSerialized for FastqWorkerState<P> {
     }
 }
 
+impl<P: Send> WorkerStateCommon for FastqWorkerState<P> {
+    fn has_any_held_items(&self) -> bool {
+        FastqWorkerState::has_any_held_items(self)
+    }
+
+    fn clear_held_items(&mut self) {
+        FastqWorkerState::clear_held_items(self);
+    }
+}
+
+impl<P: Send> HasWorkerCore for FastqWorkerState<P> {
+    fn core(&self) -> &WorkerCoreState {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut WorkerCoreState {
+        &mut self.core
+    }
+}
+
 /// Shared state for FASTQ 7-step pipeline.
 ///
 /// Generic parameter P is the processed type (output of `process_fn`).
@@ -2215,6 +2236,9 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
     }; // Reorder lock released here (boundary lock still held)
 
     let Some(batch) = batch_opt else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(2);
+        }
         return (did_work, false); // No more data available
     };
 
@@ -2310,6 +2334,9 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
         if boundaries_done && all_parsed && state.q2_5_boundaries.is_empty() {
             state.parse_done.store(true, Ordering::Release);
             log::trace!("fastq_try_step_parse: set parse_done=true");
+        } else if let Some(stats) = state.stats() {
+            // Record Q2.5 as extension of Q2
+            stats.record_queue_empty(2);
         }
         return false;
     };
@@ -3207,271 +3234,103 @@ where
     }
 }
 
-/// Worker loop for thread 0 (sticky reader).
-fn fastq_worker_loop_reader<
-    R: BufRead + Send + 'static,
-    P: Send + MemoryEstimate + 'static,
-    PF,
-    SF,
->(
-    state: &FastqPipelineState<R, P>,
-    header: &Header,
-    process_fn: &PF,
-    serialize_fn: &SF,
-    worker: &mut FastqWorkerState<P>,
-) where
-    PF: Fn(FastqTemplate) -> io::Result<P>,
-    SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64>,
-{
-    let cap = state.config.queue_capacity;
-    let collect_stats = state.stats().is_some();
+// ============================================================================
+// Step Context (for consolidated generic_worker_loop)
+// ============================================================================
 
-    loop {
-        if state.has_error() {
-            log::trace!("fastq_worker_loop_reader: exiting due to error");
-            break;
-        }
-        // CRITICAL: Don't exit while holding items - they would be lost!
-        if state.is_complete() && !worker.has_any_held_items() {
-            log::trace!(
-                "fastq_worker_loop_reader: exiting - is_complete, group_done={}, q3={}, q4={}, q5={}, q6={}",
-                state.group_done.load(Ordering::Relaxed),
-                state.output.groups.len(),
-                state.output.processed.len(),
-                state.output.serialized.len(),
-                state.output.compressed.len()
-            );
-            break;
-        }
-
-        let mut did_work = false;
-
-        // Prioritize reading (thread 0's specialty)
-        loop {
-            // Record attempt before executing
-            if let Some(stats) = state.stats() {
-                stats.record_step_attempt(worker.core.scheduler.thread_id(), PipelineStep::Read);
-            }
-
-            let success = if collect_stats {
-                let start = std::time::Instant::now();
-                let success = fastq_try_step_read(state, worker);
-                if success {
-                    if let Some(stats) = state.stats() {
-                        stats.record_step_for_thread(
-                            PipelineStep::Read,
-                            start.elapsed().as_nanos() as u64,
-                            Some(worker.core.scheduler.thread_id()),
-                        );
-                    }
-                }
-                success
-            } else {
-                fastq_try_step_read(state, worker)
-            };
-
-            if success {
-                did_work = true;
-            } else {
-                break;
-            }
-        }
-
-        // Use scheduler for other steps
-        let read_done = state.read_done.load(Ordering::Relaxed);
-
-        // When read completes and input queue is empty, enter drain mode
-        // to bypass memory backpressure and prevent deadlock during completion
-        if read_done && state.q1_raw.is_empty() {
-            state.output.draining.store(true, Ordering::Relaxed);
-        }
-
-        let backpressure = BackpressureState {
-            output_high: state.output.compressed.len() > cap * 3 / 4,
-            input_low: state.q1_raw.len() < cap / 4,
-            read_done,
-            memory_high: !state.is_draining() && state.is_memory_high(),
-            memory_drained: state.is_memory_drained(),
-        };
-        // Copy priorities to stack-allocated array to avoid borrow conflict with worker mutation
-        let priorities_slice = worker.core.scheduler.get_priorities(backpressure);
-        let priority_count = priorities_slice.len().min(9);
-        let mut priorities = [PipelineStep::Read; 9]; // Stack-allocated, no heap allocation
-        priorities[..priority_count].copy_from_slice(&priorities_slice[..priority_count]);
-
-        for &step in &priorities[..priority_count] {
-            if state.has_error() {
-                break;
-            }
-
-            // Skip Read - already handled above
-            if step == PipelineStep::Read {
-                continue;
-            }
-
-            // Record attempt before executing
-            if let Some(stats) = state.stats() {
-                stats.record_step_attempt(worker.core.scheduler.thread_id(), step);
-            }
-
-            // Execute with optional timing
-            let (success, elapsed_ns, was_contention) = if collect_stats {
-                let start = std::time::Instant::now();
-                let (success, was_contention) =
-                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
-                let elapsed = start.elapsed().as_nanos() as u64;
-                (success, elapsed, was_contention)
-            } else {
-                let (success, was_contention) =
-                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
-                (success, 0, was_contention)
-            };
-
-            // Record outcome for adaptive schedulers
-            worker.core.scheduler.record_outcome(step, success, was_contention);
-
-            if success {
-                if let Some(stats) = state.stats() {
-                    stats.record_step_for_thread(
-                        step,
-                        elapsed_ns,
-                        Some(worker.core.scheduler.thread_id()),
-                    );
-                }
-                did_work = true;
-                break; // Restart priority evaluation
-            }
-        }
-
-        // Adaptive backoff: sleep longer when no work, reset when work found
-        if did_work {
-            worker.core.reset_backoff();
-        } else {
-            if let Some(stats) = state.stats() {
-                let idle_start = std::time::Instant::now();
-                worker.core.sleep_backoff();
-                stats.record_idle_for_thread(
-                    worker.core.scheduler.thread_id(),
-                    idle_start.elapsed().as_nanos() as u64,
-                );
-            } else {
-                worker.core.sleep_backoff();
-            }
-            // Exponential backoff up to max
-            worker.core.increase_backoff();
-        }
-    }
+/// Context for FASTQ pipeline step execution.
+///
+/// This struct holds references to all the state needed to execute pipeline steps,
+/// and implements `StepContext` to work with `generic_worker_loop`.
+pub struct FastqStepContext<'a, R: BufRead + Send, P: Send + MemoryEstimate, PF, SF> {
+    pub state: &'a FastqPipelineState<R, P>,
+    pub header: &'a Header,
+    pub process_fn: &'a PF,
+    pub serialize_fn: &'a SF,
+    pub is_reader: bool,
 }
 
-/// Worker loop for threads 1..N (no reading).
-fn fastq_worker_loop_worker<
+impl<R, P, PF, SF> StepContext for FastqStepContext<'_, R, P, PF, SF>
+where
     R: BufRead + Send + 'static,
     P: Send + MemoryEstimate + 'static,
-    PF,
-    SF,
->(
-    state: &FastqPipelineState<R, P>,
-    header: &Header,
-    process_fn: &PF,
-    serialize_fn: &SF,
-    worker: &mut FastqWorkerState<P>,
-) where
     PF: Fn(FastqTemplate) -> io::Result<P>,
     SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64>,
 {
-    let cap = state.config.queue_capacity;
-    let collect_stats = state.stats().is_some();
+    type Worker = FastqWorkerState<P>;
 
-    loop {
-        // CRITICAL: Don't exit while holding items - they would be lost!
-        if state.has_error() || (state.is_complete() && !worker.has_any_held_items()) {
-            break;
-        }
+    fn execute_step(&self, worker: &mut Self::Worker, step: PipelineStep) -> (bool, bool) {
+        fastq_execute_step(
+            self.state,
+            self.header,
+            self.process_fn,
+            self.serialize_fn,
+            worker,
+            step,
+        )
+    }
 
-        let mut did_work = false;
-
-        // Use scheduler to determine step priority
-        let read_done = state.read_done.load(Ordering::Relaxed);
-
-        // When read completes and input queue is empty, enter drain mode
-        // to bypass memory backpressure and prevent deadlock during completion
-        if read_done && state.q1_raw.is_empty() {
-            state.output.draining.store(true, Ordering::Relaxed);
-        }
-
-        let backpressure = BackpressureState {
-            output_high: state.output.compressed.len() > cap * 3 / 4,
-            input_low: state.q1_raw.len() < cap / 4,
+    fn get_backpressure(&self, _worker: &Self::Worker) -> BackpressureState {
+        let cap = self.state.config.queue_capacity;
+        let read_done = self.state.read_done.load(Ordering::Relaxed);
+        BackpressureState {
+            output_high: self.state.output.compressed.len() > cap * 3 / 4,
+            input_low: self.state.q1_raw.len() < cap / 4,
             read_done,
-            memory_high: !state.is_draining() && state.is_memory_high(),
-            memory_drained: state.is_memory_drained(),
-        };
-        // Copy priorities to stack-allocated array to avoid borrow conflict with worker mutation
-        let priorities_slice = worker.core.scheduler.get_priorities(backpressure);
-        let priority_count = priorities_slice.len().min(9);
-        let mut priorities = [PipelineStep::Read; 9]; // Stack-allocated, no heap allocation
-        priorities[..priority_count].copy_from_slice(&priorities_slice[..priority_count]);
-
-        for &step in &priorities[..priority_count] {
-            if state.has_error() {
-                break;
-            }
-
-            // Skip Read - only thread 0 reads
-            if step == PipelineStep::Read {
-                continue;
-            }
-
-            // Record attempt before executing
-            if let Some(stats) = state.stats() {
-                stats.record_step_attempt(worker.core.scheduler.thread_id(), step);
-            }
-
-            // Execute with optional timing
-            let (success, elapsed_ns, was_contention) = if collect_stats {
-                let start = std::time::Instant::now();
-                let (success, was_contention) =
-                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
-                let elapsed = start.elapsed().as_nanos() as u64;
-                (success, elapsed, was_contention)
-            } else {
-                let (success, was_contention) =
-                    fastq_execute_step(state, header, process_fn, serialize_fn, worker, step);
-                (success, 0, was_contention)
-            };
-
-            // Record outcome for adaptive schedulers
-            worker.core.scheduler.record_outcome(step, success, was_contention);
-
-            if success {
-                if let Some(stats) = state.stats() {
-                    stats.record_step_for_thread(
-                        step,
-                        elapsed_ns,
-                        Some(worker.core.scheduler.thread_id()),
-                    );
-                }
-                did_work = true;
-                break; // Restart priority evaluation
-            }
+            memory_high: !self.state.is_draining() && self.state.is_memory_high(),
+            memory_drained: self.state.is_memory_drained(),
         }
+    }
 
-        // Adaptive backoff: sleep longer when no work, reset when work found
-        if did_work {
-            worker.core.reset_backoff();
+    fn check_drain_mode(&self) {
+        let read_done = self.state.read_done.load(Ordering::Relaxed);
+        if read_done && self.state.q1_raw.is_empty() {
+            self.state.output.draining.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn has_error(&self) -> bool {
+        self.state.has_error()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state.is_complete()
+    }
+
+    fn stats(&self) -> Option<&PipelineStats> {
+        self.state.stats()
+    }
+
+    fn skip_read(&self) -> bool {
+        // Always skip Read in priority loop:
+        // - Readers handle reading via sticky read before the priority loop
+        // - Workers don't read at all
+        true
+    }
+
+    // check_completion_at_end defaults to false (original FASTQ behavior)
+
+    fn should_attempt_sticky_read(&self) -> bool {
+        self.is_reader
+    }
+
+    fn sticky_read_should_continue(&self) -> bool {
+        // FASTQ just loops until read fails - no pre-condition
+        true
+    }
+
+    fn execute_read_step(&self, worker: &mut Self::Worker) -> bool {
+        fastq_try_step_read(self.state, worker)
+    }
+
+    fn exclusive_step_owned(&self, worker: &Self::Worker) -> Option<PipelineStep> {
+        if self.is_reader {
+            // Reader thread doesn't use the "try owned first" pattern
+            // (it has sticky read instead)
+            None
         } else {
-            if let Some(stats) = state.stats() {
-                let idle_start = std::time::Instant::now();
-                worker.core.sleep_backoff();
-                stats.record_idle_for_thread(
-                    worker.core.scheduler.thread_id(),
-                    idle_start.elapsed().as_nanos() as u64,
-                );
-            } else {
-                worker.core.sleep_backoff();
-            }
-            // Exponential backoff up to max
-            worker.core.increase_backoff();
+            // Non-reader workers may own an exclusive step
+            worker.core.scheduler.exclusive_step_owned()
         }
     }
 }
@@ -3578,23 +3437,14 @@ where
                         scheduler_strategy,
                     );
                     log::debug!("Worker thread {thread_id} created worker state");
-                    if thread_id == 0 {
-                        fastq_worker_loop_reader(
-                            &state,
-                            &header,
-                            &*process_fn,
-                            &*serialize_fn,
-                            &mut worker,
-                        );
-                    } else {
-                        fastq_worker_loop_worker(
-                            &state,
-                            &header,
-                            &*process_fn,
-                            &*serialize_fn,
-                            &mut worker,
-                        );
-                    }
+                    let ctx = FastqStepContext {
+                        state: &state,
+                        header: &header,
+                        process_fn: &*process_fn,
+                        serialize_fn: &*serialize_fn,
+                        is_reader: thread_id == 0,
+                    };
+                    generic_worker_loop(&ctx, &mut worker);
                     log::debug!("Worker thread {thread_id} finished");
                 }));
 

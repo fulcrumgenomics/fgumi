@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::progress::ProgressTracker;
 
@@ -28,7 +28,7 @@ use crate::reorder_buffer::ReorderBuffer;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::data::field::Tag;
 
-use super::scheduler::{Scheduler, SchedulerStrategy, create_scheduler};
+use super::scheduler::{BackpressureState, Scheduler, SchedulerStrategy, create_scheduler};
 
 // ============================================================================
 // Batch Weight Trait (for template-based batching)
@@ -1856,6 +1856,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     fn record_q7_push_progress(&self) {
         // Deadlock tracking handled by caller if needed
     }
+
+    fn stats(&self) -> Option<&PipelineStats> {
+        self.stats.as_ref()
+    }
 }
 
 /// Unit type always has zero heap size (used in tests).
@@ -3243,6 +3247,335 @@ pub trait OutputPipelineState: Send + Sync {
 /// Trait for types that have a BGZF compressor.
 pub trait HasCompressor {
     fn compressor_mut(&mut self) -> &mut InlineBgzfCompressor;
+}
+
+/// Trait for worker states that may hold items between iterations.
+///
+/// When a worker tries to push to a full queue, it "holds" the item and returns
+/// immediately (non-blocking). The next iteration tries to advance the held item
+/// before doing new work.
+///
+/// **CRITICAL**: Worker loops MUST check `has_any_held_items()` before exiting!
+/// If a worker exits while holding items, that data is lost. The correct exit
+/// condition is:
+///
+/// ```ignore
+/// if state.is_complete() && !worker.has_any_held_items() {
+///     break;
+/// }
+/// ```
+///
+/// This trait ensures both BAM and FASTQ pipelines use the same exit logic,
+/// preventing the race condition where data in held items is lost on exit.
+pub trait WorkerStateCommon {
+    /// Check if this worker is holding any items that haven't been pushed yet.
+    ///
+    /// Returns `true` if any `held_*` field contains data. Used to prevent
+    /// premature exit from the worker loop - workers must not exit while
+    /// holding data or it will be lost.
+    fn has_any_held_items(&self) -> bool;
+
+    /// Clear all held items (used during error recovery or cleanup).
+    ///
+    /// **WARNING**: This discards data! Only use when the pipeline is in an
+    /// error state and data loss is acceptable.
+    fn clear_held_items(&mut self);
+}
+
+/// Trait for workers that have a `WorkerCoreState`.
+///
+/// This enables shared worker loop functions to access scheduler and backoff state.
+pub trait HasWorkerCore {
+    fn core(&self) -> &WorkerCoreState;
+    fn core_mut(&mut self) -> &mut WorkerCoreState;
+}
+
+/// Handle worker backoff with optional idle time tracking.
+///
+/// This consolidates the common backoff pattern used in both BAM and FASTQ worker loops:
+/// - If work was done, reset backoff
+/// - If no work, mark thread as idle, sleep and record idle time (if stats enabled), then increase backoff
+#[inline]
+pub fn handle_worker_backoff<W: HasWorkerCore>(
+    worker: &mut W,
+    stats: Option<&PipelineStats>,
+    did_work: bool,
+) {
+    if did_work {
+        worker.core_mut().reset_backoff();
+    } else {
+        if let Some(stats) = stats {
+            let tid = worker.core().scheduler.thread_id();
+            // Mark thread as idle before sleeping so activity snapshots are accurate
+            stats.clear_current_step(tid);
+            let idle_start = Instant::now();
+            worker.core_mut().sleep_backoff();
+            stats.record_idle_for_thread(tid, idle_start.elapsed().as_nanos() as u64);
+        } else {
+            worker.core_mut().sleep_backoff();
+        }
+        worker.core_mut().increase_backoff();
+    }
+}
+
+// ============================================================================
+// Generic Worker Loop (Consolidated Implementation)
+// ============================================================================
+
+/// Trait for pipeline step execution context.
+///
+/// This trait abstracts over the differences between BAM and FASTQ pipelines,
+/// allowing a single `generic_worker_loop` implementation to handle both.
+/// Each pipeline provides a context struct that implements this trait.
+pub trait StepContext {
+    /// The worker type for this pipeline (e.g., `WorkerState<P>` or `FastqWorkerState<P>`)
+    type Worker: WorkerStateCommon + HasWorkerCore;
+
+    /// Execute a pipeline step, returning `(success, was_contention)`.
+    fn execute_step(&self, worker: &mut Self::Worker, step: PipelineStep) -> (bool, bool);
+
+    /// Compute backpressure state for the scheduler.
+    fn get_backpressure(&self, worker: &Self::Worker) -> BackpressureState;
+
+    /// Check and set drain mode if appropriate (called each iteration).
+    fn check_drain_mode(&self);
+
+    /// Check if the pipeline has encountered an error.
+    fn has_error(&self) -> bool;
+
+    /// Check if the pipeline is complete.
+    fn is_complete(&self) -> bool;
+
+    /// Get stats for recording (if enabled).
+    fn stats(&self) -> Option<&PipelineStats>;
+
+    /// Whether this context should skip the Read step.
+    /// Returns `true` for non-reader worker threads.
+    fn skip_read(&self) -> bool;
+
+    /// Whether to check completion at end of loop iteration (original BAM behavior).
+    /// If false (default), checks at start (original FASTQ behavior).
+    fn check_completion_at_end(&self) -> bool {
+        false
+    }
+
+    // -------------------------------------------------------------------------
+    // Sticky Read Methods (consolidated)
+    // -------------------------------------------------------------------------
+
+    /// Fast check before entering sticky read loop.
+    /// BAM uses this to skip the loop entirely when `read_done` is true.
+    /// Default returns false (no sticky read).
+    fn should_attempt_sticky_read(&self) -> bool {
+        false
+    }
+
+    /// Condition for continuing the sticky read loop.
+    /// Called before each read attempt.
+    /// - BAM: `!error && !read_done && q1.len() < capacity`
+    /// - FASTQ: `true` (relies on `execute_read_step` returning false)
+    fn sticky_read_should_continue(&self) -> bool {
+        false
+    }
+
+    /// Execute the read step. Returns true if read succeeded.
+    fn execute_read_step(&self, _worker: &mut Self::Worker) -> bool {
+        false
+    }
+
+    /// Get drain mode flag for exclusive step relaxation.
+    /// Default is false.
+    fn is_drain_mode(&self) -> bool {
+        false
+    }
+
+    /// Check if worker should attempt an exclusive step.
+    /// Default implementation always returns true (no ownership checks).
+    fn should_attempt_step(
+        &self,
+        _worker: &Self::Worker,
+        _step: PipelineStep,
+        _drain_mode: bool,
+    ) -> bool {
+        true
+    }
+
+    /// Get the exclusive step owned by this worker (if any).
+    /// Used by BAM to prioritize owned steps before the normal priority loop.
+    /// Default returns None (no exclusive step ownership).
+    fn exclusive_step_owned(&self, _worker: &Self::Worker) -> Option<PipelineStep> {
+        None
+    }
+}
+
+/// Generic worker loop implementation used by both BAM and FASTQ pipelines.
+///
+/// This consolidates the duplicated worker loop logic into a single function.
+/// The `StepContext` trait provides pipeline-specific behavior.
+pub fn generic_worker_loop<C: StepContext>(ctx: &C, worker: &mut C::Worker) {
+    let collect_stats = ctx.stats().is_some();
+    let check_completion_at_end = ctx.check_completion_at_end();
+
+    loop {
+        // Check for errors
+        if ctx.has_error() {
+            break;
+        }
+
+        // Check for completion at start (FASTQ behavior, default)
+        // CRITICAL: Don't exit while holding items - they would be lost!
+        if !check_completion_at_end && ctx.is_complete() && !worker.has_any_held_items() {
+            break;
+        }
+
+        let mut did_work = false;
+
+        // Sticky read for reader threads (fills Q1 before doing other work)
+        // Uses outer guard to skip when not applicable (BAM optimization)
+        if ctx.should_attempt_sticky_read() {
+            while ctx.sticky_read_should_continue() {
+                // Record attempt before executing
+                if let Some(stats) = ctx.stats() {
+                    stats.record_step_attempt(
+                        worker.core().scheduler.thread_id(),
+                        PipelineStep::Read,
+                    );
+                }
+
+                let success = if collect_stats {
+                    let start = Instant::now();
+                    let success = ctx.execute_read_step(worker);
+                    if success {
+                        if let Some(stats) = ctx.stats() {
+                            stats.record_step_for_thread(
+                                PipelineStep::Read,
+                                start.elapsed().as_nanos() as u64,
+                                Some(worker.core().scheduler.thread_id()),
+                            );
+                        }
+                    }
+                    success
+                } else {
+                    ctx.execute_read_step(worker)
+                };
+
+                if success {
+                    did_work = true;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Check/set drain mode
+        ctx.check_drain_mode();
+
+        // Get step priorities from scheduler
+        let backpressure = ctx.get_backpressure(worker);
+        let priorities_slice = worker.core_mut().scheduler.get_priorities(backpressure);
+        let priority_count = priorities_slice.len().min(9);
+        let mut priorities = [PipelineStep::Read; 9];
+        priorities[..priority_count].copy_from_slice(&priorities_slice[..priority_count]);
+
+        let drain_mode = ctx.is_drain_mode();
+
+        // BAM optimization: try owned exclusive step first (before priority loop)
+        // This prevents starvation: since only this thread can do the step, prioritize it
+        let owned_step = ctx.exclusive_step_owned(worker);
+        if let Some(step) = owned_step {
+            if step != PipelineStep::Read && !ctx.has_error() {
+                // Record attempt
+                if let Some(stats) = ctx.stats() {
+                    stats.record_step_attempt(worker.core().scheduler.thread_id(), step);
+                }
+
+                let (success, elapsed_ns, was_contention) = if collect_stats {
+                    let start = Instant::now();
+                    let (success, was_contention) = ctx.execute_step(worker, step);
+                    (success, start.elapsed().as_nanos() as u64, was_contention)
+                } else {
+                    let (success, was_contention) = ctx.execute_step(worker, step);
+                    (success, 0, was_contention)
+                };
+
+                worker.core_mut().scheduler.record_outcome(step, success, was_contention);
+
+                if success {
+                    if let Some(stats) = ctx.stats() {
+                        stats.record_step_for_thread(
+                            step,
+                            elapsed_ns,
+                            Some(worker.core().scheduler.thread_id()),
+                        );
+                    }
+                    did_work = true;
+                }
+            }
+        }
+
+        // Execute steps in priority order (if owned step didn't succeed)
+        if !did_work {
+            for &step in &priorities[..priority_count] {
+                if ctx.has_error() {
+                    break;
+                }
+
+                // Skip Read step for non-reader workers
+                if ctx.skip_read() && step == PipelineStep::Read {
+                    continue;
+                }
+
+                // Skip the owned step (already tried above)
+                if Some(step) == owned_step {
+                    continue;
+                }
+
+                // Skip exclusive steps this worker doesn't own (BAM optimization)
+                if !ctx.should_attempt_step(worker, step, drain_mode) {
+                    continue;
+                }
+
+                // Record attempt
+                if let Some(stats) = ctx.stats() {
+                    stats.record_step_attempt(worker.core().scheduler.thread_id(), step);
+                }
+
+                // Execute with timing
+                let (success, elapsed_ns, was_contention) = if collect_stats {
+                    let start = Instant::now();
+                    let (success, was_contention) = ctx.execute_step(worker, step);
+                    (success, start.elapsed().as_nanos() as u64, was_contention)
+                } else {
+                    let (success, was_contention) = ctx.execute_step(worker, step);
+                    (success, 0, was_contention)
+                };
+
+                // Record outcome for adaptive scheduler
+                worker.core_mut().scheduler.record_outcome(step, success, was_contention);
+
+                if success {
+                    if let Some(stats) = ctx.stats() {
+                        stats.record_step_for_thread(
+                            step,
+                            elapsed_ns,
+                            Some(worker.core().scheduler.thread_id()),
+                        );
+                    }
+                    did_work = true;
+                    break; // Restart priority evaluation
+                }
+            }
+        }
+
+        // Check for completion at end (original BAM behavior)
+        // CRITICAL: Don't exit while holding items - they would be lost!
+        if check_completion_at_end && ctx.is_complete() && !worker.has_any_held_items() {
+            break;
+        }
+
+        // Backoff handling
+        handle_worker_backoff(worker, ctx.stats(), did_work);
+    }
 }
 
 /// Trait for workers that can hold compressed batches when output queue is full.
