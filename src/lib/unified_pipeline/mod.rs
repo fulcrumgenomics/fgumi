@@ -61,6 +61,23 @@
 //! - `deadlock`: Deadlock detection and recovery
 //! - `queue`: Memory-bounded queue implementations
 //! - `rebalancer`: Dynamic memory rebalancing
+//!
+//! # Parallel Ordered Batch Processing Pattern
+//!
+//! Both BAM and FASTQ pipelines use a common pattern for steps that require
+//! ordered output but can do work in parallel:
+//!
+//! 1. **Per-worker held state**: Each worker holds its result if output queue is full
+//! 2. **Brief reorder lock**: Lock held only for insert/pop, not during work
+//! 3. **Work outside lock**: Actual processing happens without holding locks
+//! 4. **Priority advancement**: Always try to push held items first
+//!
+//! This pattern is implemented in:
+//! - `bam.rs`: `try_step_find_boundaries()` with `WorkerState.held_boundaries`
+//! - `fastq.rs`: `fastq_try_step_find_boundaries()` with `FastqWorkerState.held_boundaries`
+//!
+//! When modifying either implementation, ensure the pattern stays in sync.
+//! The `HasHeldBoundaries` trait in `base.rs` documents the interface.
 
 mod bam;
 mod base;

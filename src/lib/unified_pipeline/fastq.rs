@@ -24,8 +24,8 @@ use crate::reorder_buffer::ReorderBuffer;
 use libdeflater::Decompressor;
 
 use super::base::{
-    CompressedBlockBatch, HasCompressor, HasHeldCompressed, HasHeldProcessed, HasHeldSerialized,
-    MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
+    CompressedBlockBatch, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
+    HasHeldSerialized, MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
     PROGRESS_LOG_INTERVAL, PipelineLifecycle, PipelineStats, PipelineStep, ProcessPipelineState,
     ReorderBufferState, SerializePipelineState, SerializedBatch, WorkerCoreState,
     WritePipelineState, finalize_pipeline, handle_worker_panic, join_monitor_thread,
@@ -1215,6 +1215,8 @@ pub struct FastqWorkerState<P: Send> {
     /// Held decompressed batch from Decompress step (couldn't push to `q2_decompressed`).
     /// Includes `heap_size` for memory tracking.
     pub held_decompressed: Option<(u64, FastqReadBatch, usize)>,
+    /// Held boundary batch from `FindBoundaries` step (couldn't push to `q2_5_boundaries`).
+    pub held_boundaries: Option<(u64, FastqBoundaryBatch)>,
     /// Held processed batch from Process step (couldn't push to `q4_processed`).
     /// Includes `heap_size` for memory tracking.
     pub held_processed: Option<(u64, Vec<P>, usize)>,
@@ -1245,6 +1247,7 @@ impl<P: Send> FastqWorkerState<P> {
             decompressor: Decompressor::new(),
             held_raw: None,
             held_decompressed: None,
+            held_boundaries: None,
             held_processed: None,
             held_serialized: None,
             held_compressed: None,
@@ -1258,6 +1261,7 @@ impl<P: Send> FastqWorkerState<P> {
     pub fn has_any_held_items(&self) -> bool {
         self.held_raw.is_some()
             || self.held_decompressed.is_some()
+            || self.held_boundaries.is_some()
             || self.held_processed.is_some()
             || self.held_serialized.is_some()
             || self.held_compressed.is_some()
@@ -1267,6 +1271,7 @@ impl<P: Send> FastqWorkerState<P> {
     pub fn clear_held_items(&mut self) {
         self.held_raw = None;
         self.held_decompressed = None;
+        self.held_boundaries = None;
         self.held_processed = None;
         self.held_serialized = None;
         self.held_compressed = None;
@@ -1282,6 +1287,12 @@ impl<P: Send> HasCompressor for FastqWorkerState<P> {
 impl<P: Send> HasHeldCompressed for FastqWorkerState<P> {
     fn held_compressed_mut(&mut self) -> &mut Option<(u64, CompressedBlockBatch, usize)> {
         &mut self.held_compressed
+    }
+}
+
+impl<P: Send> HasHeldBoundaries<FastqBoundaryBatch> for FastqWorkerState<P> {
+    fn held_boundaries_mut(&mut self) -> &mut Option<(u64, FastqBoundaryBatch)> {
+        &mut self.held_boundaries
     }
 }
 
@@ -1337,8 +1348,11 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
 
     // ========== Queue 2.5: FindBoundaries → Parse (parallel parse only) ==========
     /// State for finding FASTQ record boundaries (only used when `use_parallel_parse=true`).
-    /// Uses per-stream internal locks for parallel access - no outer lock needed.
+    /// Uses per-stream internal locks for parallel access.
     pub boundary_state: FastqBoundaryState,
+    /// Lock to ensure boundary batches are processed in order.
+    /// Required because per-stream leftover handling needs chunks in order.
+    pub boundary_lock: Mutex<()>,
     /// Flag indicating boundary finding is complete.
     pub boundaries_done: AtomicBool,
     /// Count of batches that have had boundaries found.
@@ -1420,6 +1434,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             q2_reorder_state: ReorderBufferState::new(memory_limit),
             // Parallel Parse step state (Q2.5: FindBoundaries → Parse)
             boundary_state: FastqBoundaryState::new(num_streams),
+            boundary_lock: Mutex::new(()),
             boundaries_done: AtomicBool::new(false),
             batches_boundaries_found: AtomicU64::new(0),
             q2_5_boundaries: ArrayQueue::new(cap),
@@ -2094,118 +2109,155 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
 
 /// Try to find FASTQ record boundaries (Step 2.5).
 ///
+/// SYNC WITH: bam.rs `try_step_find_boundaries()`
+/// Both implementations use the "held boundaries" pattern for parallelism.
+/// See base.rs `HasHeldBoundaries` trait for pattern documentation.
+///
 /// This step scans decompressed data for record boundaries (@ characters at
 /// line starts). Uses per-stream internal locks for parallel access.
 ///
 /// Only used when `config.use_parallel_parse` is true.
+///
+/// Returns (`did_work`, `had_contention`).
 fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
-) -> bool {
+    worker: &mut FastqWorkerState<P>,
+) -> (bool, bool) {
     if !state.config.use_parallel_parse {
-        return false; // Not using parallel parse
+        return (false, false); // Not using parallel parse
     }
     if state.boundaries_done.load(Ordering::Relaxed) || state.has_error() {
-        return false;
+        return (false, false);
     }
 
-    // Acquire the Q2 reorder buffer (this serializes batch processing for ordering)
-    let Some(mut reorder) = state.q2_reorder.try_lock() else {
-        // Record contention on the reorder buffer lock
-        if let Some(stats) = state.stats() {
-            stats.record_contention(PipelineStep::FindBoundaries);
+    // =========================================================================
+    // Priority 1: Try to advance any held boundary batch first
+    // =========================================================================
+    let mut did_work = false;
+    if let Some((serial, held)) = worker.held_boundaries.take() {
+        let boundary_heap_size = held.estimate_heap_size();
+        match state.q2_5_boundaries.push((serial, held)) {
+            Ok(()) => {
+                state
+                    .q2_5_boundaries_heap_bytes
+                    .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
+                state.batches_boundaries_found.fetch_add(1, Ordering::Release);
+                state.deadlock_state.record_q2_5_push();
+                did_work = true;
+            }
+            Err((serial, held)) => {
+                // Still can't push - put it back and signal backpressure
+                worker.held_boundaries = Some((serial, held));
+                return (false, false); // Backpressure, not contention
+            }
         }
-        return false;
+    }
+
+    // =========================================================================
+    // Priority 2: Check if output queue has space
+    // =========================================================================
+    if state.q2_5_boundaries.is_full() {
+        return (false, false); // Backpressure, not contention
+    }
+
+    // =========================================================================
+    // Priority 3: Acquire boundary lock to ensure ordered processing
+    // =========================================================================
+    // FASTQ per-stream leftover handling requires batches to be processed in order.
+    // Use try_lock() so other threads can do different work instead of blocking.
+    let Some(_boundary_guard) = state.boundary_lock.try_lock() else {
+        return (did_work, true); // Contention on boundary lock
     };
 
-    // First, move items from Q2 ArrayQueue to reorder buffer (CRITICAL - same as Group step)
-    while let Some((serial, batch)) = state.q2_decompressed.pop() {
-        let heap_size = batch.estimate_heap_size();
-        reorder.insert_with_size(serial, batch, heap_size);
-        state.deadlock_state.record_q2_pop();
-    }
+    // =========================================================================
+    // Priority 4: Get next batch from reorder buffer (under boundary lock)
+    // =========================================================================
+    let batch_opt = {
+        let mut reorder = state.q2_reorder.lock();
 
-    // Process batches in order from reorder buffer (matching old Group pattern)
-    // Check output queue capacity BEFORE each pop to prevent data loss
-    let mut processed_any = false;
-    while !state.q2_5_boundaries.is_full() {
-        let Some(batch) = reorder.try_pop_next() else {
-            break;
-        };
-        let serial = batch.serial;
-        let heap_size = batch.estimate_heap_size();
+        // Insert pending items from Q2 ArrayQueue to reorder buffer
+        while let Some((serial, batch)) = state.q2_decompressed.pop() {
+            let heap_size = batch.estimate_heap_size();
+            reorder.insert_with_size(serial, batch, heap_size);
+            state.deadlock_state.record_q2_pop();
+        }
+
+        // Try to pop next in-order batch
+        let batch_opt = reorder.try_pop_next();
 
         // Update Q2 reorder tracking
         state.q2_reorder_state.update_next_seq(reorder.next_seq());
-        state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
 
-        // Convert FastqReadBatch to FastqDecompressedBatch for the format trait
-        let decompressed = FastqDecompressedBatch {
-            chunks: batch
-                .chunks
-                .into_iter()
-                .map(|c| FastqDecompressedChunk { stream_idx: c.stream_idx, data: c.data })
-                .collect(),
-            serial,
-        };
+        // Check for completion while we have the lock
+        let read_done = state.read_done.load(Ordering::Acquire);
+        let batches_read = state.batches_read.load(Ordering::Acquire);
+        let batches_boundaries_found = state.batches_boundaries_found.load(Ordering::Acquire);
+        let all_processed = batches_read == batches_boundaries_found;
+        let reorder_empty = reorder.is_empty();
 
-        // Find boundaries (uses per-stream internal locks)
-        match FastqFormat::find_boundaries(&state.boundary_state, decompressed) {
-            Ok(boundary_batch) => {
-                // Push to Q2.5 boundaries queue
-                let boundary_heap_size = boundary_batch.estimate_heap_size();
-                if let Ok(()) = state.q2_5_boundaries.push((serial, boundary_batch)) {
-                    state
-                        .q2_5_boundaries_heap_bytes
-                        .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
-                    state.batches_boundaries_found.fetch_add(1, Ordering::Release);
-                    state.deadlock_state.record_q2_pop();
-                    processed_any = true;
-                } else {
-                    // Queue full after capacity check - should be unreachable
-                    // Fail with error to avoid silent data loss
-                    state.set_error(io::Error::other(
-                        "Q2.5 boundaries queue unexpectedly full after capacity check",
-                    ));
-                    return processed_any;
-                }
-            }
-            Err(e) => {
-                state.set_error(e);
-                return false;
-            }
+        if batch_opt.is_none() && read_done && all_processed && reorder_empty {
+            state.boundaries_done.store(true, Ordering::Release);
+            log::info!(
+                "fastq_try_step_find_boundaries: set boundaries_done=true (read={}, found={})",
+                batches_read,
+                batches_boundaries_found
+            );
+        }
+
+        batch_opt
+    }; // Reorder lock released here (boundary lock still held)
+
+    let Some(batch) = batch_opt else {
+        return (did_work, false); // No more data available
+    };
+
+    let serial = batch.serial;
+    let heap_size = batch.estimate_heap_size();
+
+    // Release memory from atomic tracker when popping from reorder buffer
+    state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
+
+    // =========================================================================
+    // Priority 5: Find boundaries (under boundary lock for ordering)
+    // =========================================================================
+    // Convert FastqReadBatch to FastqDecompressedBatch for the format trait
+    let decompressed = FastqDecompressedBatch {
+        chunks: batch
+            .chunks
+            .into_iter()
+            .map(|c| FastqDecompressedChunk { stream_idx: c.stream_idx, data: c.data })
+            .collect(),
+        serial,
+    };
+
+    // Find boundaries - must be done in order due to per-stream leftover state
+    let boundary_batch = match FastqFormat::find_boundaries(&state.boundary_state, decompressed) {
+        Ok(batch) => batch,
+        Err(e) => {
+            state.set_error(e);
+            return (true, false); // Did work (processed batch from reorder buffer)
+        }
+    };
+
+    // =========================================================================
+    // Priority 6: Push or hold (boundary lock released after this)
+    // =========================================================================
+    let boundary_heap_size = boundary_batch.estimate_heap_size();
+    match state.q2_5_boundaries.push((serial, boundary_batch)) {
+        Ok(()) => {
+            state
+                .q2_5_boundaries_heap_bytes
+                .fetch_add(boundary_heap_size as u64, Ordering::Relaxed);
+            state.batches_boundaries_found.fetch_add(1, Ordering::Release);
+            state.deadlock_state.record_q2_5_push();
+            (true, false) // Did work, no contention
+        }
+        Err((serial, batch)) => {
+            // Output full - hold the result and return
+            worker.held_boundaries = Some((serial, batch));
+            (true, false) // Did work (processed data), will retry push later
         }
     }
-
-    // Check if boundary finding is complete (AFTER processing, like old Group step)
-    let read_done = state.read_done.load(Ordering::Acquire);
-    let batches_read = state.batches_read.load(Ordering::Acquire);
-    let batches_boundaries_found = state.batches_boundaries_found.load(Ordering::Acquire);
-    let all_processed = batches_read == batches_boundaries_found;
-    let reorder_empty = reorder.is_empty();
-    let reorder_next_seq = reorder.next_seq();
-    let reorder_len = reorder.len();
-
-    if read_done && all_processed && reorder_empty {
-        state.boundaries_done.store(true, Ordering::Release);
-        log::info!(
-            "fastq_try_step_find_boundaries: set boundaries_done=true (read={}, found={})",
-            batches_read,
-            batches_boundaries_found
-        );
-    } else if read_done && !state.boundaries_done.load(Ordering::Relaxed) {
-        // Log why we're not setting boundaries_done
-        log::debug!(
-            "fastq_try_step_find_boundaries: NOT complete - read_done={}, batches_read={}, batches_found={}, reorder_empty={}, reorder_len={}, reorder_next_seq={}",
-            read_done,
-            batches_read,
-            batches_boundaries_found,
-            reorder_empty,
-            reorder_len,
-            reorder_next_seq
-        );
-    }
-
-    processed_any
 }
 
 /// Try to parse FASTQ records (Step 2.75 - parallel).
@@ -2251,6 +2303,7 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
         }
         return false;
     };
+    state.deadlock_state.record_q2_5_pop();
 
     let input_heap_size = boundary_batch.estimate_heap_size();
 
@@ -2347,6 +2400,8 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
             }
         }
         Err(e) => {
+            // Batch already removed from Q2.5; keep heap tracking consistent
+            state.q2_5_boundaries_heap_bytes.fetch_sub(input_heap_size as u64, Ordering::Relaxed);
             state.set_error(e);
             false
         }
@@ -3082,9 +3137,8 @@ where
         PipelineStep::FindBoundaries => {
             // When parallel parse is enabled, FindBoundaries scans for record boundaries
             if state.config.use_parallel_parse {
-                let success = fastq_try_step_find_boundaries(state);
-                // FindBoundaries is exclusive - contention if we couldn't get the lock
-                (success, !success && !state.q2_decompressed.is_empty())
+                // Uses held-boundaries pattern for parallelism (see base.rs HasHeldBoundaries)
+                fastq_try_step_find_boundaries(state, worker)
             } else {
                 (false, false) // Not applicable when parallel parse is disabled
             }
