@@ -24,11 +24,12 @@ use crate::reorder_buffer::ReorderBuffer;
 use super::base::{
     BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch, GroupKeyConfig,
     HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed, HasHeldSerialized,
-    MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
+    HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
     PROGRESS_LOG_INTERVAL, PipelineConfig, PipelineLifecycle, PipelineStats, PipelineStep,
     ProcessPipelineState, QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState,
-    SerializedBatch, WorkerCoreState, WritePipelineState, finalize_pipeline, handle_worker_panic,
-    join_monitor_thread, join_worker_threads, shared_try_step_compress,
+    SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
+    finalize_pipeline, generic_worker_loop, handle_worker_panic, join_monitor_thread,
+    join_worker_threads, shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -1283,6 +1284,26 @@ impl<P: Send> HasHeldSerialized for WorkerState<P> {
     }
 }
 
+impl<P: Send> WorkerStateCommon for WorkerState<P> {
+    fn has_any_held_items(&self) -> bool {
+        WorkerState::has_any_held_items(self)
+    }
+
+    fn clear_held_items(&mut self) {
+        WorkerState::clear_held_items(self);
+    }
+}
+
+impl<P: Send> HasWorkerCore for WorkerState<P> {
+    fn core(&self) -> &WorkerCoreState {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut WorkerCoreState {
+        &mut self.core
+    }
+}
+
 // ============================================================================
 // Step Execution Functions
 // ============================================================================
@@ -1605,6 +1626,11 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
 
         // Release memory from atomic tracker when popping from reorder buffer
         let Some((batch, heap_size)) = batch_with_size else {
+            if !did_work {
+                if let Some(stats) = state.stats() {
+                    stats.record_queue_empty(2);
+                }
+            }
             break; // No more data available
         };
         state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
@@ -1758,6 +1784,9 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
         // Check if boundary finding is done and queue is empty
         if state.boundary_done.load(Ordering::SeqCst) && state.q2b_boundaries.is_empty() {
             state.decode_done.store(true, Ordering::SeqCst);
+        } else if let Some(stats) = state.stats() {
+            // Q2b is extension of Q2
+            stats.record_queue_empty(2);
         }
         return false;
     };
@@ -1981,6 +2010,11 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
 
         // Release memory from atomic tracker when popping from reorder buffer
         let Some((records, heap_size)) = records else {
+            if !did_work {
+                if let Some(stats) = state.stats() {
+                    stats.record_queue_empty(3);
+                }
+            }
             break; // No more data available
         };
         state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
@@ -2432,347 +2466,111 @@ fn try_step_write<G: Send, P: Send + MemoryEstimate>(
 }
 
 // ============================================================================
-// Worker Loop
+// Step Context (for consolidated generic_worker_loop)
 // ============================================================================
 
-/// Main worker loop for the BAM pipeline.
+/// Context for BAM pipeline step execution.
 ///
-/// Each thread runs this loop, trying steps in priority order.
-/// Worker loop for thread 0 (sticky reader).
-///
-/// Thread 0 is designated as the "sticky reader". It prioritizes reading and
-/// keeps reading until Q1 is full or EOF, only then doing other work.
-/// This eliminates read contention for other threads.
-fn worker_loop_reader<
-    G: Send + BatchWeight + MemoryEstimate + 'static,
-    P: Send + MemoryEstimate + 'static,
->(
-    state: &BamPipelineState<G, P>,
-    group_state: &Mutex<GroupState<G>>,
-    fns: &PipelineFunctions<G, P>,
-    worker: &mut WorkerState<P>,
-) {
-    let collect_stats = state.stats().is_some();
-
-    loop {
-        // Check for errors
-        if state.has_error() {
-            break;
-        }
-
-        let mut did_work = false;
-
-        // Sticky reader: Keep reading until Q1 is full or EOF
-        if !state.read_done.load(Ordering::Relaxed) {
-            while !state.has_error()
-                && !state.read_done.load(Ordering::Relaxed)
-                && state.q1_raw_blocks.len() < state.config.queue_capacity
-            {
-                // Record attempt before executing
-                if let Some(stats) = state.stats() {
-                    stats
-                        .record_step_attempt(worker.core.scheduler.thread_id(), PipelineStep::Read);
-                }
-
-                let success = if collect_stats {
-                    let start = Instant::now();
-                    let success = try_step_read(state, worker);
-                    if success {
-                        if let Some(stats) = state.stats() {
-                            // Thread 0 is always the reader
-                            stats.record_step_for_thread(
-                                PipelineStep::Read,
-                                start.elapsed().as_nanos() as u64,
-                                Some(0),
-                            );
-                        }
-                    }
-                    success
-                } else {
-                    try_step_read(state, worker)
-                };
-
-                if success {
-                    did_work = true;
-                } else {
-                    // Couldn't read (another thread has lock, or EOF)
-                    break;
-                }
-            }
-        }
-
-        // Now do other work based on priority (skip Read since we just did it)
-        // Use scheduler with backpressure for non-Read steps
-        let depths = state.queue_depths();
-        let read_done = state.read_done.load(Ordering::Relaxed);
-        let group_done = state.group_done.load(Ordering::Relaxed);
-
-        // When read completes and input queue is empty, enter drain mode
-        // to bypass memory backpressure and prevent deadlock during completion
-        if read_done && state.q1_raw_blocks.is_empty() {
-            state.output.draining.store(true, Ordering::Relaxed);
-        }
-
-        let backpressure = BackpressureState {
-            output_high: depths.q7 > state.config.output_high_water,
-            input_low: depths.q1 < state.config.input_low_water,
-            read_done,
-            memory_high: !state.is_draining() && state.is_memory_high(),
-            memory_drained: state.is_memory_drained(),
-        };
-        // Copy priorities to stack-allocated array to avoid borrow conflict with worker mutation
-        // (get_priorities borrows scheduler, but we need &mut scheduler for record_outcome later)
-        let priorities_slice = worker.core.scheduler.get_priorities(backpressure);
-        let priority_count = priorities_slice.len().min(9);
-        let mut priorities = [PipelineStep::Read; 9]; // Stack-allocated, no heap allocation
-        priorities[..priority_count].copy_from_slice(&priorities_slice[..priority_count]);
-
-        // Drain mode: when read and group are done, all threads can help with exclusive steps
-        let drain_mode = read_done && group_done;
-
-        for &step in &priorities[..priority_count] {
-            if state.has_error() {
-                break;
-            }
-
-            // Skip Read step - we already handled it above
-            if step == PipelineStep::Read {
-                continue;
-            }
-
-            // Skip exclusive steps this thread doesn't own (eliminates contention)
-            // In drain mode, relax ownership to avoid starvation
-            if !worker.core.scheduler.should_attempt_step_with_drain(step, drain_mode) {
-                continue;
-            }
-
-            // Record attempt before executing
-            if let Some(stats) = state.stats() {
-                stats.record_step_attempt(worker.core.scheduler.thread_id(), step);
-            }
-
-            let (success, elapsed_ns, was_contention) = if collect_stats {
-                let start = Instant::now();
-                let (success, was_contention) = execute_step(state, group_state, fns, worker, step);
-                let elapsed = start.elapsed().as_nanos() as u64;
-                (success, elapsed, was_contention)
-            } else {
-                let (success, was_contention) = execute_step(state, group_state, fns, worker, step);
-                (success, 0, was_contention)
-            };
-
-            // Record outcome for adaptive schedulers
-            worker.core.scheduler.record_outcome(step, success, was_contention);
-
-            if success {
-                if let Some(stats) = state.stats() {
-                    stats.record_step_for_thread(
-                        step,
-                        elapsed_ns,
-                        Some(worker.core.scheduler.thread_id()),
-                    );
-                }
-                did_work = true;
-                break; // Restart priority evaluation
-            }
-        }
-
-        // Check for completion
-        // CRITICAL: Don't exit while holding items - they would be lost!
-        if state.is_complete() && !worker.has_any_held_items() {
-            break;
-        }
-
-        // Adaptive backoff: sleep longer when no work, reset when work found
-        if did_work {
-            worker.core.reset_backoff();
-        } else {
-            if let Some(stats) = state.stats() {
-                let idle_start = Instant::now();
-                worker.core.sleep_backoff();
-                stats.record_idle_for_thread(
-                    worker.core.scheduler.thread_id(),
-                    idle_start.elapsed().as_nanos() as u64,
-                );
-            } else {
-                worker.core.sleep_backoff();
-            }
-            // Exponential backoff up to max
-            worker.core.increase_backoff();
-        }
-    }
+/// This struct holds references to all the state needed to execute pipeline steps,
+/// and implements `StepContext` to work with `generic_worker_loop`.
+pub struct BamStepContext<'a, G: Send, P: Send + MemoryEstimate> {
+    pub state: &'a BamPipelineState<G, P>,
+    pub group_state: &'a Mutex<GroupState<G>>,
+    pub fns: &'a PipelineFunctions<G, P>,
+    pub is_reader: bool,
 }
 
-/// Worker loop for threads 1..N-1 (non-readers).
-///
-/// These threads handle all steps except Read. They use the configured
-/// scheduler strategy to reduce contention on exclusive steps.
-fn worker_loop_worker<
+impl<G, P> StepContext for BamStepContext<'_, G, P>
+where
     G: Send + BatchWeight + MemoryEstimate + 'static,
     P: Send + MemoryEstimate + 'static,
->(
-    state: &BamPipelineState<G, P>,
-    group_state: &Mutex<GroupState<G>>,
-    fns: &PipelineFunctions<G, P>,
-    worker: &mut WorkerState<P>,
-) {
-    let collect_stats = state.stats().is_some();
+{
+    type Worker = WorkerState<P>;
 
-    loop {
-        // Check for errors
-        if state.has_error() {
-            break;
-        }
+    fn execute_step(&self, worker: &mut Self::Worker, step: PipelineStep) -> (bool, bool) {
+        execute_step(self.state, self.group_state, self.fns, worker, step)
+    }
 
-        // Get step priorities using scheduler with backpressure
-        let depths = state.queue_depths();
-        let read_done = state.read_done.load(Ordering::Relaxed);
-        let group_done = state.group_done.load(Ordering::Relaxed);
-
-        // When read completes and input queue is empty, enter drain mode
-        // to bypass memory backpressure and prevent deadlock during completion
-        if read_done && state.q1_raw_blocks.is_empty() {
-            state.output.draining.store(true, Ordering::Relaxed);
-        }
-
-        let backpressure = BackpressureState {
-            output_high: depths.q7 > state.config.output_high_water,
-            input_low: depths.q1 < state.config.input_low_water,
+    fn get_backpressure(&self, _worker: &Self::Worker) -> BackpressureState {
+        let depths = self.state.queue_depths();
+        let read_done = self.state.read_done.load(Ordering::Relaxed);
+        BackpressureState {
+            output_high: depths.q7 > self.state.config.output_high_water,
+            input_low: depths.q1 < self.state.config.input_low_water,
             read_done,
-            memory_high: !state.is_draining() && state.is_memory_high(),
-            memory_drained: state.is_memory_drained(),
-        };
-        // Copy priorities to stack-allocated array to avoid borrow conflict with worker mutation
-        // (get_priorities borrows scheduler, but we need &mut scheduler for record_outcome later)
-        let priorities_slice = worker.core.scheduler.get_priorities(backpressure);
-        let priority_count = priorities_slice.len().min(9);
-        let mut priorities = [PipelineStep::Read; 9]; // Stack-allocated, no heap allocation
-        priorities[..priority_count].copy_from_slice(&priorities_slice[..priority_count]);
-
-        // Drain mode: when read and group are done, all threads can help with exclusive steps
-        // to avoid starvation and allow threads to clear their held items
-        let drain_mode = read_done && group_done;
-
-        let mut did_work = false;
-
-        // If this thread owns an exclusive step (other than Read), try it FIRST.
-        // This prevents starvation: since only this thread can do the step, we must
-        // prioritize it over parallel work that other threads could help with.
-        if let Some(owned_step) = worker.core.scheduler.exclusive_step_owned() {
-            if owned_step != PipelineStep::Read && !state.has_error() {
-                // Record attempt before executing
-                if let Some(stats) = state.stats() {
-                    stats.record_step_attempt(worker.core.scheduler.thread_id(), owned_step);
-                }
-
-                let (success, elapsed_ns, was_contention) = if collect_stats {
-                    let start = Instant::now();
-                    let (success, was_contention) =
-                        execute_step(state, group_state, fns, worker, owned_step);
-                    let elapsed = start.elapsed().as_nanos() as u64;
-                    (success, elapsed, was_contention)
-                } else {
-                    let (success, was_contention) =
-                        execute_step(state, group_state, fns, worker, owned_step);
-                    (success, 0, was_contention)
-                };
-
-                worker.core.scheduler.record_outcome(owned_step, success, was_contention);
-
-                if success {
-                    if let Some(stats) = state.stats() {
-                        stats.record_step_for_thread(
-                            owned_step,
-                            elapsed_ns,
-                            Some(worker.core.scheduler.thread_id()),
-                        );
-                    }
-                    did_work = true;
-                }
-            }
+            memory_high: !self.state.is_draining() && self.state.is_memory_high(),
+            memory_drained: self.state.is_memory_drained(),
         }
+    }
 
-        // Try each step in priority order, skipping Read and already-tried owned step
-        if !did_work {
-            let owned_step = worker.core.scheduler.exclusive_step_owned();
-            for &step in &priorities[..priority_count] {
-                if state.has_error() {
-                    break;
-                }
-
-                // Skip Read step - only thread 0 reads
-                if step == PipelineStep::Read {
-                    continue;
-                }
-
-                // Skip the owned exclusive step - we already tried it above
-                if Some(step) == owned_step {
-                    continue;
-                }
-
-                // Skip exclusive steps this thread doesn't own (eliminates contention)
-                // In drain mode (read_done && group_done), relax ownership to avoid starvation
-                if !worker.core.scheduler.should_attempt_step_with_drain(step, drain_mode) {
-                    continue;
-                }
-
-                // Record attempt before executing
-                if let Some(stats) = state.stats() {
-                    stats.record_step_attempt(worker.core.scheduler.thread_id(), step);
-                }
-
-                let (success, elapsed_ns, was_contention) = if collect_stats {
-                    let start = Instant::now();
-                    let (success, was_contention) =
-                        execute_step(state, group_state, fns, worker, step);
-                    let elapsed = start.elapsed().as_nanos() as u64;
-                    (success, elapsed, was_contention)
-                } else {
-                    let (success, was_contention) =
-                        execute_step(state, group_state, fns, worker, step);
-                    (success, 0, was_contention)
-                };
-
-                // Record outcome for adaptive schedulers
-                worker.core.scheduler.record_outcome(step, success, was_contention);
-
-                if success {
-                    // Record successful step timing
-                    if let Some(stats) = state.stats() {
-                        stats.record_step_for_thread(
-                            step,
-                            elapsed_ns,
-                            Some(worker.core.scheduler.thread_id()),
-                        );
-                    }
-                    did_work = true;
-                    break; // Restart priority evaluation
-                }
-            }
+    fn check_drain_mode(&self) {
+        let read_done = self.state.read_done.load(Ordering::Relaxed);
+        if read_done && self.state.q1_raw_blocks.is_empty() {
+            self.state.output.draining.store(true, Ordering::Relaxed);
         }
+    }
 
-        // Check for completion
-        // CRITICAL: Don't exit while holding items - they would be lost!
-        if state.is_complete() && !worker.has_any_held_items() {
-            break;
-        }
+    fn has_error(&self) -> bool {
+        self.state.has_error()
+    }
 
-        // Adaptive backoff: sleep longer when no work, reset when work found
-        if did_work {
-            worker.core.reset_backoff();
+    fn is_complete(&self) -> bool {
+        self.state.is_complete()
+    }
+
+    fn stats(&self) -> Option<&PipelineStats> {
+        self.state.stats()
+    }
+
+    fn skip_read(&self) -> bool {
+        // Always skip Read in priority loop:
+        // - Readers handle reading via sticky read before the priority loop
+        // - Workers don't read at all
+        true
+    }
+
+    fn check_completion_at_end(&self) -> bool {
+        true // Original BAM behavior: check completion at end of loop
+    }
+
+    fn should_attempt_sticky_read(&self) -> bool {
+        // Outer guard: skip entirely when read_done (original BAM optimization)
+        self.is_reader && !self.state.read_done.load(Ordering::Relaxed)
+    }
+
+    fn sticky_read_should_continue(&self) -> bool {
+        // Full condition checked each iteration
+        !self.state.has_error()
+            && !self.state.read_done.load(Ordering::Relaxed)
+            && self.state.q1_raw_blocks.len() < self.state.config.queue_capacity
+    }
+
+    fn execute_read_step(&self, worker: &mut Self::Worker) -> bool {
+        try_step_read(self.state, worker)
+    }
+
+    fn is_drain_mode(&self) -> bool {
+        let read_done = self.state.read_done.load(Ordering::Relaxed);
+        let group_done = self.state.group_done.load(Ordering::Relaxed);
+        read_done && group_done
+    }
+
+    fn should_attempt_step(
+        &self,
+        worker: &Self::Worker,
+        step: PipelineStep,
+        drain_mode: bool,
+    ) -> bool {
+        worker.core.scheduler.should_attempt_step_with_drain(step, drain_mode)
+    }
+
+    fn exclusive_step_owned(&self, worker: &Self::Worker) -> Option<PipelineStep> {
+        if self.is_reader {
+            // Reader thread doesn't use the "try owned first" pattern
+            // (it has sticky read instead)
+            None
         } else {
-            if let Some(stats) = state.stats() {
-                let idle_start = Instant::now();
-                worker.core.sleep_backoff();
-                stats.record_idle_for_thread(
-                    worker.core.scheduler.thread_id(),
-                    idle_start.elapsed().as_nanos() as u64,
-                );
-            } else {
-                worker.core.sleep_backoff();
-            }
-            // Exponential backoff up to max
-            worker.core.increase_backoff();
+            worker.core.scheduler.exclusive_step_owned()
         }
     }
 }
@@ -3047,14 +2845,13 @@ where
                         num_threads,
                         scheduler_strategy,
                     );
-                    if thread_id == 0 {
-                        // Thread 0: sticky reader - prioritizes reading until Q1 full
-                        worker_loop_reader(&state, &group_state, &fns, &mut worker);
-                    } else {
-                        // Threads 1..N-1: workers only
-                        // Each thread uses configured scheduler for step selection
-                        worker_loop_worker(&state, &group_state, &fns, &mut worker);
-                    }
+                    let ctx = BamStepContext {
+                        state: &state,
+                        group_state: &group_state,
+                        fns: &fns,
+                        is_reader: thread_id == 0,
+                    };
+                    generic_worker_loop(&ctx, &mut worker);
                 }));
 
                 // If a panic occurred, set the error flag so other threads exit
