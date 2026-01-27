@@ -848,6 +848,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     fn record_q7_push_progress(&self) {
         self.deadlock_state.record_q7_push();
     }
+
+    fn stats(&self) -> Option<&PipelineStats> {
+        self.output.stats.as_ref()
+    }
 }
 
 // ============================================================================
@@ -1443,6 +1447,9 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
     // Priority 3: Pop input and process
     // =========================================================================
     let Some((serial, raw_batch)) = state.q1_raw_blocks.pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(1);
+        }
         return false;
     };
     state.deadlock_state.record_q1_pop();
@@ -1745,6 +1752,9 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     // Priority 3: Pop input
     // =========================================================================
     let Some((serial, boundary_batch)) = state.q2b_boundaries.pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(25); // Q2b (boundaries queue)
+        }
         // Check if boundary finding is done and queue is empty
         if state.boundary_done.load(Ordering::SeqCst) && state.q2b_boundaries.is_empty() {
             state.decode_done.store(true, Ordering::SeqCst);
@@ -2194,6 +2204,9 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
         }
 
         let Some((serial, batch)) = state.output.groups.pop() else {
+            if let Some(stats) = state.stats() {
+                stats.record_queue_empty(4);
+            }
             break;
         };
         state.deadlock_state.record_q4_pop();
@@ -2275,6 +2288,9 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     // Priority 3: Pop input
     // =========================================================================
     let Some((serial, batch)) = state.output.processed.pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(5);
+        }
         return false;
     };
     state.deadlock_state.record_q5_pop();
@@ -2366,6 +2382,7 @@ fn try_step_write<G: Send, P: Send + MemoryEstimate>(
 
     // Drain Q7 into reorder buffer AND write all ready batches in single lock scope
     let mut wrote_any = false;
+    let q7_truly_empty;
     {
         let mut reorder = state.output.write_reorder.lock();
 
@@ -2397,6 +2414,17 @@ fn try_step_write<G: Send, P: Send + MemoryEstimate>(
             state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
             state.output.progress.log_if_needed(records_in_batch);
             wrote_any = true;
+        }
+
+        // Check if truly empty (queue drained and reorder buffer has no pending items)
+        q7_truly_empty = reorder.is_empty();
+    }
+
+    // Record queue empty only if both Q7 queue AND reorder buffer are empty
+    // (not when items are waiting out-of-order in the reorder buffer)
+    if !wrote_any && q7_truly_empty {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(7);
         }
     }
 
@@ -2550,7 +2578,8 @@ fn worker_loop_reader<
         }
 
         // Check for completion
-        if state.is_complete() {
+        // CRITICAL: Don't exit while holding items - they would be lost!
+        if state.is_complete() && !worker.has_any_held_items() {
             break;
         }
 
@@ -2723,7 +2752,8 @@ fn worker_loop_worker<
         }
 
         // Check for completion
-        if state.is_complete() {
+        // CRITICAL: Don't exit while holding items - they would be lost!
+        if state.is_complete() && !worker.has_any_held_items() {
             break;
         }
 

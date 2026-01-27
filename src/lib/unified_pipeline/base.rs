@@ -2470,15 +2470,20 @@ impl PipelineStats {
     }
 
     /// Record empty queue poll.
+    ///
+    /// Queue numbers: 1=raw, 2=decompressed, 25=boundaries (Q2b), 3=decoded,
+    /// 4=groups, 5=processed, 6=serialized, 7=compressed
     #[inline]
     pub fn record_queue_empty(&self, queue_num: usize) {
         match queue_num {
             1 => self.q1_empty.fetch_add(1, Ordering::Relaxed),
             2 => self.q2_empty.fetch_add(1, Ordering::Relaxed),
+            25 => self.q2b_empty.fetch_add(1, Ordering::Relaxed), // Q2b (boundaries)
             3 => self.q3_empty.fetch_add(1, Ordering::Relaxed),
             4 => self.q4_empty.fetch_add(1, Ordering::Relaxed),
             5 => self.q5_empty.fetch_add(1, Ordering::Relaxed),
             6 => self.q6_empty.fetch_add(1, Ordering::Relaxed),
+            7 => self.q7_empty.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }
@@ -3227,6 +3232,12 @@ pub trait OutputPipelineState: Send + Sync {
     fn record_q6_pop_progress(&self) {}
     /// Record progress when pushing to compressed queue (Q7).
     fn record_q7_push_progress(&self) {}
+
+    // Stats access (optional, with default no-op implementation)
+    /// Get reference to pipeline stats for recording metrics.
+    fn stats(&self) -> Option<&PipelineStats> {
+        None
+    }
 }
 
 /// Trait for types that have a BGZF compressor.
@@ -3319,6 +3330,9 @@ where
     // Priority 3: Pop from Q5
     // =========================================================================
     let Some((serial, serialized)) = state.q5_pop() else {
+        if let Some(stats) = state.stats() {
+            stats.record_queue_empty(6);
+        }
         return StepResult::InputEmpty;
     };
     state.record_q6_pop_progress();
@@ -3786,4 +3800,68 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
     }
 
     if wrote_any { StepResult::Success } else { StepResult::InputEmpty }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stats_record_step_timing() {
+        let stats = PipelineStats::new();
+
+        // Record some step timing
+        stats.record_step(PipelineStep::Decompress, 1_000_000); // 1ms
+        stats.record_step(PipelineStep::Decompress, 2_000_000); // 2ms
+
+        assert_eq!(stats.step_decompress_ns.load(Ordering::Relaxed), 3_000_000);
+        assert_eq!(stats.step_decompress_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_stats_record_step_for_thread() {
+        let stats = PipelineStats::new();
+
+        stats.record_step_for_thread(PipelineStep::Read, 500_000, Some(0));
+        stats.record_step_for_thread(PipelineStep::Read, 500_000, Some(1));
+
+        assert_eq!(stats.step_read_ns.load(Ordering::Relaxed), 1_000_000);
+        assert_eq!(stats.step_read_count.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.per_thread_step_counts[0][0].load(Ordering::Relaxed), 1);
+        assert_eq!(stats.per_thread_step_counts[1][0].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_stats_record_queue_empty() {
+        let stats = PipelineStats::new();
+
+        stats.record_queue_empty(1);
+        stats.record_queue_empty(1);
+        stats.record_queue_empty(2);
+        stats.record_queue_empty(25); // Q2b
+        stats.record_queue_empty(7);
+
+        assert_eq!(stats.q1_empty.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.q2_empty.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.q2b_empty.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.q7_empty.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.q3_empty.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_stats_record_idle_for_thread() {
+        let stats = PipelineStats::new();
+
+        stats.record_idle_for_thread(0, 100_000);
+        stats.record_idle_for_thread(0, 200_000);
+        stats.record_idle_for_thread(1, 50_000);
+
+        assert_eq!(stats.idle_yields.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.per_thread_idle_ns[0].load(Ordering::Relaxed), 300_000);
+        assert_eq!(stats.per_thread_idle_ns[1].load(Ordering::Relaxed), 50_000);
+    }
 }
