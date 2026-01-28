@@ -29,7 +29,9 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
+use crate::read_info::LibraryIndex;
 use crate::sam::record_utils::{mate_unclipped_end, mate_unclipped_start};
+use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use std::io::{Read, Write};
 
 /// The MI (Molecular Identifier) tag.
@@ -280,9 +282,19 @@ impl SortOrder {
 }
 
 /// Trait for sort keys that can be extracted from BAM records.
+///
+/// The `Context` associated type allows sort keys to pre-compute data from the header
+/// once (e.g., library index mapping) and reuse it for each record extraction.
 pub trait SortKey: Ord + Clone + Send + Sync {
-    /// Extract a sort key from a BAM record.
-    fn from_record(record: &RecordBuf, header: &Header) -> Result<Self>;
+    /// Context built once from header (e.g., `LibraryIndex` for template-coordinate).
+    /// Use `()` for keys that don't need context.
+    type Context: Clone + Send + Sync;
+
+    /// Build context from header (called once at sort start).
+    fn build_context(header: &Header) -> Self::Context;
+
+    /// Extract a sort key from a BAM record using pre-built context.
+    fn from_record(record: &RecordBuf, header: &Header, ctx: &Self::Context) -> Result<Self>;
 }
 
 // ============================================================================
@@ -330,7 +342,11 @@ impl PartialOrd for CoordinateKey {
 }
 
 impl SortKey for CoordinateKey {
-    fn from_record(record: &RecordBuf, _header: &Header) -> Result<Self> {
+    type Context = ();
+
+    fn build_context(_header: &Header) -> Self::Context {}
+
+    fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
         let name =
             record.name().map_or_else(Vec::new, |n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
 
@@ -522,7 +538,11 @@ impl PartialOrd for QuerynameKey {
 }
 
 impl SortKey for QuerynameKey {
-    fn from_record(record: &RecordBuf, _header: &Header) -> Result<Self> {
+    type Context = ();
+
+    fn build_context(_header: &Header) -> Self::Context {}
+
+    fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
         let name =
             record.name().map_or_else(Vec::new, |n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
         let flags = u16::from(record.flags());
@@ -685,9 +705,9 @@ impl RawSortKey for RawQuerynameKey {
 /// Sort key for template-coordinate ordering.
 ///
 /// Matches the sort order used by `samtools sort --template-coordinate` and
-/// required for `fgumi group` input.
+/// fgbio's `TemplateCoordinate` order for `fgumi group` input.
 ///
-/// Sort order:
+/// Sort order (matching fgbio):
 /// 1. tid1 - reference ID of earlier read
 /// 2. tid2 - reference ID of later read
 /// 3. pos1 - unclipped 5' position of earlier read
@@ -696,7 +716,8 @@ impl RawSortKey for RawQuerynameKey {
 /// 6. neg2 - strand of later read
 /// 7. MI tag (length first, then lexicographic, stripping /A /B suffix)
 /// 8. Read name
-/// 9. Whether this is the upper read of the pair
+/// 9. Library (ordinal index from header's @RG LB field)
+/// 10. Whether this is the upper read of the pair
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TemplateCoordinateKey {
     /// Reference ID of earlier read (`i32::MAX` for unmapped).
@@ -715,6 +736,8 @@ pub struct TemplateCoordinateKey {
     pub mid: String,
     /// Read name.
     pub name: Vec<u8>,
+    /// Library ordinal index (from `LibraryIndex`, 0 = unknown).
+    pub library_idx: u16,
     /// True if this is the "upper" (later) read of the pair.
     pub is_upper: bool,
 }
@@ -722,7 +745,7 @@ pub struct TemplateCoordinateKey {
 impl TemplateCoordinateKey {
     /// Create a key for an unmapped read.
     #[must_use]
-    pub fn unmapped(name: Vec<u8>, mid: String) -> Self {
+    pub fn unmapped(name: Vec<u8>, mid: String, library_idx: u16) -> Self {
         Self {
             tid1: i32::MAX,
             tid2: i32::MAX,
@@ -732,6 +755,7 @@ impl TemplateCoordinateKey {
             neg2: false,
             mid,
             name,
+            library_idx,
             is_upper: false,
         }
     }
@@ -757,6 +781,7 @@ impl Ord for TemplateCoordinateKey {
             })
             .then_with(|| compare_mid(&self.mid, &other.mid))
             .then_with(|| self.name.cmp(&other.name))
+            .then_with(|| self.library_idx.cmp(&other.library_idx))
             .then_with(|| self.is_upper.cmp(&other.is_upper))
     }
 }
@@ -793,16 +818,30 @@ fn strip_mi_suffix(mid: &str) -> &str {
 }
 
 impl SortKey for TemplateCoordinateKey {
-    fn from_record(record: &RecordBuf, _header: &Header) -> Result<Self> {
+    type Context = LibraryIndex;
+
+    fn build_context(header: &Header) -> Self::Context {
+        LibraryIndex::from_header(header)
+    }
+
+    fn from_record(record: &RecordBuf, _header: &Header, ctx: &Self::Context) -> Result<Self> {
         let name =
             record.name().map_or_else(Vec::new, |n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
 
         // Extract MI tag
         let mid = extract_mi_tag(record);
 
+        // Extract library index from RG tag (O(1) hash lookup)
+        let library_idx = if let Some(DataValue::String(rg_bytes)) = record.data().get(b"RG") {
+            let rg_hash = LibraryIndex::hash_rg(rg_bytes);
+            ctx.get(rg_hash)
+        } else {
+            0 // unknown library
+        };
+
         // Handle unmapped reads
         if record.flags().is_unmapped() {
-            return Ok(Self::unmapped(name, mid));
+            return Ok(Self::unmapped(name, mid, library_idx));
         }
 
         let flags = record.flags();
@@ -821,6 +860,7 @@ impl SortKey for TemplateCoordinateKey {
                     neg2: pa_info.neg2,
                     mid,
                     name,
+                    library_idx,
                     is_upper: false,
                 });
             }
@@ -876,7 +916,7 @@ impl SortKey for TemplateCoordinateKey {
                 (tid, tid, this_pos, this_pos, is_reverse, is_reverse, false)
             };
 
-        Ok(Self { tid1, tid2, pos1, pos2, neg1, neg2, mid, name, is_upper })
+        Ok(Self { tid1, tid2, pos1, pos2, neg1, neg2, mid, name, library_idx, is_upper })
     }
 }
 
@@ -1051,6 +1091,7 @@ mod tests {
             neg2: true,
             mid: String::new(),
             name: vec![],
+            library_idx: 0,
             is_upper: false,
         };
         let k2 = TemplateCoordinateKey {
@@ -1062,6 +1103,7 @@ mod tests {
             neg2: true,
             mid: String::new(),
             name: vec![],
+            library_idx: 0,
             is_upper: false,
         };
 
@@ -1080,6 +1122,7 @@ mod tests {
             neg2: false,
             mid: String::new(),
             name: vec![],
+            library_idx: 0,
             is_upper: false,
         };
         let k_fwd = TemplateCoordinateKey {
@@ -1091,10 +1134,149 @@ mod tests {
             neg2: false,
             mid: String::new(),
             name: vec![],
+            library_idx: 0,
             is_upper: false,
         };
 
         assert!(k_rev < k_fwd);
+    }
+
+    #[test]
+    fn test_template_coord_key_library_ordering() {
+        // Library comes after name in sort order
+        let k1 = TemplateCoordinateKey {
+            tid1: 0,
+            tid2: 0,
+            pos1: 100,
+            pos2: 200,
+            neg1: false,
+            neg2: false,
+            mid: String::new(),
+            name: b"read1".to_vec(),
+            library_idx: 1,
+            is_upper: false,
+        };
+        let k2 = TemplateCoordinateKey {
+            tid1: 0,
+            tid2: 0,
+            pos1: 100,
+            pos2: 200,
+            neg1: false,
+            neg2: false,
+            mid: String::new(),
+            name: b"read1".to_vec(),
+            library_idx: 2,
+            is_upper: false,
+        };
+
+        assert!(k1 < k2);
+    }
+
+    /// Comprehensive regression test for `TemplateCoordinateKey` comparison order.
+    /// Verifies each field is compared in the correct order:
+    /// `tid1` → `tid2` → `pos1` → `pos2` → `neg1` → `neg2` → `mid` → `name` → `library_idx` → `is_upper`
+    #[test]
+    fn test_template_coord_key_comparison_order_regression() {
+        // Helper to create a key with specific values
+        #[allow(clippy::too_many_arguments)]
+        fn key(
+            tid1: i32,
+            tid2: i32,
+            pos1: i64,
+            pos2: i64,
+            neg1: bool,
+            neg2: bool,
+            mid: &str,
+            name: &[u8],
+            library_idx: u16,
+            is_upper: bool,
+        ) -> TemplateCoordinateKey {
+            TemplateCoordinateKey {
+                tid1,
+                tid2,
+                pos1,
+                pos2,
+                neg1,
+                neg2,
+                mid: mid.to_string(),
+                name: name.to_vec(),
+                library_idx,
+                is_upper,
+            }
+        }
+
+        // Baseline key - all zeros/empty/false
+        let baseline = key(0, 0, 0, 0, false, false, "", b"", 0, false);
+
+        // 1. tid1 determines ordering when different
+        let higher_tid1 = key(1, 0, 0, 0, false, false, "", b"", 0, false);
+        assert!(baseline < higher_tid1, "tid1 should determine ordering");
+
+        // 2. tid2 determines ordering when tid1 matches
+        let higher_tid2 = key(0, 1, 0, 0, false, false, "", b"", 0, false);
+        assert!(baseline < higher_tid2, "tid2 should determine ordering when tid1 matches");
+
+        // 3. pos1 determines ordering when tid1, tid2 match
+        let higher_pos1 = key(0, 0, 1, 0, false, false, "", b"", 0, false);
+        assert!(baseline < higher_pos1, "pos1 should determine ordering when tids match");
+
+        // 4. pos2 determines ordering when tid1, tid2, pos1 match
+        let higher_pos2 = key(0, 0, 0, 1, false, false, "", b"", 0, false);
+        assert!(baseline < higher_pos2, "pos2 should determine ordering when tids and pos1 match");
+
+        // 5. neg1 determines ordering when tid1, tid2, pos1, pos2 match
+        // samtools ordering: reverse (true) sorts BEFORE forward (false)
+        let neg1_true = key(0, 0, 0, 0, true, false, "", b"", 0, false);
+        assert!(
+            neg1_true < baseline,
+            "neg1=true should sort before neg1=false (samtools ordering)"
+        );
+
+        // 6. neg2 determines ordering when tid1, tid2, pos1, pos2, neg1 match
+        let neg2_true = key(0, 0, 0, 0, false, true, "", b"", 0, false);
+        assert!(
+            neg2_true < baseline,
+            "neg2=true should sort before neg2=false (samtools ordering)"
+        );
+
+        // 7. mid determines ordering when positions and strands match
+        // MI comparison: length first, then lexicographic
+        let longer_mid = key(0, 0, 0, 0, false, false, "aa", b"", 0, false);
+        let shorter_mid = key(0, 0, 0, 0, false, false, "a", b"", 0, false);
+        assert!(shorter_mid < longer_mid, "shorter MI should sort before longer MI");
+
+        let mid_a = key(0, 0, 0, 0, false, false, "a", b"", 0, false);
+        let mid_b = key(0, 0, 0, 0, false, false, "b", b"", 0, false);
+        assert!(mid_a < mid_b, "MI comparison should be lexicographic when same length");
+
+        // 8. name determines ordering when mid matches
+        let name_a = key(0, 0, 0, 0, false, false, "", b"a", 0, false);
+        let name_b = key(0, 0, 0, 0, false, false, "", b"b", 0, false);
+        assert!(name_a < name_b, "name should determine ordering when mid matches");
+
+        // 9. library_idx determines ordering when name matches
+        let lib_0 = key(0, 0, 0, 0, false, false, "", b"a", 0, false);
+        let lib_1 = key(0, 0, 0, 0, false, false, "", b"a", 1, false);
+        assert!(lib_0 < lib_1, "library_idx should determine ordering when name matches");
+
+        // 10. is_upper determines ordering when everything else matches
+        let is_upper_false = key(0, 0, 0, 0, false, false, "", b"a", 0, false);
+        let is_upper_true = key(0, 0, 0, 0, false, false, "", b"a", 0, true);
+        assert!(
+            is_upper_false < is_upper_true,
+            "is_upper should determine ordering when all else matches"
+        );
+
+        // Verify that earlier fields take precedence over later fields
+        // tid1 difference should override all other fields
+        let k_low_tid1 = key(0, 10, 10, 10, true, true, "zzz", b"zzz", 10, true);
+        let k_high_tid1 = key(1, 0, 0, 0, false, false, "", b"", 0, false);
+        assert!(k_low_tid1 < k_high_tid1, "tid1 difference should override all later fields");
+
+        // pos1 difference should override later fields (but not tid1/tid2)
+        let k_low_pos1 = key(0, 0, 0, 10, true, true, "zzz", b"zzz", 10, true);
+        let k_high_pos1 = key(0, 0, 1, 0, false, false, "", b"", 0, false);
+        assert!(k_low_pos1 < k_high_pos1, "pos1 difference should override later fields");
     }
 
     #[test]
@@ -1167,7 +1349,8 @@ mod tests {
             .build();
 
         let header = Header::default();
-        let key = TemplateCoordinateKey::from_record(&record, &header).unwrap();
+        let ctx = TemplateCoordinateKey::build_context(&header);
+        let key = TemplateCoordinateKey::from_record(&record, &header, &ctx).unwrap();
 
         // Key should use pa tag coordinates, not actual coordinates (chr5:5000)
         assert_eq!(key.tid1, 0);
@@ -1193,7 +1376,8 @@ mod tests {
             .build();
 
         let header = Header::default();
-        let key = TemplateCoordinateKey::from_record(&record, &header).unwrap();
+        let ctx = TemplateCoordinateKey::build_context(&header);
+        let key = TemplateCoordinateKey::from_record(&record, &header, &ctx).unwrap();
 
         // Key should use own coordinates since no pa tag
         assert_eq!(key.tid1, 5);
