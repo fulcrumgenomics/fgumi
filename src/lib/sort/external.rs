@@ -180,6 +180,9 @@ impl ExternalSorter {
         let max_records = self.memory_limit / ESTIMATED_RECORD_SIZE;
         let mut stats = SortStats::default();
 
+        // Build context once (e.g., LibraryIndex for TemplateCoordinate)
+        let ctx = K::build_context(header);
+
         // Phase 1: Read and sort chunks
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut records: Vec<(K, RecordBuf)> = Vec::with_capacity(max_records);
@@ -191,8 +194,8 @@ impl ExternalSorter {
             let record = result.context("Failed to read BAM record")?;
             stats.total_records += 1;
 
-            // Extract sort key
-            let key = K::from_record(&record, header)?;
+            // Extract sort key using pre-built context
+            let key = K::from_record(&record, header, &ctx)?;
 
             // Estimate record memory usage
             let record_size = estimate_record_size(&record);
@@ -231,7 +234,7 @@ impl ExternalSorter {
             info!("Phase 2: Merging {} chunks...", chunk_files.len());
 
             // Phase 3: K-way merge
-            self.merge_chunks::<K>(&chunk_files, header, output)?;
+            self.merge_chunks::<K>(&chunk_files, header, output, &ctx)?;
         }
 
         stats.output_records = stats.total_records;
@@ -298,6 +301,7 @@ impl ExternalSorter {
         chunk_files: &[PathBuf],
         header: &Header,
         output: &Path,
+        ctx: &K::Context,
     ) -> Result<()> {
         // Create output header with sort order tags
         let output_header = self.create_output_header(header);
@@ -314,7 +318,7 @@ impl ExternalSorter {
             BinaryHeap::with_capacity(chunk_files.len());
 
         for reader in &mut chunk_readers {
-            if let Some((key, record)) = reader.next(header)? {
+            if let Some((key, record)) = reader.next(header, ctx)? {
                 heap.push(Reverse(HeapEntry { key, record, chunk_idx: reader.idx }));
             }
         }
@@ -330,7 +334,7 @@ impl ExternalSorter {
 
             // Get next record from the same chunk
             let reader = &mut chunk_readers[entry.chunk_idx];
-            if let Some((key, record)) = reader.next(header)? {
+            if let Some((key, record)) = reader.next(header, ctx)? {
                 heap.push(Reverse(HeapEntry { key, record, chunk_idx: reader.idx }));
             }
         }
@@ -352,6 +356,10 @@ impl ExternalSorter {
         let max_records = self.memory_limit / ESTIMATED_RECORD_SIZE;
         let mut stats = SortStats::default();
 
+        // Build context (empty for CoordinateKey, but needed for generic consistency)
+        #[allow(clippy::let_unit_value)]
+        let ctx = CoordinateKey::build_context(header);
+
         info!("Indexing enabled: will write BAM index alongside output");
 
         // Phase 1: Read and sort chunks
@@ -365,7 +373,7 @@ impl ExternalSorter {
             let record = result.context("Failed to read BAM record")?;
             stats.total_records += 1;
 
-            let key = CoordinateKey::from_record(&record, header)?;
+            let key = CoordinateKey::from_record(&record, header, &ctx)?;
             let record_size = estimate_record_size(&record);
             memory_used += record_size;
 
@@ -400,7 +408,7 @@ impl ExternalSorter {
             }
 
             info!("Phase 2: Merging {} chunks with index generation...", chunk_files.len());
-            self.merge_chunks_with_index(&chunk_files, header, &output_header, output)?;
+            self.merge_chunks_with_index(&chunk_files, header, &output_header, output, &ctx)?;
         }
 
         stats.output_records = stats.total_records;
@@ -446,12 +454,14 @@ impl ExternalSorter {
     }
 
     /// K-way merge with index generation.
+    #[allow(clippy::trivially_copy_pass_by_ref)] // Context is generic, () for CoordinateKey
     fn merge_chunks_with_index(
         &self,
         chunk_files: &[PathBuf],
         header: &Header,
         output_header: &Header,
         output: &Path,
+        ctx: &<CoordinateKey as SortKey>::Context,
     ) -> Result<()> {
         // Open chunk readers
         let mut chunk_readers: Vec<ChunkReader<CoordinateKey>> = chunk_files
@@ -465,7 +475,7 @@ impl ExternalSorter {
             BinaryHeap::with_capacity(chunk_files.len());
 
         for reader in &mut chunk_readers {
-            if let Some((key, record)) = reader.next(header)? {
+            if let Some((key, record)) = reader.next(header, ctx)? {
                 heap.push(Reverse(HeapEntry { key, record, chunk_idx: reader.idx }));
             }
         }
@@ -486,7 +496,7 @@ impl ExternalSorter {
             records_merged += 1;
 
             let reader = &mut chunk_readers[entry.chunk_idx];
-            if let Some((key, record)) = reader.next(header)? {
+            if let Some((key, record)) = reader.next(header, ctx)? {
                 heap.push(Reverse(HeapEntry { key, record, chunk_idx: reader.idx }));
             }
         }
@@ -601,12 +611,12 @@ impl<K: SortKey> ChunkReader<K> {
         Ok(Self { reader, idx, _phantom: std::marker::PhantomData })
     }
 
-    fn next(&mut self, header: &Header) -> Result<Option<(K, RecordBuf)>> {
+    fn next(&mut self, header: &Header, ctx: &K::Context) -> Result<Option<(K, RecordBuf)>> {
         let mut record = RecordBuf::default();
         match self.reader.read_record_buf(header, &mut record) {
             Ok(0) => Ok(None), // EOF
             Ok(_) => {
-                let key = K::from_record(&record, header)?;
+                let key = K::from_record(&record, header, ctx)?;
                 Ok(Some((key, record)))
             }
             Err(e) => Err(e.into()),
