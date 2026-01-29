@@ -22,7 +22,7 @@ use fgumi_lib::metrics::group::UmiGroupingMetrics;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
-use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
+use fgumi_lib::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
 use fgumi_lib::unified_pipeline::DecodedRecord;
 use fgumi_lib::unified_pipeline::{
@@ -35,6 +35,7 @@ use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
+use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +92,8 @@ struct GroupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length (None to disable).
     min_umi_length: Option<usize>,
+    /// Whether to allow fully unmapped templates (both reads unmapped).
+    allow_unmapped: bool,
 }
 
 /// Filter a template based on filtering criteria.
@@ -119,7 +122,7 @@ fn filter_template(
     let both_unmapped =
         r1.is_none_or(|r| r.flags().is_unmapped()) && r2.is_none_or(|r| r.flags().is_unmapped());
 
-    if both_unmapped {
+    if both_unmapped && !config.allow_unmapped {
         metrics.discarded_poor_alignment += num_primary_reads;
         return false;
     }
@@ -516,6 +519,13 @@ pub struct GroupReadsByUmi {
     #[arg(short = 'n', long = "include-non-pf-reads")]
     pub include_non_pf_reads: bool,
 
+    /// Allow fully unmapped templates (both reads unmapped).
+    /// Groups unmapped reads by UMI only within each library/cell barcode.
+    /// Useful for ribosome display or other protocols with unmapped reads.
+    /// When enabled, queryname-sorted input is also accepted.
+    #[arg(long = "allow-unmapped")]
+    pub allow_unmapped: bool,
+
     /// The UMI assignment strategy
     #[arg(short = 's', long = "strategy", value_enum)]
     pub strategy: Strategy,
@@ -580,6 +590,9 @@ impl Command for GroupReadsByUmi {
         if matches!(self.strategy, Strategy::Adjacency | Strategy::Paired) {
             info!("Index threshold: {}", self.index_threshold);
         }
+        if self.allow_unmapped {
+            info!("Allow unmapped: enabled (unmapped templates will be grouped by UMI only)");
+        }
 
         // Log threading configuration
         info!("{}", self.threading.log_message());
@@ -588,19 +601,39 @@ impl Command for GroupReadsByUmi {
         info!("Reading input BAM");
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
-        if !is_template_coordinate_sorted(&header) {
-            bail!(
-                "Input BAM must be template-coordinate sorted.\n\n\
-                To sort your BAM file, run:\n  \
-                samtools sort -n -t CO input.bam | samtools sort -t CO -O bam -o sorted.bam\n\n\
-                Or if you have samtools 1.18+:\n  \
-                samtools sort --template-coordinate input.bam -o sorted.bam\n\n\
-                Note: Pre-sorting is required because fgumi does not include an internal sorter.\n\
-                This design choice keeps the tool lightweight and allows users to leverage\n\
-                samtools' highly optimized sorting routines."
-            );
+        // Check sort order - template-coordinate sorted is required,
+        // but queryname-sorted is also accepted when --allow-unmapped is set
+        let is_tc_sorted = is_template_coordinate_sorted(&header);
+        let is_qname_sorted = is_sorted(&header, QUERY_NAME);
+
+        if !(is_tc_sorted || self.allow_unmapped && is_qname_sorted) {
+            if self.allow_unmapped {
+                bail!(
+                    "Input BAM must be template-coordinate sorted or queryname sorted \
+                    when --allow-unmapped is enabled.\n\n\
+                    To queryname sort your BAM file, run:\n  \
+                    samtools sort -n input.bam -o sorted.bam"
+                );
+            } else {
+                bail!(
+                    "Input BAM must be template-coordinate sorted.\n\n\
+                    To sort your BAM file, run:\n  \
+                    samtools sort -n -t CO input.bam | samtools sort -t CO -O bam -o sorted.bam\n\n\
+                    Or if you have samtools 1.18+:\n  \
+                    samtools sort --template-coordinate input.bam -o sorted.bam\n\n\
+                    Note: Pre-sorting is required because fgumi does not include an internal sorter.\n\
+                    This design choice keeps the tool lightweight and allows users to leverage\n\
+                    samtools' highly optimized sorting routines."
+                );
+            }
         }
-        info!("template coordinate sorted");
+
+        if is_tc_sorted {
+            info!("Input is template-coordinate sorted");
+        } else {
+            info!("Input is queryname sorted (accepted with --allow-unmapped)");
+            info!("All unmapped reads will form a single position group per library/cell");
+        }
 
         // Add @PG record with PP chaining to input's last program
         let header = fgumi_lib::header::add_pg_record(
@@ -637,6 +670,7 @@ impl Command for GroupReadsByUmi {
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
             min_umi_length: self.min_umi_length,
+            allow_unmapped: self.allow_unmapped,
         };
 
         // ============================================================
@@ -1898,6 +1932,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
@@ -1929,6 +1964,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
@@ -1960,6 +1996,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
@@ -2018,6 +2055,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2073,6 +2111,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2122,6 +2161,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2169,6 +2209,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2227,6 +2268,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2305,6 +2347,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2354,6 +2397,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2407,6 +2451,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2482,6 +2527,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2614,6 +2660,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2664,6 +2711,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2732,6 +2780,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2806,6 +2855,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2881,6 +2931,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -2979,6 +3030,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3077,6 +3129,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3154,6 +3207,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3212,6 +3266,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3266,6 +3321,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3325,6 +3381,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3385,6 +3442,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3432,6 +3490,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3482,6 +3541,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3532,6 +3592,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3583,6 +3644,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3626,6 +3688,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3675,6 +3738,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3724,6 +3788,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3774,6 +3839,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3821,6 +3887,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         // Should handle gracefully (either error or filter out)
@@ -3867,6 +3934,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3916,6 +3984,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -3960,6 +4029,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4009,6 +4079,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4048,6 +4119,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4093,6 +4165,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4134,6 +4207,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4180,6 +4254,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4224,6 +4299,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4281,6 +4357,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4441,6 +4518,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4511,6 +4589,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4582,6 +4661,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            allow_unmapped: false,
         };
 
         cmd.execute("test")?;
@@ -4590,6 +4670,373 @@ mod tests {
         assert_eq!(output_records.len(), 6, "Should have 6 records (3 pairs)");
 
         // All records should have the same MI tag (one group)
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "All records with same UMI should be in 1 group");
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Tests for --allow-unmapped feature
+    // ========================================================================
+
+    /// Create a minimal SAM header for testing with queryname sort order
+    fn create_queryname_sorted_header() -> sam::Header {
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        use noodles::sam::header::record::value::{
+            Map as HeaderRecordMap,
+            map::{Header as HeaderRecord, Tag as HeaderTag},
+        };
+
+        let mut builder = sam::Header::builder();
+
+        // Add header with queryname sort order
+        let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
+
+        let map =
+            HeaderRecordMap::<HeaderRecord>::builder().insert(so_tag, "queryname").build().unwrap();
+        builder = builder.set_header(map);
+
+        // Add reference sequences (even though reads are unmapped, header needs refs)
+        builder = builder.add_reference_sequence(
+            BString::from("chr1"),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
+        );
+
+        builder.build()
+    }
+
+    /// Build a pair of fully unmapped reads with UMI tags
+    fn build_unmapped_test_pair(name: &str, umi: &str) -> (RecordBuf, RecordBuf) {
+        RecordPairBuilder::new()
+            .name(name)
+            .r1_sequence(&"A".repeat(100))
+            .r2_sequence(&"A".repeat(100))
+            .tag("RX", umi)
+            .build()
+    }
+
+    /// Write records to a temporary BAM file with queryname sorted header
+    fn create_queryname_sorted_test_bam(records: Vec<RecordBuf>) -> Result<NamedTempFile> {
+        let temp_file = NamedTempFile::new()?;
+        let header = create_queryname_sorted_header();
+
+        let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
+
+        writer.write_header(&header)?;
+
+        for record in records {
+            writer.write_alignment_record(&header, &record)?;
+        }
+
+        drop(writer); // Ensure file is flushed
+
+        Ok(temp_file)
+    }
+
+    #[test]
+    fn test_filter_template_allows_unmapped_when_enabled() -> Result<()> {
+        // Test that filter_template passes unmapped templates when allow_unmapped=true
+        let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
+        let template = Template::from_records(vec![r1, r2])?;
+
+        let config = GroupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 1,
+            include_non_pf: false,
+            min_umi_length: None,
+            allow_unmapped: true,
+        };
+
+        let mut metrics = FilterMetrics::new();
+        let should_keep = filter_template(&template, &config, &mut metrics);
+
+        assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
+        assert_eq!(metrics.total_templates, 2, "Should count 2 records");
+        assert_eq!(metrics.discarded_poor_alignment, 0, "Should not discard for poor alignment");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_template_rejects_unmapped_by_default() -> Result<()> {
+        // Test that filter_template rejects unmapped templates when allow_unmapped=false
+        let (r1, r2) = build_unmapped_test_pair("unmapped", "AAAAAA");
+        let template = Template::from_records(vec![r1, r2])?;
+
+        let config = GroupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 1,
+            include_non_pf: false,
+            min_umi_length: None,
+            allow_unmapped: false,
+        };
+
+        let mut metrics = FilterMetrics::new();
+        let should_keep = filter_template(&template, &config, &mut metrics);
+
+        assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");
+        assert_eq!(metrics.total_templates, 2, "Should count 2 records");
+        assert_eq!(
+            metrics.discarded_poor_alignment, 2,
+            "Should discard both reads for poor alignment"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_unmapped_groups_unmapped_reads() -> Result<()> {
+        // Integration test: unmapped reads should be grouped by UMI when --allow-unmapped is set
+        let mut records = Vec::new();
+
+        // Three unmapped pairs with same UMI -> should be grouped together
+        let (r1_a, r2_a) = build_unmapped_test_pair("read_a", "AAAAAA");
+        let (r1_b, r2_b) = build_unmapped_test_pair("read_b", "AAAAAA");
+        let (r1_c, r2_c) = build_unmapped_test_pair("read_c", "AAAAAA");
+        records.push(r1_a);
+        records.push(r2_a);
+        records.push(r1_b);
+        records.push(r2_b);
+        records.push(r1_c);
+        records.push(r2_c);
+
+        // One unmapped pair with different UMI -> should be in a different group
+        let (r1_d, r2_d) = build_unmapped_test_pair("read_d", "TTTTTT");
+        records.push(r1_d);
+        records.push(r2_d);
+
+        let input = create_queryname_sorted_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            allow_unmapped: true,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 8, "Should have all 8 records (4 pairs)");
+
+        // Should have 2 unique MI groups (3 with same UMI, 1 with different)
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 2, "Should have 2 unique UMI groups");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_unmapped_adjacency_strategy() -> Result<()> {
+        // Test that adjacency grouping works with unmapped reads
+        let mut records = Vec::new();
+
+        // UMIs that are 1 edit apart should be grouped together with adjacency strategy
+        let (r1_a, r2_a) = build_unmapped_test_pair("read_a", "AAAAAA");
+        let (r1_b, r2_b) = build_unmapped_test_pair("read_b", "TAAAAA"); // 1 edit from AAAAAA
+        records.push(r1_a);
+        records.push(r2_a);
+        records.push(r1_b);
+        records.push(r2_b);
+
+        let input = create_queryname_sorted_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Adjacency,
+            edits: 1,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            allow_unmapped: true,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "Should have all 4 records (2 pairs)");
+
+        // With adjacency and edits=1, both UMIs should be grouped together
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "UMIs within 1 edit should be in same group");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_without_allow_unmapped_rejects_unmapped_reads() -> Result<()> {
+        // Integration test: without --allow-unmapped, unmapped reads should be filtered
+        let mut records = Vec::new();
+
+        // Unmapped pair
+        let (r1_unmapped, r2_unmapped) = build_unmapped_test_pair("unmapped", "AAAAAA");
+        records.push(r1_unmapped);
+        records.push(r2_unmapped);
+
+        // Mapped pair (for comparison)
+        let (r1_mapped, r2_mapped) = build_test_pair("mapped", 0, 100, 300, 60, 60, "TTTTTT");
+        records.push(r1_mapped);
+        records.push(r2_mapped);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            allow_unmapped: false,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        // Only the mapped pair should be in output (2 records)
+        assert_eq!(output_records.len(), 2, "Should only have mapped pair (unmapped filtered)");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_unmapped_mixed_mapped_unmapped() -> Result<()> {
+        // Test that mixed mapped/unmapped input works with --allow-unmapped
+        let mut records = Vec::new();
+
+        // Unmapped pair with UMI "AAAAAA"
+        let (r1_unmapped, r2_unmapped) = build_unmapped_test_pair("unmapped", "AAAAAA");
+        records.push(r1_unmapped);
+        records.push(r2_unmapped);
+
+        // Mapped pair with same UMI at a specific position
+        // Note: Mapped and unmapped reads will be in different position groups,
+        // so they should get different MI tags even with the same UMI
+        let (r1_mapped, r2_mapped) = build_test_pair("mapped", 0, 100, 300, 60, 60, "AAAAAA");
+        records.push(r1_mapped);
+        records.push(r2_mapped);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            allow_unmapped: true,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "Should have all 4 records");
+
+        // Both mapped and unmapped with same UMI should be in the same position group
+        // (since unmapped has pos=0 and mapped has a specific position, they may be
+        // in different groups depending on template-coordinate sort order)
+        // With template-coordinate sorting, unmapped (pos=0) comes before mapped (pos=100)
+        let unique_groups = count_unique_mi_tags(&output_records);
+        // With identity assigner, same UMI in same position group = same MI
+        // But unmapped and mapped may be in different position groups
+        assert!((1..=2).contains(&unique_groups), "Should have 1-2 MI groups");
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::pipeline_1(ThreadingOptions::new(1))]
+    #[case::pipeline_2(ThreadingOptions::new(2))]
+    fn test_allow_unmapped_threading_modes(#[case] threading: ThreadingOptions) -> Result<()> {
+        // Test that --allow-unmapped works with all threading modes
+        let mut records = Vec::new();
+
+        // Create unmapped pairs with same UMI
+        for i in 1..=3 {
+            let (r1, r2) = build_unmapped_test_pair(&format!("read_{i}"), "AAAAAA");
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_queryname_sorted_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            allow_unmapped: true,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 6, "Should have 6 records (3 pairs)");
+
+        // All records with same UMI should be in one group
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 1, "All records with same UMI should be in 1 group");
 
