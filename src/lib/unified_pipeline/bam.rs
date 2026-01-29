@@ -418,6 +418,10 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
     pub next_boundary_serial: AtomicU64,
     /// Count of batches that have completed boundary finding (for completion tracking).
     pub batches_boundary_found: AtomicU64,
+    /// Count of batches that `FindBoundaries` has processed (popped from `q2_reorder`).
+    /// Used for completion tracking - `FindBoundaries` only finishes when
+    /// `batches_boundary_processed == batches_decompressed`.
+    pub batches_boundary_processed: AtomicU64,
 
     // ========== Queue 2b: FindBoundaries → Decode ==========
     /// Boundary batches waiting to be decoded.
@@ -450,6 +454,9 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
     pub group_done: AtomicBool,
     /// Next serial number for output groups.
     pub next_group_serial: AtomicU64,
+    /// Count of batches that have been processed by Group step (popped from `q3_reorder`).
+    /// Used for completion tracking - Group only finishes when `batches_grouped == batches_boundary_found`.
+    pub batches_grouped: AtomicU64,
 
     // ========== Output-Half State (Group → Process → Serialize → Compress → Write) ==========
     /// Shared output pipeline queues and state.
@@ -504,6 +511,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             boundary_done: AtomicBool::new(false),
             next_boundary_serial: AtomicU64::new(0),
             batches_boundary_found: AtomicU64::new(0),
+            batches_boundary_processed: AtomicU64::new(0),
             // Q2b: FindBoundaries → Decode
             q2b_boundaries: ArrayQueue::new(cap),
             // Step 4: Decode
@@ -519,6 +527,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             // Step 5: Group
             group_done: AtomicBool::new(false),
             next_group_serial: AtomicU64::new(0),
+            batches_grouped: AtomicU64::new(0),
             // Output-half state (Group → Process → Serialize → Compress → Write)
             output: OutputPipelineQueues::new(cap, output, stats, "Processed records"),
             // Deadlock detection
@@ -1635,6 +1644,9 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
         };
         state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
 
+        // Track that we've processed a batch from q2 (for completion tracking)
+        state.batches_boundary_processed.fetch_add(1, Ordering::Release);
+
         // Find boundaries in the decompressed data
         match boundary_guard.find_boundaries(&batch.data) {
             Ok(boundary_batch) => {
@@ -1675,13 +1687,18 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     }
 
     // No batches processed - check if we should finish
-    // Use atomic counter for completion check (not reorder buffer next_seq)
-    // This avoids TOCTOU races because the counter is incremented atomically after push.
+    // Completion check: Only finish when THIS step has processed all input batches.
+    // We check batches_boundary_processed == total_read directly, which implies that
+    // Decompress has also finished (since we can't process more than was decompressed).
+    // This prevents a race where FindBoundaries sets boundary_done while data is still
+    // in q2_decompressed waiting to be processed.
     let read_done = state.read_done.load(Ordering::Acquire);
     let total_read = state.next_read_serial.load(Ordering::Acquire);
-    let total_decompressed = state.batches_decompressed.load(Ordering::Acquire);
+    let batches_boundary_processed = state.batches_boundary_processed.load(Ordering::Acquire);
 
-    if read_done && total_decompressed == total_read && !state.boundary_done.load(Ordering::Acquire)
+    if read_done
+        && batches_boundary_processed == total_read
+        && !state.boundary_done.load(Ordering::Acquire)
     {
         // All input processed - finish and emit any remaining boundaries
         match boundary_guard.finish() {
@@ -2019,6 +2036,9 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
         };
         state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
 
+        // Track that we've processed a batch from q3 (for completion tracking)
+        state.batches_grouped.fetch_add(1, Ordering::Release);
+
         // Process the decoded records
         match guard.process(records) {
             Ok(groups) => {
@@ -2081,11 +2101,14 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
 
     // Use atomic counters for completion check (not reorder buffer next_seq)
     // This avoids TOCTOU races because counters are incremented atomically after push.
+    // CRITICAL: We use batches_grouped (batches processed by Group), NOT batches_decoded
+    // (batches pushed to q3). Using batches_decoded caused a race where Group would finish
+    // before actually processing all the data in q3.
     let boundary_done = state.boundary_done.load(Ordering::Acquire);
     let total_boundary_batches = state.batches_boundary_found.load(Ordering::Acquire);
-    let total_decoded = state.batches_decoded.load(Ordering::Acquire);
+    let batches_grouped = state.batches_grouped.load(Ordering::Acquire);
 
-    if boundary_done && total_decoded == total_boundary_batches {
+    if boundary_done && batches_grouped == total_boundary_batches {
         // All input processed - finish and emit any remaining group
         match guard.finish() {
             Ok(Some(group)) => {
@@ -2244,7 +2267,6 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
             break;
         };
         state.deadlock_state.record_q4_pop();
-
         // Process each group in the batch
         let mut results: Vec<P> = Vec::with_capacity(batch.len());
         for group in batch {
