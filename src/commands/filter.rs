@@ -40,6 +40,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -334,7 +335,11 @@ impl Filter {
         )?;
 
         // Create reference reader for tag regeneration (always enabled, matching fgbio behavior)
+        info!("Loading reference genome into memory...");
+        let ref_load_start = Instant::now();
         let reference_reader = Some(ReferenceReader::new(&self.reference)?);
+        let ref_load_elapsed = ref_load_start.elapsed();
+        info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
 
         // Process reads
         let mut total_reads = 0;
@@ -641,8 +646,12 @@ impl Filter {
         ));
 
         // Load reference for tag regeneration (always enabled, matching fgbio behavior)
+        info!("Loading reference genome into memory...");
+        let ref_load_start = Instant::now();
         let reference: Option<Arc<ReferenceReader>> =
             Some(Arc::new(ReferenceReader::new(&self.reference)?));
+        let ref_load_elapsed = ref_load_start.elapsed();
+        info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedFilterMetrics>> = Arc::new(SegQueue::new());
@@ -862,8 +871,12 @@ impl Filter {
         ));
 
         // Load reference for tag regeneration (always enabled, matching fgbio behavior)
+        info!("Loading reference genome into memory...");
+        let ref_load_start = Instant::now();
         let reference: Option<Arc<ReferenceReader>> =
             Some(Arc::new(ReferenceReader::new(&self.reference)?));
+        let ref_load_elapsed = ref_load_start.elapsed();
+        info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedFilterMetrics>> = Arc::new(SegQueue::new());
