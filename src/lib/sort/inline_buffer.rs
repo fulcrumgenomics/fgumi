@@ -11,7 +11,6 @@
 
 use crate::sort::keys::{RawSortKey, SortContext};
 use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 
 // ============================================================================
@@ -66,13 +65,14 @@ impl PackedCoordKey {
 ///
 /// This is a lightweight handle that can be sorted efficiently.
 /// The actual record data stays in place in the buffer.
+///
+/// Note: No read name tie-breaking is used, matching samtools behavior.
+/// Equal records maintain their original input order (stable sort).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct RecordRef {
     /// Packed primary sort key for fast comparison.
     pub sort_key: u64,
-    /// Hash of read name for secondary sort (tie-breaker).
-    pub name_hash: u64,
     /// Offset into `RecordBuffer` where record header starts.
     pub offset: u64,
     /// Length of raw BAM data (excluding inline header).
@@ -83,7 +83,7 @@ pub struct RecordRef {
 
 impl PartialEq for RecordRef {
     fn eq(&self, other: &Self) -> bool {
-        self.sort_key == other.sort_key && self.name_hash == other.name_hash
+        self.sort_key == other.sort_key
     }
 }
 
@@ -97,7 +97,7 @@ impl PartialOrd for RecordRef {
 
 impl Ord for RecordRef {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.sort_key.cmp(&other.sort_key).then_with(|| self.name_hash.cmp(&other.name_hash))
+        self.sort_key.cmp(&other.sort_key)
     }
 }
 
@@ -114,15 +114,13 @@ impl Ord for RecordRef {
 struct InlineHeader {
     /// Pre-computed packed sort key.
     sort_key: u64,
-    /// Pre-computed name hash.
-    name_hash: u64,
     /// Length of following raw BAM data.
     record_len: u32,
     /// Padding for 8-byte alignment.
     padding: u32,
 }
 
-const HEADER_SIZE: usize = std::mem::size_of::<InlineHeader>(); // 24 bytes
+const HEADER_SIZE: usize = std::mem::size_of::<InlineHeader>(); // 16 bytes
 
 // ============================================================================
 // RecordBuffer - Main Data Structure
@@ -171,14 +169,13 @@ impl RecordBuffer {
         let len = record.len() as u32;
 
         // Extract sort key from raw BAM bytes
-        let (sort_key, name_hash) = extract_coordinate_key_inline(record, self.nref);
+        let sort_key = extract_coordinate_key_inline(record, self.nref);
 
-        // Write inline header (24 bytes)
-        let header = InlineHeader { sort_key, name_hash, record_len: len, padding: 0 };
+        // Write inline header (16 bytes)
+        let header = InlineHeader { sort_key, record_len: len, padding: 0 };
 
         // Extend data with header bytes
         self.data.extend_from_slice(&header.sort_key.to_le_bytes());
-        self.data.extend_from_slice(&header.name_hash.to_le_bytes());
         self.data.extend_from_slice(&header.record_len.to_le_bytes());
         self.data.extend_from_slice(&header.padding.to_le_bytes());
 
@@ -186,19 +183,22 @@ impl RecordBuffer {
         self.data.extend_from_slice(record);
 
         // Add to index
-        self.refs.push(RecordRef { sort_key, name_hash, offset, len, padding: 0 });
+        self.refs.push(RecordRef { sort_key, offset, len, padding: 0 });
     }
 
     /// Sort the index by key (records stay in place).
+    ///
+    /// Uses stable sort to maintain input order for equal keys (matching samtools).
     pub fn sort(&mut self) {
-        // Use unstable sort for better performance (no stability needed)
-        self.refs.sort_unstable();
+        self.refs.sort();
     }
 
     /// Sort using parallel sort (for large arrays).
+    ///
+    /// Uses stable sort to maintain input order for equal keys (matching samtools).
     pub fn par_sort(&mut self) {
         use rayon::prelude::*;
-        self.refs.par_sort_unstable();
+        self.refs.par_sort();
     }
 
     /// Get record bytes by reference.
@@ -264,14 +264,15 @@ impl RecordBuffer {
 /// - Reads with valid tid (>= 0) are sorted by (tid, pos, reverse)
 /// - Reads with tid = -1 (no reference) sort at the end
 /// - Unmapped reads with a valid tid use that tid for sorting (typically mate's position)
+///
+/// Note: No read name tie-breaking is used, matching samtools behavior.
+/// Equal records maintain their original input order (stable sort).
 #[inline]
-fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> (u64, u64) {
+fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
     // BAM format offsets (all little-endian):
     // 0-3: tid (i32)
     // 4-7: pos (i32)
-    // 8: l_read_name (u8)
     // 14-15: flags (u16)
-    // 32+: read name (null-terminated)
 
     let tid = i32::from_le_bytes([bam[0], bam[1], bam[2], bam[3]]);
     let pos = i32::from_le_bytes([bam[4], bam[5], bam[6], bam[7]]);
@@ -281,27 +282,11 @@ fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> (u64, u64) {
     // Pack key based on tid (samtools behavior):
     // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
     // - tid < 0: unmapped with no reference, sort at end
-    let sort_key = if tid < 0 {
+    if tid < 0 {
         PackedCoordKey::unmapped().0
     } else {
         PackedCoordKey::new(tid, pos, reverse, nref).0
-    };
-
-    // Hash read name for tie-breaking
-    let name_len = (bam[8] as usize).saturating_sub(1); // Exclude null terminator
-    let name =
-        if name_len > 0 && 32 + name_len <= bam.len() { &bam[32..32 + name_len] } else { &[] };
-    let name_hash = hash_name(name);
-
-    (sort_key, name_hash)
-}
-
-/// Fast name hashing using ahash (same hasher as used elsewhere in fgumi).
-#[inline]
-fn hash_name(name: &[u8]) -> u64 {
-    let mut hasher = ahash::AHasher::default();
-    name.hash(&mut hasher);
-    hasher.finish()
+    }
 }
 
 // ============================================================================
