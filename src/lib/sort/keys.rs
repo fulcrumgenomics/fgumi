@@ -27,7 +27,6 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
 
 use crate::read_info::LibraryIndex;
 use crate::sam::record_utils::{mate_unclipped_end, mate_unclipped_start};
@@ -305,6 +304,9 @@ pub trait SortKey: Ord + Clone + Send + Sync {
 ///
 /// Sort order: reference ID → position → reverse strand flag.
 /// Unmapped reads (tid = -1) are sorted to the end.
+///
+/// Note: No read name tie-breaking is used, matching samtools behavior.
+/// Equal records maintain their original input order (stable sort).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CoordinateKey {
     /// Reference sequence ID (tid), or `i32::MAX` for unmapped.
@@ -313,15 +315,13 @@ pub struct CoordinateKey {
     pub pos: i64,
     /// True if reverse strand.
     pub reverse: bool,
-    /// Read name for tie-breaking (lexicographic).
-    pub name: Vec<u8>,
 }
 
 impl CoordinateKey {
     /// Create a coordinate key for an unmapped read.
     #[must_use]
-    pub fn unmapped(name: Vec<u8>) -> Self {
-        Self { tid: i32::MAX, pos: i64::MAX, reverse: false, name }
+    pub fn unmapped() -> Self {
+        Self { tid: i32::MAX, pos: i64::MAX, reverse: false }
     }
 }
 
@@ -331,7 +331,6 @@ impl Ord for CoordinateKey {
             .cmp(&other.tid)
             .then_with(|| self.pos.cmp(&other.pos))
             .then_with(|| self.reverse.cmp(&other.reverse))
-            .then_with(|| self.name.cmp(&other.name))
     }
 }
 
@@ -347,11 +346,8 @@ impl SortKey for CoordinateKey {
     fn build_context(_header: &Header) -> Self::Context {}
 
     fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
-        let name =
-            record.name().map_or_else(Vec::new, |n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
-
         if record.flags().is_unmapped() {
-            return Ok(Self::unmapped(name));
+            return Ok(Self::unmapped());
         }
 
         #[allow(clippy::cast_possible_wrap)]
@@ -362,7 +358,7 @@ impl SortKey for CoordinateKey {
 
         let reverse = record.flags().is_reverse_complemented();
 
-        Ok(Self { tid, pos, reverse, name })
+        Ok(Self { tid, pos, reverse })
     }
 }
 
@@ -370,27 +366,24 @@ impl SortKey for CoordinateKey {
 // Raw Coordinate Sort Key (Fixed-size for RawSortKey trait)
 // ============================================================================
 
-/// Fixed-size coordinate sort key for raw BAM sorting (16 bytes).
+/// Fixed-size coordinate sort key for raw BAM sorting (8 bytes).
 ///
 /// This key is designed for efficient temp file storage and O(1) comparisons
 /// during merge phase. It packs:
 /// - `sort_key`: (tid << 34) | ((pos+1) << 1) | reverse
-/// - `name_hash`: Hash of read name for deterministic tie-breaking
 ///
-/// Unlike [`CoordinateKey`], this type doesn't store the actual read name,
-/// making it fixed-size (16 bytes) instead of variable-length.
+/// Note: No read name tie-breaking is used, matching samtools behavior.
+/// Equal records maintain their original input order (stable sort).
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RawCoordinateKey {
     /// Packed primary sort key: (tid << 34) | ((pos+1) << 1) | reverse.
     pub sort_key: u64,
-    /// Hash of read name for deterministic tie-breaking.
-    pub name_hash: u64,
 }
 
 impl RawCoordinateKey {
     /// Size in bytes when serialized.
-    pub const SIZE: usize = 16;
+    pub const SIZE: usize = 8;
 
     /// Create a new coordinate key from components.
     ///
@@ -398,32 +391,31 @@ impl RawCoordinateKey {
     /// * `tid` - Reference sequence ID (-1 for unmapped)
     /// * `pos` - 0-based alignment position
     /// * `reverse` - True if reverse complemented
-    /// * `name_hash` - Hash of read name
     /// * `nref` - Number of reference sequences (for unmapped handling)
     #[inline]
     #[must_use]
-    pub fn new(tid: i32, pos: i32, reverse: bool, name_hash: u64, nref: u32) -> Self {
+    pub fn new(tid: i32, pos: i32, reverse: bool, nref: u32) -> Self {
         // Map unmapped (tid=-1) to nref for proper sorting (after all mapped)
         let tid = if tid < 0 { nref } else { tid as u32 };
         // Pack: tid in high bits, (pos+1) in middle, reverse in LSB
         let key = (u64::from(tid) << 34)
             | ((i64::from(pos) as u64).wrapping_add(1) << 1)
             | u64::from(reverse);
-        Self { sort_key: key, name_hash }
+        Self { sort_key: key }
     }
 
     /// Create a key for unmapped records (sorts after all mapped).
     #[inline]
     #[must_use]
-    pub fn unmapped(name_hash: u64) -> Self {
-        Self { sort_key: u64::MAX, name_hash }
+    pub fn unmapped() -> Self {
+        Self { sort_key: u64::MAX }
     }
 
     /// Create a zeroed key (for memory operations).
     #[inline]
     #[must_use]
     pub fn zeroed() -> Self {
-        Self { sort_key: 0, name_hash: 0 }
+        Self { sort_key: 0 }
     }
 }
 
@@ -436,7 +428,7 @@ impl Default for RawCoordinateKey {
 impl Ord for RawCoordinateKey {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.sort_key.cmp(&other.sort_key).then_with(|| self.name_hash.cmp(&other.name_hash))
+        self.sort_key.cmp(&other.sort_key)
     }
 }
 
@@ -455,58 +447,30 @@ impl RawSortKey for RawCoordinateKey {
         // BAM format offsets (all little-endian):
         // 0-3: tid (i32)
         // 4-7: pos (i32)
-        // 8: l_read_name (u8)
         // 14-15: flags (u16)
-        // 32+: read name (null-terminated)
 
         let tid = i32::from_le_bytes([bam[0], bam[1], bam[2], bam[3]]);
         let pos = i32::from_le_bytes([bam[4], bam[5], bam[6], bam[7]]);
         let flags = u16::from_le_bytes([bam[14], bam[15]]);
         let reverse = (flags & 0x10) != 0;
 
-        // Hash read name for tie-breaking (exclude null terminator)
-        let name_len = (bam[8] as usize).saturating_sub(1);
-        let name =
-            if name_len > 0 && 32 + name_len <= bam.len() { &bam[32..32 + name_len] } else { &[] };
-        let name_hash = hash_name(name);
-
         // Create key based on tid (samtools behavior):
         // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
         // - tid < 0: unmapped with no reference, sort at end
-        if tid < 0 {
-            Self::unmapped(name_hash)
-        } else {
-            Self::new(tid, pos, reverse, name_hash, ctx.nref)
-        }
+        if tid < 0 { Self::unmapped() } else { Self::new(tid, pos, reverse, ctx.nref) }
     }
 
     #[inline]
     fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        writer.write_all(&self.sort_key.to_le_bytes())?;
-        writer.write_all(&self.name_hash.to_le_bytes())
+        writer.write_all(&self.sort_key.to_le_bytes())
     }
 
     #[inline]
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 8];
         reader.read_exact(&mut buf)?;
-        Ok(Self {
-            sort_key: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            name_hash: u64::from_le_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]),
-        })
+        Ok(Self { sort_key: u64::from_le_bytes(buf) })
     }
-}
-
-/// Fast name hashing using ahash.
-#[inline]
-fn hash_name(name: &[u8]) -> u64 {
-    let mut hasher = ahash::AHasher::default();
-    name.hash(&mut hasher);
-    hasher.finish()
 }
 
 // ============================================================================
@@ -1092,9 +1056,9 @@ mod tests {
 
     #[test]
     fn test_coordinate_key_ordering() {
-        let k1 = CoordinateKey { tid: 0, pos: 100, reverse: false, name: vec![] };
-        let k2 = CoordinateKey { tid: 0, pos: 200, reverse: false, name: vec![] };
-        let k3 = CoordinateKey { tid: 1, pos: 50, reverse: false, name: vec![] };
+        let k1 = CoordinateKey { tid: 0, pos: 100, reverse: false };
+        let k2 = CoordinateKey { tid: 0, pos: 200, reverse: false };
+        let k3 = CoordinateKey { tid: 1, pos: 50, reverse: false };
 
         assert!(k1 < k2);
         assert!(k2 < k3);
@@ -1102,8 +1066,8 @@ mod tests {
 
     #[test]
     fn test_coordinate_key_unmapped_last() {
-        let mapped = CoordinateKey { tid: 0, pos: 100, reverse: false, name: vec![] };
-        let unmapped = CoordinateKey::unmapped(vec![]);
+        let mapped = CoordinateKey { tid: 0, pos: 100, reverse: false };
+        let unmapped = CoordinateKey::unmapped();
 
         assert!(mapped < unmapped);
     }

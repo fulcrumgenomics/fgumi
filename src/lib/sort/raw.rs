@@ -587,7 +587,7 @@ impl RawExternalSorter {
                     self.threads,
                 )?;
                 for r in buffer.refs() {
-                    let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
+                    let key = RawCoordinateKey { sort_key: r.sort_key };
                     let record_bytes = buffer.get_record(r);
                     writer.write_record(&key, record_bytes)?;
                 }
@@ -639,7 +639,7 @@ impl RawExternalSorter {
                     .refs()
                     .iter()
                     .map(|r| {
-                        let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
+                        let key = RawCoordinateKey { sort_key: r.sort_key };
                         let record_bytes = buffer.get_record(r).to_vec();
                         (key, record_bytes)
                     })
@@ -712,7 +712,7 @@ impl RawExternalSorter {
                     self.threads,
                 )?;
                 for r in buffer.refs() {
-                    let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
+                    let key = RawCoordinateKey { sort_key: r.sort_key };
                     let record_bytes = buffer.get_record(r);
                     writer.write_record(&key, record_bytes)?;
                 }
@@ -771,7 +771,7 @@ impl RawExternalSorter {
                     .refs()
                     .iter()
                     .map(|r| {
-                        let key = RawCoordinateKey { sort_key: r.sort_key, name_hash: r.name_hash };
+                        let key = RawCoordinateKey { sort_key: r.sort_key };
                         let record_bytes = buffer.get_record(r).to_vec();
                         (key, record_bytes)
                     })
