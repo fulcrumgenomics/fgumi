@@ -513,6 +513,33 @@ fn hash_name(name: &[u8]) -> u64 {
 // Queryname Sort Key
 // ============================================================================
 
+/// Transform flags for queryname sort ordering.
+///
+/// Matches samtools' queryname sort order (`bam_sort.c` lines 245-248):
+/// ```c
+/// // Sort order is READ1, READ2, (PRIMARY), SUPPLEMENTARY, SECONDARY
+/// fa = ((fa&0xc0)<<8)|((fa&0x100)<<3)|((fa&0x800)>>3);
+/// ```
+///
+/// This transforms the relevant flag bits into a value that sorts correctly:
+/// - R1 (0x40) and R2 (0x80) bits are shifted to high positions (bits 14-15)
+/// - SECONDARY (0x100) is shifted to middle (bit 11)
+/// - SUPPLEMENTARY (0x800) is shifted to low position (bit 8)
+///
+/// The resulting sort order is:
+/// 1. NONE (unpaired) - 0x0000
+/// 2. R1 PRIMARY      - 0x4000
+/// 3. R1 SUPPLEMENTARY - 0x4100
+/// 4. R1 SECONDARY    - 0x4800
+/// 5. R2 PRIMARY      - 0x8000
+/// 6. R2 SUPPLEMENTARY - 0x8100
+/// 7. R2 SECONDARY    - 0x8800
+#[inline]
+#[must_use]
+pub const fn queryname_flag_order(flags: u16) -> u16 {
+    ((flags & 0xc0) << 8) | ((flags & 0x100) << 3) | ((flags & 0x800) >> 3)
+}
+
 /// Sort key for queryname ordering.
 ///
 /// Uses natural string ordering where numeric runs are compared numerically.
@@ -545,7 +572,7 @@ impl SortKey for QuerynameKey {
     fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
         let name =
             record.name().map_or_else(Vec::new, |n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
-        let flags = u16::from(record.flags());
+        let flags = queryname_flag_order(u16::from(record.flags()));
         Ok(Self { name, flags })
     }
 }
@@ -664,7 +691,8 @@ impl RawSortKey for RawQuerynameKey {
         } else {
             Vec::new()
         };
-        let flags = u16::from_le_bytes([bam[14], bam[15]]);
+        let raw_flags = u16::from_le_bytes([bam[14], bam[15]]);
+        let flags = queryname_flag_order(raw_flags);
 
         Self { name, flags }
     }
@@ -1543,5 +1571,247 @@ mod tests {
         // Values are stored as provided, even if "out of order"
         assert_eq!(info.pos1, 2000); // pos1 > pos2 is allowed
         assert_eq!(info.pos2, 1000);
+    }
+
+    // ========================================================================
+    // queryname_flag_order tests
+    // ========================================================================
+
+    /// Test exact transformation values match samtools formula.
+    /// Formula: ((flags & 0xc0) << 8) | ((flags & 0x100) << 3) | ((flags & 0x800) >> 3)
+    #[test]
+    fn test_queryname_flag_order_exact_transformation_values() {
+        // Flag bits:
+        // 0x40  = READ1 (bit 6)
+        // 0x80  = READ2 (bit 7)
+        // 0x100 = SECONDARY (bit 8)
+        // 0x800 = SUPPLEMENTARY (bit 11)
+
+        // NONE (unpaired primary)
+        assert_eq!(queryname_flag_order(0x0000), 0x0000);
+
+        // R1 PRIMARY: 0x40 << 8 = 0x4000
+        assert_eq!(queryname_flag_order(0x0040), 0x4000);
+
+        // R2 PRIMARY: 0x80 << 8 = 0x8000
+        assert_eq!(queryname_flag_order(0x0080), 0x8000);
+
+        // SECONDARY only: 0x100 << 3 = 0x800
+        assert_eq!(queryname_flag_order(0x0100), 0x0800);
+
+        // SUPPLEMENTARY only: 0x800 >> 3 = 0x100
+        assert_eq!(queryname_flag_order(0x0800), 0x0100);
+
+        // R1 SUPPLEMENTARY: (0x40 << 8) | (0x800 >> 3) = 0x4000 | 0x100 = 0x4100
+        assert_eq!(queryname_flag_order(0x0840), 0x4100);
+
+        // R1 SECONDARY: (0x40 << 8) | (0x100 << 3) = 0x4000 | 0x800 = 0x4800
+        assert_eq!(queryname_flag_order(0x0140), 0x4800);
+
+        // R2 SUPPLEMENTARY: (0x80 << 8) | (0x800 >> 3) = 0x8000 | 0x100 = 0x8100
+        assert_eq!(queryname_flag_order(0x0880), 0x8100);
+
+        // R2 SECONDARY: (0x80 << 8) | (0x100 << 3) = 0x8000 | 0x800 = 0x8800
+        assert_eq!(queryname_flag_order(0x0180), 0x8800);
+    }
+
+    /// Test the complete sort order of all 12 categories.
+    /// Order: NONE < R1 PRIMARY < R1 SUPP < R1 SEC < R2 PRIMARY < R2 SUPP < R2 SEC
+    ///        (and combined R1+R2 categories)
+    #[test]
+    fn test_queryname_flag_order_complete_sort_order() {
+        // All 12 possible combinations sorted in expected order
+        let flags_in_order = [
+            // NONE (unpaired)
+            0x0000u16, // NONE PRIMARY
+            0x0800,    // NONE SUPPLEMENTARY
+            0x0100,    // NONE SECONDARY
+            // R1
+            0x0040, // R1 PRIMARY
+            0x0840, // R1 SUPPLEMENTARY
+            0x0140, // R1 SECONDARY
+            // R2
+            0x0080, // R2 PRIMARY
+            0x0880, // R2 SUPPLEMENTARY
+            0x0180, // R2 SECONDARY
+            // R1+R2 (unusual but possible in edge cases)
+            0x00c0, // R1+R2 PRIMARY
+            0x08c0, // R1+R2 SUPPLEMENTARY
+            0x01c0, // R1+R2 SECONDARY
+        ];
+
+        // Transform all flags
+        let transformed: Vec<u16> =
+            flags_in_order.iter().map(|&f| queryname_flag_order(f)).collect();
+
+        // Verify sorted order
+        for i in 0..transformed.len() - 1 {
+            assert!(
+                transformed[i] < transformed[i + 1],
+                "Expected flags 0x{:04x} (transformed 0x{:04x}) < 0x{:04x} (transformed 0x{:04x})",
+                flags_in_order[i],
+                transformed[i],
+                flags_in_order[i + 1],
+                transformed[i + 1]
+            );
+        }
+    }
+
+    /// Test R1 always sorts before R2.
+    #[test]
+    fn test_queryname_flag_order_r1_before_r2() {
+        // R1 variants
+        let r1_primary = queryname_flag_order(0x0040);
+        let r1_supp = queryname_flag_order(0x0840);
+        let r1_sec = queryname_flag_order(0x0140);
+
+        // R2 variants
+        let r2_primary = queryname_flag_order(0x0080);
+        let r2_supp = queryname_flag_order(0x0880);
+        let r2_sec = queryname_flag_order(0x0180);
+
+        // All R1 variants should be less than all R2 variants
+        assert!(r1_primary < r2_primary);
+        assert!(r1_primary < r2_supp);
+        assert!(r1_primary < r2_sec);
+        assert!(r1_supp < r2_primary);
+        assert!(r1_supp < r2_supp);
+        assert!(r1_supp < r2_sec);
+        assert!(r1_sec < r2_primary);
+        assert!(r1_sec < r2_supp);
+        assert!(r1_sec < r2_sec);
+    }
+
+    /// Test PRIMARY < SUPPLEMENTARY < SECONDARY within each read type.
+    #[test]
+    fn test_queryname_flag_order_primary_before_supplementary_before_secondary() {
+        // Test for NONE (unpaired)
+        let none_pri = queryname_flag_order(0x0000);
+        let none_supp = queryname_flag_order(0x0800);
+        let none_sec = queryname_flag_order(0x0100);
+        assert!(none_pri < none_supp, "NONE: PRIMARY < SUPP");
+        assert!(none_supp < none_sec, "NONE: SUPP < SEC");
+
+        // Test for R1
+        let r1_pri = queryname_flag_order(0x0040);
+        let r1_supp = queryname_flag_order(0x0840);
+        let r1_sec = queryname_flag_order(0x0140);
+        assert!(r1_pri < r1_supp, "R1: PRIMARY < SUPP");
+        assert!(r1_supp < r1_sec, "R1: SUPP < SEC");
+
+        // Test for R2
+        let r2_pri = queryname_flag_order(0x0080);
+        let r2_supp = queryname_flag_order(0x0880);
+        let r2_sec = queryname_flag_order(0x0180);
+        assert!(r2_pri < r2_supp, "R2: PRIMARY < SUPP");
+        assert!(r2_supp < r2_sec, "R2: SUPP < SEC");
+    }
+
+    /// Test NONE (unpaired) sorts before R1 sorts before R2.
+    #[test]
+    fn test_queryname_flag_order_none_before_r1_before_r2() {
+        let none = queryname_flag_order(0x0000);
+        let r1 = queryname_flag_order(0x0040);
+        let r2 = queryname_flag_order(0x0080);
+
+        assert!(none < r1, "NONE < R1");
+        assert!(r1 < r2, "R1 < R2");
+    }
+
+    /// Test that irrelevant flags don't affect ordering.
+    /// Only 0x40, 0x80, 0x100, 0x800 should matter.
+    #[test]
+    fn test_queryname_flag_order_irrelevant_flags_do_not_affect_order() {
+        // Irrelevant flags: PAIRED(0x1), PROPER_PAIR(0x2), UNMAPPED(0x4), MATE_UNMAPPED(0x8),
+        // REVERSE(0x10), MATE_REVERSE(0x20), DUPLICATE(0x400), FAIL_QC(0x200)
+        let irrelevant_flags: u16 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x200 | 0x400;
+
+        // Base case: R1 PRIMARY
+        let r1_base = queryname_flag_order(0x0040);
+        let r1_with_irrelevant = queryname_flag_order(0x0040 | irrelevant_flags);
+        assert_eq!(r1_base, r1_with_irrelevant, "Irrelevant flags should not change result");
+
+        // R2 SUPPLEMENTARY
+        let r2_supp_base = queryname_flag_order(0x0880);
+        let r2_supp_with = queryname_flag_order(0x0880 | irrelevant_flags);
+        assert_eq!(r2_supp_base, r2_supp_with);
+
+        // NONE SECONDARY
+        let none_sec_base = queryname_flag_order(0x0100);
+        let none_sec_with = queryname_flag_order(0x0100 | irrelevant_flags);
+        assert_eq!(none_sec_base, none_sec_with);
+    }
+
+    /// Test with real-world flag combinations commonly seen in BAM files.
+    #[test]
+    fn test_queryname_flag_order_real_world_flags() {
+        // Common real-world flag values (from paired-end sequencing)
+
+        // R1 forward, properly paired: 0x63 = PAIRED|PROPER|MATE_REV|R1 = 0x1|0x2|0x20|0x40
+        let r1_fwd = queryname_flag_order(0x0063);
+        assert_eq!(r1_fwd, 0x4000, "R1 fwd should extract to R1 PRIMARY");
+
+        // R2 reverse, properly paired: 0x93 = PAIRED|PROPER|REV|R2 = 0x1|0x2|0x10|0x80
+        let r2_rev = queryname_flag_order(0x0093);
+        assert_eq!(r2_rev, 0x8000, "R2 rev should extract to R2 PRIMARY");
+
+        // R1 supplementary: 0x841 = PAIRED|R1|SUPP = 0x1|0x40|0x800
+        let r1_supp = queryname_flag_order(0x0841);
+        assert_eq!(r1_supp, 0x4100, "R1 supp should extract to R1 SUPP");
+
+        // R2 secondary: 0x181 = PAIRED|R2|SEC = 0x1|0x80|0x100
+        let r2_sec = queryname_flag_order(0x0181);
+        assert_eq!(r2_sec, 0x8800, "R2 sec should extract to R2 SEC");
+
+        // Verify ordering
+        assert!(r1_fwd < r1_supp);
+        assert!(r1_supp < r2_rev);
+        assert!(r2_rev < r2_sec);
+    }
+
+    /// Test from actual test data showing the bug fix.
+    /// samtools order: 113 → 2161 → 177 (R1 primary → R1 supplementary → R2 primary)
+    /// fgumi (before fix): 113 → 177 → 2161 (wrong - puts R2 primary before R1 supp)
+    #[test]
+    fn test_queryname_flag_order_from_test_data() {
+        // Flags from actual test data:
+        // 113 = 0x71 = PAIRED|PROPER|REV|R1 (R1 PRIMARY on reverse strand)
+        // 177 = 0xB1 = PAIRED|PROPER|REV|R2 (R2 PRIMARY on reverse strand)
+        // 2161 = 0x871 = PAIRED|PROPER|REV|R1|SUPP (R1 SUPPLEMENTARY)
+
+        let f113 = queryname_flag_order(113); // R1 PRIMARY
+        let f177 = queryname_flag_order(177); // R2 PRIMARY
+        let f2161 = queryname_flag_order(2161); // R1 SUPPLEMENTARY
+
+        // Correct order: R1 PRIMARY < R1 SUPP < R2 PRIMARY
+        assert!(f113 < f2161, "R1 PRIMARY (113) should be < R1 SUPP (2161): {} vs {}", f113, f2161);
+        assert!(f2161 < f177, "R1 SUPP (2161) should be < R2 PRIMARY (177): {} vs {}", f2161, f177);
+    }
+
+    /// Test edge case: both R1 and R2 flags set (unusual but possible).
+    #[test]
+    fn test_queryname_flag_order_edge_case_both_r1_r2() {
+        // Both R1 and R2 set: 0xc0
+        let both = queryname_flag_order(0x00c0);
+
+        // Should combine: (0xc0 << 8) = 0xc000
+        assert_eq!(both, 0xc000);
+
+        // Should sort after both R1-only and R2-only
+        let r1_only = queryname_flag_order(0x0040);
+        let r2_only = queryname_flag_order(0x0080);
+        assert!(r1_only < both);
+        assert!(r2_only < both);
+    }
+
+    /// Test that the function is const-evaluable.
+    #[test]
+    fn test_queryname_flag_order_is_const() {
+        // This compiles only if queryname_flag_order is const
+        const R1_PRIMARY: u16 = queryname_flag_order(0x0040);
+        const R2_PRIMARY: u16 = queryname_flag_order(0x0080);
+
+        assert_eq!(R1_PRIMARY, 0x4000);
+        assert_eq!(R2_PRIMARY, 0x8000);
     }
 }
