@@ -1443,6 +1443,46 @@ impl HasCompressor for WorkerCoreState {
 }
 
 // ============================================================================
+// Pipeline Validation - Post-shutdown data loss detection
+// ============================================================================
+
+/// Error returned when pipeline validation detects data loss or inconsistency.
+///
+/// This error provides detailed diagnostics about what went wrong, including
+/// which queues still contain data, which counters don't match, and how much
+/// memory is leaked in tracking.
+#[derive(Debug, Clone)]
+pub struct PipelineValidationError {
+    /// Names of queues that are not empty at completion.
+    pub non_empty_queues: Vec<String>,
+    /// Descriptions of counter mismatches.
+    pub counter_mismatches: Vec<String>,
+    /// Total heap bytes still tracked (should be 0 at completion).
+    pub leaked_heap_bytes: u64,
+}
+
+impl std::fmt::Display for PipelineValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Pipeline validation failed - potential data loss detected:")?;
+        if !self.non_empty_queues.is_empty() {
+            writeln!(f, "  Non-empty queues: {}", self.non_empty_queues.join(", "))?;
+        }
+        if !self.counter_mismatches.is_empty() {
+            writeln!(f, "  Counter mismatches:")?;
+            for mismatch in &self.counter_mismatches {
+                writeln!(f, "    - {mismatch}")?;
+            }
+        }
+        if self.leaked_heap_bytes > 0 {
+            writeln!(f, "  Leaked heap bytes: {}", self.leaked_heap_bytes)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PipelineValidationError {}
+
+// ============================================================================
 // PipelineLifecycle Trait - Common patterns for pipeline state management
 // ============================================================================
 
@@ -1494,6 +1534,21 @@ pub trait PipelineLifecycle {
 
     /// Flush the output writer and finalize.
     fn flush_output(&self) -> io::Result<()>;
+
+    /// Validate pipeline completion to detect data loss.
+    ///
+    /// This method should be called after the pipeline has completed to verify:
+    /// 1. All queues are empty (no data stuck in transit)
+    /// 2. All batch counters match (no batches lost between stages)
+    /// 3. Internal buffers are empty (grouper state, boundary leftovers)
+    ///
+    /// Note: Heap byte tracking is reported in `PipelineValidationError::leaked_heap_bytes`
+    /// but is currently advisory only (implementations set it to 0) because estimation
+    /// can be imprecise. Only queue emptiness and counter checks cause validation failure.
+    ///
+    /// Returns `Ok(())` if validation passes, or `Err(PipelineValidationError)`
+    /// with detailed diagnostics if any issues are detected.
+    fn validate_completion(&self) -> Result<(), PipelineValidationError>;
 }
 
 /// Monitor thread exit condition - returns true when pipeline should stop.
@@ -1648,6 +1703,9 @@ pub fn finalize_pipeline<S: PipelineLifecycle>(state: &S) -> io::Result<u64> {
     if let Some(error) = state.take_error() {
         return Err(error);
     }
+
+    // Validate pipeline completion to detect data loss
+    state.validate_completion().map_err(io::Error::other)?;
 
     // Flush output
     state.flush_output()?;

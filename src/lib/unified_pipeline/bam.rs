@@ -26,10 +26,10 @@ use super::base::{
     HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed, HasHeldSerialized,
     HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
     PROGRESS_LOG_INTERVAL, PipelineConfig, PipelineLifecycle, PipelineStats, PipelineStep,
-    ProcessPipelineState, QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState,
-    SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
-    finalize_pipeline, generic_worker_loop, handle_worker_panic, join_monitor_thread,
-    join_worker_threads, shared_try_step_compress,
+    PipelineValidationError, ProcessPipelineState, QueueSample, RawBlockBatch, ReorderBufferState,
+    SerializePipelineState, SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon,
+    WritePipelineState, finalize_pipeline, generic_worker_loop, handle_worker_panic,
+    join_monitor_thread, join_worker_threads, shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -692,6 +692,120 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         }
         Ok(())
     }
+
+    /// Validate pipeline completion to detect data loss.
+    ///
+    /// Checks that:
+    /// 1. All queues are empty
+    /// 2. All batch counters match between stages
+    ///
+    /// Note: Heap byte tracking is reported but advisory only (set to 0) because
+    /// estimation can be imprecise. Only queue emptiness and counter checks
+    /// cause validation failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineValidationError` with diagnostics if any issues are detected.
+    pub fn validate_completion(&self) -> Result<(), PipelineValidationError> {
+        let mut non_empty_queues = Vec::new();
+        let mut counter_mismatches = Vec::new();
+
+        // Check all input-half queues are empty
+        if !self.q1_raw_blocks.is_empty() {
+            non_empty_queues.push(format!("q1_raw_blocks ({})", self.q1_raw_blocks.len()));
+        }
+        if !self.q2_decompressed.is_empty() {
+            non_empty_queues.push(format!("q2_decompressed ({})", self.q2_decompressed.len()));
+        }
+        if !self.q2b_boundaries.is_empty() {
+            non_empty_queues.push(format!("q2b_boundaries ({})", self.q2b_boundaries.len()));
+        }
+        if !self.q3_decoded.is_empty() {
+            non_empty_queues.push(format!("q3_decoded ({})", self.q3_decoded.len()));
+        }
+
+        // Check output-half queues are empty
+        if !self.output.groups.is_empty() {
+            non_empty_queues.push(format!("q4_groups ({})", self.output.groups.len()));
+        }
+        if !self.output.processed.is_empty() {
+            non_empty_queues.push(format!("q5_processed ({})", self.output.processed.len()));
+        }
+        if !self.output.serialized.is_empty() {
+            non_empty_queues.push(format!("q6_serialized ({})", self.output.serialized.len()));
+        }
+        if !self.output.compressed.is_empty() {
+            non_empty_queues.push(format!("q7_compressed ({})", self.output.compressed.len()));
+        }
+
+        // Check reorder buffers are empty
+        {
+            let q2_reorder = self.q2_reorder.lock();
+            if !q2_reorder.is_empty() {
+                non_empty_queues.push(format!("q2_reorder ({})", q2_reorder.len()));
+            }
+        }
+        {
+            let q3_reorder = self.q3_reorder.lock();
+            if !q3_reorder.is_empty() {
+                non_empty_queues.push(format!("q3_reorder ({})", q3_reorder.len()));
+            }
+        }
+        {
+            let write_reorder = self.output.write_reorder.lock();
+            if !write_reorder.is_empty() {
+                non_empty_queues.push(format!("write_reorder ({})", write_reorder.len()));
+            }
+        }
+
+        // Check batch counter invariants
+        let total_read = self.next_read_serial.load(Ordering::Acquire);
+        let batches_decompressed = self.batches_decompressed.load(Ordering::Acquire);
+        let batches_boundary_processed = self.batches_boundary_processed.load(Ordering::Acquire);
+        let batches_boundary_found = self.batches_boundary_found.load(Ordering::Acquire);
+        let batches_decoded = self.batches_decoded.load(Ordering::Acquire);
+        let batches_grouped = self.batches_grouped.load(Ordering::Acquire);
+
+        // Each batch flows through: Read -> Decompress -> FindBoundaries -> Decode -> Group
+        if batches_decompressed != total_read {
+            counter_mismatches.push(format!(
+                "batches_decompressed ({batches_decompressed}) != total_read ({total_read})"
+            ));
+        }
+        if batches_boundary_processed != total_read {
+            counter_mismatches.push(format!(
+                "batches_boundary_processed ({batches_boundary_processed}) != total_read ({total_read})"
+            ));
+        }
+        // Note: batches_boundary_found may differ from total_read because FindBoundaries
+        // can split or combine batches. But batches_decoded should match batches_boundary_found.
+        if batches_decoded != batches_boundary_found {
+            counter_mismatches.push(format!(
+                "batches_decoded ({batches_decoded}) != batches_boundary_found ({batches_boundary_found})"
+            ));
+        }
+        if batches_grouped != batches_boundary_found {
+            counter_mismatches.push(format!(
+                "batches_grouped ({batches_grouped}) != batches_boundary_found ({batches_boundary_found})"
+            ));
+        }
+
+        // Note: Heap byte tracking can have small imbalances due to estimation errors,
+        // so we don't fail validation on heap bytes. The important checks are queues
+        // (actual data) and counters (batch flow).
+        let leaked_heap_bytes = 0u64;
+
+        // Return error if any issues found
+        if !non_empty_queues.is_empty() || !counter_mismatches.is_empty() {
+            return Err(PipelineValidationError {
+                non_empty_queues,
+                counter_mismatches,
+                leaked_heap_bytes,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -739,6 +853,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> PipelineLifecycle
 
     fn flush_output(&self) -> io::Result<()> {
         BamPipelineState::flush_output(self)
+    }
+
+    fn validate_completion(&self) -> Result<(), PipelineValidationError> {
+        BamPipelineState::validate_completion(self)
     }
 }
 
@@ -3676,5 +3794,192 @@ mod tests {
         // At 256MB, not drained
         state.q3_reorder_state.heap_bytes.store(256 * 1024 * 1024, Ordering::SeqCst);
         assert!(!state.is_memory_drained());
+    }
+
+    // ========================================================================
+    // Pipeline Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_validation_passes_when_complete() {
+        let state = create_test_state(0);
+        // Set all done flags
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+        // Counters are all 0, queues are all empty
+        let result = state.validate_completion();
+        assert!(result.is_ok(), "Validation should pass: {result:?}");
+    }
+
+    #[test]
+    fn test_validation_detects_non_empty_q1() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Add item to q1_raw_blocks
+        let batch = RawBlockBatch { blocks: vec![] };
+        assert!(state.q1_raw_blocks.push((0, batch)).is_ok());
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.non_empty_queues.iter().any(|s| s.contains("q1_raw_blocks")));
+    }
+
+    #[test]
+    fn test_validation_detects_non_empty_q2() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Add item to q2_decompressed
+        let batch = DecompressedBatch { data: vec![] };
+        assert!(state.q2_decompressed.push((0, batch)).is_ok());
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.non_empty_queues.iter().any(|s| s.contains("q2_decompressed")));
+    }
+
+    #[test]
+    fn test_validation_detects_counter_mismatch_decompressed() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Simulate: read 5 batches, but only decompressed 3
+        state.next_read_serial.store(5, Ordering::SeqCst);
+        state.batches_decompressed.store(3, Ordering::SeqCst);
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.counter_mismatches.iter().any(|s| s.contains("batches_decompressed")));
+    }
+
+    #[test]
+    fn test_validation_detects_counter_mismatch_boundary_processed() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // All decompressed but not all boundary processed
+        state.next_read_serial.store(5, Ordering::SeqCst);
+        state.batches_decompressed.store(5, Ordering::SeqCst);
+        state.batches_boundary_processed.store(3, Ordering::SeqCst);
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.counter_mismatches.iter().any(|s| s.contains("batches_boundary_processed")));
+    }
+
+    #[test]
+    fn test_validation_detects_counter_mismatch_grouped() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Everything processed up to group, but group didn't finish
+        state.next_read_serial.store(5, Ordering::SeqCst);
+        state.batches_decompressed.store(5, Ordering::SeqCst);
+        state.batches_boundary_processed.store(5, Ordering::SeqCst);
+        state.batches_boundary_found.store(5, Ordering::SeqCst);
+        state.batches_decoded.store(5, Ordering::SeqCst);
+        state.batches_grouped.store(3, Ordering::SeqCst);
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.counter_mismatches.iter().any(|s| s.contains("batches_grouped")));
+    }
+
+    #[test]
+    fn test_validation_error_display() {
+        let err = PipelineValidationError {
+            non_empty_queues: vec!["q1 (5)".to_string(), "q2 (3)".to_string()],
+            counter_mismatches: vec!["batches_x (5) != batches_y (3)".to_string()],
+            leaked_heap_bytes: 0,
+        };
+        let display = err.to_string();
+        assert!(display.contains("q1"));
+        assert!(display.contains("q2"));
+        assert!(display.contains("batches_x"));
+    }
+
+    #[test]
+    fn test_validation_detects_non_empty_reorder_buffer() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Add item to q2_reorder buffer
+        {
+            let mut q2_reorder = state.q2_reorder.lock();
+            let batch = DecompressedBatch { data: vec![] };
+            q2_reorder.insert(0, batch);
+        }
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.non_empty_queues.iter().any(|s| s.contains("q2_reorder")));
+    }
+
+    #[test]
+    fn test_validation_detects_non_empty_q3_reorder() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Add item to q3_reorder buffer
+        {
+            let mut q3_reorder = state.q3_reorder.lock();
+            let batch: Vec<DecodedRecord> = vec![];
+            q3_reorder.insert(0, batch);
+        }
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.non_empty_queues.iter().any(|s| s.contains("q3_reorder")));
+    }
+
+    #[test]
+    fn test_validation_detects_non_empty_output_queue() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Add item to output.groups (q4_groups)
+        // G = () for create_test_state
+        let batch: Vec<()> = vec![()];
+        assert!(state.output.groups.push((0, batch)).is_ok());
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.non_empty_queues.iter().any(|s| s.contains("q4_groups")));
+    }
+
+    #[test]
+    fn test_validation_detects_non_empty_write_reorder() {
+        let state = create_test_state(0);
+        state.read_done.store(true, Ordering::SeqCst);
+        state.group_done.store(true, Ordering::SeqCst);
+
+        // Add item to write_reorder buffer
+        {
+            let mut write_reorder = state.output.write_reorder.lock();
+            let batch = CompressedBlockBatch { blocks: vec![], record_count: 0 };
+            write_reorder.insert(0, batch);
+        }
+
+        let result = state.validate_completion();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.non_empty_queues.iter().any(|s| s.contains("write_reorder")));
     }
 }

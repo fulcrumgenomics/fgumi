@@ -27,11 +27,11 @@ use super::base::{
     CompressedBlockBatch, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
     HasHeldSerialized, HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues,
     OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineLifecycle, PipelineStats, PipelineStep,
-    ProcessPipelineState, ReorderBufferState, SerializePipelineState, SerializedBatch, StepContext,
-    WorkerCoreState, WorkerStateCommon, WritePipelineState, finalize_pipeline, generic_worker_loop,
-    handle_worker_panic, join_monitor_thread, join_worker_threads, run_monitor_loop,
-    shared_try_step_compress, shared_try_step_process, shared_try_step_serialize,
-    shared_try_step_write_new,
+    PipelineValidationError, ProcessPipelineState, ReorderBufferState, SerializePipelineState,
+    SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
+    finalize_pipeline, generic_worker_loop, handle_worker_panic, join_monitor_thread,
+    join_worker_threads, run_monitor_loop, shared_try_step_compress, shared_try_step_process,
+    shared_try_step_serialize, shared_try_step_write_new,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -1648,6 +1648,151 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
         }
         Ok(())
     }
+
+    /// Validate pipeline completion to detect data loss.
+    ///
+    /// Checks that:
+    /// 1. All queues are empty
+    /// 2. All batch counters match between stages
+    /// 3. Internal buffers are empty (grouper state, boundary leftovers)
+    ///
+    /// Note: Heap byte tracking is reported but advisory only (set to 0) because
+    /// estimation can be imprecise. Only queue/buffer emptiness and counter checks
+    /// cause validation failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineValidationError` with diagnostics if any issues are detected.
+    pub fn validate_completion(&self) -> Result<(), PipelineValidationError> {
+        let mut non_empty_queues = Vec::new();
+        let mut counter_mismatches = Vec::new();
+
+        // Check input-half queues are empty
+        if !self.q1_raw.is_empty() {
+            non_empty_queues.push(format!("q1_raw ({})", self.q1_raw.len()));
+        }
+        if !self.q2_decompressed.is_empty() {
+            non_empty_queues.push(format!("q2_decompressed ({})", self.q2_decompressed.len()));
+        }
+
+        // Check parallel parse queues if enabled
+        if self.config.use_parallel_parse {
+            if !self.q2_5_boundaries.is_empty() {
+                non_empty_queues.push(format!("q2_5_boundaries ({})", self.q2_5_boundaries.len()));
+            }
+            if !self.q2_75_parsed.is_empty() {
+                non_empty_queues.push(format!("q2_75_parsed ({})", self.q2_75_parsed.len()));
+            }
+        }
+
+        // Check output-half queues are empty
+        if !self.output.groups.is_empty() {
+            non_empty_queues.push(format!("q3_templates ({})", self.output.groups.len()));
+        }
+        if !self.output.processed.is_empty() {
+            non_empty_queues.push(format!("q4_processed ({})", self.output.processed.len()));
+        }
+        if !self.output.serialized.is_empty() {
+            non_empty_queues.push(format!("q5_serialized ({})", self.output.serialized.len()));
+        }
+        if !self.output.compressed.is_empty() {
+            non_empty_queues.push(format!("q6_compressed ({})", self.output.compressed.len()));
+        }
+
+        // Check reorder buffers are empty
+        {
+            let q2_reorder = self.q2_reorder.lock();
+            if !q2_reorder.is_empty() {
+                non_empty_queues.push(format!("q2_reorder ({})", q2_reorder.len()));
+            }
+        }
+        if self.config.use_parallel_parse {
+            let q2_75_reorder = self.q2_75_reorder.lock();
+            if !q2_75_reorder.is_empty() {
+                non_empty_queues.push(format!("q2_75_reorder ({})", q2_75_reorder.len()));
+            }
+        }
+        {
+            let write_reorder = self.output.write_reorder.lock();
+            if !write_reorder.is_empty() {
+                non_empty_queues.push(format!("write_reorder ({})", write_reorder.len()));
+            }
+        }
+        {
+            let pending = self.pending_templates.lock();
+            if !pending.is_empty() {
+                non_empty_queues.push(format!("pending_templates ({})", pending.len()));
+            }
+        }
+
+        // Check grouper has no pending data
+        {
+            let grouper = self.grouper.lock();
+            if grouper.has_pending() {
+                non_empty_queues.push("grouper_pending".to_string());
+            }
+        }
+
+        // Check boundary state has no leftover bytes (only in parallel parse mode)
+        if self.config.use_parallel_parse {
+            for (idx, stream_state) in self.boundary_state.stream_states.iter().enumerate() {
+                let leftover_len = stream_state.lock().leftover.len();
+                if leftover_len > 0 {
+                    non_empty_queues.push(format!("boundary_leftover[{idx}] ({leftover_len})"));
+                }
+            }
+        }
+
+        // Check batch counter invariants
+        let batches_read = self.batches_read.load(Ordering::Acquire);
+        let batches_grouped = self.batches_grouped.load(Ordering::Acquire);
+
+        // In non-parallel mode: batches flow Read -> Group directly
+        // In parallel mode: batches flow Read -> FindBoundaries -> Parse -> Group
+        if self.config.use_parallel_parse {
+            let batches_boundaries_found = self.batches_boundaries_found.load(Ordering::Acquire);
+            let batches_parsed = self.batches_parsed.load(Ordering::Acquire);
+
+            if batches_boundaries_found != batches_read {
+                counter_mismatches.push(format!(
+                    "batches_boundaries_found ({batches_boundaries_found}) != batches_read ({batches_read})"
+                ));
+            }
+            if batches_parsed != batches_boundaries_found {
+                counter_mismatches.push(format!(
+                    "batches_parsed ({batches_parsed}) != batches_boundaries_found ({batches_boundaries_found})"
+                ));
+            }
+            if batches_grouped != batches_parsed {
+                counter_mismatches.push(format!(
+                    "batches_grouped ({batches_grouped}) != batches_parsed ({batches_parsed})"
+                ));
+            }
+        } else {
+            // Non-parallel mode: batches_grouped should match batches_read
+            if batches_grouped != batches_read {
+                counter_mismatches.push(format!(
+                    "batches_grouped ({batches_grouped}) != batches_read ({batches_read})"
+                ));
+            }
+        }
+
+        // Note: Heap byte tracking can have small imbalances due to estimation errors,
+        // so we don't fail validation on heap bytes. The important checks are queues
+        // (actual data) and counters (batch flow).
+        let leaked_heap_bytes = 0u64;
+
+        // Return error if any issues found
+        if !non_empty_queues.is_empty() || !counter_mismatches.is_empty() {
+            return Err(PipelineValidationError {
+                non_empty_queues,
+                counter_mismatches,
+                leaked_heap_bytes,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1695,6 +1840,10 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> PipelineLi
 
     fn flush_output(&self) -> io::Result<()> {
         FastqPipelineState::flush_output(self)
+    }
+
+    fn validate_completion(&self) -> Result<(), PipelineValidationError> {
+        FastqPipelineState::validate_completion(self)
     }
 }
 
