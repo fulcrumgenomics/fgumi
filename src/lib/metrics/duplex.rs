@@ -1,9 +1,13 @@
-//! Metrics for the `duplex_metrics` command.
+//! Metrics for duplex sequencing QC.
 //!
 //! This module provides comprehensive QC metrics for duplex sequencing experiments,
 //! including family size distributions, UMI frequencies, and duplex yield at multiple
 //! sampling levels.
+//!
+//! Used by both `duplex` and `duplex-metrics` commands.
 
+use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
+use crate::umi::extract_mi_base;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -361,6 +365,42 @@ impl DuplexMetricsCollector {
         }
     }
 
+    /// Merge another collector's metrics into this one.
+    ///
+    /// Used for aggregating metrics from parallel batch processing.
+    pub fn merge(&mut self, other: &Self) {
+        for (size, count) in &other.cs_family_sizes {
+            *self.cs_family_sizes.entry(*size).or_insert(0) += count;
+        }
+        for (size, count) in &other.ss_family_sizes {
+            *self.ss_family_sizes.entry(*size).or_insert(0) += count;
+        }
+        for (size, count) in &other.ds_family_sizes {
+            *self.ds_family_sizes.entry(*size).or_insert(0) += count;
+        }
+        for (sizes, count) in &other.duplex_family_sizes {
+            *self.duplex_family_sizes.entry(*sizes).or_insert(0) += count;
+        }
+        for (umi, count) in &other.umi_raw_counts {
+            *self.umi_raw_counts.entry(umi.clone()).or_insert(0) += count;
+        }
+        for (umi, count) in &other.umi_raw_error_counts {
+            *self.umi_raw_error_counts.entry(umi.clone()).or_insert(0) += count;
+        }
+        for (umi, count) in &other.umi_unique_counts {
+            *self.umi_unique_counts.entry(umi.clone()).or_insert(0) += count;
+        }
+        for (umi, count) in &other.duplex_umi_raw_counts {
+            *self.duplex_umi_raw_counts.entry(umi.clone()).or_insert(0) += count;
+        }
+        for (umi, count) in &other.duplex_umi_raw_error_counts {
+            *self.duplex_umi_raw_error_counts.entry(umi.clone()).or_insert(0) += count;
+        }
+        for (umi, count) in &other.duplex_umi_unique_counts {
+            *self.duplex_umi_unique_counts.entry(umi.clone()).or_insert(0) += count;
+        }
+    }
+
     /// Records a duplex UMI observation
     ///
     /// # Arguments
@@ -382,6 +422,196 @@ impl DuplexMetricsCollector {
         *self.duplex_umi_raw_error_counts.entry(umi.to_string()).or_insert(0) += error_count;
         if is_unique {
             *self.duplex_umi_unique_counts.entry(umi.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Updates UMI metrics for a duplex family.
+    ///
+    /// This method:
+    /// 1. Uses RX tags (raw UMI sequences) to extract individual UMI observations
+    /// 2. Separates by strand (/A and /B suffixes in MI tags), swapping UMI parts for B strand
+    /// 3. Calls consensus for each UMI position
+    /// 4. Records raw observations, errors, and unique observations for each individual UMI
+    /// 5. Records duplex UMI metrics if enabled
+    ///
+    /// # Arguments
+    /// * `umi_consensus_caller` - Caller for computing UMI consensus sequences
+    /// * `mi_rx_pairs` - Pairs of (MI tag value, RX tag value) for each read in the family
+    /// * `base_mi` - The base MI (without /A or /B suffix) for this family
+    pub fn update_umi_metrics_for_family(
+        &mut self,
+        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
+        mi_rx_pairs: &[(String, String)],
+        base_mi: &str,
+    ) {
+        // Collect individual UMI parts from each strand's RX tag
+        // For /A strand: split RX "AAA-TTT" → umi1s += "AAA", umi2s += "TTT"
+        // For /B strand: split RX "TTT-AAA" → umi1s += "AAA", umi2s += "TTT" (swapped)
+        let mut umi1s = Vec::new();
+        let mut umi2s = Vec::new();
+
+        for (mi, rx) in mi_rx_pairs {
+            // Check if this MI tag belongs to the current base_mi family
+            let mi_base = extract_mi_base(mi);
+
+            if mi_base != base_mi {
+                continue;
+            }
+
+            // Split the RX tag to get individual UMI parts
+            let parts: Vec<&str> = rx.split('-').collect();
+            if parts.len() != 2 {
+                // Not a valid duplex UMI, skip
+                continue;
+            }
+
+            // Check that both components are non-empty
+            if parts[0].is_empty() || parts[1].is_empty() {
+                // Empty component, skip
+                continue;
+            }
+
+            // Add UMI parts based on strand
+            if mi.ends_with("/A") {
+                // For /A strand: u1 goes to umi1s, u2 goes to umi2s
+                umi1s.push(parts[0].to_string());
+                umi2s.push(parts[1].to_string());
+            } else if mi.ends_with("/B") {
+                // For /B strand: u2 goes to umi1s, u1 goes to umi2s (swapped)
+                umi1s.push(parts[1].to_string());
+                umi2s.push(parts[0].to_string());
+            }
+        }
+
+        // Call consensus for each UMI position and record metrics
+        let mut consensus_umis = Vec::new();
+
+        if !umi1s.is_empty() {
+            let (consensus, _had_errors) = umi_consensus_caller.consensus(&umi1s);
+            let raw_count = umi1s.len();
+            let error_count = umi1s.iter().filter(|u| **u != consensus).count();
+            self.record_umi(&consensus, raw_count, error_count, true);
+            consensus_umis.push(consensus);
+        }
+
+        if !umi2s.is_empty() {
+            let (consensus, _had_errors) = umi_consensus_caller.consensus(&umi2s);
+            let raw_count = umi2s.len();
+            let error_count = umi2s.iter().filter(|u| **u != consensus).count();
+            self.record_umi(&consensus, raw_count, error_count, true);
+            consensus_umis.push(consensus);
+        }
+
+        // Record duplex UMI metrics if enabled
+        if self.collect_duplex_umi_counts && consensus_umis.len() == 2 {
+            let duplex_umi = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
+            // Each read pair contributes one observation to the duplex UMI
+            let total_raw = umi1s.len();
+
+            // Count how many raw RX tags had errors (don't match either duplex orientation)
+            let expected_duplex1 = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
+            let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
+            let error_count = mi_rx_pairs
+                .iter()
+                .filter(|(mi, rx)| {
+                    let mi_base = extract_mi_base(mi);
+                    mi_base == base_mi && *rx != expected_duplex1 && *rx != expected_duplex2
+                })
+                .count();
+
+            self.record_duplex_umi(&duplex_umi, total_raw, error_count, true);
+        }
+    }
+
+    /// Updates UMI metrics using the consensus UMI from the main caller's output.
+    ///
+    /// This method takes the consensus UMI that was already computed by `DuplexConsensusCaller`
+    /// and compares it against the raw UMI observations to count errors.
+    ///
+    /// # Arguments
+    /// * `consensus_rx` - The consensus UMI from the output read's RX tag (e.g., "AAT-CCG")
+    /// * `strand_rx_pairs` - Raw UMI observations: (is_a_strand, rx_bytes) for each read
+    pub fn update_umi_metrics_from_consensus(
+        &mut self,
+        consensus_rx: &[u8],
+        strand_rx_pairs: &[(bool, Vec<u8>)],
+    ) {
+        // Parse consensus UMI into two parts
+        let Some(consensus_sep) = consensus_rx.iter().position(|&b| b == b'-') else {
+            return;
+        };
+        let consensus_umi1 = &consensus_rx[..consensus_sep];
+        let consensus_umi2 = &consensus_rx[consensus_sep + 1..];
+
+        if consensus_umi1.is_empty() || consensus_umi2.is_empty() {
+            return;
+        }
+
+        // Count raw observations and errors for each UMI position
+        let mut umi1_count = 0usize;
+        let mut umi1_errors = 0usize;
+        let mut umi2_count = 0usize;
+        let mut umi2_errors = 0usize;
+
+        for (is_a_strand, rx) in strand_rx_pairs {
+            // Split raw RX tag
+            let Some(sep_pos) = rx.iter().position(|&b| b == b'-') else {
+                continue;
+            };
+            let part1 = &rx[..sep_pos];
+            let part2 = &rx[sep_pos + 1..];
+
+            if part1.is_empty() || part2.is_empty() {
+                continue;
+            }
+
+            // Normalize by strand (B strand is swapped)
+            let (raw_umi1, raw_umi2) = if *is_a_strand {
+                (part1, part2)
+            } else {
+                (part2, part1)
+            };
+
+            // Count UMI1
+            umi1_count += 1;
+            if raw_umi1 != consensus_umi1 {
+                umi1_errors += 1;
+            }
+
+            // Count UMI2
+            umi2_count += 1;
+            if raw_umi2 != consensus_umi2 {
+                umi2_errors += 1;
+            }
+        }
+
+        // Record metrics for each UMI position
+        if umi1_count > 0 {
+            let umi1_str = String::from_utf8_lossy(consensus_umi1);
+            self.record_umi(&umi1_str, umi1_count, umi1_errors, true);
+        }
+        if umi2_count > 0 {
+            let umi2_str = String::from_utf8_lossy(consensus_umi2);
+            self.record_umi(&umi2_str, umi2_count, umi2_errors, true);
+        }
+
+        // Record duplex UMI metrics if enabled
+        if self.collect_duplex_umi_counts && umi1_count > 0 && umi2_count > 0 {
+            let duplex_umi = String::from_utf8_lossy(consensus_rx);
+            // Count errors: raw RX doesn't match consensus in either orientation
+            let reversed_consensus: Vec<u8> = consensus_umi2
+                .iter()
+                .chain(std::iter::once(&b'-'))
+                .chain(consensus_umi1.iter())
+                .copied()
+                .collect();
+
+            let duplex_errors = strand_rx_pairs
+                .iter()
+                .filter(|(_, rx)| rx.as_slice() != consensus_rx && rx.as_slice() != reversed_consensus.as_slice())
+                .count();
+
+            self.record_duplex_umi(&duplex_umi, umi1_count, duplex_errors, true);
         }
     }
 
@@ -568,6 +798,262 @@ impl DuplexMetricsCollector {
     #[must_use]
     pub fn yield_metrics(&self) -> &[DuplexYieldMetric] {
         &self.yield_metrics
+    }
+}
+
+// ============================================================================
+// Ideal Duplex Fraction Calculation - Shared binomial model
+// ============================================================================
+
+use statrs::distribution::{Binomial, DiscreteCDF};
+
+/// Calculates the ideal duplex fraction using binomial model.
+///
+/// For each family of size N, calculates the probability that both strands
+/// have sufficient reads (A >= `min_ab` AND B >= `min_ba` where A + B = N).
+/// Assumes each read has 0.5 probability of being on each strand.
+///
+/// # Arguments
+///
+/// * `family_sizes` - Slice of DS family sizes
+/// * `min_ab` - Minimum reads required on AB strand
+/// * `min_ba` - Minimum reads required on BA strand
+///
+/// # Returns
+///
+/// Expected fraction of DS families that should be duplexes under ideal model.
+#[must_use]
+pub fn calculate_ideal_duplex_fraction(
+    family_sizes: &[usize],
+    min_ab: usize,
+    min_ba: usize,
+) -> f64 {
+    if family_sizes.is_empty() {
+        return 0.0;
+    }
+
+    let mut ideal_duplexes = 0.0;
+    let total_families = family_sizes.len() as f64;
+
+    for &size in family_sizes {
+        if size < min_ab + min_ba {
+            // Impossible to form a duplex with this family size
+            continue;
+        }
+
+        // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
+        // and B = size - A
+        //
+        // This is equivalent to: P(min_ba <= A <= size - min_ab)
+        // = P(A <= size - min_ab) - P(A < min_ba)
+        // = CDF(size - min_ab) - CDF(min_ba - 1)
+
+        let binomial = match Binomial::new(0.5, size as u64) {
+            Ok(b) => b,
+            Err(_) => continue, // Skip if binomial creation fails
+        };
+
+        let upper_bound = size - min_ba;
+        let lower_bound = min_ab;
+
+        // P(A >= lower_bound AND A <= upper_bound)
+        let prob = if upper_bound >= lower_bound {
+            let p_upper = binomial.cdf(upper_bound as u64);
+            let p_lower =
+                if lower_bound > 0 { binomial.cdf((lower_bound - 1) as u64) } else { 0.0 };
+            p_upper - p_lower
+        } else {
+            0.0
+        };
+
+        ideal_duplexes += prob;
+    }
+
+    ideal_duplexes / total_families
+}
+
+// ============================================================================
+// Metrics Writer - Shared logic for writing duplex metrics files
+// ============================================================================
+
+use std::sync::OnceLock;
+
+/// Embedded R script for PDF plot generation (bundled with binary)
+const R_SCRIPT: &str = include_str!("../../../resources/CollectDuplexSeqMetrics.R");
+
+/// Cached R availability check (computed once per process)
+static R_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Writer for duplex metrics files.
+///
+/// This struct provides shared logic for writing metrics files from both
+/// the `duplex` and `duplex-metrics` commands.
+pub struct DuplexMetricsWriter<'a> {
+    /// Output prefix for metrics files
+    prefix: &'a std::path::Path,
+    /// Optional description for PDF plots
+    description: Option<&'a str>,
+}
+
+impl<'a> DuplexMetricsWriter<'a> {
+    /// Create a new metrics writer with the given output prefix.
+    #[must_use]
+    pub fn new(prefix: &'a std::path::Path) -> Self {
+        Self { prefix, description: None }
+    }
+
+    /// Set the description for PDF plot titles.
+    #[must_use]
+    pub fn with_description(mut self, description: Option<&'a str>) -> Self {
+        self.description = description;
+        self
+    }
+
+    /// Write all metrics files from a collector.
+    ///
+    /// Writes:
+    /// - `PREFIX.family_sizes.txt`
+    /// - `PREFIX.duplex_family_sizes.txt`
+    /// - `PREFIX.duplex_yield_metrics.txt`
+    /// - `PREFIX.umi_counts.txt`
+    /// - `PREFIX.duplex_qc.pdf` (if R is available)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any file cannot be written.
+    pub fn write_all(
+        &self,
+        collector: &DuplexMetricsCollector,
+        yield_metrics: &[DuplexYieldMetric],
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use fgoxide::io::DelimFile;
+        use log::info;
+
+        // Write family_sizes.txt
+        let family_size_metrics = collector.family_size_metrics();
+        let family_size_path = format!("{}.family_sizes.txt", self.prefix.display());
+        DelimFile::default()
+            .write_tsv(&family_size_path, family_size_metrics)
+            .with_context(|| format!("Failed to write family size metrics: {family_size_path}"))?;
+        info!("Wrote family size metrics to {family_size_path}");
+
+        // Write duplex_family_sizes.txt
+        let duplex_family_size_metrics = collector.duplex_family_size_metrics();
+        let duplex_family_size_path = format!("{}.duplex_family_sizes.txt", self.prefix.display());
+        DelimFile::default()
+            .write_tsv(&duplex_family_size_path, duplex_family_size_metrics)
+            .with_context(|| {
+                format!("Failed to write duplex family size metrics: {duplex_family_size_path}")
+            })?;
+        info!("Wrote duplex family size metrics to {duplex_family_size_path}");
+
+        // Write umi_counts.txt
+        let umi_metrics = collector.umi_metrics();
+        let umi_path = format!("{}.umi_counts.txt", self.prefix.display());
+        DelimFile::default()
+            .write_tsv(&umi_path, umi_metrics.clone())
+            .with_context(|| format!("Failed to write UMI metrics: {umi_path}"))?;
+        info!("Wrote UMI metrics to {umi_path}");
+
+        // Write duplex_yield_metrics.txt
+        let yield_path = format!("{}.duplex_yield_metrics.txt", self.prefix.display());
+        DelimFile::default()
+            .write_tsv(&yield_path, yield_metrics.to_vec())
+            .with_context(|| format!("Failed to write yield metrics: {yield_path}"))?;
+        info!("Wrote yield metrics to {yield_path}");
+
+        // Generate PDF plots using R script (optional)
+        let pdf_path = format!("{}.duplex_qc.pdf", self.prefix.display());
+        if Self::is_r_available() {
+            let description = self.description.unwrap_or("Sample");
+            match Self::execute_r_script(
+                &family_size_path,
+                &duplex_family_size_path,
+                &yield_path,
+                &umi_path,
+                &pdf_path,
+                description,
+            ) {
+                Ok(()) => info!("Generated PDF plots: {pdf_path}"),
+                Err(e) => {
+                    log::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");
+                    log::warn!(
+                        "To enable PDF generation, ensure R is installed with ggplot2 and scales packages:"
+                    );
+                    log::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
+                }
+            }
+        } else {
+            log::warn!(
+                "R or required packages (ggplot2, scales) not available. Skipping PDF generation."
+            );
+            log::warn!("To enable PDF generation, install R and required packages:");
+            log::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
+        }
+
+        Ok(())
+    }
+
+    /// Checks if R and required packages (ggplot2, scales) are available.
+    /// Result is cached for the lifetime of the process.
+    fn is_r_available() -> bool {
+        use std::process::Command;
+
+        *R_AVAILABLE.get_or_init(|| {
+            Command::new("Rscript")
+                .args(["-e", "stopifnot(require(ggplot2)); stopifnot(require(scales))"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Executes the R script to generate PDF plots.
+    fn execute_r_script(
+        family_size_path: &str,
+        duplex_family_size_path: &str,
+        yield_path: &str,
+        umi_path: &str,
+        pdf_path: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use log::info;
+        use std::process::Command;
+
+        // Write embedded R script to temp file
+        let temp_dir = std::env::temp_dir();
+        let r_script_path = temp_dir.join("fgumi_CollectDuplexSeqMetrics.R");
+        std::fs::write(&r_script_path, R_SCRIPT)
+            .context("Failed to write embedded R script to temp file")?;
+
+        info!("Executing R script to generate PDF plots...");
+
+        let output = Command::new("Rscript")
+            .arg(&r_script_path)
+            .arg(family_size_path)
+            .arg(duplex_family_size_path)
+            .arg(yield_path)
+            .arg(umi_path)
+            .arg(pdf_path)
+            .arg(description)
+            .output()
+            .context("Failed to execute Rscript command")?;
+
+        // Clean up temp file (ignore errors)
+        let _ = std::fs::remove_file(&r_script_path);
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "R script execution failed with exit code {:?}. Error: {}",
+                output.status.code(),
+                stderr
+            )
+        }
     }
 }
 

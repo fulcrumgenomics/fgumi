@@ -11,22 +11,23 @@ use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_lib::bam_io::create_bam_reader;
 use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
+use fgumi_lib::metrics::duplex::{
+    calculate_ideal_duplex_fraction, DuplexMetricsCollector, DuplexYieldMetric,
+};
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
 use fgumi_lib::template::TemplateIterator;
-use fgumi_lib::umi::extract_mi_base;
 use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use murmur3::murmur3_32;
 use noodles::sam::alignment::record::Cigar;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record_buf::RecordBuf;
-use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use super::command::Command;
+use super::common::ThreadingOptions;
 
 /// Embedded R script for PDF plot generation (bundled with binary)
 const R_SCRIPT: &str = include_str!("../../resources/CollectDuplexSeqMetrics.R");
@@ -211,6 +212,10 @@ pub struct DuplexMetrics {
     /// Optional SAM tag for cell barcode (for single-cell data)
     #[arg(long = "cell-tag")]
     pub cell_tag: Option<String>,
+
+    /// Threading options for parallel BAM decompression
+    #[command(flatten)]
+    pub threading: ThreadingOptions,
 }
 
 impl Command for DuplexMetrics {
@@ -221,6 +226,7 @@ impl Command for DuplexMetrics {
         info!("  Min AB reads: {}", self.min_ab_reads);
         info!("  Min BA reads: {}", self.min_ba_reads);
         info!("  Collect duplex UMI counts: {}", self.duplex_umi_counts);
+        info!("  Threads: {}", self.threading.num_threads());
 
         let timer = OperationTimer::new("Computing duplex metrics");
 
@@ -400,7 +406,7 @@ impl DuplexMetrics {
     fn validate_not_consensus_bam(&self) -> Result<()> {
         use fgumi_lib::consensus_tags::is_consensus;
 
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
+        let (mut reader, header) = create_bam_reader(&self.input, self.threading.num_threads())?;
 
         // Look at the first valid R1 record
         for result in reader.record_bufs(&header) {
@@ -564,7 +570,7 @@ impl DuplexMetrics {
         collectors: &mut [DuplexMetricsCollector],
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
     ) -> Result<(usize, Vec<usize>)> {
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
+        let (mut reader, header) = create_bam_reader(&self.input, self.threading.num_threads())?;
 
         let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
         let template_iter = TemplateIterator::new(record_iter);
@@ -770,7 +776,7 @@ impl DuplexMetrics {
         collectors: &mut [DuplexMetricsCollector],
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
         fraction_template_counts: &mut [usize],
-        metrics: &DuplexMetrics,
+        _metrics: &DuplexMetrics,
     ) {
         use std::collections::HashMap;
 
@@ -856,13 +862,10 @@ impl DuplexMetrics {
                         .map(|(mi, rx)| ((*mi).to_string(), (*rx).to_string()))
                         .collect();
 
-                    metrics.update_umi_metrics(
-                        &mut collectors[idx],
+                    collectors[idx].update_umi_metrics_for_family(
                         umi_consensus_caller,
                         &owned_pairs,
                         base_umi,
-                        *a_count,
-                        *b_count,
                     );
                 }
             }
@@ -931,7 +934,7 @@ impl DuplexMetrics {
         let ds_family_sizes: Vec<usize> =
             family_size_metrics.iter().flat_map(|m| vec![m.family_size; m.ds_count]).collect();
 
-        let ideal_fraction = Self::calculate_ideal_duplex_fraction(
+        let ideal_fraction = calculate_ideal_duplex_fraction(
             &ds_family_sizes,
             self.min_ab_reads,
             self.min_ba_reads,
@@ -965,159 +968,6 @@ impl DuplexMetrics {
                 0.0
             },
             ds_fraction_duplexes_ideal: ideal_fraction,
-        }
-    }
-
-    /// Calculates the ideal duplex fraction using binomial model.
-    ///
-    /// For each family of size N, calculates the probability that both strands
-    /// have sufficient reads (A >= `min_ab` AND B >= `min_ba` where A + B = N).
-    /// Assumes each read has 0.5 probability of being on each strand.
-    fn calculate_ideal_duplex_fraction(
-        family_sizes: &[usize],
-        min_ab: usize,
-        min_ba: usize,
-    ) -> f64 {
-        if family_sizes.is_empty() {
-            return 0.0;
-        }
-
-        let mut ideal_duplexes = 0.0;
-        let total_families = family_sizes.len() as f64;
-
-        for &size in family_sizes {
-            if size < min_ab + min_ba {
-                // Impossible to form a duplex with this family size
-                continue;
-            }
-
-            // Calculate P(A >= min_ab AND B >= min_ba) where A ~ Binomial(n=size, p=0.5)
-            // and B = size - A
-            //
-            // This is equivalent to: P(min_ba <= A <= size - min_ab)
-            // = P(A <= size - min_ab) - P(A < min_ba)
-            // = CDF(size - min_ab) - CDF(min_ba - 1)
-
-            let binomial = match Binomial::new(0.5, size as u64) {
-                Ok(b) => b,
-                Err(_) => continue, // Skip if binomial creation fails
-            };
-
-            let upper_bound = size - min_ba;
-            let lower_bound = min_ab;
-
-            // P(A >= lower_bound AND A <= upper_bound)
-            let prob = if upper_bound >= lower_bound {
-                let p_upper = binomial.cdf(upper_bound as u64);
-                let p_lower =
-                    if lower_bound > 0 { binomial.cdf((lower_bound - 1) as u64) } else { 0.0 };
-                p_upper - p_lower
-            } else {
-                0.0
-            };
-
-            ideal_duplexes += prob;
-        }
-
-        ideal_duplexes / total_families
-    }
-
-    /// Updates UMI metrics for a duplex family
-    ///
-    /// This method:
-    /// 1. Uses RX tags (raw UMI sequences) to extract individual UMI observations
-    /// 2. Separates by strand (/A and /B suffixes in MI tags), swapping UMI parts for B strand
-    /// 3. Calls consensus for each UMI position
-    /// 4. Records raw observations, errors, and unique observations for each individual UMI
-    /// 5. Records duplex UMI metrics if enabled
-    ///
-    /// This matches the Scala implementation in CollectDuplexSeqMetrics.scala:407-431
-    fn update_umi_metrics(
-        &self,
-        collector: &mut DuplexMetricsCollector,
-        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-        group_pairs: &[(String, String)],
-        base_umi: &str,
-        _a_count: usize,
-        _b_count: usize,
-    ) {
-        // Collect individual UMI parts from each strand's RX tag
-        // For /A strand: split RX "AAA-TTT" → umi1s += "AAA", umi2s += "TTT"
-        // For /B strand: split RX "TTT-AAA" → umi1s += "AAA", umi2s += "TTT" (swapped)
-        let mut umi1s = Vec::new();
-        let mut umi2s = Vec::new();
-
-        for (mi, rx) in group_pairs {
-            // Check if this MI tag belongs to the current base_umi family
-            let mi_base = extract_mi_base(mi);
-
-            if mi_base != base_umi {
-                continue;
-            }
-
-            // Split the RX tag to get individual UMI parts
-            let parts: Vec<&str> = rx.split('-').collect();
-            if parts.len() != 2 {
-                // Not a valid duplex UMI, skip
-                continue;
-            }
-
-            // Check that both components are non-empty
-            if parts[0].is_empty() || parts[1].is_empty() {
-                // Empty component, skip
-                continue;
-            }
-
-            // Add UMI parts based on strand
-            if mi.ends_with("/A") {
-                // For /A strand: u1 goes to umi1s, u2 goes to umi2s
-                umi1s.push(parts[0].to_string());
-                umi2s.push(parts[1].to_string());
-            } else if mi.ends_with("/B") {
-                // For /B strand: u2 goes to umi1s, u1 goes to umi2s (swapped)
-                umi1s.push(parts[1].to_string());
-                umi2s.push(parts[0].to_string());
-            }
-        }
-
-        // Call consensus for each UMI position and record metrics
-        let mut consensus_umis = Vec::new();
-
-        if !umi1s.is_empty() {
-            let (consensus, _had_errors) = umi_consensus_caller.consensus(&umi1s);
-            let raw_count = umi1s.len();
-            let error_count = umi1s.iter().filter(|u| **u != consensus).count();
-            collector.record_umi(&consensus, raw_count, error_count, true);
-            consensus_umis.push(consensus);
-        }
-
-        if !umi2s.is_empty() {
-            let (consensus, _had_errors) = umi_consensus_caller.consensus(&umi2s);
-            let raw_count = umi2s.len();
-            let error_count = umi2s.iter().filter(|u| **u != consensus).count();
-            collector.record_umi(&consensus, raw_count, error_count, true);
-            consensus_umis.push(consensus);
-        }
-
-        // Record duplex UMI metrics if enabled
-        if self.duplex_umi_counts && consensus_umis.len() == 2 {
-            let duplex_umi = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
-            // Each read pair contributes one observation to the duplex UMI
-            // (not two, even though we track each component separately)
-            let total_raw = umi1s.len();
-
-            // Count how many raw RX tags had errors (don't match either duplex orientation)
-            let expected_duplex1 = format!("{}-{}", consensus_umis[0], consensus_umis[1]);
-            let expected_duplex2 = format!("{}-{}", consensus_umis[1], consensus_umis[0]);
-            let error_count = group_pairs
-                .iter()
-                .filter(|(mi, rx)| {
-                    let mi_base = extract_mi_base(mi);
-                    mi_base == base_umi && *rx != expected_duplex1 && *rx != expected_duplex2
-                })
-                .count();
-
-            collector.record_duplex_umi(&duplex_umi, total_raw, error_count, true);
         }
     }
 
@@ -1313,6 +1163,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1379,6 +1230,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1468,6 +1320,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1595,6 +1448,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1750,6 +1604,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -1876,6 +1731,7 @@ mod tests {
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
                 cell_tag: None,
+                threading: ThreadingOptions::none(),
             };
 
             cmd.execute("test")?;
@@ -1906,6 +1762,7 @@ mod tests {
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
                 cell_tag: None,
+                threading: ThreadingOptions::none(),
             };
 
             cmd.execute("test")?;
@@ -1936,6 +1793,7 @@ mod tests {
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
                 cell_tag: None,
+                threading: ThreadingOptions::none(),
             };
 
             cmd.execute("test")?;
@@ -2073,6 +1931,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -2137,6 +1996,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         cmd.execute("test")?;
@@ -2342,6 +2202,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         // This should fail with an error about consensus BAM
@@ -2369,6 +2230,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         assert_eq!(metrics.min_ab_reads, 1);
@@ -2391,6 +2253,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         assert_eq!(metrics.min_ab_reads, 3);
@@ -2412,6 +2275,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         // The validation happens in execute(), check during command construction would be ideal
@@ -2553,6 +2417,7 @@ mod tests {
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
             cell_tag: None,
+            threading: ThreadingOptions::none(),
         };
 
         // Should complete without panicking or errors

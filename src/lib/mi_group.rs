@@ -418,19 +418,21 @@ impl MemoryEstimate for MiGroupBatch {
 pub struct MiGroupBatch {
     /// The MI groups in this batch
     pub groups: Vec<MiGroup>,
+    /// CS family sizes collected during grouping (only populated if CS tracking is enabled)
+    pub cs_family_sizes: Vec<usize>,
 }
 
 impl MiGroupBatch {
     /// Creates a new empty MI group batch.
     #[must_use]
     pub fn new() -> Self {
-        Self { groups: Vec::new() }
+        Self { groups: Vec::new(), cs_family_sizes: Vec::new() }
     }
 
     /// Creates a new MI group batch with pre-allocated capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { groups: Vec::with_capacity(capacity) }
+        Self { groups: Vec::with_capacity(capacity), cs_family_sizes: Vec::new() }
     }
 
     /// Returns the number of groups in the batch.
@@ -500,6 +502,9 @@ type MiTransformFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 ///     |mi| extract_mi_base(mi).to_string(),   // transform function
 /// );
 /// ```
+/// Coordinate key type for CS family tracking (ref1, pos1, strand1, ref2, pos2, strand2)
+pub type CoordinateKey = (i32, i32, u8, i32, i32, u8);
+
 pub struct MiGrouper {
     /// The MI tag to group by (e.g., "MI")
     tag: Tag,
@@ -517,6 +522,14 @@ pub struct MiGrouper {
     record_filter: Option<RecordFilterFn>,
     /// Optional MI tag transformation function
     mi_transform: Option<MiTransformFn>,
+    /// Whether to track CS (Coordinate & Strand) families
+    track_cs_families: bool,
+    /// Current coordinate being tracked for CS families
+    current_coordinate: Option<CoordinateKey>,
+    /// Count of templates at current coordinate
+    current_cs_count: usize,
+    /// CS family sizes collected during grouping
+    pending_cs_sizes: Vec<usize>,
 }
 
 impl MiGrouper {
@@ -544,7 +557,21 @@ impl MiGrouper {
             finished: false,
             record_filter: None,
             mi_transform: None,
+            track_cs_families: false,
+            current_coordinate: None,
+            current_cs_count: 0,
+            pending_cs_sizes: Vec::new(),
         }
+    }
+
+    /// Enable CS (Coordinate & Strand) family tracking.
+    ///
+    /// When enabled, the grouper will track consecutive coordinates and
+    /// count CS families. The counts are returned in `MiGroupBatch::cs_family_sizes`.
+    #[must_use]
+    pub fn with_cs_tracking(mut self) -> Self {
+        self.track_cs_families = true;
+        self
     }
 
     /// Create a `MiGrouper` with record filtering and MI tag transformation.
@@ -585,6 +612,10 @@ impl MiGrouper {
             finished: false,
             record_filter: Some(Box::new(record_filter)),
             mi_transform: Some(Box::new(mi_transform)),
+            track_cs_families: false,
+            current_coordinate: None,
+            current_cs_count: 0,
+            pending_cs_sizes: Vec::new(),
         }
     }
 
@@ -627,7 +658,9 @@ impl MiGrouper {
         let mut batches = Vec::new();
         while self.pending_groups.len() >= self.batch_size {
             let groups: Vec<MiGroup> = self.pending_groups.drain(..self.batch_size).collect();
-            batches.push(MiGroupBatch { groups });
+            // Move CS sizes to batch (they correspond to coordinates seen while building these groups)
+            let cs_family_sizes = std::mem::take(&mut self.pending_cs_sizes);
+            batches.push(MiGroupBatch { groups, cs_family_sizes });
         }
         batches
     }
@@ -639,9 +672,42 @@ impl Grouper for MiGrouper {
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
         for decoded in records {
             let record = decoded.record;
+            let key = decoded.key;
+
             // Apply record filter if configured - skip records that don't pass
             if !self.should_keep(&record) {
                 continue;
+            }
+
+            // Track CS families if enabled (for R1 primaries with valid coordinates)
+            if self.track_cs_families {
+                let flags = record.flags();
+                let is_r1_primary = flags.is_first_segment()
+                    && !flags.is_secondary()
+                    && !flags.is_supplementary();
+
+                if is_r1_primary && key.is_valid_paired() {
+                    let coord = key.coordinate_key();
+                    match &self.current_coordinate {
+                        Some(current) if *current == coord => {
+                            // Same coordinate, increment count
+                            self.current_cs_count += 1;
+                        }
+                        Some(_) => {
+                            // Different coordinate, record current and start new
+                            if self.current_cs_count > 0 {
+                                self.pending_cs_sizes.push(self.current_cs_count);
+                            }
+                            self.current_coordinate = Some(coord);
+                            self.current_cs_count = 1;
+                        }
+                        None => {
+                            // First coordinate
+                            self.current_coordinate = Some(coord);
+                            self.current_cs_count = 1;
+                        }
+                    }
+                }
             }
 
             // Get MI tag from record (with optional transformation)
@@ -680,12 +746,20 @@ impl Grouper for MiGrouper {
         // Flush any remaining current group
         self.flush_current_group();
 
+        // Flush final CS count if tracking
+        if self.track_cs_families && self.current_cs_count > 0 {
+            self.pending_cs_sizes.push(self.current_cs_count);
+            self.current_cs_count = 0;
+            self.current_coordinate = None;
+        }
+
         // Return any remaining groups as final batch
-        if self.pending_groups.is_empty() {
+        if self.pending_groups.is_empty() && self.pending_cs_sizes.is_empty() {
             Ok(None)
         } else {
             let groups: Vec<MiGroup> = self.pending_groups.drain(..).collect();
-            Ok(Some(MiGroupBatch { groups }))
+            let cs_family_sizes = std::mem::take(&mut self.pending_cs_sizes);
+            Ok(Some(MiGroupBatch { groups, cs_family_sizes }))
         }
     }
 

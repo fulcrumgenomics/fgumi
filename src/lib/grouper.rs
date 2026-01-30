@@ -618,6 +618,515 @@ impl Grouper for PositionGrouper {
 }
 
 // ============================================================================
+// PositionMiGrouper - Groups by position then by MI for duplex metrics
+// ============================================================================
+
+use crate::umi::extract_mi_base;
+use noodles::sam::alignment::record::Cigar;
+use noodles::sam::alignment::record::cigar::op::Kind;
+use std::collections::HashMap;
+
+/// Coordinate grouping key matching fgbio's `ReadInfo` structure.
+/// Uses unclipped 5' positions of both R1 and R2, normalized so lower position comes first.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ReadInfoKey {
+    /// Reference index for position 1 (lower).
+    pub ref_index1: Option<usize>,
+    /// Unclipped 5' position for position 1.
+    pub start1: i32,
+    /// Strand for position 1 (true = reverse).
+    pub strand1: bool,
+    /// Reference index for position 2 (higher).
+    pub ref_index2: Option<usize>,
+    /// Unclipped 5' position for position 2.
+    pub start2: i32,
+    /// Strand for position 2 (true = reverse).
+    pub strand2: bool,
+}
+
+impl ReadInfoKey {
+    /// Create an "unknown" key for unpaired/unmapped reads (excluded from metrics).
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            ref_index1: None,
+            start1: 0,
+            strand1: false,
+            ref_index2: None,
+            start2: 0,
+            strand2: false,
+        }
+    }
+
+    /// Returns true if this key represents a valid paired read.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.ref_index1.is_some() && self.ref_index2.is_some()
+    }
+
+    /// Compute `ReadInfoKey` from template records (R1 + R2).
+    ///
+    /// Uses same filtering criteria as duplex-metrics:
+    /// - R1: segmented, mapped, mate mapped, first segment, primary
+    /// - R2: segmented, mapped, mate mapped, last segment, primary
+    ///
+    /// Returns `ReadInfoKey::unknown()` if R1/R2 cannot be identified or are on different references.
+    #[must_use]
+    pub fn from_template_records(records: &[RecordBuf]) -> Self {
+        Self::compute_from_iter(records.iter())
+    }
+
+    /// Compute `ReadInfoKey` from template record references (R1 + R2).
+    ///
+    /// Same as `from_template_records` but takes references to avoid cloning.
+    #[must_use]
+    pub fn from_template_refs(records: &[&RecordBuf]) -> Self {
+        Self::compute_from_iter(records.iter().copied())
+    }
+
+    /// Compute `ReadInfoKey` directly from R1 and R2 records.
+    ///
+    /// This is the most efficient method when R1 and R2 are already identified.
+    /// Returns `ReadInfoKey::unknown()` if records are on different references.
+    #[must_use]
+    pub fn from_r1_r2(r1: &RecordBuf, r2: &RecordBuf) -> Self {
+        let r1_ref = r1.reference_sequence_id();
+        let r2_ref = r2.reference_sequence_id();
+
+        // Only process if same reference
+        if r1_ref != r2_ref || r1_ref.is_none() {
+            return Self::unknown();
+        }
+
+        let r1_5prime = unclipped_five_prime_position(r1);
+        let r2_5prime = unclipped_five_prime_position(r2);
+        let r1_strand = r1.flags().is_reverse_complemented();
+        let r2_strand = r2.flags().is_reverse_complemented();
+
+        match (r1_5prime, r2_5prime) {
+            (Some(s1), Some(s2)) => {
+                // Normalize: lower position comes first (matching fgbio)
+                if (r1_ref, s1) <= (r2_ref, s2) {
+                    Self {
+                        ref_index1: r1_ref,
+                        start1: s1,
+                        strand1: r1_strand,
+                        ref_index2: r2_ref,
+                        start2: s2,
+                        strand2: r2_strand,
+                    }
+                } else {
+                    Self {
+                        ref_index1: r2_ref,
+                        start1: s2,
+                        strand1: r2_strand,
+                        ref_index2: r1_ref,
+                        start2: s1,
+                        strand2: r1_strand,
+                    }
+                }
+            }
+            _ => Self::unknown(),
+        }
+    }
+
+    /// Internal helper to compute ReadInfoKey from an iterator of record references.
+    fn compute_from_iter<'a>(records: impl Iterator<Item = &'a RecordBuf>) -> Self {
+        let records: Vec<&RecordBuf> = records.collect();
+
+        // Find R1: segmented, mapped, mate mapped, first segment, primary
+        let r1 = records.iter().find(|r| {
+            let f = r.flags();
+            f.is_segmented()
+                && !f.is_unmapped()
+                && !f.is_mate_unmapped()
+                && f.is_first_segment()
+                && !f.is_secondary()
+                && !f.is_supplementary()
+        });
+
+        // Find R2: segmented, mapped, mate mapped, last segment, primary
+        let r2 = records.iter().find(|r| {
+            let f = r.flags();
+            f.is_segmented()
+                && !f.is_unmapped()
+                && !f.is_mate_unmapped()
+                && f.is_last_segment()
+                && !f.is_secondary()
+                && !f.is_supplementary()
+        });
+
+        match (r1, r2) {
+            (Some(r1), Some(r2)) => {
+                let r1_ref = r1.reference_sequence_id();
+                let r2_ref = r2.reference_sequence_id();
+
+                // Only process if same reference
+                if r1_ref != r2_ref || r1_ref.is_none() {
+                    return Self::unknown();
+                }
+
+                let r1_5prime = unclipped_five_prime_position(r1);
+                let r2_5prime = unclipped_five_prime_position(r2);
+                let r1_strand = r1.flags().is_reverse_complemented();
+                let r2_strand = r2.flags().is_reverse_complemented();
+
+                match (r1_5prime, r2_5prime) {
+                    (Some(s1), Some(s2)) => {
+                        // Normalize: lower position comes first (matching fgbio)
+                        if (r1_ref, s1) <= (r2_ref, s2) {
+                            Self {
+                                ref_index1: r1_ref,
+                                start1: s1,
+                                strand1: r1_strand,
+                                ref_index2: r2_ref,
+                                start2: s2,
+                                strand2: r2_strand,
+                            }
+                        } else {
+                            Self {
+                                ref_index1: r2_ref,
+                                start1: s2,
+                                strand1: r2_strand,
+                                ref_index2: r1_ref,
+                                start2: s1,
+                                strand2: r1_strand,
+                            }
+                        }
+                    }
+                    _ => Self::unknown(),
+                }
+            }
+            _ => Self::unknown(),
+        }
+    }
+}
+
+/// Computes the unclipped 5' position for a read, matching fgbio's `positionOf`.
+///
+/// For forward strand reads: `unclipped_start = alignment_start - leading_soft_clips`
+/// For reverse strand reads: `unclipped_end = alignment_end + trailing_soft_clips`
+fn unclipped_five_prime_position(record: &RecordBuf) -> Option<i32> {
+    let is_reverse = record.flags().is_reverse_complemented();
+    let cigar = record.cigar();
+
+    if is_reverse {
+        // For reverse strand, 5' is at the end
+        // unclippedEnd = alignmentEnd + trailing soft clips
+        let alignment_end = record.alignment_end().map(|p| usize::from(p) as i32)?;
+
+        // Count trailing soft clips (last element if it's S)
+        let trailing_clips: i32 = cigar
+            .iter()
+            .filter_map(std::result::Result::ok)
+            .last()
+            .filter(|op| op.kind() == Kind::SoftClip)
+            .map_or(0, |op| op.len() as i32);
+
+        Some(alignment_end + trailing_clips)
+    } else {
+        // For forward strand, 5' is at the start
+        // unclippedStart = alignmentStart - leading soft clips
+        let alignment_start = record.alignment_start().map(|p| usize::from(p) as i32)?;
+
+        // Count leading soft clips (first element if it's S)
+        let leading_clips: i32 = cigar
+            .iter()
+            .find_map(std::result::Result::ok)
+            .filter(|op| op.kind() == Kind::SoftClip)
+            .map_or(0, |op| op.len() as i32);
+
+        Some(alignment_start - leading_clips)
+    }
+}
+
+/// A position-MI group containing records at the same position, organized by MI.
+///
+/// This structure is used for collecting duplex metrics during consensus calling.
+/// It groups records first by genomic position (using `ReadInfoKey`), then by
+/// molecular identifier (MI).
+///
+/// Family size definitions:
+/// - **CS** (Coordinate & Strand): Total templates at this position (`total_templates`)
+/// - **SS** (Single Strand): Templates with same position AND full MI tag (including /A or /B)
+/// - **DS** (Double Strand): Templates with same position AND base MI (without /A, /B)
+#[derive(Debug)]
+pub struct PositionMiGroup {
+    /// The coordinate key for this group (computed from R1+R2 unclipped 5' positions).
+    pub read_info_key: ReadInfoKey,
+    /// Records organized by base MI (without /A, /B suffix).
+    /// Each entry maps base_mi -> records with that MI.
+    pub mi_groups: HashMap<String, Vec<RecordBuf>>,
+    /// Total number of templates at this position (CS family size).
+    pub total_templates: usize,
+    /// Total number of records at this position.
+    pub total_records: usize,
+}
+
+impl BatchWeight for PositionMiGroup {
+    /// Returns the number of templates in this group.
+    fn batch_weight(&self) -> usize {
+        self.total_templates
+    }
+}
+
+impl MemoryEstimate for PositionMiGroup {
+    fn estimate_heap_size(&self) -> usize {
+        // read_info_key: ReadInfoKey has minimal heap allocation
+        // mi_groups: HashMap<String, Vec<RecordBuf>>
+        let mi_groups_size: usize = self
+            .mi_groups
+            .iter()
+            .map(|(k, v)| {
+                let key_size = k.capacity();
+                let vec_size: usize = v.iter().map(MemoryEstimate::estimate_heap_size).sum();
+                let vec_overhead = v.capacity() * std::mem::size_of::<RecordBuf>();
+                key_size + vec_size + vec_overhead
+            })
+            .sum();
+        let hashmap_overhead = self.mi_groups.capacity() * 48; // rough estimate
+        mi_groups_size + hashmap_overhead
+    }
+}
+
+/// A batch of position-MI groups for parallel processing.
+#[derive(Default)]
+pub struct PositionMiGroupBatch {
+    /// The position-MI groups in this batch.
+    pub groups: Vec<PositionMiGroup>,
+}
+
+impl PositionMiGroupBatch {
+    /// Creates a new empty batch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { groups: Vec::new() }
+    }
+
+    /// Returns the number of groups in the batch.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Returns true if the batch is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+}
+
+impl BatchWeight for PositionMiGroupBatch {
+    fn batch_weight(&self) -> usize {
+        self.groups.iter().map(|g| g.total_templates).sum()
+    }
+}
+
+impl MemoryEstimate for PositionMiGroupBatch {
+    fn estimate_heap_size(&self) -> usize {
+        let groups_size: usize = self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum();
+        let groups_vec_overhead = self.groups.capacity() * std::mem::size_of::<PositionMiGroup>();
+        groups_size + groups_vec_overhead
+    }
+}
+
+/// A grouper that groups records by position, then by MI.
+///
+/// Used by the `duplex` command with `--metrics-output` to collect duplex metrics
+/// during consensus calling. Groups records first by genomic position using
+/// `ReadInfoKey` (matching duplex-metrics exactly), then organizes them by base MI.
+///
+/// Expects input sorted by template-coordinate with MI tags already assigned
+/// (output from `group` command).
+pub struct PositionMiGrouper {
+    /// MI tag name (e.g., "MI").
+    mi_tag: Tag,
+    /// Number of position groups per batch.
+    batch_size: usize,
+
+    // Template accumulation (group records by QNAME first)
+    /// Current template name hash being accumulated.
+    current_name_hash: Option<u64>,
+    /// Records for the current template.
+    current_template_records: Vec<RecordBuf>,
+
+    // Position group (using ReadInfoKey computed from template)
+    /// Current ReadInfoKey for the position group.
+    current_read_info_key: Option<ReadInfoKey>,
+    /// Records at current position, organized by base MI.
+    current_mi_groups: HashMap<String, Vec<RecordBuf>>,
+    /// Number of templates at current position (for CS family count).
+    current_template_count: usize,
+    /// Total records at current position.
+    current_record_count: usize,
+
+    /// Completed groups waiting to be batched.
+    pending_groups: VecDeque<PositionMiGroup>,
+    /// Whether `finish()` has been called.
+    finished: bool,
+}
+
+impl PositionMiGrouper {
+    /// Create a new `PositionMiGrouper`.
+    ///
+    /// # Arguments
+    /// * `mi_tag_name` - The MI tag name (e.g., "MI")
+    /// * `batch_size` - Number of position groups per batch
+    ///
+    /// # Panics
+    /// Panics if `mi_tag_name` is not exactly 2 characters.
+    #[must_use]
+    pub fn new(mi_tag_name: &str, batch_size: usize) -> Self {
+        assert!(mi_tag_name.len() == 2, "Tag name must be exactly 2 characters");
+        let tag_bytes = mi_tag_name.as_bytes();
+        let mi_tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
+
+        Self {
+            mi_tag,
+            batch_size: batch_size.max(1),
+            current_name_hash: None,
+            current_template_records: Vec::new(),
+            current_read_info_key: None,
+            current_mi_groups: HashMap::new(),
+            current_template_count: 0,
+            current_record_count: 0,
+            pending_groups: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    /// Extract the MI tag value from a record.
+    fn get_record_mi(&self, record: &RecordBuf) -> Option<String> {
+        if let Some(val) = record.data().get(&self.mi_tag) {
+            use noodles::sam::alignment::record_buf::data::field::Value;
+            if let Value::String(s) = val {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+
+
+    /// Process accumulated template: compute `ReadInfoKey` and add to position group.
+    fn flush_template(&mut self) {
+        if self.current_template_records.is_empty() {
+            return;
+        }
+
+        let records = std::mem::take(&mut self.current_template_records);
+        let read_info_key = ReadInfoKey::from_template_records(&records);
+        self.current_name_hash = None;
+
+        // Skip templates with invalid ReadInfoKey (unpaired, unmapped, etc.)
+        if !read_info_key.is_valid() {
+            return;
+        }
+
+        // Check if position changed
+        if self.current_read_info_key.as_ref() != Some(&read_info_key) {
+            self.flush_current_position_group();
+            self.current_read_info_key = Some(read_info_key);
+        }
+
+        // Extract MI from first record with MI tag
+        let full_mi = records.iter().find_map(|r| self.get_record_mi(r)).unwrap_or_default();
+        let base_mi = extract_mi_base(&full_mi).to_string();
+
+        // Add records to MI group
+        let record_count = records.len();
+        self.current_mi_groups.entry(base_mi).or_default().extend(records);
+        self.current_template_count += 1;
+        self.current_record_count += record_count;
+    }
+
+    /// Flush current position group to pending queue.
+    fn flush_current_position_group(&mut self) {
+        if let Some(key) = self.current_read_info_key.take() {
+            if !self.current_mi_groups.is_empty() || self.current_record_count > 0 {
+                let mi_groups = std::mem::take(&mut self.current_mi_groups);
+                let total_templates = self.current_template_count;
+                let total_records = self.current_record_count;
+                self.current_template_count = 0;
+                self.current_record_count = 0;
+
+                self.pending_groups.push_back(PositionMiGroup {
+                    read_info_key: key,
+                    mi_groups,
+                    total_templates,
+                    total_records,
+                });
+            }
+        }
+    }
+
+    /// Try to form complete batches from pending groups.
+    fn drain_batches(&mut self) -> Vec<PositionMiGroupBatch> {
+        let mut batches = Vec::new();
+        while self.pending_groups.len() >= self.batch_size {
+            let groups: Vec<PositionMiGroup> =
+                self.pending_groups.drain(..self.batch_size).collect();
+            batches.push(PositionMiGroupBatch { groups });
+        }
+        batches
+    }
+}
+
+impl Grouper for PositionMiGrouper {
+    type Group = PositionMiGroupBatch;
+
+    fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+        for decoded in records {
+            let record = decoded.record;
+            let key = decoded.key;
+
+            // Skip secondary and supplementary reads
+            let flags = record.flags();
+            if flags.is_secondary() || flags.is_supplementary() {
+                continue;
+            }
+
+            // Check if same template (by name hash)
+            if self.current_name_hash != Some(key.name_hash) {
+                // New template - flush previous
+                self.flush_template();
+                self.current_name_hash = Some(key.name_hash);
+            }
+
+            self.current_template_records.push(record);
+        }
+
+        Ok(self.drain_batches())
+    }
+
+    fn finish(&mut self) -> io::Result<Option<Self::Group>> {
+        if self.finished {
+            return Ok(None);
+        }
+        self.finished = true;
+
+        // Flush any remaining template
+        self.flush_template();
+
+        // Flush any remaining position group
+        self.flush_current_position_group();
+
+        // Return remaining groups as final batch
+        if self.pending_groups.is_empty() {
+            Ok(None)
+        } else {
+            let groups: Vec<PositionMiGroup> = self.pending_groups.drain(..).collect();
+            Ok(Some(PositionMiGroupBatch { groups }))
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.current_template_records.is_empty()
+            || !self.current_mi_groups.is_empty()
+            || !self.pending_groups.is_empty()
+    }
+}
+
+// ============================================================================
 // FASTQ Record Parsing Utilities
 // ============================================================================
 
