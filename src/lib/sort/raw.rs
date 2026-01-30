@@ -522,8 +522,13 @@ impl RawExternalSorter {
             return Ok(());
         }
 
-        // Merge oldest half of files into one
-        let merge_count = self.max_temp_files / 2;
+        // Need at least 2 files to consolidate meaningfully
+        if self.max_temp_files < 2 {
+            return Ok(());
+        }
+
+        // Merge oldest half of files into one (at least 2)
+        let merge_count = (self.max_temp_files / 2).max(2).min(chunk_files.len());
         let files_to_merge: Vec<PathBuf> = chunk_files.drain(..merge_count).collect();
 
         info!(
@@ -566,7 +571,8 @@ impl RawExternalSorter {
         let mut heap_size = heap.len();
         if heap_size == 0 {
             writer.finish()?;
-            chunk_files.push(merged_path);
+            // Insert at beginning to preserve stable order
+            chunk_files.insert(0, merged_path);
             // Clean up old files
             for path in &files_to_merge {
                 let _ = std::fs::remove_file(path);
@@ -604,8 +610,9 @@ impl RawExternalSorter {
 
         writer.finish()?;
 
-        // Add merged file to chunk list
-        chunk_files.push(merged_path);
+        // Insert merged file at the beginning to preserve stable order for equal keys.
+        // The merged file contains the oldest records, so it should be processed first.
+        chunk_files.insert(0, merged_path);
 
         // Clean up old files
         for path in &files_to_merge {

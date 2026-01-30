@@ -78,8 +78,9 @@ impl ReadAheadReader {
     #[must_use]
     pub fn with_buffer_size(reader: BamReaderAuto, buffer_size: usize) -> Self {
         // Approximate the old behavior: buffer_size records total
-        let batch_size = BATCH_SIZE;
-        let channel_buffer = (buffer_size / batch_size).max(1);
+        let buffer_size = buffer_size.max(1);
+        let batch_size = BATCH_SIZE.min(buffer_size);
+        let channel_buffer = buffer_size.div_ceil(batch_size);
         Self::with_batch_size(reader, batch_size, channel_buffer)
     }
 

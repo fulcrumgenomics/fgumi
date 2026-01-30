@@ -140,7 +140,12 @@ impl<R: Read> RawBamRecordReader<R> {
         header_bytes.extend_from_slice(&(l_text as u32).to_le_bytes());
 
         // Skip header text
-        self.ensure_bytes(l_text)?;
+        if !self.ensure_bytes(l_text)? {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated BAM header (text)",
+            ));
+        }
         header_bytes.extend_from_slice(&self.decompressed[self.position..self.position + l_text]);
         self.position += l_text;
 
@@ -155,7 +160,12 @@ impl<R: Read> RawBamRecordReader<R> {
             header_bytes.extend_from_slice(&(l_name as u32).to_le_bytes());
 
             // Reference name
-            self.ensure_bytes(l_name)?;
+            if !self.ensure_bytes(l_name)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Truncated BAM header (ref name)",
+                ));
+            }
             header_bytes
                 .extend_from_slice(&self.decompressed[self.position..self.position + l_name]);
             self.position += l_name;
@@ -172,7 +182,7 @@ impl<R: Read> RawBamRecordReader<R> {
     /// Read the next raw BAM record.
     ///
     /// Returns `Some(record_bytes)` if a record is available, `None` at EOF.
-    /// The returned bytes include the full BAM record (`block_size` + data).
+    /// The returned bytes exclude the 4-byte `block_size` prefix (matching noodles format).
     pub fn next_record(&mut self) -> io::Result<Option<Vec<u8>>> {
         if !self.header_skipped {
             return Err(io::Error::other("Must call skip_header() first"));
@@ -214,7 +224,12 @@ impl<R: Read> RawBamRecordReader<R> {
 
     /// Read a u32 from the decompressed buffer.
     fn read_u32(&mut self) -> io::Result<u32> {
-        self.ensure_bytes(4)?;
+        if !self.ensure_bytes(4)? {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF while reading u32",
+            ));
+        }
         let val = u32::from_le_bytes([
             self.decompressed[self.position],
             self.decompressed[self.position + 1],
