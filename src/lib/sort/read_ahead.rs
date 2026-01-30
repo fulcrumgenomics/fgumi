@@ -41,8 +41,8 @@ const CHANNEL_BUFFER_SIZE: usize = 16;
 /// Records are batched (256 per batch by default) to reduce channel
 /// synchronization overhead by ~256x compared to per-record sends.
 pub struct ReadAheadReader {
-    /// Receiver for prefetched record batches.
-    receiver: Receiver<Vec<Record>>,
+    /// Receiver for prefetched record batches (Option to allow closing before join).
+    receiver: Option<Receiver<Vec<Record>>>,
     /// Handle to the reader thread.
     handle: Option<JoinHandle<()>>,
     /// Current batch being consumed.
@@ -71,7 +71,7 @@ impl ReadAheadReader {
             Self::reader_thread(&mut reader, tx, batch_size);
         });
 
-        Self { receiver: rx, handle: Some(handle), current_batch: Vec::new(), batch_index: 0 }
+        Self { receiver: Some(rx), handle: Some(handle), current_batch: Vec::new(), batch_index: 0 }
     }
 
     /// Create with legacy per-record behavior (for compatibility).
@@ -140,7 +140,8 @@ impl ReadAheadReader {
         }
 
         // Need to fetch next batch
-        match self.receiver.recv() {
+        let receiver = self.receiver.as_ref()?;
+        match receiver.recv() {
             Ok(batch) if !batch.is_empty() => {
                 self.current_batch = batch;
                 self.batch_index = 1; // We'll return index 0
@@ -153,7 +154,11 @@ impl ReadAheadReader {
 
 impl Drop for ReadAheadReader {
     fn drop(&mut self) {
-        // Wait for the reader thread to finish
+        // Close the receiver first to unblock any pending sends in the reader thread.
+        // This prevents deadlock when the channel is full and the thread is blocked on send.
+        drop(self.receiver.take());
+
+        // Now wait for the reader thread to finish
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
