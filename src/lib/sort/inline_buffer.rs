@@ -188,17 +188,21 @@ impl RecordBuffer {
 
     /// Sort the index by key (records stay in place).
     ///
-    /// Uses stable sort to maintain input order for equal keys (matching samtools).
+    /// Uses radix sort for O(n×k) performance instead of O(n log n) comparison sort.
+    /// Falls back to insertion sort for small arrays.
     pub fn sort(&mut self) {
-        self.refs.sort();
+        radix_sort_record_refs(&mut self.refs);
     }
 
-    /// Sort using parallel sort (for large arrays).
+    /// Sort using parallel radix sort (for large arrays).
     ///
-    /// Uses stable sort to maintain input order for equal keys (matching samtools).
+    /// Divides data into chunks, sorts each with radix sort, then merges.
+    /// For very large arrays this is faster than single-threaded radix sort.
     pub fn par_sort(&mut self) {
-        use rayon::prelude::*;
-        self.refs.par_sort();
+        // For parallel sort, we use chunked radix sort
+        // Radix sort is already O(n×k), so parallelizing chunks provides
+        // linear speedup without the merge overhead of comparison-based parallel sorts
+        parallel_radix_sort_record_refs(&mut self.refs);
     }
 
     /// Get record bytes by reference.
@@ -618,15 +622,17 @@ impl TemplateRecordBuffer {
     }
 
     /// Sort the index by cached key (O(1) comparison, no data buffer access).
+    ///
+    /// Note: Uses comparison sort rather than radix sort because `TemplateKey`
+    /// is 32 bytes (4 × u64), making multi-field radix sort slower than
+    /// comparison sort due to the many passes required.
     pub fn sort(&mut self) {
-        // Keys are cached in refs - no need to access data buffer during sort
         self.refs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     }
 
     /// Sort using parallel sort with cached keys.
     pub fn par_sort(&mut self) {
         use rayon::prelude::*;
-        // Keys are cached in refs - no need to access data buffer during sort
         self.refs.par_sort_unstable_by(|a, b| a.key.cmp(&b.key));
     }
 
@@ -694,6 +700,437 @@ impl TemplateRecordBuffer {
     }
 }
 
+// ============================================================================
+// Radix Sort for RecordRef
+// ============================================================================
+
+/// Threshold below which we use insertion sort instead of radix sort.
+const RADIX_THRESHOLD: usize = 256;
+
+/// Radix sort for `RecordRef` arrays using LSD (Least Significant Digit) approach.
+///
+/// Sorts by the `sort_key` field using 8-bit radix (256 buckets).
+/// This is O(n×k) where k is the number of bytes to sort (typically 5-8).
+///
+/// # Stability
+/// Radix sort is inherently stable - records with equal keys maintain their
+/// relative input order, matching samtools behavior.
+#[allow(clippy::uninit_vec)]
+pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
+    let n = refs.len();
+    if n < RADIX_THRESHOLD {
+        // Use insertion sort for small arrays
+        insertion_sort_refs(refs);
+        return;
+    }
+
+    // Find max key to determine how many bytes we need to sort
+    let max_key = refs.iter().map(|r| r.sort_key).max().unwrap_or(0);
+    let bytes_needed =
+        if max_key == 0 { 0 } else { ((64 - max_key.leading_zeros()) as usize).div_ceil(8) };
+
+    if bytes_needed == 0 {
+        return; // All keys are 0, already sorted
+    }
+
+    // Allocate auxiliary buffer
+    let mut aux: Vec<RecordRef> = Vec::with_capacity(n);
+    unsafe {
+        aux.set_len(n);
+    }
+
+    let mut src = refs as *mut [RecordRef];
+    let mut dst = aux.as_mut_slice() as *mut [RecordRef];
+
+    // LSD radix sort - byte by byte from least significant
+    for byte_idx in 0..bytes_needed {
+        let src_slice = unsafe { &*src };
+        let dst_slice = unsafe { &mut *dst };
+
+        // Count occurrences of each byte value
+        let mut counts = [0usize; 256];
+        for r in src_slice.iter() {
+            let byte = ((r.sort_key >> (byte_idx * 8)) & 0xFF) as usize;
+            counts[byte] += 1;
+        }
+
+        // Convert to cumulative offsets
+        let mut total = 0;
+        for count in counts.iter_mut() {
+            let c = *count;
+            *count = total;
+            total += c;
+        }
+
+        // Scatter elements to destination (stable - preserves order within buckets)
+        for r in src_slice.iter() {
+            let byte = ((r.sort_key >> (byte_idx * 8)) & 0xFF) as usize;
+            let dest_idx = counts[byte];
+            counts[byte] += 1;
+            dst_slice[dest_idx] = *r;
+        }
+
+        // Swap src and dst
+        std::mem::swap(&mut src, &mut dst);
+    }
+
+    // If odd number of passes, copy back to original buffer
+    if bytes_needed % 2 == 1 {
+        let src_slice = unsafe { &*src };
+        refs.copy_from_slice(src_slice);
+    }
+}
+
+/// Parallel radix sort for `RecordRef` arrays.
+///
+/// Divides the array into chunks, sorts each chunk with radix sort,
+/// then performs k-way merge. This provides near-linear speedup.
+pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
+    use rayon::prelude::*;
+
+    let n = refs.len();
+    if n < RADIX_THRESHOLD * 2 {
+        // Small array - just use single-threaded radix sort
+        radix_sort_record_refs(refs);
+        return;
+    }
+
+    // Get number of threads from rayon
+    let n_threads = rayon::current_num_threads();
+
+    // For very large arrays, parallel chunked sort + merge is faster
+    if n_threads > 1 && n > 10_000 {
+        let chunk_size = n.div_ceil(n_threads);
+
+        // Sort each chunk in parallel using radix sort
+        refs.par_chunks_mut(chunk_size).for_each(|chunk| {
+            radix_sort_record_refs(chunk);
+        });
+
+        // K-way merge the sorted chunks
+        // For simplicity, we use a heap-based merge into auxiliary storage
+        let chunk_boundaries: Vec<_> = refs
+            .chunks(chunk_size)
+            .scan(0, |pos, chunk| {
+                let start = *pos;
+                *pos += chunk.len();
+                Some(start..*pos)
+            })
+            .collect();
+
+        merge_sorted_chunks(refs, &chunk_boundaries);
+    } else {
+        // Single-threaded radix sort
+        radix_sort_record_refs(refs);
+    }
+}
+
+/// Merge k sorted chunks in place using auxiliary storage.
+fn merge_sorted_chunks(refs: &mut [RecordRef], chunk_ranges: &[std::ops::Range<usize>]) {
+    use crate::sort::radix::{heap_make, heap_sift_down};
+
+    if chunk_ranges.len() <= 1 {
+        return;
+    }
+
+    let n = refs.len();
+    let mut result: Vec<RecordRef> = Vec::with_capacity(n);
+
+    // Heap entry: (sort_key, chunk_idx, position_in_chunk)
+    struct HeapEntry {
+        key: u64,
+        chunk_idx: usize,
+        pos: usize,
+    }
+
+    // Initialize heap with first element from each chunk
+    let mut heap: Vec<HeapEntry> = Vec::with_capacity(chunk_ranges.len());
+    for (chunk_idx, range) in chunk_ranges.iter().enumerate() {
+        if !range.is_empty() {
+            heap.push(HeapEntry { key: refs[range.start].sort_key, chunk_idx, pos: range.start });
+        }
+    }
+
+    if heap.is_empty() {
+        return;
+    }
+
+    // Min-heap: smaller keys should be at the top
+    // Use chunk_idx as tie-breaker for stability
+    let lt = |a: &HeapEntry, b: &HeapEntry| -> bool { (a.key, a.chunk_idx) > (b.key, b.chunk_idx) };
+
+    heap_make(&mut heap, &lt);
+    let mut heap_size = heap.len();
+
+    // Merge
+    while heap_size > 0 {
+        let entry = &heap[0];
+        result.push(refs[entry.pos]);
+
+        let chunk_idx = entry.chunk_idx;
+        let next_pos = entry.pos + 1;
+        let range = &chunk_ranges[chunk_idx];
+
+        if next_pos < range.end {
+            // More elements in this chunk
+            heap[0] = HeapEntry { key: refs[next_pos].sort_key, chunk_idx, pos: next_pos };
+            heap_sift_down(&mut heap, 0, heap_size, &lt);
+        } else {
+            // Chunk exhausted
+            heap_size -= 1;
+            if heap_size > 0 {
+                heap.swap(0, heap_size);
+                heap_sift_down(&mut heap, 0, heap_size, &lt);
+            }
+        }
+    }
+
+    // Copy result back
+    refs.copy_from_slice(&result);
+}
+
+/// Binary insertion sort for small arrays of `RecordRef`.
+fn insertion_sort_refs(refs: &mut [RecordRef]) {
+    for i in 1..refs.len() {
+        let key = refs[i].sort_key;
+        let insert_pos = refs[..i].partition_point(|r| r.sort_key <= key);
+        if insert_pos < i {
+            refs[insert_pos..=i].rotate_right(1);
+        }
+    }
+}
+
+// ============================================================================
+// Radix Sort for TemplateRecordRef (multi-field 4×u64 key)
+// ============================================================================
+
+/// Radix sort for `TemplateRecordRef` arrays using multi-field LSD approach.
+///
+/// The `TemplateKey` consists of 4 u64 fields sorted in order:
+/// primary → secondary → tertiary → `name_hash_upper`
+///
+/// For LSD radix sort, we sort from least significant to most significant:
+/// 1. Sort by `name_hash_upper`
+/// 2. Sort by tertiary (stable, preserves `name_hash_upper` order)
+/// 3. Sort by secondary (stable, preserves tertiary + `name_hash_upper` order)
+/// 4. Sort by primary (stable, final order)
+///
+/// This is O(n×k) where k is the total bytes to sort (up to 32 bytes).
+///
+/// Note: Currently unused because benchmarks showed multi-field radix sort
+/// provides minimal benefit over comparison sort for 32-byte keys.
+/// Kept for potential future optimization experiments.
+#[allow(dead_code)]
+#[allow(clippy::uninit_vec)]
+pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
+    let n = refs.len();
+    if n < RADIX_THRESHOLD {
+        insertion_sort_template_refs(refs);
+        return;
+    }
+
+    // Allocate auxiliary buffer
+    let mut aux: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+    unsafe {
+        aux.set_len(n);
+    }
+
+    // Sort by each field from least significant to most significant
+    // This ensures the final order is: primary → secondary → tertiary → name_hash_upper
+    let fields = [
+        |r: &TemplateRecordRef| r.key.name_hash_upper,
+        |r: &TemplateRecordRef| r.key.tertiary,
+        |r: &TemplateRecordRef| r.key.secondary,
+        |r: &TemplateRecordRef| r.key.primary,
+    ];
+
+    for (field_idx, get_field) in fields.iter().enumerate() {
+        // Find max value for this field to determine bytes needed
+        let max_val = refs.iter().map(get_field).max().unwrap_or(0);
+        let bytes_needed =
+            if max_val == 0 { 0 } else { ((64 - max_val.leading_zeros()) as usize).div_ceil(8) };
+
+        if bytes_needed == 0 {
+            continue; // All values are 0 for this field, skip
+        }
+
+        // Radix sort this field
+        radix_sort_template_field(refs, &mut aux, get_field, bytes_needed, field_idx);
+    }
+}
+
+/// Radix sort a single u64 field of `TemplateRecordRef` using raw pointers.
+#[allow(dead_code)]
+#[allow(clippy::uninit_vec)]
+fn radix_sort_template_field<F>(
+    refs: &mut [TemplateRecordRef],
+    aux: &mut [TemplateRecordRef],
+    get_field: F,
+    bytes_needed: usize,
+    _field_idx: usize,
+) where
+    F: Fn(&TemplateRecordRef) -> u64,
+{
+    let n = refs.len();
+
+    // Use raw pointers to avoid borrow checker issues with swapping
+    let mut src = refs as *mut [TemplateRecordRef];
+    let mut dst = aux as *mut [TemplateRecordRef];
+
+    for byte_idx in 0..bytes_needed {
+        let src_slice = unsafe { &*src };
+        let dst_slice = unsafe { &mut *dst };
+
+        // Count occurrences of each byte value
+        let mut counts = [0usize; 256];
+        for r in src_slice.iter() {
+            let byte = ((get_field(r) >> (byte_idx * 8)) & 0xFF) as usize;
+            counts[byte] += 1;
+        }
+
+        // Convert to cumulative offsets
+        let mut total = 0;
+        for count in counts.iter_mut() {
+            let c = *count;
+            *count = total;
+            total += c;
+        }
+
+        // Scatter elements to destination
+        for item in src_slice.iter().take(n) {
+            let byte = ((get_field(item) >> (byte_idx * 8)) & 0xFF) as usize;
+            let dest_idx = counts[byte];
+            counts[byte] += 1;
+            dst_slice[dest_idx] = *item;
+        }
+
+        // Swap src and dst
+        std::mem::swap(&mut src, &mut dst);
+    }
+
+    // If odd number of passes, copy back to original buffer
+    if bytes_needed % 2 == 1 {
+        let src_slice = unsafe { &*src };
+        refs.copy_from_slice(src_slice);
+    }
+}
+
+/// Parallel radix sort for `TemplateRecordRef` arrays.
+#[allow(dead_code)]
+pub fn parallel_radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
+    use rayon::prelude::*;
+
+    let n = refs.len();
+    if n < RADIX_THRESHOLD * 2 {
+        radix_sort_template_refs(refs);
+        return;
+    }
+
+    let n_threads = rayon::current_num_threads();
+
+    if n_threads > 1 && n > 10_000 {
+        let chunk_size = n.div_ceil(n_threads);
+
+        // Sort each chunk in parallel
+        refs.par_chunks_mut(chunk_size).for_each(|chunk| {
+            radix_sort_template_refs(chunk);
+        });
+
+        // K-way merge the sorted chunks
+        let chunk_boundaries: Vec<_> = refs
+            .chunks(chunk_size)
+            .scan(0, |pos, chunk| {
+                let start = *pos;
+                *pos += chunk.len();
+                Some(start..*pos)
+            })
+            .collect();
+
+        merge_sorted_template_chunks(refs, &chunk_boundaries);
+    } else {
+        radix_sort_template_refs(refs);
+    }
+}
+
+/// Merge k sorted chunks of `TemplateRecordRef` in place.
+#[allow(dead_code)]
+fn merge_sorted_template_chunks(
+    refs: &mut [TemplateRecordRef],
+    chunk_ranges: &[std::ops::Range<usize>],
+) {
+    use crate::sort::radix::{heap_make, heap_sift_down};
+
+    if chunk_ranges.len() <= 1 {
+        return;
+    }
+
+    let n = refs.len();
+    let mut result: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+
+    struct HeapEntry {
+        key: TemplateKey,
+        chunk_idx: usize,
+        pos: usize,
+    }
+
+    let mut heap: Vec<HeapEntry> = Vec::with_capacity(chunk_ranges.len());
+    for (chunk_idx, range) in chunk_ranges.iter().enumerate() {
+        if !range.is_empty() {
+            heap.push(HeapEntry { key: refs[range.start].key, chunk_idx, pos: range.start });
+        }
+    }
+
+    if heap.is_empty() {
+        return;
+    }
+
+    // Min-heap with chunk_idx tie-breaker for stability
+    let lt = |a: &HeapEntry, b: &HeapEntry| -> bool {
+        match a.key.cmp(&b.key) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => a.chunk_idx > b.chunk_idx,
+        }
+    };
+
+    heap_make(&mut heap, &lt);
+    let mut heap_size = heap.len();
+
+    while heap_size > 0 {
+        let entry = &heap[0];
+        result.push(refs[entry.pos]);
+
+        let chunk_idx = entry.chunk_idx;
+        let next_pos = entry.pos + 1;
+        let range = &chunk_ranges[chunk_idx];
+
+        if next_pos < range.end {
+            heap[0] = HeapEntry { key: refs[next_pos].key, chunk_idx, pos: next_pos };
+            heap_sift_down(&mut heap, 0, heap_size, &lt);
+        } else {
+            heap_size -= 1;
+            if heap_size > 0 {
+                heap.swap(0, heap_size);
+                heap_sift_down(&mut heap, 0, heap_size, &lt);
+            }
+        }
+    }
+
+    refs.copy_from_slice(&result);
+}
+
+/// Binary insertion sort for small arrays of `TemplateRecordRef`.
+#[allow(dead_code)]
+fn insertion_sort_template_refs(refs: &mut [TemplateRecordRef]) {
+    for i in 1..refs.len() {
+        let key = &refs[i].key;
+        let insert_pos = refs[..i].partition_point(|r| r.key <= *key);
+        if insert_pos < i {
+            refs[insert_pos..=i].rotate_right(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +1174,157 @@ mod tests {
         // first_hash records should come before second_hash records
         assert!(first_hash_lo < second_hash);
         assert!(first_hash_hi < second_hash);
+    }
+
+    #[test]
+    fn test_radix_sort_record_refs() {
+        // Create test refs with various keys
+        let mut refs = vec![
+            RecordRef { sort_key: 100, offset: 0, len: 10, padding: 0 },
+            RecordRef { sort_key: 50, offset: 100, len: 10, padding: 0 },
+            RecordRef { sort_key: 200, offset: 200, len: 10, padding: 0 },
+            RecordRef { sort_key: 50, offset: 300, len: 10, padding: 0 }, // Duplicate key
+            RecordRef { sort_key: 1, offset: 400, len: 10, padding: 0 },
+        ];
+
+        radix_sort_record_refs(&mut refs);
+
+        // Verify sorted order
+        assert_eq!(refs[0].sort_key, 1);
+        assert_eq!(refs[1].sort_key, 50);
+        assert_eq!(refs[2].sort_key, 50);
+        assert_eq!(refs[3].sort_key, 100);
+        assert_eq!(refs[4].sort_key, 200);
+
+        // Verify stability: duplicate keys should maintain original order
+        // offset=100 was before offset=300 in input, should remain so
+        assert_eq!(refs[1].offset, 100);
+        assert_eq!(refs[2].offset, 300);
+    }
+
+    #[test]
+    fn test_radix_sort_large() {
+        // Test with larger array to trigger radix sort (> RADIX_THRESHOLD)
+        let mut refs: Vec<RecordRef> = (0..1000)
+            .map(|i| RecordRef {
+                sort_key: (999 - i) as u64, // Reverse order
+                offset: i as u64 * 100,
+                len: 10,
+                padding: 0,
+            })
+            .collect();
+
+        radix_sort_record_refs(&mut refs);
+
+        // Verify sorted
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(r.sort_key, i as u64, "Expected sort_key {} at index {}", i, i);
+        }
+    }
+
+    #[test]
+    fn test_radix_sort_empty() {
+        let mut refs: Vec<RecordRef> = Vec::new();
+        radix_sort_record_refs(&mut refs);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_radix_sort_single() {
+        let mut refs = vec![RecordRef { sort_key: 42, offset: 0, len: 10, padding: 0 }];
+        radix_sort_record_refs(&mut refs);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].sort_key, 42);
+    }
+
+    #[test]
+    fn test_radix_sort_all_same_keys() {
+        // All same keys should maintain original order (stability)
+        let mut refs: Vec<RecordRef> = (0..100)
+            .map(|i| RecordRef { sort_key: 42, offset: i as u64 * 100, len: 10, padding: 0 })
+            .collect();
+
+        radix_sort_record_refs(&mut refs);
+
+        // Verify all keys are 42 and order is preserved
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(r.sort_key, 42);
+            assert_eq!(r.offset, i as u64 * 100, "Stability violated at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_radix_sort_all_zero_keys() {
+        let mut refs: Vec<RecordRef> = (0..50)
+            .map(|i| RecordRef { sort_key: 0, offset: i as u64 * 100, len: 10, padding: 0 })
+            .collect();
+
+        radix_sort_record_refs(&mut refs);
+
+        // Should be stable for all-zero keys
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(r.sort_key, 0);
+            assert_eq!(r.offset, i as u64 * 100);
+        }
+    }
+
+    #[test]
+    fn test_radix_sort_max_key() {
+        // Test with maximum u64 values
+        let mut refs = vec![
+            RecordRef { sort_key: u64::MAX, offset: 0, len: 10, padding: 0 },
+            RecordRef { sort_key: 0, offset: 100, len: 10, padding: 0 },
+            RecordRef { sort_key: u64::MAX / 2, offset: 200, len: 10, padding: 0 },
+        ];
+
+        radix_sort_record_refs(&mut refs);
+
+        assert_eq!(refs[0].sort_key, 0);
+        assert_eq!(refs[1].sort_key, u64::MAX / 2);
+        assert_eq!(refs[2].sort_key, u64::MAX);
+    }
+
+    #[test]
+    fn test_parallel_radix_sort() {
+        // Test parallel sort with enough elements to trigger parallelism
+        let mut refs: Vec<RecordRef> = (0..50_000)
+            .map(|i| RecordRef {
+                sort_key: (49_999 - i) as u64, // Reverse order
+                offset: i as u64 * 100,
+                len: 10,
+                padding: 0,
+            })
+            .collect();
+
+        parallel_radix_sort_record_refs(&mut refs);
+
+        // Verify sorted
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(r.sort_key, i as u64, "Expected sort_key {} at index {}", i, i);
+        }
+    }
+
+    #[test]
+    fn test_parallel_radix_sort_stability() {
+        // Test that parallel sort maintains stability for equal keys
+        let mut refs: Vec<RecordRef> = (0..20_000)
+            .map(|i| RecordRef {
+                sort_key: (i / 100) as u64, // Groups of 100 with same key
+                offset: i as u64,           // Use offset to track original order
+                len: 10,
+                padding: 0,
+            })
+            .collect();
+
+        parallel_radix_sort_record_refs(&mut refs);
+
+        // Verify sorted and stable within groups
+        for i in 1..refs.len() {
+            assert!(refs[i - 1].sort_key <= refs[i].sort_key, "Not sorted at index {}", i);
+            // Within same key group, offsets should be in order
+            if refs[i - 1].sort_key == refs[i].sort_key {
+                assert!(refs[i - 1].offset < refs[i].offset, "Stability violated at index {}", i);
+            }
+        }
     }
 }

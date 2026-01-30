@@ -172,6 +172,10 @@ fn find_string_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<&[u8]> {
 /// Larger buffer reduces I/O latency impact during merge.
 const MERGE_PREFETCH_SIZE: usize = 1024;
 
+/// Maximum number of temp files before consolidation (like samtools).
+/// When this limit is reached, oldest files are merged to reduce file count.
+const DEFAULT_MAX_TEMP_FILES: usize = 64;
+
 // ============================================================================
 // Generic Keyed Temp File I/O (works with any RawSortKey)
 // ============================================================================
@@ -415,6 +419,8 @@ pub struct RawExternalSorter {
     write_index: bool,
     /// Program record info (version, `command_line`) for @PG header.
     pg_info: Option<(String, String)>,
+    /// Maximum temp files before consolidation (0 = unlimited).
+    max_temp_files: usize,
 }
 
 impl RawExternalSorter {
@@ -430,6 +436,7 @@ impl RawExternalSorter {
             temp_compression: 1, // Default: fast compression
             write_index: false,
             pg_info: None,
+            max_temp_files: DEFAULT_MAX_TEMP_FILES,
         }
     }
 
@@ -488,6 +495,133 @@ impl RawExternalSorter {
     pub fn pg_info(mut self, version: String, command_line: String) -> Self {
         self.pg_info = Some((version, command_line));
         self
+    }
+
+    /// Set maximum temp files before consolidation.
+    ///
+    /// When the number of temp files exceeds this limit, the oldest files
+    /// are merged together to reduce the count. Set to 0 for unlimited.
+    /// Default is 64 (matching samtools).
+    #[must_use]
+    pub fn max_temp_files(mut self, max: usize) -> Self {
+        self.max_temp_files = max;
+        self
+    }
+
+    /// Consolidate temp files if we've exceeded the limit.
+    ///
+    /// Merges the oldest half of temp files into a single new file to reduce
+    /// the total count while maintaining sort order.
+    fn maybe_consolidate_temp_files<K: RawSortKey + Default + 'static>(
+        &self,
+        chunk_files: &mut Vec<PathBuf>,
+        temp_path: &Path,
+        consolidation_count: &mut usize,
+    ) -> Result<()> {
+        if self.max_temp_files == 0 || chunk_files.len() < self.max_temp_files {
+            return Ok(());
+        }
+
+        // Need at least 2 files to consolidate meaningfully
+        if self.max_temp_files < 2 {
+            return Ok(());
+        }
+
+        // Merge oldest half of files into one (at least 2)
+        let merge_count = (self.max_temp_files / 2).max(2).min(chunk_files.len());
+        let files_to_merge: Vec<PathBuf> = chunk_files.drain(..merge_count).collect();
+
+        info!(
+            "Consolidating {} temp files into 1 (total was {})...",
+            merge_count,
+            merge_count + chunk_files.len()
+        );
+
+        // Create merged output file
+        let merged_path = temp_path.join(format!("merged_{:04}.keyed", *consolidation_count));
+        *consolidation_count += 1;
+
+        // Open readers for files to merge
+        let mut readers: Vec<GenericKeyedChunkReader<K>> = files_to_merge
+            .iter()
+            .map(|p| GenericKeyedChunkReader::<K>::open(p))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Create writer for merged output
+        let mut writer = GenericKeyedChunkWriter::<K>::create(
+            &merged_path,
+            self.temp_compression,
+            self.threads,
+        )?;
+
+        // Initialize heap with first record from each reader
+        struct HeapEntry<K> {
+            key: K,
+            record: Vec<u8>,
+            reader_idx: usize,
+        }
+
+        let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(readers.len());
+        for (reader_idx, reader) in readers.iter_mut().enumerate() {
+            if let Some((key, record)) = reader.next_record() {
+                heap.push(HeapEntry { key, record, reader_idx });
+            }
+        }
+
+        let mut heap_size = heap.len();
+        if heap_size == 0 {
+            writer.finish()?;
+            // Insert at beginning to preserve stable order
+            chunk_files.insert(0, merged_path);
+            // Clean up old files
+            for path in &files_to_merge {
+                let _ = std::fs::remove_file(path);
+            }
+            return Ok(());
+        }
+
+        // Use chunk_idx as tie-breaker for stable merge
+        let lt = |a: &HeapEntry<K>, b: &HeapEntry<K>| -> bool {
+            a.key.cmp(&b.key).then_with(|| a.reader_idx.cmp(&b.reader_idx)) == Ordering::Greater
+        };
+
+        heap_make(&mut heap, &lt);
+
+        // Merge loop
+        while heap_size > 0 {
+            let reader_idx = heap[0].reader_idx;
+            let key = std::mem::take(&mut heap[0].key);
+            let record = std::mem::take(&mut heap[0].record);
+
+            writer.write_record(&key, &record)?;
+
+            if let Some((next_key, next_record)) = readers[reader_idx].next_record() {
+                heap[0].key = next_key;
+                heap[0].record = next_record;
+                heap_sift_down(&mut heap, 0, heap_size, &lt);
+            } else {
+                heap_size -= 1;
+                if heap_size > 0 {
+                    heap.swap(0, heap_size);
+                    heap_sift_down(&mut heap, 0, heap_size, &lt);
+                }
+            }
+        }
+
+        writer.finish()?;
+
+        // Insert merged file at the beginning to preserve stable order for equal keys.
+        // The merged file contains the oldest records, so it should be processed first.
+        chunk_files.insert(0, merged_path);
+
+        // Clean up old files
+        for path in &files_to_merge {
+            let _ = std::fs::remove_file(path);
+        }
+
+        info!("Consolidation complete, {} temp files remain", chunk_files.len());
+
+        Ok(())
     }
 
     /// Sort a BAM file using raw-bytes approach.
@@ -558,6 +692,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
+        let mut consolidation_count = 0usize;
 
         let read_ahead = ReadAheadReader::new(reader);
 
@@ -595,6 +730,14 @@ impl RawExternalSorter {
 
                 stats.chunks_written += 1;
                 chunk_files.push(chunk_path);
+
+                // Consolidate if we have too many temp files
+                self.maybe_consolidate_temp_files::<RawCoordinateKey>(
+                    &mut chunk_files,
+                    temp_path,
+                    &mut consolidation_count,
+                )?;
+
                 buffer.clear();
             }
         }
@@ -689,6 +832,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
+        let mut consolidation_count = 0usize;
         let read_ahead = ReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
@@ -720,6 +864,14 @@ impl RawExternalSorter {
 
                 stats.chunks_written += 1;
                 chunk_files.push(chunk_path);
+
+                // Consolidate if we have too many temp files
+                self.maybe_consolidate_temp_files::<RawCoordinateKey>(
+                    &mut chunk_files,
+                    temp_path,
+                    &mut consolidation_count,
+                )?;
+
                 buffer.clear();
             }
         }
@@ -825,6 +977,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut entries: Vec<(RawQuerynameKey, Vec<u8>)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
+        let mut consolidation_count = 0usize;
 
         let read_ahead = ReadAheadReader::new(reader);
 
@@ -868,6 +1021,14 @@ impl RawExternalSorter {
 
                 stats.chunks_written += 1;
                 chunk_files.push(chunk_path);
+
+                // Consolidate if we have too many temp files
+                self.maybe_consolidate_temp_files::<RawQuerynameKey>(
+                    &mut chunk_files,
+                    temp_path,
+                    &mut consolidation_count,
+                )?;
+
                 memory_used = 0;
             }
         }
@@ -954,6 +1115,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
+        let mut consolidation_count = 0usize;
 
         let read_ahead = ReadAheadReader::new(reader);
 
@@ -992,6 +1154,14 @@ impl RawExternalSorter {
 
                 stats.chunks_written += 1;
                 chunk_files.push(chunk_path);
+
+                // Consolidate if we have too many temp files
+                self.maybe_consolidate_temp_files::<TemplateKey>(
+                    &mut chunk_files,
+                    temp_path,
+                    &mut consolidation_count,
+                )?;
+
                 buffer.clear();
             }
         }
@@ -1133,8 +1303,9 @@ impl RawExternalSorter {
 
         // O(1) comparison using pre-computed keys - THIS IS THE KEY OPTIMIZATION
         // No CIGAR parsing, no aux scanning, just 4 u64 comparisons
+        // Use chunk_idx as tie-breaker for stable merge (preserves input order for equal keys)
         let lt = |a: &KeyedHeapEntry, b: &KeyedHeapEntry| -> bool {
-            a.key.cmp(&b.key) == Ordering::Greater
+            a.key.cmp(&b.key).then_with(|| a.chunk_idx.cmp(&b.chunk_idx)) == Ordering::Greater
         };
 
         // Build initial heap
@@ -1279,8 +1450,9 @@ impl RawExternalSorter {
         }
 
         // O(1) comparison using pre-computed keys
+        // Use chunk_idx as tie-breaker for stable merge (preserves input order for equal keys)
         let lt = |a: &GenericKeyedHeapEntry<K>, b: &GenericKeyedHeapEntry<K>| -> bool {
-            a.key.cmp(&b.key) == Ordering::Greater
+            a.key.cmp(&b.key).then_with(|| a.chunk_idx.cmp(&b.chunk_idx)) == Ordering::Greater
         };
 
         // Build initial heap
@@ -1425,8 +1597,10 @@ impl RawExternalSorter {
             return Ok(index);
         }
 
-        let lt =
-            |a: &HeapEntry<K>, b: &HeapEntry<K>| -> bool { a.key.cmp(&b.key) == Ordering::Greater };
+        // Use chunk_idx as tie-breaker for stable merge (preserves input order for equal keys)
+        let lt = |a: &HeapEntry<K>, b: &HeapEntry<K>| -> bool {
+            a.key.cmp(&b.key).then_with(|| a.chunk_idx.cmp(&b.chunk_idx)) == Ordering::Greater
+        };
         heap_make(&mut heap, &lt);
 
         // Use IndexingBamWriter (single-threaded for accurate virtual positions)

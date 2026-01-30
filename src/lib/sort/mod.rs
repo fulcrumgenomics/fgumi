@@ -30,6 +30,7 @@ pub mod keys;
 pub mod pipeline;
 pub mod radix;
 pub mod raw;
+pub mod raw_bam_reader;
 pub mod read_ahead;
 
 pub use external::ExternalSorter;

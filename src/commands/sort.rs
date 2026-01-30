@@ -79,7 +79,7 @@ PERFORMANCE:
   - Handles BAM files larger than available RAM via spill-to-disk
   - Uses parallel sorting (--threads) for in-memory chunks
   - Configurable temp file compression (--temp-compression)
-  - Configurable memory limit (--max-memory)
+  - Memory scales with threads by default (768MB/thread, like samtools)
 
 EXAMPLES:
 
@@ -110,13 +110,23 @@ pub struct Sort {
     #[arg(long = "order", value_enum, default_value = "template-coordinate")]
     pub order: SortOrderArg,
 
-    /// Maximum memory to use for in-memory sorting.
+    /// Maximum memory to use for in-memory sorting (per thread when --memory-per-thread).
     ///
     /// Accepts values like "512M", "1G", "2G". When the memory limit
     /// is reached, sorted chunks are written to temporary files and
     /// merged at the end.
-    #[arg(short = 'm', long = "max-memory", default_value = "512M", value_parser = parse_memory)]
+    ///
+    /// With --memory-per-thread (default), this is multiplied by thread count
+    /// (like samtools' -m option). With 8 threads and 768M, total = 6GB.
+    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
     pub max_memory: usize,
+
+    /// Scale memory limit by thread count (samtools behavior).
+    ///
+    /// When enabled (default), --max-memory specifies memory per thread.
+    /// Total memory = `max_memory` × threads. Disable for fixed total memory.
+    #[arg(long = "memory-per-thread", default_value = "true", action = clap::ArgAction::Set)]
+    pub memory_per_thread: bool,
 
     /// Temporary directory for intermediate files.
     ///
@@ -197,11 +207,27 @@ impl Command for Sort {
 
         let timer = OperationTimer::new("Sorting BAM");
 
+        // Calculate effective memory: per-thread or fixed total
+        let effective_memory = if self.memory_per_thread {
+            self.max_memory.saturating_mul(self.threads.max(1))
+        } else {
+            self.max_memory
+        };
+
         info!("Starting Sort");
         info!("Input: {}", self.input.display());
         info!("Output: {}", self.output.display());
         info!("Sort order: {:?}", self.order);
-        info!("Max memory: {} MB", self.max_memory / (1024 * 1024));
+        if self.memory_per_thread {
+            info!(
+                "Max memory: {} MB ({} MB/thread × {} threads)",
+                effective_memory / (1024 * 1024),
+                self.max_memory / (1024 * 1024),
+                self.threads
+            );
+        } else {
+            info!("Max memory: {} MB (fixed)", effective_memory / (1024 * 1024));
+        }
         info!("Threads: {}", self.threads);
         info!("Temp compression level: {}", self.temp_compression);
         if self.write_index {
@@ -213,7 +239,7 @@ impl Command for Sort {
 
         // Sort using raw-bytes sorter for optimal memory efficiency and speed
         let mut sorter = RawExternalSorter::new(self.order.into())
-            .memory_limit(self.max_memory)
+            .memory_limit(effective_memory)
             .threads(self.threads)
             .output_compression(self.compression.compression_level)
             .temp_compression(self.temp_compression)
