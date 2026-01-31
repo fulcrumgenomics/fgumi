@@ -50,14 +50,15 @@ use tempfile::TempDir;
 ///
 /// Pre-computes ordinals by sorting library names alphabetically.
 /// Empty/unknown library sorts first (ordinal 0).
-struct LibraryLookup {
+pub struct LibraryLookup {
     /// RG ID -> library ordinal
     rg_to_ordinal: HashMap<Vec<u8>, u32>,
 }
 
 impl LibraryLookup {
     /// Build lookup from BAM header.
-    fn from_header(header: &Header) -> Self {
+    #[must_use]
+    pub fn from_header(header: &Header) -> Self {
         // Collect all unique library names from read groups
         let mut libraries: Vec<String> = header
             .read_groups()
@@ -97,7 +98,8 @@ impl LibraryLookup {
 
     /// Get library ordinal for a record (from RG tag in aux data).
     #[inline]
-    fn get_ordinal(&self, bam: &[u8]) -> u32 {
+    #[must_use]
+    pub fn get_ordinal(&self, bam: &[u8]) -> u32 {
         find_rg_tag_raw(bam).and_then(|rg| self.rg_to_ordinal.get(rg)).copied().unwrap_or(0)
     }
 }
@@ -1707,12 +1709,12 @@ impl RawExternalSorter {
 ///
 /// This function computes the template-coordinate sort key inline, avoiding
 /// heap allocations for the read name by using a hash instead.
-fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup) -> TemplateKey {
+#[must_use]
+pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup) -> TemplateKey {
     use crate::sort::bam_fields::{
         find_mc_tag_in_record, find_mi_tag_in_record, flags, get_cigar_ops, mate_unclipped_5prime,
         unclipped_5prime,
     };
-    use std::hash::{Hash, Hasher};
 
     // Extract MI tag using fast raw byte scan (bypasses noodles overhead)
     let mi = find_mi_tag_in_record(bam_bytes);
@@ -1742,10 +1744,16 @@ fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup) -> 
     } else {
         &[]
     };
+    // Use fixed seeds for deterministic hashing across runs.
+    // This ensures template-coordinate sort produces consistent output.
     let name_hash = {
-        let mut hasher = ahash::AHasher::default();
-        name.hash(&mut hasher);
-        hasher.finish()
+        let state = ahash::RandomState::with_seeds(
+            0x517c_c1b7_2722_0a95,
+            0x1234_5678_90ab_cdef,
+            0xfedc_ba98_7654_3210,
+            0x0123_4567_89ab_cdef,
+        );
+        state.hash_one(name)
     };
 
     // Handle unmapped reads

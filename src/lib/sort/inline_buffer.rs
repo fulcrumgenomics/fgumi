@@ -272,7 +272,8 @@ impl RecordBuffer {
 /// Note: No read name tie-breaking is used, matching samtools behavior.
 /// Equal records maintain their original input order (stable sort).
 #[inline]
-fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
+#[must_use]
+pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
     // BAM format offsets (all little-endian):
     // 0-3: tid (i32)
     // 4-7: pos (i32)
@@ -344,10 +345,11 @@ impl TemplateKey {
         // Handle i32::MAX specially (indicates unmapped mate)
         let tid1_packed = if tid1 == i32::MAX { 0xFFFF_u64 } else { (tid1.max(0) as u64) & 0xFFFF };
         let tid2_packed = if tid2 == i32::MAX { 0xFFFF_u64 } else { (tid2.max(0) as u64) & 0xFFFF };
-        let pos1_packed =
-            if pos1 == i32::MAX { 0xFFFF_FFFF_u64 } else { (pos1.max(0) as u64) & 0xFFFF_FFFF };
-        let pos2_packed =
-            if pos2 == i32::MAX { 0xFFFF_FFFF_u64 } else { (pos2.max(0) as u64) & 0xFFFF_FFFF };
+        // Convert signed positions to unsigned preserving sort order (XOR with sign bit).
+        // This ensures negative positions sort correctly before positive ones.
+        // i32::MAX maps to 0xFFFFFFFF which sorts last (used for unmapped mate sentinel).
+        let pos1_packed = u64::from((pos1 as u32) ^ 0x8000_0000) & 0xFFFF_FFFF;
+        let pos2_packed = u64::from((pos2 as u32) ^ 0x8000_0000) & 0xFFFF_FFFF;
 
         // Pack primary: tid1 (bits 63-48), tid2 (bits 47-32), pos1 (bits 31-0)
         // This ensures comparison order matches samtools: tid1, tid2, pos1
@@ -444,6 +446,21 @@ impl Ord for TemplateKey {
             .then_with(|| self.tertiary.cmp(&other.tertiary))
             // name_hash_upper comparison handles both name grouping AND is_upper ordering
             .then_with(|| self.name_hash_upper.cmp(&other.name_hash_upper))
+    }
+}
+
+impl TemplateKey {
+    /// Compare only core fields (tid1, tid2, pos1, pos2, neg1, neg2, library, MI).
+    ///
+    /// This ignores the `name_hash` tie-breaker, allowing verification to accept
+    /// both fgumi and samtools sorted files (which differ only in tie-breaking).
+    #[inline]
+    #[must_use]
+    pub fn core_cmp(&self, other: &Self) -> Ordering {
+        self.primary
+            .cmp(&other.primary)
+            .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.tertiary.cmp(&other.tertiary))
     }
 }
 
