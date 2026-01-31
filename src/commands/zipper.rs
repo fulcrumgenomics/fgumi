@@ -56,8 +56,9 @@ use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::sam::{
     buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
+    unclipped_five_prime_position,
 };
-use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo, get_unclipped_5prime_position};
+use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo};
 use fgumi_lib::template::{Template, TemplateIterator};
 use fgumi_lib::umi::TagInfo;
 use fgumi_lib::validation::validate_file_exists;
@@ -312,7 +313,7 @@ fn add_primary_alignment_tags(template: &mut Template) {
         }
         let ref_id: i32 = r.reference_sequence_id()?.try_into().ok()?;
         // Use unclipped 5' position to match sort key calculation
-        let pos: i32 = get_unclipped_5prime_position(r).ok()?.try_into().ok()?;
+        let pos: i32 = unclipped_five_prime_position(r)?.try_into().ok()?;
         let is_reverse = r.flags().is_reverse_complemented();
         Some((ref_id, pos, is_reverse))
     });
@@ -324,7 +325,7 @@ fn add_primary_alignment_tags(template: &mut Template) {
         }
         let ref_id: i32 = r.reference_sequence_id()?.try_into().ok()?;
         // Use unclipped 5' position to match sort key calculation
-        let pos: i32 = get_unclipped_5prime_position(r).ok()?.try_into().ok()?;
+        let pos: i32 = unclipped_five_prime_position(r)?.try_into().ok()?;
         let is_reverse = r.flags().is_reverse_complemented();
         Some((ref_id, pos, is_reverse))
     });

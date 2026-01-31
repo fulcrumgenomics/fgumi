@@ -15,9 +15,14 @@
 //! - Handles BAM files larger than available RAM via spill-to-disk
 //! - Uses parallel sorting for in-memory chunks
 //! - Configurable temp file compression (--temp-compression)
+//!
+//! # Verification
+//!
+//! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
+use fgumi_lib::bam_io::create_bam_reader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::sort::{RawExternalSorter, SortOrder};
 use fgumi_lib::validation::validate_file_exists;
@@ -95,6 +100,9 @@ EXAMPLES:
   # High-performance sort with more memory and threads
   fgumi sort -i input.bam -o sorted.bam --order template-coordinate \
     --max-memory 8G --threads 8
+
+  # Verify a BAM file is correctly sorted
+  fgumi sort -i sorted.bam --verify --order template-coordinate
 "#
 )]
 pub struct Sort {
@@ -102,9 +110,17 @@ pub struct Sort {
     #[arg(short = 'i', long = "input")]
     pub input: PathBuf,
 
-    /// Output BAM file.
-    #[arg(short = 'o', long = "output")]
-    pub output: PathBuf,
+    /// Output BAM file (required unless --verify is used).
+    #[arg(short = 'o', long = "output", conflicts_with = "verify")]
+    pub output: Option<PathBuf>,
+
+    /// Verify the input file is correctly sorted (no output written).
+    ///
+    /// Reads records sequentially and checks that each record's sort key
+    /// is >= the previous record's key. Exits 0 if sorted correctly,
+    /// non-zero if any records are out of order.
+    #[arg(long = "verify", conflicts_with = "output")]
+    pub verify: bool,
 
     /// Sort order.
     #[arg(long = "order", value_enum, default_value = "template-coordinate")]
@@ -196,6 +212,24 @@ impl Command for Sort {
         // Validate inputs
         validate_file_exists(&self.input, "Input BAM")?;
 
+        // Either --output or --verify must be specified
+        if !self.verify && self.output.is_none() {
+            bail!("Either --output or --verify must be specified");
+        }
+
+        if self.verify {
+            return self.execute_verify();
+        }
+
+        self.execute_sort(command_line)
+    }
+}
+
+impl Sort {
+    /// Execute sort mode: read, sort, and write output.
+    fn execute_sort(&self, command_line: &str) -> Result<()> {
+        let output = self.output.as_ref().expect("output required for sort mode");
+
         if self.max_memory == 0 {
             bail!("--max-memory must be greater than 0");
         }
@@ -216,7 +250,7 @@ impl Command for Sort {
 
         info!("Starting Sort");
         info!("Input: {}", self.input.display());
-        info!("Output: {}", self.output.display());
+        info!("Output: {}", output.display());
         info!("Sort order: {:?}", self.order);
         if self.memory_per_thread {
             info!(
@@ -250,7 +284,7 @@ impl Command for Sort {
             sorter = sorter.temp_dir(tmp.clone());
         }
 
-        let stats = sorter.sort(&self.input, &self.output)?;
+        let stats = sorter.sort(&self.input, output)?;
         let (total_records, output_records, chunks_written) =
             (stats.total_records, stats.output_records, stats.chunks_written);
 
@@ -261,8 +295,149 @@ impl Command for Sort {
         if chunks_written > 0 {
             info!("Temporary chunks: {chunks_written}");
         }
-        info!("Output: {}", self.output.display());
+        info!("Output: {}", output.display());
 
+        timer.log_completion(total_records);
+        Ok(())
+    }
+
+    /// Execute verify mode: read records and check sort order.
+    fn execute_verify(&self) -> Result<()> {
+        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+        use fgumi_lib::sort::{
+            LibraryLookup, RawQuerynameKey, RawSortKey, SortContext, TemplateKey,
+            extract_coordinate_key_inline, extract_template_key_inline,
+        };
+        use std::cmp::Ordering;
+        use std::fs::File;
+
+        let timer = OperationTimer::new("Verifying BAM sort order");
+
+        info!("Starting Sort Verification");
+        info!("Input: {}", self.input.display());
+        info!("Expected order: {:?}", self.order);
+
+        // Get header using noodles reader, then use raw reader for records
+        let (_, header) = create_bam_reader(&self.input, 1)?;
+
+        let mut total_records: u64 = 0;
+        let mut violations: u64 = 0;
+        let mut first_violation: Option<(u64, String)> = None;
+
+        // Helper to extract name from raw BAM bytes
+        let extract_name = |bam: &[u8]| -> String {
+            let l_read_name = bam.get(8).copied().unwrap_or(0) as usize;
+            let name_len = l_read_name.saturating_sub(1);
+            if name_len > 0 && 32 + name_len <= bam.len() {
+                String::from_utf8_lossy(&bam[32..32 + name_len]).to_string()
+            } else {
+                "<unnamed>".to_string()
+            }
+        };
+
+        match self.order {
+            SortOrderArg::Coordinate => {
+                // Use raw BAM reading with same key extraction as sort
+                let file = File::open(&self.input)?;
+                let mut raw_reader = RawBamRecordReader::new(file)?;
+                raw_reader.skip_header()?;
+                let nref = header.reference_sequences().len() as u32;
+
+                let mut prev_key: Option<u64> = None;
+
+                for result in raw_reader {
+                    let record_bytes = result?;
+                    total_records += 1;
+                    let bam = record_bytes.as_slice();
+
+                    let key = extract_coordinate_key_inline(bam, nref);
+
+                    if let Some(prev) = prev_key {
+                        if key < prev {
+                            violations += 1;
+                            if first_violation.is_none() {
+                                first_violation = Some((total_records, extract_name(bam)));
+                            }
+                        }
+                    }
+                    prev_key = Some(key);
+                }
+            }
+            SortOrderArg::Queryname => {
+                // Use raw BAM reading with same key extraction as sort
+                let file = File::open(&self.input)?;
+                let mut raw_reader = RawBamRecordReader::new(file)?;
+                raw_reader.skip_header()?;
+                let ctx = SortContext::from_header(&header);
+
+                let mut prev_key: Option<RawQuerynameKey> = None;
+
+                for result in raw_reader {
+                    let record_bytes = result?;
+                    total_records += 1;
+                    let bam = record_bytes.as_slice();
+
+                    let key = RawQuerynameKey::extract(bam, &ctx);
+
+                    if let Some(ref prev) = prev_key {
+                        if key < *prev {
+                            violations += 1;
+                            if first_violation.is_none() {
+                                first_violation = Some((total_records, extract_name(bam)));
+                            }
+                        }
+                    }
+                    prev_key = Some(key);
+                }
+            }
+            SortOrderArg::TemplateCoordinate => {
+                // Use raw BAM reading with same key extraction as sort
+                let file = File::open(&self.input)?;
+                let mut raw_reader = RawBamRecordReader::new(file)?;
+                raw_reader.skip_header()?;
+                let lib_lookup = LibraryLookup::from_header(&header);
+
+                let mut prev_key: Option<TemplateKey> = None;
+
+                for result in raw_reader {
+                    let record_bytes = result?;
+                    total_records += 1;
+                    let bam = record_bytes.as_slice();
+
+                    let key = extract_template_key_inline(bam, &lib_lookup);
+
+                    if let Some(ref prev) = prev_key {
+                        // Use core_cmp to ignore name_hash tie-breaker differences
+                        // This allows both fgumi and samtools sorted files to pass
+                        if key.core_cmp(prev) == Ordering::Less {
+                            violations += 1;
+                            if first_violation.is_none() {
+                                first_violation = Some((total_records, extract_name(bam)));
+                            }
+                        }
+                    }
+                    prev_key = Some(key);
+                }
+            }
+        }
+
+        // Summary
+        info!("=== Verification Summary ===");
+        info!("Records checked: {total_records}");
+        info!("Sort order violations: {violations}");
+
+        if violations > 0 {
+            if let Some((record_num, name)) = first_violation {
+                info!("First violation at record {record_num}: {name}");
+            }
+            timer.log_completion(total_records);
+            bail!(
+                "BAM file is NOT correctly sorted by {:?}: {violations} violations found",
+                self.order
+            );
+        }
+
+        info!("Result: PASS - file is correctly sorted by {:?}", self.order);
         timer.log_completion(total_records);
         Ok(())
     }
