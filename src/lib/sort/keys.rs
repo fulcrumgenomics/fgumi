@@ -23,13 +23,14 @@
 
 use anyhow::Result;
 use noodles::sam::Header;
-use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::cmp::Ordering;
 
 use crate::read_info::LibraryIndex;
-use crate::sam::record_utils::{mate_unclipped_end, mate_unclipped_start};
+use crate::sam::record_utils::{
+    mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
+};
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use std::io::{Read, Write};
 
@@ -866,7 +867,8 @@ impl SortKey for TemplateCoordinateKey {
         let tid = record.reference_sequence_id().map_or(-1, |id| id as i32);
 
         // Calculate unclipped 5' position for this read
-        let this_pos = get_unclipped_5prime_position(record)?;
+        #[allow(clippy::cast_possible_wrap)]
+        let this_pos = unclipped_five_prime_position(record).unwrap_or(0) as i64;
 
         // Get mate information
         #[allow(clippy::cast_possible_wrap)]
@@ -909,73 +911,6 @@ impl SortKey for TemplateCoordinateKey {
             };
 
         Ok(Self { tid1, tid2, pos1, pos2, neg1, neg2, mid, name, library_idx, is_upper })
-    }
-}
-
-/// Calculate the unclipped 5' position of a read.
-///
-/// For forward strand: unclipped start = alignment start - leading soft clips
-/// For reverse strand: unclipped end = alignment start + alignment span + trailing soft clips
-///
-/// This is the position used by template-coordinate sorting to determine read order.
-pub fn get_unclipped_5prime_position(record: &RecordBuf) -> Result<i64> {
-    if record.flags().is_unmapped() {
-        return Ok(0);
-    }
-
-    let Some(alignment_start) = record.alignment_start() else {
-        return Ok(0);
-    };
-
-    #[allow(clippy::cast_possible_wrap)]
-    let alignment_start_i64 = usize::from(alignment_start) as i64;
-
-    if record.flags().is_reverse_complemented() {
-        // Negative strand: calculate unclipped end (5' position)
-        let cigar = record.cigar();
-
-        // Calculate alignment span (M/D/N/=/X operations)
-        #[allow(clippy::cast_possible_wrap)]
-        let alignment_span: i64 = cigar
-            .as_ref()
-            .iter()
-            .filter_map(|op| match op.kind() {
-                Kind::Match
-                | Kind::Deletion
-                | Kind::Skip
-                | Kind::SequenceMatch
-                | Kind::SequenceMismatch => Some(op.len() as i64),
-                _ => None,
-            })
-            .sum();
-
-        // Get trailing soft clips (at the end of CIGAR = 5' end for reverse strand)
-        #[allow(clippy::cast_possible_wrap)]
-        let trailing_soft_clips: i64 = cigar
-            .as_ref()
-            .iter()
-            .rev()
-            .take_while(|op| op.kind() == Kind::SoftClip || op.kind() == Kind::HardClip)
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map(|op| op.len() as i64)
-            .sum();
-
-        Ok(alignment_start_i64 + alignment_span + trailing_soft_clips - 1)
-    } else {
-        // Positive strand: calculate unclipped start (5' position)
-        let cigar = record.cigar();
-
-        // Get leading soft clips
-        #[allow(clippy::cast_possible_wrap)]
-        let leading_soft_clips: i64 = cigar
-            .as_ref()
-            .iter()
-            .take_while(|op| op.kind() == Kind::SoftClip || op.kind() == Kind::HardClip)
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map(|op| op.len() as i64)
-            .sum();
-
-        Ok(alignment_start_i64 - leading_soft_clips)
     }
 }
 
