@@ -34,11 +34,10 @@ pub mod raw_bam_reader;
 pub mod read_ahead;
 
 pub use external::ExternalSorter;
-pub use inline_buffer::TemplateKey;
+pub use inline_buffer::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     CoordinateKey, PA_TAG, PrimaryAlignmentInfo, QuerynameKey, RawCoordinateKey, RawQuerynameKey,
     RawSortKey, SortContext, SortKey, SortOrder, TemplateCoordinateKey,
-    get_unclipped_5prime_position,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
-pub use raw::RawExternalSorter;
+pub use raw::{LibraryLookup, RawExternalSorter, extract_template_key_inline};

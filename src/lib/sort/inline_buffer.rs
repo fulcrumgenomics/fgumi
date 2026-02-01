@@ -272,7 +272,8 @@ impl RecordBuffer {
 /// Note: No read name tie-breaking is used, matching samtools behavior.
 /// Equal records maintain their original input order (stable sort).
 #[inline]
-fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
+#[must_use]
+pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
     // BAM format offsets (all little-endian):
     // 0-3: tid (i32)
     // 4-7: pos (i32)
@@ -312,9 +313,11 @@ fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TemplateKey {
-    /// Packed: (tid1 << 48) | (pos1 << 16) | (neg1 << 1)
+    /// Packed: (tid1 << 48) | (tid2 << 32) | pos1
+    /// Comparison order matches samtools: tid1, tid2, pos1
     pub primary: u64,
-    /// Packed: (tid2 << 48) | (pos2 << 16) | neg2
+    /// Packed: (pos2 << 32) | (!neg1 << 1) | !neg2
+    /// neg flags inverted so reverse (neg=true) sorts before forward (neg=false)
     pub secondary: u64,
     /// Packed: (library << 48) | (`mi_value` << 1) | `mi_suffix`
     pub tertiary: u64,
@@ -342,16 +345,20 @@ impl TemplateKey {
         // Handle i32::MAX specially (indicates unmapped mate)
         let tid1_packed = if tid1 == i32::MAX { 0xFFFF_u64 } else { (tid1.max(0) as u64) & 0xFFFF };
         let tid2_packed = if tid2 == i32::MAX { 0xFFFF_u64 } else { (tid2.max(0) as u64) & 0xFFFF };
-        let pos1_packed =
-            if pos1 == i32::MAX { 0xFFFF_FFFF_u64 } else { (pos1.max(0) as u64) & 0xFFFF_FFFF };
-        let pos2_packed =
-            if pos2 == i32::MAX { 0xFFFF_FFFF_u64 } else { (pos2.max(0) as u64) & 0xFFFF_FFFF };
+        // Convert signed positions to unsigned preserving sort order (XOR with sign bit).
+        // This ensures negative positions sort correctly before positive ones.
+        // i32::MAX maps to 0xFFFFFFFF which sorts last (used for unmapped mate sentinel).
+        let pos1_packed = u64::from((pos1 as u32) ^ 0x8000_0000) & 0xFFFF_FFFF;
+        let pos2_packed = u64::from((pos2 as u32) ^ 0x8000_0000) & 0xFFFF_FFFF;
 
-        // Pack primary: tid1 (high 16), pos1 (middle 32), neg1 (bit 1)
-        let p1 = (tid1_packed << 48) | (pos1_packed << 16) | (u64::from(neg1) << 1);
+        // Pack primary: tid1 (bits 63-48), tid2 (bits 47-32), pos1 (bits 31-0)
+        // This ensures comparison order matches samtools: tid1, tid2, pos1
+        let p1 = (tid1_packed << 48) | (tid2_packed << 32) | pos1_packed;
 
-        // Pack secondary: tid2 (high 16), pos2 (middle 32), neg2 (bit 0)
-        let p2 = (tid2_packed << 48) | (pos2_packed << 16) | u64::from(neg2);
+        // Pack secondary: pos2 (bits 63-32), neg1 (bit 1), neg2 (bit 0)
+        // Invert neg flags: samtools sorts reverse (neg=true) BEFORE forward (neg=false)
+        // By storing !neg, we get: !true=0 < !false=1, so reverse sorts first
+        let p2 = (pos2_packed << 32) | (u64::from(!neg1) << 1) | u64::from(!neg2);
 
         // Pack tertiary: library (high 16), mi_value (middle), mi_suffix (bit 0)
         // Note: /B suffix should sort after /A, so we use !is_a as the bit
@@ -439,6 +446,21 @@ impl Ord for TemplateKey {
             .then_with(|| self.tertiary.cmp(&other.tertiary))
             // name_hash_upper comparison handles both name grouping AND is_upper ordering
             .then_with(|| self.name_hash_upper.cmp(&other.name_hash_upper))
+    }
+}
+
+impl TemplateKey {
+    /// Compare only core fields (tid1, tid2, pos1, pos2, neg1, neg2, library, MI).
+    ///
+    /// This ignores the `name_hash` tie-breaker, allowing verification to accept
+    /// both fgumi and samtools sorted files (which differ only in tie-breaking).
+    #[inline]
+    #[must_use]
+    pub fn core_cmp(&self, other: &Self) -> Ordering {
+        self.primary
+            .cmp(&other.primary)
+            .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.tertiary.cmp(&other.tertiary))
     }
 }
 
@@ -621,19 +643,21 @@ impl TemplateRecordBuffer {
         self.refs.push(TemplateRecordRef { key, offset, len: record_len, padding: 0 });
     }
 
-    /// Sort the index by cached key (O(1) comparison, no data buffer access).
+    /// Sort the index by cached key using stable LSD radix sort.
     ///
-    /// Note: Uses comparison sort rather than radix sort because `TemplateKey`
-    /// is 32 bytes (4 × u64), making multi-field radix sort slower than
-    /// comparison sort due to the many passes required.
+    /// Uses multi-field radix sort which is stable (preserves relative order
+    /// of records with equal keys). This ensures deterministic output that
+    /// matches samtools when records have identical sort keys.
     pub fn sort(&mut self) {
-        self.refs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        radix_sort_template_refs(&mut self.refs);
     }
 
-    /// Sort using parallel sort with cached keys.
+    /// Sort using parallel radix sort with stable k-way merge.
+    ///
+    /// Each chunk is sorted with stable radix sort, then merged with a
+    /// heap that uses `chunk_idx` as tie-breaker to preserve input order.
     pub fn par_sort(&mut self) {
-        use rayon::prelude::*;
-        self.refs.par_sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        parallel_radix_sort_template_refs(&mut self.refs);
     }
 
     /// Get record bytes by reference.
@@ -856,7 +880,7 @@ fn merge_sorted_chunks(refs: &mut [RecordRef], chunk_ranges: &[std::ops::Range<u
     }
 
     // Min-heap: smaller keys should be at the top
-    // Use chunk_idx as tie-breaker for stability
+    // Use `chunk_idx` as tie-breaker for stability
     let lt = |a: &HeapEntry, b: &HeapEntry| -> bool { (a.key, a.chunk_idx) > (b.key, b.chunk_idx) };
 
     heap_make(&mut heap, &lt);
@@ -917,10 +941,8 @@ fn insertion_sort_refs(refs: &mut [RecordRef]) {
 ///
 /// This is O(n×k) where k is the total bytes to sort (up to 32 bytes).
 ///
-/// Note: Currently unused because benchmarks showed multi-field radix sort
-/// provides minimal benefit over comparison sort for 32-byte keys.
-/// Kept for potential future optimization experiments.
-#[allow(dead_code)]
+/// This is used for stable sorting - LSD radix sort inherently preserves
+/// relative order of records with equal keys.
 #[allow(clippy::uninit_vec)]
 pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     let n = refs.len();
@@ -960,7 +982,6 @@ pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
 }
 
 /// Radix sort a single u64 field of `TemplateRecordRef` using raw pointers.
-#[allow(dead_code)]
 #[allow(clippy::uninit_vec)]
 fn radix_sort_template_field<F>(
     refs: &mut [TemplateRecordRef],
@@ -1016,7 +1037,8 @@ fn radix_sort_template_field<F>(
 }
 
 /// Parallel radix sort for `TemplateRecordRef` arrays.
-#[allow(dead_code)]
+///
+/// Uses stable radix sort per chunk with stable k-way merge (`chunk_idx` tie-breaker).
 pub fn parallel_radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     use rayon::prelude::*;
 
@@ -1053,7 +1075,8 @@ pub fn parallel_radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
 }
 
 /// Merge k sorted chunks of `TemplateRecordRef` in place.
-#[allow(dead_code)]
+///
+/// Uses `chunk_idx` as tie-breaker for stable merge (preserves input order for equal keys).
 fn merge_sorted_template_chunks(
     refs: &mut [TemplateRecordRef],
     chunk_ranges: &[std::ops::Range<usize>],
@@ -1325,6 +1348,141 @@ mod tests {
             if refs[i - 1].sort_key == refs[i].sort_key {
                 assert!(refs[i - 1].offset < refs[i].offset, "Stability violated at index {}", i);
             }
+        }
+    }
+
+    #[test]
+    fn test_radix_sort_template_refs_stability() {
+        // Test that template radix sort is stable for equal keys
+        // Create refs with identical TemplateKey but different offsets to track order
+        let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 12345, false);
+
+        let mut refs: Vec<TemplateRecordRef> = (0..500)
+            .map(|i| TemplateRecordRef {
+                key,              // All same key
+                offset: i as u64, // Use offset to track original order
+                len: 10,
+                padding: 0,
+            })
+            .collect();
+
+        radix_sort_template_refs(&mut refs);
+
+        // All keys equal, so offsets should maintain original order (stability)
+        for i in 1..refs.len() {
+            assert!(
+                refs[i - 1].offset < refs[i].offset,
+                "Template radix sort stability violated at index {}: offset {} should be < {}",
+                i,
+                refs[i - 1].offset,
+                refs[i].offset
+            );
+        }
+    }
+
+    #[test]
+    fn test_parallel_radix_sort_template_refs_stability() {
+        // Test that parallel template sort maintains stability for equal keys
+        // Use groups of records with same key to verify stability within groups
+        let mut refs: Vec<TemplateRecordRef> = (0..20_000)
+            .map(|i| {
+                // Create groups of 100 with same key (different lib_name_hash for each group)
+                let group = i / 100;
+                let key = TemplateKey::new(
+                    0,
+                    100,
+                    false,
+                    0,
+                    200,
+                    false,
+                    0,
+                    (1, true),
+                    group as u64, // Different hash per group
+                    false,
+                );
+                TemplateRecordRef {
+                    key,
+                    offset: i as u64, // Use offset to track original order
+                    len: 10,
+                    padding: 0,
+                }
+            })
+            .collect();
+
+        parallel_radix_sort_template_refs(&mut refs);
+
+        // Verify sorted by key and stable within groups
+        for i in 1..refs.len() {
+            let prev_key = &refs[i - 1].key;
+            let curr_key = &refs[i].key;
+            assert!(prev_key <= curr_key, "Not sorted at index {}", i);
+            // Within same key group, offsets should be in order (stability)
+            if prev_key == curr_key {
+                assert!(
+                    refs[i - 1].offset < refs[i].offset,
+                    "Parallel template sort stability violated at index {}: offset {} should be < {}",
+                    i,
+                    refs[i - 1].offset,
+                    refs[i].offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_template_record_buffer_sort_stability() {
+        // Test that TemplateRecordBuffer::sort() is stable
+        // This is the method actually used during template-coordinate sorting
+        let mut buffer = TemplateRecordBuffer::with_capacity(100, 10000);
+
+        // Add records with identical keys - they should maintain insertion order after sort
+        let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 12345, false);
+
+        // Create distinct records (different sequence bytes) with same sort key
+        for i in 0..100u8 {
+            // Minimal valid BAM record: 4 bytes block_size prefix not included in our data
+            // ref_id (4) + pos (4) + name_len (1) + mapq (1) + bin (2) + n_cigar (2) + flag (2) + seq_len (4)
+            // + mate_ref_id (4) + mate_pos (4) + tlen (4) + name + cigar + seq + qual
+            let mut record = vec![
+                0, 0, 0, 0, // ref_id = 0
+                100, 0, 0, 0, // pos = 100
+                2, // name_len = 2 (including null)
+                0, // mapq = 0
+                0, 0, // bin
+                0, 0, // n_cigar_op = 0
+                99, 0, // flag = 99 (paired, proper, mate reverse, first)
+                1, 0, 0, 0, // seq_len = 1
+                0, 0, 0, 0, // mate_ref_id = 0
+                200, 0, 0, 0, // mate_pos = 200
+                0, 0, 0, 0, // tlen = 0
+                b'A', 0, // read name "A\0"
+                // no cigar
+                i,    // seq (1 byte for 2 bases) - use i to make records distinguishable
+                0xFF, // qual
+            ];
+            // Pad to make it valid
+            while record.len() < 40 {
+                record.push(0);
+            }
+            buffer.push(&record, key);
+        }
+
+        buffer.sort();
+
+        // Verify records maintain insertion order (tracked by sequence byte value)
+        let mut prev_seq_byte = None;
+        for rec in buffer.iter_sorted() {
+            // Extract the distinguishing byte (seq field at offset 34 after header parsing)
+            let seq_byte = rec.get(34).copied().unwrap_or(0);
+            if let Some(prev) = prev_seq_byte {
+                assert!(
+                    prev < seq_byte,
+                    "TemplateRecordBuffer::sort() stability violated: {} should be < {}",
+                    prev,
+                    seq_byte
+                );
+            }
+            prev_seq_byte = Some(seq_byte);
         }
     }
 }
