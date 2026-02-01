@@ -2518,10 +2518,10 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
                 }
 
                 let count = templates.len();
-                // Use atomic serial assignment (no lock needed!)
-                // Note: Serial order may differ from input order due to parallel completion,
-                // but this is acceptable for unmapped BAM output where record order is irrelevant.
-                let template_serial = state.next_template_serial.fetch_add(1, Ordering::Relaxed);
+                // Use the original batch serial to preserve input order.
+                // The downstream reorder buffer will ensure batches are written in order
+                // even if they complete out-of-order due to parallel processing.
+                let template_serial = serial;
 
                 // Push templates directly to Q3 with spin-wait
                 let mut templates_to_push = templates;
