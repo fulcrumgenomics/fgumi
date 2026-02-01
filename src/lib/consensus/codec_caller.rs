@@ -812,11 +812,17 @@ impl CodecConsensusCaller {
         }
 
         // Create indexed data: (read_index, query_length, simplified_cigar)
+        // For negative strand reads, reverse the CIGAR to match fgbio's toSourceReadForCodec
+        // which reverses the CIGAR before filterToMostCommonAlignment
         let mut indexed: Vec<IndexedSourceRead> = reads
             .iter()
             .enumerate()
             .map(|(i, read)| {
-                let cigar = cigar_utils::simplify_cigar(read.cigar());
+                let mut cigar = cigar_utils::simplify_cigar(read.cigar());
+                // Reverse CIGAR for negative strand reads (matching fgbio's behavior)
+                if read.flags().is_reverse_complemented() {
+                    cigar.reverse();
+                }
                 let query_len = read.sequence().len();
                 (i, query_len, cigar)
             })
@@ -1868,6 +1874,103 @@ mod tests {
             assert_eq!(ops[2].len(), 1);
         }
         // 2 reads should be rejected
+        assert_eq!(
+            caller.stats.rejection_reasons.get(&CallerRejectionReason::MinorityAlignment),
+            Some(&2)
+        );
+    }
+
+    /// Tests that CIGAR is reversed for negative strand reads before minority alignment filtering.
+    /// This matches fgbio's toSourceReadForCodec behavior where the CIGAR is reversed for
+    /// negative strand reads before filterToMostCommonAlignment.
+    ///
+    /// Without reversal:
+    /// - Read A (3M1I2M): first element length = 3
+    /// - Read B (2M1I3M): first element length = 2
+    /// - 2 < 3, so Read B would win
+    ///
+    /// With reversal (both negative strand):
+    /// - Read A reversed (2M1I3M): first element length = 2
+    /// - Read B reversed (3M1I2M): first element length = 3
+    /// - 2 < 3, so Read A wins
+    #[test]
+    fn test_filter_to_most_common_alignment_negative_strand_cigar_reversal() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let options = CodecConsensusOptions::default();
+        let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
+
+        // Create two groups with equal sizes, both on negative strand
+        // The CIGAR reversal should affect which group wins the tie-breaker
+        let reads = vec![
+            // Group A: 3M1I2M on negative strand -> reversed to 2M1I3M
+            create_test_paired_read(
+                "r1_groupA",
+                b"ACGTAC",
+                b"######",
+                true,
+                true, // negative strand
+                false,
+                100,
+                &[(Kind::Match, 3), (Kind::Insertion, 1), (Kind::Match, 2)],
+            ),
+            create_test_paired_read(
+                "r2_groupA",
+                b"ACGTAC",
+                b"######",
+                true,
+                true, // negative strand
+                false,
+                100,
+                &[(Kind::Match, 3), (Kind::Insertion, 1), (Kind::Match, 2)],
+            ),
+            // Group B: 2M1I3M on negative strand -> reversed to 3M1I2M
+            create_test_paired_read(
+                "r3_groupB",
+                b"ACGTAC",
+                b"######",
+                true,
+                true, // negative strand
+                false,
+                100,
+                &[(Kind::Match, 2), (Kind::Insertion, 1), (Kind::Match, 3)],
+            ),
+            create_test_paired_read(
+                "r4_groupB",
+                b"ACGTAC",
+                b"######",
+                true,
+                true, // negative strand
+                false,
+                100,
+                &[(Kind::Match, 2), (Kind::Insertion, 1), (Kind::Match, 3)],
+            ),
+        ];
+
+        let filtered = caller.filter_to_most_common_alignment(reads);
+
+        // Both groups have size 2, so CIGAR-based tie-breaking kicks in
+        assert_eq!(filtered.len(), 2);
+
+        // With CIGAR reversal for negative strand:
+        // - Group A's 3M1I2M -> reversed to 2M1I3M (first element = 2)
+        // - Group B's 2M1I3M -> reversed to 3M1I2M (first element = 3)
+        // Since 2 < 3, Group A wins (the 3M1I2M reads)
+        // Without reversal, Group B would win
+        for read in &filtered {
+            let cigar = read.cigar();
+            let ops: Vec<_> = cigar.iter().map(|r| r.unwrap()).collect();
+            assert_eq!(ops.len(), 3, "Expected 3-op cigar");
+            // The original CIGAR should be 3M1I2M (Group A)
+            assert_eq!(ops[0].kind(), Kind::Match);
+            assert_eq!(ops[0].len(), 3, "Expected first element to be 3M (Group A won)");
+            assert_eq!(ops[1].kind(), Kind::Insertion);
+            assert_eq!(ops[1].len(), 1);
+            assert_eq!(ops[2].kind(), Kind::Match);
+            assert_eq!(ops[2].len(), 2);
+        }
+
+        // 2 reads from Group B should be rejected
         assert_eq!(
             caller.stats.rejection_reasons.get(&CallerRejectionReason::MinorityAlignment),
             Some(&2)
