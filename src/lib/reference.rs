@@ -90,17 +90,62 @@ fn read_sequence_raw(file: &mut File, record: &fai::Record) -> Result<Vec<u8>> {
 }
 
 /// Find FAI index path for a FASTA file.
+///
+/// Tries multiple naming conventions:
+/// 1. Replace extension with `.fa.fai` (e.g., `ref.fasta` → `ref.fa.fai`)
+/// 2. Append `.fai` to full path (e.g., `ref.fa` → `ref.fa.fai`, `ref.fasta` → `ref.fasta.fai`)
 fn find_fai_path(fasta_path: &Path) -> Option<PathBuf> {
-    // Try .fai extension
+    // Try replacing extension with .fa.fai
     let fai_path = fasta_path.with_extension("fa.fai");
     if fai_path.exists() {
         return Some(fai_path);
     }
 
-    // Try appending .fai to full path
+    // Try appending .fai to full path (handles ref.fa -> ref.fa.fai and ref.fasta -> ref.fasta.fai)
     let fai_path = PathBuf::from(format!("{}.fai", fasta_path.display()));
     if fai_path.exists() {
         return Some(fai_path);
+    }
+
+    None
+}
+
+/// Find sequence dictionary path for a FASTA file.
+///
+/// Tries multiple naming conventions used by different tools:
+/// 1. Replace extension with `.dict` (fgbio/HTSJDK/Picard convention: `ref.fa` → `ref.dict`)
+/// 2. Append `.dict` to full path (GATK convention: `ref.fa` → `ref.fa.dict`)
+///
+/// # Arguments
+/// * `fasta_path` - Path to the FASTA file
+///
+/// # Returns
+/// The path to the dictionary file if found, or `None` if not found.
+///
+/// # Examples
+/// ```no_run
+/// use std::path::Path;
+/// use fgumi_lib::reference::find_dict_path;
+///
+/// // Will find either "ref.dict" or "ref.fa.dict"
+/// if let Some(dict_path) = find_dict_path(Path::new("ref.fa")) {
+///     println!("Found dictionary: {}", dict_path.display());
+/// }
+/// ```
+#[must_use]
+pub fn find_dict_path(fasta_path: &Path) -> Option<PathBuf> {
+    // Try replacing extension with .dict (fgbio/HTSJDK/Picard convention)
+    // e.g., ref.fa -> ref.dict, ref.fasta -> ref.dict
+    let dict_path = fasta_path.with_extension("dict");
+    if dict_path.exists() {
+        return Some(dict_path);
+    }
+
+    // Try appending .dict to full path (GATK convention)
+    // e.g., ref.fa -> ref.fa.dict, ref.fasta -> ref.fasta.dict
+    let dict_path = PathBuf::from(format!("{}.dict", fasta_path.display()));
+    if dict_path.exists() {
+        return Some(dict_path);
     }
 
     None
@@ -629,6 +674,110 @@ mod tests {
         // fetch(1, 2) should return "AC"
         let seq = reader.fetch("chr1", Position::try_from(1)?, Position::try_from(2)?)?;
         assert_eq!(seq, b"AC");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_dict_path_replacing_convention() -> Result<()> {
+        // Test the fgbio/HTSJDK/Picard convention: ref.fa -> ref.dict
+        let temp_dir = tempfile::tempdir()?;
+        let fasta_path = temp_dir.path().join("ref.fa");
+        let dict_path = temp_dir.path().join("ref.dict");
+
+        // Create empty files
+        std::fs::write(&fasta_path, "")?;
+        std::fs::write(&dict_path, "")?;
+
+        let found = find_dict_path(&fasta_path);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), dict_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_dict_path_appending_convention() -> Result<()> {
+        // Test the GATK convention: ref.fa -> ref.fa.dict
+        let temp_dir = tempfile::tempdir()?;
+        let fasta_path = temp_dir.path().join("ref.fa");
+        let dict_path = temp_dir.path().join("ref.fa.dict");
+
+        // Create empty files
+        std::fs::write(&fasta_path, "")?;
+        std::fs::write(&dict_path, "")?;
+
+        let found = find_dict_path(&fasta_path);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), dict_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_dict_path_prefers_replacing_convention() -> Result<()> {
+        // When both exist, prefer the fgbio/HTSJDK convention (ref.dict)
+        let temp_dir = tempfile::tempdir()?;
+        let fasta_path = temp_dir.path().join("ref.fa");
+        let dict_replacing = temp_dir.path().join("ref.dict");
+        let dict_appending = temp_dir.path().join("ref.fa.dict");
+
+        // Create all files
+        std::fs::write(&fasta_path, "")?;
+        std::fs::write(&dict_replacing, "")?;
+        std::fs::write(&dict_appending, "")?;
+
+        let found = find_dict_path(&fasta_path);
+        assert!(found.is_some());
+        // Should find ref.dict first (fgbio/HTSJDK convention)
+        assert_eq!(found.unwrap(), dict_replacing);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_dict_path_not_found() {
+        // When no dict file exists, return None
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fasta_path = temp_dir.path().join("ref.fa");
+
+        // Create only the FASTA file, no dict
+        std::fs::write(&fasta_path, "").unwrap();
+
+        let found = find_dict_path(&fasta_path);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_dict_path_fasta_extension() -> Result<()> {
+        // Test with .fasta extension: ref.fasta -> ref.dict
+        let temp_dir = tempfile::tempdir()?;
+        let fasta_path = temp_dir.path().join("ref.fasta");
+        let dict_path = temp_dir.path().join("ref.dict");
+
+        std::fs::write(&fasta_path, "")?;
+        std::fs::write(&dict_path, "")?;
+
+        let found = find_dict_path(&fasta_path);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), dict_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_dict_path_fasta_appending_convention() -> Result<()> {
+        // Test with .fasta extension: ref.fasta -> ref.fasta.dict
+        let temp_dir = tempfile::tempdir()?;
+        let fasta_path = temp_dir.path().join("ref.fasta");
+        let dict_path = temp_dir.path().join("ref.fasta.dict");
+
+        std::fs::write(&fasta_path, "")?;
+        std::fs::write(&dict_path, "")?;
+
+        let found = find_dict_path(&fasta_path);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), dict_path);
 
         Ok(())
     }

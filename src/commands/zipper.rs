@@ -54,6 +54,7 @@ use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer};
 use fgumi_lib::batched_sam_reader::BatchedSamReader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
+use fgumi_lib::reference::find_dict_path;
 use fgumi_lib::sam::{
     buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
     unclipped_five_prime_position,
@@ -184,8 +185,8 @@ pub struct Zipper {
 /// # Arguments
 ///
 /// * `unmapped` - Header from the unmapped BAM
-/// * `mapped` - Header from the mapped BAM  
-/// * `dict_path` - Path to reference FASTA (will open .dict file)
+/// * `mapped` - Header from the mapped BAM
+/// * `dict_path` - Path to the sequence dictionary file (.dict)
 ///
 /// # Returns
 ///
@@ -195,8 +196,8 @@ pub struct Zipper {
 ///
 /// Returns an error if the reference dictionary cannot be opened or parsed
 pub fn build_output_header(unmapped: &Header, mapped: &Header, dict_path: &Path) -> Result<Header> {
-    let dict_file = std::fs::File::open(dict_path.with_extension("dict"))
-        .context("Failed to open reference dictionary")?;
+    let dict_file =
+        std::fs::File::open(dict_path).context("Failed to open reference dictionary")?;
     let mut dict_reader = noodles::sam::io::Reader::new(std::io::BufReader::new(dict_file));
     let dict_header = dict_reader.read_header()?;
 
@@ -765,12 +766,18 @@ impl Command for Zipper {
         // Validate input files exist
         validate_file_exists(&self.unmapped, "unmapped BAM file")?;
         validate_file_exists(&self.reference, "reference FASTA file")?;
-        let dict_path = self.reference.with_extension("dict");
-        anyhow::ensure!(
-            dict_path.exists(),
-            "Reference dictionary file does not exist: {}",
-            dict_path.display()
-        );
+        let dict_path = find_dict_path(&self.reference).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Reference dictionary file not found. Tried:\n  \
+                - {}\n  \
+                - {}.dict\n\
+                Please run: samtools dict {} -o {}",
+                self.reference.with_extension("dict").display(),
+                self.reference.display(),
+                self.reference.display(),
+                self.reference.with_extension("dict").display()
+            )
+        })?;
 
         let (mut unmapped_reader, unmapped_header) = create_bam_reader(&self.unmapped, 1)?;
 
@@ -792,7 +799,7 @@ impl Command for Zipper {
         check_sort(&unmapped_header, &self.unmapped, "unmapped");
         check_sort(&mapped_header, &self.input, "mapped");
 
-        let output_header = build_output_header(&unmapped_header, &mapped_header, &self.reference)?;
+        let output_header = build_output_header(&unmapped_header, &mapped_header, &dict_path)?;
 
         // Add @PG record with PP chaining
         let output_header = fgumi_lib::header::add_pg_record(
