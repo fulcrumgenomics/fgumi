@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
+use fgumi_lib::reference::find_dict_path;
 use fgumi_lib::umi::extract_mi_base;
 use fgumi_lib::validation::validate_file_exists;
 use fgumi_lib::variant_review::{
@@ -219,13 +220,17 @@ impl Review {
         }
 
         // Check for sequence dictionary (.dict)
-        let dict_path = self.reference.with_extension("dict");
-        if !dict_path.exists() {
+        // Supports both fgbio/HTSJDK convention (ref.dict) and GATK convention (ref.fa.dict)
+        if find_dict_path(&self.reference).is_none() {
             bail!(
-                "The reference file has no sequence dictionary. Please run:\n  \
-                samtools dict {} -o {}",
+                "The reference file has no sequence dictionary. Tried:\n  \
+                - {}\n  \
+                - {}.dict\n\
+                Please run: samtools dict {} -o {}",
+                self.reference.with_extension("dict").display(),
                 self.reference.display(),
-                dict_path.display()
+                self.reference.display(),
+                self.reference.with_extension("dict").display()
             );
         }
 
