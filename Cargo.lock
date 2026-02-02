@@ -684,6 +684,7 @@ dependencies = [
  "bstr 1.12.1",
  "built",
  "bytemuck",
+ "bytes",
  "clap",
  "crc32fast",
  "criterion",
@@ -701,6 +702,7 @@ dependencies = [
  "libdeflater",
  "log",
  "lru",
+ "memchr",
  "mimalloc",
  "murmur3",
  "noodles",
@@ -1480,6 +1482,8 @@ dependencies = [
 [[package]]
 name = "noodles-bam"
 version = "0.84.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b80af1d8e5b35c1f711e250008bbaf061f6d6c15063a67cc0f786d168a8c1a2"
 dependencies = [
  "bstr 1.12.1",
  "indexmap",
@@ -1504,7 +1508,8 @@ dependencies = [
 [[package]]
 name = "noodles-bgzf"
 version = "0.45.0"
-source = "git+https://github.com/nh13/noodles.git?branch=bgzf-position-tracking#fe63dfd6f58a0a44a8d38aa5ac1a2e149a6fb50e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51c6a40480d211d9db28956b77443cac7c90b2d3d775f02e9c3fdf67ef8d611a"
 dependencies = [
  "bytes",
  "crossbeam-channel",

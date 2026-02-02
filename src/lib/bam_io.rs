@@ -21,11 +21,14 @@ use noodles::bam::bai;
 use noodles::bgzf::VirtualPosition;
 use noodles::core::Position;
 use noodles::sam::Header;
-// Use noodles_bgzf directly to get patched version with position tracking methods
-use noodles_bgzf::io::{
-    BlockInfoRx, MultithreadedReader, MultithreadedWriter, Reader as BgzfReader,
-    Writer as BgzfWriter, multithreaded_writer, writer::CompressionLevel,
-};
+// Use noodles_bgzf for standard BGZF types
+use noodles_bgzf::io::{MultithreadedReader, Reader as BgzfReader, Writer as BgzfWriter};
+// Use vendored MultithreadedWriter with position tracking (until upstream PR merges)
+use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
+// Use vendored RawBamReader for raw byte access (until noodles exposes Record bytes)
+use crate::vendored::RawBamReader;
+// Use bgzf crate for CompressionLevel
+use bgzf::CompressionLevel;
 use noodles_csi::binning_index::Indexer;
 use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
 use noodles_csi::binning_index::index::reference_sequence::index::LinearIndex;
@@ -112,7 +115,7 @@ impl BgzfWriterEnum {
                 Ok(())
             }
             BgzfWriterEnum::MultiThreaded(mut w) => {
-                w.finish()?;
+                w.finish().map_err(|e| io::Error::other(e.to_string()))?;
                 Ok(())
             }
         }
@@ -210,10 +213,10 @@ pub fn create_raw_bam_writer<P: AsRef<Path>>(
 
     let bgzf_writer = if threads > 1 {
         let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        let mut builder = multithreaded_writer::Builder::default().set_worker_count(worker_count);
+        let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
 
         #[allow(clippy::cast_possible_truncation)]
-        if let Some(cl) = CompressionLevel::new(compression_level as u8) {
+        if let Ok(cl) = CompressionLevel::new(compression_level as u8) {
             builder = builder.set_compression_level(cl);
         }
 
@@ -383,7 +386,7 @@ impl IndexingBamWriter {
         header: &Header,
         record: &noodles::sam::alignment::record_buf::RecordBuf,
     ) -> io::Result<()> {
-        use noodles::bam::record::codec::encode_record_buf;
+        use crate::vendored::bam_codec::encode_record_buf;
 
         // Encode record to raw bytes
         let mut buf = Vec::new();
@@ -536,7 +539,7 @@ impl IndexingBamWriter {
         }
 
         // Finish the writer (writes EOF marker)
-        let _ = self.inner.finish()?;
+        let _ = self.inner.finish().map_err(|e| io::Error::other(e.to_string()))?;
 
         // Final flush of any remaining entries
         self.flush_completed_blocks()?;
@@ -585,10 +588,10 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
 
     // Use multi-threaded writer with block position tracking
     let worker_count = NonZero::new(threads.max(1)).expect("threads.max(1) >= 1");
-    let mut builder = multithreaded_writer::Builder::default().set_worker_count(worker_count);
+    let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
 
     #[allow(clippy::cast_possible_truncation)]
-    if let Some(cl) = CompressionLevel::new(compression_level as u8) {
+    if let Ok(cl) = CompressionLevel::new(compression_level as u8) {
         builder = builder.set_compression_level(cl);
     }
 
@@ -669,6 +672,53 @@ pub fn create_bam_reader<P: AsRef<Path>>(
     Ok((reader, header))
 }
 
+/// Type alias for a raw BAM reader that supports both single and multi-threaded BGZF.
+pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
+
+/// Create a raw BAM reader that yields raw bytes instead of noodles Record.
+///
+/// This is used by the raw sorting pipeline for high-performance byte-level access
+/// without going through noodles' Record parsing.
+///
+/// # Arguments
+/// * `path` - Path to the input BAM file
+/// * `threads` - Number of threads for BGZF decompression (1 = single-threaded)
+///
+/// # Returns
+/// A tuple of (`raw_reader`, `header`)
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or the header cannot be read
+pub fn create_raw_bam_reader<P: AsRef<Path>>(
+    path: P,
+    threads: usize,
+) -> Result<(RawBamReaderAuto, Header)> {
+    let path_ref = path.as_ref();
+    let file = File::open(path_ref)
+        .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
+
+    let bgzf_reader = if threads > 1 {
+        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
+        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, file))
+    } else {
+        BgzfReaderEnum::SingleThreaded(BgzfReader::new(file))
+    };
+
+    // Use noodles to read the header, then extract the BGZF reader
+    let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);
+    let header = noodles_reader
+        .read_header()
+        .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?;
+
+    // Get back the BGZF reader (header has been consumed)
+    let bgzf_reader = noodles_reader.into_inner();
+
+    // Wrap in our raw reader
+    let raw_reader = RawBamReader::new(bgzf_reader);
+
+    Ok((raw_reader, header))
+}
+
 /// Create a BAM writer and write the header in one operation
 ///
 /// # Arguments
@@ -708,10 +758,10 @@ pub fn create_bam_writer<P: AsRef<Path>>(
     let bgzf_writer = if threads > 1 {
         // Use multi-threaded BGZF writer with compression level
         let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        let mut builder = multithreaded_writer::Builder::default().set_worker_count(worker_count);
+        let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
 
         #[allow(clippy::cast_possible_truncation)]
-        if let Some(cl) = CompressionLevel::new(compression_level as u8) {
+        if let Ok(cl) = CompressionLevel::new(compression_level as u8) {
             builder = builder.set_compression_level(cl);
         }
 
@@ -1087,9 +1137,11 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let output_file = File::create(temp_file.path())?;
         let worker_count = NonZero::new(2).expect("2 is non-zero");
+        let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
             worker_count,
             output_file,
+            compression_level,
         ));
 
         // Write some data and flush
@@ -1121,9 +1173,11 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let output_file = File::create(temp_file.path())?;
         let worker_count = NonZero::new(2).expect("2 is non-zero");
+        let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
             worker_count,
             output_file,
+            compression_level,
         ));
 
         // Write some data
@@ -1154,9 +1208,11 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let output_file = File::create(temp_file.path())?;
         let worker_count = NonZero::new(2).expect("2 is non-zero");
+        let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
             worker_count,
             output_file,
+            compression_level,
         ));
 
         // Test writing via the Write trait

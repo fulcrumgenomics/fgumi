@@ -17,11 +17,11 @@
 //! 3. Sort by keys while keeping raw records
 //! 4. Write raw record bytes to output
 
-use crate::bam_io::create_bam_reader;
+use crate::bam_io::create_raw_bam_reader;
 use crate::sort::inline_buffer::{RecordBuffer, TemplateKey, TemplateRecordBuffer};
 use crate::sort::keys::SortOrder;
 use crate::sort::radix::{heap_make, heap_sift_down};
-use crate::sort::read_ahead::ReadAheadReader;
+use crate::sort::read_ahead::RawReadAheadReader;
 use anyhow::{Context, Result};
 use bstr::BString;
 use crossbeam_channel::{Receiver, bounded};
@@ -633,7 +633,7 @@ impl RawExternalSorter {
         info!("Threads: {}", self.threads);
 
         // Open input BAM with lazy record reading
-        let (reader, header) = create_bam_reader(input, self.threads)?;
+        let (reader, header) = create_raw_bam_reader(input, self.threads)?;
 
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
@@ -659,7 +659,7 @@ impl RawExternalSorter {
     /// Sort by coordinate order using optimized radix sort for large arrays.
     fn sort_coordinate(
         &self,
-        reader: crate::bam_io::BamReaderAuto,
+        reader: crate::bam_io::RawBamReaderAuto,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -677,7 +677,7 @@ impl RawExternalSorter {
     /// with pre-computed sort keys, eliminating per-record heap allocations.
     fn sort_coordinate_optimized(
         &self,
-        reader: crate::bam_io::BamReaderAuto,
+        reader: crate::bam_io::RawBamReaderAuto,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -696,7 +696,7 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
         let mut consolidation_count = 0usize;
 
-        let read_ahead = ReadAheadReader::new(reader);
+        let read_ahead = RawReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
 
@@ -818,7 +818,7 @@ impl RawExternalSorter {
     /// compression for accurate virtual position tracking.
     fn sort_coordinate_with_index(
         &self,
-        reader: crate::bam_io::BamReaderAuto,
+        reader: crate::bam_io::RawBamReaderAuto,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -835,7 +835,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
         let mut consolidation_count = 0usize;
-        let read_ahead = ReadAheadReader::new(reader);
+        let read_ahead = RawReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
 
@@ -963,7 +963,7 @@ impl RawExternalSorter {
     /// enabling efficient merge without re-parsing BAM records.
     fn sort_queryname(
         &self,
-        reader: crate::bam_io::BamReaderAuto,
+        reader: crate::bam_io::RawBamReaderAuto,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -981,7 +981,7 @@ impl RawExternalSorter {
         let mut memory_used = 0usize;
         let mut consolidation_count = 0usize;
 
-        let read_ahead = ReadAheadReader::new(reader);
+        let read_ahead = RawReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (keyed output)...");
 
@@ -1093,7 +1093,7 @@ impl RawExternalSorter {
     /// comparisons during merge (instead of expensive CIGAR/aux parsing).
     fn sort_template_coordinate(
         &self,
-        reader: crate::bam_io::BamReaderAuto,
+        reader: crate::bam_io::RawBamReaderAuto,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -1119,7 +1119,7 @@ impl RawExternalSorter {
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
         let mut consolidation_count = 0usize;
 
-        let read_ahead = ReadAheadReader::new(reader);
+        let read_ahead = RawReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (inline buffer)...");
 

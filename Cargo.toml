@@ -28,6 +28,7 @@ anyhow = "1.0.100"
 read-structure = "0.2.0"
 seq_io = "0.3.4"
 bstr = "1.12.1"
+bytes = "1"
 fgoxide = "0.6.0"
 tempfile = "3.3.0"
 lru = "0.16.3"
@@ -44,6 +45,7 @@ itertools = "0.14.0"
 indexmap = "2"
 rand = "0.9"
 csv = "1.1"
+memchr = "2"
 murmur3 = "0.5"
 statrs = "0.18"
 rayon = "1.10"
@@ -87,11 +89,6 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
-
-# Local patch to expose BAM record decoding for the 7-step pipeline
-[patch.crates-io]
-noodles-bam = { path = "vendor/noodles-bam" }
-noodles-bgzf = { git = "https://github.com/nh13/noodles.git", branch = "bgzf-position-tracking" }
 
 # Config for 'cargo dist'
 [workspace.metadata.dist]

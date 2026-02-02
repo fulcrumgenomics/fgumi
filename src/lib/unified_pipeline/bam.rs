@@ -310,7 +310,7 @@ pub fn decode_records(
     batch: &BoundaryBatch,
     group_key_config: &GroupKeyConfig,
 ) -> io::Result<Vec<DecodedRecord>> {
-    use noodles::bam::record::codec::decode;
+    use crate::vendored::bam_codec::decode;
 
     let num_records = batch.offsets.len().saturating_sub(1);
     let mut records = Vec::with_capacity(num_records);
@@ -3131,7 +3131,7 @@ pub fn serialize_bam_records_into(
     header: &Header,
     output: &mut Vec<u8>,
 ) -> io::Result<u64> {
-    use noodles::bam::record::codec::encode_record_buf;
+    use crate::vendored::bam_codec::encode_record_buf;
 
     log::trace!("serialize_bam_records_into: {} records", records.len());
 
@@ -3204,7 +3204,7 @@ pub fn serialize_bam_record_into(
     header: &Header,
     output: &mut Vec<u8>,
 ) -> io::Result<u64> {
-    use noodles::bam::record::codec::encode_record_buf;
+    use crate::vendored::bam_codec::encode_record_buf;
 
     SERIALIZE_RECORD_BUFFER.with(|buf| {
         let mut record_data = buf.borrow_mut();
@@ -3232,7 +3232,7 @@ pub fn serialize_bam_records_to_compressor(
     header: &Header,
     compressor: &mut crate::bgzf_writer::InlineBgzfCompressor,
 ) -> io::Result<u64> {
-    use noodles::bam::record::codec::encode_record_buf;
+    use crate::vendored::bam_codec::encode_record_buf;
 
     log::trace!("serialize_bam_records_to_compressor: {} records", records.len());
 
