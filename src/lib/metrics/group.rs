@@ -31,9 +31,6 @@ pub struct UmiGroupingMetrics {
     /// Records discarded (UMI too short)
     pub discarded_umi_too_short: u64,
 
-    /// Records discarded (duplicate UMI at same position)
-    pub discarded_duplicate_umi: u64,
-
     /// Number of unique molecule IDs assigned
     pub unique_molecule_ids: u64,
 
@@ -64,7 +61,6 @@ impl UmiGroupingMetrics {
             discarded_poor_alignment: 0,
             discarded_ns_in_umi: 0,
             discarded_umi_too_short: 0,
-            discarded_duplicate_umi: 0,
             unique_molecule_ids: 0,
             total_families: 0,
             avg_reads_per_molecule: 0.0,
@@ -101,7 +97,6 @@ impl super::ProcessingMetrics for UmiGroupingMetrics {
             + self.discarded_poor_alignment
             + self.discarded_ns_in_umi
             + self.discarded_umi_too_short
-            + self.discarded_duplicate_umi
     }
 }
 

@@ -35,6 +35,7 @@ use fgumi_lib::metrics::group::FamilySizeMetrics;
 use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
+use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::{
     BamPipelineConfig, BatchWeight, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
     serialize_bam_records_into,
@@ -308,24 +309,20 @@ fn filter_template(
             }
         }
 
-        // Check UMI for Ns and minimum length
+        // Check UMI for Ns and minimum length using common validation
         if let Some(DataValue::String(umi)) = record.data().get(&config.umi_tag) {
-            let mut acgt_count = 0usize;
-            for &b in umi.iter() {
-                match b {
-                    b'A' | b'C' | b'G' | b'T' => acgt_count += 1,
-                    b'N' => {
-                        metrics.discarded_ns_in_umi += 1;
-                        return false;
-                    }
-                    _ => {} // Skip non-ACGT chars (e.g., '-' in paired UMIs)
-                }
-            }
-
-            if let Some(min_len) = config.min_umi_length {
-                if acgt_count < min_len {
-                    metrics.discarded_umi_too_short += 1;
+            match validate_umi(umi) {
+                UmiValidation::ContainsN => {
+                    metrics.discarded_ns_in_umi += 1;
                     return false;
+                }
+                UmiValidation::Valid(base_count) => {
+                    if let Some(min_len) = config.min_umi_length {
+                        if base_count < min_len {
+                            metrics.discarded_umi_too_short += 1;
+                            return false;
+                        }
+                    }
                 }
             }
         } else {

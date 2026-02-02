@@ -24,6 +24,7 @@ use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
 use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
+use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::DecodedRecord;
 use fgumi_lib::unified_pipeline::{
     BamPipelineConfig, Grouper, run_bam_pipeline_from_reader, serialize_bam_records_into,
@@ -165,27 +166,22 @@ fn filter_template(
             }
         }
 
-        // Check UMI for Ns and minimum length (single pass)
+        // Check UMI for Ns and minimum length using common validation
         if let Some(data) = record.data().get(&config.umi_tag) {
             if let DataValue::String(umi) = data {
-                // Single pass: count ACGT and detect N simultaneously
-                let mut acgt_count = 0usize;
-                for &b in umi.iter() {
-                    match b {
-                        b'A' | b'C' | b'G' | b'T' => acgt_count += 1,
-                        b'N' => {
-                            metrics.discarded_ns_in_umi += num_primary_reads;
-                            return false;
-                        }
-                        _ => {} // Skip non-ACGT, non-N characters (e.g., '-' in paired UMIs)
-                    }
-                }
-
-                // Check minimum UMI length
-                if let Some(min_len) = config.min_umi_length {
-                    if acgt_count < min_len {
-                        metrics.discarded_umi_too_short += num_primary_reads;
+                match validate_umi(umi) {
+                    UmiValidation::ContainsN => {
+                        metrics.discarded_ns_in_umi += num_primary_reads;
                         return false;
+                    }
+                    UmiValidation::Valid(base_count) => {
+                        // Check minimum UMI length
+                        if let Some(min_len) = config.min_umi_length {
+                            if base_count < min_len {
+                                metrics.discarded_umi_too_short += num_primary_reads;
+                                return false;
+                            }
+                        }
                     }
                 }
             } else {
