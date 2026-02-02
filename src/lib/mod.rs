@@ -178,6 +178,7 @@ pub mod umi;
 pub mod unified_pipeline;
 pub mod validation;
 pub mod variant_review;
+pub mod vendored;
 
 #[cfg(feature = "simulate")]
 pub mod simulate;
