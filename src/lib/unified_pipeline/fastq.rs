@@ -352,10 +352,13 @@ impl FastqFormat {
             max_stream
         );
 
-        let mut streams = Vec::with_capacity(batch.chunks.len());
+        // Track which streams have chunks in this batch
+        let mut streams_with_chunks = vec![false; state.stream_states.len()];
+        let mut streams = Vec::with_capacity(state.stream_states.len());
 
         for chunk in batch.chunks {
             let stream_idx = chunk.stream_idx;
+            streams_with_chunks[stream_idx] = true;
 
             // Lock only this stream's state - other streams can be processed in parallel
             let mut stream_state = state.stream_states[stream_idx].lock();
@@ -379,6 +382,67 @@ impl FastqFormat {
 
             streams.push(FastqStreamBoundaries { stream_idx, data, offsets });
             // stream_state lock is dropped here, allowing other threads to access this stream
+        }
+
+        // For synchronized mode with multiple streams, process leftover from streams
+        // that had no chunk in this batch. This handles the case where one stream's
+        // reader reaches EOF before the other, but still has complete records in leftover.
+        if state.stream_states.len() > 1 {
+            for (stream_idx, &had_chunk) in streams_with_chunks.iter().enumerate() {
+                if had_chunk {
+                    continue; // Already processed above
+                }
+
+                let mut stream_state = state.stream_states[stream_idx].lock();
+                if stream_state.leftover.is_empty() {
+                    continue; // No leftover to process
+                }
+
+                // Process leftover as if it were a chunk
+                stream_state.work_buffer.clear();
+                let leftover = std::mem::take(&mut stream_state.leftover);
+                stream_state.work_buffer.extend_from_slice(&leftover);
+
+                let (data, offsets, leftover_start) =
+                    find_fastq_boundaries_inplace(&stream_state.work_buffer)?;
+
+                stream_state.leftover = stream_state.work_buffer[leftover_start..].to_vec();
+
+                streams.push(FastqStreamBoundaries { stream_idx, data, offsets });
+            }
+        }
+
+        // Align record counts for synchronized mode.
+        // When multiple streams are processed together (e.g., R1/R2 paired FASTQs),
+        // byte-aligned chunks may contain different numbers of complete records.
+        // Move excess records back to leftover for the next batch.
+        if streams.len() > 1 {
+            // Find minimum record count across all streams
+            // (offsets includes position 0, so record_count = offsets.len() - 1)
+            let min_records =
+                streams.iter().map(|s| s.offsets.len().saturating_sub(1)).min().unwrap_or(0);
+
+            // Move excess records back to leftover for each stream
+            for stream in &mut streams {
+                let record_count = stream.offsets.len().saturating_sub(1);
+                if record_count > min_records {
+                    let excess_start = stream.offsets[min_records];
+
+                    // Re-acquire lock for this stream
+                    let mut stream_state = state.stream_states[stream.stream_idx].lock();
+
+                    // Prepend excess bytes to existing leftover
+                    // (existing leftover has incomplete record from end of this chunk)
+                    let excess_bytes = stream.data[excess_start..].to_vec();
+                    let incomplete_leftover = std::mem::take(&mut stream_state.leftover);
+                    stream_state.leftover = excess_bytes;
+                    stream_state.leftover.extend(incomplete_leftover);
+
+                    // Truncate stream data and offsets
+                    stream.data.truncate(excess_start);
+                    stream.offsets.truncate(min_records + 1);
+                }
+            }
         }
 
         Ok(FastqBoundaryBatch { streams, serial: batch.serial })
@@ -4848,5 +4912,260 @@ mod tests {
         // Verify grouper state is clean
         let grouper = grouper.lock();
         assert!(!grouper.has_pending(), "Grouper should have no pending data");
+    }
+
+    // ========================================================================
+    // Synchronized Stream Record Alignment Tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_boundaries_aligns_unequal_record_counts() {
+        // Test that find_boundaries aligns record counts when streams have different
+        // numbers of complete records in their chunks.
+        let boundary_state = FastqBoundaryState::new(2);
+
+        // Stream 0 has 3 complete records, Stream 1 has 2 complete records
+        let batch = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk {
+                    stream_idx: 0,
+                    data: b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n@r3\nACGT\n+\nIIII\n".to_vec(),
+                },
+                FastqDecompressedChunk {
+                    stream_idx: 1,
+                    data: b"@r1\nTTTT\n+\nJJJJ\n@r2\nTTTT\n+\nJJJJ\n".to_vec(),
+                },
+            ],
+            serial: 0,
+        };
+
+        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+
+        // Both streams should have exactly 2 records (the minimum)
+        assert_eq!(boundary_batch.streams.len(), 2);
+        // offsets.len() = record_count + 1 (includes position 0)
+        assert_eq!(
+            boundary_batch.streams[0].offsets.len(),
+            3,
+            "Stream 0 should have 2 records (3 offsets)"
+        );
+        assert_eq!(
+            boundary_batch.streams[1].offsets.len(),
+            3,
+            "Stream 1 should have 2 records (3 offsets)"
+        );
+
+        // Stream 0's excess record should be in leftover
+        let leftover = &boundary_state.stream_states[0].lock().leftover;
+        assert!(!leftover.is_empty(), "Stream 0 should have leftover containing the excess record");
+        assert!(leftover.starts_with(b"@r3\n"), "Leftover should contain the third record");
+
+        // Stream 1's leftover should be empty (no excess)
+        let leftover1 = &boundary_state.stream_states[1].lock().leftover;
+        assert!(leftover1.is_empty(), "Stream 1 should have no leftover");
+    }
+
+    #[test]
+    fn test_find_boundaries_leftover_persists_to_next_batch() {
+        // Test that excess records moved to leftover are correctly processed
+        // in the next batch.
+        let boundary_state = FastqBoundaryState::new(2);
+
+        // Batch 1: Stream 0 has 3 records, Stream 1 has 2 records
+        let batch1 = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk {
+                    stream_idx: 0,
+                    data: b"@r1\nAAAA\n+\nIIII\n@r2\nAAAA\n+\nIIII\n@r3\nAAAA\n+\nIIII\n".to_vec(),
+                },
+                FastqDecompressedChunk {
+                    stream_idx: 1,
+                    data: b"@r1\nTTTT\n+\nJJJJ\n@r2\nTTTT\n+\nJJJJ\n".to_vec(),
+                },
+            ],
+            serial: 0,
+        };
+
+        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        assert_eq!(boundary_batch1.streams[0].offsets.len() - 1, 2); // 2 records from stream 0
+        assert_eq!(boundary_batch1.streams[1].offsets.len() - 1, 2); // 2 records from stream 1
+
+        // Batch 2: Stream 0 has 1 record, Stream 1 has 2 records
+        // Stream 0's leftover (r3) + new record (r4) = 2 records total
+        let batch2 = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk { stream_idx: 0, data: b"@r4\nAAAA\n+\nIIII\n".to_vec() },
+                FastqDecompressedChunk {
+                    stream_idx: 1,
+                    data: b"@r3\nTTTT\n+\nJJJJ\n@r4\nTTTT\n+\nJJJJ\n".to_vec(),
+                },
+            ],
+            serial: 1,
+        };
+
+        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+
+        // Stream 0: leftover(r3) + new(r4) = 2 records
+        // Stream 1: 2 new records (r3, r4)
+        // Both should have 2 records
+        assert_eq!(
+            boundary_batch2.streams[0].offsets.len() - 1,
+            2,
+            "Stream 0 should have 2 records (leftover + new)"
+        );
+        assert_eq!(
+            boundary_batch2.streams[1].offsets.len() - 1,
+            2,
+            "Stream 1 should have 2 records"
+        );
+
+        // Parse and verify record names
+        let parsed = FastqFormat::parse_records(boundary_batch2).unwrap();
+        assert_eq!(parsed.streams[0][0].name, b"r3", "First record should be r3 from leftover");
+        assert_eq!(parsed.streams[0][1].name, b"r4", "Second record should be r4");
+    }
+
+    #[test]
+    fn test_find_boundaries_processes_leftover_without_new_chunk() {
+        // Test that when one stream has no new chunk but has leftover,
+        // the leftover is still processed.
+        let boundary_state = FastqBoundaryState::new(2);
+
+        // Batch 1: Both streams have data, but stream 0 has an extra record
+        let batch1 = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk {
+                    stream_idx: 0,
+                    data: b"@r1\nAAAA\n+\nIIII\n@r2\nAAAA\n+\nIIII\n".to_vec(),
+                },
+                FastqDecompressedChunk { stream_idx: 1, data: b"@r1\nTTTT\n+\nJJJJ\n".to_vec() },
+            ],
+            serial: 0,
+        };
+
+        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        // Both aligned to 1 record
+        assert_eq!(boundary_batch1.streams[0].offsets.len() - 1, 1);
+        assert_eq!(boundary_batch1.streams[1].offsets.len() - 1, 1);
+
+        // Stream 0's leftover should have r2
+        assert!(!boundary_state.stream_states[0].lock().leftover.is_empty());
+
+        // Batch 2: Only stream 1 has a new chunk (simulating stream 0 at EOF)
+        let batch2 = FastqDecompressedBatch {
+            chunks: vec![FastqDecompressedChunk {
+                stream_idx: 1,
+                data: b"@r2\nTTTT\n+\nJJJJ\n".to_vec(),
+            }],
+            serial: 1,
+        };
+
+        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+
+        // Both streams should be present (stream 0 from leftover, stream 1 from new chunk)
+        assert_eq!(boundary_batch2.streams.len(), 2, "Both streams should be present");
+
+        // Find stream 0 and stream 1 in the result (order may vary)
+        let stream0 = boundary_batch2.streams.iter().find(|s| s.stream_idx == 0).unwrap();
+        let stream1 = boundary_batch2.streams.iter().find(|s| s.stream_idx == 1).unwrap();
+
+        assert_eq!(stream0.offsets.len() - 1, 1, "Stream 0 should have 1 record from leftover");
+        assert_eq!(stream1.offsets.len() - 1, 1, "Stream 1 should have 1 record");
+
+        // Stream 0's leftover should now be empty
+        assert!(
+            boundary_state.stream_states[0].lock().leftover.is_empty(),
+            "Stream 0 leftover should be consumed"
+        );
+    }
+
+    #[test]
+    fn test_find_boundaries_equal_counts_no_alignment_needed() {
+        // Test that when both streams have equal record counts, no alignment is needed
+        let boundary_state = FastqBoundaryState::new(2);
+
+        let batch = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk {
+                    stream_idx: 0,
+                    data: b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n".to_vec(),
+                },
+                FastqDecompressedChunk {
+                    stream_idx: 1,
+                    data: b"@r1\nTTTT\n+\nJJJJ\n@r2\nTTTT\n+\nJJJJ\n".to_vec(),
+                },
+            ],
+            serial: 0,
+        };
+
+        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+
+        // Both streams should have 2 records
+        assert_eq!(boundary_batch.streams[0].offsets.len() - 1, 2);
+        assert_eq!(boundary_batch.streams[1].offsets.len() - 1, 2);
+
+        // No leftover for either stream
+        assert!(boundary_state.stream_states[0].lock().leftover.is_empty());
+        assert!(boundary_state.stream_states[1].lock().leftover.is_empty());
+    }
+
+    #[test]
+    fn test_find_boundaries_single_stream_no_alignment() {
+        // Test that single-stream mode doesn't apply alignment (no need)
+        let boundary_state = FastqBoundaryState::new(1);
+
+        let batch = FastqDecompressedBatch {
+            chunks: vec![FastqDecompressedChunk {
+                stream_idx: 0,
+                data: b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n@r3\nACGT\n+\nIIII\n".to_vec(),
+            }],
+            serial: 0,
+        };
+
+        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+
+        // All 3 records should be present (no alignment needed for single stream)
+        assert_eq!(boundary_batch.streams[0].offsets.len() - 1, 3);
+        assert!(boundary_state.stream_states[0].lock().leftover.is_empty());
+    }
+
+    #[test]
+    fn test_find_boundaries_empty_batch_with_leftover() {
+        // Test handling when a batch has no chunks but streams have leftover
+        let boundary_state = FastqBoundaryState::new(2);
+
+        // First, create leftover by processing a batch with unequal records
+        let batch1 = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk {
+                    stream_idx: 0,
+                    data: b"@r1\nAAAA\n+\nIIII\n@r2\nAAAA\n+\nIIII\n".to_vec(),
+                },
+                FastqDecompressedChunk { stream_idx: 1, data: b"@r1\nTTTT\n+\nJJJJ\n".to_vec() },
+            ],
+            serial: 0,
+        };
+
+        let _ = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+
+        // Verify stream 0 has leftover
+        assert!(!boundary_state.stream_states[0].lock().leftover.is_empty());
+
+        // Now process a batch with only stream 1 data
+        let batch2 = FastqDecompressedBatch {
+            chunks: vec![FastqDecompressedChunk {
+                stream_idx: 1,
+                data: b"@r2\nTTTT\n+\nJJJJ\n".to_vec(),
+            }],
+            serial: 1,
+        };
+
+        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+
+        // Both streams should be present
+        assert_eq!(boundary_batch2.streams.len(), 2);
+
+        // After processing, stream 0's leftover should be consumed
+        assert!(boundary_state.stream_states[0].lock().leftover.is_empty());
     }
 }
