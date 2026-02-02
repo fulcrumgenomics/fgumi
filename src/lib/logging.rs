@@ -196,30 +196,27 @@ pub fn log_umi_grouping_summary(metrics: &UmiGroupingMetrics) {
         log::info!("  Max reads/molecule: {}", metrics.max_reads_per_molecule);
     }
 
-    // Log discard reasons if any
-    let total_discarded = metrics.discarded_non_pf
-        + metrics.discarded_poor_alignment
-        + metrics.discarded_ns_in_umi
-        + metrics.discarded_umi_too_short
-        + metrics.discarded_duplicate_umi;
-
-    if total_discarded > 0 {
-        log::info!("  Discard reasons:");
-        if metrics.discarded_non_pf > 0 {
-            log::info!("    Non-PF: {}", format_count(metrics.discarded_non_pf));
-        }
-        if metrics.discarded_poor_alignment > 0 {
-            log::info!("    Poor alignment: {}", format_count(metrics.discarded_poor_alignment));
-        }
-        if metrics.discarded_ns_in_umi > 0 {
-            log::info!("    Ns in UMI: {}", format_count(metrics.discarded_ns_in_umi));
-        }
-        if metrics.discarded_umi_too_short > 0 {
-            log::info!("    UMI too short: {}", format_count(metrics.discarded_umi_too_short));
-        }
-        if metrics.discarded_duplicate_umi > 0 {
-            log::info!("    Duplicate UMI: {}", format_count(metrics.discarded_duplicate_umi));
-        }
+    // Log filter counts (matching fgbio's logging style)
+    // Non-PF only logged if > 0
+    if metrics.discarded_non_pf > 0 {
+        log::info!("Filtered out {} non-PF records.", format_count(metrics.discarded_non_pf));
+    }
+    // Poor alignment always logged (like fgbio)
+    log::info!(
+        "Filtered out {} records due to mapping issues.",
+        format_count(metrics.discarded_poor_alignment)
+    );
+    // Ns in UMI always logged (like fgbio)
+    log::info!(
+        "Filtered out {} records that contained one or more Ns in their UMIs.",
+        format_count(metrics.discarded_ns_in_umi)
+    );
+    // UMI too short only logged if > 0
+    if metrics.discarded_umi_too_short > 0 {
+        log::info!(
+            "Filtered out {} records that contained UMIs that were too short.",
+            format_count(metrics.discarded_umi_too_short)
+        );
     }
 }
 

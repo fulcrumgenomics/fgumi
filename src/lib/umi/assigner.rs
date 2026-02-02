@@ -1532,6 +1532,11 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             counts.into_iter().map(|(enc, (count, idx))| (enc, count, idx)).collect()
         };
 
+        // Handle case where all UMIs had invalid characters
+        if umi_counts.is_empty() {
+            return vec![MoleculeId::None; raw_umis.len()];
+        }
+
         #[cfg(feature = "profile-adjacency")]
         let t_after_count = std::time::Instant::now();
 
