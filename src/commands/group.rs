@@ -1701,6 +1701,58 @@ mod tests {
         builder.build()
     }
 
+    /// Build a test read with custom CIGAR string
+    #[allow(clippy::cast_sign_loss)]
+    fn build_test_read_with_cigar(
+        name: &str,
+        ref_id: usize,
+        pos: i32,
+        mapq: u8,
+        flags: u16,
+        umi: &str,
+        cigar: &str,
+    ) -> sam::alignment::RecordBuf {
+        // Generate sequence based on CIGAR read length
+        let read_len = cigar
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<usize>()
+            .unwrap_or(100);
+        let seq: String = "ACGT".chars().cycle().take(read_len).collect();
+
+        let mut builder = RecordBuilder::new()
+            .name(name)
+            .sequence(&seq)
+            .reference_sequence_id(ref_id)
+            .alignment_start(pos as usize)
+            .mapping_quality(mapq)
+            .cigar(cigar)
+            .tag("RX", umi);
+
+        // Set flags based on raw u16
+        let sam_flags = sam::alignment::record::Flags::from(flags);
+        if sam_flags.is_segmented() {
+            builder = builder.paired(true);
+        }
+        if sam_flags.is_first_segment() {
+            builder = builder.first_segment(true);
+        } else if sam_flags.is_last_segment() {
+            builder = builder.first_segment(false);
+        }
+        if sam_flags.is_reverse_complemented() {
+            builder = builder.reverse_complement(true);
+        }
+        if sam_flags.is_unmapped() {
+            builder = builder.unmapped(true);
+        }
+        if sam_flags.is_mate_unmapped() {
+            builder = builder.mate_unmapped(true);
+        }
+
+        builder.build()
+    }
+
     /// Create a pair of reads
     #[allow(clippy::cast_sign_loss)]
     fn build_test_pair(
@@ -2175,6 +2227,56 @@ mod tests {
         // Should have 4 groups
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 4, "Should have 4 UMI groups");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_end_different_lengths_separate_groups() -> Result<()> {
+        // Two reads at same 5' position with same UMI but different lengths (different 3' positions)
+        // Should be in DIFFERENT groups due to different 3' positions
+        let records: Vec<RecordBuf> = vec![
+            // 50M at position 100: 3' position = 100 + 50 - 1 = 149
+            build_test_read_with_cigar("a01", 0, 100, 60, 0, "AAAAAAAA", "50M"),
+            // Another 50M at position 100 with same UMI (same group as a01)
+            build_test_read_with_cigar("a02", 0, 100, 60, 0, "AAAAAAAA", "50M"),
+            // 100M at position 100: 3' position = 100 + 100 - 1 = 199 (different group)
+            build_test_read_with_cigar("a03", 0, 100, 60, 0, "AAAAAAAA", "100M"),
+            // Another 100M at position 100 with same UMI (same group as a03)
+            build_test_read_with_cigar("a04", 0, 100, 60, 0, "AAAAAAAA", "100M"),
+        ];
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "Should have all 4 records");
+
+        // Should have 2 groups: one for 50M reads, one for 100M reads
+        // Even though they have the same UMI and same 5' position, they differ in 3' position
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 2, "Should have 2 UMI groups (different 3' positions)");
 
         Ok(())
     }
