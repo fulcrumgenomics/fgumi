@@ -24,13 +24,16 @@ use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
 use fgumi_lib::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
+use fgumi_lib::umi::parallel_assigner::{
+    ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelPairedAssigner,
+};
 use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::DecodedRecord;
 use fgumi_lib::unified_pipeline::{
     BamPipelineConfig, Grouper, run_bam_pipeline_from_reader, serialize_bam_records_into,
 };
 use fgumi_lib::validation::{string_to_tag, validate_file_exists};
-use log::info;
+use log::{info, warn};
 use noodles::sam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -516,9 +519,19 @@ pub struct GroupReadsByUmi {
     pub include_non_pf_reads: bool,
 
     /// Allow fully unmapped templates (both reads unmapped).
+    ///
     /// Groups unmapped reads by UMI only within each library/cell barcode.
     /// Useful for ribosome display or other protocols with unmapped reads.
     /// When enabled, queryname-sorted input is also accepted.
+    ///
+    /// IMPORTANT: All unmapped reads are placed in a single position group,
+    /// meaning reads with identical/similar UMIs will be grouped together
+    /// even if they originate from different genomic locations. This may
+    /// cause over-grouping if UMI diversity is low.
+    ///
+    /// For paired UMIs (e.g., "ACGT-TGCA"), edit distance is computed on the
+    /// concatenated sequence with dashes removed (30 bases for 15bp-15bp UMIs).
+    /// With --edits 1, only 1 mismatch is allowed across ALL bases.
     #[arg(long = "allow-unmapped")]
     pub allow_unmapped: bool,
 
@@ -588,6 +601,19 @@ impl Command for GroupReadsByUmi {
         }
         if self.allow_unmapped {
             info!("Allow unmapped: enabled (unmapped templates will be grouped by UMI only)");
+            warn!(
+                "WARNING: All unmapped reads are placed in a single position group. \
+                 Reads with identical/similar UMIs will be grouped together even if they \
+                 originate from different genomic locations."
+            );
+            if matches!(self.strategy, Strategy::Edit | Strategy::Adjacency) {
+                warn!(
+                    "WARNING: For paired UMIs (e.g., ACGT-TGCA), edit distance is computed \
+                     on the concatenated sequence with dashes removed. With --edits {}, \
+                     only {} mismatch(es) allowed across ALL bases.",
+                    self.edits, self.edits
+                );
+            }
         }
 
         // Log threading configuration
@@ -696,6 +722,7 @@ impl Command for GroupReadsByUmi {
         // Clone values needed by closures
         let strategy = self.strategy;
         let index_threshold = self.index_threshold;
+        let allow_unmapped = self.allow_unmapped;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
         // Configure 7-step pipeline
@@ -763,7 +790,27 @@ impl Command for GroupReadsByUmi {
                 }
 
                 // Create UMI assigner for this group
-                let assigner = strategy.new_assigner_full(effective_edits, 1, index_threshold);
+                // Use parallel assigner when allow_unmapped is enabled (large single groups)
+                let assigner: Box<dyn UmiAssigner> = if allow_unmapped {
+                    match strategy {
+                        Strategy::Identity => {
+                            // Identity is already O(n), no parallel version needed
+                            strategy.new_assigner_full(effective_edits, 1, index_threshold)
+                        }
+                        Strategy::Edit => {
+                            Box::new(ParallelEditAssigner::new(effective_edits, num_threads))
+                        }
+                        Strategy::Adjacency => {
+                            Box::new(ParallelAdjacencyAssigner::new(effective_edits, num_threads))
+                        }
+                        Strategy::Paired => {
+                            Box::new(ParallelPairedAssigner::new(effective_edits, num_threads))
+                        }
+                    }
+                } else {
+                    // Use existing sequential assigner for mapped data
+                    strategy.new_assigner_full(effective_edits, 1, index_threshold)
+                };
 
                 // Assign UMI groups using the unified _impl function
                 let mut templates = filtered_templates;
@@ -1029,6 +1076,7 @@ impl GroupReadsByUmi {
                     self.strategy,
                     effective_edits,
                     self.index_threshold,
+                    1, // Single-threaded mode
                     raw_tag,
                     assign_tag_bytes,
                     &mut total_filter_metrics,
@@ -1049,6 +1097,7 @@ impl GroupReadsByUmi {
                 self.strategy,
                 effective_edits,
                 self.index_threshold,
+                1, // Single-threaded mode
                 raw_tag,
                 assign_tag_bytes,
                 &mut total_filter_metrics,
@@ -1148,6 +1197,7 @@ impl GroupReadsByUmi {
         strategy: Strategy,
         effective_edits: u32,
         index_threshold: usize,
+        threads: usize,
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
@@ -1172,7 +1222,23 @@ impl GroupReadsByUmi {
         }
 
         // Create UMI assigner
-        let assigner = strategy.new_assigner_full(effective_edits, 1, index_threshold);
+        // Use parallel assigner when allow_unmapped is enabled (large single groups)
+        let assigner: Box<dyn UmiAssigner> = if filter_config.allow_unmapped {
+            match strategy {
+                Strategy::Identity => {
+                    // Identity is already O(n), no parallel version needed
+                    strategy.new_assigner_full(effective_edits, 1, index_threshold)
+                }
+                Strategy::Edit => Box::new(ParallelEditAssigner::new(effective_edits, threads)),
+                Strategy::Adjacency => {
+                    Box::new(ParallelAdjacencyAssigner::new(effective_edits, threads))
+                }
+                Strategy::Paired => Box::new(ParallelPairedAssigner::new(effective_edits, threads)),
+            }
+        } else {
+            // Use existing sequential assigner for mapped data
+            strategy.new_assigner_full(effective_edits, 1, index_threshold)
+        };
 
         // Assign UMI groups
         let mut templates = filtered_templates;
