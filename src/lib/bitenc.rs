@@ -136,6 +136,35 @@ impl BitEnc {
         let mask = (1u64 << (len * 2)) - 1;
         ((self.bits >> start_bit) & mask) as u32
     }
+
+    /// Create a new `BitEnc` with a different base at the specified position.
+    /// Used for generating neighbors in edit distance calculations.
+    ///
+    /// # Arguments
+    /// * `pos` - Base position (0-indexed)
+    /// * `base` - New base value (0=A, 1=C, 2=G, 3=T)
+    #[inline]
+    #[must_use]
+    pub fn with_base_at(&self, pos: usize, base: u8) -> Self {
+        debug_assert!(pos < self.len as usize, "Position out of bounds");
+        debug_assert!(base < 4, "Invalid base value");
+
+        let bit_pos = pos * 2;
+        // Clear the 2 bits at this position, then set new value
+        let mask = !(0b11u64 << bit_pos);
+        let new_bits = (self.bits & mask) | (u64::from(base) << bit_pos);
+
+        Self { bits: new_bits, len: self.len }
+    }
+
+    /// Get the base value at the specified position.
+    /// Returns 0=A, 1=C, 2=G, 3=T.
+    #[inline]
+    #[must_use]
+    pub fn base_at(&self, pos: usize) -> u8 {
+        debug_assert!(pos < self.len as usize, "Position out of bounds");
+        ((self.bits >> (pos * 2)) & 0b11) as u8
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +269,102 @@ mod tests {
         let umi3 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC").unwrap();
         let umi4 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC").unwrap();
         assert_eq!(umi3.hamming_distance(&umi4), 0);
+    }
+
+    #[test]
+    fn test_with_base_at() {
+        let enc = BitEnc::from_bytes(b"AAAA").unwrap();
+
+        // Change first A to T (T=3)
+        let modified = enc.with_base_at(0, 3);
+        assert_eq!(modified, BitEnc::from_bytes(b"TAAA").unwrap());
+
+        // Change second A to C (C=1)
+        let modified2 = enc.with_base_at(1, 1);
+        assert_eq!(modified2, BitEnc::from_bytes(b"ACAA").unwrap());
+
+        // Change third A to G (G=2)
+        let modified3 = enc.with_base_at(2, 2);
+        assert_eq!(modified3, BitEnc::from_bytes(b"AAGA").unwrap());
+
+        // Change last A to C (C=1)
+        let modified4 = enc.with_base_at(3, 1);
+        assert_eq!(modified4, BitEnc::from_bytes(b"AAAC").unwrap());
+
+        // Original should be unchanged
+        assert_eq!(enc, BitEnc::from_bytes(b"AAAA").unwrap());
+    }
+
+    #[test]
+    fn test_with_base_at_preserves_other_bases() {
+        let enc = BitEnc::from_bytes(b"ACGT").unwrap();
+
+        // Change G to A
+        let modified = enc.with_base_at(2, 0);
+        assert_eq!(modified, BitEnc::from_bytes(b"ACAT").unwrap());
+
+        // Verify hamming distance is 1
+        assert_eq!(enc.hamming_distance(&modified), 1);
+    }
+
+    #[test]
+    fn test_base_at() {
+        let enc = BitEnc::from_bytes(b"ACGT").unwrap();
+        assert_eq!(enc.base_at(0), 0); // A
+        assert_eq!(enc.base_at(1), 1); // C
+        assert_eq!(enc.base_at(2), 2); // G
+        assert_eq!(enc.base_at(3), 3); // T
+    }
+
+    #[test]
+    fn test_base_at_roundtrip() {
+        // Test that base_at correctly reads what we set with with_base_at
+        let enc = BitEnc::from_bytes(b"AAAA").unwrap();
+
+        for pos in 0..4 {
+            for base in 0..4u8 {
+                let modified = enc.with_base_at(pos, base);
+                assert_eq!(modified.base_at(pos), base);
+
+                // Other positions should still be A (0)
+                for other_pos in 0..4 {
+                    if other_pos != pos {
+                        assert_eq!(modified.base_at(other_pos), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_all_neighbors() {
+        // Test that we can generate all Hamming-1 neighbors using with_base_at
+        let enc = BitEnc::from_bytes(b"AA").unwrap();
+        let mut neighbors = Vec::new();
+
+        for pos in 0..enc.len() {
+            let current_base = enc.base_at(pos);
+            for base in 0..4u8 {
+                if base != current_base {
+                    neighbors.push(enc.with_base_at(pos, base));
+                }
+            }
+        }
+
+        // 2 positions × 3 alternatives = 6 neighbors
+        assert_eq!(neighbors.len(), 6);
+
+        // Verify all neighbors are distance 1
+        for neighbor in &neighbors {
+            assert_eq!(enc.hamming_distance(neighbor), 1);
+        }
+
+        // Verify expected neighbors are present
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"CA").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"GA").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"TA").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"AC").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"AG").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"AT").unwrap()));
     }
 }

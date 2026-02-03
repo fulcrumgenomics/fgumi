@@ -6,6 +6,7 @@
 //! - UMI grouping and family analysis
 
 pub mod assigner;
+pub mod parallel_assigner;
 
 // Re-export commonly used items
 pub use assigner::{
