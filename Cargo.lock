@@ -124,8 +124,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "bgzf"
-version = "0.1.0"
-source = "git+https://github.com/fulcrumgenomics/bgzf.git?branch=main#36b7e44af94b0ea23f14ee7d1791cb9d8a83108b"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceb34b265c76cea4adf8478fc193bc159c4df33ceca9044f8576f709df87b4bf"
 dependencies = [
  "byteorder",
  "bytes",
