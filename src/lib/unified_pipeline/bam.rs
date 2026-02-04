@@ -357,8 +357,12 @@ pub fn decode_records(
         decode(&mut &record_data[..], &mut record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let key =
-            compute_group_key(&record, &group_key_config.library_index, group_key_config.cell_tag);
+        let key = compute_group_key(
+            &record,
+            &group_key_config.library_index,
+            group_key_config.cell_tag,
+            group_key_config.single_end_three_prime,
+        );
         records.push(DecodedRecord::new(record, key));
     }
 
@@ -2877,8 +2881,10 @@ where
         }
     }
 
-    // Finish grouper - process any remaining partial group
-    if let Some(final_group) = grouper.finish()? {
+    // Finish grouper - process any remaining partial groups
+    // The grouper may have multiple remaining groups when templates at EOF have different
+    // position keys (e.g., single-end reads with --single-end-three-prime enabled).
+    while let Some(final_group) = grouper.finish()? {
         // Step 6: Process
         let processed = (fns.process_fn)(final_group)?;
 
@@ -3400,11 +3406,13 @@ where
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Build GroupKeyConfig from header if not provided
+    // Note: single_end_three_prime is false here because this is the generic pipeline entry point.
+    // Commands that need single-end 3' grouping (like `group`) pass their own GroupKeyConfig.
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
         use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&header);
         let cell_tag = Tag::from([b'C', b'B']); // Default cell tag
-        GroupKeyConfig::new(library_index, cell_tag)
+        GroupKeyConfig::new(library_index, cell_tag, false)
     });
 
     // Create the grouper
@@ -3525,11 +3533,13 @@ where
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Build GroupKeyConfig from input header if not provided
+    // Note: single_end_three_prime is false here because this is the generic pipeline entry point.
+    // Commands that need single-end 3' grouping (like `group`) pass their own GroupKeyConfig.
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
         use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&input_header);
         let cell_tag = Tag::from([b'C', b'B']); // Default cell tag
-        GroupKeyConfig::new(library_index, cell_tag)
+        GroupKeyConfig::new(library_index, cell_tag, false)
     });
 
     // Create the grouper using INPUT header
@@ -3642,11 +3652,13 @@ where
     let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Build GroupKeyConfig from input header if not provided
+    // Note: single_end_three_prime is false here because this is the generic pipeline entry point.
+    // Commands that need single-end 3' grouping (like `group`) pass their own GroupKeyConfig.
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
         use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&input_header);
         let cell_tag = Tag::from([b'C', b'B']); // Default cell tag
-        GroupKeyConfig::new(library_index, cell_tag)
+        GroupKeyConfig::new(library_index, cell_tag, false)
     });
 
     // Create the grouper using INPUT header
@@ -3703,7 +3715,7 @@ mod tests {
         let header = Header::default();
         let library_index = LibraryIndex::from_header(&header);
         let cell_tag: [u8; 2] = [b'C', b'B'];
-        let group_key_config = GroupKeyConfig::new(library_index, cell_tag.into());
+        let group_key_config = GroupKeyConfig::new(library_index, cell_tag.into(), false);
         BamPipelineState::new(config, input, output, group_key_config)
     }
 

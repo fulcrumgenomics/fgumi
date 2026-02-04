@@ -1067,13 +1067,15 @@ pub struct GroupKeyConfig {
     pub library_index: Arc<LibraryIndex>,
     /// Tag used for cell barcode extraction.
     pub cell_tag: Tag,
+    /// Whether to use 3' position for single-end read grouping.
+    pub single_end_three_prime: bool,
 }
 
 impl GroupKeyConfig {
     /// Create a new `GroupKeyConfig`.
     #[must_use]
-    pub fn new(library_index: LibraryIndex, cell_tag: Tag) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag }
+    pub fn new(library_index: LibraryIndex, cell_tag: Tag, single_end_three_prime: bool) -> Self {
+        Self { library_index: Arc::new(library_index), cell_tag, single_end_three_prime }
     }
 }
 
@@ -1082,6 +1084,7 @@ impl Default for GroupKeyConfig {
         Self {
             library_index: Arc::new(LibraryIndex::default()),
             cell_tag: Tag::from([b'C', b'B']), // Default cell barcode tag
+            single_end_three_prime: false,
         }
     }
 }

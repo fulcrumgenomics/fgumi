@@ -585,9 +585,25 @@ impl Grouper for PositionGrouper {
                     // Same position - add to current group
                     self.current_templates.push(template);
                 } else {
-                    // Different position - this shouldn't happen at EOF, but handle it
-                    // Just add to current group as a fallback
+                    // Different position - emit current group first, save this template for
+                    // the next finish() call. This handles the case where templates with
+                    // different positions arrive at EOF (e.g., when using --single-end-three-prime).
+                    let finished_templates = std::mem::take(&mut self.current_templates);
+                    let finished_key =
+                        self.current_position_key.replace(template_key).expect("inside Some branch");
+
+                    // Assign MI base and reserve range for this group
+                    let base_mi = self.next_mi_base;
+                    self.next_mi_base += finished_templates.len() as u64;
+
+                    // Store the pending template for the next finish() call
                     self.current_templates.push(template);
+
+                    return Ok(Some(PositionGroup {
+                        group_key: finished_key,
+                        templates: finished_templates,
+                        base_mi,
+                    }));
                 }
             } else {
                 // First template

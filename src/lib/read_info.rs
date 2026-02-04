@@ -224,6 +224,7 @@ pub fn compute_group_key(
     record: &sam::alignment::RecordBuf,
     library_index: &LibraryIndex,
     cell_tag: Tag,
+    single_end_three_prime: bool,
 ) -> GroupKey {
     // Extract name hash
     let name_hash = LibraryIndex::hash_name(record.name().map(AsRef::as_ref));
@@ -259,21 +260,24 @@ pub fn compute_group_key(
     // Check if paired and has mate info
     let is_paired = flags.is_segmented();
     if !is_paired {
-        // For single-end reads, use both 5' and 3' positions to distinguish
-        // reads of different lengths at the same start position.
-        let pos_3prime = get_unclipped_three_prime_position_for_groupkey(record);
-        // Use paired constructor with 5' and 3' positions (same ref, same strand)
-        return GroupKey::paired(
-            ref_id,
-            pos,
-            strand,
-            ref_id,
-            pos_3prime,
-            strand,
-            library_idx,
-            cell_hash,
-            name_hash,
-        );
+        if single_end_three_prime {
+            // For single-end reads, use both 5' and 3' positions to distinguish
+            // reads of different lengths at the same start position.
+            let pos_3prime = get_unclipped_three_prime_position_for_groupkey(record);
+            // Use paired constructor with 5' and 3' positions (same ref, same strand)
+            return GroupKey::paired(
+                ref_id,
+                pos,
+                strand,
+                ref_id,
+                pos_3prime,
+                strand,
+                library_idx,
+                cell_hash,
+                name_hash,
+            );
+        }
+        return GroupKey::single(ref_id, pos, strand, library_idx, cell_hash, name_hash);
     }
 
     // Try to get mate position from MC tag
