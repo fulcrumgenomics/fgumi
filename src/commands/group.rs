@@ -19,6 +19,7 @@ use fgumi_lib::grouper::{
 };
 use fgumi_lib::logging::{OperationTimer, log_umi_grouping_summary};
 use fgumi_lib::metrics::group::UmiGroupingMetrics;
+use fgumi_lib::metrics::paired_half_match::HalfMatchCollector;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
@@ -69,6 +70,7 @@ struct PositionGroupResult {
 struct CollectedMetrics {
     family_sizes: AHashMap<usize, u64>,
     filter_metrics: FilterMetrics,
+    half_match_metrics: Option<HalfMatchCollector>,
 }
 
 impl CollectedMetrics {
@@ -78,6 +80,12 @@ impl CollectedMetrics {
             *self.family_sizes.entry(*size).or_insert(0) += count;
         }
         self.filter_metrics.merge(&other.filter_metrics);
+        if let Some(ref other_hm) = other.half_match_metrics {
+            match &mut self.half_match_metrics {
+                Some(hm) => hm.merge(other_hm),
+                None => self.half_match_metrics = Some(other_hm.clone()),
+            }
+        }
     }
 }
 
@@ -412,6 +420,238 @@ fn set_mi_tag_on_record(
     record.data_mut().insert(assign_tag, DataValue::String(BString::from(mi_string)));
 }
 
+/// Compute half-match metrics for a position group with paired UMIs.
+///
+/// Analyzes templates that have been assigned to UMI families, looking for cases
+/// where families share only one half of their paired UMI (left or right) but not
+/// the full UMI. This can indicate systematic issues in paired UMI protocols.
+///
+/// Uses O(n) algorithm by grouping families by left/right halves first, then
+/// iterating through groups to find collisions.
+///
+/// Returns `None` if there are fewer than 2 families with valid paired UMIs.
+fn compute_half_match_metrics(
+    templates: &[Template],
+    raw_tag: [u8; 2],
+) -> Option<HalfMatchCollector> {
+    use std::collections::{HashMap, HashSet};
+
+    // Group templates into families by MoleculeId base (ignoring /A vs /B)
+    let mut families: AHashMap<u64, Vec<&Template>> = AHashMap::new();
+    for template in templates {
+        if let Some(id) = template.mi.id() {
+            families.entry(id).or_default().push(template);
+        }
+    }
+
+    // Need at least 2 families for comparison
+    if families.len() < 2 {
+        return None;
+    }
+
+    // Extract (left_half, right_half, has_paired_a, has_paired_b, family_index) for each family
+    // Track A/B presence across all templates in family (not just first) for accurate strand metrics
+    // Some families may be filtered out if UMI parsing fails
+    let family_umis: Vec<(String, String, bool, bool, usize)> = families
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (_, family_templates))| {
+            let first = family_templates.first()?;
+            let umi = extract_umi_string(first, raw_tag)?;
+            let (left, right) = PairedUmiAssigner::split(&umi).ok()?;
+            // Check all templates in family for A/B presence
+            let has_paired_a =
+                family_templates.iter().any(|t| matches!(t.mi, MoleculeId::PairedA(_)));
+            let has_paired_b =
+                family_templates.iter().any(|t| matches!(t.mi, MoleculeId::PairedB(_)));
+            Some((left.to_string(), right.to_string(), has_paired_a, has_paired_b, idx))
+        })
+        .collect();
+
+    // Need at least 2 families with valid UMIs for meaningful comparison
+    if family_umis.len() < 2 {
+        return None;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mut collector = HalfMatchCollector {
+        position_groups_analyzed: 1,
+        families_analyzed: family_umis.len() as u64,
+        ..Default::default()
+    };
+
+    // Build indexes for O(n) lookup: left_half -> list of (family_idx, right_half, has_a, has_b)
+    let mut left_index: HashMap<&str, Vec<(usize, &str, bool, bool)>> = HashMap::new();
+    let mut right_index: HashMap<&str, Vec<(usize, &str, bool, bool)>> = HashMap::new();
+
+    for (left, right, has_a, has_b, idx) in &family_umis {
+        left_index.entry(left.as_str()).or_default().push((*idx, right.as_str(), *has_a, *has_b));
+        right_index.entry(right.as_str()).or_default().push((*idx, left.as_str(), *has_a, *has_b));
+    }
+
+    // Track which families have half-matches
+    let mut families_with_left: HashSet<usize> = HashSet::new();
+    let mut families_with_right: HashSet<usize> = HashSet::new();
+
+    // Find left-half collisions: families that share left but not right
+    for group in left_index.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        // Check all pairs in this group for right-half differences
+        for i in 0..group.len() {
+            for j in (i + 1)..group.len() {
+                let (idx_i, right_i, has_a_i, has_b_i) = group[i];
+                let (idx_j, right_j, has_a_j, has_b_j) = group[j];
+                // Left halves match (they're in same group), check if right halves differ
+                if right_i != right_j {
+                    collector.family_pairs_left_collision += 1;
+                    families_with_left.insert(idx_i);
+                    families_with_left.insert(idx_j);
+                    update_strand_counts(&mut collector, has_a_i, has_b_i, has_a_j, has_b_j, true);
+                }
+            }
+        }
+    }
+
+    // Find right-half collisions: families that share right but not left
+    for group in right_index.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        for i in 0..group.len() {
+            for j in (i + 1)..group.len() {
+                let (idx_i, left_i, has_a_i, has_b_i) = group[i];
+                let (idx_j, left_j, has_a_j, has_b_j) = group[j];
+                // Right halves match, check if left halves differ
+                if left_i != left_j {
+                    collector.family_pairs_right_collision += 1;
+                    families_with_right.insert(idx_i);
+                    families_with_right.insert(idx_j);
+                    update_strand_counts(&mut collector, has_a_i, has_b_i, has_a_j, has_b_j, false);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        collector.families_with_left_half_match = families_with_left.len() as u64;
+        collector.families_with_right_half_match = families_with_right.len() as u64;
+        // Compute union of left and right to avoid double-counting families
+        // that have both types of half-matches
+        let families_with_any: HashSet<usize> =
+            families_with_left.union(&families_with_right).copied().collect();
+        collector.families_with_any_half_match = families_with_any.len() as u64;
+    }
+
+    // Check if ALL families share same half (only meaningful with 2+ families)
+    // This indicates a potential systematic adapter issue
+    let unique_lefts: HashSet<&str> =
+        family_umis.iter().map(|(l, _, _, _, _)| l.as_str()).collect();
+    let unique_rights: HashSet<&str> =
+        family_umis.iter().map(|(_, r, _, _, _)| r.as_str()).collect();
+
+    if unique_lefts.len() == 1 && family_umis.len() >= 2 {
+        collector.position_groups_all_same_left = 1;
+    }
+    if unique_rights.len() == 1 && family_umis.len() >= 2 {
+        collector.position_groups_all_same_right = 1;
+    }
+
+    Some(collector)
+}
+
+/// Extract the raw UMI string from a template.
+fn extract_umi_string(template: &Template, raw_tag: [u8; 2]) -> Option<String> {
+    let record = template.r1().or_else(|| template.r2())?;
+    if let Some(DataValue::String(umi_bytes)) = record.data().get(&raw_tag) {
+        Some(String::from_utf8_lossy(umi_bytes).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Update strand counts for half-match metrics.
+///
+/// Counts families (not pairs) involved in half-matches by strand category.
+/// Since each pair involves two families, this will be ~2x the pair count.
+///
+/// Categories are mutually exclusive:
+/// - Forward only: family has `PairedA` templates but no `PairedB`
+/// - Reverse only: family has `PairedB` templates but no `PairedA`
+/// - Duplex: family has both `PairedA` and `PairedB` templates
+fn update_strand_counts(
+    collector: &mut HalfMatchCollector,
+    has_a_i: bool,
+    has_b_i: bool,
+    has_a_j: bool,
+    has_b_j: bool,
+    is_left: bool,
+) {
+    // Count family i based on its A/B presence (mutually exclusive categories)
+    match (has_a_i, has_b_i) {
+        (true, true) => {
+            // Duplex: both strands present
+            if is_left {
+                collector.half_matches_duplex_strand_left += 1;
+            } else {
+                collector.half_matches_duplex_strand_right += 1;
+            }
+        }
+        (true, false) => {
+            // Forward only
+            if is_left {
+                collector.half_matches_forward_strand_left += 1;
+            } else {
+                collector.half_matches_forward_strand_right += 1;
+            }
+        }
+        (false, true) => {
+            // Reverse only
+            if is_left {
+                collector.half_matches_reverse_strand_left += 1;
+            } else {
+                collector.half_matches_reverse_strand_right += 1;
+            }
+        }
+        (false, false) => {
+            // Neither strand - shouldn't happen with paired strategy, skip
+        }
+    }
+
+    // Count family j based on its A/B presence (mutually exclusive categories)
+    match (has_a_j, has_b_j) {
+        (true, true) => {
+            // Duplex: both strands present
+            if is_left {
+                collector.half_matches_duplex_strand_left += 1;
+            } else {
+                collector.half_matches_duplex_strand_right += 1;
+            }
+        }
+        (true, false) => {
+            // Forward only
+            if is_left {
+                collector.half_matches_forward_strand_left += 1;
+            } else {
+                collector.half_matches_forward_strand_right += 1;
+            }
+        }
+        (false, true) => {
+            // Reverse only
+            if is_left {
+                collector.half_matches_reverse_strand_left += 1;
+            } else {
+                collector.half_matches_reverse_strand_right += 1;
+            }
+        }
+        (false, false) => {
+            // Neither strand - shouldn't happen with paired strategy, skip
+        }
+    }
+}
+
 /// Groups reads by UMI to identify reads from the same original molecule
 #[derive(Debug, Parser)]
 #[command(
@@ -492,6 +732,11 @@ pub struct GroupReadsByUmi {
     #[arg(short = 'g', long = "grouping-metrics")]
     pub grouping_metrics: Option<PathBuf>,
 
+    /// Optional output of paired UMI half-match metrics.
+    /// Only meaningful with --strategy paired; ignored for other strategies.
+    #[arg(long = "half-match-metrics")]
+    pub half_match_metrics: Option<PathBuf>,
+
     /// The tag containing the raw UMI
     #[arg(short = 't', long = "raw-tag", default_value = "RX")]
     pub raw_tag: String,
@@ -556,6 +801,20 @@ impl Command for GroupReadsByUmi {
         if self.min_umi_length.is_some() && matches!(self.strategy, Strategy::Paired) {
             bail!("Paired strategy cannot be used with --min-umi-length");
         }
+
+        // Warn if --half-match-metrics is used with non-paired strategy
+        let compute_half_match = if self.half_match_metrics.is_some() {
+            if matches!(self.strategy, Strategy::Paired) {
+                true
+            } else {
+                log::warn!(
+                    "--half-match-metrics is only meaningful with --strategy paired; ignoring"
+                );
+                false
+            }
+        } else {
+            false
+        };
 
         // Validate input file exists (skip for stdin)
         if !is_stdin_path(&self.io.input) {
@@ -649,6 +908,7 @@ impl Command for GroupReadsByUmi {
                 cell_tag,
                 &filter_config,
                 &timer,
+                compute_half_match,
             );
         }
 
@@ -663,6 +923,7 @@ impl Command for GroupReadsByUmi {
         let strategy = self.strategy;
         let index_threshold = self.index_threshold;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
+        let compute_half_match_clone = compute_half_match;
 
         // Configure 7-step pipeline
         let num_threads = self.threading.num_threads();
@@ -725,6 +986,7 @@ impl Command for GroupReadsByUmi {
                         filter_metrics,
                         input_record_count,
                         base_mi: group.base_mi,
+                        half_match_metrics: None,
                     });
                 }
 
@@ -746,8 +1008,16 @@ impl Command for GroupReadsByUmi {
                         filter_metrics,
                         input_record_count,
                         base_mi: group.base_mi,
+                        half_match_metrics: None,
                     });
                 }
+
+                // Compute half-match metrics if enabled (only for paired strategy)
+                let half_match = if compute_half_match_clone {
+                    compute_half_match_metrics(&templates, raw_tag)
+                } else {
+                    None
+                };
 
                 // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
                 let base_mi = group.base_mi;
@@ -791,6 +1061,7 @@ impl Command for GroupReadsByUmi {
                     filter_metrics,
                     input_record_count,
                     base_mi,
+                    half_match_metrics: half_match,
                 })
             },
             // serialize_fn: Serialize records + collect metrics (parallel)
@@ -802,6 +1073,7 @@ impl Command for GroupReadsByUmi {
                 let metrics = CollectedMetrics {
                     family_sizes: processed.family_sizes,
                     filter_metrics: processed.filter_metrics,
+                    half_match_metrics: processed.half_match_metrics,
                 };
 
                 // Lock-free push to SegQueue - no contention
@@ -844,12 +1116,16 @@ impl Command for GroupReadsByUmi {
         // Drain all metrics and merge them
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_half_match = HalfMatchCollector::default();
 
         while let Some(m) = collected_metrics.pop() {
             for (size, count) in m.family_sizes {
                 *family_size_counter.entry(size).or_insert(0) += count;
             }
             total_filter_metrics.merge(&m.filter_metrics);
+            if let Some(ref hm) = m.half_match_metrics {
+                total_half_match.merge(hm);
+            }
         }
 
         // Build final metrics
@@ -920,6 +1196,17 @@ impl Command for GroupReadsByUmi {
             info!("Wrote grouping metrics to {}", path.display());
         }
 
+        // Write half-match metrics if path provided and strategy is paired
+        if let Some(path) = &self.half_match_metrics {
+            if compute_half_match {
+                let hm_metrics = total_half_match.to_metrics();
+                DelimFile::default().write_tsv(path, &hm_metrics).with_context(|| {
+                    format!("Failed to write half-match metrics: {}", path.display())
+                })?;
+                info!("Wrote half-match metrics to {}", path.display());
+            }
+        }
+
         // Log completion with timing
         timer.log_completion(accepted_records);
 
@@ -945,6 +1232,7 @@ impl GroupReadsByUmi {
         cell_tag: Tag,
         filter_config: &GroupFilterConfig,
         timer: &OperationTimer,
+        compute_half_match: bool,
     ) -> Result<()> {
         info!("Using single-threaded mode");
 
@@ -972,6 +1260,7 @@ impl GroupReadsByUmi {
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
         let mut total_filter_metrics = FilterMetrics::new();
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
+        let mut total_half_match = HalfMatchCollector::default();
 
         // Progress tracking
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
@@ -999,6 +1288,8 @@ impl GroupReadsByUmi {
                     assign_tag_bytes,
                     &mut total_filter_metrics,
                     &mut family_size_counter,
+                    &mut total_half_match,
+                    compute_half_match,
                     header,
                     &mut writer,
                 )?;
@@ -1019,6 +1310,8 @@ impl GroupReadsByUmi {
                 assign_tag_bytes,
                 &mut total_filter_metrics,
                 &mut family_size_counter,
+                &mut total_half_match,
+                compute_half_match,
                 header,
                 &mut writer,
             )?;
@@ -1098,6 +1391,17 @@ impl GroupReadsByUmi {
             info!("Wrote grouping metrics to {}", path.display());
         }
 
+        // Write half-match metrics if path provided and strategy is paired
+        if let Some(path) = &self.half_match_metrics {
+            if compute_half_match {
+                let hm_metrics = total_half_match.to_metrics();
+                DelimFile::default().write_tsv(path, &hm_metrics).with_context(|| {
+                    format!("Failed to write half-match metrics: {}", path.display())
+                })?;
+                info!("Wrote half-match metrics to {}", path.display());
+            }
+        }
+
         // Log completion with timing
         timer.log_completion(accepted_records);
 
@@ -1118,6 +1422,8 @@ impl GroupReadsByUmi {
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
         family_size_counter: &mut AHashMap<usize, u64>,
+        total_half_match: &mut HalfMatchCollector,
+        compute_half_match: bool,
         header: &Header,
         writer: &mut fgumi_lib::bam_io::BamWriter,
     ) -> Result<()> {
@@ -1152,6 +1458,13 @@ impl GroupReadsByUmi {
             // Log error but continue processing
             log::warn!("Failed to assign UMI groups: {e}");
             return Ok(());
+        }
+
+        // Compute half-match metrics if enabled (only for paired strategy)
+        if compute_half_match {
+            if let Some(hm) = compute_half_match_metrics(&templates, raw_tag) {
+                total_half_match.merge(&hm);
+            }
         }
 
         // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
@@ -1602,6 +1915,7 @@ mod tests {
         pub output: PathBuf,
         pub histogram: PathBuf,
         pub metrics: PathBuf,
+        pub half_match_metrics: PathBuf,
     }
 
     impl TestPaths {
@@ -1611,6 +1925,7 @@ mod tests {
                 output: dir.path().join("output.bam"),
                 histogram: dir.path().join("histogram.txt"),
                 metrics: dir.path().join("metrics.txt"),
+                half_match_metrics: dir.path().join("half_match.txt"),
                 dir,
             })
         }
@@ -1881,6 +2196,7 @@ mod tests {
             },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -1912,6 +2228,7 @@ mod tests {
             },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -1943,6 +2260,7 @@ mod tests {
             },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2001,6 +2319,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2056,6 +2375,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2105,6 +2425,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2152,6 +2473,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2210,6 +2532,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: Some(paths.histogram.clone()),
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2288,6 +2611,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2337,6 +2661,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2390,6 +2715,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2465,6 +2791,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2597,6 +2924,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2647,6 +2975,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2715,6 +3044,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2789,6 +3119,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2864,6 +3195,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -2962,6 +3294,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3060,6 +3393,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3137,6 +3471,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3195,6 +3530,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3249,6 +3585,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3308,6 +3645,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3368,6 +3706,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3415,6 +3754,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3465,6 +3805,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3515,6 +3856,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3566,6 +3908,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3609,6 +3952,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3658,6 +4002,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3707,6 +4052,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3757,6 +4103,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3804,6 +4151,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3850,6 +4198,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3899,6 +4248,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3943,6 +4293,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -3992,6 +4343,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: Some(paths.histogram.clone()),
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4031,6 +4383,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4076,6 +4429,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4117,6 +4471,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4163,6 +4518,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4207,6 +4563,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4264,6 +4621,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4424,6 +4782,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4494,6 +4853,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4565,6 +4925,7 @@ mod tests {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: None,
             grouping_metrics: None,
+            half_match_metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -4588,6 +4949,244 @@ mod tests {
         // All records should have the same MI tag (one group)
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 1, "All records with same UMI should be in 1 group");
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Half-Match Metrics Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_half_match_metrics_with_paired_strategy() -> Result<()> {
+        use fgumi_lib::metrics::paired_half_match::PairedHalfMatchMetric;
+
+        // Create families with half-matches at the same position:
+        // Family 1: AAAA-CCCC
+        // Family 2: AAAA-GGGG (shares left half "AAAA" with family 1)
+        // Family 3: TTTT-CCCC (shares right half "CCCC" with family 1)
+        //
+        // Expected half-matches:
+        // - Left collision: (1,2) share "AAAA" -> 1 pair, 2 families affected
+        // - Right collision: (1,3) share "CCCC" -> 1 pair, 2 families affected
+        let mut records = Vec::new();
+
+        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "AAAA-CCCC");
+        records.push(r1);
+        records.push(r2);
+
+        let (r1, r2) = build_test_pair("a02", 0, 100, 300, 60, 60, "AAAA-GGGG");
+        records.push(r1);
+        records.push(r2);
+
+        let (r1, r2) = build_test_pair("a03", 0, 100, 300, 60, 60, "TTTT-CCCC");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            half_match_metrics: Some(paths.half_match_metrics.clone()),
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Paired,
+            edits: 1,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+        };
+
+        cmd.execute("test")?;
+
+        // Verify half-match metrics file was written
+        assert!(paths.half_match_metrics.exists(), "Half-match metrics file should exist");
+
+        // Read and verify metrics
+        let metrics: Vec<PairedHalfMatchMetric> =
+            DelimFile::default().read_tsv(&paths.half_match_metrics)?;
+        assert!(!metrics.is_empty(), "Metrics should not be empty");
+
+        // Helper to find metric by name
+        let find_metric = |name: &str| -> &PairedHalfMatchMetric {
+            metrics.iter().find(|m| m.metric == name).unwrap_or_else(|| {
+                panic!("Should have {name} metric");
+            })
+        };
+
+        // Verify position groups analyzed
+        let groups = find_metric("position_groups_analyzed");
+        assert!(groups.left_half >= 1.0, "Should have at least 1 position group analyzed");
+
+        // Verify families analyzed (should be 3 since we have 3 distinct UMIs)
+        let families = find_metric("families_analyzed");
+        assert!(families.left_half >= 3.0, "Should have at least 3 families analyzed");
+
+        // Verify family pairs with collision
+        // Expected: 1 left collision (AAAA shared), 1 right collision (CCCC shared)
+        let pairs = find_metric("family_pairs_with_collision");
+        assert!(pairs.left_half >= 1.0, "Should have at least 1 left-half collision pair");
+        assert!(pairs.right_half >= 1.0, "Should have at least 1 right-half collision pair");
+
+        // Verify families with half-match
+        // Expected: 2 families with left match (a01,a02), 2 with right match (a01,a03)
+        let families_with_match = find_metric("families_with_half_match_only");
+        assert!(
+            families_with_match.left_half >= 2.0,
+            "Should have at least 2 families with left half-match"
+        );
+        assert!(
+            families_with_match.right_half >= 2.0,
+            "Should have at least 2 families with right half-match"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_half_match_metrics_ignored_with_non_paired_strategy() -> Result<()> {
+        // Even if --half-match-metrics is specified, it should be ignored for non-paired strategies
+        let mut records = Vec::new();
+
+        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "AAAAAA");
+        records.push(r1);
+        records.push(r2);
+
+        let (r1, r2) = build_test_pair("a02", 0, 100, 300, 60, 60, "AAAAAG");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            half_match_metrics: Some(paths.half_match_metrics.clone()),
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity, // Non-paired strategy
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+        };
+
+        cmd.execute("test")?;
+
+        // Verify half-match metrics file was NOT written (ignored for non-paired)
+        assert!(
+            !paths.half_match_metrics.exists(),
+            "Half-match metrics file should NOT exist for non-paired strategy"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_half_match_metrics_no_collisions() -> Result<()> {
+        use fgumi_lib::metrics::paired_half_match::PairedHalfMatchMetric;
+
+        // Create families with NO half-matches (all UMIs completely distinct)
+        // AAAA-CCCC and TTTT-GGGG share neither left nor right halves
+        let mut records = Vec::new();
+
+        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "AAAA-CCCC");
+        records.push(r1);
+        records.push(r2);
+
+        let (r1, r2) = build_test_pair("a02", 0, 100, 300, 60, 60, "TTTT-GGGG");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            half_match_metrics: Some(paths.half_match_metrics.clone()),
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Paired,
+            edits: 1,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+        };
+
+        cmd.execute("test")?;
+
+        // Verify half-match metrics file was written
+        assert!(paths.half_match_metrics.exists(), "Half-match metrics file should exist");
+
+        // Read and verify metrics
+        let metrics: Vec<PairedHalfMatchMetric> =
+            DelimFile::default().read_tsv(&paths.half_match_metrics)?;
+
+        // Helper to find metric by name
+        let find_metric = |name: &str| -> &PairedHalfMatchMetric {
+            metrics.iter().find(|m| m.metric == name).unwrap_or_else(|| {
+                panic!("Should have {name} metric");
+            })
+        };
+
+        // Verify we have 2 families analyzed
+        let families = find_metric("families_analyzed");
+        assert!(
+            (families.left_half - 2.0).abs() < 0.1,
+            "Should have 2 families analyzed, got {}",
+            families.left_half
+        );
+
+        // Should have 0 half-matches since UMIs are completely distinct
+        let families_with_half_match = find_metric("families_with_half_match_only");
+        assert!(
+            families_with_half_match.left_half < 0.5,
+            "Should have 0 left half-matches, got {}",
+            families_with_half_match.left_half
+        );
+        assert!(
+            families_with_half_match.right_half < 0.5,
+            "Should have 0 right half-matches, got {}",
+            families_with_half_match.right_half
+        );
+
+        // Should have 0 collision pairs
+        let pairs = find_metric("family_pairs_with_collision");
+        assert!(
+            pairs.left_half < 0.5,
+            "Should have 0 left collision pairs, got {}",
+            pairs.left_half
+        );
+        assert!(
+            pairs.right_half < 0.5,
+            "Should have 0 right collision pairs, got {}",
+            pairs.right_half
+        );
 
         Ok(())
     }

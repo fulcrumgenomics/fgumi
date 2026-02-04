@@ -39,6 +39,7 @@ pub mod consensus;
 pub mod correct;
 pub mod duplex;
 pub mod group;
+pub mod paired_half_match;
 pub mod writer;
 
 /// A metric type that can be serialized to TSV files.
@@ -100,6 +101,7 @@ pub use duplex::{
     FamilySizeMetric, UmiMetric,
 };
 pub use group::{FamilySizeMetrics, UmiGroupingMetrics};
+pub use paired_half_match::{HalfMatchCollector, PairedHalfMatchMetric};
 pub use writer::write_metrics;
 
 #[cfg(test)]
