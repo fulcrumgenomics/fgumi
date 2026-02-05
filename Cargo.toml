@@ -18,7 +18,7 @@ resolver = "2"
 clap = { version = "4", features = ["derive", "string"] }
 log = "0"
 thiserror = "2"
-noodles = { version = "0.102.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles = { version = "0.104.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.45.0", features = ["libdeflate"] }
 noodles-util = { version = "0.71.0", features = ["alignment"] }
 mimalloc = { version = "0.1.48", default-features = false }
