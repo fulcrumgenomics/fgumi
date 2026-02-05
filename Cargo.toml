@@ -51,7 +51,7 @@ statrs = "0.18"
 rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"
-bytemuck = { version = "1.14", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive"] }
 noodles-csi = "0.52.0"
 bgzf = "0.3.0"
 wide = "0.7"
