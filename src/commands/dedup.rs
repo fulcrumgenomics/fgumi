@@ -204,6 +204,8 @@ struct DedupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length.
     min_umi_length: Option<usize>,
+    /// Skip UMI validation (position-only grouping).
+    no_umi: bool,
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -307,6 +309,11 @@ fn filter_template(
                     }
                 }
             }
+        }
+
+        // Skip UMI validation in no-umi mode
+        if config.no_umi {
+            continue;
         }
 
         // Check UMI for Ns and minimum length using common validation
@@ -417,6 +424,7 @@ fn assign_umi_groups_for_indices(
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
+    no_umi: bool,
 ) -> Result<()> {
     if indices.is_empty() {
         return Ok(());
@@ -426,36 +434,45 @@ fn assign_umi_groups_for_indices(
 
     for &idx in indices {
         let template = &templates[idx];
-        let umi_bytes = if let Some(r1) = template.r1() {
-            if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
-                bytes
-            } else {
-                bail!("UMI tag is not a string");
-            }
-        } else if let Some(r2) = template.r2() {
-            if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
-                bytes
-            } else {
-                bail!("UMI tag is not a string");
-            }
+
+        // In no-umi mode, use empty string for all templates
+        let processed_umi = if no_umi {
+            // Empty string uppercased is still empty string
+            String::new()
         } else {
-            bail!("Template has no reads");
+            let umi_bytes = if let Some(r1) = template.r1() {
+                if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
+                    bytes
+                } else {
+                    bail!("UMI tag is not a string");
+                }
+            } else if let Some(r2) = template.r2() {
+                if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
+                    bytes
+                } else {
+                    bail!("UMI tag is not a string");
+                }
+            } else {
+                bail!("Template has no reads");
+            };
+
+            let umi_str = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
+
+            let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
+                is_r1_genomically_earlier(r1, r2)?
+            } else {
+                true
+            };
+
+            umi_for_read(umi_str, is_r1_earlier, assigner)?
         };
 
-        let umi_str =
-            std::str::from_utf8(umi_bytes).map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
-
-        let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
-            is_r1_genomically_earlier(r1, r2)?
-        } else {
-            true
-        };
-
-        let processed_umi = umi_for_read(umi_str, is_r1_earlier, assigner)?;
         umis.push(processed_umi);
     }
 
-    let truncated_umis = truncate_umis(umis, min_umi_length)?;
+    // Truncate UMIs if needed (skip in no-umi mode)
+    let truncated_umis = if no_umi { umis } else { truncate_umis(umis, min_umi_length)? };
     let assignments = assigner.assign(&truncated_umis);
 
     for (i, &idx) in indices.iter().enumerate() {
@@ -471,6 +488,7 @@ fn assign_umi_groups(
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
+    no_umi: bool,
 ) -> Result<()> {
     if assigner.split_templates_by_pair_orientation() {
         let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
@@ -480,11 +498,25 @@ fn assign_umi_groups(
         }
 
         for indices in subgroups.values() {
-            assign_umi_groups_for_indices(templates, indices, assigner, raw_tag, min_umi_length)?;
+            assign_umi_groups_for_indices(
+                templates,
+                indices,
+                assigner,
+                raw_tag,
+                min_umi_length,
+                no_umi,
+            )?;
         }
     } else {
         let all_indices: Vec<usize> = (0..templates.len()).collect();
-        assign_umi_groups_for_indices(templates, &all_indices, assigner, raw_tag, min_umi_length)?;
+        assign_umi_groups_for_indices(
+            templates,
+            &all_indices,
+            assigner,
+            raw_tag,
+            min_umi_length,
+            no_umi,
+        )?;
     }
 
     Ok(())
@@ -581,6 +613,7 @@ fn process_position_group(
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
+    no_umi: bool,
 ) -> io::Result<ProcessedDedupGroup> {
     let mut dedup_metrics = DedupMetrics::default();
     let input_record_count: u64 = group.templates.iter().map(|t| t.read_count() as u64).sum();
@@ -618,7 +651,7 @@ fn process_position_group(
             t
         })
         .collect();
-    if let Err(e) = assign_umi_groups(&mut templates, assigner, raw_tag, min_umi_length) {
+    if let Err(e) = assign_umi_groups(&mut templates, assigner, raw_tag, min_umi_length, no_umi) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, e));
     }
 
@@ -804,6 +837,11 @@ pub struct MarkDuplicates {
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
+    /// Skip UMI-based grouping; group by position only. Forces identity strategy
+    /// and ignores any existing UMI tags.
+    #[arg(long = "no-umi", default_value = "false")]
+    pub no_umi: bool,
+
     /// Scheduler and pipeline options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -820,6 +858,21 @@ impl Command for MarkDuplicates {
             bail!("Paired strategy cannot be used with --min-umi-length");
         }
 
+        // Validate --no-umi is not used with paired strategy
+        if self.no_umi && matches!(self.strategy, Strategy::Paired) {
+            bail!("--no-umi cannot be used with --strategy paired");
+        }
+
+        // Handle --no-umi mode: force identity strategy
+        let (effective_strategy, no_umi_edits_override) = if self.no_umi {
+            if !matches!(self.strategy, Strategy::Identity) {
+                info!("--no-umi mode: overriding strategy to identity");
+            }
+            (Strategy::Identity, true)
+        } else {
+            (self.strategy, false)
+        };
+
         // Validate input file exists
         if !is_stdin_path(&self.io.input) {
             validate_file_exists(&self.io.input, "input BAM file")?;
@@ -827,15 +880,27 @@ impl Command for MarkDuplicates {
 
         let min_mapq: u8 = self.min_map_q.unwrap_or(0);
 
+        // Identity strategy requires edits=0, others use the configured value
+        // Also force edits=0 in no-umi mode
+        let effective_edits =
+            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
+                0
+            } else {
+                self.edits
+            };
+
         let timer = OperationTimer::new("Marking duplicates");
 
         info!("Starting dedup");
         info!("Input: {}", self.io.input.display());
         info!("Output: {}", self.io.output.display());
-        info!("Strategy: {:?}", self.strategy);
-        info!("Edits: {}", self.edits);
+        info!("Strategy: {effective_strategy:?}");
+        info!("Edits: {effective_edits}");
         info!("Remove duplicates: {}", self.remove_duplicates);
-        if matches!(self.strategy, Strategy::Adjacency | Strategy::Paired) {
+        if self.no_umi {
+            info!("No-UMI mode: deduplicating by position only");
+        }
+        if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
             info!("Index threshold: {}", self.index_threshold);
         }
         info!("{}", self.threading.log_message());
@@ -872,23 +937,22 @@ impl Command for MarkDuplicates {
 
         let assign_tag_bytes: [u8; 2] = validate_tag(&self.assign_tag, "assign-tag")?;
 
-        let effective_edits =
-            if matches!(self.strategy, Strategy::Identity) { 0 } else { self.edits };
-
         let filter_config = DedupFilterConfig {
             umi_tag: raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
             min_umi_length: self.min_umi_length,
+            no_umi: self.no_umi,
         };
 
         // Shared state for collecting metrics
         let collected_metrics: Arc<SegQueue<CollectedDedupMetrics>> = Arc::new(SegQueue::new());
 
         // Clone values needed by closures
-        let strategy = self.strategy;
+        let strategy = effective_strategy;
         let index_threshold = self.index_threshold;
         let min_umi_length = self.min_umi_length;
+        let no_umi = self.no_umi;
         let remove_duplicates = self.remove_duplicates;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
@@ -937,6 +1001,7 @@ impl Command for MarkDuplicates {
                     assigner.as_ref(),
                     raw_tag,
                     min_umi_length,
+                    no_umi,
                 )
             },
             // Serialize function (parallel)
@@ -1442,6 +1507,7 @@ mod tests {
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
+            no_umi: false,
         }
     }
 
@@ -1594,6 +1660,59 @@ mod tests {
         let mut metrics = FilterMetrics::new();
         let template = create_mapped_template_with_umi("q1", "ACGT-TGCA", 30);
 
+        assert!(filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    // ========================================================================
+    // no_umi mode tests
+    // ========================================================================
+
+    #[test]
+    fn test_filter_template_accepts_missing_umi_when_no_umi_mode() {
+        let mut config = default_filter_config();
+        config.no_umi = true; // Enable no-umi mode
+        let mut metrics = FilterMetrics::new();
+
+        // Create template without RX tag
+        let record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .build();
+        let template = Template::from_records(vec![record]).unwrap();
+
+        // In no_umi mode, templates without UMI tags should be accepted
+        assert!(filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    #[test]
+    fn test_filter_template_accepts_umi_with_n_when_no_umi_mode() {
+        let mut config = default_filter_config();
+        config.no_umi = true; // Enable no-umi mode
+        let mut metrics = FilterMetrics::new();
+        let template = create_mapped_template_with_umi("q1", "ACNTACGT", 30); // N in UMI
+
+        // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
+        assert!(filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    #[test]
+    fn test_filter_template_accepts_short_umi_when_no_umi_mode() {
+        let mut config = default_filter_config();
+        config.min_umi_length = Some(8); // Require 8 bases
+        config.no_umi = true; // Enable no-umi mode
+        let mut metrics = FilterMetrics::new();
+        let template = create_mapped_template_with_umi("q1", "ACGT", 30); // Only 4 bases
+
+        // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
         assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }

@@ -92,6 +92,8 @@ struct GroupFilterConfig {
     include_non_pf: bool,
     /// Minimum UMI length (None to disable).
     min_umi_length: Option<usize>,
+    /// Skip UMI validation (position-only grouping).
+    no_umi: bool,
 }
 
 /// Filter a template based on filtering criteria.
@@ -164,6 +166,11 @@ fn filter_template(
                     }
                 }
             }
+        }
+
+        // Skip UMI validation in no-umi mode
+        if config.no_umi {
+            continue;
         }
 
         // Check UMI for Ns and minimum length using common validation
@@ -289,6 +296,7 @@ fn assign_umi_groups_impl(
     raw_tag: [u8; 2],
     assign_tag_bytes: [u8; 2],
     min_umi_length: Option<usize>,
+    no_umi: bool,
 ) -> Result<()> {
     if assigner.split_templates_by_pair_orientation() {
         // Group by pair orientation
@@ -307,6 +315,7 @@ fn assign_umi_groups_impl(
                 raw_tag,
                 assign_tag_bytes,
                 min_umi_length,
+                no_umi,
             )?;
         }
     } else {
@@ -319,6 +328,7 @@ fn assign_umi_groups_impl(
             raw_tag,
             assign_tag_bytes,
             min_umi_length,
+            no_umi,
         )?;
     }
 
@@ -336,6 +346,7 @@ fn assign_umi_groups_for_indices_impl(
     raw_tag: [u8; 2],
     _assign_tag_bytes: [u8; 2], // No longer used here - tags set during serialization
     min_umi_length: Option<usize>,
+    no_umi: bool,
 ) -> Result<()> {
     if indices.is_empty() {
         return Ok(());
@@ -346,39 +357,47 @@ fn assign_umi_groups_for_indices_impl(
 
     for &idx in indices {
         let template = &templates[idx];
-        let umi_bytes = if let Some(r1) = template.r1() {
-            if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
-                bytes
-            } else {
-                bail!("UMI tag is not a string");
-            }
-        } else if let Some(r2) = template.r2() {
-            if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
-                bytes
-            } else {
-                bail!("UMI tag is not a string");
-            }
-        } else {
-            bail!("Template has no reads");
-        };
-        // UMIs are DNA sequences (valid ASCII), so from_utf8 should always succeed
-        // This avoids the allocation that from_utf8_lossy().into_owned() would cause
-        let umi_str = std::str::from_utf8(umi_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in UMI: {e}"))?;
 
-        // Determine which read is genomically earlier
-        let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
-            is_r1_genomically_earlier_impl(r1, r2)?
+        // In no-umi mode, use empty string for all templates
+        let processed_umi = if no_umi {
+            // Empty string uppercased is still empty string
+            String::new()
         } else {
-            true
+            let umi_bytes = if let Some(r1) = template.r1() {
+                if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
+                    bytes
+                } else {
+                    bail!("UMI tag is not a string");
+                }
+            } else if let Some(r2) = template.r2() {
+                if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
+                    bytes
+                } else {
+                    bail!("UMI tag is not a string");
+                }
+            } else {
+                bail!("Template has no reads");
+            };
+            // UMIs are DNA sequences (valid ASCII), so from_utf8 should always succeed
+            // This avoids the allocation that from_utf8_lossy().into_owned() would cause
+            let umi_str = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in UMI: {e}"))?;
+
+            // Determine which read is genomically earlier
+            let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
+                is_r1_genomically_earlier_impl(r1, r2)?
+            } else {
+                true
+            };
+
+            umi_for_read_impl(umi_str, is_r1_earlier, assigner)?
         };
 
-        let processed_umi = umi_for_read_impl(umi_str, is_r1_earlier, assigner)?;
         umis.push(processed_umi);
     }
 
-    // Truncate UMIs if needed
-    let truncated_umis = truncate_umis_impl(umis, min_umi_length)?;
+    // Truncate UMIs if needed (skip in no-umi mode)
+    let truncated_umis = if no_umi { umis } else { truncate_umis_impl(umis, min_umi_length)? };
 
     // Assign UMI groups - returns Vec<MoleculeId> indexed by input position
     let assignments = assigner.assign(&truncated_umis);
@@ -537,6 +556,11 @@ pub struct GroupReadsByUmi {
     #[arg(long = "index-threshold", default_value = "100")]
     pub index_threshold: usize,
 
+    /// Skip UMI-based grouping; group by position only. Forces identity strategy
+    /// and ignores any existing UMI tags.
+    #[arg(long = "no-umi", default_value = "false")]
+    pub no_umi: bool,
+
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -557,6 +581,21 @@ impl Command for GroupReadsByUmi {
             bail!("Paired strategy cannot be used with --min-umi-length");
         }
 
+        // Validate --no-umi is not used with paired strategy
+        if self.no_umi && matches!(self.strategy, Strategy::Paired) {
+            bail!("--no-umi cannot be used with --strategy paired");
+        }
+
+        // Handle --no-umi mode: force identity strategy
+        let (effective_strategy, no_umi_edits_override) = if self.no_umi {
+            if !matches!(self.strategy, Strategy::Identity) {
+                info!("--no-umi mode: overriding strategy to identity");
+            }
+            (Strategy::Identity, true)
+        } else {
+            (self.strategy, false)
+        };
+
         // Validate input file exists (skip for stdin)
         if !is_stdin_path(&self.io.input) {
             validate_file_exists(&self.io.input, "input BAM file")?;
@@ -565,15 +604,27 @@ impl Command for GroupReadsByUmi {
         // Set minimum mapping quality
         let min_mapq: u8 = self.min_map_q.unwrap_or(1);
 
+        // Identity strategy requires edits=0, others use the configured value
+        // Also force edits=0 in no-umi mode
+        let effective_edits =
+            if no_umi_edits_override || matches!(effective_strategy, Strategy::Identity) {
+                0
+            } else {
+                self.edits
+            };
+
         // Initialize tracking infrastructure
         let timer = OperationTimer::new("Grouping reads by UMI");
 
         info!("Starting group");
         info!("Input: {}", self.io.input.display());
         info!("Output: {}", self.io.output.display());
-        info!("Strategy: {:?}", self.strategy);
-        info!("Edits: {}", self.edits);
-        if matches!(self.strategy, Strategy::Adjacency | Strategy::Paired) {
+        info!("Strategy: {effective_strategy:?}");
+        info!("Edits: {effective_edits}");
+        if self.no_umi {
+            info!("No-UMI mode: grouping by position only");
+        }
+        if matches!(effective_strategy, Strategy::Adjacency | Strategy::Paired) {
             info!("Index threshold: {}", self.index_threshold);
         }
 
@@ -623,16 +674,13 @@ impl Command for GroupReadsByUmi {
             [bytes[0], bytes[1]]
         };
 
-        // Identity strategy requires edits=0, others use the configured value
-        let effective_edits =
-            if matches!(self.strategy, Strategy::Identity) { 0 } else { self.edits };
-
         // Create filter configuration
         let filter_config = GroupFilterConfig {
             umi_tag: raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
             min_umi_length: self.min_umi_length,
+            no_umi: self.no_umi,
         };
 
         // ============================================================
@@ -643,6 +691,7 @@ impl Command for GroupReadsByUmi {
             return self.execute_single_threaded(
                 reader,
                 &header,
+                effective_strategy,
                 effective_edits,
                 raw_tag,
                 assign_tag_bytes,
@@ -660,8 +709,9 @@ impl Command for GroupReadsByUmi {
         let collected_metrics: Arc<SegQueue<CollectedMetrics>> = Arc::new(SegQueue::new());
 
         // Clone values needed by closures
-        let strategy = self.strategy;
+        let strategy = effective_strategy;
         let index_threshold = self.index_threshold;
+        let no_umi = self.no_umi;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
         // Configure 7-step pipeline
@@ -739,6 +789,7 @@ impl Command for GroupReadsByUmi {
                     raw_tag,
                     assign_tag_bytes,
                     filter_config.min_umi_length,
+                    no_umi,
                 ) {
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
@@ -939,6 +990,7 @@ impl GroupReadsByUmi {
         &self,
         reader: Box<dyn std::io::Read + Send>,
         header: &Header,
+        effective_strategy: Strategy,
         effective_edits: u32,
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
@@ -992,7 +1044,7 @@ impl GroupReadsByUmi {
                 Self::process_and_write_position_group(
                     group,
                     filter_config,
-                    self.strategy,
+                    effective_strategy,
                     effective_edits,
                     self.index_threshold,
                     raw_tag,
@@ -1012,7 +1064,7 @@ impl GroupReadsByUmi {
             Self::process_and_write_position_group(
                 final_group,
                 filter_config,
-                self.strategy,
+                effective_strategy,
                 effective_edits,
                 self.index_threshold,
                 raw_tag,
@@ -1148,6 +1200,7 @@ impl GroupReadsByUmi {
             raw_tag,
             assign_tag_bytes,
             filter_config.min_umi_length,
+            filter_config.no_umi,
         ) {
             // Log error but continue processing
             log::warn!("Failed to assign UMI groups: {e}");
@@ -1894,6 +1947,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
@@ -1925,6 +1979,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
@@ -1956,6 +2011,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
@@ -2014,6 +2070,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2069,6 +2126,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2118,6 +2176,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2165,6 +2224,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2223,6 +2283,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2301,6 +2362,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2350,6 +2412,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2403,6 +2466,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2478,6 +2542,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2610,6 +2675,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2660,6 +2726,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2669,6 +2736,195 @@ mod tests {
         assert_eq!(output_records.len(), 0, "Should have no output records");
 
         Ok(())
+    }
+
+    // ========================================================================
+    // no_umi mode tests
+    // ========================================================================
+
+    #[test]
+    fn test_no_umi_mode_accepts_missing_umi_tag() -> Result<()> {
+        // Test that templates without UMI tags are accepted when --no-umi is used
+        let mut records = Vec::new();
+
+        // Create a pair WITHOUT the RX tag
+        let (mut r1, mut r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "dummy");
+
+        // Remove the RX tag
+        use noodles::sam::alignment::record::data::field::Tag;
+        let rx_tag = Tag::from([b'R', b'X']);
+        r1.data_mut().remove(&rx_tag);
+        r2.data_mut().remove(&rx_tag);
+
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity, // Will be forced to identity anyway
+            edits: 1,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            no_umi: true, // Enable no-umi mode
+        };
+
+        cmd.execute("test")?;
+
+        // With no_umi mode, templates without UMI tags should be accepted
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have 2 output records");
+
+        // All records should have an MI tag assigned
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "All records at same position should be in 1 group");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_umi_mode_groups_by_position_only() -> Result<()> {
+        // Test that templates with different UMIs at the same position get the same MI
+        let mut records = Vec::new();
+
+        // Create pairs at the same position with DIFFERENT UMIs
+        let (r1a, r2a) = build_test_pair("a01", 0, 100, 300, 60, 60, "AAAAAAAA");
+        let (r1b, r2b) = build_test_pair("a02", 0, 100, 300, 60, 60, "TTTTTTTT"); // Different UMI
+        let (r1c, r2c) = build_test_pair("a03", 0, 100, 300, 60, 60, "CCCCCCCC"); // Different UMI
+
+        records.push(r1a);
+        records.push(r2a);
+        records.push(r1b);
+        records.push(r2b);
+        records.push(r1c);
+        records.push(r2c);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Adjacency, // Will be overridden to identity
+            edits: 1,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            no_umi: true, // Enable no-umi mode
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 6, "Should have 6 output records (3 pairs)");
+
+        // All records at the same position should have the same MI (ignoring UMI differences)
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(
+            unique_groups, 1,
+            "All records at same position should be in 1 group (UMI ignored)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_umi_mode_accepts_umi_with_n() -> Result<()> {
+        // Test that UMIs with N are accepted in no-umi mode
+        let mut records = Vec::new();
+
+        // Create a pair with N in the UMI (normally would be filtered out)
+        let (r1, r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "ACNTNACGT");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            no_umi: true, // Enable no-umi mode
+        };
+
+        cmd.execute("test")?;
+
+        // With no_umi mode, UMIs with N should be accepted
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have 2 output records");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_umi_mode_rejects_paired_strategy() {
+        // Test that --no-umi with --strategy paired returns an error
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: std::path::PathBuf::from("/dev/null"),
+                output: std::path::PathBuf::from("/dev/null"),
+            },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Paired, // Paired strategy
+            edits: 1,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            no_umi: true, // no-umi mode with paired strategy should fail
+        };
+
+        let result = cmd.execute("test");
+        assert!(result.is_err(), "Should fail when --no-umi is used with --strategy paired");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("--no-umi cannot be used with --strategy paired"),
+            "Error message should mention the conflict"
+        );
     }
 
     #[test]
@@ -2728,6 +2984,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2802,6 +3059,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2877,6 +3135,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -2975,6 +3234,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3073,6 +3333,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3150,6 +3411,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3208,6 +3470,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3262,6 +3525,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3321,6 +3585,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3381,6 +3646,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3428,6 +3694,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3478,6 +3745,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3528,6 +3796,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3579,6 +3848,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3622,6 +3892,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3671,6 +3942,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3720,6 +3992,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3770,6 +4043,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3817,6 +4091,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         // Should handle gracefully (either error or filter out)
@@ -3863,6 +4138,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3912,6 +4188,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -3956,6 +4233,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4005,6 +4283,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4044,6 +4323,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4089,6 +4369,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4130,6 +4411,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4176,6 +4458,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4220,6 +4503,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4277,6 +4561,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4437,6 +4722,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4507,6 +4793,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
@@ -4578,6 +4865,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            no_umi: false,
         };
 
         cmd.execute("test")?;
