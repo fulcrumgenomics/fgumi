@@ -14,6 +14,14 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Memory statistics for a queue
+#[derive(Debug, Clone)]
+pub struct QueueMemoryStats {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub limit_bytes: u64,
+}
+
 /// Statistics collected per queue for rebalancing decisions.
 #[derive(Debug, Clone, Default)]
 pub struct QueueStats {
@@ -132,6 +140,15 @@ impl<T> MemoryBoundedQueue<T> {
     /// Current memory usage in bytes.
     pub fn current_bytes(&self) -> u64 {
         self.current_bytes.load(Ordering::Acquire)
+    }
+
+    /// Get queue memory statistics for reporting.
+    pub fn memory_stats(&self) -> QueueMemoryStats {
+        QueueMemoryStats {
+            current_bytes: self.current_bytes(),
+            peak_bytes: self.peak_bytes.load(Ordering::Relaxed),
+            limit_bytes: self.limit_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Check if queue is at or over memory limit.

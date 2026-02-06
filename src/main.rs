@@ -54,6 +54,11 @@ const FEATURE_GATED_COMMANDS: &[(&str, &str)] = &[
     ("simulate", "simulate"),
 ];
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -121,6 +126,9 @@ enum Subcommand {
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     // Capture full command line BEFORE clap parsing for @PG records

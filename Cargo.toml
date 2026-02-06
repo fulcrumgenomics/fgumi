@@ -22,6 +22,7 @@ noodles = { version = "0.102.0", features = ["bam", "fasta", "sam", "bgzf", "cor
 noodles-bgzf = { version = "0.45.0", features = ["libdeflate"] }
 noodles-util = { version = "0.71.0", features = ["alignment"] }
 mimalloc = { version = "0.1.48", default-features = false }
+libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
 anyhow = "1.0.100"
@@ -59,9 +60,13 @@ bgzf = "0.3.0"
 wide = "0.7"
 rand_distr = "0.5"
 flate2 = "1.1"
+dhat = { version = "0.3", optional = true }
 
 [features]
 default = []
+dhat-heap = ["dep:dhat"]
+# Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
+memory-debug = ["dep:libmimalloc-sys"]
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
 # Enable simulate commands for generating synthetic test data

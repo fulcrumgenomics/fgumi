@@ -31,6 +31,313 @@ use noodles::sam::alignment::record::data::field::Tag;
 use super::scheduler::{BackpressureState, Scheduler, SchedulerStrategy, create_scheduler};
 
 // ============================================================================
+// Memory Breakdown Structure
+// ============================================================================
+
+/// Memory breakdown for comprehensive debugging
+#[cfg(feature = "memory-debug")]
+#[derive(Debug, Clone)]
+pub struct MemoryBreakdown {
+    /// System RSS in GB
+    pub system_rss_gb: f64,
+    /// Total tracked memory in GB
+    pub tracked_total_gb: f64,
+    /// Untracked memory (allocator overhead, etc.) in GB
+    pub untracked_gb: f64,
+
+    // Queue memory in MB/GB
+    pub q1_mb: f64,
+    pub q2_mb: f64,
+    pub q3_mb: f64,
+    pub q4_gb: f64,
+    pub q5_gb: f64,
+    pub q6_mb: f64,
+    pub q7_mb: f64,
+
+    // Processing memory in GB/MB
+    pub position_groups_gb: f64,
+    pub templates_gb: f64,
+    pub reorder_buffers_mb: f64,
+    pub grouper_mb: f64,
+    pub worker_local_mb: f64,
+
+    // Infrastructure memory in MB
+    pub decompressors_mb: f64,
+    pub compressors_mb: f64,
+    pub worker_buffers_mb: f64,
+    pub io_buffers_mb: f64,
+    pub thread_stacks_mb: f64,
+    pub queue_capacity_mb: f64,
+    /// Total infrastructure memory in GB (sum of above)
+    pub infrastructure_gb: f64,
+}
+
+/// Comprehensive memory tracking fields, grouped into a single struct to keep
+/// `PipelineStats` readable. All fields are `AtomicU64` for lock-free updates.
+#[cfg(feature = "memory-debug")]
+#[derive(Debug)]
+pub struct MemoryDebugStats {
+    // Queue-specific memory tracking
+    /// Memory held in Q1 (raw BGZF blocks)
+    pub q1_memory_bytes: AtomicU64,
+    /// Memory held in Q2 (decompressed blocks)
+    pub q2_memory_bytes: AtomicU64,
+    /// Memory held in Q3 (decoded records)
+    pub q3_memory_bytes: AtomicU64,
+    /// Memory held in Q4 (position groups) - likely the big one
+    pub q4_memory_bytes: AtomicU64,
+    /// Memory held in Q5 (processed groups)
+    pub q5_memory_bytes: AtomicU64,
+    /// Memory held in Q6 (serialized data)
+    pub q6_memory_bytes: AtomicU64,
+    /// Memory held in Q7 (compressed output blocks)
+    pub q7_memory_bytes: AtomicU64,
+
+    // Processing memory tracking
+    /// Memory held in position groups during processing
+    pub position_group_processing_bytes: AtomicU64,
+    /// Memory held in templates during operations
+    pub template_processing_bytes: AtomicU64,
+    /// Memory held in reorder buffers
+    pub reorder_buffer_bytes: AtomicU64,
+    /// Memory held by PositionGrouper state
+    pub grouper_memory_bytes: AtomicU64,
+    /// Memory held by worker-local allocations
+    pub worker_local_memory_bytes: AtomicU64,
+
+    // Infrastructure memory (known constants set once at pipeline startup)
+    /// Memory for per-thread decompressor instances (libdeflater)
+    pub decompressor_memory_bytes: AtomicU64,
+    /// Memory for per-thread compressor instances (InlineBgzfCompressor)
+    pub compressor_memory_bytes: AtomicU64,
+    /// Memory for per-thread serialization + decompression buffers
+    pub worker_buffer_memory_bytes: AtomicU64,
+    /// Memory for I/O buffers (BufReader + BufWriter)
+    pub io_buffer_memory_bytes: AtomicU64,
+    /// Memory for thread stacks (2MB per thread default)
+    pub thread_stack_memory_bytes: AtomicU64,
+    /// Memory for ArrayQueue pre-allocation overhead
+    pub queue_capacity_memory_bytes: AtomicU64,
+
+    // System memory tracking
+    /// Actual system RSS (from /proc/self/status or sysinfo)
+    pub system_rss_bytes: AtomicU64,
+}
+
+#[cfg(feature = "memory-debug")]
+impl MemoryDebugStats {
+    /// Create a new memory debug stats collector with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            q1_memory_bytes: AtomicU64::new(0),
+            q2_memory_bytes: AtomicU64::new(0),
+            q3_memory_bytes: AtomicU64::new(0),
+            q4_memory_bytes: AtomicU64::new(0),
+            q5_memory_bytes: AtomicU64::new(0),
+            q6_memory_bytes: AtomicU64::new(0),
+            q7_memory_bytes: AtomicU64::new(0),
+            position_group_processing_bytes: AtomicU64::new(0),
+            template_processing_bytes: AtomicU64::new(0),
+            reorder_buffer_bytes: AtomicU64::new(0),
+            grouper_memory_bytes: AtomicU64::new(0),
+            worker_local_memory_bytes: AtomicU64::new(0),
+            decompressor_memory_bytes: AtomicU64::new(0),
+            compressor_memory_bytes: AtomicU64::new(0),
+            worker_buffer_memory_bytes: AtomicU64::new(0),
+            io_buffer_memory_bytes: AtomicU64::new(0),
+            thread_stack_memory_bytes: AtomicU64::new(0),
+            queue_capacity_memory_bytes: AtomicU64::new(0),
+            system_rss_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+// ============================================================================
+// Thread-Local Memory Tracking
+// ============================================================================
+
+#[cfg(feature = "memory-debug")]
+/// Sentinel value meaning "no thread ID assigned yet".
+const THREAD_ID_UNSET: usize = usize::MAX;
+
+#[cfg(feature = "memory-debug")]
+thread_local! {
+    static THREAD_ID: std::cell::Cell<usize> = std::cell::Cell::new(THREAD_ID_UNSET);
+}
+
+#[cfg(feature = "memory-debug")]
+/// Get or assign a thread ID for memory tracking.
+/// Returns IDs in range 0..MAX_THREADS. IDs wrap if more than MAX_THREADS
+/// unique threads call this function (per-thread data will be shared).
+pub fn get_or_assign_thread_id() -> usize {
+    THREAD_ID.with(|id| {
+        let current = id.get();
+        if current == THREAD_ID_UNSET {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+            let new_id = THREAD_COUNTER.fetch_add(1, Ordering::Relaxed) % MAX_THREADS;
+            id.set(new_id);
+            new_id
+        } else {
+            current
+        }
+    })
+}
+
+// ============================================================================
+// System Memory Utilities
+// ============================================================================
+
+#[cfg(feature = "memory-debug")]
+/// Get current process RSS from /proc/self/status (Linux) or sysinfo (cross-platform)
+pub fn get_process_rss_bytes() -> Option<u64> {
+    // Try Linux-style /proc/self/status first (most accurate)
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        return status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb * 1024); // Convert KB to bytes
+    }
+
+    // Cross-platform fallback using sysinfo (cached instance)
+    use std::sync::Mutex;
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+
+    static RSS_SYSTEM: std::sync::OnceLock<Mutex<System>> = std::sync::OnceLock::new();
+
+    let sys = RSS_SYSTEM.get_or_init(|| {
+        Mutex::new(System::new_with_specifics(
+            RefreshKind::new().with_processes(ProcessRefreshKind::new().with_memory()),
+        ))
+    });
+
+    let mut sys_guard = sys.lock().ok()?;
+    sys_guard.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        ProcessRefreshKind::new().with_memory(),
+    );
+
+    // Get current process RSS
+    let pid = sysinfo::get_current_pid().ok()?;
+    let process = sys_guard.process(pid)?;
+    Some(process.memory()) // sysinfo returns bytes
+}
+
+#[cfg(feature = "memory-debug")]
+/// Log comprehensive memory statistics with accuracy tracking
+pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
+    // Update RSS
+    if let Some(rss) = get_process_rss_bytes() {
+        stats.update_system_rss(rss);
+    }
+
+    // TODO: Queue memory integration deferred - requires pipeline reference to read actual queues
+    // For now, queue memory is tracked through estimates only
+
+    let breakdown = stats.get_memory_breakdown();
+
+    // Main memory line with RSS vs tracked accuracy
+    if breakdown.system_rss_gb > 0.0 {
+        let pct = (breakdown.tracked_total_gb / breakdown.system_rss_gb * 100.0) as u32;
+        log::info!(
+            "MEMORY: RSS={:.1}GB Tracked={:.1}GB ({}%) | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
+            breakdown.system_rss_gb,
+            breakdown.tracked_total_gb,
+            pct,
+            breakdown.q1_mb,
+            breakdown.q2_mb,
+            breakdown.q3_mb,
+            breakdown.q4_gb,
+            breakdown.q5_gb,
+            breakdown.q6_mb,
+            breakdown.q7_mb,
+            breakdown.position_groups_gb,
+            breakdown.templates_gb,
+            breakdown.infrastructure_gb * 1e3, // Convert GB to MB for display
+        );
+    } else {
+        log::info!(
+            "MEMORY: Tracked={:.1}GB | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
+            breakdown.tracked_total_gb,
+            breakdown.q1_mb,
+            breakdown.q2_mb,
+            breakdown.q3_mb,
+            breakdown.q4_gb,
+            breakdown.q5_gb,
+            breakdown.q6_mb,
+            breakdown.q7_mb,
+            breakdown.position_groups_gb,
+            breakdown.templates_gb,
+            breakdown.infrastructure_gb * 1e3,
+        );
+    }
+
+    // Untracked memory details (only if RSS is available)
+    if breakdown.system_rss_gb > 0.0 {
+        let untracked_pct = ((breakdown.untracked_gb / breakdown.system_rss_gb) * 100.0) as u32;
+        if breakdown.untracked_gb > 1.0 {
+            log::info!(
+                "   Untracked: {:.1}GB ({}%) = allocator fragmentation + noodles internals",
+                breakdown.untracked_gb,
+                untracked_pct,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "memory-debug")]
+/// Start memory monitoring thread that reports at the given interval.
+pub fn start_memory_monitor(
+    stats: Arc<PipelineStats>,
+    shutdown_signal: Arc<AtomicBool>,
+    report_interval_secs: u64,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_report = Instant::now();
+        let report_interval = Duration::from_secs(report_interval_secs);
+
+        let mut last_rss: u64 = 0;
+        let mut peak_rss: u64 = 0;
+        let mut stats_printed = false;
+        while !shutdown_signal.load(Ordering::Relaxed) {
+            if last_report.elapsed() >= report_interval {
+                log_comprehensive_memory_stats(&stats);
+                let current_rss = stats.memory.system_rss_bytes.load(Ordering::Relaxed);
+                // Print mimalloc stats when RSS starts declining (just past peak)
+                if !stats_printed
+                    && current_rss > 0
+                    && last_rss > 0
+                    && current_rss < last_rss
+                    && peak_rss > 4_000_000_000
+                {
+                    log::info!("=== MIMALLOC STATS AT PEAK (no mi_collect) ===");
+                    // SAFETY: `mi_stats_print_out(None, null_mut())` prints mimalloc allocator
+                    // statistics to stderr using the default output handler. mimalloc internally
+                    // synchronizes stats collection, making this safe to call concurrently with
+                    // allocation/deallocation on other threads.
+                    unsafe {
+                        libmimalloc_sys::mi_stats_print_out(None, std::ptr::null_mut());
+                    }
+                    stats_printed = true;
+                }
+                if current_rss > peak_rss {
+                    peak_rss = current_rss;
+                }
+                last_rss = current_rss;
+                last_report = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    })
+}
+
+// ============================================================================
 // Batch Weight Trait (for template-based batching)
 // ============================================================================
 
@@ -194,8 +501,22 @@ impl MemoryTracker {
     }
 
     /// Remove bytes from the tracker (call when item is consumed from queue).
+    /// Uses saturating subtraction to prevent underflow from estimation mismatches.
     pub fn remove(&self, bytes: usize) {
-        self.current_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        let bytes = bytes as u64;
+        let mut current = self.current_bytes.load(Ordering::Relaxed);
+        loop {
+            let new_val = current.saturating_sub(bytes);
+            match self.current_bytes.compare_exchange_weak(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Add bytes unconditionally (for tracking after a successful push).
@@ -237,11 +558,10 @@ impl MemoryTracker {
     pub fn is_at_limit(&self) -> bool {
         // Always apply backpressure at 512MB for optimal cache behavior.
         // If a lower limit is configured, use that instead.
-        const BACKPRESSURE_CAP: u64 = 512 * 1024 * 1024;
         let backpressure_threshold = if self.limit_bytes == 0 {
-            BACKPRESSURE_CAP
+            BACKPRESSURE_THRESHOLD_BYTES
         } else {
-            self.limit_bytes.min(BACKPRESSURE_CAP)
+            self.limit_bytes.min(BACKPRESSURE_THRESHOLD_BYTES)
         };
         self.current() >= backpressure_threshold
     }
@@ -257,11 +577,10 @@ impl MemoryTracker {
     #[must_use]
     pub fn is_below_drain_threshold(&self) -> bool {
         // Drain threshold is half of the backpressure threshold
-        const BACKPRESSURE_CAP: u64 = 512 * 1024 * 1024;
         let backpressure_threshold = if self.limit_bytes == 0 {
-            BACKPRESSURE_CAP
+            BACKPRESSURE_THRESHOLD_BYTES
         } else {
-            self.limit_bytes.min(BACKPRESSURE_CAP)
+            self.limit_bytes.min(BACKPRESSURE_THRESHOLD_BYTES)
         };
         self.current() < backpressure_threshold / 2
     }
@@ -986,28 +1305,8 @@ impl DecodedRecord {
 
 impl MemoryEstimate for DecodedRecord {
     fn estimate_heap_size(&self) -> usize {
-        // RecordBuf contains:
-        // - name: Option<BString> (Vec<u8>)
-        // - sequence: Vec<u8>
-        // - quality_scores: Vec<u8>
-        // - cigar: Vec<Op> (Op is 4 bytes)
-        // - data: Vec<(Tag, Value)> - variable size tags
-        //
-        // O(1) estimation based on accessible fields:
-        let name_size = self.record.name().map_or(0, |n| n.len());
-        let seq_len = self.record.sequence().len();
-        let qual_len = self.record.quality_scores().len();
-        let cigar_ops = self.record.cigar().as_ref().len();
-
-        // Core size (O(1) - no iteration)
-        let core_size = name_size + seq_len + qual_len + (cigar_ops * 4);
-
-        // Estimate auxiliary data as ~25% of core size (typical for BAM records)
-        // This avoids O(n) iteration over data fields while staying reasonably accurate
-        let data_estimate = core_size / 4;
-
-        // Total with 64 bytes overhead for struct/Vec allocations
-        core_size + data_estimate + 64
+        // Delegate to the shared estimator to avoid divergence between add/remove tracking
+        crate::template::estimate_record_buf_heap_size(&self.record)
     }
 }
 
@@ -1020,28 +1319,8 @@ impl MemoryEstimate for Vec<DecodedRecord> {
 
 impl MemoryEstimate for RecordBuf {
     fn estimate_heap_size(&self) -> usize {
-        // RecordBuf contains:
-        // - name: Option<BString> (Vec<u8>)
-        // - sequence: Sequence (Vec<u8>)
-        // - quality_scores: QualityScores (Vec<u8>)
-        // - cigar: Cigar (Vec<Op>)
-        // - data: Data (IndexMap of tags to values)
-        //
-        // O(1) estimation based on accessible fields:
-        let name_size = self.name().map_or(0, |n| n.len());
-        let seq_len = self.sequence().len();
-        let qual_len = self.quality_scores().len();
-        let cigar_ops = self.cigar().as_ref().len();
-
-        // Core size (O(1) - no iteration)
-        let core_size = name_size + seq_len + qual_len + (cigar_ops * 4);
-
-        // Estimate auxiliary data as ~25% of core size (typical for BAM records)
-        // This avoids O(n) iteration over data fields while staying reasonably accurate
-        let data_estimate = core_size / 4;
-
-        // Total with 64 bytes overhead for struct/Vec allocations
-        core_size + data_estimate + 64
+        // Delegate to the detailed estimation in template.rs (single source of truth)
+        crate::template::estimate_record_buf_heap_size(self)
     }
 }
 
@@ -1175,7 +1454,8 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     // ========== Queue: Group → Process ==========
     /// Batches of groups/templates waiting to be processed.
     pub groups: ArrayQueue<(u64, Vec<G>)>,
-    /// Current heap bytes in groups queue.
+    /// Current heap bytes in groups queue (stats/reporting only, not used for backpressure).
+    /// Mutations are gated behind the `memory-debug` feature; reads are zero without the feature.
     pub groups_heap_bytes: AtomicU64,
 
     // ========== Queue: Process → Serialize ==========
@@ -1216,7 +1496,7 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
 
     // ========== Performance Statistics ==========
     /// Optional performance statistics collector.
-    pub stats: Option<PipelineStats>,
+    pub stats: Option<Arc<PipelineStats>>,
 }
 
 impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
@@ -1231,7 +1511,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     pub fn new(
         queue_capacity: usize,
         output: Box<dyn Write + Send>,
-        stats: Option<PipelineStats>,
+        stats: Option<Arc<PipelineStats>>,
         progress_name: &str,
     ) -> Self {
         Self {
@@ -1830,7 +2110,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> WritePipelineState
     }
 
     fn stats(&self) -> Option<&PipelineStats> {
-        self.stats.as_ref()
+        self.stats.as_deref()
     }
 }
 
@@ -1871,12 +2151,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
         &self,
         item: (u64, CompressedBlockBatch),
     ) -> Result<(), (u64, CompressedBlockBatch)> {
-        let heap_size = item.1.estimate_heap_size();
-        let result = self.compressed.push(item);
-        if result.is_ok() {
-            self.compressed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
-        }
-        result
+        self.compressed.push(item)
     }
 
     fn q6_is_full(&self) -> bool {
@@ -1916,7 +2191,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     }
 
     fn stats(&self) -> Option<&PipelineStats> {
-        self.stats.as_ref()
+        self.stats.as_deref()
     }
 }
 
@@ -2001,6 +2276,9 @@ pub struct PipelineConfig {
     /// When enabled, uses progressive doubling: 2x -> 4x -> 8x -> unbind,
     /// then restores toward original limits after 30s of sustained progress.
     pub deadlock_recover_enabled: bool,
+    /// Shared statistics instance for external memory monitoring.
+    /// When provided, the pipeline will use this instead of creating its own.
+    pub shared_stats: Option<Arc<PipelineStats>>,
 }
 
 impl PipelineConfig {
@@ -2022,6 +2300,7 @@ impl PipelineConfig {
             queue_memory_limit: 0,           // No limit by default
             deadlock_timeout_secs: 10,       // Default 10 second timeout
             deadlock_recover_enabled: false, // Detection only by default
+            shared_stats: None,              // No shared stats by default
         }
     }
 
@@ -2043,6 +2322,15 @@ impl PipelineConfig {
     #[must_use]
     pub fn with_stats(mut self, collect: bool) -> Self {
         self.collect_stats = collect;
+        self
+    }
+
+    /// Set custom statistics instance for memory debugging.
+    /// This allows external monitoring to access the same stats used by the pipeline.
+    #[must_use]
+    pub fn with_shared_stats(mut self, stats: Arc<PipelineStats>) -> Self {
+        self.collect_stats = true; // Enable stats collection
+        self.shared_stats = Some(stats);
         self
     }
 
@@ -2100,6 +2388,7 @@ impl PipelineConfig {
             queue_memory_limit: 0,           // No limit by default
             deadlock_timeout_secs: 10,       // Default 10 second timeout
             deadlock_recover_enabled: false, // Detection only by default
+            shared_stats: None,              // No shared stats by default
         }
     }
 
@@ -2326,6 +2615,13 @@ pub struct PipelineStats {
     pub group_memory_rejects: AtomicU64,
     /// Peak memory usage in the reorder buffer (bytes).
     pub peak_memory_bytes: AtomicU64,
+
+    // ========================================================================
+    // COMPREHENSIVE MEMORY TRACKING SYSTEM (behind memory-debug feature)
+    // ========================================================================
+    /// Comprehensive memory tracking stats, only present with `memory-debug` feature.
+    #[cfg(feature = "memory-debug")]
+    pub memory: MemoryDebugStats,
 }
 
 /// Helper to create a boxed array of `AtomicU64` initialized to zero.
@@ -2423,6 +2719,9 @@ impl PipelineStats {
             memory_drain_activations: AtomicU64::new(0),
             group_memory_rejects: AtomicU64::new(0),
             peak_memory_bytes: AtomicU64::new(0),
+
+            #[cfg(feature = "memory-debug")]
+            memory: MemoryDebugStats::new(),
         }
     }
 
@@ -3246,6 +3545,208 @@ impl PipelineStats {
 }
 
 // ============================================================================
+// Comprehensive Memory Tracking Methods (behind memory-debug feature)
+// ============================================================================
+
+#[cfg(feature = "memory-debug")]
+impl PipelineStats {
+    /// Track queue memory addition (queue memory is separate from processing memory)
+    pub fn track_queue_memory_add(&self, queue_name: &str, size: usize) {
+        let m = &self.memory;
+        let size_u64 = size as u64;
+        match queue_name {
+            "q1" => m.q1_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            "q2" => m.q2_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            "q3" => m.q3_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            "q4" => m.q4_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            "q5" => m.q5_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            "q6" => m.q6_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            "q7" => m.q7_memory_bytes.fetch_add(size_u64, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+
+    /// Track queue memory removal (queue memory is separate from processing memory).
+    /// Uses saturating subtraction to prevent u64 underflow from estimation mismatches.
+    pub fn track_queue_memory_remove(&self, queue_name: &str, size: usize) {
+        let m = &self.memory;
+        let counter = match queue_name {
+            "q1" => &m.q1_memory_bytes,
+            "q2" => &m.q2_memory_bytes,
+            "q3" => &m.q3_memory_bytes,
+            "q4" => &m.q4_memory_bytes,
+            "q5" => &m.q5_memory_bytes,
+            "q6" => &m.q6_memory_bytes,
+            "q7" => &m.q7_memory_bytes,
+            _ => return,
+        };
+        let size_u64 = size as u64;
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let new_val = current.saturating_sub(size_u64);
+            match counter.compare_exchange_weak(
+                current,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Track position group processing memory (separate from queue memory).
+    /// Uses saturating subtraction to prevent u64 underflow from estimation mismatches.
+    pub fn track_position_group_memory(&self, size: usize, is_allocation: bool) {
+        let counter = &self.memory.position_group_processing_bytes;
+        let size_u64 = size as u64;
+        if is_allocation {
+            counter.fetch_add(size_u64, Ordering::Relaxed);
+        } else {
+            let mut current = counter.load(Ordering::Relaxed);
+            loop {
+                let new_val = current.saturating_sub(size_u64);
+                match counter.compare_exchange_weak(
+                    current,
+                    new_val,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+    }
+
+    /// Track template processing memory (separate from queue memory).
+    /// Uses saturating subtraction to prevent u64 underflow from estimation mismatches.
+    pub fn track_template_memory(&self, size: usize, is_allocation: bool) {
+        let counter = &self.memory.template_processing_bytes;
+        let size_u64 = size as u64;
+        if is_allocation {
+            counter.fetch_add(size_u64, Ordering::Relaxed);
+        } else {
+            let mut current = counter.load(Ordering::Relaxed);
+            loop {
+                let new_val = current.saturating_sub(size_u64);
+                match counter.compare_exchange_weak(
+                    current,
+                    new_val,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+    }
+
+    /// Update system RSS.
+    pub fn update_system_rss(&self, rss_bytes: u64) {
+        self.memory.system_rss_bytes.store(rss_bytes, Ordering::Relaxed);
+    }
+
+    /// Set infrastructure memory estimates (call once at pipeline startup).
+    pub fn set_infrastructure_memory(&self, num_threads: usize, queue_capacity: usize) {
+        let m = &self.memory;
+        m.decompressor_memory_bytes.store(num_threads as u64 * 32 * 1024, Ordering::Relaxed);
+        m.compressor_memory_bytes.store(num_threads as u64 * 280 * 1024, Ordering::Relaxed);
+        m.worker_buffer_memory_bytes.store(num_threads as u64 * 512 * 1024, Ordering::Relaxed);
+        m.io_buffer_memory_bytes.store(16u64 * 1024 * 1024, Ordering::Relaxed);
+        m.thread_stack_memory_bytes
+            .store((num_threads as u64 + 1) * 2 * 1024 * 1024, Ordering::Relaxed);
+        m.queue_capacity_memory_bytes.store(7u64 * queue_capacity as u64 * 128, Ordering::Relaxed);
+    }
+
+    /// Update queue memory stats from actual queues (call periodically during monitoring)
+    pub fn update_queue_memory_from_external(&self, queue_stats: &[(&str, u64)]) {
+        let m = &self.memory;
+        for (queue_name, current_bytes) in queue_stats {
+            match *queue_name {
+                "q1" => m.q1_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q2" => m.q2_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q3" => m.q3_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q4" => m.q4_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q5" => m.q5_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q6" => m.q6_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                "q7" => m.q7_memory_bytes.store(*current_bytes, Ordering::Relaxed),
+                _ => {}
+            }
+        }
+    }
+
+    /// Get current memory breakdown
+    pub fn get_memory_breakdown(&self) -> MemoryBreakdown {
+        let m = &self.memory;
+
+        // Load each counter once to avoid divergence under contention
+        let q1 = m.q1_memory_bytes.load(Ordering::Relaxed);
+        let q2 = m.q2_memory_bytes.load(Ordering::Relaxed);
+        let q3 = m.q3_memory_bytes.load(Ordering::Relaxed);
+        let q4 = m.q4_memory_bytes.load(Ordering::Relaxed);
+        let q5 = m.q5_memory_bytes.load(Ordering::Relaxed);
+        let q6 = m.q6_memory_bytes.load(Ordering::Relaxed);
+        let q7 = m.q7_memory_bytes.load(Ordering::Relaxed);
+        let queue_total = q1 + q2 + q3 + q4 + q5 + q6 + q7;
+
+        let pos_groups = m.position_group_processing_bytes.load(Ordering::Relaxed);
+        let templates = m.template_processing_bytes.load(Ordering::Relaxed);
+        let reorder = m.reorder_buffer_bytes.load(Ordering::Relaxed);
+        let grouper = m.grouper_memory_bytes.load(Ordering::Relaxed);
+        let worker_local = m.worker_local_memory_bytes.load(Ordering::Relaxed);
+        let processing_total = pos_groups + templates + reorder + grouper + worker_local;
+
+        let infra_decompressors = m.decompressor_memory_bytes.load(Ordering::Relaxed);
+        let infra_compressors = m.compressor_memory_bytes.load(Ordering::Relaxed);
+        let infra_buffers = m.worker_buffer_memory_bytes.load(Ordering::Relaxed);
+        let infra_io = m.io_buffer_memory_bytes.load(Ordering::Relaxed);
+        let infra_stacks = m.thread_stack_memory_bytes.load(Ordering::Relaxed);
+        let infra_queues = m.queue_capacity_memory_bytes.load(Ordering::Relaxed);
+        let infra_total = infra_decompressors
+            + infra_compressors
+            + infra_buffers
+            + infra_io
+            + infra_stacks
+            + infra_queues;
+
+        let tracked_total = queue_total + processing_total + infra_total;
+        let system_rss = m.system_rss_bytes.load(Ordering::Relaxed);
+        let untracked = system_rss.saturating_sub(tracked_total);
+
+        MemoryBreakdown {
+            system_rss_gb: system_rss as f64 / 1e9,
+            tracked_total_gb: tracked_total as f64 / 1e9,
+            untracked_gb: untracked as f64 / 1e9,
+
+            q1_mb: q1 as f64 / 1e6,
+            q2_mb: q2 as f64 / 1e6,
+            q3_mb: q3 as f64 / 1e6,
+            q4_gb: q4 as f64 / 1e9,
+            q5_gb: q5 as f64 / 1e9,
+            q6_mb: q6 as f64 / 1e6,
+            q7_mb: q7 as f64 / 1e6,
+
+            position_groups_gb: pos_groups as f64 / 1e9,
+            templates_gb: templates as f64 / 1e9,
+            reorder_buffers_mb: reorder as f64 / 1e6,
+            grouper_mb: grouper as f64 / 1e6,
+            worker_local_mb: worker_local as f64 / 1e6,
+
+            decompressors_mb: infra_decompressors as f64 / 1e6,
+            compressors_mb: infra_compressors as f64 / 1e6,
+            worker_buffers_mb: infra_buffers as f64 / 1e6,
+            io_buffers_mb: infra_io as f64 / 1e6,
+            thread_stacks_mb: infra_stacks as f64 / 1e6,
+            queue_capacity_mb: infra_queues as f64 / 1e6,
+            infrastructure_gb: infra_total as f64 / 1e9,
+        }
+    }
+}
+
+// ============================================================================
 // Shared Traits for Steps 4-7 (used by both BAM and FASTQ pipelines)
 // ============================================================================
 
@@ -3273,6 +3774,8 @@ pub trait OutputPipelineState: Send + Sync {
     fn q6_push(&self, item: (u64, CompressedBlockBatch))
     -> Result<(), (u64, CompressedBlockBatch)>;
     fn q6_is_full(&self) -> bool;
+    /// Track memory released when popping from Q6.
+    fn q6_track_pop(&self, _heap_size: u64) {}
 
     // Reorder buffer for Q6
     fn q6_reorder_insert(&self, serial: u64, batch: CompressedBlockBatch);
@@ -3793,6 +4296,8 @@ fn shared_try_step_write<S: OutputPipelineState>(state: &S) -> bool {
 
     // Drain Q6 into reorder buffer
     while let Some((serial, batch)) = state.q6_pop() {
+        let q7_heap = batch.estimate_heap_size() as u64;
+        state.q6_track_pop(q7_heap);
         state.q6_reorder_insert(serial, batch);
     }
 

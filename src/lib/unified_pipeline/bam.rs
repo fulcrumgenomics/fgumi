@@ -390,6 +390,9 @@ pub struct BamPipelineState<G, P: MemoryEstimate> {
     // ========== Queue 1: Read → Decompress ==========
     /// Raw BGZF blocks waiting to be decompressed.
     pub q1_raw_blocks: ArrayQueue<(u64, RawBlockBatch)>,
+    /// Heap bytes currently held in Q1 (compressed BGZF blocks).
+    #[cfg(feature = "memory-debug")]
+    pub q1_heap_bytes: AtomicU64,
 
     // ========== Step 2: Decompress (parallel) ==========
     // No state needed - each thread has its own Decompressor
@@ -478,7 +481,11 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     ) -> Self {
         let cap = config.queue_capacity;
         let memory_limit = config.queue_memory_limit;
-        let stats = if config.collect_stats { Some(PipelineStats::new()) } else { None };
+        let stats = if config.collect_stats {
+            config.shared_stats.clone().or_else(|| Some(Arc::new(PipelineStats::new())))
+        } else {
+            None
+        };
         // Create boundary state based on whether header was already read
         let boundary_state = if config.header_already_read {
             BoundaryState::new_no_header()
@@ -497,6 +504,8 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             next_read_serial: AtomicU64::new(0),
             // Q1: Read → Decompress
             q1_raw_blocks: ArrayQueue::new(cap),
+            #[cfg(feature = "memory-debug")]
+            q1_heap_bytes: AtomicU64::new(0),
             // Step 2: Decompress
             decompress_done: AtomicBool::new(false),
             batches_decompressed: AtomicU64::new(0),
@@ -665,7 +674,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     /// Get optional reference to pipeline statistics.
     #[must_use]
     pub fn stats(&self) -> Option<&PipelineStats> {
-        self.output.stats.as_ref()
+        self.output.stats.as_deref()
     }
 
     /// Get optional reference to progress tracker.
@@ -938,11 +947,20 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
         &self,
         item: (u64, CompressedBlockBatch),
     ) -> Result<(), (u64, CompressedBlockBatch)> {
-        self.output.compressed.push(item)
+        let heap_size = item.1.estimate_heap_size();
+        let result = self.output.compressed.push(item);
+        if result.is_ok() {
+            self.output.compressed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
+        }
+        result
     }
 
     fn q6_is_full(&self) -> bool {
         self.output.compressed.is_full()
+    }
+
+    fn q6_track_pop(&self, heap_size: u64) {
+        self.output.compressed_heap_bytes.fetch_sub(heap_size, Ordering::AcqRel);
     }
 
     fn q6_reorder_insert(&self, serial: u64, batch: CompressedBlockBatch) {
@@ -978,7 +996,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
     }
 
     fn stats(&self) -> Option<&PipelineStats> {
-        self.output.stats.as_ref()
+        self.output.stats.as_deref()
     }
 }
 
@@ -986,12 +1004,14 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
 // New Shared Traits (Phase 2 - Pipeline Consolidation)
 // ============================================================================
 
-impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> ProcessPipelineState<G, P>
-    for BamPipelineState<G, P>
+impl<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate + 'static>
+    ProcessPipelineState<G, P> for BamPipelineState<G, P>
 {
     fn process_input_pop(&self) -> Option<(u64, Vec<G>)> {
         let result = self.output.groups.pop();
         if result.is_some() {
+            // Q4 memory-debug tracking is handled by try_step_process (which does its own
+            // direct pop). Do NOT track here to avoid double-subtraction.
             self.deadlock_state.record_q4_pop();
         }
         result
@@ -1103,7 +1123,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> WritePipelineState
     }
 
     fn stats(&self) -> Option<&PipelineStats> {
-        self.output.stats.as_ref()
+        self.output.stats.as_deref()
     }
 }
 
@@ -1452,9 +1472,13 @@ fn try_step_read<G: Send, P: Send + MemoryEstimate>(
     // Priority 1: Try to advance any held raw batch first
     // =========================================================================
     if let Some((serial, held)) = worker.held_raw.take() {
+        #[cfg(feature = "memory-debug")]
+        let q1_bytes = held.total_compressed_size() as u64;
         match state.q1_raw_blocks.push((serial, held)) {
             Ok(()) => {
                 // Successfully advanced held item, continue to read more
+                #[cfg(feature = "memory-debug")]
+                state.q1_heap_bytes.fetch_add(q1_bytes, Ordering::Relaxed);
                 state.deadlock_state.record_q1_push();
             }
             Err((serial, held)) => {
@@ -1517,8 +1541,12 @@ fn try_step_read<G: Send, P: Send + MemoryEstimate>(
             // =========================================================================
             // Priority 6: Try to push result (non-blocking)
             // =========================================================================
+            #[cfg(feature = "memory-debug")]
+            let q1_bytes = batch.total_compressed_size() as u64;
             match state.q1_raw_blocks.push((serial, batch)) {
                 Ok(()) => {
+                    #[cfg(feature = "memory-debug")]
+                    state.q1_heap_bytes.fetch_add(q1_bytes, Ordering::Relaxed);
                     state.deadlock_state.record_q1_push();
                     true
                 }
@@ -1600,6 +1628,12 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
         }
         return false;
     };
+    // Track Q1 memory on pop
+    #[cfg(feature = "memory-debug")]
+    {
+        let q1_pop_bytes = raw_batch.total_compressed_size() as u64;
+        state.q1_heap_bytes.fetch_sub(q1_pop_bytes, Ordering::Relaxed);
+    }
     state.deadlock_state.record_q1_pop();
 
     // Prepare worker's buffer: clear and reserve capacity
@@ -2016,6 +2050,13 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
             return Err(groups);
         }
 
+        // Track Q4 memory (debug only — estimate_heap_size is O(templates))
+        #[cfg(feature = "memory-debug")]
+        {
+            let heap_size: u64 = groups.iter().map(|g| g.estimate_heap_size() as u64).sum();
+            state.output.groups_heap_bytes.fetch_add(heap_size, Ordering::AcqRel);
+        }
+
         let serial = state.next_group_serial.fetch_add(1, Ordering::SeqCst);
         state
             .output
@@ -2385,6 +2426,14 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
             break;
         };
         state.deadlock_state.record_q4_pop();
+
+        // Track Q4 memory decrement (debug only — estimate_heap_size is O(templates))
+        #[cfg(feature = "memory-debug")]
+        {
+            let q4_heap: u64 = batch.iter().map(|g| g.estimate_heap_size() as u64).sum();
+            state.output.groups_heap_bytes.fetch_sub(q4_heap, Ordering::AcqRel);
+        }
+
         // Process each group in the batch
         let mut results: Vec<P> = Vec::with_capacity(batch.len());
         for group in batch {
@@ -2537,7 +2586,7 @@ fn try_step_compress<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
 /// Try to execute Step 9: Write blocks to output.
 ///
 /// This step is exclusive - only one thread at a time.
-fn try_step_write<G: Send, P: Send + MemoryEstimate>(
+fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     state: &BamPipelineState<G, P>,
 ) -> (bool, bool) {
     // Try to acquire exclusive access to output file FIRST
@@ -2562,6 +2611,8 @@ fn try_step_write<G: Send, P: Send + MemoryEstimate>(
 
         // Drain Q7 into reorder buffer
         while let Some((serial, batch)) = state.output.compressed.pop() {
+            let q7_heap = batch.estimate_heap_size() as u64;
+            state.q6_track_pop(q7_heap);
             state.deadlock_state.record_q7_pop();
             reorder.insert(serial, batch);
         }
@@ -2960,9 +3011,11 @@ where
 
     let state = Arc::new(BamPipelineState::<G, P>::new(config, input, output, group_key_config));
 
-    // Set num_threads for per-thread stats display
+    // Set num_threads for stats display
     if let Some(stats) = state.stats() {
         stats.set_num_threads(num_threads);
+        #[cfg(feature = "memory-debug")]
+        stats.set_infrastructure_memory(num_threads, state.config.queue_capacity);
     }
 
     let group_state = Arc::new(Mutex::new(GroupState::new(grouper)));
@@ -3045,12 +3098,23 @@ where
                 let reorder_sizes = [q2_reorder_len, q3_reorder_len, q7_reorder_len];
                 let reorder_memory_bytes = [q2_reorder_mem, q3_reorder_mem, q7_reorder_mem];
 
-                // Queue memory from AtomicU64 counters (Q4-Q7)
+                // Queue memory from AtomicU64 counters
+                // Q1: only tracked with memory-debug feature
+                #[cfg(feature = "memory-debug")]
+                let q1_mem = state_clone.q1_heap_bytes.load(Ordering::Relaxed);
+                #[cfg(not(feature = "memory-debug"))]
+                let q1_mem: u64 = 0;
+                // Q2-Q3: reorder buffer heap_bytes tracked unconditionally (used for backpressure)
+                let q2_mem = state_clone.q2_reorder_state.heap_bytes.load(Ordering::Relaxed);
+                let q3_mem = state_clone.q3_reorder_state.heap_bytes.load(Ordering::Relaxed);
+                // Q4: groups_heap_bytes is only mutated under memory-debug (reads 0 without feature)
                 let q4_mem = state_clone.output.groups_heap_bytes.load(Ordering::Relaxed);
+                // Q5-Q7: tracked unconditionally via OutputPipelineQueues atomic counters
                 let q5_mem = state_clone.output.processed_heap_bytes.load(Ordering::Relaxed);
                 let q6_mem = state_clone.output.serialized_heap_bytes.load(Ordering::Relaxed);
                 let q7_mem = state_clone.output.compressed_heap_bytes.load(Ordering::Relaxed);
-                let queue_memory_bytes = [0, 0, 0, 0, q4_mem, q5_mem, q6_mem, q7_mem];
+                let queue_memory_bytes =
+                    [q1_mem, q2_mem, 0, q3_mem, q4_mem, q5_mem, q6_mem, q7_mem];
 
                 // Collect thread activity
                 let thread_steps: Vec<u8> = if let Some(stats) = state_clone.stats() {
@@ -3065,14 +3129,28 @@ where
                 // Record sample and track peak memory
                 if let Some(stats) = state_clone.stats() {
                     // Track peak memory from all queues (reorder buffers + ArrayQueues)
-                    let total_mem = q2_reorder_mem
-                        + q3_reorder_mem
+                    let total_mem = q1_mem
+                        + q2_mem
+                        + q3_mem
                         + q7_reorder_mem
                         + q4_mem
                         + q5_mem
                         + q6_mem
                         + q7_mem;
                     stats.record_memory_usage(total_mem);
+
+                    // Update shared PipelineStats with actual queue memory bytes
+                    // so the memory debugging monitor can see them
+                    #[cfg(feature = "memory-debug")]
+                    stats.update_queue_memory_from_external(&[
+                        ("q1", q1_mem),
+                        ("q2", q2_mem),
+                        ("q3", q3_mem),
+                        ("q4", q4_mem),
+                        ("q5", q5_mem),
+                        ("q6", q6_mem),
+                        ("q7", q7_mem),
+                    ]);
 
                     stats.add_queue_sample(QueueSample {
                         time_ms: start_time.elapsed().as_millis() as u64,
