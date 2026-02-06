@@ -10,6 +10,7 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
+use crate::metrics::paired_half_match::HalfMatchCollector;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
 
@@ -314,6 +315,8 @@ pub struct ProcessedPositionGroup {
     pub input_record_count: u64,
     /// Base MI offset for this position group (for global uniqueness).
     pub base_mi: u64,
+    /// Half-match metrics for paired UMI strategies (optional).
+    pub half_match_metrics: Option<HalfMatchCollector>,
 }
 
 /// Configuration for position grouping.
