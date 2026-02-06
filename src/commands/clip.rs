@@ -36,7 +36,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::command::Command;
-use super::common::{BamIoOptions, CompressionOptions, SchedulerOptions, ThreadingOptions};
+use super::common::{
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+};
 
 /// Clips reads in a BAM file to remove overlaps
 #[derive(Parser, Debug)]
@@ -146,6 +148,10 @@ pub struct Clip {
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 // ============================================================================
@@ -680,8 +686,6 @@ impl Clip {
         header: Header,
         reference: Arc<ReferenceReader>,
     ) -> Result<u64> {
-        info!("Using 7-step unified pipeline with {num_threads} threads");
-
         // Configure pipeline - clip is writer-heavy workload
         let mut pipeline_config =
             BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
@@ -693,6 +697,11 @@ impl Clip {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedClipMetrics>> = Arc::new(SegQueue::new());
@@ -978,6 +987,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.clipping_mode, "hard");
@@ -1009,6 +1019,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.read_one_five_prime, 5);
@@ -1040,6 +1051,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.clipping_mode, "hard");
@@ -1070,6 +1082,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.clipping_mode, "soft-with-mask");
@@ -1100,6 +1113,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(clip.regenerate_tags);
@@ -1130,6 +1144,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // All options enabled
@@ -1165,6 +1180,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(soft.clipping_mode, "soft");
@@ -1193,6 +1209,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.sort_order, Some("coordinate".to_string()));
@@ -1221,6 +1238,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // R1 5' and R2 3' clipping only
@@ -1253,6 +1271,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // upgrade_clipping should upgrade existing soft clips to hard clips
@@ -1283,6 +1302,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Only clip_extending_past_mate is enabled
@@ -1313,6 +1333,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Only clip_overlapping_reads is enabled
@@ -1343,6 +1364,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // auto_clip_attributes should work with hard clipping
@@ -1373,6 +1395,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // All fixed position clipping is zero (no fixed clipping)
@@ -1405,6 +1428,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.clipping_mode, "soft-with-mask");
@@ -1435,6 +1459,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Large fixed clipping values (e.g., for adapter trimming)
@@ -1467,6 +1492,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Both overlapping read clipping and fixed position clipping
@@ -1498,6 +1524,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let soft_mask = Clip {
@@ -1521,6 +1548,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let hard = Clip {
@@ -1544,6 +1572,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Verify all three modes are distinct
@@ -1575,6 +1604,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.sort_order, Some("queryname".to_string()));
@@ -1603,6 +1633,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(clip.sort_order, Some("unsorted".to_string()));
@@ -1632,6 +1663,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // regenerate_tags should always be true to match fgbio
@@ -1661,6 +1693,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Only R2 3' end clipping
@@ -1693,6 +1726,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(clip.clip_overlapping_reads);
@@ -1723,6 +1757,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(clip.clip_overlapping_reads);
@@ -1753,6 +1788,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // regenerate_tags must always be true (unlike Scala which had option to disable)
@@ -1821,6 +1857,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -1867,6 +1904,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -1912,6 +1950,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -1957,6 +1996,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2002,6 +2042,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2047,6 +2088,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2093,6 +2135,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2139,6 +2182,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2184,6 +2228,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2230,6 +2275,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2276,6 +2322,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 
@@ -2322,6 +2369,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let result = clip.execute("test");
@@ -2366,6 +2414,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let result = clip.execute("test");
@@ -2418,6 +2467,7 @@ mod tests {
             threading,
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         clip.execute("test")?;
 

@@ -15,7 +15,9 @@
 //! quality encodings.
 
 use crate::commands::command::Command;
-use crate::commands::common::{CompressionOptions, SchedulerOptions, ThreadingOptions};
+use crate::commands::common::{
+    CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+};
 use anyhow::{Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
@@ -472,6 +474,10 @@ pub(crate) struct Extract {
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 impl Extract {
@@ -944,7 +950,8 @@ impl Extract {
         });
 
         let num_threads = self.threading.threads.unwrap_or(1);
-        let config =
+
+        let mut config =
             FastqPipelineConfig::new(num_threads, all_bgzf, self.compression.compression_level)
                 .with_stats(self.scheduler_opts.collect_stats())
                 .with_scheduler_strategy(self.scheduler_opts.strategy())
@@ -952,13 +959,10 @@ impl Extract {
                 .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled())
                 .with_synchronized(true); // Extract always uses synchronized FASTQs
 
-        info!(
-            "Using unified 7-step pipeline: threads={}, bgzf={}, stats={}, scheduler={:?}",
-            num_threads,
-            all_bgzf,
-            self.scheduler_opts.collect_stats(),
-            self.scheduler_opts.strategy()
-        );
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        config.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // For Gzip/Plain: open decompressed readers upfront
         // For BGZF: pass None, pipeline opens files directly
@@ -1366,6 +1370,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1421,6 +1426,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1480,6 +1486,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1529,6 +1536,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1587,6 +1595,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1638,6 +1647,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1696,6 +1706,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1751,6 +1762,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1813,6 +1825,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1860,6 +1873,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1930,6 +1944,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -1997,6 +2012,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2045,6 +2061,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2089,6 +2106,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract2.execute("test").unwrap();
@@ -2142,6 +2160,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2194,6 +2213,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2245,6 +2265,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2293,6 +2314,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2338,6 +2360,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2381,6 +2404,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2424,6 +2448,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2475,6 +2500,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2525,6 +2551,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2577,6 +2604,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2617,6 +2645,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2660,6 +2689,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2718,6 +2748,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should panic because read is too short
@@ -2767,6 +2798,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -2973,6 +3005,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should succeed without panicking
@@ -3037,6 +3070,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -3092,6 +3126,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -3162,6 +3197,7 @@ mod tests {
             threading: ThreadingOptions::new(4), // Use multiple threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -3224,6 +3260,7 @@ mod tests {
             threading: ThreadingOptions::new(8), // Use multiple threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test").unwrap();
@@ -3280,6 +3317,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should succeed with all quality tag parameters specified
@@ -3329,6 +3367,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test")?;
@@ -3456,6 +3495,7 @@ mod tests {
             threading,
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         extract.execute("test")?;

@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    BamIoOptions, CompressionOptions, SchedulerOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 use fgumi_lib::sort::PA_TAG;
 
@@ -808,9 +808,9 @@ pub struct MarkDuplicates {
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
 
-    /// Memory limit for pipeline queues in megabytes
-    #[arg(long = "queue-memory-limit-mb", default_value = "4096")]
-    pub queue_memory_limit_mb: u64,
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 impl Command for MarkDuplicates {
@@ -905,11 +905,10 @@ impl Command for MarkDuplicates {
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
 
-        if self.queue_memory_limit_mb > 0 {
-            let limit_bytes = self.queue_memory_limit_mb * 1024 * 1024;
-            pipeline_config.pipeline.queue_memory_limit = limit_bytes;
-            info!("Queue memory limit: {} MB", self.queue_memory_limit_mb);
-        }
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 

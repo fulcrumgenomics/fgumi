@@ -5,7 +5,10 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
+use bytesize::ByteSize;
 use clap::Args;
+use sysinfo::System;
 
 use fgumi_lib::bam_io::is_stdin_path;
 use fgumi_lib::unified_pipeline::SchedulerStrategy;
@@ -401,6 +404,286 @@ impl ThreadingOptions {
     }
 }
 
+/// Options for pipeline queue memory limits.
+///
+/// Controls memory usage in pipeline queues to prevent out-of-memory conditions.
+/// Supports human-readable formats for better UX.
+#[derive(Debug, Clone, Args)]
+pub struct QueueMemoryOptions {
+    /// Pipeline queue memory limit per thread (default) or total.
+    ///
+    /// Plain numbers are interpreted as MB. Also supports human-readable
+    /// formats like "2GB", "1.5GB", or "1024MiB".
+    /// By default this value is per-thread, so with --threads 8 the total
+    /// memory will be 8x this value. Use --queue-memory-per-thread false
+    /// for a fixed total limit.
+    #[arg(long = "queue-memory", default_value = "768")]
+    pub queue_memory: String,
+
+    /// Interpret --queue-memory as per-thread (true, default) or total (false).
+    ///
+    /// When true, total memory = queue-memory * threads. For example,
+    /// --queue-memory 768 with --threads 16 allocates 12 GB total.
+    /// Set to false for a fixed total memory budget regardless of thread count.
+    #[arg(long = "queue-memory-per-thread", default_value = "true")]
+    pub queue_memory_per_thread: bool,
+
+    /// DEPRECATED: Use --queue-memory instead. Memory limit for pipeline queues in megabytes.
+    #[arg(long = "queue-memory-limit-mb", hide = true)]
+    pub queue_memory_limit_mb: Option<u64>,
+}
+
+impl Default for QueueMemoryOptions {
+    fn default() -> Self {
+        Self {
+            queue_memory: "768".to_string(),
+            queue_memory_per_thread: true,
+            queue_memory_limit_mb: None,
+        }
+    }
+}
+
+impl QueueMemoryOptions {
+    /// Maximum reasonable memory per thread (1TB)
+    const MAX_MEMORY_PER_THREAD: u64 = 1024 * 1024 * 1024 * 1024;
+
+    /// Minimum reasonable memory (1MB)
+    const MIN_MEMORY_TOTAL: u64 = 1024 * 1024;
+
+    /// Calculates the total queue memory limit in bytes with comprehensive validation.
+    ///
+    /// This includes system memory checks via `sysinfo` (warns if >90% of system memory).
+    /// Use [`compute_memory_limit`](Self::compute_memory_limit) for the pure arithmetic
+    /// without system queries (e.g. in tests).
+    ///
+    /// # Errors
+    /// Returns an error if the memory size string cannot be parsed, `num_threads` is 0,
+    /// or the memory calculation would overflow.
+    pub fn calculate_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
+        let total_memory = self.compute_memory_limit(num_threads)?;
+        Self::validate_against_system_memory(total_memory);
+        Ok(total_memory)
+    }
+
+    /// Computes the total queue memory limit in bytes (pure arithmetic, no system queries).
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The memory size string cannot be parsed
+    /// - `num_threads` is 0
+    /// - Memory calculation would overflow
+    /// - Memory values are unreasonable
+    pub fn compute_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
+        // Validate thread count
+        if num_threads == 0 {
+            anyhow::bail!("Number of threads must be greater than 0, got: {num_threads}");
+        }
+
+        // Handle migration from old parameter
+        let (base_memory_bytes, is_legacy) = if let Some(legacy_mb) = self.queue_memory_limit_mb {
+            log::warn!(
+                "DEPRECATED: --queue-memory-limit-mb is deprecated. Use --queue-memory instead."
+            );
+            log::warn!(
+                "Migration: --queue-memory-limit-mb {legacy_mb} → --queue-memory {legacy_mb} --queue-memory-per-thread false"
+            );
+            (
+                legacy_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+                    anyhow::anyhow!("Legacy memory size overflow: {legacy_mb} MB")
+                })?,
+                true,
+            )
+        } else {
+            (
+                parse_memory_size(&self.queue_memory).with_context(|| {
+                    format!("Failed to parse queue memory size: {}", self.queue_memory)
+                })?,
+                false,
+            )
+        };
+
+        // Validate base memory range
+        if base_memory_bytes < Self::MIN_MEMORY_TOTAL {
+            anyhow::bail!(
+                "Memory limit too small: {} (minimum: {})",
+                ByteSize(base_memory_bytes),
+                ByteSize(Self::MIN_MEMORY_TOTAL)
+            );
+        }
+
+        // Calculate total memory with overflow checking
+        let total_memory = if self.queue_memory_per_thread && !is_legacy {
+            // Validate per-thread memory limit
+            if base_memory_bytes > Self::MAX_MEMORY_PER_THREAD {
+                anyhow::bail!(
+                    "Memory per thread too large: {} (maximum: {})",
+                    ByteSize(base_memory_bytes),
+                    ByteSize(Self::MAX_MEMORY_PER_THREAD)
+                );
+            }
+
+            // Check for overflow before multiplication
+            base_memory_bytes
+                .checked_mul(num_threads as u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Memory calculation overflow: {} × {} threads exceeds maximum addressable memory",
+                        ByteSize(base_memory_bytes),
+                        num_threads
+                    )
+                })?
+        } else {
+            // Fixed total memory (legacy mode or explicit setting)
+            base_memory_bytes
+        };
+
+        Ok(total_memory)
+    }
+
+    /// Warns if the requested memory exceeds reasonable system limits.
+    fn validate_against_system_memory(requested_bytes: u64) {
+        let mut system = System::new();
+        system.refresh_memory();
+
+        let total_memory_bytes = system.total_memory();
+        let available_memory_bytes = system.available_memory();
+
+        // Calculate 90% limit using integer arithmetic to avoid precision loss
+        let memory_limit = total_memory_bytes - (total_memory_bytes / 10); // 90% = total - 10%
+        if requested_bytes > memory_limit {
+            log::warn!(
+                "Requested memory {} exceeds 90% of system memory ({}). System has {} total, {} available. This may cause OOM conditions.",
+                ByteSize(requested_bytes),
+                ByteSize(memory_limit),
+                ByteSize(total_memory_bytes),
+                ByteSize(available_memory_bytes)
+            );
+        }
+
+        // Warn if requesting more than currently available memory
+        if requested_bytes > available_memory_bytes {
+            log::warn!(
+                "Requested memory {} exceeds currently available memory {}. This may cause swapping.",
+                ByteSize(requested_bytes),
+                ByteSize(available_memory_bytes)
+            );
+        }
+    }
+
+    /// Logs the memory configuration.
+    ///
+    /// # Arguments
+    /// * `num_threads` - Number of threads for the calculation
+    /// * `total_memory` - Pre-computed total memory limit in bytes from `calculate_memory_limit`
+    pub fn log_memory_config(&self, num_threads: usize, total_memory: u64) {
+        if let Some(legacy_mb) = self.queue_memory_limit_mb {
+            log::info!(
+                "Queue memory limit: {} (LEGACY: {legacy_mb} MB total, per-thread scaling disabled)",
+                ByteSize(total_memory)
+            );
+        } else if self.queue_memory_per_thread && num_threads > 1 {
+            log::info!(
+                "Queue memory limit: {} total ({} MB/thread × {} threads)",
+                ByteSize(total_memory),
+                self.queue_memory,
+                num_threads
+            );
+        } else {
+            log::info!("Queue memory limit: {} total (fixed)", ByteSize(total_memory));
+        }
+    }
+}
+
+/// Parses a memory size string into bytes.
+///
+/// Accepts both plain numbers (interpreted as MB) and human-readable formats like:
+/// - "2GB", "2G" -> 2 gigabytes
+/// - "1.5GB" -> 1.5 gigabytes
+/// - "1024MB", "1024M" -> 1024 megabytes
+/// - "512MiB" -> 512 mebibytes
+/// - "768" -> 768 megabytes (backward compatibility)
+///
+/// # Examples
+///
+/// ```
+/// # use anyhow::Result;
+/// # use fgumi::commands::common::parse_memory_size;
+/// assert_eq!(parse_memory_size("768")?, 768 * 1024 * 1024);
+/// assert_eq!(parse_memory_size("2GB")?, 2 * 1000 * 1000 * 1000);
+/// assert_eq!(parse_memory_size("1024MiB")?, 1024 * 1024 * 1024);
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the string cannot be parsed as a valid size.
+pub fn parse_memory_size(size_str: &str) -> anyhow::Result<u64> {
+    // Validate input string
+    let trimmed = size_str.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Memory size cannot be empty");
+    }
+
+    // Handle negative values early
+    if trimmed.starts_with('-') {
+        anyhow::bail!("Memory size cannot be negative: '{trimmed}'");
+    }
+
+    // First try parsing as a plain integer in MB (backward compatibility)
+    // Only accept simple integers, not floats or scientific notation
+    if let Ok(mb_value) = trimmed.parse::<u64>() {
+        // Validate reasonable range for plain numbers
+        if mb_value == 0 {
+            anyhow::bail!("Memory size cannot be zero");
+        }
+        if mb_value > 1_000_000 {
+            // Sanity guard: >1TB as a plain number likely means the user forgot a unit suffix.
+            // Values above this should use human-readable format (e.g. "2TB") which bypasses
+            // this check and goes through ByteSize parsing instead.
+            anyhow::bail!(
+                "Plain number memory size too large: {} MB. Use human-readable format like '{}GB' instead.",
+                mb_value,
+                mb_value / 1000
+            );
+        }
+
+        return mb_value
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("Memory size calculation overflow for {mb_value} MB"));
+    }
+
+    // Reject scientific notation (e.g. "1e3") but allow decimals in human-readable sizes (e.g. "1.5GB")
+    if trimmed.contains('e') || trimmed.contains('E') {
+        anyhow::bail!(
+            "Scientific notation not supported: '{trimmed}'. Use integer values or human-readable formats like '2GB'."
+        );
+    }
+
+    // Reject bare decimal numbers without a unit suffix (e.g. "1.5") since plain numbers are MB
+    if trimmed.contains('.') && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        anyhow::bail!(
+            "Plain decimal numbers not supported: '{trimmed}'. Use an integer for MB (e.g. '768') or a human-readable format (e.g. '1.5GB')."
+        );
+    }
+
+    // Fall back to parsing as a human-readable size (like "2GB", "1024MiB")
+    match trimmed.parse::<ByteSize>() {
+        Ok(size) => {
+            if size.0 == 0 {
+                anyhow::bail!("Memory size cannot be zero: '{trimmed}'");
+            }
+            Ok(size.0)
+        }
+        Err(_) => {
+            anyhow::bail!(
+                "Invalid memory size '{trimmed}'. Valid formats:\n\
+                 - Plain numbers (interpreted as MB): '768', '4096'\n\
+                 - Human-readable (decimal): '2GB', '1024MB'\n\
+                 - Human-readable (binary): '1GiB', '512MiB'"
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +851,197 @@ mod tests {
             deadlock_recover: true,
         };
         assert!(opts.deadlock_recover_enabled());
+    }
+
+    // ========== Tests for memory size parsing ==========
+
+    #[test]
+    fn test_parse_memory_size_plain_numbers() {
+        assert_eq!(parse_memory_size("768").unwrap(), 768 * 1024 * 1024);
+        assert_eq!(parse_memory_size("1").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_size("4096").unwrap(), 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_size_human_readable() {
+        assert_eq!(parse_memory_size("2GB").unwrap(), 2 * 1000 * 1000 * 1000);
+        assert_eq!(parse_memory_size("2G").unwrap(), 2 * 1000 * 1000 * 1000);
+        assert_eq!(parse_memory_size("1024MB").unwrap(), 1024 * 1000 * 1000);
+        assert_eq!(parse_memory_size("1024M").unwrap(), 1024 * 1000 * 1000);
+        assert_eq!(parse_memory_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_size("512MiB").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_size_invalid() {
+        assert!(parse_memory_size("invalid").is_err());
+        assert!(parse_memory_size("").is_err());
+        assert!(parse_memory_size("GB2").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_size_zero() {
+        // Zero values should be rejected
+        assert!(parse_memory_size("0").is_err());
+        assert!(parse_memory_size("0MB").is_err());
+        assert!(parse_memory_size("0GB").is_err());
+    }
+
+    // ========== Tests for new edge cases and validation ==========
+
+    #[test]
+    fn test_parse_memory_size_edge_cases() {
+        // Empty and whitespace
+        assert!(parse_memory_size("").is_err());
+        assert!(parse_memory_size("   ").is_err());
+
+        // Negative values
+        assert!(parse_memory_size("-100").is_err());
+        assert!(parse_memory_size("-1GB").is_err());
+
+        // Bare floating point without unit suffix (should be rejected)
+        assert!(parse_memory_size("1.5").is_err());
+
+        // Floating point with unit suffix (should be accepted via ByteSize)
+        assert!(parse_memory_size("1.5GB").is_ok());
+        assert!(parse_memory_size("2.5GB").is_ok());
+
+        // Scientific notation (should be rejected for plain numbers)
+        assert!(parse_memory_size("1e3").is_err());
+        assert!(parse_memory_size("1E6").is_err());
+
+        // Very large plain numbers (should be rejected)
+        assert!(parse_memory_size("9999999").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_size_whitespace_handling() {
+        // Trimmed input should work
+        assert_eq!(parse_memory_size("  768  ").unwrap(), 768 * 1024 * 1024);
+        assert_eq!(parse_memory_size("\t1GB\n").unwrap(), 1000 * 1000 * 1000);
+    }
+
+    #[test]
+    fn test_parse_memory_size_overflow() {
+        // Very large MB values should be caught
+        let very_large = format!("{}", u64::MAX / 1024); // Would overflow when * 1024 * 1024
+        assert!(parse_memory_size(&very_large).is_err());
+    }
+
+    // ========== Tests for QueueMemoryOptions ==========
+
+    #[test]
+    fn test_queue_memory_options_compute_basic() {
+        let opts = QueueMemoryOptions {
+            queue_memory: "100".to_string(),
+            queue_memory_per_thread: true,
+            queue_memory_limit_mb: None,
+        };
+
+        // 100MB × 4 threads = 400MB
+        let result = opts.compute_memory_limit(4).unwrap();
+        assert_eq!(result, 100 * 1024 * 1024 * 4);
+
+        // Fixed memory (no scaling)
+        let opts_fixed = QueueMemoryOptions {
+            queue_memory: "200".to_string(),
+            queue_memory_per_thread: false,
+            queue_memory_limit_mb: None,
+        };
+        let result_fixed = opts_fixed.compute_memory_limit(8).unwrap();
+        assert_eq!(result_fixed, 200 * 1024 * 1024); // Should not scale
+    }
+
+    #[test]
+    fn test_queue_memory_options_validation_errors() {
+        let opts = QueueMemoryOptions::default();
+
+        // Zero threads should fail
+        assert!(opts.compute_memory_limit(0).is_err());
+
+        // Very large memory per thread should fail
+        let large_opts = QueueMemoryOptions {
+            queue_memory: "2TB".to_string(),
+            queue_memory_per_thread: true,
+            queue_memory_limit_mb: None,
+        };
+        assert!(large_opts.compute_memory_limit(1).is_err());
+
+        // Very small memory should fail
+        let tiny_opts = QueueMemoryOptions {
+            queue_memory: "1KB".to_string(),
+            queue_memory_per_thread: false,
+            queue_memory_limit_mb: None,
+        };
+        assert!(tiny_opts.compute_memory_limit(1).is_err());
+    }
+
+    #[test]
+    fn test_queue_memory_options_overflow() {
+        let opts = QueueMemoryOptions {
+            queue_memory: "2TB".to_string(), // 2TB > 1TB limit
+            queue_memory_per_thread: true,
+            queue_memory_limit_mb: None,
+        };
+
+        // Should fail due to per-thread limit
+        assert!(opts.compute_memory_limit(1).is_err());
+
+        // Large total (100TB) succeeds at the math level (system check is separate)
+        let opts2 = QueueMemoryOptions {
+            queue_memory: "100GB".to_string(),
+            queue_memory_per_thread: true,
+            queue_memory_limit_mb: None,
+        };
+        assert!(opts2.compute_memory_limit(1000).is_ok());
+    }
+
+    #[test]
+    fn test_queue_memory_options_legacy_migration() {
+        let legacy_opts = QueueMemoryOptions {
+            queue_memory: "768".to_string(), // Should be ignored
+            queue_memory_per_thread: true,   // Should be ignored
+            queue_memory_limit_mb: Some(2048),
+        };
+
+        let result = legacy_opts.compute_memory_limit(4).unwrap();
+        assert_eq!(result, 2048 * 1024 * 1024); // Should use legacy value, no scaling
+    }
+
+    #[test]
+    fn test_queue_memory_options_human_readable() {
+        let opts = QueueMemoryOptions {
+            queue_memory: "2GB".to_string(),
+            queue_memory_per_thread: false,
+            queue_memory_limit_mb: None,
+        };
+
+        let result = opts.compute_memory_limit(4).unwrap();
+        assert_eq!(result, 2 * 1000 * 1000 * 1000); // 2GB in bytes
+    }
+
+    #[test]
+    fn test_queue_memory_options_small_value() {
+        let opts = QueueMemoryOptions {
+            queue_memory: "1".to_string(), // 1MB
+            queue_memory_per_thread: false,
+            queue_memory_limit_mb: None,
+        };
+
+        assert!(opts.compute_memory_limit(1).is_ok());
+    }
+
+    #[test]
+    fn test_sysinfo_returns_reasonable_values() {
+        use sysinfo::System;
+        let mut system = System::new();
+        system.refresh_memory();
+
+        let total = system.total_memory();
+        let available = system.available_memory();
+
+        assert!(total > 100_000_000); // > 100MB
+        assert!(available > 0);
+        assert!(available <= total);
     }
 }

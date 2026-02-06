@@ -18,8 +18,8 @@ use fgumi_lib::bam_io::{
 };
 
 use super::common::{
-    BamIoOptions, CompressionOptions, ConsensusCallingOptions, ReadGroupOptions, RejectsOptions,
-    SchedulerOptions, StatsOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, ConsensusCallingOptions, QueueMemoryOptions,
+    ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
 };
 use fgumi_lib::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats,
@@ -233,6 +233,10 @@ pub struct Codec {
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 impl Command for Codec {
@@ -491,8 +495,6 @@ impl Codec {
         read_name_prefix: String,
         track_rejects: bool,
     ) -> Result<()> {
-        info!("Using 7-step unified pipeline with {num_threads} threads");
-
         // Configure pipeline
         let mut pipeline_config =
             BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
@@ -504,6 +506,11 @@ impl Codec {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedCodecMetrics>> = Arc::new(SegQueue::new());
@@ -705,6 +712,7 @@ mod tests {
             cell_tag: None,
             sort_order: None,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         }
     }
 

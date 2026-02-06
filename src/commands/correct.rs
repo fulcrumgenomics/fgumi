@@ -10,7 +10,10 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use fgumi_lib::correct_umis::CorrectUmis;
-//! use fgumi_lib::commands::common::{BamIoOptions, RejectsOptions, ThreadingOptions};
+//! use fgumi_lib::commands::common::{
+//!     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
+//!     SchedulerOptions, ThreadingOptions,
+//! };
 //!
 //! let corrector = CorrectUmis {
 //!     io: BamIoOptions {
@@ -29,6 +32,9 @@
 //!     min_corrected: None,
 //!     revcomp: false,
 //!     threading: ThreadingOptions::new(4),
+//!     compression: CompressionOptions::default(),
+//!     scheduler_opts: SchedulerOptions::default(),
+//!     queue_memory: QueueMemoryOptions::default(),
 //! };
 //!
 //! corrector.execute().expect("Failed to correct UMIs");
@@ -68,7 +74,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    BamIoOptions, CompressionOptions, RejectsOptions, SchedulerOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
+    ThreadingOptions,
 };
 
 /// Result of matching an observed UMI to an expected UMI.
@@ -109,7 +116,10 @@ pub struct UmiMatch {
 ///
 /// ```no_run
 /// # use fgumi_lib::correct_umis::CorrectUmis;
-/// # use fgumi_lib::commands::common::{BamIoOptions, RejectsOptions, ThreadingOptions};
+/// # use fgumi_lib::commands::common::{
+/// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
+/// #     SchedulerOptions, ThreadingOptions,
+/// # };
 /// # use std::path::PathBuf;
 /// let corrector = CorrectUmis {
 ///     io: BamIoOptions {
@@ -128,6 +138,9 @@ pub struct UmiMatch {
 ///     min_corrected: None,
 ///     revcomp: false,
 ///     threading: ThreadingOptions::new(4),
+///     compression: CompressionOptions::default(),
+///     scheduler_opts: SchedulerOptions::default(),
+///     queue_memory: QueueMemoryOptions::default(),
 /// };
 ///
 /// corrector.execute("test")?;
@@ -245,6 +258,10 @@ pub struct CorrectUmis {
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -767,8 +784,6 @@ impl CorrectUmis {
         umi_length: usize,
         track_rejects: bool,
     ) -> Result<u64> {
-        info!("Using 7-step unified pipeline with {num_threads} threads");
-
         // Configure pipeline - correct is ReaderHeavy (70% in decompression)
         let mut pipeline_config =
             BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
@@ -780,6 +795,11 @@ impl CorrectUmis {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedCorrectMetrics>> = Arc::new(SegQueue::new());
@@ -1525,6 +1545,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         }
     }
 
@@ -1753,6 +1774,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -1787,6 +1809,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(corrector.execute("test").is_err());
@@ -1815,6 +1838,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -1866,6 +1890,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -1927,6 +1952,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -1983,6 +2009,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         corrector1.execute("test")?;
 
@@ -2003,6 +2030,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         corrector2.execute("test")?;
 
@@ -2044,6 +2072,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         corrector.execute("test")?;
 
@@ -2083,6 +2112,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         corrector2.execute("test")?;
 
@@ -2123,6 +2153,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         corrector.execute("test")?;
 
@@ -2176,6 +2207,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2225,6 +2257,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2275,6 +2308,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2316,6 +2350,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2356,6 +2391,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2395,6 +2431,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should succeed - 3/4 = 75% pass
@@ -2428,6 +2465,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should fail - only 1/4 = 25% pass, which is below 75% threshold
@@ -2465,6 +2503,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2518,6 +2557,7 @@ mod tests {
             threading: ThreadingOptions::new(4), // Multiple threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2576,6 +2616,7 @@ mod tests {
             threading: ThreadingOptions::new(8), // 8 threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2911,6 +2952,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -2970,6 +3012,7 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -3048,6 +3091,7 @@ mod tests {
             threading: ThreadingOptions::new(4), // Multi-threaded!
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
@@ -3114,6 +3158,7 @@ mod tests {
             threading,
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         corrector.execute("test")?;
