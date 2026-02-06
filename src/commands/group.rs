@@ -546,6 +546,12 @@ pub struct GroupReadsByUmi {
     /// Use 0 to disable the limit.
     #[arg(long = "queue-memory-limit-mb", default_value = "4096")]
     pub queue_memory_limit_mb: u64,
+
+    /// Use the 3' position when grouping single-end reads.
+    /// When enabled, single-end reads of different lengths at the same 5' position
+    /// will be placed in separate groups (since their 3' positions differ).
+    #[arg(long = "single-end-three-prime")]
+    pub single_end_three_prime: bool,
 }
 
 impl Command for GroupReadsByUmi {
@@ -981,7 +987,8 @@ impl GroupReadsByUmi {
             let record = record_result?;
 
             // Compute GroupKey for this record
-            let key = compute_group_key(&record, &library_index, cell_tag);
+            let key =
+                compute_group_key(&record, &library_index, cell_tag, self.single_end_three_prime);
             let decoded = DecodedRecord::new(record, key);
 
             // Feed to PositionGrouper - may emit completed groups
@@ -1007,8 +1014,10 @@ impl GroupReadsByUmi {
             progress.log_if_needed(1);
         }
 
-        // Finish grouper - emit final group
-        if let Some(final_group) = grouper.finish()? {
+        // Finish grouper - emit final groups
+        // The grouper may have multiple remaining groups when templates at EOF have different
+        // position keys (e.g., single-end reads with --single-end-three-prime enabled).
+        while let Some(final_group) = grouper.finish()? {
             Self::process_and_write_position_group(
                 final_group,
                 filter_config,
@@ -1701,6 +1710,78 @@ mod tests {
         builder.build()
     }
 
+    /// Default read length when CIGAR is empty or doesn't consume any query bases.
+    const DEFAULT_TEST_READ_LENGTH: usize = 100;
+
+    /// Calculate the read length from a CIGAR string by summing operations that consume the query.
+    /// Operations that consume query: M, I, S, =, X
+    /// Operations that don't consume query: D, N, H, P
+    fn cigar_read_length(cigar: &str) -> usize {
+        let mut read_len = 0usize;
+        let mut num_str = String::new();
+
+        for c in cigar.chars() {
+            if c.is_ascii_digit() {
+                num_str.push(c);
+            } else {
+                let len: usize = num_str.parse().unwrap_or(0);
+                num_str.clear();
+                // Operations that consume the query sequence
+                if matches!(c, 'M' | 'I' | 'S' | '=' | 'X') {
+                    read_len += len;
+                }
+            }
+        }
+        if read_len == 0 { DEFAULT_TEST_READ_LENGTH } else { read_len }
+    }
+
+    /// Build a test read with custom CIGAR string
+    #[allow(clippy::cast_sign_loss)]
+    fn build_test_read_with_cigar(
+        name: &str,
+        ref_id: usize,
+        pos: i32,
+        mapq: u8,
+        flags: u16,
+        umi: &str,
+        cigar: &str,
+    ) -> sam::alignment::RecordBuf {
+        // Generate sequence based on CIGAR read length
+        let read_len = cigar_read_length(cigar);
+        let seq: String = "ACGT".chars().cycle().take(read_len).collect();
+
+        let mut builder = RecordBuilder::new()
+            .name(name)
+            .sequence(&seq)
+            .reference_sequence_id(ref_id)
+            .alignment_start(pos as usize)
+            .mapping_quality(mapq)
+            .cigar(cigar)
+            .tag("RX", umi);
+
+        // Set flags based on raw u16
+        let sam_flags = sam::alignment::record::Flags::from(flags);
+        if sam_flags.is_segmented() {
+            builder = builder.paired(true);
+        }
+        if sam_flags.is_first_segment() {
+            builder = builder.first_segment(true);
+        } else if sam_flags.is_last_segment() {
+            builder = builder.first_segment(false);
+        }
+        if sam_flags.is_reverse_complemented() {
+            builder = builder.reverse_complement(true);
+        }
+        if sam_flags.is_unmapped() {
+            builder = builder.unmapped(true);
+        }
+        if sam_flags.is_mate_unmapped() {
+            builder = builder.mate_unmapped(true);
+        }
+
+        builder.build()
+    }
+
     /// Create a pair of reads
     #[allow(clippy::cast_sign_loss)]
     fn build_test_pair(
@@ -1832,6 +1913,42 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn test_cigar_read_length_simple() {
+        // Simple match
+        assert_eq!(cigar_read_length("100M"), 100);
+        // Match with soft clips
+        assert_eq!(cigar_read_length("10S90M"), 100);
+        assert_eq!(cigar_read_length("90M10S"), 100);
+        assert_eq!(cigar_read_length("5S90M5S"), 100);
+    }
+
+    #[test]
+    fn test_cigar_read_length_with_deletions() {
+        // Deletions don't consume read sequence
+        assert_eq!(cigar_read_length("50M10D50M"), 100);
+        assert_eq!(cigar_read_length("10M5D10M"), 20);
+    }
+
+    #[test]
+    fn test_cigar_read_length_with_insertions() {
+        // Insertions consume read sequence
+        assert_eq!(cigar_read_length("50M10I40M"), 100);
+        assert_eq!(cigar_read_length("10M5I10M"), 25);
+    }
+
+    #[test]
+    fn test_cigar_read_length_complex() {
+        // Complex CIGAR: 5S + 10M + 5I + 20M + 10D + 30M + 5S = 75 read bases
+        assert_eq!(cigar_read_length("5S10M5I20M10D30M5S"), 75);
+    }
+
+    #[test]
+    fn test_cigar_read_length_empty_returns_default() {
+        // Empty CIGAR returns default
+        assert_eq!(cigar_read_length(""), DEFAULT_TEST_READ_LENGTH);
+    }
+
+    #[test]
     fn test_umi_for_read_assigns_ab_prefixes_by_coordinates() {
         let assigner: Box<dyn UmiAssigner> = Box::new(PairedUmiAssigner::new(1));
 
@@ -1894,6 +2011,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
@@ -1925,6 +2043,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
@@ -1956,6 +2075,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
@@ -2014,6 +2134,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2069,6 +2190,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2118,6 +2240,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2165,6 +2288,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2175,6 +2299,108 @@ mod tests {
         // Should have 4 groups
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 4, "Should have 4 UMI groups");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_end_different_lengths_separate_groups() -> Result<()> {
+        // Two reads at same 5' position with same UMI but different lengths (different 3' positions)
+        // Should be in DIFFERENT groups due to different 3' positions
+        let records: Vec<RecordBuf> = vec![
+            // 50M at position 100: 3' position = 100 + 50 - 1 = 149
+            build_test_read_with_cigar("a01", 0, 100, 60, 0, "AAAAAAAA", "50M"),
+            // Another 50M at position 100 with same UMI (same group as a01)
+            build_test_read_with_cigar("a02", 0, 100, 60, 0, "AAAAAAAA", "50M"),
+            // 100M at position 100: 3' position = 100 + 100 - 1 = 199 (different group)
+            build_test_read_with_cigar("a03", 0, 100, 60, 0, "AAAAAAAA", "100M"),
+            // Another 100M at position 100 with same UMI (same group as a03)
+            build_test_read_with_cigar("a04", 0, 100, 60, 0, "AAAAAAAA", "100M"),
+        ];
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            single_end_three_prime: true,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "Should have all 4 records");
+
+        // With single_end_three_prime: true, should have 2 groups: one for 50M reads, one for 100M reads
+        // Even though they have the same UMI and same 5' position, they differ in 3' position
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 2, "Should have 2 UMI groups (different 3' positions)");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_end_different_lengths_same_group_by_default() -> Result<()> {
+        // Two reads at same 5' position with same UMI but different lengths (different 3' positions)
+        // With default behavior (single_end_three_prime: false), should be in SAME group
+        let records: Vec<RecordBuf> = vec![
+            // 50M at position 100: 3' position = 100 + 50 - 1 = 149
+            build_test_read_with_cigar("a01", 0, 100, 60, 0, "AAAAAAAA", "50M"),
+            // Another 50M at position 100 with same UMI
+            build_test_read_with_cigar("a02", 0, 100, 60, 0, "AAAAAAAA", "50M"),
+            // 100M at position 100: 3' position = 100 + 100 - 1 = 199
+            build_test_read_with_cigar("a03", 0, 100, 60, 0, "AAAAAAAA", "100M"),
+            // Another 100M at position 100 with same UMI
+            build_test_read_with_cigar("a04", 0, 100, 60, 0, "AAAAAAAA", "100M"),
+        ];
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy: Strategy::Identity,
+            edits: 0,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 4, "Should have all 4 records");
+
+        // With single_end_three_prime: false (default), should have 1 group
+        // All reads share the same 5' position and UMI, so they're grouped together
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "Should have 1 UMI group (default ignores 3' position)");
 
         Ok(())
     }
@@ -2223,6 +2449,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2301,6 +2528,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2350,6 +2578,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2403,6 +2632,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2478,6 +2708,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2610,6 +2841,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2660,6 +2892,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2728,6 +2961,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2802,6 +3036,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2877,6 +3112,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -2975,6 +3211,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3073,6 +3310,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3150,6 +3388,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3208,6 +3447,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3262,6 +3502,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3321,6 +3562,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3381,6 +3623,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3428,6 +3671,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3478,6 +3722,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3528,6 +3773,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3579,6 +3825,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3622,6 +3869,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3671,6 +3919,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3720,6 +3969,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3770,6 +4020,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3817,6 +4068,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         // Should handle gracefully (either error or filter out)
@@ -3863,6 +4115,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3912,6 +4165,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -3956,6 +4210,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4005,6 +4260,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4044,6 +4300,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4089,6 +4346,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4130,6 +4388,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4176,6 +4435,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4220,6 +4480,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4277,6 +4538,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4437,6 +4699,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4507,6 +4770,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
@@ -4578,6 +4842,7 @@ mod tests {
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory_limit_mb: 0,
+            single_end_three_prime: false,
         };
 
         cmd.execute("test")?;
