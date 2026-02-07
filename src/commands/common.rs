@@ -8,8 +8,6 @@ use std::path::PathBuf;
 use anyhow::Context;
 use bytesize::ByteSize;
 use clap::Args;
-use sysinfo::System;
-
 use fgumi_lib::bam_io::is_stdin_path;
 use fgumi_lib::unified_pipeline::SchedulerStrategy;
 use fgumi_lib::validation::validate_file_exists;
@@ -461,6 +459,7 @@ impl QueueMemoryOptions {
     /// or the memory calculation would overflow.
     pub fn calculate_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
         let total_memory = self.compute_memory_limit(num_threads)?;
+        #[cfg(feature = "memory-debug")]
         Self::validate_against_system_memory(total_memory);
         Ok(total_memory)
     }
@@ -541,7 +540,9 @@ impl QueueMemoryOptions {
     }
 
     /// Warns if the requested memory exceeds reasonable system limits.
+    #[cfg(feature = "memory-debug")]
     fn validate_against_system_memory(requested_bytes: u64) {
+        use sysinfo::System;
         let mut system = System::new();
         system.refresh_memory();
 
@@ -1032,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "memory-debug")]
     fn test_sysinfo_returns_reasonable_values() {
         use sysinfo::System;
         let mut system = System::new();

@@ -3,7 +3,8 @@
 //! Run with: `cargo bench`
 //! View reports in: `target/criterion/report/index.html`
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use bstr::BString;
 use fgumi_lib::bitenc::BitEnc;

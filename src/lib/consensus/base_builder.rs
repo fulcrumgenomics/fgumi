@@ -359,7 +359,7 @@ impl ConsensusBaseBuilder {
         // threshold = 23 corresponds to likelihood ratio > 10^10, giving Q > 90
         const FAST_PATH_THRESHOLD: f64 = 23.0;
 
-        let likelihoods = self.likelihoods.as_array_ref();
+        let likelihoods = self.likelihoods.as_array();
         let winner_ll = likelihoods[base_idx];
         let loser_ll = likelihoods[(base_idx + 1) % 4]; // Any loser will do (all same)
 
@@ -391,7 +391,7 @@ impl ConsensusBaseBuilder {
         }
 
         // Extract likelihoods as array for iteration and function calls
-        let likelihoods = self.likelihoods.as_array_ref();
+        let likelihoods = self.likelihoods.as_array();
 
         // Compute the sum of likelihoods for normalization
         let ln_sum = ln_sum_exp_array(likelihoods);
