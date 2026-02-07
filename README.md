@@ -51,6 +51,7 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 
 * [Documentation](https://docs.rs/fgumi)
 * [Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/best-practice-consensus-pipeline.md): Recommended workflow from FASTQ to consensus
+* [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md): Threading, memory, and compression optimization
 * [Snakemake Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/FastqToConsensus-RnD.smk): Reference implementation
 * [Metrics](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/metrics.md): Output metrics documentation
 * [Developing](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/DEVELOPING.md): Developer guide
@@ -206,21 +207,15 @@ fgumi filter \
   --reference ref.fa
 ```
 
-## Threading Options
+## Performance Options
 
-fgumi supports multi-threading for parallel processing:
+fgumi supports multi-threading and memory management for optimal performance:
 
-- `--threads 0` or `--threads 1` or omitted → single-threaded
-- `--threads N` where N > 1 → multi-threaded with N threads
+- **Threading**: `--threads N` for parallel processing
+- **Memory**: `--queue-memory 768` (plain numbers are MB; supports human-readable formats like `2GB`)
+- **Compression**: `--compression-level 1-9` for speed vs size trade-offs
 
-Thread distribution is optimized per-command based on workload profiling.
-
-| Scenario | Recommendation |
-|----------|----------------|
-| SLURM job with 8 CPUs allocated | `--threads 8` |
-| Dedicated 16-core workstation | `--threads 16` |
-| Shared login node | `--threads 2` (or avoid heavy jobs) |
-| Snakemake/Nextflow with resource limits | `--threads {threads}` |
+For detailed performance tuning guidance, see the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md).
 
 ## Performance
 

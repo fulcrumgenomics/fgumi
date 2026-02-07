@@ -15,7 +15,8 @@ use fgumi_lib::bam_io::{
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
-    ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
+    QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
+    ThreadingOptions,
 };
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
@@ -193,6 +194,10 @@ pub struct Duplex {
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 impl Command for Duplex {
@@ -504,8 +509,6 @@ impl Duplex {
         track_rejects: bool,
         command_line: &str,
     ) -> Result<()> {
-        info!("Using 7-step unified pipeline with {num_threads} threads");
-
         // Create output header (for duplex, output is unmapped like simplex)
         let output_header = create_unmapped_consensus_header(
             &input_header,
@@ -526,6 +529,11 @@ impl Duplex {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedDuplexMetrics>> = Arc::new(SegQueue::new());
@@ -801,6 +809,7 @@ mod tests {
             max_reads_per_strand: None,
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         }
     }
 

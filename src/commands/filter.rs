@@ -44,7 +44,7 @@ use std::time::Instant;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    BamIoOptions, CompressionOptions, SchedulerOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -180,6 +180,10 @@ pub struct Filter {
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
+
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 // ============================================================================
@@ -621,8 +625,6 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        info!("Using 7-step unified pipeline with {num_threads} threads (single-read mode)");
-
         // Configure pipeline - filter is Balanced workload
         let mut pipeline_config =
             BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
@@ -634,6 +636,11 @@ impl Filter {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Create filter configuration
         let config = Arc::new(FilterConfig::new(
@@ -846,8 +853,6 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        info!("Using 7-step unified pipeline with {num_threads} threads (template-aware mode)");
-
         // Configure pipeline - filter is Balanced workload
         let mut pipeline_config =
             BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
@@ -859,6 +864,11 @@ impl Filter {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Create filter configuration
         let config = Arc::new(FilterConfig::new(
@@ -1630,6 +1640,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         }
     }
 
@@ -1713,6 +1724,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_base_quality, Some(13));
@@ -1743,6 +1755,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.threading.threads, Some(8));
@@ -1771,6 +1784,7 @@ mod tests {
             stats: Some(PathBuf::from("stats.txt")),
             require_single_strand_agreement: true,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_mean_base_quality, Some(20.0));
@@ -1802,6 +1816,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.validate_parameters().is_err());
@@ -1830,6 +1845,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.validate_parameters().is_err());
@@ -2221,6 +2237,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should fail validation
@@ -2255,6 +2272,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should pass validation
@@ -2287,6 +2305,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.rejects.is_some());
@@ -2316,6 +2335,7 @@ mod tests {
             stats: Some(PathBuf::from("stats.txt")),
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.stats.is_some());
@@ -2345,6 +2365,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.threading.threads, Some(8));
@@ -2373,6 +2394,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: true,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.require_single_strand_agreement);
@@ -2401,6 +2423,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(!filter.filter_by_template);
@@ -2429,6 +2452,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.sort_order, Some("coordinate".to_string()));
@@ -2457,6 +2481,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.sort_order, Some("queryname".to_string()));
@@ -2485,6 +2510,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(!filter.reverse_per_base_tags);
@@ -2513,6 +2539,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_base_quality, Some(30));
@@ -2541,6 +2568,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_mean_base_quality, Some(25.0));
@@ -2569,6 +2597,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.max_read_error_rate[0], 0.01);
@@ -2599,6 +2628,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.max_read_error_rate[0], 0.5);
@@ -2629,6 +2659,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_reads[0], 10);
@@ -2658,6 +2689,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_reads.len(), 3);
@@ -2689,6 +2721,7 @@ mod tests {
             stats: Some(PathBuf::from("stats.txt")),
             require_single_strand_agreement: true,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.rejects.is_some());
@@ -2721,6 +2754,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.max_no_call_fraction, 0.0);
@@ -2749,6 +2783,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         assert_eq!(filter.min_base_quality, Some(2));
@@ -2851,6 +2886,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")
     }
@@ -2970,6 +3006,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3122,6 +3159,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3193,6 +3231,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3258,6 +3297,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3380,6 +3420,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3447,6 +3488,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3512,6 +3554,7 @@ mod tests {
             stats: Some(stats_path.clone()),
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3581,6 +3624,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd_single.execute("test")?;
 
@@ -3603,6 +3647,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd_multi.execute("test")?;
 
@@ -3665,6 +3710,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3718,6 +3764,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3774,6 +3821,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -3839,6 +3887,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd_single.execute("test")?;
 
@@ -3861,6 +3910,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd_multi.execute("test")?;
 
@@ -3941,6 +3991,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -4049,6 +4100,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -4163,6 +4215,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -4198,6 +4251,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let result = cmd.validate_parameters();
@@ -4228,6 +4282,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let result = cmd.validate_parameters();
@@ -4282,6 +4337,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -4341,6 +4397,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 
@@ -4403,6 +4460,7 @@ mod tests {
             stats: None,
             require_single_strand_agreement: false,
             scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
         };
         cmd.execute("test")?;
 

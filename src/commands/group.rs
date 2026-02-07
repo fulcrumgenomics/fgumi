@@ -4,7 +4,7 @@
 
 use crate::commands::command::Command;
 use crate::commands::common::{
-    BamIoOptions, CompressionOptions, SchedulerOptions, ThreadingOptions,
+    BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
@@ -541,11 +541,9 @@ pub struct GroupReadsByUmi {
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
 
-    /// Memory limit for pipeline queues in megabytes (default: 4096 = 4GB).
-    /// Applies backpressure when queue memory exceeds this limit.
-    /// Use 0 to disable the limit.
-    #[arg(long = "queue-memory-limit-mb", default_value = "4096")]
-    pub queue_memory_limit_mb: u64,
+    /// Queue memory options.
+    #[command(flatten)]
+    pub queue_memory: QueueMemoryOptions,
 }
 
 impl Command for GroupReadsByUmi {
@@ -677,17 +675,13 @@ impl Command for GroupReadsByUmi {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
-        // Set memory limit if specified (convert MB to bytes)
-        if self.queue_memory_limit_mb > 0 {
-            let limit_bytes = self.queue_memory_limit_mb * 1024 * 1024;
-            pipeline_config.pipeline.queue_memory_limit = limit_bytes;
-            info!("Queue memory limit: {} MB", self.queue_memory_limit_mb);
-        }
+        // Calculate and apply queue memory limit
+        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
+        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         // Template-based batching is enabled by default in auto_tuned() with target=500 templates.
         // This provides consistent batch sizes across datasets with varying templates-per-group ratios.
-
-        info!("Using 7-step unified pipeline with {num_threads} threads");
 
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
         let records_processed = run_bam_pipeline_from_reader(
@@ -1893,7 +1887,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
@@ -1924,7 +1918,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
@@ -1955,7 +1949,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
@@ -2013,7 +2007,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2068,7 +2062,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2117,7 +2111,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2164,7 +2158,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2222,7 +2216,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2300,7 +2294,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2349,7 +2343,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2402,7 +2396,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2477,7 +2471,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2609,7 +2603,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2659,7 +2653,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2727,7 +2721,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2801,7 +2795,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2876,7 +2870,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -2974,7 +2968,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3072,7 +3066,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3149,7 +3143,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3207,7 +3201,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3261,7 +3255,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3320,7 +3314,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3380,7 +3374,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3427,7 +3421,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3477,7 +3471,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3527,7 +3521,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3578,7 +3572,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3621,7 +3615,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3670,7 +3664,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3719,7 +3713,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3769,7 +3763,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3816,7 +3810,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         // Should handle gracefully (either error or filter out)
@@ -3862,7 +3856,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3911,7 +3905,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -3955,7 +3949,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4004,7 +3998,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4043,7 +4037,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4088,7 +4082,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4129,7 +4123,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4175,7 +4169,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4219,7 +4213,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4276,7 +4270,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4436,7 +4430,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4506,7 +4500,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
@@ -4577,7 +4571,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             scheduler_opts: SchedulerOptions::default(),
-            queue_memory_limit_mb: 0,
+            queue_memory: QueueMemoryOptions::default(),
         };
 
         cmd.execute("test")?;
