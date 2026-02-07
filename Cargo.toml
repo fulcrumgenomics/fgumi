@@ -39,7 +39,7 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 parking_lot = "0.12"
-libdeflater = "1.22"
+libdeflater = "1.25"
 isal-rs = { path = "vendor/isal-rs", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 itertools = "0.14.0"
