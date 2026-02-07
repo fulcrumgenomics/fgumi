@@ -268,11 +268,20 @@ impl MemoryEstimate for FastqBoundaryBatch {
     }
 }
 
+/// Parsed records for a single stream, carrying the stream identity.
+#[derive(Debug, Clone)]
+pub struct FastqParsedStream {
+    /// Which stream this is for (0=R1, 1=R2, etc.).
+    pub stream_idx: usize,
+    /// Parsed records from this stream.
+    pub records: Vec<FastqRecord>,
+}
+
 /// Parsed records batch - ready for grouping.
 #[derive(Debug, Clone)]
 pub struct FastqParsedBatch {
-    /// Parsed records per stream, indexed by `stream_idx`.
-    pub streams: Vec<Vec<FastqRecord>>,
+    /// Parsed records per stream, each carrying its `stream_idx`.
+    pub streams: Vec<FastqParsedStream>,
     /// Serial number for ordering.
     pub serial: u64,
 }
@@ -281,8 +290,9 @@ impl MemoryEstimate for FastqParsedBatch {
     fn estimate_heap_size(&self) -> usize {
         self.streams
             .iter()
-            .map(|records| {
-                records
+            .map(|stream| {
+                stream
+                    .records
                     .iter()
                     .map(|r| r.name.capacity() + r.sequence.capacity() + r.quality.capacity())
                     .sum::<usize>()
@@ -457,11 +467,18 @@ impl FastqFormat {
         // This is the KEY PARALLEL STEP!
         // Parse records from boundary information.
         // Since each record is independent, this can be parallelized.
+        //
+        // We preserve `stream_idx` from the boundary batch so that downstream
+        // consumers can correctly identify which stream each set of records
+        // belongs to, regardless of the order in the Vec.
 
         let streams = batch
             .streams
             .into_iter()
-            .map(|stream| parse_fastq_records_from_boundaries(&stream.data, &stream.offsets))
+            .map(|stream| {
+                let records = parse_fastq_records_from_boundaries(&stream.data, &stream.offsets)?;
+                Ok(FastqParsedStream { stream_idx: stream.stream_idx, records })
+            })
             .collect::<io::Result<Vec<_>>>()?;
 
         Ok(FastqParsedBatch { streams, serial: batch.serial })
@@ -1195,11 +1212,12 @@ impl FastqMultiStreamGrouper {
     /// All templates that are complete (have records from all streams)
     pub fn add_parsed_batch(
         &mut self,
-        streams: Vec<Vec<FastqRecord>>,
+        streams: Vec<FastqParsedStream>,
     ) -> io::Result<Vec<FastqTemplate>> {
-        // Feed to grouper and drain with name validation
-        for (stream_idx, records) in streams.into_iter().enumerate() {
-            self.inner.add_records_for_stream(stream_idx, records)?;
+        // Feed to grouper using the explicit stream_idx from each stream,
+        // not positional index — this is robust to any ordering.
+        for stream in streams {
+            self.inner.add_records_for_stream(stream.stream_idx, stream.records)?;
         }
 
         // Drain all complete templates (records matched across all streams)
@@ -2685,7 +2703,7 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 /// For single-end: each record becomes its own template.
 /// For paired-end: R1[i] and R2[i] are zipped into a single template.
 fn create_templates_from_streams(
-    mut streams: Vec<Vec<FastqRecord>>,
+    mut streams: Vec<FastqParsedStream>,
 ) -> io::Result<Vec<FastqTemplate>> {
     let num_streams = streams.len();
 
@@ -2693,7 +2711,7 @@ fn create_templates_from_streams(
         0 => Ok(Vec::new()),
         1 => {
             // Single-end: each record becomes its own template
-            let records = streams.pop().unwrap_or_default();
+            let records = streams.pop().unwrap().records;
             Ok(records
                 .into_iter()
                 .map(|r| {
@@ -2703,9 +2721,13 @@ fn create_templates_from_streams(
                 .collect())
         }
         2 => {
-            // Paired-end: zip R1 and R2 by position
-            let r2_records = streams.pop().unwrap();
-            let r1_records = streams.pop().unwrap();
+            // Paired-end: zip R1 and R2 by position.
+            // Sort by stream_idx so streams[0] is always R1 and streams[1] is
+            // always R2, regardless of the order produced by find_boundaries().
+            streams.sort_by_key(|s| s.stream_idx);
+            let mut drain = streams.into_iter();
+            let r1_records = drain.next().unwrap().records;
+            let r2_records = drain.next().unwrap().records;
 
             // Validate batch sizes match
             if r1_records.len() != r2_records.len() {
@@ -4704,16 +4726,22 @@ mod tests {
         // Create pre-parsed records for 2 streams (R1 and R2)
         // Both have the same template "read1"
         let streams = vec![
-            vec![FastqRecord {
-                name: b"read1".to_vec(),
-                sequence: b"ACGT".to_vec(),
-                quality: b"IIII".to_vec(),
-            }],
-            vec![FastqRecord {
-                name: b"read1".to_vec(),
-                sequence: b"GGGG".to_vec(),
-                quality: b"JJJJ".to_vec(),
-            }],
+            FastqParsedStream {
+                stream_idx: 0,
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"ACGT".to_vec(),
+                    quality: b"IIII".to_vec(),
+                }],
+            },
+            FastqParsedStream {
+                stream_idx: 1,
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"GGGG".to_vec(),
+                    quality: b"JJJJ".to_vec(),
+                }],
+            },
         ];
 
         let templates = grouper.add_parsed_batch(streams).unwrap();
@@ -4731,30 +4759,36 @@ mod tests {
 
         // Create pre-parsed records for multiple templates
         let streams = vec![
-            vec![
-                FastqRecord {
-                    name: b"read1".to_vec(),
-                    sequence: b"AAAA".to_vec(),
-                    quality: b"IIII".to_vec(),
-                },
-                FastqRecord {
-                    name: b"read2".to_vec(),
-                    sequence: b"CCCC".to_vec(),
-                    quality: b"JJJJ".to_vec(),
-                },
-            ],
-            vec![
-                FastqRecord {
-                    name: b"read1".to_vec(),
-                    sequence: b"GGGG".to_vec(),
-                    quality: b"KKKK".to_vec(),
-                },
-                FastqRecord {
-                    name: b"read2".to_vec(),
-                    sequence: b"TTTT".to_vec(),
-                    quality: b"LLLL".to_vec(),
-                },
-            ],
+            FastqParsedStream {
+                stream_idx: 0,
+                records: vec![
+                    FastqRecord {
+                        name: b"read1".to_vec(),
+                        sequence: b"AAAA".to_vec(),
+                        quality: b"IIII".to_vec(),
+                    },
+                    FastqRecord {
+                        name: b"read2".to_vec(),
+                        sequence: b"CCCC".to_vec(),
+                        quality: b"JJJJ".to_vec(),
+                    },
+                ],
+            },
+            FastqParsedStream {
+                stream_idx: 1,
+                records: vec![
+                    FastqRecord {
+                        name: b"read1".to_vec(),
+                        sequence: b"GGGG".to_vec(),
+                        quality: b"KKKK".to_vec(),
+                    },
+                    FastqRecord {
+                        name: b"read2".to_vec(),
+                        sequence: b"TTTT".to_vec(),
+                        quality: b"LLLL".to_vec(),
+                    },
+                ],
+            },
         ];
 
         let templates = grouper.add_parsed_batch(streams).unwrap();
@@ -4801,15 +4835,17 @@ mod tests {
         // Step 2: Parse records
         let parsed_batch = FastqFormat::parse_records(boundary_batch).unwrap();
         assert_eq!(parsed_batch.streams.len(), 2);
-        assert_eq!(parsed_batch.streams[0].len(), 2);
-        assert_eq!(parsed_batch.streams[1].len(), 2);
+        assert_eq!(parsed_batch.streams[0].stream_idx, 0);
+        assert_eq!(parsed_batch.streams[1].stream_idx, 1);
+        assert_eq!(parsed_batch.streams[0].records.len(), 2);
+        assert_eq!(parsed_batch.streams[1].records.len(), 2);
 
         // Verify record contents
-        assert_eq!(parsed_batch.streams[0][0].name, b"read1");
-        assert_eq!(parsed_batch.streams[0][0].sequence, b"ACGT");
-        assert_eq!(parsed_batch.streams[0][1].name, b"read2");
-        assert_eq!(parsed_batch.streams[1][0].name, b"read1");
-        assert_eq!(parsed_batch.streams[1][0].sequence, b"TTTT");
+        assert_eq!(parsed_batch.streams[0].records[0].name, b"read1");
+        assert_eq!(parsed_batch.streams[0].records[0].sequence, b"ACGT");
+        assert_eq!(parsed_batch.streams[0].records[1].name, b"read2");
+        assert_eq!(parsed_batch.streams[1].records[0].name, b"read1");
+        assert_eq!(parsed_batch.streams[1].records[0].sequence, b"TTTT");
 
         // Step 3: Group - use the add_parsed_batch method
         let mut grouper = FastqMultiStreamGrouper::new(2);
@@ -4854,10 +4890,10 @@ mod tests {
         let parsed1 = FastqFormat::parse_records(boundary_batch1).unwrap();
         let parsed2 = FastqFormat::parse_records(boundary_batch2).unwrap();
 
-        assert_eq!(parsed1.streams[0].len(), 1);
-        assert_eq!(parsed1.streams[0][0].name, b"read1");
-        assert_eq!(parsed2.streams[0].len(), 1);
-        assert_eq!(parsed2.streams[0][0].name, b"read2");
+        assert_eq!(parsed1.streams[0].records.len(), 1);
+        assert_eq!(parsed1.streams[0].records[0].name, b"read1");
+        assert_eq!(parsed2.streams[0].records.len(), 1);
+        assert_eq!(parsed2.streams[0].records[0].name, b"read2");
     }
 
     #[test]
@@ -4889,8 +4925,12 @@ mod tests {
 
                         // Parse the batch
                         let parsed = FastqFormat::parse_records(boundary_batch).unwrap();
-                        assert_eq!(parsed.streams[0].len(), 1);
-                        assert_eq!(String::from_utf8_lossy(&parsed.streams[0][0].name), name);
+                        assert_eq!(parsed.streams[0].stream_idx, 0);
+                        assert_eq!(parsed.streams[0].records.len(), 1);
+                        assert_eq!(
+                            String::from_utf8_lossy(&parsed.streams[0].records[0].name),
+                            name
+                        );
                         records_parsed += 1;
                     }
                     records_parsed
@@ -4924,16 +4964,22 @@ mod tests {
                     for i in 0..records_per_thread {
                         let name = format!("read_t{}_i{}", thread_id, i);
                         let streams = vec![
-                            vec![FastqRecord {
-                                name: name.as_bytes().to_vec(),
-                                sequence: b"ACGT".to_vec(),
-                                quality: b"IIII".to_vec(),
-                            }],
-                            vec![FastqRecord {
-                                name: name.as_bytes().to_vec(),
-                                sequence: b"TTTT".to_vec(),
-                                quality: b"JJJJ".to_vec(),
-                            }],
+                            FastqParsedStream {
+                                stream_idx: 0,
+                                records: vec![FastqRecord {
+                                    name: name.as_bytes().to_vec(),
+                                    sequence: b"ACGT".to_vec(),
+                                    quality: b"IIII".to_vec(),
+                                }],
+                            },
+                            FastqParsedStream {
+                                stream_idx: 1,
+                                records: vec![FastqRecord {
+                                    name: name.as_bytes().to_vec(),
+                                    sequence: b"TTTT".to_vec(),
+                                    quality: b"JJJJ".to_vec(),
+                                }],
+                            },
                         ];
 
                         let templates = grouper.lock().add_parsed_batch(streams).unwrap();
@@ -5062,8 +5108,11 @@ mod tests {
 
         // Parse and verify record names
         let parsed = FastqFormat::parse_records(boundary_batch2).unwrap();
-        assert_eq!(parsed.streams[0][0].name, b"r3", "First record should be r3 from leftover");
-        assert_eq!(parsed.streams[0][1].name, b"r4", "Second record should be r4");
+        assert_eq!(
+            parsed.streams[0].records[0].name, b"r3",
+            "First record should be r3 from leftover"
+        );
+        assert_eq!(parsed.streams[0].records[1].name, b"r4", "Second record should be r4");
     }
 
     #[test]
@@ -5208,5 +5257,230 @@ mod tests {
 
         // After processing, stream 0's leftover should be consumed
         assert!(boundary_state.stream_states[0].lock().leftover.is_empty());
+    }
+
+    // ========================================================================
+    // Stream Identity Preservation Tests (regression for R1/R2 swap bug)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_records_preserves_stream_idx() {
+        // Verify that parse_records carries stream_idx from boundary batch
+        // to parsed batch, even when streams are in non-sequential order.
+        let boundary_batch = FastqBoundaryBatch {
+            streams: vec![
+                FastqStreamBoundaries {
+                    stream_idx: 1, // R2 first (reversed order)
+                    data: b"@read1\nTTTT\n+\nJJJJ\n".to_vec(),
+                    offsets: vec![0, 20],
+                },
+                FastqStreamBoundaries {
+                    stream_idx: 0, // R1 second
+                    data: b"@read1\nACGT\n+\nIIII\n".to_vec(),
+                    offsets: vec![0, 20],
+                },
+            ],
+            serial: 42,
+        };
+
+        let parsed = FastqFormat::parse_records(boundary_batch).unwrap();
+        assert_eq!(parsed.serial, 42);
+        assert_eq!(parsed.streams.len(), 2);
+        // stream_idx must be preserved, not assumed from position
+        assert_eq!(
+            parsed.streams[0].stream_idx, 1,
+            "First parsed stream should be R2 (stream_idx=1)"
+        );
+        assert_eq!(
+            parsed.streams[1].stream_idx, 0,
+            "Second parsed stream should be R1 (stream_idx=0)"
+        );
+        assert_eq!(parsed.streams[0].records[0].sequence, b"TTTT");
+        assert_eq!(parsed.streams[1].records[0].sequence, b"ACGT");
+    }
+
+    #[test]
+    fn test_create_templates_from_reversed_streams() {
+        // Regression test: when find_boundaries() produces streams in reversed
+        // order [R2, R1] near EOF, create_templates_from_streams() must still
+        // produce templates with records in the correct R1, R2 order.
+        //
+        // Before the fix, this would swap R1 and R2 data, causing read
+        // structures to be applied to the wrong reads.
+        let streams = vec![
+            FastqParsedStream {
+                stream_idx: 1, // R2 comes first in the Vec (reversed!)
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"TTTT".to_vec(), // R2 sequence
+                    quality: b"JJJJ".to_vec(),
+                }],
+            },
+            FastqParsedStream {
+                stream_idx: 0, // R1 comes second
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"ACGT".to_vec(), // R1 sequence
+                    quality: b"IIII".to_vec(),
+                }],
+            },
+        ];
+
+        let templates = create_templates_from_streams(streams).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].records.len(), 2);
+        // Critical: R1 must be first (records[0]), R2 must be second (records[1])
+        assert_eq!(
+            templates[0].records[0].sequence, b"ACGT",
+            "First record in template must be R1 (ACGT), not R2"
+        );
+        assert_eq!(
+            templates[0].records[1].sequence, b"TTTT",
+            "Second record in template must be R2 (TTTT), not R1"
+        );
+    }
+
+    #[test]
+    fn test_create_templates_from_correctly_ordered_streams() {
+        // Verify correct behavior when streams are already in order
+        let streams = vec![
+            FastqParsedStream {
+                stream_idx: 0,
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"ACGT".to_vec(),
+                    quality: b"IIII".to_vec(),
+                }],
+            },
+            FastqParsedStream {
+                stream_idx: 1,
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"TTTT".to_vec(),
+                    quality: b"JJJJ".to_vec(),
+                }],
+            },
+        ];
+
+        let templates = create_templates_from_streams(streams).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].records[0].sequence, b"ACGT", "R1 should be first");
+        assert_eq!(templates[0].records[1].sequence, b"TTTT", "R2 should be second");
+    }
+
+    #[test]
+    fn test_add_parsed_batch_with_reversed_streams() {
+        // Regression test: add_parsed_batch must use stream_idx, not positional
+        // index, when feeding records to the grouper.
+        let mut grouper = FastqMultiStreamGrouper::new(2);
+
+        // Streams in reversed order (R2 first, R1 second)
+        let streams = vec![
+            FastqParsedStream {
+                stream_idx: 1, // R2 first
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"TTTT".to_vec(),
+                    quality: b"JJJJ".to_vec(),
+                }],
+            },
+            FastqParsedStream {
+                stream_idx: 0, // R1 second
+                records: vec![FastqRecord {
+                    name: b"read1".to_vec(),
+                    sequence: b"ACGT".to_vec(),
+                    quality: b"IIII".to_vec(),
+                }],
+            },
+        ];
+
+        let templates = grouper.add_parsed_batch(streams).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].records.len(), 2);
+        // The grouper stores records by stream_idx, so records[0] = stream 0 (R1),
+        // records[1] = stream 1 (R2)
+        assert_eq!(
+            templates[0].records[0].sequence, b"ACGT",
+            "R1 record should be first in template"
+        );
+        assert_eq!(
+            templates[0].records[1].sequence, b"TTTT",
+            "R2 record should be second in template"
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_reversed_stream_order_at_eof() {
+        // End-to-end regression test simulating the EOF boundary condition.
+        //
+        // This reproduces the exact bug scenario: when one stream reaches EOF
+        // before the other, find_boundaries() processes the leftover stream
+        // after the non-EOF stream, producing a reversed streams Vec.
+        // The full pipeline (find_boundaries -> parse_records ->
+        // create_templates_from_streams) must handle this correctly.
+        let boundary_state = FastqBoundaryState::new(2);
+
+        // Batch 1: Both streams have data, but stream 0 has an extra record.
+        // This creates leftover for stream 0.
+        let batch1 = FastqDecompressedBatch {
+            chunks: vec![
+                FastqDecompressedChunk {
+                    stream_idx: 0,
+                    data: b"@read1\nACGT\n+\nIIII\n@read2\nGGGG\n+\nJJJJ\n".to_vec(),
+                },
+                FastqDecompressedChunk { stream_idx: 1, data: b"@read1\nTTTT\n+\nKKKK\n".to_vec() },
+            ],
+            serial: 0,
+        };
+
+        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        // Both aligned to 1 record; stream 0 has leftover
+        assert_eq!(boundary_batch1.streams[0].offsets.len() - 1, 1);
+        assert_eq!(boundary_batch1.streams[1].offsets.len() - 1, 1);
+
+        // Batch 2: Only stream 1 has a new chunk (stream 0 at EOF).
+        // Stream 0's leftover is processed in the "missing chunk" path,
+        // which appends AFTER stream 1 — producing reversed order.
+        let batch2 = FastqDecompressedBatch {
+            chunks: vec![FastqDecompressedChunk {
+                stream_idx: 1,
+                data: b"@read2\nCCCC\n+\nLLLL\n".to_vec(),
+            }],
+            serial: 1,
+        };
+
+        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+        assert_eq!(boundary_batch2.streams.len(), 2);
+
+        // The order of streams in boundary_batch2 may be [stream_idx=1, stream_idx=0]
+        // (reversed). This is the trigger for the bug.
+        let first_stream_idx = boundary_batch2.streams[0].stream_idx;
+        let second_stream_idx = boundary_batch2.streams[1].stream_idx;
+
+        // Parse records — stream_idx must be preserved
+        let parsed = FastqFormat::parse_records(boundary_batch2).unwrap();
+        assert_eq!(parsed.streams[0].stream_idx, first_stream_idx);
+        assert_eq!(parsed.streams[1].stream_idx, second_stream_idx);
+
+        // Create templates — must produce correct R1/R2 ordering regardless
+        // of the stream order in the Vec
+        let templates = create_templates_from_streams(parsed.streams).unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, b"read2");
+        assert_eq!(templates[0].records.len(), 2);
+
+        // THE KEY ASSERTION: R1 data (GGGG from leftover) must be records[0],
+        // R2 data (CCCC from new chunk) must be records[1].
+        assert_eq!(
+            templates[0].records[0].sequence, b"GGGG",
+            "records[0] must be R1 (stream 0) data, not R2"
+        );
+        assert_eq!(
+            templates[0].records[1].sequence, b"CCCC",
+            "records[1] must be R2 (stream 1) data, not R1"
+        );
     }
 }
