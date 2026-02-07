@@ -32,10 +32,10 @@ use-system-isal = ["isal-sys/use-system-isal"]
 isal-sys = { path = "isal-sys", version = "0.5.3+496255c", default-features = false }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-md5 = "0.7.0"
+criterion = { version = "0.8", features = ["html_reports"] }
+md5 = "0.8.0"
 flate2 = { version = "^1", features = ["zlib-ng"], default-features = false }
-rand = "^0.8"
+rand = "^0.9"
 
 [[bench]]
 name = "igzip"
