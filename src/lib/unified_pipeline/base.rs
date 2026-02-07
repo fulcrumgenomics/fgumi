@@ -213,14 +213,15 @@ pub fn get_process_rss_bytes() -> Option<u64> {
 
     let sys = RSS_SYSTEM.get_or_init(|| {
         Mutex::new(System::new_with_specifics(
-            RefreshKind::new().with_processes(ProcessRefreshKind::new().with_memory()),
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
         ))
     });
 
     let mut sys_guard = sys.lock().ok()?;
     sys_guard.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
-        ProcessRefreshKind::new().with_memory(),
+        false,
+        ProcessRefreshKind::nothing().with_memory(),
     );
 
     // Get current process RSS
