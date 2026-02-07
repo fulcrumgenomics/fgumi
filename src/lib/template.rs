@@ -1380,14 +1380,23 @@ impl MemoryEstimate for TemplateBatch {
 ///
 /// This function estimates the heap memory used by a noodles `RecordBuf`,
 /// including its name, sequence, quality scores, CIGAR, and data fields.
-fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
+///
+/// noodles `RecordBuf` layout:
+/// - name: Option<BString> (Vec<u8>) - heap allocated
+/// - sequence: Sequence (Vec<u8>, 1 byte per base, unpacked ASCII)
+/// - `quality_scores`: `QualityScores` (Vec<u8>)
+/// - cigar: Cigar (Vec<Op>, each Op is 4 bytes)
+/// - data: Data (`IndexMap`<Tag, Value>) - significant overhead from hash table
+#[must_use]
+pub fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
     // Name: Option<BString> which is a Vec<u8>
     let name_size = record.name().map_or(0, |n| n.len());
 
-    // Sequence: stored as Vec<u8> (4 bases per byte for 2-bit encoding, but we estimate conservatively)
+    // Sequence: noodles stores bases as unpacked ASCII (1 byte per base in Vec<u8>)
+    // .len() returns number of bases, which equals the heap allocation in bytes
     let seq_len = record.sequence().len();
 
-    // Quality scores: Vec<u8>
+    // Quality scores: Vec<u8>, one byte per base
     let qual_len = record.quality_scores().len();
 
     // CIGAR: Vec<Op> where each Op is 4 bytes (u32)
@@ -1395,12 +1404,24 @@ fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
     let cigar_size = cigar_ops * 4;
 
     // Data fields: IndexMap<Tag, Value>
-    // Estimate ~20 bytes per field on average (tag + value + overhead)
+    // IndexMap stores entries in a Vec<Bucket<(K, V)>> plus a hash table Vec<usize>.
+    // - Each entry: Tag (2 bytes) + Value enum (~40 bytes on stack for noodles Value)
+    //   + padding = ~48 bytes per entry in the entries vec
+    // - Hash table: capacity * 8 bytes (indices) + capacity * 8 bytes (hashes)
+    //   With ~87.5% load factor, capacity ~= count * 1.15
+    // - Values with heap allocation (String, Array): add ~24 bytes (Vec header) + data
+    //   Typical BAM tags: RX/QX (string, ~20 bytes), MI (int, no heap), CB/CR (string, ~16 bytes)
+    //   Estimate ~32 bytes average heap per string-type field, ~50% of fields are strings
     let data_fields = record.data().iter().count();
-    let data_size = data_fields * 20;
+    let entry_capacity = (data_fields * 115) / 100 + 1; // ~1.15x for load factor
+    let entries_size = data_fields * 48; // entry vec storage
+    let hash_table_size = entry_capacity * 16; // hash + index arrays
+    let value_heap_size = data_fields * 16; // average heap per field (50% strings × 32 bytes)
+    let data_size = entries_size + hash_table_size + value_heap_size;
 
-    // Add some overhead for struct alignment and internal pointers
-    name_size + seq_len + qual_len + cigar_size + data_size + 64
+    // Note: RecordBuf inline struct overhead (flags, position, etc.) is accounted for
+    // by the caller via `capacity * size_of::<RecordBuf>()`, so we only count heap allocations here.
+    name_size + seq_len + qual_len + cigar_size + data_size
 }
 
 #[cfg(test)]

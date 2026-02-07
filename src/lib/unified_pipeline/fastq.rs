@@ -678,6 +678,9 @@ pub struct FastqPipelineConfig {
     /// When true, skips name validation in Group step (done in Process instead).
     /// This eliminates lock contention for synchronized FASTQs.
     pub synchronized: bool,
+    /// Shared statistics instance for external memory monitoring.
+    /// When provided, the pipeline will use this instead of creating its own.
+    pub shared_stats: Option<Arc<PipelineStats>>,
 }
 
 impl FastqPipelineConfig {
@@ -706,6 +709,7 @@ impl FastqPipelineConfig {
             deadlock_recover_enabled: false,
             use_parallel_parse: false, // Disabled - overhead hurts t4 performance
             synchronized: false,       // Not synchronized by default
+            shared_stats: None,        // No shared stats by default
         }
     }
 
@@ -1499,7 +1503,11 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
         let cap = config.queue_capacity;
         let batch_size = config.batch_size;
         let num_streams = reader.num_streams();
-        let stats = if config.collect_stats { Some(PipelineStats::new()) } else { None };
+        let stats = if config.collect_stats {
+            config.shared_stats.clone().or_else(|| Some(Arc::new(PipelineStats::new())))
+        } else {
+            None
+        };
 
         // Create deadlock detection config and state
         let deadlock_config =
@@ -1683,7 +1691,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
     /// Get optional reference to pipeline statistics.
     #[must_use]
     pub fn stats(&self) -> Option<&PipelineStats> {
-        self.output.stats.as_ref()
+        self.output.stats.as_deref()
     }
 
     /// Get reference to progress tracker.
@@ -1989,11 +1997,20 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
         &self,
         item: (u64, CompressedBlockBatch),
     ) -> Result<(), (u64, CompressedBlockBatch)> {
-        self.output.compressed.push(item)
+        let heap_size = item.1.estimate_heap_size();
+        let result = self.output.compressed.push(item);
+        if result.is_ok() {
+            self.output.compressed_heap_bytes.fetch_add(heap_size as u64, Ordering::AcqRel);
+        }
+        result
     }
 
     fn q6_is_full(&self) -> bool {
         self.output.compressed.is_full()
+    }
+
+    fn q6_track_pop(&self, heap_size: u64) {
+        self.output.compressed_heap_bytes.fetch_sub(heap_size, Ordering::AcqRel);
     }
 
     fn q6_reorder_insert(&self, serial: u64, batch: CompressedBlockBatch) {
@@ -2029,7 +2046,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
     }
 
     fn stats(&self) -> Option<&PipelineStats> {
-        self.output.stats.as_ref()
+        self.output.stats.as_deref()
     }
 }
 
@@ -2130,7 +2147,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> WritePipel
     }
 
     fn stats(&self) -> Option<&PipelineStats> {
-        self.output.stats.as_ref()
+        self.output.stats.as_deref()
     }
 }
 
@@ -2589,9 +2606,14 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 
                 // Push templates directly to Q3 with spin-wait
                 let mut templates_to_push = templates;
+                #[cfg(feature = "memory-debug")]
+                let q4_heap: u64 =
+                    templates_to_push.iter().map(|t| t.estimate_heap_size() as u64).sum();
                 loop {
                     match state.output.groups.push((template_serial, templates_to_push)) {
                         Ok(()) => {
+                            #[cfg(feature = "memory-debug")]
+                            state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
                             state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                             if let Some(stats) = state.stats() {
                                 stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
@@ -2797,10 +2819,14 @@ fn fastq_try_step_group_parsed<R: BufRead + Send, P: Send + MemoryEstimate>(
 
                     let batch: Vec<FastqTemplate> = pending.drain(..batch_size).collect();
                     let count = batch.len();
+                    #[cfg(feature = "memory-debug")]
+                    let q4_heap: u64 = batch.iter().map(|t| t.estimate_heap_size() as u64).sum();
                     let serial = state.next_template_serial.fetch_add(1, Ordering::Relaxed);
 
                     match state.output.groups.push((serial, batch)) {
                         Ok(()) => {
+                            #[cfg(feature = "memory-debug")]
+                            state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
                             state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                             if let Some(stats) = state.stats() {
                                 stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
@@ -2852,11 +2878,15 @@ fn fastq_try_step_group_parsed<R: BufRead + Send, P: Send + MemoryEstimate>(
             let serial = state.next_template_serial.fetch_add(1, Ordering::Relaxed);
             let batch: Vec<FastqTemplate> = std::mem::take(&mut *pending);
             let count = batch.len();
+            #[cfg(feature = "memory-debug")]
+            let q4_heap: u64 = batch.iter().map(|t| t.estimate_heap_size() as u64).sum();
 
             let mut batch_to_push = batch;
             loop {
                 match state.output.groups.push((serial, batch_to_push)) {
                     Ok(()) => {
+                        #[cfg(feature = "memory-debug")]
+                        state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
                         state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
                         break;
                     }
@@ -2929,9 +2959,6 @@ fn fastq_try_step_group<R: BufRead + Send, P: Send + MemoryEstimate>(
     }
 
     // Helper to flush pending templates as a batch. Returns true if flushed, false if queue full.
-    // NOTE: No memory tracking here - matches BAM's pattern where memory is tracked BEFORE
-    // the Group step (Q2 reorder), not after. This avoids the coordination problem where
-    // we'd release Q2 memory but fail to add Q3 memory, leaving data in pending untracked.
     let flush_pending = |pending: &mut Vec<FastqTemplate>,
                          state: &FastqPipelineState<R, P>|
      -> bool {
@@ -2943,11 +2970,15 @@ fn fastq_try_step_group<R: BufRead + Send, P: Send + MemoryEstimate>(
         }
         let batch: Vec<FastqTemplate> = std::mem::take(pending);
         let count = batch.len() as u64;
+        #[cfg(feature = "memory-debug")]
+        let q4_heap: u64 = batch.iter().map(|t| t.estimate_heap_size() as u64).sum();
         let serial = state.next_template_serial.fetch_add(1, Ordering::Release);
         log::trace!("fastq_try_step_group: pushing batch of {count} templates, serial={serial}");
         // Handle race condition: queue could fill between is_full check and push
         match state.output.groups.push((serial, batch)) {
             Ok(()) => {
+                #[cfg(feature = "memory-debug")]
+                state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
                 state.total_templates_pushed.fetch_add(count, Ordering::Release);
                 // Record groups produced for throughput metrics
                 if let Some(stats) = state.stats() {
@@ -3138,9 +3169,11 @@ where
         };
         state.deadlock_state.record_q4_pop();
 
-        // Track memory being removed from Q3
-        let q3_heap_size: usize = batch.iter().map(|t| t.estimate_heap_size()).sum();
-        state.output.groups_heap_bytes.fetch_sub(q3_heap_size as u64, Ordering::AcqRel);
+        #[cfg(feature = "memory-debug")]
+        {
+            let q4_heap: u64 = batch.iter().map(|t| t.estimate_heap_size() as u64).sum();
+            state.output.groups_heap_bytes.fetch_sub(q4_heap, Ordering::AcqRel);
+        }
 
         log::trace!(
             "fastq_try_step_process: processing batch of {} templates, serial={}",
@@ -3317,7 +3350,7 @@ fn fastq_try_step_compress<R: BufRead + Send + 'static, P: Send + MemoryEstimate
 }
 
 /// Try to write compressed data (Step 7 - exclusive).
-fn fastq_try_step_write<R: BufRead + Send, P: Send + MemoryEstimate>(
+fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
     if state.has_error() {
@@ -3344,6 +3377,8 @@ fn fastq_try_step_write<R: BufRead + Send, P: Send + MemoryEstimate>(
 
         // Move items from Q6 to reorder buffer
         while let Some((serial, batch)) = state.output.compressed.pop() {
+            let q7_heap = batch.estimate_heap_size() as u64;
+            state.q6_track_pop(q7_heap);
             reorder.insert(serial, batch);
             state.deadlock_state.record_q7_pop();
         }
@@ -3801,7 +3836,7 @@ where
         error: Mutex<Option<io::Error>>,
         templates_written: AtomicU64,
         progress: ProgressTracker,
-        stats: Option<PipelineStats>,
+        stats: Option<Arc<PipelineStats>>,
     }
 
     impl<P: Send> BgzfPipelineState<P> {
@@ -3920,6 +3955,8 @@ where
         fn q6_pop(&self) -> Option<(u64, CompressedBlockBatch)> {
             self.q6_compressed.pop()
         }
+        // Note: BGZF path does not track compressed queue heap bytes (no add/remove tracking).
+        // This is intentional — the BGZF pipeline is simpler and doesn't need memory-debug visibility.
         fn q6_push(
             &self,
             item: (u64, CompressedBlockBatch),
@@ -3944,7 +3981,7 @@ where
             self.templates_written.fetch_add(1, Ordering::Release)
         }
         fn stats(&self) -> Option<&PipelineStats> {
-            self.stats.as_ref()
+            self.stats.as_deref()
         }
     }
 
@@ -3973,11 +4010,15 @@ where
             self.progress.log_if_needed(count);
         }
         fn stats(&self) -> Option<&PipelineStats> {
-            self.stats.as_ref()
+            self.stats.as_deref()
         }
     }
 
-    let stats = if config.collect_stats { Some(PipelineStats::new()) } else { None };
+    let stats = if config.collect_stats {
+        config.shared_stats.clone().or_else(|| Some(Arc::new(PipelineStats::new())))
+    } else {
+        None
+    };
 
     let state = Arc::new(BgzfPipelineState::<P> {
         batch_size,

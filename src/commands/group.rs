@@ -26,10 +26,12 @@ use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_positio
 use fgumi_lib::template::{MoleculeId, Template};
 use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::DecodedRecord;
-use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, Grouper, run_bam_pipeline_from_reader, serialize_bam_records_into,
-};
+use fgumi_lib::unified_pipeline::{BamPipelineConfig, Grouper, run_bam_pipeline_from_reader};
+// MemoryEstimate is gated because it's only used in memory-debug blocks below
+#[cfg(feature = "memory-debug")]
+use fgumi_lib::unified_pipeline::MemoryEstimate;
 use fgumi_lib::validation::{string_to_tag, validate_file_exists};
+use fgumi_lib::vendored::bam_codec::encode_record_buf;
 use log::info;
 use noodles::sam;
 use noodles::sam::Header;
@@ -39,6 +41,23 @@ use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Estimate total heap size of a template slice using sampling for large batches.
+/// For small batches (<=10), computes exact total. For larger batches, samples the
+/// first 5 templates and extrapolates. This avoids O(n) overhead on every call but
+/// may underestimate for groups with heterogeneous read lengths.
+#[cfg(feature = "memory-debug")]
+fn estimate_templates_heap_size(templates: &[Template]) -> usize {
+    if templates.len() <= 10 {
+        templates.iter().map(|t| t.estimate_heap_size()).sum()
+    } else {
+        let sample_size = 5;
+        let sample_total: usize =
+            templates.iter().take(sample_size).map(|t| t.estimate_heap_size()).sum();
+        // Use multiply-before-divide to avoid truncation bias
+        (sample_total * templates.len()) / sample_size
+    }
+}
 
 /// Metrics describing the distribution of tag family sizes
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -544,6 +563,16 @@ pub struct GroupReadsByUmi {
     /// Queue memory options.
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
+
+    /// Enable comprehensive memory debugging (reports every 1 second)
+    #[cfg(feature = "memory-debug")]
+    #[arg(long)]
+    pub debug_memory: bool,
+
+    /// Memory report interval in seconds (default: 1, minimum: 1)
+    #[cfg(feature = "memory-debug")]
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
+    pub memory_report_interval: u64,
 }
 
 impl Command for GroupReadsByUmi {
@@ -662,15 +691,52 @@ impl Command for GroupReadsByUmi {
         let index_threshold = self.index_threshold;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
+        // Setup comprehensive memory monitoring first if debug mode is enabled
+        #[cfg(feature = "memory-debug")]
+        let debug_memory_flag = self.debug_memory;
+        #[cfg(feature = "memory-debug")]
+        let (memory_monitor_handle, shared_stats) = if self.debug_memory {
+            use fgumi_lib::unified_pipeline::{PipelineStats, start_memory_monitor};
+            use std::sync::atomic::AtomicBool;
+
+            info!("Memory debugging enabled - reporting every {}s", self.memory_report_interval);
+
+            let stats = Arc::new(PipelineStats::new());
+            let shutdown_signal = Arc::new(AtomicBool::new(false));
+            let shutdown_signal_clone = shutdown_signal.clone();
+
+            let handle = start_memory_monitor(
+                stats.clone(),
+                shutdown_signal_clone,
+                self.memory_report_interval,
+            );
+            (Some((handle, shutdown_signal)), Some(stats))
+        } else {
+            (None, None)
+        };
+        #[cfg(not(feature = "memory-debug"))]
+        let shared_stats: Option<Arc<fgumi_lib::unified_pipeline::PipelineStats>> = None;
+
+        // Clone stats for hot path tracking (process_fn and serialize_fn closures)
+        #[cfg(feature = "memory-debug")]
+        let stats_for_tracking = shared_stats.clone();
+        #[cfg(feature = "memory-debug")]
+        let stats_for_serialize = shared_stats.clone();
+
         // Configure 7-step pipeline
         let num_threads = self.threading.num_threads();
         // Use auto-tuned config for better performance with varying thread counts
         let mut pipeline_config =
             BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
         pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
+
+        // Configure stats collection - use shared stats if available, otherwise enable regular stats
+        if let Some(stats) = shared_stats.as_ref() {
+            pipeline_config.pipeline = pipeline_config.pipeline.with_shared_stats(stats.clone());
+        } else if self.scheduler_opts.collect_stats() {
             pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
         }
+
         pipeline_config.pipeline.deadlock_timeout_secs =
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
@@ -682,6 +748,34 @@ impl Command for GroupReadsByUmi {
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         // Template-based batching is enabled by default in auto_tuned() with target=500 templates.
         // This provides consistent batch sizes across datasets with varying templates-per-group ratios.
+
+        // Short-circuit support for memory bisection debugging.
+        // Set FGUMI_SHORT_CIRCUIT=process|serialize|compress to skip downstream steps.
+        #[cfg(feature = "memory-debug")]
+        let short_circuit = std::env::var("FGUMI_SHORT_CIRCUIT").unwrap_or_default();
+        #[cfg(feature = "memory-debug")]
+        if !short_circuit.is_empty() {
+            match short_circuit.as_str() {
+                "process" | "serialize" | "compress" => {
+                    log::warn!(
+                        "SHORT-CIRCUIT mode: pipeline truncated at '{}' — OUTPUT WILL BE INVALID",
+                        short_circuit
+                    );
+                }
+                other => {
+                    bail!(
+                        "Invalid FGUMI_SHORT_CIRCUIT value '{}'. Valid: process, serialize, compress",
+                        other
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "memory-debug")]
+        let short_circuit_process = short_circuit == "process";
+        #[cfg(feature = "memory-debug")]
+        let short_circuit_serialize = short_circuit == "serialize";
+        #[cfg(feature = "memory-debug")]
+        let short_circuit_compress = short_circuit == "compress";
 
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
         let records_processed = run_bam_pipeline_from_reader(
@@ -699,7 +793,42 @@ impl Command for GroupReadsByUmi {
             },
             // process_fn: Filter templates + assign UMIs (parallel)
             move |group: PositionGroup| -> std::io::Result<ProcessedPositionGroup> {
+                #[cfg(feature = "memory-debug")]
+                if short_circuit_process {
+                    let input_record_count: u64 =
+                        group.templates.iter().map(|t| t.read_count() as u64).sum();
+                    drop(group);
+                    return Ok(ProcessedPositionGroup {
+                        templates: Vec::new(),
+                        family_sizes: AHashMap::new(),
+                        filter_metrics: FilterMetrics::new(),
+                        input_record_count,
+                        base_mi: 0,
+                    });
+                }
                 let mut filter_metrics = FilterMetrics::new();
+
+                // Track memory usage if debug mode is enabled (optimized for hot path)
+                #[cfg(feature = "memory-debug")]
+                let initial_group_size = if debug_memory_flag {
+                    let size = group.estimate_heap_size();
+                    if let Some(stats) = stats_for_tracking.as_ref() {
+                        use fgumi_lib::unified_pipeline::get_or_assign_thread_id;
+                        let thread_id = get_or_assign_thread_id();
+                        let template_count = group.templates.len();
+
+                        stats.track_position_group_memory(size, true);
+
+                        if template_count > 100 {
+                            let group_size_gb = size as f64 / 1e9;
+                            log::debug!("Processing large position group: {:.2}GB ({} templates) on thread {}",
+                                       group_size_gb, template_count, thread_id);
+                        }
+                    }
+                    size
+                } else {
+                    0
+                };
 
                 // Count ALL input records for progress tracking
                 let input_record_count: u64 =
@@ -712,7 +841,39 @@ impl Command for GroupReadsByUmi {
                     .filter(|t| filter_template(t, &filter_config, &mut filter_metrics))
                     .collect();
 
+                // Track filtered template memory (optimized for hot path).
+                // Note: alloc/dealloc estimates may diverge since templates are mutated between
+                // estimation points (e.g. MI fields populated, records reordered). This is
+                // acceptable for debug instrumentation — counters may drift slightly.
+                #[cfg(feature = "memory-debug")]
+                let _template_memory_size = if debug_memory_flag && !filtered_templates.is_empty() {
+                    let estimated_size = estimate_templates_heap_size(&filtered_templates);
+
+                    if let Some(stats) = stats_for_tracking.as_ref() {
+                        let thread_id = fgumi_lib::unified_pipeline::get_or_assign_thread_id();
+
+                        stats.track_template_memory(estimated_size, true);
+
+                        if filtered_templates.len() > 50 {
+                            let estimated_total_mb = estimated_size as f64 / 1e6;
+                            if estimated_total_mb > 10.0 {
+                                log::debug!("Filtered templates: ~{:.1}MB ({} templates) on thread {}",
+                                           estimated_total_mb, filtered_templates.len(), thread_id);
+                            }
+                        }
+                    }
+                    estimated_size
+                } else {
+                    0
+                };
+
                 if filtered_templates.is_empty() {
+                    #[cfg(feature = "memory-debug")]
+                    if debug_memory_flag {
+                        if let Some(stats) = stats_for_tracking.as_ref() {
+                            stats.track_position_group_memory(initial_group_size, false);
+                        }
+                    }
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
@@ -734,6 +895,13 @@ impl Command for GroupReadsByUmi {
                     assign_tag_bytes,
                     filter_config.min_umi_length,
                 ) {
+                    #[cfg(feature = "memory-debug")]
+                    if debug_memory_flag {
+                        if let Some(stats) = stats_for_tracking.as_ref() {
+                            stats.track_position_group_memory(initial_group_size, false);
+                            stats.track_template_memory(_template_memory_size, false);
+                        }
+                    }
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
@@ -779,6 +947,14 @@ impl Command for GroupReadsByUmi {
 
                 // Templates are now sorted by MI, no need for additional collection
 
+                // Track memory deallocation when processing completes (if debug mode)
+                #[cfg(feature = "memory-debug")]
+                if debug_memory_flag {
+                    if let Some(stats) = stats_for_tracking.as_ref() {
+                        stats.track_position_group_memory(initial_group_size, false);
+                    }
+                }
+
                 Ok(ProcessedPositionGroup {
                     templates,
                     family_sizes,
@@ -792,6 +968,18 @@ impl Command for GroupReadsByUmi {
                   header: &Header,
                   output: &mut Vec<u8>|
                   -> std::io::Result<u64> {
+                #[cfg(feature = "memory-debug")]
+                if short_circuit_serialize {
+                    let count = processed.input_record_count;
+                    if debug_memory_flag {
+                        if let Some(stats) = stats_for_serialize.as_ref() {
+                            let tmpl_size = estimate_templates_heap_size(&processed.templates);
+                            stats.track_template_memory(tmpl_size, false);
+                        }
+                    }
+                    drop(processed);
+                    return Ok(count);
+                }
                 // Collect metrics for later aggregation
                 let metrics = CollectedMetrics {
                     family_sizes: processed.family_sizes,
@@ -808,29 +996,76 @@ impl Command for GroupReadsByUmi {
                 // Convert assign_tag_bytes to Tag for setting MI
                 let assign_tag = Tag::from(assign_tag_bytes);
 
-                // Extract primary reads for serialization, setting MI tags just before write
-                let mut records: Vec<noodles::sam::alignment::record_buf::RecordBuf> = Vec::new();
+                // Track template memory deallocation (templates are consumed here)
+                #[cfg(feature = "memory-debug")]
+                if debug_memory_flag {
+                    if let Some(stats) = stats_for_serialize.as_ref() {
+                        let tmpl_size = estimate_templates_heap_size(&processed.templates);
+                        stats.track_template_memory(tmpl_size, false);
+                    }
+                }
+
+                // Serialize primary reads directly from templates — no intermediate Vec<RecordBuf>.
+                // Each record is serialized and dropped immediately, reducing per-thread peak memory.
+                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
+                output.reserve(processed.templates.len() * 2 * 400);
+                thread_local! {
+                    static RECORD_BUF: std::cell::RefCell<Vec<u8>> =
+                        std::cell::RefCell::new(Vec::with_capacity(512));
+                }
                 for template in processed.templates {
-                    // Capture mi before consuming template
                     let mi = template.mi;
                     let (r1, r2) = template.into_primary_reads();
                     if let Some(mut r1) = r1 {
                         set_mi_tag_on_record(&mut r1, mi, assign_tag, base_mi);
-                        records.push(r1);
+                        RECORD_BUF.with(|buf| -> std::io::Result<()> {
+                            let mut record_data = buf.borrow_mut();
+                            record_data.clear();
+                            encode_record_buf(&mut record_data, header, &r1)?;
+                            let block_size = record_data.len() as u32;
+                            output.extend_from_slice(&block_size.to_le_bytes());
+                            output.extend_from_slice(&record_data);
+                            Ok(())
+                        })?;
                     }
                     if let Some(mut r2) = r2 {
                         set_mi_tag_on_record(&mut r2, mi, assign_tag, base_mi);
-                        records.push(r2);
+                        RECORD_BUF.with(|buf| -> std::io::Result<()> {
+                            let mut record_data = buf.borrow_mut();
+                            record_data.clear();
+                            encode_record_buf(&mut record_data, header, &r2)?;
+                            let block_size = record_data.len() as u32;
+                            output.extend_from_slice(&block_size.to_le_bytes());
+                            output.extend_from_slice(&record_data);
+                            Ok(())
+                        })?;
                     }
+                    // r1, r2, and the rest of template are dropped here
                 }
-
-                // Serialize records into the provided buffer
-                serialize_bam_records_into(&records, header, output)?;
+                // Short-circuit: let serialize run fully but starve compress/write
+                #[cfg(feature = "memory-debug")]
+                if short_circuit_compress {
+                    output.clear();
+                }
                 // Return INPUT record count for progress tracking (not output count)
                 Ok(input_record_count)
             },
         )
         .context("Pipeline execution failed")?;
+
+        // Cleanup memory monitoring if it was enabled
+        #[cfg(feature = "memory-debug")]
+        if let Some((handle, shutdown_signal)) = memory_monitor_handle {
+            use fgumi_lib::unified_pipeline::log_comprehensive_memory_stats;
+
+            shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _: Result<(), _> = handle.join();
+
+            if let Some(stats) = shared_stats.as_ref() {
+                log_comprehensive_memory_stats(stats);
+                info!("Memory monitoring stopped - final stats logged above");
+            }
+        }
 
         info!("Wrote output to {}", self.io.output.display());
 
@@ -1610,6 +1845,40 @@ mod tests {
         }
     }
 
+    /// Creates a `GroupReadsByUmi` with common test defaults.
+    /// Tests override specific fields as needed via struct update syntax.
+    fn test_group_cmd(strategy: Strategy, edits: u32) -> GroupReadsByUmi {
+        GroupReadsByUmi {
+            io: BamIoOptions {
+                input: std::path::PathBuf::from("/dev/null"),
+                output: std::path::PathBuf::from("/dev/null"),
+            },
+            family_size_histogram: None,
+            grouping_metrics: None,
+            raw_tag: "RX".to_string(),
+            assign_tag: "MI".to_string(),
+            cell_tag: "CB".to_string(),
+            min_map_q: None,
+            include_non_pf_reads: false,
+            strategy,
+            edits,
+            min_umi_length: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            index_threshold: 100,
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions {
+                queue_memory: "768".to_string(),
+                queue_memory_per_thread: true,
+                queue_memory_limit_mb: None,
+            },
+            #[cfg(feature = "memory-debug")]
+            debug_memory: false,
+            #[cfg(feature = "memory-debug")]
+            memory_report_interval: 1,
+        }
+    }
+
     // ========================================================================
     // Helper Functions for Test Data Creation - FIXED
     // ========================================================================
@@ -1868,27 +2137,8 @@ mod tests {
 
     #[test]
     fn test_truncate_umis_to_minimum_length() {
-        let tool = GroupReadsByUmi {
-            io: BamIoOptions {
-                input: std::path::PathBuf::from("/dev/null"),
-                output: std::path::PathBuf::from("/dev/null"),
-            },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: Some(5),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
+        let tool =
+            GroupReadsByUmi { min_umi_length: Some(5), ..test_group_cmd(Strategy::Identity, 0) };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
         let truncated = tool.truncate_umis(umis).expect("Should truncate successfully");
@@ -1899,27 +2149,7 @@ mod tests {
 
     #[test]
     fn test_truncate_umis_none_returns_unchanged() {
-        let tool = GroupReadsByUmi {
-            io: BamIoOptions {
-                input: std::path::PathBuf::from("/dev/null"),
-                output: std::path::PathBuf::from("/dev/null"),
-            },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
+        let tool = test_group_cmd(Strategy::Identity, 0);
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
         let original = umis.clone();
@@ -1930,27 +2160,8 @@ mod tests {
 
     #[test]
     fn test_truncate_umis_fails_when_too_short() {
-        let tool = GroupReadsByUmi {
-            io: BamIoOptions {
-                input: std::path::PathBuf::from("/dev/null"),
-                output: std::path::PathBuf::from("/dev/null"),
-            },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: Some(6),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
+        let tool =
+            GroupReadsByUmi { min_umi_length: Some(6), ..test_group_cmd(Strategy::Identity, 0) };
 
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
         let result = tool.truncate_umis(umis);
@@ -1993,21 +2204,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
             min_map_q: Some(30),
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 1)
         };
 
         cmd.execute("test")?;
@@ -2048,21 +2246,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -2097,21 +2282,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
             min_map_q: Some(30),
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -2144,21 +2316,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 1)
         };
 
         cmd.execute("test")?;
@@ -2203,20 +2361,7 @@ mod tests {
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: Some(paths.histogram.clone()),
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -2280,21 +2425,9 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
             min_map_q: Some(30),
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -2329,21 +2462,9 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 0,
             min_umi_length: Some(6),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 0)
         };
 
         cmd.execute("test")?;
@@ -2382,21 +2503,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 0,
             min_umi_length: Some(5),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 0)
         };
 
         cmd.execute("test")?;
@@ -2457,21 +2565,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 1)
         };
 
         cmd.execute("test")?;
@@ -2589,21 +2683,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
         cmd.execute("test")?;
@@ -2639,21 +2719,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 1)
         };
 
         cmd.execute("test")?;
@@ -2707,21 +2773,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 1)
         };
 
         cmd.execute("test")?;
@@ -2781,21 +2833,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 1)
         };
 
         cmd.execute("test")?;
@@ -2856,21 +2894,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 1)
         };
 
         cmd.execute("test")?;
@@ -2954,21 +2978,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 1)
         };
 
         cmd.execute("test")?;
@@ -3052,21 +3062,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 2,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 2)
         };
 
         cmd.execute("test")?;
@@ -3129,21 +3125,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 2,
-            min_umi_length: None,
             threading: ThreadingOptions::new(4), // Use 4 threads
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 2)
         };
 
         cmd.execute("test")?;
@@ -3187,21 +3170,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
         cmd.execute("test")?;
@@ -3241,21 +3210,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 1,
-            min_umi_length: None,
             threading: ThreadingOptions::new(4), // Use 4 threads
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
         cmd.execute("test")?;
@@ -3300,21 +3256,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 0)
         };
 
         cmd.execute("test")?;
@@ -3360,21 +3302,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 1)
         };
 
         cmd.execute("test")?;
@@ -3407,21 +3335,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 1)
         };
 
         cmd.execute("test")?;
@@ -3457,21 +3371,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -3507,21 +3407,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
         cmd.execute("test")?;
@@ -3558,21 +3444,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 1,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
         cmd.execute("test")?;
@@ -3601,21 +3473,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -3650,21 +3508,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
             min_umi_length: Some(8), // Require at least 8 bases
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -3699,21 +3544,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -3749,21 +3580,7 @@ mod tests {
         // With edits=2, all should group together
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 2,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 2)
         };
 
         cmd.execute("test")?;
@@ -3796,21 +3613,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 0)
         };
 
         // Should handle gracefully (either error or filter out)
@@ -3842,21 +3645,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 0, // No edits allowed
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 0) // No edits allowed
         };
 
         cmd.execute("test")?;
@@ -3891,21 +3680,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Edit,
-            edits: 3, // Allow up to 3 edits
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Edit, 3) // Allow up to 3 edits
         };
 
         cmd.execute("test")?;
@@ -3935,21 +3710,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 0)
         };
 
         cmd.execute("test")?;
@@ -3985,20 +3746,7 @@ mod tests {
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             family_size_histogram: Some(paths.histogram.clone()),
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4023,21 +3771,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
             grouping_metrics: Some(paths.metrics.clone()),
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4068,21 +3803,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
             min_map_q: Some(20), // Filter reads with mapq < 20
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4109,21 +3831,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4155,21 +3863,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4199,21 +3893,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4256,21 +3936,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
             min_map_q: Some(30), // Threshold is 30, "bad" pair has MAPQ=10
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4416,21 +4083,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Identity,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
@@ -4486,21 +4139,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Paired,
-            edits: 0,
-            min_umi_length: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Paired, 0)
         };
 
         cmd.execute("test")?;
@@ -4557,21 +4196,8 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: None,
-            grouping_metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
-            min_map_q: None,
-            include_non_pf_reads: false,
-            strategy: Strategy::Adjacency,
-            edits: 1,
-            min_umi_length: None,
             threading,
-            compression: CompressionOptions { compression_level: 1 },
-            index_threshold: 100,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
         cmd.execute("test")?;
