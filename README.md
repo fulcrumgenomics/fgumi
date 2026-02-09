@@ -2,6 +2,7 @@
 [![Latest release](https://img.shields.io/github/downloads-pre/fulcrumgenomics/fgumi/latest/total)](https://github.com/fulcrumgenomics/fgumi/releases)
 [![Version at crates.io](https://img.shields.io/crates/v/fgumi)](https://crates.io/crates/fgumi)
 [![Documentation at docs.rs](https://img.shields.io/docsrs/fgumi)](https://docs.rs/fgumi)
+[![codecov](https://codecov.io/gh/fulcrumgenomics/fgumi/graph/badge.svg)](https://codecov.io/gh/fulcrumgenomics/fgumi)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/fgumi/blob/main/LICENSE)
 
 # fgumi
@@ -204,7 +205,7 @@ fgumi duplex-metrics \
 fgumi filter \
   --input consensus.bam \
   --output filtered.bam \
-  --reference ref.fa
+  --ref ref.fa
 ```
 
 ## Performance Options
@@ -213,9 +214,21 @@ fgumi supports multi-threading and memory management for optimal performance:
 
 - **Threading**: `--threads N` for parallel processing
 - **Memory**: `--queue-memory 768` (plain numbers are MB; supports human-readable formats like `2GB`)
-- **Compression**: `--compression-level 1-9` for speed vs size trade-offs
+- **Compression**: `--compression-level 1-12` for speed vs size trade-offs
 
-For detailed performance tuning guidance, see the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md).
+> **Memory Model — Important for fgbio users:**
+> Unlike fgbio's JVM `-Xmx` which sets a hard ceiling on total process memory,
+> fgumi's `--queue-memory` controls pipeline queue backpressure only. Two things
+> to be aware of:
+>
+> 1. **Per-thread scaling (default):** `--queue-memory 768 --threads 8` allocates
+>    768 MB **per thread** = ~6 GB total queue memory. Use `--queue-memory-per-thread false`
+>    for a fixed total budget.
+> 2. **Queue memory < total process memory:** Actual RSS will be higher due to
+>    UMI data structures, decompressors, thread stacks, and working buffers.
+>
+> See the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md)
+> for detailed guidance, including scenario-based configurations and troubleshooting.
 
 ## Performance
 

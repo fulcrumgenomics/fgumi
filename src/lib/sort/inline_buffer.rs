@@ -739,7 +739,7 @@ const RADIX_THRESHOLD: usize = 256;
 /// # Stability
 /// Radix sort is inherently stable - records with equal keys maintain their
 /// relative input order, matching samtools behavior.
-#[allow(clippy::uninit_vec)]
+#[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
     let n = refs.len();
     if n < RADIX_THRESHOLD {
@@ -943,7 +943,7 @@ fn insertion_sort_refs(refs: &mut [RecordRef]) {
 ///
 /// This is used for stable sorting - LSD radix sort inherently preserves
 /// relative order of records with equal keys.
-#[allow(clippy::uninit_vec)]
+#[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     let n = refs.len();
     if n < RADIX_THRESHOLD {
@@ -982,7 +982,7 @@ pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
 }
 
 /// Radix sort a single u64 field of `TemplateRecordRef` using raw pointers.
-#[allow(clippy::uninit_vec)]
+#[allow(clippy::uninit_vec, unsafe_code)]
 fn radix_sort_template_field<F>(
     refs: &mut [TemplateRecordRef],
     aux: &mut [TemplateRecordRef],

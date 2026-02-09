@@ -173,7 +173,7 @@ pub struct Sort {
     /// Write BAM index (.bai) alongside output.
     ///
     /// Only valid for coordinate sort. The index file will be written to
-    /// <output>.bai. Uses single-threaded compression for accurate virtual
+    /// `<output>.bai`. Uses single-threaded compression for accurate virtual
     /// position tracking.
     #[arg(long = "write-index", default_value = "false")]
     pub write_index: bool,

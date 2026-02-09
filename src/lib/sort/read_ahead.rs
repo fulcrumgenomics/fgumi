@@ -327,4 +327,145 @@ mod tests {
         assert_eq!(CHANNEL_BUFFER_SIZE, 16);
         assert_eq!(BATCH_SIZE * CHANNEL_BUFFER_SIZE, 4096);
     }
+
+    #[test]
+    fn test_prefetch_total_records() {
+        // Verify the total prefetch capacity is exactly 4096 records.
+        // This is the product of batch size and channel buffer size, and is
+        // documented in the module-level comments as the expected total.
+        let total = BATCH_SIZE * CHANNEL_BUFFER_SIZE;
+        assert_eq!(total, 4096, "Total prefetch should be BATCH_SIZE * CHANNEL_BUFFER_SIZE = 4096");
+    }
+
+    use noodles::sam::Header;
+    use noodles::sam::alignment::RecordBuf;
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
+    use noodles::sam::alignment::record::Flags;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::ReferenceSequence;
+    use std::num::NonZeroUsize;
+    use tempfile::NamedTempFile;
+
+    use crate::bam_io::{create_bam_reader, create_raw_bam_reader};
+
+    /// Create a temporary BAM file with the given number of unmapped records.
+    /// Returns the temp file handle (keeps the file alive) and the header used.
+    fn create_test_bam_file(num_records: usize) -> (NamedTempFile, Header) {
+        let ref_seq =
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero"));
+        let header = Header::builder().add_reference_sequence("chr1", ref_seq).build();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = noodles::bam::io::Writer::new(file);
+            writer.write_header(&header).unwrap();
+
+            for i in 0..num_records {
+                let name = format!("read{i}");
+                let record =
+                    RecordBuf::builder().set_name(&*name).set_flags(Flags::UNMAPPED).build();
+                writer.write_alignment_record(&header, &record).unwrap();
+            }
+        }
+
+        (tmp, header)
+    }
+
+    #[test]
+    fn test_read_ahead_reader_empty_bam() {
+        let (tmp, _header) = create_test_bam_file(0);
+        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+
+        let mut ra = ReadAheadReader::new(reader);
+        assert!(ra.next_record().is_none(), "Empty BAM should yield no records");
+    }
+
+    #[test]
+    fn test_read_ahead_reader_single_record() {
+        let (tmp, _header) = create_test_bam_file(1);
+        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+
+        let mut ra = ReadAheadReader::new(reader);
+        assert!(ra.next_record().is_some(), "Should yield exactly one record");
+        assert!(ra.next_record().is_none(), "Should yield no more records after the single record");
+    }
+
+    #[test]
+    fn test_read_ahead_reader_multiple_records() {
+        let num = 10;
+        let (tmp, _header) = create_test_bam_file(num);
+        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+
+        let mut ra = ReadAheadReader::new(reader);
+        let mut count = 0;
+        while ra.next_record().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, num, "Should read exactly {num} records");
+    }
+
+    #[test]
+    fn test_read_ahead_reader_iterator() {
+        let num = 10;
+        let (tmp, _header) = create_test_bam_file(num);
+        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+
+        let ra = ReadAheadReader::new(reader);
+        let records: Vec<Record> = ra.collect();
+        assert_eq!(records.len(), num, "Iterator should collect exactly {num} records");
+    }
+
+    #[test]
+    fn test_read_ahead_reader_with_buffer_size() {
+        let num = 10;
+        let (tmp, _header) = create_test_bam_file(num);
+        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+
+        // Use a small buffer size (4) to exercise partial-batch logic
+        let ra = ReadAheadReader::with_buffer_size(reader, 4);
+        let records: Vec<Record> = ra.collect();
+        assert_eq!(records.len(), num, "with_buffer_size(4) should still read all {num} records");
+    }
+
+    #[test]
+    fn test_read_ahead_reader_drop_while_reading() {
+        // Create many records so the background thread is likely still reading
+        // when we drop the reader. This verifies the Drop impl does not deadlock.
+        let num = 5000;
+        let (tmp, _header) = create_test_bam_file(num);
+        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+
+        let mut ra = ReadAheadReader::new(reader);
+        // Read only a few records
+        for _ in 0..5 {
+            let _ = ra.next_record();
+        }
+        // Drop the reader while there are still records pending in the channel
+        // or still being read by the background thread.
+        drop(ra);
+        // If we reach here, the Drop impl did not deadlock.
+    }
+
+    #[test]
+    fn test_raw_read_ahead_empty() {
+        let (tmp, _header) = create_test_bam_file(0);
+        let (reader, _header) = create_raw_bam_reader(tmp.path(), 1).unwrap();
+
+        let mut ra = RawReadAheadReader::new(reader);
+        assert!(ra.next_record().is_none(), "Empty BAM should yield no raw records");
+    }
+
+    #[test]
+    fn test_raw_read_ahead_multiple() {
+        let num = 10;
+        let (tmp, _header) = create_test_bam_file(num);
+        let (reader, _header) = create_raw_bam_reader(tmp.path(), 1).unwrap();
+
+        let ra = RawReadAheadReader::new(reader);
+        let records: Vec<RawRecord> = ra.collect();
+        assert_eq!(records.len(), num, "Raw read-ahead should yield exactly {num} records");
+    }
 }

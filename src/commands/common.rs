@@ -280,28 +280,28 @@ pub struct SchedulerOptions {
     ///
     /// - `fixed-priority`: Assigns fixed thread roles (reader, writer, workers).
     ///   Thread 0 prioritizes reading, Thread N-1 prioritizes writing.
-    #[arg(long = "scheduler", value_enum, default_value_t = SchedulerStrategy::default())]
+    #[arg(long = "scheduler", value_enum, default_value_t = SchedulerStrategy::default(), hide = true)]
     pub scheduler: SchedulerStrategy,
 
     /// Print detailed pipeline statistics at completion.
     ///
     /// Shows per-step timing, throughput, contention metrics, and
     /// per-thread work distribution.
-    #[arg(long = "pipeline-stats", default_value_t = false)]
+    #[arg(long = "pipeline-stats", default_value_t = false, hide = true)]
     pub pipeline_stats: bool,
 
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
     ///
     /// When no progress is made for this duration, a warning is logged with
     /// diagnostic info (queue depths, memory usage, per-queue timestamps).
-    #[arg(long = "deadlock-timeout", default_value_t = 10)]
+    #[arg(long = "deadlock-timeout", default_value_t = 10, hide = true)]
     pub deadlock_timeout: u64,
 
     /// Enable automatic deadlock recovery (default: false, detection only).
     ///
     /// Uses progressive doubling: 2x -> 4x -> unbind, with restoration
     /// after 30s of sustained progress.
-    #[arg(long = "deadlock-recover", default_value_t = false)]
+    #[arg(long = "deadlock-recover", default_value_t = false, hide = true)]
     pub deadlock_recover: bool,
 }
 

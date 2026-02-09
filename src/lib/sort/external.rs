@@ -685,4 +685,82 @@ mod tests {
         assert_eq!(sorter.threads, 4);
         assert_eq!(sorter.output_compression, 6);
     }
+
+    // ========================================================================
+    // ExternalSorter builder tests
+    // ========================================================================
+
+    #[test]
+    fn test_sorter_defaults() {
+        let sorter = ExternalSorter::new(SortOrder::Coordinate);
+        assert_eq!(sorter.sort_order, SortOrder::Coordinate);
+        assert_eq!(sorter.memory_limit, DEFAULT_MEMORY_LIMIT);
+        assert!(sorter.temp_dir.is_none());
+        assert_eq!(sorter.threads, 1);
+        assert_eq!(sorter.output_compression, 6);
+        assert!(!sorter.write_index);
+        assert!(sorter.pg_info.is_none());
+    }
+
+    #[test]
+    fn test_sorter_builder_temp_dir() {
+        let sorter =
+            ExternalSorter::new(SortOrder::Queryname).temp_dir(PathBuf::from("/tmp/my_sort"));
+        assert_eq!(sorter.temp_dir, Some(PathBuf::from("/tmp/my_sort")));
+    }
+
+    #[test]
+    fn test_sorter_builder_pg_info() {
+        let sorter = ExternalSorter::new(SortOrder::Coordinate)
+            .pg_info("0.2.0".to_string(), "fgumi sort --input in.bam".to_string());
+        assert_eq!(
+            sorter.pg_info,
+            Some(("0.2.0".to_string(), "fgumi sort --input in.bam".to_string()))
+        );
+    }
+
+    // ========================================================================
+    // create_output_header tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_output_header_coordinate() {
+        let sorter = ExternalSorter::new(SortOrder::Coordinate);
+        let header = Header::builder().build();
+        let output_header = sorter.create_output_header(&header);
+
+        let hd = output_header.header().expect("header should have HD record");
+        let so = hd.other_fields().get(b"SO").expect("should have SO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"coordinate");
+    }
+
+    #[test]
+    fn test_create_output_header_queryname() {
+        let sorter = ExternalSorter::new(SortOrder::Queryname);
+        let header = Header::builder().build();
+        let output_header = sorter.create_output_header(&header);
+
+        let hd = output_header.header().expect("header should have HD record");
+        let so = hd.other_fields().get(b"SO").expect("should have SO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"queryname");
+    }
+
+    #[test]
+    fn test_create_output_header_template() {
+        let sorter = ExternalSorter::new(SortOrder::TemplateCoordinate);
+        let header = Header::builder().build();
+        let output_header = sorter.create_output_header(&header);
+
+        let hd = output_header.header().expect("header should have HD record");
+        let fields = hd.other_fields();
+
+        let so = fields.get(b"SO").expect("should have SO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"unsorted");
+
+        let go = fields.get(b"GO").expect("should have GO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(go), b"query");
+
+        let ss = fields.get(b"SS").expect("should have SS tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(ss), b"template-coordinate");
+    }
 }

@@ -678,6 +678,7 @@ pub fn unclipped_other_end(mate_pos: i32, mc_cigar: &str) -> i32 {
 /// Extract CIGAR operations from BAM record.
 #[inline]
 #[must_use]
+#[allow(unsafe_code)]
 pub fn get_cigar_ops(bam: &[u8]) -> &[u32] {
     let l_read_name = bam[8] as usize;
     let n_cigar_op = u16::from_le_bytes([bam[12], bam[13]]) as usize;
@@ -754,6 +755,7 @@ pub fn mate_unclipped_5prime(mate_pos: i32, mate_reverse: bool, mc_cigar: &str) 
 }
 
 #[cfg(test)]
+#[allow(clippy::identity_op)]
 mod tests {
     use super::*;
 
@@ -830,5 +832,458 @@ mod tests {
         aux_data[3..7].copy_from_slice(&42i32.to_le_bytes());
         let result = find_mi_tag(&aux_data);
         assert_eq!(result, Some((42, true)));
+    }
+
+    // ========================================================================
+    // Helper: make_bam_bytes
+    // ========================================================================
+
+    /// Construct a raw BAM byte array for testing.
+    ///
+    /// IMPORTANT: `name` length + 1 (for null terminator) should be divisible
+    /// by 4 to maintain alignment for CIGAR ops.  Use names like b"rea" (3+1=4)
+    /// or b"readABC" (7+1=8).
+    #[allow(clippy::too_many_arguments)]
+    fn make_bam_bytes(
+        tid: i32,
+        pos: i32,
+        flag: u16,
+        name: &[u8],
+        cigar_ops: &[u32],
+        seq_len: usize,
+        mate_tid: i32,
+        mate_pos: i32,
+        aux_data: &[u8],
+    ) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
+        let n_cigar_op = cigar_ops.len() as u16;
+        let seq_bytes = seq_len.div_ceil(2);
+        let total =
+            32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len + aux_data.len();
+        let mut buf = vec![0u8; total];
+
+        // Fixed header fields
+        buf[0..4].copy_from_slice(&tid.to_le_bytes());
+        buf[4..8].copy_from_slice(&pos.to_le_bytes());
+        buf[8] = l_read_name;
+        buf[9] = 0; // mapq
+        buf[10..12].copy_from_slice(&0u16.to_le_bytes()); // bin
+        buf[12..14].copy_from_slice(&n_cigar_op.to_le_bytes());
+        buf[14..16].copy_from_slice(&flag.to_le_bytes());
+        buf[16..20].copy_from_slice(&(seq_len as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&mate_tid.to_le_bytes());
+        buf[24..28].copy_from_slice(&mate_pos.to_le_bytes());
+        buf[28..32].copy_from_slice(&0i32.to_le_bytes()); // tlen
+
+        // Read name + null terminator
+        let name_start = 32;
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        buf[name_start + name.len()] = 0; // null terminator
+
+        // CIGAR ops
+        let cigar_start = name_start + l_read_name as usize;
+        for (i, &op) in cigar_ops.iter().enumerate() {
+            let offset = cigar_start + i * 4;
+            buf[offset..offset + 4].copy_from_slice(&op.to_le_bytes());
+        }
+
+        // Sequence bytes (all zeros) and quality bytes (all zeros) are already zero
+
+        // Aux data
+        let aux_start = cigar_start + cigar_ops.len() * 4 + seq_bytes + seq_len;
+        buf[aux_start..aux_start + aux_data.len()].copy_from_slice(aux_data);
+
+        buf
+    }
+
+    // ========================================================================
+    // compare_coordinate_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_compare_coordinate_raw_same_records() {
+        let rec = make_bam_bytes(1, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&rec, &rec), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_different_tid() {
+        let a = make_bam_bytes(0, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        let b = make_bam_bytes(2, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_coordinate_raw(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_different_pos() {
+        let a = make_bam_bytes(1, 50, 0, b"rea", &[], 0, -1, -1, &[]);
+        let b = make_bam_bytes(1, 200, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_coordinate_raw(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_reverse_strand() {
+        // Forward strand (flag=0) should sort before reverse (flag=REVERSE)
+        let fwd = make_bam_bytes(1, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        let rev = make_bam_bytes(1, 100, flags::REVERSE, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&fwd, &rev), Ordering::Less);
+        assert_eq!(compare_coordinate_raw(&rev, &fwd), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_name_tiebreak() {
+        let a = make_bam_bytes(1, 100, 0, b"aaa", &[], 0, -1, -1, &[]);
+        let b = make_bam_bytes(1, 100, 0, b"zzz", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_coordinate_raw(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_no_ref_sorts_last() {
+        // tid=-1 (no reference) should sort after mapped records
+        let mapped = make_bam_bytes(1, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        let no_ref = make_bam_bytes(-1, -1, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&mapped, &no_ref), Ordering::Less);
+        assert_eq!(compare_coordinate_raw(&no_ref, &mapped), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_both_no_ref() {
+        // Both tid=-1, compare by name
+        let a = make_bam_bytes(-1, -1, 0, b"aaa", &[], 0, -1, -1, &[]);
+        let b = make_bam_bytes(-1, -1, 0, b"zzz", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_coordinate_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_coordinate_raw(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_coordinate_raw_one_no_ref_each_direction() {
+        let mapped = make_bam_bytes(5, 999, 0, b"rea", &[], 0, -1, -1, &[]);
+        let no_ref = make_bam_bytes(-1, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        // Mapped < no_ref
+        assert_eq!(compare_coordinate_raw(&mapped, &no_ref), Ordering::Less);
+        // no_ref > mapped
+        assert_eq!(compare_coordinate_raw(&no_ref, &mapped), Ordering::Greater);
+    }
+
+    // ========================================================================
+    // compare_queryname_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_compare_queryname_raw_name_ordering() {
+        let a = make_bam_bytes(0, 0, 0, b"abc", &[], 0, -1, -1, &[]);
+        let b = make_bam_bytes(0, 0, 0, b"xyz", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_queryname_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_queryname_raw(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_queryname_raw_same_name_flag_tiebreak() {
+        // Same name, different flags -> flag decides
+        let a = make_bam_bytes(0, 0, 0x40, b"rea", &[], 0, -1, -1, &[]); // first in pair
+        let b = make_bam_bytes(0, 0, 0x80, b"rea", &[], 0, -1, -1, &[]); // second in pair
+        assert_eq!(compare_queryname_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_queryname_raw(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_queryname_raw_equal() {
+        let rec = make_bam_bytes(1, 100, 0x40, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(compare_queryname_raw(&rec, &rec), Ordering::Equal);
+    }
+
+    // ========================================================================
+    // Unclipped position tests
+    // ========================================================================
+
+    #[test]
+    fn test_unclipped_start_from_cigar_no_clips() {
+        // 10M = (10 << 4) | 0
+        let cigar = &[(10 << 4) | 0];
+        assert_eq!(unclipped_start_from_cigar(100, cigar), 100);
+    }
+
+    #[test]
+    fn test_unclipped_start_from_cigar_soft_clip() {
+        // 5S10M: soft clip (op type 4), then match
+        let cigar = &[(5 << 4) | 4, (10 << 4) | 0];
+        assert_eq!(unclipped_start_from_cigar(100, cigar), 95);
+    }
+
+    #[test]
+    fn test_unclipped_start_from_cigar_hard_clip() {
+        // 3H10M: hard clip (op type 5), then match
+        let cigar = &[(3 << 4) | 5, (10 << 4) | 0];
+        assert_eq!(unclipped_start_from_cigar(100, cigar), 97);
+    }
+
+    #[test]
+    fn test_unclipped_end_from_cigar_no_clips() {
+        // 10M: end = pos + 10 - 1 = 109
+        let cigar = &[(10 << 4) | 0];
+        assert_eq!(unclipped_end_from_cigar(100, cigar), 109);
+    }
+
+    #[test]
+    fn test_unclipped_end_from_cigar_trailing_clips() {
+        // 10M5S3H: end = 100 + 10 + 5 + 3 - 1 = 117
+        let cigar = &[(10 << 4) | 0, (5 << 4) | 4, (3 << 4) | 5];
+        assert_eq!(unclipped_end_from_cigar(100, cigar), 117);
+    }
+
+    #[test]
+    fn test_unclipped_5prime_forward_vs_reverse() {
+        // 5S10M3S: forward uses start, reverse uses end
+        let cigar = &[(5 << 4) | 4, (10 << 4) | 0, (3 << 4) | 4];
+        // Forward: unclipped_start = 100 - 5 = 95
+        assert_eq!(unclipped_5prime(100, false, cigar), 95);
+        // Reverse: unclipped_end = 100 + 10 + 3 - 1 = 112
+        assert_eq!(unclipped_5prime(100, true, cigar), 112);
+    }
+
+    // ========================================================================
+    // CIGAR string parsing tests (parse_leading_clips, parse_ref_len_and_trailing_clips)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_leading_clips_soft() {
+        // "5S10M" -> leading clips = 5
+        assert_eq!(parse_leading_clips("5S10M"), 5);
+    }
+
+    #[test]
+    fn test_parse_leading_clips_hard_and_soft() {
+        // "3H5S10M" -> leading clips = 3 + 5 = 8
+        assert_eq!(parse_leading_clips("3H5S10M"), 8);
+    }
+
+    #[test]
+    fn test_parse_leading_clips_no_clips() {
+        // "10M" -> leading clips = 0
+        assert_eq!(parse_leading_clips("10M"), 0);
+    }
+
+    #[test]
+    fn test_parse_ref_len_and_trailing_clips_basic() {
+        // "10M5S" -> ref_len=10, trailing_clips=5
+        assert_eq!(parse_ref_len_and_trailing_clips("10M5S"), (10, 5));
+    }
+
+    #[test]
+    fn test_parse_ref_len_and_trailing_clips_complex() {
+        // "5S10M2I3D5M3S2H"
+        // ref consuming: 10M + 3D + 5M = 18
+        // trailing clips: 3S + 2H = 5
+        assert_eq!(parse_ref_len_and_trailing_clips("5S10M2I3D5M3S2H"), (18, 5));
+    }
+
+    // ========================================================================
+    // reference_length_from_cigar tests
+    // ========================================================================
+
+    #[test]
+    fn test_reference_length_simple_match() {
+        // 50M
+        let cigar = &[(50 << 4) | 0];
+        assert_eq!(reference_length_from_cigar(cigar), 50);
+    }
+
+    #[test]
+    fn test_reference_length_with_deletions() {
+        // 10M3D5M2N8M
+        // M (0), D (2), N (3) all consume reference
+        // ref_len = 10 + 3 + 5 + 2 + 8 = 28
+        let cigar = &[
+            (10 << 4) | 0, // 10M
+            (3 << 4) | 2,  // 3D
+            (5 << 4) | 0,  // 5M
+            (2 << 4) | 3,  // 2N
+            (8 << 4) | 0,  // 8M
+        ];
+        assert_eq!(reference_length_from_cigar(cigar), 28);
+    }
+
+    #[test]
+    fn test_reference_length_with_insertions() {
+        // 10M5I10M: insertions don't consume reference
+        // ref_len = 10 + 10 = 20
+        let cigar = &[
+            (10 << 4) | 0, // 10M
+            (5 << 4) | 1,  // 5I
+            (10 << 4) | 0, // 10M
+        ];
+        assert_eq!(reference_length_from_cigar(cigar), 20);
+    }
+
+    // ========================================================================
+    // find_mc_tag tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_mc_tag_present() {
+        // MC:Z:10M5S\0
+        let aux = b"MCZ10M5S\x00";
+        assert_eq!(find_mc_tag(aux), Some("10M5S"));
+    }
+
+    #[test]
+    fn test_find_mc_tag_absent() {
+        // Some other tag but no MC
+        let aux = b"NMC\x05\x00\x00\x00"; // NM:i:5
+        assert_eq!(find_mc_tag(aux), None);
+    }
+
+    #[test]
+    fn test_find_mc_tag_after_other_tags() {
+        // NM:C:5 (1 byte) then MC:Z:15M\0
+        // NM tag: b'N', b'M', b'C', 5
+        // MC tag: b'M', b'C', b'Z', b'1', b'5', b'M', 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"NMC"); // tag NM, type C (unsigned byte)
+        aux.push(5); // value
+        aux.extend_from_slice(b"MCZ15M\x00"); // MC:Z:15M
+        assert_eq!(find_mc_tag(&aux), Some("15M"));
+    }
+
+    // ========================================================================
+    // tag_value_size tests
+    // ========================================================================
+
+    #[test]
+    fn test_tag_value_size_fixed() {
+        assert_eq!(tag_value_size(b'A', &[0]), Some(1));
+        assert_eq!(tag_value_size(b'c', &[0]), Some(1));
+        assert_eq!(tag_value_size(b'C', &[0]), Some(1));
+        assert_eq!(tag_value_size(b's', &[0, 0]), Some(2));
+        assert_eq!(tag_value_size(b'S', &[0, 0]), Some(2));
+        assert_eq!(tag_value_size(b'i', &[0, 0, 0, 0]), Some(4));
+        assert_eq!(tag_value_size(b'I', &[0, 0, 0, 0]), Some(4));
+        assert_eq!(tag_value_size(b'f', &[0, 0, 0, 0]), Some(4));
+    }
+
+    #[test]
+    fn test_tag_value_size_string() {
+        // Z type: null-terminated string "hello\0" -> size = 6
+        let data = b"hello\x00";
+        assert_eq!(tag_value_size(b'Z', data), Some(6));
+
+        // H type: hex-encoded string "ABCD\0" -> size = 5
+        let data = b"ABCD\x00";
+        assert_eq!(tag_value_size(b'H', data), Some(5));
+    }
+
+    #[test]
+    fn test_tag_value_size_array() {
+        // B type: array header is elem_type (1 byte) + count (4 bytes) + data
+        // B:i:3 -> 3 int32 elements = 5 + 3*4 = 17
+        let mut data = vec![b'i']; // elem_type
+        data.extend_from_slice(&3u32.to_le_bytes()); // count = 3
+        data.extend_from_slice(&[0; 12]); // 3 * 4 bytes of data
+        assert_eq!(tag_value_size(b'B', &data), Some(17));
+    }
+
+    // ========================================================================
+    // find_mi_tag edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_find_mi_tag_empty_aux() {
+        let aux_data: &[u8] = &[];
+        assert_eq!(find_mi_tag(aux_data), None);
+    }
+
+    #[test]
+    fn test_find_mi_tag_unsigned_int_types() {
+        // MI:C:200 (unsigned byte)
+        let aux = [b'M', b'I', b'C', 200];
+        assert_eq!(find_mi_tag(&aux), Some((200, true)));
+
+        // MI:S:5000 (unsigned short)
+        let mut aux = [b'M', b'I', b'S', 0, 0];
+        aux[3..5].copy_from_slice(&5000u16.to_le_bytes());
+        assert_eq!(find_mi_tag(&aux), Some((5000, true)));
+
+        // MI:I:100000 (unsigned int)
+        let mut aux = [b'M', b'I', b'I', 0, 0, 0, 0];
+        aux[3..7].copy_from_slice(&100_000u32.to_le_bytes());
+        assert_eq!(find_mi_tag(&aux), Some((100_000, true)));
+    }
+
+    #[test]
+    fn test_find_mi_tag_after_other_tags() {
+        // Put another tag before MI
+        // XY:C:42 then MI:Z:99\0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"XYC"); // tag XY, type C
+        aux.push(42); // value
+        aux.extend_from_slice(b"MIZ99\x00"); // MI:Z:99
+        assert_eq!(find_mi_tag(&aux), Some((99, true)));
+    }
+
+    #[test]
+    fn test_find_mi_tag_invalid_string() {
+        // MI:Z:abc\0 -> non-numeric chars return default (0, true)
+        let aux = b"MIZabc\x00";
+        assert_eq!(find_mi_tag(aux), Some((0, true)));
+    }
+
+    // ========================================================================
+    // parse_mi_bytes tests (tested through find_mi_tag with Z-type values)
+    // ========================================================================
+
+    #[test]
+    fn test_find_mi_tag_empty_string_value() {
+        // MI:Z: with empty string -> MI:Z:\0
+        let aux = b"MIZ\x00";
+        // parse_mi_bytes gets an empty slice, returns None
+        assert_eq!(find_mi_tag(aux), None);
+    }
+
+    #[test]
+    fn test_find_mi_tag_suffix_other_than_ab() {
+        // "12345/C" -> suffix != 'B', so is_a=true
+        let aux = b"MIZ12345/C\x00";
+        assert_eq!(find_mi_tag(aux), Some((12345, true)));
+    }
+
+    #[test]
+    fn test_find_mi_tag_large_number() {
+        // Large number: "9999999999"
+        let aux = b"MIZ9999999999\x00";
+        assert_eq!(find_mi_tag(aux), Some((9_999_999_999, true)));
+    }
+
+    // ========================================================================
+    // compare_template_coordinate_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_compare_template_coordinate_raw_equal() {
+        // Two identical unmapped, unpaired records -> should be Equal
+        let rec = make_bam_bytes(
+            -1,
+            -1,
+            flags::UNMAPPED, // unmapped, not paired
+            b"rea",
+            &[],
+            0,
+            -1,
+            -1,
+            &[],
+        );
+        assert_eq!(compare_template_coordinate_raw(&rec, &rec), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_template_coordinate_raw_different_tid() {
+        // Two mapped, unpaired records with different tids
+        // 10M cigar for proper alignment
+        let cigar = &[(10 << 4) | 0]; // 10M
+        let a = make_bam_bytes(0, 100, 0, b"rea", cigar, 10, -1, -1, &[]);
+        let b = make_bam_bytes(2, 100, 0, b"rea", cigar, 10, -1, -1, &[]);
+        assert_eq!(compare_template_coordinate_raw(&a, &b), Ordering::Less);
+        assert_eq!(compare_template_coordinate_raw(&b, &a), Ordering::Greater);
     }
 }

@@ -1827,3 +1827,235 @@ pub struct RawSortStats {
     /// Number of temporary chunk files written.
     pub chunks_written: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noodles::sam::header::record::value::map::ReadGroup;
+
+    // ========================================================================
+    // LibraryLookup tests
+    // ========================================================================
+
+    #[test]
+    fn test_library_lookup_empty_header() {
+        let header = Header::builder().build();
+        let lookup = LibraryLookup::from_header(&header);
+        assert!(lookup.rg_to_ordinal.is_empty());
+    }
+
+    #[test]
+    fn test_library_lookup_single_rg() {
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let header = Header::builder().add_read_group(BString::from("rg1"), rg).build();
+
+        let lookup = LibraryLookup::from_header(&header);
+        assert_eq!(lookup.rg_to_ordinal.len(), 1);
+        // LibA is the only library, so it gets ordinal 1 (0 is reserved for empty/unknown)
+        assert_eq!(*lookup.rg_to_ordinal.get(b"rg1".as_slice()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_library_lookup_multiple_libraries() {
+        let rg_a = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibC"))
+            .build()
+            .expect("valid");
+        let rg_b = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let rg_c = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibB"))
+            .build()
+            .expect("valid");
+
+        let header = Header::builder()
+            .add_read_group(BString::from("rg1"), rg_a)
+            .add_read_group(BString::from("rg2"), rg_b)
+            .add_read_group(BString::from("rg3"), rg_c)
+            .build();
+
+        let lookup = LibraryLookup::from_header(&header);
+        assert_eq!(lookup.rg_to_ordinal.len(), 3);
+
+        // Libraries sorted alphabetically: LibA=1, LibB=2, LibC=3
+        assert_eq!(*lookup.rg_to_ordinal.get(b"rg2".as_slice()).unwrap(), 1); // LibA
+        assert_eq!(*lookup.rg_to_ordinal.get(b"rg3".as_slice()).unwrap(), 2); // LibB
+        assert_eq!(*lookup.rg_to_ordinal.get(b"rg1".as_slice()).unwrap(), 3); // LibC
+    }
+
+    #[test]
+    fn test_library_lookup_unknown_rg_returns_zero() {
+        let rg = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, String::from("LibA"))
+            .build()
+            .expect("valid");
+        let header = Header::builder().add_read_group(BString::from("rg1"), rg).build();
+
+        let lookup = LibraryLookup::from_header(&header);
+        // A BAM record with no RG tag or unknown RG should return ordinal 0
+        // We can test get_ordinal with a minimal BAM record that has no aux data
+        let mut bam = vec![0u8; 36];
+        bam[8] = 4; // l_read_name = 4
+        bam[32..36].copy_from_slice(b"rea\0");
+        assert_eq!(lookup.get_ordinal(&bam), 0);
+    }
+
+    // ========================================================================
+    // RawExternalSorter builder tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_sorter_defaults() {
+        let sorter = RawExternalSorter::new(SortOrder::Coordinate);
+        assert_eq!(sorter.memory_limit, 512 * 1024 * 1024);
+        assert!(sorter.temp_dir.is_none());
+        assert_eq!(sorter.threads, 1);
+        assert_eq!(sorter.output_compression, 6);
+        assert_eq!(sorter.temp_compression, 1);
+        assert!(!sorter.write_index);
+        assert!(sorter.pg_info.is_none());
+        assert_eq!(sorter.max_temp_files, DEFAULT_MAX_TEMP_FILES);
+    }
+
+    #[test]
+    fn test_raw_sorter_builder_chain() {
+        let sorter = RawExternalSorter::new(SortOrder::Queryname)
+            .memory_limit(1024)
+            .temp_dir(PathBuf::from("/tmp/test"))
+            .threads(8)
+            .output_compression(9)
+            .temp_compression(3)
+            .write_index(true)
+            .pg_info("1.0".to_string(), "fgumi sort".to_string())
+            .max_temp_files(128);
+
+        assert_eq!(sorter.memory_limit, 1024);
+        assert_eq!(sorter.temp_dir, Some(PathBuf::from("/tmp/test")));
+        assert_eq!(sorter.threads, 8);
+        assert_eq!(sorter.output_compression, 9);
+        assert_eq!(sorter.temp_compression, 3);
+        assert!(sorter.write_index);
+        assert_eq!(sorter.pg_info, Some(("1.0".to_string(), "fgumi sort".to_string())));
+        assert_eq!(sorter.max_temp_files, 128);
+    }
+
+    #[test]
+    fn test_raw_sorter_memory_limit() {
+        let sorter = RawExternalSorter::new(SortOrder::Coordinate).memory_limit(256 * 1024 * 1024);
+        assert_eq!(sorter.memory_limit, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_raw_sorter_temp_compression() {
+        let sorter = RawExternalSorter::new(SortOrder::Coordinate).temp_compression(0);
+        assert_eq!(sorter.temp_compression, 0);
+    }
+
+    #[test]
+    fn test_raw_sorter_max_temp_files() {
+        let sorter = RawExternalSorter::new(SortOrder::Coordinate).max_temp_files(0);
+        assert_eq!(sorter.max_temp_files, 0);
+    }
+
+    // ========================================================================
+    // create_output_header tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_output_header_coordinate() {
+        let sorter = RawExternalSorter::new(SortOrder::Coordinate);
+        let header = Header::builder().build();
+        let output_header = sorter.create_output_header(&header);
+
+        let hd = output_header.header().expect("header should have HD record");
+        let so = hd.other_fields().get(b"SO").expect("should have SO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"coordinate");
+    }
+
+    #[test]
+    fn test_create_output_header_queryname() {
+        let sorter = RawExternalSorter::new(SortOrder::Queryname);
+        let header = Header::builder().build();
+        let output_header = sorter.create_output_header(&header);
+
+        let hd = output_header.header().expect("header should have HD record");
+        let so = hd.other_fields().get(b"SO").expect("should have SO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"queryname");
+    }
+
+    #[test]
+    fn test_create_output_header_template_coordinate() {
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        let header = Header::builder().build();
+        let output_header = sorter.create_output_header(&header);
+
+        let hd = output_header.header().expect("header should have HD record");
+        let fields = hd.other_fields();
+
+        let so = fields.get(b"SO").expect("should have SO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"unsorted");
+
+        let go = fields.get(b"GO").expect("should have GO tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(go), b"query");
+
+        let ss = fields.get(b"SS").expect("should have SS tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(ss), b"template-coordinate");
+    }
+
+    // ========================================================================
+    // find_rg_tag_raw tests
+    // ========================================================================
+
+    /// Helper to build minimal BAM bytes with aux data appended.
+    /// Fixed 32-byte header + read name "rea\0" (`l_read_name=4`) + no cigar + no seq + aux.
+    fn build_bam_with_aux(aux_data: &[u8]) -> Vec<u8> {
+        let l_read_name: u8 = 4; // "rea" + null
+        let mut bam = vec![0u8; 32];
+        bam[8] = l_read_name;
+        // n_cigar_op = 0 (bytes 12-13 already zero)
+        // l_seq = 0 (bytes 16-19 already zero)
+        // read name
+        bam.extend_from_slice(b"rea\0");
+        // no cigar, no seq, no qual
+        // append aux data
+        bam.extend_from_slice(aux_data);
+        bam
+    }
+
+    #[test]
+    fn test_find_rg_tag_raw_present() {
+        // RG:Z:group1\0
+        let aux = b"RGZgroup1\0";
+        let bam = build_bam_with_aux(aux);
+        let result = find_rg_tag_raw(&bam);
+        assert_eq!(result, Some(b"group1".as_slice()));
+    }
+
+    #[test]
+    fn test_find_rg_tag_raw_absent() {
+        // No aux data at all
+        let bam = build_bam_with_aux(&[]);
+        let result = find_rg_tag_raw(&bam);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_rg_tag_raw_after_other_tags() {
+        // First an integer tag: XY:i:<4 bytes>, then RG:Z:mygroup\0
+        let mut aux = Vec::new();
+        // XY:i:42
+        aux.extend_from_slice(b"XYi");
+        aux.extend_from_slice(&42i32.to_le_bytes());
+        // RG:Z:mygroup\0
+        aux.extend_from_slice(b"RGZmygroup\0");
+
+        let bam = build_bam_with_aux(&aux);
+        let result = find_rg_tag_raw(&bam);
+        assert_eq!(result, Some(b"mygroup".as_slice()));
+    }
+}

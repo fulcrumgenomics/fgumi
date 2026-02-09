@@ -8,34 +8,62 @@ use clap::ValueEnum;
 
 use super::base::PipelineStep;
 
+#[doc(hidden)]
 pub mod backpressure_proportional;
+#[doc(hidden)]
 pub mod balanced_chase;
+#[doc(hidden)]
 pub mod balanced_chase_drain;
+#[doc(hidden)]
 pub mod chase_bottleneck;
+#[doc(hidden)]
 pub mod epsilon_greedy;
+#[doc(hidden)]
 pub mod fixed_priority;
+#[doc(hidden)]
 pub mod hybrid_adaptive;
+#[doc(hidden)]
 pub mod learned_affinity;
+#[doc(hidden)]
 pub mod optimized_chase;
+#[doc(hidden)]
 pub mod sticky_work_stealing;
+#[doc(hidden)]
 pub mod thompson_sampling;
+#[doc(hidden)]
 pub mod thompson_with_priors;
+#[doc(hidden)]
 pub mod two_phase;
+#[doc(hidden)]
 pub mod ucb;
 
+#[doc(hidden)]
 pub use backpressure_proportional::BackpressureProportionalScheduler;
+#[doc(hidden)]
 pub use balanced_chase::BalancedChaseScheduler;
+#[doc(hidden)]
 pub use balanced_chase_drain::BalancedChaseDrainScheduler;
+#[doc(hidden)]
 pub use chase_bottleneck::ChaseBottleneckScheduler;
+#[doc(hidden)]
 pub use epsilon_greedy::EpsilonGreedyScheduler;
+#[doc(hidden)]
 pub use fixed_priority::FixedPriorityScheduler;
+#[doc(hidden)]
 pub use hybrid_adaptive::HybridAdaptiveScheduler;
+#[doc(hidden)]
 pub use learned_affinity::LearnedAffinityScheduler;
+#[doc(hidden)]
 pub use optimized_chase::OptimizedChaseScheduler;
+#[doc(hidden)]
 pub use sticky_work_stealing::StickyWorkStealingScheduler;
+#[doc(hidden)]
 pub use thompson_sampling::ThompsonSamplingScheduler;
+#[doc(hidden)]
 pub use thompson_with_priors::ThompsonWithPriorsScheduler;
+#[doc(hidden)]
 pub use two_phase::TwoPhaseScheduler;
+#[doc(hidden)]
 pub use ucb::UCBScheduler;
 
 /// Scheduler strategy for pipeline execution.
