@@ -2,6 +2,26 @@
 
 fgumi provides three key options to optimize performance for your system: threading, memory management, and compression. This guide explains how to configure these options for different scenarios.
 
+## Coming from fgbio?
+
+If you're used to fgbio's JVM-based memory model (`java -Xmx4g`), there are important differences in how fgumi manages memory:
+
+| | fgbio (JVM) | fgumi |
+|---|---|---|
+| **Memory control** | `-Xmx` sets a hard ceiling on the entire process | `--queue-memory` controls pipeline queue backpressure |
+| **Enforcement** | Hard limit — JVM throws `OutOfMemoryError` at the ceiling | Soft limit — triggers backpressure to slow producers |
+| **Scope** | Total process memory (heap + off-heap) | Queue memory only; does not cover UMI data structures, decompressors, thread stacks, or working buffers |
+| **Scaling** | Fixed regardless of threads | Per-thread by default (`--queue-memory 768 --threads 8` = ~6 GB) |
+| **Recommendation** | Set once and forget | Monitor RSS and adjust; use `--queue-memory-per-thread false` for a fixed total budget |
+
+**Key takeaway:** fgumi's actual process memory (RSS) will be higher than the `--queue-memory` value. When estimating memory needs, account for:
+- Queue memory (controlled by `--queue-memory`)
+- UMI grouping data structures (scales with UMI diversity and position depth)
+- Per-thread decompressor and compressor instances
+- Thread stacks and I/O buffers
+
+For memory-constrained environments, start with `--queue-memory-per-thread false` and a conservative total budget, then increase if throughput is too low.
+
 ## Threading Options
 
 ### Single-threaded Mode
@@ -50,7 +70,7 @@ fgumi filter --queue-memory 4096 --queue-memory-per-thread false
 ## Compression Options
 
 ### Compression Level
-- **Range**: 1 (fastest) to 9 (best compression)
+- **Range**: 1 (fastest) to 12 (best compression)
 - **Default**: 1 (fastest)
 - **Usage**: `--compression-level N`
 

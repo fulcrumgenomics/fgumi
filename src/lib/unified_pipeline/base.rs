@@ -4761,4 +4761,715 @@ mod tests {
         assert_eq!(stats.per_thread_idle_ns[0].load(Ordering::Relaxed), 300_000);
         assert_eq!(stats.per_thread_idle_ns[1].load(Ordering::Relaxed), 50_000);
     }
+
+    // ========================================================================
+    // MemoryTracker tests
+    // ========================================================================
+
+    #[test]
+    fn test_memory_tracker_new() {
+        let tracker = MemoryTracker::new(1000);
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.peak(), 0);
+        assert_eq!(tracker.limit(), 1000);
+    }
+
+    #[test]
+    fn test_memory_tracker_unlimited() {
+        let tracker = MemoryTracker::unlimited();
+        assert_eq!(tracker.limit(), 0);
+        // Unlimited tracker should always succeed
+        assert!(tracker.try_add(1_000_000));
+        assert!(tracker.try_add(1_000_000_000));
+        assert_eq!(tracker.current(), 1_001_000_000);
+    }
+
+    #[test]
+    fn test_memory_tracker_try_add_under_limit() {
+        let tracker = MemoryTracker::new(1000);
+        assert!(tracker.try_add(500));
+        assert_eq!(tracker.current(), 500);
+    }
+
+    #[test]
+    fn test_memory_tracker_try_add_at_limit() {
+        let tracker = MemoryTracker::new(1000);
+        assert!(tracker.try_add(1000));
+        // Now at the limit, next add should be rejected
+        assert!(!tracker.try_add(1));
+    }
+
+    #[test]
+    fn test_memory_tracker_try_add_single_exceeds() {
+        // Key behavior: if currently under limit, a single addition that
+        // would exceed the limit still succeeds.
+        let tracker = MemoryTracker::new(1000);
+        assert!(tracker.try_add(500)); // under limit
+        assert!(tracker.try_add(600)); // would exceed, but we're under limit so it succeeds
+        assert_eq!(tracker.current(), 1100);
+        // Now over limit, next add should be rejected
+        assert!(!tracker.try_add(1));
+    }
+
+    #[test]
+    fn test_memory_tracker_remove_saturating() {
+        let tracker = MemoryTracker::new(1000);
+        tracker.try_add(100);
+        // Remove more than current -> saturates to 0
+        tracker.remove(200);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn test_memory_tracker_peak_tracking() {
+        let tracker = MemoryTracker::new(0); // unlimited
+        tracker.try_add(100);
+        tracker.try_add(200);
+        assert_eq!(tracker.peak(), 300);
+        tracker.remove(250);
+        assert_eq!(tracker.current(), 50);
+        // Peak should still reflect the high-water mark
+        assert_eq!(tracker.peak(), 300);
+    }
+
+    #[test]
+    fn test_memory_tracker_is_at_limit() {
+        // Backpressure threshold is min(limit, 512MB).
+        // With a limit of 1000, backpressure threshold = 1000.
+        let tracker = MemoryTracker::new(1000);
+        assert!(!tracker.is_at_limit());
+        tracker.try_add(999);
+        assert!(!tracker.is_at_limit());
+        tracker.try_add(1);
+        assert!(tracker.is_at_limit());
+    }
+
+    #[test]
+    fn test_memory_tracker_drain_threshold() {
+        // Drain threshold is half of backpressure threshold.
+        // With limit=1000, backpressure=1000, drain=500.
+        let tracker = MemoryTracker::new(1000);
+        tracker.try_add(1000);
+        assert!(!tracker.is_below_drain_threshold()); // at 1000, threshold is 500
+        tracker.remove(501);
+        assert!(tracker.is_below_drain_threshold()); // at 499, below 500
+    }
+
+    #[test]
+    fn test_memory_tracker_default_is_unlimited() {
+        let tracker = MemoryTracker::default();
+        assert_eq!(tracker.limit(), 0);
+        // Should behave like unlimited
+        assert!(tracker.try_add(1_000_000));
+    }
+
+    // ========================================================================
+    // ReorderBufferState tests
+    // ========================================================================
+
+    #[test]
+    fn test_reorder_buffer_state_new() {
+        let state = ReorderBufferState::new(1000);
+        assert_eq!(state.get_next_seq(), 0);
+        assert_eq!(state.get_heap_bytes(), 0);
+        assert_eq!(state.get_memory_limit(), 1000);
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_can_proceed_next_seq() {
+        // Always allows the next_seq serial, even if over memory limit
+        let state = ReorderBufferState::new(100);
+        state.add_heap_bytes(10_000); // way over limit
+        // next_seq is 0, so serial 0 should always proceed
+        assert!(state.can_proceed(0));
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_can_proceed_over_limit() {
+        // Blocks non-next serials when heap_bytes >= effective_limit / 2
+        let state = ReorderBufferState::new(1000);
+        // effective_limit = min(1000, 512MB) = 1000
+        // backpressure at 50% = 500
+        state.add_heap_bytes(500);
+        // Serial 1 is not next_seq (0), and heap_bytes >= 500, so should block
+        assert!(!state.can_proceed(1));
+        // Serial 0 is next_seq, should still proceed
+        assert!(state.can_proceed(0));
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_is_memory_high() {
+        let state = ReorderBufferState::new(1000);
+        assert!(!state.is_memory_high());
+        state.add_heap_bytes(1000);
+        assert!(state.is_memory_high());
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_is_memory_drained() {
+        // Hysteresis: enter drain at threshold, exit at half threshold
+        let state = ReorderBufferState::new(1000);
+        state.add_heap_bytes(1000);
+        assert!(!state.is_memory_drained()); // at 1000, threshold/2 = 500
+        state.sub_heap_bytes(501);
+        assert!(state.is_memory_drained()); // at 499, below 500
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_effective_limit() {
+        // 0 uses BACKPRESSURE_THRESHOLD_BYTES, non-zero uses min
+        let state_zero = ReorderBufferState::new(0);
+        // is_memory_high checks heap_bytes >= effective_limit
+        // With 0 limit, effective_limit = BACKPRESSURE_THRESHOLD_BYTES (512MB)
+        assert!(!state_zero.is_memory_high()); // 0 < 512MB
+
+        let state_small = ReorderBufferState::new(100);
+        state_small.add_heap_bytes(100);
+        assert!(state_small.is_memory_high()); // 100 >= min(100, 512MB) = 100
+    }
+
+    #[test]
+    fn test_reorder_buffer_state_add_sub_heap_bytes() {
+        let state = ReorderBufferState::new(0);
+        state.add_heap_bytes(100);
+        assert_eq!(state.get_heap_bytes(), 100);
+        state.add_heap_bytes(50);
+        assert_eq!(state.get_heap_bytes(), 150);
+        state.sub_heap_bytes(30);
+        assert_eq!(state.get_heap_bytes(), 120);
+    }
+
+    // ========================================================================
+    // GroupKey tests
+    // ========================================================================
+
+    #[test]
+    fn test_group_key_single() {
+        let key = GroupKey::single(1, 100, 0, 5, 0, 42);
+        assert_eq!(key.ref_id1, 1);
+        assert_eq!(key.pos1, 100);
+        assert_eq!(key.strand1, 0);
+        assert_eq!(key.ref_id2, GroupKey::UNKNOWN_REF);
+        assert_eq!(key.pos2, GroupKey::UNKNOWN_POS);
+        assert_eq!(key.strand2, GroupKey::UNKNOWN_STRAND);
+        assert_eq!(key.library_idx, 5);
+        assert_eq!(key.cell_hash, 0);
+        assert_eq!(key.name_hash, 42);
+    }
+
+    #[test]
+    fn test_group_key_paired() {
+        // When (ref_id, pos, strand) <= (mate_ref_id, mate_pos, mate_strand),
+        // the positions stay as given.
+        let key = GroupKey::paired(1, 100, 0, 2, 200, 1, 3, 0, 99);
+        assert_eq!(key.ref_id1, 1);
+        assert_eq!(key.pos1, 100);
+        assert_eq!(key.strand1, 0);
+        assert_eq!(key.ref_id2, 2);
+        assert_eq!(key.pos2, 200);
+        assert_eq!(key.strand2, 1);
+    }
+
+    #[test]
+    fn test_group_key_paired_swap() {
+        // When (ref_id, pos, strand) > (mate_ref_id, mate_pos, mate_strand),
+        // the positions are swapped so lower comes first.
+        let key = GroupKey::paired(5, 500, 1, 1, 100, 0, 3, 0, 99);
+        assert_eq!(key.ref_id1, 1);
+        assert_eq!(key.pos1, 100);
+        assert_eq!(key.strand1, 0);
+        assert_eq!(key.ref_id2, 5);
+        assert_eq!(key.pos2, 500);
+        assert_eq!(key.strand2, 1);
+    }
+
+    #[test]
+    fn test_group_key_position_key() {
+        let key = GroupKey::single(1, 100, 0, 5, 7, 42);
+        let pk = key.position_key();
+        // position_key returns tuple without name_hash
+        assert_eq!(
+            pk,
+            (
+                1,
+                100,
+                0,
+                GroupKey::UNKNOWN_REF,
+                GroupKey::UNKNOWN_POS,
+                GroupKey::UNKNOWN_STRAND,
+                5,
+                7
+            )
+        );
+    }
+
+    #[test]
+    fn test_group_key_ord_by_position() {
+        let key_a = GroupKey::single(1, 100, 0, 0, 0, 0);
+        let key_b = GroupKey::single(2, 50, 0, 0, 0, 0);
+        // key_a has lower ref_id1, so it should come first
+        assert!(key_a < key_b);
+    }
+
+    #[test]
+    fn test_group_key_ord_tiebreak_name_hash() {
+        let key_a = GroupKey::single(1, 100, 0, 0, 0, 10);
+        let key_b = GroupKey::single(1, 100, 0, 0, 0, 20);
+        // Same position, name_hash breaks tie
+        assert!(key_a < key_b);
+    }
+
+    #[test]
+    fn test_group_key_default() {
+        let key = GroupKey::default();
+        assert_eq!(key.ref_id1, GroupKey::UNKNOWN_REF);
+        assert_eq!(key.pos1, GroupKey::UNKNOWN_POS);
+        assert_eq!(key.strand1, GroupKey::UNKNOWN_STRAND);
+        assert_eq!(key.ref_id2, GroupKey::UNKNOWN_REF);
+        assert_eq!(key.pos2, GroupKey::UNKNOWN_POS);
+        assert_eq!(key.strand2, GroupKey::UNKNOWN_STRAND);
+        assert_eq!(key.library_idx, 0);
+        assert_eq!(key.cell_hash, 0);
+        assert_eq!(key.name_hash, 0);
+    }
+
+    #[test]
+    fn test_group_key_eq() {
+        let key_a = GroupKey::single(1, 100, 0, 5, 0, 42);
+        let key_b = GroupKey::single(1, 100, 0, 5, 0, 42);
+        assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_group_key_paired_same_position() {
+        // Same ref_id and pos, different strand normalizes correctly
+        let key = GroupKey::paired(1, 100, 1, 1, 100, 0, 0, 0, 0);
+        // (1,100,0) < (1,100,1) so mate comes first
+        assert_eq!(key.ref_id1, 1);
+        assert_eq!(key.pos1, 100);
+        assert_eq!(key.strand1, 0);
+        assert_eq!(key.strand2, 1);
+    }
+
+    #[test]
+    fn test_group_key_hash() {
+        use std::collections::HashSet;
+        let key_a = GroupKey::single(1, 100, 0, 0, 0, 42);
+        let key_b = GroupKey::single(1, 100, 0, 0, 0, 42);
+        let key_c = GroupKey::single(2, 200, 1, 0, 0, 99);
+        let mut set = HashSet::new();
+        set.insert(key_a);
+        assert!(set.contains(&key_b));
+        set.insert(key_c);
+        assert_eq!(set.len(), 2);
+    }
+
+    // ========================================================================
+    // PipelineStep tests
+    // ========================================================================
+
+    #[test]
+    fn test_pipeline_step_is_exclusive() {
+        assert!(PipelineStep::Read.is_exclusive());
+        assert!(!PipelineStep::Decompress.is_exclusive());
+        assert!(PipelineStep::FindBoundaries.is_exclusive());
+        assert!(!PipelineStep::Decode.is_exclusive());
+        assert!(PipelineStep::Group.is_exclusive());
+        assert!(!PipelineStep::Process.is_exclusive());
+        assert!(!PipelineStep::Serialize.is_exclusive());
+        assert!(!PipelineStep::Compress.is_exclusive());
+        assert!(PipelineStep::Write.is_exclusive());
+    }
+
+    #[test]
+    fn test_pipeline_step_all() {
+        let all = PipelineStep::all();
+        assert_eq!(all.len(), 9);
+        assert_eq!(all[0], PipelineStep::Read);
+        assert_eq!(all[1], PipelineStep::Decompress);
+        assert_eq!(all[2], PipelineStep::FindBoundaries);
+        assert_eq!(all[3], PipelineStep::Decode);
+        assert_eq!(all[4], PipelineStep::Group);
+        assert_eq!(all[5], PipelineStep::Process);
+        assert_eq!(all[6], PipelineStep::Serialize);
+        assert_eq!(all[7], PipelineStep::Compress);
+        assert_eq!(all[8], PipelineStep::Write);
+    }
+
+    #[test]
+    fn test_pipeline_step_from_index() {
+        assert_eq!(PipelineStep::from_index(0), PipelineStep::Read);
+        assert_eq!(PipelineStep::from_index(1), PipelineStep::Decompress);
+        assert_eq!(PipelineStep::from_index(2), PipelineStep::FindBoundaries);
+        assert_eq!(PipelineStep::from_index(3), PipelineStep::Decode);
+        assert_eq!(PipelineStep::from_index(4), PipelineStep::Group);
+        assert_eq!(PipelineStep::from_index(5), PipelineStep::Process);
+        assert_eq!(PipelineStep::from_index(6), PipelineStep::Serialize);
+        assert_eq!(PipelineStep::from_index(7), PipelineStep::Compress);
+        assert_eq!(PipelineStep::from_index(8), PipelineStep::Write);
+    }
+
+    #[test]
+    fn test_pipeline_step_short_name() {
+        assert_eq!(PipelineStep::Read.short_name(), "Rd");
+        assert_eq!(PipelineStep::Decompress.short_name(), "Dc");
+        assert_eq!(PipelineStep::FindBoundaries.short_name(), "Fb");
+        assert_eq!(PipelineStep::Decode.short_name(), "De");
+        assert_eq!(PipelineStep::Group.short_name(), "Gr");
+        assert_eq!(PipelineStep::Process.short_name(), "Pr");
+        assert_eq!(PipelineStep::Serialize.short_name(), "Se");
+        assert_eq!(PipelineStep::Compress.short_name(), "Co");
+        assert_eq!(PipelineStep::Write.short_name(), "Wr");
+        // Verify each is exactly 2 chars
+        for step in PipelineStep::all() {
+            assert_eq!(step.short_name().len(), 2);
+        }
+    }
+
+    // ========================================================================
+    // StepResult tests
+    // ========================================================================
+
+    #[test]
+    fn test_step_result_is_success() {
+        assert!(StepResult::Success.is_success());
+        assert!(!StepResult::OutputFull.is_success());
+        assert!(!StepResult::InputEmpty.is_success());
+    }
+
+    #[test]
+    fn test_step_result_variants() {
+        // All three variants exist and are distinct
+        let s = StepResult::Success;
+        let o = StepResult::OutputFull;
+        let i = StepResult::InputEmpty;
+        assert_ne!(s, o);
+        assert_ne!(s, i);
+        assert_ne!(o, i);
+    }
+
+    // ========================================================================
+    // Batch type tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_block_batch_new_empty() {
+        let batch = RawBlockBatch::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+    }
+
+    #[test]
+    fn test_raw_block_batch_with_capacity() {
+        let batch = RawBlockBatch::with_capacity(32);
+        assert!(batch.is_empty());
+        assert!(batch.blocks.capacity() >= 32);
+    }
+
+    #[test]
+    fn test_compressed_block_batch_new() {
+        let batch = CompressedBlockBatch::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert_eq!(batch.record_count, 0);
+    }
+
+    #[test]
+    fn test_compressed_block_batch_clear() {
+        let mut batch = CompressedBlockBatch::new();
+        batch.record_count = 42;
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.record_count, 0);
+    }
+
+    #[test]
+    fn test_bgzf_batch_config_default() {
+        let config = BgzfBatchConfig::default();
+        assert_eq!(config.blocks_per_batch, 16);
+        assert_eq!(config.compression_level, 6);
+    }
+
+    #[test]
+    fn test_bgzf_batch_config_new() {
+        let config = BgzfBatchConfig::new(64);
+        assert_eq!(config.blocks_per_batch, 64);
+        // compression_level should still be default
+        assert_eq!(config.compression_level, 6);
+    }
+
+    #[test]
+    fn test_decompressed_batch_new_empty() {
+        let batch = DecompressedBatch::new();
+        assert!(batch.is_empty());
+        assert!(batch.data.is_empty());
+    }
+
+    #[test]
+    fn test_serialized_batch_clear() {
+        let mut batch = SerializedBatch::new();
+        batch.data.extend_from_slice(&[1, 2, 3]);
+        batch.record_count = 10;
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.record_count, 0);
+    }
+
+    // ========================================================================
+    // PipelineConfig tests
+    // ========================================================================
+
+    #[test]
+    fn test_pipeline_config_new_defaults() {
+        let config = PipelineConfig::new(4, 6);
+        assert_eq!(config.num_threads, 4);
+        assert_eq!(config.compression_level, 6);
+        assert_eq!(config.queue_capacity, 64);
+        assert_eq!(config.batch_size, 1);
+        assert_eq!(config.queue_memory_limit, 0);
+        assert!(!config.collect_stats);
+    }
+
+    #[test]
+    fn test_pipeline_config_builder_chain() {
+        let config = PipelineConfig::new(4, 6)
+            .with_compression_level(9)
+            .with_batch_size(100)
+            .with_stats(true)
+            .with_queue_memory_limit(1_000_000);
+        assert_eq!(config.compression_level, 9);
+        assert_eq!(config.batch_size, 100);
+        assert!(config.collect_stats);
+        assert_eq!(config.queue_memory_limit, 1_000_000);
+    }
+
+    #[test]
+    fn test_pipeline_config_auto_tuned_1_thread() {
+        let config = PipelineConfig::auto_tuned(1, 6);
+        assert_eq!(config.num_threads, 1);
+        // queue_capacity = (1*16).clamp(64, 256) = 64
+        assert_eq!(config.queue_capacity, 64);
+    }
+
+    #[test]
+    fn test_pipeline_config_auto_tuned_8_threads() {
+        let config = PipelineConfig::auto_tuned(8, 6);
+        assert_eq!(config.num_threads, 8);
+        // queue_capacity = (8*16).clamp(64, 256) = 128
+        assert_eq!(config.queue_capacity, 128);
+        // blocks_per_read_batch = 32 for >= 8 threads
+        assert_eq!(config.blocks_per_read_batch, 32);
+    }
+
+    #[test]
+    fn test_pipeline_config_auto_tuned_32_threads() {
+        let config = PipelineConfig::auto_tuned(32, 6);
+        assert_eq!(config.num_threads, 32);
+        // queue_capacity = (32*16).clamp(64, 256) = 256 (capped)
+        assert_eq!(config.queue_capacity, 256);
+    }
+
+    #[test]
+    fn test_pipeline_config_with_compression_level() {
+        let config = PipelineConfig::new(4, 6).with_compression_level(12);
+        assert_eq!(config.compression_level, 12);
+    }
+
+    #[test]
+    fn test_pipeline_config_with_batch_size_min_1() {
+        let config = PipelineConfig::new(4, 6).with_batch_size(0);
+        // batch_size of 0 gets clamped to 1
+        assert_eq!(config.batch_size, 1);
+    }
+
+    #[test]
+    fn test_pipeline_config_with_queue_memory_limit() {
+        let config = PipelineConfig::new(4, 6).with_queue_memory_limit(500_000_000);
+        assert_eq!(config.queue_memory_limit, 500_000_000);
+    }
+
+    // ========================================================================
+    // PipelineValidationError tests
+    // ========================================================================
+
+    #[test]
+    fn test_pipeline_validation_error_display_empty() {
+        let err = PipelineValidationError {
+            non_empty_queues: vec![],
+            counter_mismatches: vec![],
+            leaked_heap_bytes: 0,
+        };
+        let display = format!("{err}");
+        // Even empty error prints the header
+        assert!(display.contains("Pipeline validation failed"));
+    }
+
+    #[test]
+    fn test_pipeline_validation_error_display_full() {
+        let err = PipelineValidationError {
+            non_empty_queues: vec!["Q1".to_string(), "Q2".to_string()],
+            counter_mismatches: vec!["read_count != write_count".to_string()],
+            leaked_heap_bytes: 1024,
+        };
+        let display = format!("{err}");
+        assert!(display.contains("Pipeline validation failed"));
+        assert!(display.contains("Q1"));
+        assert!(display.contains("Q2"));
+        assert!(display.contains("read_count != write_count"));
+        assert!(display.contains("1024"));
+    }
+
+    // ========================================================================
+    // extract_panic_message tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_panic_message_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("something went wrong");
+        let msg = extract_panic_message(payload);
+        assert_eq!(msg, "something went wrong");
+    }
+
+    #[test]
+    fn test_extract_panic_message_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("an error occurred"));
+        let msg = extract_panic_message(payload);
+        assert_eq!(msg, "an error occurred");
+    }
+
+    #[test]
+    fn test_extract_panic_message_other() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        let msg = extract_panic_message(payload);
+        assert_eq!(msg, "Unknown panic");
+    }
+
+    // ========================================================================
+    // WorkerCoreState tests
+    // ========================================================================
+
+    #[test]
+    fn test_worker_core_state_initial_values() {
+        use super::super::scheduler::SchedulerStrategy;
+        let state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default());
+        assert_eq!(state.backoff_us, MIN_BACKOFF_US);
+    }
+
+    #[test]
+    fn test_worker_core_state_reset_backoff() {
+        use super::super::scheduler::SchedulerStrategy;
+        let mut state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default());
+        state.increase_backoff();
+        assert!(state.backoff_us > MIN_BACKOFF_US);
+        state.reset_backoff();
+        assert_eq!(state.backoff_us, MIN_BACKOFF_US);
+    }
+
+    #[test]
+    fn test_worker_core_state_increase_backoff() {
+        use super::super::scheduler::SchedulerStrategy;
+        let mut state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default());
+        assert_eq!(state.backoff_us, MIN_BACKOFF_US); // 10
+        state.increase_backoff();
+        assert_eq!(state.backoff_us, MIN_BACKOFF_US * 2); // 20
+        state.increase_backoff();
+        assert_eq!(state.backoff_us, MIN_BACKOFF_US * 4); // 40
+        // Keep increasing until we hit the cap
+        for _ in 0..20 {
+            state.increase_backoff();
+        }
+        assert_eq!(state.backoff_us, MAX_BACKOFF_US);
+    }
+
+    // ========================================================================
+    // OutputPipelineQueues tests
+    // ========================================================================
+
+    struct TestProcessed {
+        size: usize,
+    }
+
+    impl MemoryEstimate for TestProcessed {
+        fn estimate_heap_size(&self) -> usize {
+            self.size
+        }
+    }
+
+    #[test]
+    fn test_output_queues_new() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test");
+        assert!(queues.groups.is_empty());
+        assert!(queues.processed.is_empty());
+        assert!(queues.serialized.is_empty());
+        assert!(queues.compressed.is_empty());
+    }
+
+    #[test]
+    fn test_output_queues_set_take_error() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test");
+        assert!(!queues.has_error());
+        queues.set_error(io::Error::other("test error"));
+        assert!(queues.has_error());
+        let err = queues.take_error();
+        assert!(err.is_some());
+        assert_eq!(err.unwrap().to_string(), "test error");
+    }
+
+    #[test]
+    fn test_output_queues_draining() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test");
+        assert!(!queues.is_draining());
+        queues.set_draining(true);
+        assert!(queues.is_draining());
+    }
+
+    #[test]
+    fn test_output_queues_queue_depths_empty() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test");
+        let depths = queues.queue_depths();
+        assert_eq!(depths.groups, 0);
+        assert_eq!(depths.processed, 0);
+        assert_eq!(depths.serialized, 0);
+        assert_eq!(depths.compressed, 0);
+    }
+
+    #[test]
+    fn test_output_queues_are_queues_empty() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test");
+        assert!(queues.are_queues_empty());
+    }
+
+    // ========================================================================
+    // MemoryEstimate impl tests
+    // ========================================================================
+
+    #[test]
+    fn test_memory_estimate_unit() {
+        let unit = ();
+        assert_eq!(unit.estimate_heap_size(), 0);
+    }
+
+    #[test]
+    fn test_memory_estimate_serialized_batch() {
+        let mut batch = SerializedBatch::new();
+        batch.data.reserve(1024);
+        assert!(batch.estimate_heap_size() >= 1024);
+    }
+
+    #[test]
+    fn test_memory_estimate_decompressed_batch() {
+        let mut batch = DecompressedBatch::new();
+        batch.data.reserve(2048);
+        assert!(batch.estimate_heap_size() >= 2048);
+    }
 }

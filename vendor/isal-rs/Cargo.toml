@@ -9,6 +9,7 @@ authors = ["Miles Granger <miles59923@gmail.com>"]
 documentation = "https://docs.rs/isal-rs"
 homepage = "https://github.com/milesgranger/isal-rs"
 repository = "https://github.com/milesgranger/isal-rs"
+publish = false
 keywords = ["isal", "isa-l", "igzip", "deflate", "zlib"]
 exclude = [
   ".gitignore",

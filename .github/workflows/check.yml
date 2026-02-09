@@ -41,6 +41,29 @@ jobs:
       - name: Clippy check
         run: cargo ci-lint
 
+  coverage:
+    runs-on: ubuntu-latest
+    environment: github-actions
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Generate coverage
+        run: cargo llvm-cov nextest --features compare,simulate,profile-adjacency --no-tests=pass --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   format:
     runs-on: ubuntu-latest
     steps:

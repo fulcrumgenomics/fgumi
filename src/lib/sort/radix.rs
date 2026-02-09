@@ -71,7 +71,7 @@ const RADIX_THRESHOLD: usize = 256;
 /// # Arguments
 /// * `entries` - Slice of (`packed_key`, `record_index`) pairs to sort in place
 /// * `nref` - Number of reference sequences (for mapping unmapped tid)
-#[allow(clippy::uninit_vec)]
+#[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_coordinate_adaptive<T: Clone>(
     entries: &mut [(u64, T)],
     max_tid: u32,
@@ -183,7 +183,7 @@ pub fn pack_coordinate_for_radix(tid: i32, pos: i32, reverse: bool, nref: u32) -
 ///
 /// Uses 8-bit radix (256 buckets) with 8 passes for 64-bit keys.
 /// Falls back to insertion sort for small arrays.
-#[allow(clippy::uninit_vec)]
+#[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_u64<T: Clone>(entries: &mut [(u64, T)]) {
     if entries.len() < RADIX_THRESHOLD {
         // Use insertion sort for small arrays
@@ -240,6 +240,7 @@ pub fn radix_sort_u64<T: Clone>(entries: &mut [(u64, T)]) {
 }
 
 /// Radix sort for packed coordinate keys with associated data.
+#[allow(unsafe_code)]
 pub fn radix_sort_coordinate<T: Clone>(entries: &mut [(PackedCoordinateKey, T)]) {
     if entries.len() < RADIX_THRESHOLD {
         insertion_sort_by_key(entries, |(k, _)| k.0);
@@ -272,6 +273,7 @@ pub fn radix_sort_coordinate<T: Clone>(entries: &mut [(PackedCoordinateKey, T)])
 /// * `n` - Heap size (may be less than array length)
 /// * `lt` - Less-than comparator (for max-heap, swap if child > parent)
 #[inline]
+#[allow(unsafe_code)]
 pub fn heap_sift_down<T, F>(heap: &mut [T], mut i: usize, n: usize, lt: &F)
 where
     F: Fn(&T, &T) -> bool,

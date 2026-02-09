@@ -323,4 +323,104 @@ mod tests {
         assert_eq!(config.writer_threads, 4);
         assert_eq!(config.compression_level, 6);
     }
+
+    #[test]
+    fn test_merge_entry_equal_keys() {
+        let entry1 = MergeEntry { key: 5, record: Record::default(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 5, record: Record::default(), chunk_idx: 1 };
+
+        assert_eq!(entry1.cmp(&entry2), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_merge_entry_greater_than() {
+        let entry1 = MergeEntry { key: 2, record: Record::default(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 1, record: Record::default(), chunk_idx: 1 };
+
+        assert!(entry1 > entry2);
+    }
+
+    #[test]
+    fn test_merge_entry_ordering_ignores_chunk_idx() {
+        let entry1 = MergeEntry { key: 42, record: Record::default(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 42, record: Record::default(), chunk_idx: 99 };
+
+        assert_eq!(entry1.cmp(&entry2), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_merge_entry_partial_eq() {
+        let entry1 = MergeEntry { key: 10, record: Record::default(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 10, record: Record::default(), chunk_idx: 3 };
+
+        assert!(entry1 == entry2);
+    }
+
+    #[test]
+    fn test_merge_entry_partial_eq_different() {
+        let entry1 = MergeEntry { key: 10, record: Record::default(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 20, record: Record::default(), chunk_idx: 0 };
+
+        assert!(entry1 != entry2);
+    }
+
+    #[test]
+    fn test_merge_entry_string_keys() {
+        let entry_a =
+            MergeEntry { key: "apple".to_string(), record: Record::default(), chunk_idx: 0 };
+        let entry_b =
+            MergeEntry { key: "banana".to_string(), record: Record::default(), chunk_idx: 1 };
+        let entry_c =
+            MergeEntry { key: "cherry".to_string(), record: Record::default(), chunk_idx: 2 };
+
+        assert!(entry_a < entry_b);
+        assert!(entry_b < entry_c);
+        assert!(entry_a < entry_c);
+    }
+
+    #[test]
+    fn test_merge_entry_in_binary_heap() {
+        use std::cmp::Reverse;
+
+        let mut heap = BinaryHeap::new();
+        heap.push(Reverse(MergeEntry { key: 3, record: Record::default(), chunk_idx: 0 }));
+        heap.push(Reverse(MergeEntry { key: 1, record: Record::default(), chunk_idx: 1 }));
+        heap.push(Reverse(MergeEntry { key: 2, record: Record::default(), chunk_idx: 2 }));
+
+        // Should come out in ascending order: 1, 2, 3
+        assert_eq!(heap.pop().unwrap().0.key, 1);
+        assert_eq!(heap.pop().unwrap().0.key, 2);
+        assert_eq!(heap.pop().unwrap().0.key, 3);
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn test_config_custom_values() {
+        let config =
+            ParallelMergeConfig { reader_threads: 8, writer_threads: 16, compression_level: 9 };
+
+        assert_eq!(config.reader_threads, 8);
+        assert_eq!(config.writer_threads, 16);
+        assert_eq!(config.compression_level, 9);
+    }
+
+    #[test]
+    fn test_config_single_thread() {
+        let config =
+            ParallelMergeConfig { reader_threads: 1, writer_threads: 1, compression_level: 1 };
+
+        assert_eq!(config.reader_threads, 1);
+        assert_eq!(config.writer_threads, 1);
+        assert_eq!(config.compression_level, 1);
+    }
+
+    #[test]
+    fn test_merge_buffer_size() {
+        assert_eq!(MERGE_BUFFER_SIZE, 65536);
+    }
+
+    #[test]
+    fn test_prefetch_buffer_size() {
+        assert_eq!(PREFETCH_BUFFER_SIZE, 128);
+    }
 }

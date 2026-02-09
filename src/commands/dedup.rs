@@ -1596,4 +1596,497 @@ mod tests {
         assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
+
+    // ========================================================================
+    // umi_for_read tests
+    // ========================================================================
+
+    #[test]
+    fn test_umi_for_read_identity_uppercase() {
+        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
+        let result = umi_for_read("ACGTACGT", true, assigner.as_ref()).unwrap();
+        assert_eq!(result, "ACGTACGT");
+    }
+
+    #[test]
+    fn test_umi_for_read_identity_lowercase_gets_uppercased() {
+        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
+        let result = umi_for_read("acgtacgt", true, assigner.as_ref()).unwrap();
+        assert_eq!(result, "ACGTACGT");
+    }
+
+    #[test]
+    fn test_umi_for_read_paired_r1_earlier() {
+        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
+        // With max_mismatches=1, prefix_len=2, so lower_prefix="aa", higher_prefix="bb"
+        let result = umi_for_read("ACGT-TGCA", true, assigner.as_ref()).unwrap();
+        // is_r1_earlier=true => lower_prefix:parts[0]-higher_prefix:parts[1]
+        assert_eq!(result, "aa:ACGT-bb:TGCA");
+    }
+
+    #[test]
+    fn test_umi_for_read_paired_r2_earlier() {
+        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
+        // With max_mismatches=1, prefix_len=2, so lower_prefix="aa", higher_prefix="bb"
+        let result = umi_for_read("ACGT-TGCA", false, assigner.as_ref()).unwrap();
+        // is_r1_earlier=false => higher_prefix:parts[0]-lower_prefix:parts[1]
+        assert_eq!(result, "bb:ACGT-aa:TGCA");
+    }
+
+    #[test]
+    fn test_umi_for_read_paired_missing_dash_error() {
+        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
+        let result = umi_for_read("ACGTACGT", true, assigner.as_ref());
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("did not contain 2 segments"),
+            "Error message should mention missing segments"
+        );
+    }
+
+    // ========================================================================
+    // get_pair_orientation tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_pair_orientation_both_forward() {
+        // Both R1 and R2 on forward strand (no REVERSE_COMPLEMENTED flag)
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .tag("RX", "ACGT-TGCA".to_string())
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .tag("RX", "ACGT-TGCA".to_string())
+            .build();
+        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let (r1_positive, r2_positive) = get_pair_orientation(&template);
+        assert!(r1_positive);
+        assert!(r2_positive);
+    }
+
+    #[test]
+    fn test_get_pair_orientation_r1_reverse() {
+        // R1 on reverse strand, R2 on forward strand
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
+            .tag("RX", "ACGT-TGCA".to_string())
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .tag("RX", "ACGT-TGCA".to_string())
+            .build();
+        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let (r1_positive, r2_positive) = get_pair_orientation(&template);
+        assert!(!r1_positive);
+        assert!(r2_positive);
+    }
+
+    #[test]
+    fn test_get_pair_orientation_both_reverse() {
+        // Both R1 and R2 on reverse strand
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
+            .tag("RX", "ACGT-TGCA".to_string())
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
+            .tag("RX", "ACGT-TGCA".to_string())
+            .build();
+        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let (r1_positive, r2_positive) = get_pair_orientation(&template);
+        assert!(!r1_positive);
+        assert!(!r2_positive);
+    }
+
+    // ========================================================================
+    // is_r1_genomically_earlier tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_r1_earlier_true() {
+        // R1 at position 100, R2 at position 200
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .build();
+        assert!(is_r1_genomically_earlier(&r1, &r2).unwrap());
+    }
+
+    #[test]
+    fn test_is_r1_earlier_false() {
+        // R1 at position 200, R2 at position 100
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .build();
+        assert!(!is_r1_genomically_earlier(&r1, &r2).unwrap());
+    }
+
+    #[test]
+    fn test_is_r1_earlier_equal_position() {
+        // Both at position 100 -> true (<=)
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .build();
+        assert!(is_r1_genomically_earlier(&r1, &r2).unwrap());
+    }
+
+    // ========================================================================
+    // truncate_umis tests
+    // ========================================================================
+
+    #[test]
+    fn test_truncate_umis_no_min_length() {
+        let umis = vec!["ACGTACGT".to_string(), "TGCATGCA".to_string()];
+        let result = truncate_umis(umis.clone(), None).unwrap();
+        assert_eq!(result, umis);
+    }
+
+    #[test]
+    fn test_truncate_umis_truncates() {
+        let umis = vec!["ACGTACGT".to_string(), "TGCATGCA".to_string()];
+        let result = truncate_umis(umis, Some(4)).unwrap();
+        assert_eq!(result, vec!["ACGT".to_string(), "TGCA".to_string()]);
+    }
+
+    #[test]
+    fn test_truncate_umis_error_too_short() {
+        let umis = vec!["ACG".to_string(), "TGCATGCA".to_string()];
+        let result = truncate_umis(umis, Some(4));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("shorter than expected"),
+            "Error message should mention UMI being too short"
+        );
+    }
+
+    // ========================================================================
+    // set_mi_tag_on_record tests
+    // ========================================================================
+
+    #[test]
+    fn test_set_mi_tag_assigned() {
+        let mut record =
+            RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let mi = MoleculeId::Single(42);
+        let assign_tag = Tag::from([b'M', b'I']);
+        set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
+
+        let mi_value = record.data().get(&assign_tag);
+        assert!(mi_value.is_some());
+        if let Some(DataValue::String(val)) = mi_value {
+            assert_eq!(AsRef::<[u8]>::as_ref(val), b"42");
+        } else {
+            panic!("MI tag should be a string value");
+        }
+    }
+
+    #[test]
+    fn test_set_mi_tag_unassigned() {
+        let mut record =
+            RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let mi = MoleculeId::None;
+        let assign_tag = Tag::from([b'M', b'I']);
+        set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
+
+        let mi_value = record.data().get(&assign_tag);
+        assert!(mi_value.is_none(), "Unassigned MoleculeId should not set MI tag");
+    }
+
+    #[test]
+    fn test_set_mi_tag_with_base_offset() {
+        let mut record =
+            RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let mi = MoleculeId::Single(42);
+        let assign_tag = Tag::from([b'M', b'I']);
+        set_mi_tag_on_record(&mut record, mi, assign_tag, 100);
+
+        let mi_value = record.data().get(&assign_tag);
+        assert!(mi_value.is_some());
+        if let Some(DataValue::String(val)) = mi_value {
+            // 100 (base) + 42 (id) = 142
+            assert_eq!(AsRef::<[u8]>::as_ref(val), b"142");
+        } else {
+            panic!("MI tag should be a string value");
+        }
+    }
+
+    // ========================================================================
+    // filter_template for paired reads tests
+    // ========================================================================
+
+    /// Helper to create a paired mapped template with UMI tag on both reads.
+    fn create_paired_mapped_template_with_umi(
+        name: &str,
+        umi: &str,
+        r1_mapq: u8,
+        r2_mapq: u8,
+    ) -> Template {
+        let r1 = RecordBuilder::new()
+            .name(name)
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .mapping_quality(r1_mapq)
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .tag("RX", umi.to_string())
+            .build();
+        let r2 = RecordBuilder::new()
+            .name(name)
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .mapping_quality(r2_mapq)
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .tag("RX", umi.to_string())
+            .build();
+        Template::from_records(vec![r1, r2]).unwrap()
+    }
+
+    #[test]
+    fn test_filter_paired_template_accepts_valid() {
+        let config = default_filter_config();
+        let mut metrics = FilterMetrics::new();
+        let template = create_paired_mapped_template_with_umi("q1", "ACGTACGT", 30, 30);
+
+        assert!(filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    #[test]
+    fn test_filter_paired_template_rejects_r2_low_mapq() {
+        let config = default_filter_config(); // min_mapq = 20
+        let mut metrics = FilterMetrics::new();
+        let template = create_paired_mapped_template_with_umi("q1", "ACGTACGT", 30, 10);
+
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    #[test]
+    fn test_filter_paired_template_rejects_r2_umi_with_n() {
+        let config = default_filter_config();
+        let mut metrics = FilterMetrics::new();
+        // R1 has valid UMI, but R2 has N in UMI
+        let r1 = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
+            .tag("RX", "ACGTACGT".to_string())
+            .build();
+        let r2 = RecordBuilder::new()
+            .name("q1")
+            .sequence("TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .cigar("4M")
+            .mapping_quality(30)
+            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
+            .tag("RX", "ACNTACGT".to_string())
+            .build();
+        let template = Template::from_records(vec![r1, r2]).unwrap();
+
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_ns_in_umi, 1);
+    }
+
+    #[test]
+    fn test_filter_paired_no_reads_rejected() {
+        // Template with no primary reads (empty records list)
+        let config = default_filter_config();
+        let mut metrics = FilterMetrics::new();
+        let template = Template::new(b"empty".to_vec());
+
+        assert!(!filter_template(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    // ========================================================================
+    // DedupMetrics tests
+    // ========================================================================
+
+    #[test]
+    fn test_metrics_merge_all_fields() {
+        let mut m1 = DedupMetrics {
+            total_templates: 10,
+            duplicate_templates: 2,
+            unique_templates: 8,
+            total_reads: 20,
+            duplicate_reads: 4,
+            unique_reads: 16,
+            secondary_reads: 3,
+            supplementary_reads: 1,
+            missing_pa_tag: 1,
+            ..Default::default()
+        };
+
+        let m2 = DedupMetrics {
+            total_templates: 5,
+            duplicate_templates: 1,
+            unique_templates: 4,
+            total_reads: 10,
+            duplicate_reads: 2,
+            unique_reads: 8,
+            secondary_reads: 2,
+            supplementary_reads: 3,
+            missing_pa_tag: 2,
+            ..Default::default()
+        };
+
+        m1.merge(&m2);
+        assert_eq!(m1.total_templates, 15);
+        assert_eq!(m1.duplicate_templates, 3);
+        assert_eq!(m1.unique_templates, 12);
+        assert_eq!(m1.total_reads, 30);
+        assert_eq!(m1.duplicate_reads, 6);
+        assert_eq!(m1.unique_reads, 24);
+        assert_eq!(m1.secondary_reads, 5);
+        assert_eq!(m1.supplementary_reads, 4);
+        assert_eq!(m1.missing_pa_tag, 3);
+    }
+
+    #[test]
+    fn test_duplicate_rate_all_duplicates() {
+        let metrics =
+            DedupMetrics { total_templates: 50, duplicate_templates: 50, ..Default::default() };
+        assert!((metrics.duplicate_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_metrics_default() {
+        let metrics = DedupMetrics::default();
+        assert_eq!(metrics.total_templates, 0);
+        assert_eq!(metrics.duplicate_templates, 0);
+        assert_eq!(metrics.unique_templates, 0);
+        assert_eq!(metrics.total_reads, 0);
+        assert_eq!(metrics.duplicate_reads, 0);
+        assert_eq!(metrics.unique_reads, 0);
+        assert_eq!(metrics.secondary_reads, 0);
+        assert_eq!(metrics.supplementary_reads, 0);
+        assert_eq!(metrics.missing_pa_tag, 0);
+    }
+
+    #[test]
+    fn test_dedup_metrics_output_from() {
+        let metrics = DedupMetrics {
+            total_templates: 100,
+            duplicate_templates: 25,
+            unique_templates: 75,
+            total_reads: 200,
+            duplicate_reads: 50,
+            unique_reads: 150,
+            secondary_reads: 10,
+            supplementary_reads: 5,
+            missing_pa_tag: 2,
+            ..Default::default()
+        };
+        let output = DedupMetricsOutput::from(&metrics);
+
+        assert_eq!(output.total_templates, 100);
+        assert_eq!(output.duplicate_templates, 25);
+        assert_eq!(output.unique_templates, 75);
+        assert!((output.duplicate_rate - 0.25).abs() < 0.001);
+        assert_eq!(output.total_reads, 200);
+        assert_eq!(output.duplicate_reads, 50);
+        assert_eq!(output.unique_reads, 150);
+        assert_eq!(output.secondary_reads, 10);
+        assert_eq!(output.supplementary_reads, 5);
+        assert_eq!(output.missing_pa_tag, 2);
+    }
 }

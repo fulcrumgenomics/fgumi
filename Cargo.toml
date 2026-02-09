@@ -1,7 +1,7 @@
 [package]
 name = "fgumi"
 version = "0.1.0"
-authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+authors = ["Nils Homer <nils@fulcrumgenomics.com>", "Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "High-performance tools for UMI-tagged sequencing data: extraction, grouping, and consensus calling"
 repository = "https://github.com/fulcrumgenomics/fgumi"
 homepage = "https://github.com/fulcrumgenomics/fgumi"
@@ -12,7 +12,6 @@ keywords = ["bioinformatics", "umi", "consensus", "sequencing", "ngs"]
 license = "MIT"
 edition = "2024"
 rust-version = "1.87.0"
-resolver = "2"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "string"] }
@@ -40,7 +39,7 @@ crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 parking_lot = "0.12"
 libdeflater = "1.22"
-isal-rs = { path = "vendor/isal-rs", optional = true }
+isal-rs = { version = "0.5.3", path = "vendor/isal-rs", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 itertools = "0.14.0"
 indexmap = "2"

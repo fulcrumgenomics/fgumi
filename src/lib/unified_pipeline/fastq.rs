@@ -1599,7 +1599,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
     /// Check if memory is at the backpressure threshold.
     ///
     /// Uses Q2 reorder buffer tracking (before Group step) to signal memory pressure
-    /// to the scheduler. See [`BACKPRESSURE_THRESHOLD_BYTES`] for architecture details.
+    /// to the scheduler. See [`super::base::BACKPRESSURE_THRESHOLD_BYTES`] for architecture details.
     #[must_use]
     pub fn is_memory_high(&self) -> bool {
         self.q2_reorder_state.is_memory_high()

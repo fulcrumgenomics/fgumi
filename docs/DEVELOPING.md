@@ -2,7 +2,7 @@
 
 ## Getting Started
 
-If you already have the Rust toolchain installed, make sure you have at least version `1.60.0` (e.g., with `rustup show` or `rustc --version`).
+If you already have the Rust toolchain installed, make sure you have at least version `1.87.0` (e.g., with `rustup show` or `rustc --version`).
 If not, you can run `rustup update` to install the latest version.
 
 If you do not have the Rust toolchain installed, the best way to install it is with [`rustup`](https://rustup.rs/) using the following command (which assumes that you have [`curl`](https://everything.curl.dev/get) installed):
@@ -24,17 +24,16 @@ These tools are used in the CI/CD workflows, and there are [aliases](#code-conve
 
 This project uses the [conventional Cargo package layout](https://doc.rust-lang.org/cargo/guide/project-layout.html).
 
-* `.cargo/config.toml`: Cargo configuration. This is primarily used to define [aliases]() for commonly used Cargo commands.
+* `.cargo/config.toml`: Cargo configuration. This is primarily used to define [aliases](#code-conventions) for commonly used Cargo commands.
 * `.github/ISSUE_TEMPLATE`: [Issue form templates](https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository#creating-issue-forms) for creating new GitHub issues.
 * `.github/workflows`: Workflows for continuous integration (CI) and deployment (CD).
 * `.gitignore`: Files to ignore when committing changes with `git`, i.e., files that should not be version controlled.
-* `benches/`: Optional directory with benchmarks using [`divan`](https://github.com/nvzqz/divan).
+* `benches/`: Optional directory with benchmarks using [`criterion`](https://github.com/bheisler/criterion.rs).
 * `build.rs`: Build script that is executed when building the project.
 * `Cargo.toml`: The project manifest. This contains all the necessary information for building and publishing the project crate(s).
 * `cliff.toml`: Configuration for [`git-cliff`](https://github.com/orhun/git-cliff), which automatically generates the changelog based on commit messages.
 * `clippy.toml`: Configuration for Clippy, the Rust linter that is used to check the project's code against best practices.
 * `docs/`: All project documentation.
-* `examples/`: Optional directory with example programs.
 * `LICENSE`: The project license.
 * `README.md`: The project description. This is displayed on GitHub, on the [crates.io](https://crates.io/) page for the project, and on the [docs.rs](https://docs.rs/) documentation for the project.
 * `release-plz.toml`: Configuration for [release-plz](https://release-plz.ieni.dev/), which is used to automate releases.
@@ -70,7 +69,7 @@ This means you'll need to do your development in a separate git branch and open 
 As with all aspects of development, you should follow any Fulcrum best practices that apply.
 In this case, Fulcrum [git etiquette](#git-etiquette) dictates breaking up larger issues into multiple smaller PRs and maintaining a clean commit history through the use of rebasing or squash-merging.
 Each PR should use a separate branch, and branches are automatically deleted after they are merged.
-Branches can be independent or cascading, but keep in mind that cascading branches can become unweildy when rebasing is required (although [`git rebase --update-refs`](https://andrewlock.net/working-with-stacked-branches-in-git-is-easier-with-update-refs/) can make this much easier).
+Branches can be independent or cascading, but keep in mind that cascading branches can become unwieldy when rebasing is required (although [`git rebase --update-refs`](https://andrewlock.net/working-with-stacked-branches-in-git-is-easier-with-update-refs/) can make this much easier).
 
 Branches should follow the standard naming convention `<issue-number>/<user>/<type>-<description>`:
 
@@ -88,7 +87,7 @@ When writing code, you should follow the Fulcrum best practices, which include w
 It is recommended to use an IDE that has support for Rust formatting and linting, or to configure your editor to integrate with Cargo and/or [`rust-analyzer`](https://rust-analyzer.github.io/).
 For example, [VS Code](https://code.visualstudio.com/) has excellent support for Rust via the [rust-analyzer plugin](https://code.visualstudio.com/docs/languages/rust).
 
-You can use the following Cargo aliases (defined in the project [Cargo configuration](.cargo/config.toml)) to run the same checks that are run in the CI workflow before you commit your code:
+You can use the following Cargo aliases (defined in the project [Cargo configuration](../.cargo/config.toml)) to run the same checks that are run in the CI workflow before you commit your code:
 
 * `ci-test`: Execute the same command used in CI to run tests.
 * `ci-fmt`: Execute the same command used in CI to check code formatting.
@@ -104,7 +103,7 @@ When a particular topic is not covered by Fulcrum best practices, you can [start
 
 #### Documentation
 
-Please read the [rustdoc book](https://doc.rust-lang.org/rustdoc/how-to-write-documentation.html) to learn how to write good documenation comments.
+Please read the [rustdoc book](https://doc.rust-lang.org/rustdoc/how-to-write-documentation.html) to learn how to write good documentation comments.
 At a minimum, all of the functions and data structures that are a part of the project's public API should be documented completely.
 
 You are encouraged to include [examples](https://doc.rust-lang.org/rust-by-example/testing/doc_testing.html) in the function documentation, as these are also run as test cases.
@@ -123,8 +122,8 @@ The Cargo `ci-test` alias will run the project tests in the same way they are ru
 
 ### Commit messages
 
-We follow the practice of using [conventional commit messages](https://www.conventionalcommits.org/en/v1.0.0/), which enables [automation]() of versioning and the changelog.
-Convential commit messages are only required for commits that are merged into the `main` branch (e.g., the squashed commit message when [merging a PR]()), but you are encouraged to always use them as it can help you when you need to write the final commit message, as well as others working in your branch or reviewing your PR.
+We follow the practice of using [conventional commit messages](https://www.conventionalcommits.org/en/v1.0.0/), which enables automation of versioning and the changelog.
+Conventional commit messages are only required for commits that are merged into the `main` branch (e.g., the squashed commit message when merging a PR), but you are encouraged to always use them as it can help you when you need to write the final commit message, as well as others working in your branch or reviewing your PR.
 
 A commit message is structured as follows:
 
@@ -141,7 +140,7 @@ When a new version of the package is released, the `type`s of the commits includ
 
 * `fix`: patches a bug in your codebase. This is generally associated with issues labeled `bug`. When there are only `fix` commits included in a release, it causes an increment in the `PATCH` version.
 * `feat`: introduces a new feature to the codebase. This is generally associated with issues labeled `enhancement`. When there are only `feat` and `fix` commits included in a release, it causes an increment in the `MINOR` version.
-* Commits that only change dependencies (e.g., update versions) should have type `fix`.
+* Commits that only change dependencies (e.g., update versions) should have type `build`.
 * Types other than `fix` and `feat` are allowed, but typically have no impact on the version. Currently, the following other types are allowed. If you identify a need for a new type, please add it to this list:
   * `build`: changes to how the package is compiled. Typically, such changes involve `build.rs` or `Cargo.toml`.
   * `chore`: catch-all for maintainance activities that don't fall under any of the other types.
@@ -164,7 +163,7 @@ Additional footers may be added that follow the [git trailer](https://git-scm.co
 
 ### Pull requests
 
-When you are ready to share your changes with others, please [open a pull request]() using the provided [template](../.github/PULL_REQUEST_TEMPLATE.md).
+When you are ready to share your changes with others, please open a pull request using the provided [template](../.github/PULL_REQUEST_TEMPLATE.md).
 You are encouraged to create a draft pull request early on (e.g. as soon as you push your first commit) to solicit feedback.
 Please provide all the required information and any of the optional information that applies.
 If you omit any required information, please provide justification.
@@ -191,7 +190,7 @@ Several checks will be run automatically when you open a PR and each time you pu
 
 
 The [development lifecycle](#development-lifecycle) section describes how you can run these same checks locally; you should make sure to do so before opening/updating a PR.
-If any of these checkes fail, you must resolve them before requesting a review.
+If any of these checks fail, you must resolve them before requesting a review.
 Please do not globally disable any checks in your branch, as such changes will be rejected.
 If you think that any of these checks should be changed, please open a separate PR (type `config` or `ci`) and resolve that first.
 

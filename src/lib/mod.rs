@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 // Clippy lint configuration for CI
 // These lints are allowed because:
 // - cast_*: Scientific/bioinformatics code intentionally casts between numeric types
@@ -178,6 +179,7 @@ pub mod umi;
 pub mod unified_pipeline;
 pub mod validation;
 pub mod variant_review;
+#[doc(hidden)]
 pub mod vendored;
 
 #[cfg(feature = "simulate")]

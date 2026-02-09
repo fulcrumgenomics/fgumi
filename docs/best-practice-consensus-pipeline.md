@@ -39,6 +39,10 @@ fgumi group --input in.bam --output out.bam --strategy adjacency --threads 8
 
 Thread allocation is automatically optimized per-command based on workload profiling.
 
+### Memory
+
+fgumi's memory model differs significantly from fgbio's JVM `-Xmx`. In particular, `--queue-memory` is per-thread by default and controls only pipeline queue backpressure — actual process memory will be higher. See the [Performance Tuning Guide](performance-tuning.md) for detailed guidance, including a comparison table for fgbio users.
+
 ---
 
 ## Pipeline Overview
@@ -293,19 +297,27 @@ fgumi sort \
 
 ## Phase 2b: High-Throughput Pipeline (Combined)
 
-For production use where filtering parameters are established, combine steps for better throughput:
+For production use where filtering parameters are established, combine steps for better throughput.
+
+**Stage 1: Group and call consensus in a single pipe:**
 
 ```bash
-# Simplex: group -> consensus -> align -> filter in one pipeline
 fgumi group --input aligned.bam --strategy adjacency --threads 4 --compression-level 1 \
-  | fgumi simplex --input /dev/stdin --min-reads 1 --output-per-base-tags --threads 4 --compression-level 1 \
-  | fgumi fastq --input /dev/stdin \
-  | bwa mem -t 8 -p -K 150000000 -Y ref.fa - \
-  | fgumi zipper --unmapped <(fgumi simplex ...) --reference ref.fa \
-  | fgumi filter --input /dev/stdin --ref ref.fa --min-reads 3 --output filtered.bam --threads 4
+  | fgumi simplex --input /dev/stdin --min-reads 1 --output-per-base-tags \
+    --output consensus.bam --threads 4 --compression-level 1
 ```
 
-Note: The high-throughput pipeline is more complex due to the re-alignment step. For most use cases, the R&D pipeline with intermediate files provides better debuggability and flexibility.
+**Stage 2: Align, filter, and sort in a single pipe:**
+
+```bash
+fgumi fastq --input consensus.bam \
+  | bwa mem -t 16 -p -K 150000000 -Y ref.fa - \
+  | fgumi zipper --unmapped consensus.bam --reference ref.fa \
+  | fgumi filter --input /dev/stdin --ref ref.fa --min-reads 3 \
+  | fgumi sort --input /dev/stdin --output filtered.bam --order coordinate --threads 4
+```
+
+Note: The two stages cannot be combined into a single pipeline because `fgumi zipper --unmapped` needs random access to the consensus BAM. For most use cases, the R&D pipeline with intermediate files provides better debuggability and flexibility.
 
 ---
 

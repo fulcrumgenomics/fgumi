@@ -1382,10 +1382,10 @@ impl MemoryEstimate for TemplateBatch {
 /// including its name, sequence, quality scores, CIGAR, and data fields.
 ///
 /// noodles `RecordBuf` layout:
-/// - name: Option<BString> (Vec<u8>) - heap allocated
-/// - sequence: Sequence (Vec<u8>, 1 byte per base, unpacked ASCII)
-/// - `quality_scores`: `QualityScores` (Vec<u8>)
-/// - cigar: Cigar (Vec<Op>, each Op is 4 bytes)
+/// - name: `Option<BString>` (`Vec<u8>`) - heap allocated
+/// - sequence: `Sequence` (`Vec<u8>`, 1 byte per base, unpacked ASCII)
+/// - `quality_scores`: `QualityScores` (`Vec<u8>`)
+/// - cigar: `Cigar` (`Vec<Op>`, each `Op` is 4 bytes)
 /// - data: Data (`IndexMap`<Tag, Value>) - significant overhead from hash table
 #[must_use]
 pub fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {

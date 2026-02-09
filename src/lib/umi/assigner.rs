@@ -291,6 +291,7 @@ impl BkTree {
     }
 
     /// Insert a UMI with its index into the tree.
+    #[allow(unsafe_code)]
     fn insert(&mut self, encoded: BitEnc, index: usize) {
         self.size += 1;
 
