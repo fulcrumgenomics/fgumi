@@ -1632,6 +1632,12 @@ impl RecordPairBuilder {
             r2_builder = r2_builder.tag(tag, value.clone());
         }
 
+        // Add MC (mate CIGAR) tags when both reads are mapped
+        if r1_mapped && r2_mapped {
+            r1_builder = r1_builder.tag("MC", r2_cigar.as_str());
+            r2_builder = r2_builder.tag("MC", r1_cigar.as_str());
+        }
+
         // Calculate template length if both mapped to same reference
         let mut r1 = r1_builder.build();
         let mut r2 = r2_builder.build();

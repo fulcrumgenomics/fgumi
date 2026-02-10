@@ -39,8 +39,7 @@ use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 ///
 /// Both `LibraryLookup` and [`LibraryIndex`] exist for different use cases:
 /// - `LibraryLookup`: String-based lookup returning library names. Used by
-///   [`ReadInfo::from`] and [`PositionGrouperConfig`](crate::grouper::PositionGrouperConfig)
-///   where the actual library name string is needed.
+///   [`ReadInfo::from`] where the actual library name string is needed.
 /// - [`LibraryIndex`]: Hash-based lookup returning numeric indices. Used by
 ///   [`compute_group_key`] in the hot path where only equality comparison matters,
 ///   avoiding string allocations.
@@ -227,8 +226,8 @@ pub fn compute_group_key(
     // Extract name hash
     let name_hash = LibraryIndex::hash_name(record.name().map(AsRef::as_ref));
 
-    // Skip secondary and supplementary alignments - they get a default key
-    // (they'll be filtered out by PositionGrouper anyway)
+    // Skip secondary and supplementary alignments - they get a default key with UNKNOWN_REF.
+    // RecordPositionGrouper either skips them or coalesces them by name_hash.
     let flags = record.flags();
     if flags.is_secondary() || flags.is_supplementary() {
         return GroupKey { name_hash, ..GroupKey::default() };

@@ -100,7 +100,7 @@ pub struct MemoryDebugStats {
     pub template_processing_bytes: AtomicU64,
     /// Memory held in reorder buffers
     pub reorder_buffer_bytes: AtomicU64,
-    /// Memory held by PositionGrouper state
+    /// Memory held by grouper state
     pub grouper_memory_bytes: AtomicU64,
     /// Memory held by worker-local allocations
     pub worker_local_memory_bytes: AtomicU64,
@@ -1232,7 +1232,7 @@ impl GroupKey {
 
     /// Returns the position-only key for grouping by genomic position.
     ///
-    /// This is used by `PositionGrouper` to determine if records belong to
+    /// This is used by `RecordPositionGrouper` to determine if records belong to
     /// the same position group (ignoring name).
     #[must_use]
     pub fn position_key(&self) -> (i32, i32, u8, i32, i32, u8, u16, u64) {
@@ -2228,7 +2228,7 @@ pub struct PipelineConfig {
     /// create tiny blocks instead of optimal 64KB blocks.
     ///
     /// - **`batch_size=1`**: For commands with naturally large work units
-    ///   (e.g., `group` with `PositionGroups` containing many records).
+    ///   (e.g., `group` with `RawPositionGroups` containing many records).
     /// - **`batch_size>1`**: For commands with small work units
     ///   (e.g., `filter` with single records). Use ~400 for ~60KB batches.
     pub batch_size: usize,

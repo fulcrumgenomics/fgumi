@@ -15,12 +15,12 @@ use fgoxide::io::DelimFile;
 use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
 use fgumi_lib::grouper::{
-    FilterMetrics, PositionGroup, PositionGrouper, PositionGrouperConfig, ProcessedPositionGroup,
+    FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
+    build_templates_from_records,
 };
 use fgumi_lib::logging::{OperationTimer, log_umi_grouping_summary};
 use fgumi_lib::metrics::group::UmiGroupingMetrics;
 use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::read_info::build_library_lookup;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
 use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
@@ -777,6 +777,11 @@ impl Command for GroupReadsByUmi {
         #[cfg(feature = "memory-debug")]
         let short_circuit_compress = short_circuit == "compress";
 
+        // Counter for contiguous MI assignment (incremented in the serial serialize step).
+        // AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering is fine because
+        // the serialize step is serial and ordered.
+        let next_mi_base = std::sync::atomic::AtomicU64::new(0);
+
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
         let records_processed = run_bam_pipeline_from_reader(
             pipeline_config,
@@ -784,26 +789,22 @@ impl Command for GroupReadsByUmi {
             header,
             &self.io.output,
             None, // Use input header for output
-            // grouper_fn: Create PositionGrouper with access to header
-            move |header: &Header| {
-                let library_lookup = build_library_lookup(header);
-                let config = PositionGrouperConfig::new(cell_tag, library_lookup);
-                Box::new(PositionGrouper::new(config))
-                    as Box<dyn Grouper<Group = PositionGroup> + Send>
+            // grouper_fn: Create RecordPositionGrouper (lightweight, no Template building)
+            move |_header: &Header| {
+                Box::new(RecordPositionGrouper::new())
+                    as Box<dyn Grouper<Group = RawPositionGroup> + Send>
             },
-            // process_fn: Filter templates + assign UMIs (parallel)
-            move |group: PositionGroup| -> std::io::Result<ProcessedPositionGroup> {
+            // process_fn: Build Templates + Filter + assign UMIs (parallel)
+            move |group: RawPositionGroup| -> std::io::Result<ProcessedPositionGroup> {
                 #[cfg(feature = "memory-debug")]
                 if short_circuit_process {
-                    let input_record_count: u64 =
-                        group.templates.iter().map(|t| t.read_count() as u64).sum();
+                    let input_record_count = group.records.len() as u64;
                     drop(group);
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
                         filter_metrics: FilterMetrics::new(),
                         input_record_count,
-                        base_mi: 0,
                     });
                 }
                 let mut filter_metrics = FilterMetrics::new();
@@ -815,14 +816,14 @@ impl Command for GroupReadsByUmi {
                     if let Some(stats) = stats_for_tracking.as_ref() {
                         use fgumi_lib::unified_pipeline::get_or_assign_thread_id;
                         let thread_id = get_or_assign_thread_id();
-                        let template_count = group.templates.len();
+                        let record_count = group.records.len();
 
                         stats.track_position_group_memory(size, true);
 
-                        if template_count > 100 {
+                        if record_count > 200 {
                             let group_size_gb = size as f64 / 1e9;
-                            log::debug!("Processing large position group: {:.2}GB ({} templates) on thread {}",
-                                       group_size_gb, template_count, thread_id);
+                            log::debug!("Processing large position group: {:.2}GB ({} records) on thread {}",
+                                       group_size_gb, record_count, thread_id);
                         }
                     }
                     size
@@ -830,13 +831,15 @@ impl Command for GroupReadsByUmi {
                     0
                 };
 
+                // Build Templates from raw records (was serial, now parallel!)
+                let all_templates = build_templates_from_records(group.records)?;
+
                 // Count ALL input records for progress tracking
                 let input_record_count: u64 =
-                    group.templates.iter().map(|t| t.read_count() as u64).sum();
+                    all_templates.iter().map(|t| t.read_count() as u64).sum();
 
                 // Filter templates
-                let filtered_templates: Vec<Template> = group
-                    .templates
+                let filtered_templates: Vec<Template> = all_templates
                     .into_iter()
                     .filter(|t| filter_template(t, &filter_config, &mut filter_metrics))
                     .collect();
@@ -879,7 +882,6 @@ impl Command for GroupReadsByUmi {
                         family_sizes: AHashMap::new(),
                         filter_metrics,
                         input_record_count,
-                        base_mi: group.base_mi,
                     });
                 }
 
@@ -907,12 +909,10 @@ impl Command for GroupReadsByUmi {
                         family_sizes: AHashMap::new(),
                         filter_metrics,
                         input_record_count,
-                        base_mi: group.base_mi,
                     });
                 }
 
                 // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
-                let base_mi = group.base_mi;
                 templates.sort_by(|a, b| {
                     let a_idx = a.mi.to_vec_index();
                     let b_idx = b.mi.to_vec_index();
@@ -960,10 +960,9 @@ impl Command for GroupReadsByUmi {
                     family_sizes,
                     filter_metrics,
                     input_record_count,
-                    base_mi,
                 })
             },
-            // serialize_fn: Serialize records + collect metrics (parallel)
+            // serialize_fn: Serialize records + collect metrics (serial, ordered)
             move |processed: ProcessedPositionGroup,
                   header: &Header,
                   output: &mut Vec<u8>|
@@ -991,7 +990,12 @@ impl Command for GroupReadsByUmi {
 
                 // Save input record count for progress tracking
                 let input_record_count = processed.input_record_count;
-                let base_mi = processed.base_mi;
+
+                // Assign contiguous base_mi from serial counter (template count, not record count)
+                let base_mi = next_mi_base.fetch_add(
+                    processed.templates.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 // Convert assign_tag_bytes to Tag for setting MI
                 let assign_tag = Tag::from(assign_tag_bytes);
@@ -1193,14 +1197,13 @@ impl GroupReadsByUmi {
         // Build library index for GroupKey computation
         let library_index = LibraryIndex::from_header(header);
 
-        // Create PositionGrouper
-        let library_lookup = build_library_lookup(header);
-        let config = PositionGrouperConfig::new(cell_tag, library_lookup);
-        let mut grouper = PositionGrouper::new(config);
+        // Create RecordPositionGrouper (same grouper used in pipeline mode)
+        let mut grouper = RecordPositionGrouper::new();
 
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
         let mut total_filter_metrics = FilterMetrics::new();
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
+        let mut next_mi_base: u64 = 0;
 
         // Progress tracking
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
@@ -1213,7 +1216,7 @@ impl GroupReadsByUmi {
             let key = compute_group_key(&record, &library_index, cell_tag);
             let decoded = DecodedRecord::new(record, key);
 
-            // Feed to PositionGrouper - may emit completed groups
+            // Feed to RecordPositionGrouper - may emit completed groups
             let completed_groups = grouper.add_records(vec![decoded])?;
 
             // Process any completed position groups immediately
@@ -1228,6 +1231,7 @@ impl GroupReadsByUmi {
                     assign_tag_bytes,
                     &mut total_filter_metrics,
                     &mut family_size_counter,
+                    &mut next_mi_base,
                     header,
                     &mut writer,
                 )?;
@@ -1248,6 +1252,7 @@ impl GroupReadsByUmi {
                 assign_tag_bytes,
                 &mut total_filter_metrics,
                 &mut family_size_counter,
+                &mut next_mi_base,
                 header,
                 &mut writer,
             )?;
@@ -1334,11 +1339,11 @@ impl GroupReadsByUmi {
         Ok(())
     }
 
-    /// Process a single position group: filter, assign UMIs, and write output.
+    /// Process a single position group: build templates, filter, assign UMIs, and write output.
     /// Used by `execute_single_threaded` for streaming processing.
     #[allow(clippy::too_many_arguments)]
     fn process_and_write_position_group(
-        group: PositionGroup,
+        group: RawPositionGroup,
         filter_config: &GroupFilterConfig,
         strategy: Strategy,
         effective_edits: u32,
@@ -1347,14 +1352,17 @@ impl GroupReadsByUmi {
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
         family_size_counter: &mut AHashMap<usize, u64>,
+        next_mi_base: &mut u64,
         header: &Header,
         writer: &mut fgumi_lib::bam_io::BamWriter,
     ) -> Result<()> {
+        // Build templates from raw records
+        let all_templates = build_templates_from_records(group.records)?;
+
         let mut filter_metrics = FilterMetrics::new();
 
         // Filter templates
-        let filtered_templates: Vec<Template> = group
-            .templates
+        let filtered_templates: Vec<Template> = all_templates
             .into_iter()
             .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
             .collect();
@@ -1415,7 +1423,8 @@ impl GroupReadsByUmi {
         }
 
         // Write templates (already sorted by MI, then by name)
-        let base_mi = group.base_mi;
+        let base_mi = *next_mi_base;
+        *next_mi_base += templates.len() as u64;
         let assign_tag = Tag::from(assign_tag_bytes);
 
         for template in templates {
@@ -1984,6 +1993,7 @@ mod tests {
             .r2_start(pos2 as usize)
             .mapping_quality(mapq1)
             .tag("RX", umi)
+            .tag("MC", "100M")
             .build()
     }
 
@@ -3991,6 +4001,7 @@ mod tests {
             .r1_reverse(r1_reverse)
             .r2_reverse(r2_reverse)
             .tag("RX", umi)
+            .tag("MC", "100M")
             .build()
     }
 
