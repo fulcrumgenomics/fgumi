@@ -1785,7 +1785,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
 
     // Calculate unclipped 5' position for this read
     let cigar_ops = get_cigar_ops(bam_bytes);
-    let this_pos = unclipped_5prime(pos, is_reverse, cigar_ops);
+    let this_pos = unclipped_5prime(pos, is_reverse, &cigar_ops);
 
     // Calculate mate's unclipped 5' position
     let mate_unclipped = if is_paired && !mate_unmapped {

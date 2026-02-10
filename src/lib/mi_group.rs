@@ -638,7 +638,9 @@ impl Grouper for MiGrouper {
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
         for decoded in records {
-            let record = decoded.record;
+            let record = decoded.into_record().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "MiGrouper requires parsed records")
+            })?;
             // Apply record filter if configured - skip records that don't pass
             if !self.should_keep(&record) {
                 continue;

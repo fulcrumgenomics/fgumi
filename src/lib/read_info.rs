@@ -221,7 +221,7 @@ impl Default for LibraryIndex {
 pub fn compute_group_key(
     record: &sam::alignment::RecordBuf,
     library_index: &LibraryIndex,
-    cell_tag: Tag,
+    cell_tag: Option<Tag>,
 ) -> GroupKey {
     // Extract name hash
     let name_hash = LibraryIndex::hash_name(record.name().map(AsRef::as_ref));
@@ -248,8 +248,12 @@ pub fn compute_group_key(
     };
 
     // Extract cell barcode hash
-    let cell_hash = if let Some(DataValue::String(cb_bytes)) = record.data().get(&cell_tag) {
-        LibraryIndex::hash_cell_barcode(Some(cb_bytes))
+    let cell_hash = if let Some(tag) = cell_tag {
+        if let Some(DataValue::String(cb_bytes)) = record.data().get(&tag) {
+            LibraryIndex::hash_cell_barcode(Some(cb_bytes))
+        } else {
+            0
+        }
     } else {
         0
     };

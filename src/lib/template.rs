@@ -97,6 +97,21 @@ impl MoleculeId {
         }
     }
 
+    /// Write string representation into a reusable buffer, returning the bytes.
+    ///
+    /// Avoids per-call String allocation by reusing the caller's buffer.
+    pub fn write_with_offset<'a>(&self, base: u64, buf: &'a mut String) -> &'a [u8] {
+        use std::fmt::Write;
+        buf.clear();
+        match self {
+            MoleculeId::None => {}
+            MoleculeId::Single(id) => write!(buf, "{}", base + id).unwrap(),
+            MoleculeId::PairedA(id) => write!(buf, "{}/A", base + id).unwrap(),
+            MoleculeId::PairedB(id) => write!(buf, "{}/B", base + id).unwrap(),
+        }
+        buf.as_bytes()
+    }
+
     /// Convert to a Vec index for grouping templates by molecule ID.
     ///
     /// Returns `None` for unassigned `MoleculeId`s. For assigned IDs:
@@ -164,8 +179,10 @@ impl std::fmt::Display for MoleculeId {
 pub struct Template {
     /// The query name (QNAME) shared by all records in this template
     pub name: Vec<u8>,
-    /// The records
+    /// The records (empty in raw-byte mode)
     pub records: Vec<RecordBuf>,
+    /// Raw BAM record bytes (without `block_size` prefix). Present only in raw-byte mode.
+    pub raw_records: Option<Vec<Vec<u8>>>,
     /// Primary R1 read (first segment, non-secondary, non-supplementary)
     pub r1: Option<(usize, usize)>,
     /// Primary R2 read (second segment, non-secondary, non-supplementary)
@@ -361,10 +378,7 @@ impl Builder {
             Some((r1_secondaries_end, r2_secondaries_end))
         };
 
-        let name = if let Some(name) = self.name.take() {
-            self.name = None;
-            name
-        } else {
+        let Some(name) = self.name.take() else {
             return Err(anyhow!("No records given to template builder"));
         };
 
@@ -390,6 +404,7 @@ impl Builder {
         Ok(Template {
             name,
             records,
+            raw_records: None,
             r1,
             r2,
             r1_supplementals,
@@ -409,13 +424,18 @@ impl Template {
     ///
     /// # Returns
     ///
-    /// Reference to the primary R1 record, or `None` if not present
+    /// Reference to the primary R1 record, or `None` if not present.
+    /// Returns `None` in raw-byte mode (use `raw_r1()` instead).
     #[must_use]
     pub fn r1(&self) -> Option<&RecordBuf> {
+        if self.records.is_empty() {
+            return None;
+        }
         self.r1.map(|_| &self.records[0])
     }
 
     /// Returns the primary R2 read if present.
+    /// Returns `None` in raw-byte mode (use `raw_r2()` instead).
     ///
     /// The primary R2 is the main (non-secondary, non-supplementary) alignment
     /// for the second read in a paired-end template.
@@ -425,10 +445,14 @@ impl Template {
     /// Reference to the primary R2 record, or `None` if not present
     #[must_use]
     pub fn r2(&self) -> Option<&RecordBuf> {
+        if self.records.is_empty() {
+            return None;
+        }
         self.r2.map(|(i, _)| &self.records[i])
     }
 
     /// Returns supplementary alignments for R1.
+    /// Returns empty in raw-byte mode.
     ///
     /// Supplementary alignments represent additional mapping locations for chimeric
     /// reads (reads that map to multiple locations due to structural variants or
@@ -440,13 +464,15 @@ impl Template {
     #[must_use]
     pub fn r1_supplementals(&self) -> Vec<&RecordBuf> {
         if let Some((start, end)) = self.r1_supplementals {
-            self.records[start..end].iter().collect()
-        } else {
-            Vec::new()
+            if end <= self.records.len() {
+                return self.records[start..end].iter().collect();
+            }
         }
+        Vec::new()
     }
 
     /// Returns supplementary alignments for R2.
+    /// Returns empty in raw-byte mode.
     ///
     /// Supplementary alignments represent additional mapping locations for chimeric
     /// reads (reads that map to multiple locations due to structural variants or
@@ -458,13 +484,15 @@ impl Template {
     #[must_use]
     pub fn r2_supplementals(&self) -> Vec<&RecordBuf> {
         if let Some((start, end)) = self.r2_supplementals {
-            self.records[start..end].iter().collect()
-        } else {
-            Vec::new()
+            if end <= self.records.len() {
+                return self.records[start..end].iter().collect();
+            }
         }
+        Vec::new()
     }
 
     /// Returns secondary alignments for R1.
+    /// Returns empty in raw-byte mode.
     ///
     /// Secondary alignments represent alternative mapping locations for reads with
     /// ambiguous alignments. These differ from supplementary alignments in that they
@@ -476,13 +504,15 @@ impl Template {
     #[must_use]
     pub fn r1_secondaries(&self) -> Vec<&RecordBuf> {
         if let Some((start, end)) = self.r1_secondaries {
-            self.records[start..end].iter().collect()
-        } else {
-            Vec::new()
+            if end <= self.records.len() {
+                return self.records[start..end].iter().collect();
+            }
         }
+        Vec::new()
     }
 
     /// Returns secondary alignments for R2.
+    /// Returns empty in raw-byte mode.
     ///
     /// Secondary alignments represent alternative mapping locations for reads with
     /// ambiguous alignments. These differ from supplementary alignments in that they
@@ -494,10 +524,11 @@ impl Template {
     #[must_use]
     pub fn r2_secondaries(&self) -> Vec<&RecordBuf> {
         if let Some((start, end)) = self.r2_secondaries {
-            self.records[start..end].iter().collect()
-        } else {
-            Vec::new()
+            if end <= self.records.len() {
+                return self.records[start..end].iter().collect();
+            }
         }
+        Vec::new()
     }
 
     /// Creates a new empty template with the given name
@@ -514,6 +545,7 @@ impl Template {
         Template {
             name,
             records: Vec::new(),
+            raw_records: None,
             r1: None,
             r2: None,
             r1_supplementals: None,
@@ -568,7 +600,8 @@ impl Template {
     ///
     /// Iterator over primary read records
     pub fn primary_reads(&self) -> impl Iterator<Item = &RecordBuf> {
-        self.r1.iter().chain(self.r2.iter()).map(|(start, _)| &self.records[*start])
+        let records = &self.records;
+        self.r1.iter().chain(self.r2.iter()).filter_map(move |(start, _)| records.get(*start))
     }
 
     /// Consumes the template and returns owned primary reads.
@@ -592,9 +625,12 @@ impl Template {
     /// ```
     #[must_use]
     pub fn into_primary_reads(mut self) -> (Option<RecordBuf>, Option<RecordBuf>) {
+        if self.records.is_empty() {
+            return (None, None);
+        }
         // Extract r2 first (higher index) to avoid shifting r1's position
-        let r2 = self.r2.map(|(i, _)| std::mem::take(&mut self.records[i]));
-        let r1 = self.r1.map(|_| std::mem::take(&mut self.records[0]));
+        let r2 = self.r2.and_then(|(i, _)| self.records.get_mut(i).map(std::mem::take));
+        let r1 = self.r1.and_then(|_| self.records.get_mut(0).map(std::mem::take));
         (r1, r2)
     }
 
@@ -604,13 +640,18 @@ impl Template {
     ///
     /// Iterator over non-primary reads
     pub fn all_supplementary_and_secondary(&self) -> impl Iterator<Item = &RecordBuf> {
+        let records = &self.records;
         let iter = self
             .r1_supplementals
             .iter()
             .chain(self.r2_supplementals.iter())
             .chain(self.r1_secondaries.iter())
             .chain(self.r2_secondaries.iter());
-        iter.flat_map(|(start, end)| self.records[*start..*end].iter())
+        iter.flat_map(move |(start, end)| {
+            let s = (*start).min(records.len());
+            let e = (*end).min(records.len());
+            records[s..e].iter()
+        })
     }
 
     /// Returns an iterator over all reads in this template
@@ -639,9 +680,14 @@ impl Template {
     ///
     /// Iterator over all R1 records
     pub fn all_r1s(&self) -> impl Iterator<Item = &RecordBuf> {
+        let records = &self.records;
         let iter =
             self.r1.iter().chain(self.r1_secondaries.iter()).chain(self.r1_supplementals.iter());
-        iter.flat_map(|(start, end)| self.records[*start..*end].iter())
+        iter.flat_map(move |(start, end)| {
+            let s = (*start).min(records.len());
+            let e = (*end).min(records.len());
+            records[s..e].iter()
+        })
     }
 
     /// Returns an iterator over all R2 reads (primary, supplementary, and secondary)
@@ -650,9 +696,14 @@ impl Template {
     ///
     /// Iterator over all R2 records
     pub fn all_r2s(&self) -> impl Iterator<Item = &RecordBuf> {
+        let records = &self.records;
         let iter =
             self.r2.iter().chain(self.r2_secondaries.iter()).chain(self.r2_supplementals.iter());
-        iter.flat_map(|(start, end)| self.records[*start..*end].iter())
+        iter.flat_map(move |(start, end)| {
+            let s = (*start).min(records.len());
+            let e = (*end).min(records.len());
+            records[s..e].iter()
+        })
     }
 
     /// Returns the total count of records in this template
@@ -662,7 +713,242 @@ impl Template {
     /// Total number of records (primary, supplementary, and secondary)
     #[must_use]
     pub fn read_count(&self) -> usize {
-        self.records.len()
+        if let Some(ref rr) = self.raw_records { rr.len() } else { self.records.len() }
+    }
+
+    /// Returns true if this template is in raw-byte mode.
+    #[inline]
+    #[must_use]
+    pub fn is_raw_byte_mode(&self) -> bool {
+        self.raw_records.is_some()
+    }
+
+    /// Returns the raw R1 bytes if in raw-byte mode.
+    #[must_use]
+    pub fn raw_r1(&self) -> Option<&[u8]> {
+        let rr = self.raw_records.as_ref()?;
+        self.r1.map(|_| rr[0].as_slice())
+    }
+
+    /// Returns the raw R2 bytes if in raw-byte mode.
+    #[must_use]
+    pub fn raw_r2(&self) -> Option<&[u8]> {
+        let rr = self.raw_records.as_ref()?;
+        self.r2.map(|(i, _)| rr[i].as_slice())
+    }
+
+    /// Returns all raw records if in raw-byte mode.
+    #[must_use]
+    pub fn all_raw_records(&self) -> Option<&[Vec<u8>]> {
+        self.raw_records.as_deref()
+    }
+
+    /// Consumes self and returns the raw records if in raw-byte mode.
+    #[must_use]
+    pub fn into_raw_records(self) -> Option<Vec<Vec<u8>>> {
+        self.raw_records
+    }
+
+    /// Returns mutable access to all raw records if in raw-byte mode.
+    pub fn all_raw_records_mut(&mut self) -> Option<&mut [Vec<u8>]> {
+        self.raw_records.as_deref_mut()
+    }
+
+    /// Build a Template from raw BAM byte records, categorizing by flags.
+    ///
+    /// The records are categorized using `bam_fields::flags()` to determine
+    /// R1/R2/supplementary/secondary status, with the same index-pair scheme
+    /// as `Builder::build()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if multiple primary R1s or R2s are found.
+    pub fn from_raw_records(mut raw_records: Vec<Vec<u8>>) -> Result<Self> {
+        use crate::sort::bam_fields;
+
+        if raw_records.is_empty() {
+            bail!("No records given to from_raw_records");
+        }
+
+        // Guard against truncated records
+        for (i, r) in raw_records.iter().enumerate() {
+            if r.len() < bam_fields::MIN_BAM_HEADER_LEN {
+                bail!(
+                    "Raw BAM record {i} too short to parse ({} < {})",
+                    r.len(),
+                    bam_fields::MIN_BAM_HEADER_LEN
+                );
+            }
+            let l_rn = r[8] as usize;
+            if r.len() < 32 + l_rn {
+                bail!(
+                    "Raw BAM record {i} truncated: l_read_name={l_rn} but only {} bytes after header",
+                    r.len() - 32
+                );
+            }
+        }
+
+        // Extract name from first record
+        let name = bam_fields::read_name(&raw_records[0]).to_vec();
+
+        // Fast path for common 2-record paired-end case (no supplementals/secondaries)
+        if raw_records.len() == 2 {
+            let f0 = bam_fields::flags(&raw_records[0]);
+            let f1 = bam_fields::flags(&raw_records[1]);
+            let neither_sec_supp =
+                (f0 | f1) & (bam_fields::flags::SECONDARY | bam_fields::flags::SUPPLEMENTARY) == 0;
+            if neither_sec_supp {
+                // Use same R1/R2 logic as general path: R1 = !paired || first_segment
+                let is_r1_0 = (f0 & bam_fields::flags::PAIRED) == 0
+                    || (f0 & bam_fields::flags::FIRST_SEGMENT) != 0;
+                let is_r1_1 = (f1 & bam_fields::flags::PAIRED) == 0
+                    || (f1 & bam_fields::flags::FIRST_SEGMENT) != 0;
+                // Only use fast path if exactly one R1 and one R2
+                if is_r1_0 != is_r1_1 {
+                    if !is_r1_0 {
+                        // rec[0]=R2, rec[1]=R1 — swap so R1 is at index 0
+                        raw_records.swap(0, 1);
+                    }
+                    return Ok(Template {
+                        name,
+                        records: Vec::new(),
+                        raw_records: Some(raw_records),
+                        r1: Some((0, 1)),
+                        r2: Some((1, 2)),
+                        r1_supplementals: None,
+                        r2_supplementals: None,
+                        r1_secondaries: None,
+                        r2_secondaries: None,
+                        mi: MoleculeId::None,
+                    });
+                }
+                // Both R1 or both R2 — fall through to general path for error handling
+            }
+        }
+
+        // Verify all records share the same QNAME (matching Builder behavior)
+        for rec in raw_records.iter().skip(1) {
+            if bam_fields::read_name(rec) != name.as_slice() {
+                bail!("Template name mismatch in from_raw_records");
+            }
+        }
+
+        // Categorize records into: r1, r2, r1_supp, r2_supp, r1_sec, r2_sec
+        let mut r1_idx: Option<usize> = None;
+        let mut r2_idx: Option<usize> = None;
+        let mut r1_supp: Vec<usize> = Vec::new();
+        let mut r2_supp: Vec<usize> = Vec::new();
+        let mut r1_sec: Vec<usize> = Vec::new();
+        let mut r2_sec: Vec<usize> = Vec::new();
+
+        for (i, rec) in raw_records.iter().enumerate() {
+            let flg = bam_fields::flags(rec);
+            let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
+            let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+            let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
+            let is_first = (flg & bam_fields::flags::FIRST_SEGMENT) != 0;
+            let is_r1 = !is_paired || is_first;
+
+            if is_r1 {
+                if is_secondary {
+                    r1_sec.push(i);
+                } else if is_supplementary {
+                    r1_supp.push(i);
+                } else if r1_idx.is_some() {
+                    bail!(
+                        "Multiple non-secondary, non-supplemental R1 records for read '{:?}'",
+                        name
+                    );
+                } else {
+                    r1_idx = Some(i);
+                }
+            } else if is_secondary {
+                r2_sec.push(i);
+            } else if is_supplementary {
+                r2_supp.push(i);
+            } else if r2_idx.is_some() {
+                bail!("Multiple non-secondary, non-supplemental R2 records for read '{:?}'", name);
+            } else {
+                r2_idx = Some(i);
+            }
+        }
+
+        // Build ordered Vec: r1, r2, r1_supplementals, r2_supplementals, r1_secondaries, r2_secondaries
+        // (matching Builder::build() ordering, with supplementals/secondaries reversed)
+        let mut ordered: Vec<Vec<u8>> = Vec::with_capacity(raw_records.len());
+        let mut take = |idx: usize| -> Vec<u8> { std::mem::take(&mut raw_records[idx]) };
+
+        // Track indices
+        let r1_pair = if let Some(idx) = r1_idx {
+            ordered.push(take(idx));
+            Some((ordered.len() - 1, ordered.len()))
+        } else {
+            None
+        };
+
+        let r2_pair = if let Some(idx) = r2_idx {
+            ordered.push(take(idx));
+            Some((ordered.len() - 1, ordered.len()))
+        } else {
+            None
+        };
+
+        let r1_supp_pair = if r1_supp.is_empty() {
+            None
+        } else {
+            r1_supp.reverse();
+            let start = ordered.len();
+            for idx in &r1_supp {
+                ordered.push(take(*idx));
+            }
+            Some((start, ordered.len()))
+        };
+
+        let r2_supp_pair = if r2_supp.is_empty() {
+            None
+        } else {
+            r2_supp.reverse();
+            let start = ordered.len();
+            for idx in &r2_supp {
+                ordered.push(take(*idx));
+            }
+            Some((start, ordered.len()))
+        };
+
+        let r1_sec_pair = if r1_sec.is_empty() {
+            None
+        } else {
+            r1_sec.reverse();
+            let start = ordered.len();
+            for idx in &r1_sec {
+                ordered.push(take(*idx));
+            }
+            Some((start, ordered.len()))
+        };
+
+        let r2_sec_pair = if r2_sec.is_empty() {
+            None
+        } else {
+            r2_sec.reverse();
+            let start = ordered.len();
+            for idx in &r2_sec {
+                ordered.push(take(*idx));
+            }
+            Some((start, ordered.len()))
+        };
+
+        Ok(Template {
+            name,
+            records: Vec::new(),
+            raw_records: Some(ordered),
+            r1: r1_pair,
+            r2: r2_pair,
+            r1_supplementals: r1_supp_pair,
+            r2_supplementals: r2_supp_pair,
+            r1_secondaries: r1_sec_pair,
+            r2_secondaries: r2_sec_pair,
+            mi: MoleculeId::None,
+        })
     }
 
     /// Returns the pair orientation if both R1 and R2 are present and mapped to the same chromosome.
@@ -727,6 +1013,10 @@ impl Template {
     ///
     /// Returns an error if the CIGAR operations cannot be parsed (malformed CIGAR data)
     pub fn fix_mate_info(&mut self) -> Result<()> {
+        if self.records.is_empty() {
+            return Ok(());
+        }
+
         let mapq_tag = Tag::new(b'M', b'Q');
         let mate_cigar_tag = Tag::new(b'M', b'C');
         let mate_score_tag = Tag::new(b'm', b's');
@@ -1365,7 +1655,12 @@ impl MemoryEstimate for Template {
         let records_size: usize = self.records.iter().map(estimate_record_buf_heap_size).sum();
         let records_vec_overhead = self.records.capacity() * std::mem::size_of::<RecordBuf>();
 
-        name_size + records_size + records_vec_overhead
+        let raw_records_size = self.raw_records.as_ref().map_or(0, |rr| {
+            rr.iter().map(Vec::capacity).sum::<usize>()
+                + rr.capacity() * std::mem::size_of::<Vec<u8>>()
+        });
+
+        name_size + records_size + records_vec_overhead + raw_records_size
     }
 }
 
@@ -3548,5 +3843,275 @@ mod tests {
         let template = Template::from_records(vec![r1, r2])?;
         assert_eq!(template.pair_orientation(), Some(PairOrientation::FR));
         Ok(())
+    }
+
+    // ========================================================================
+    // Tests for RecordBuf accessor panic in raw-byte mode
+    // ========================================================================
+
+    /// Helper to create a minimal raw BAM record for testing raw-byte mode.
+    fn make_minimal_raw_bam(name: &[u8], flags: u16) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
+        let total = 32 + l_read_name as usize; // minimal: header + name only
+        let mut buf = vec![0u8; total];
+
+        buf[8] = l_read_name;
+        buf[14..16].copy_from_slice(&flags.to_le_bytes());
+
+        let name_start = 32;
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        buf[name_start + name.len()] = 0; // null terminator
+
+        buf
+    }
+
+    #[test]
+    fn test_from_raw_records_creates_raw_mode_template() {
+        let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+
+        // Verify it's in raw-byte mode
+        assert!(template.is_raw_byte_mode());
+        // Verify records vec is empty (all data is in raw_records)
+        assert!(template.records.is_empty());
+        // Verify raw accessors work
+        assert!(template.raw_r1().is_some());
+    }
+
+    #[test]
+    fn test_r1_accessor_returns_none_in_raw_mode() {
+        // After fix: calling r1() on a raw-mode Template returns None instead of panicking
+        let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+
+        // r1() should return None in raw mode (use raw_r1() instead)
+        assert!(template.r1().is_none());
+        // raw_r1() should still work
+        assert!(template.raw_r1().is_some());
+    }
+
+    #[test]
+    fn test_r2_accessor_returns_none_in_raw_mode() {
+        // After fix: calling r2() on a raw-mode Template returns None instead of panicking
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
+        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+
+        assert!(template.is_raw_byte_mode());
+
+        // r2() should return None in raw mode (use raw_r2() instead)
+        assert!(template.r2().is_none());
+        // raw_r2() should still work
+        assert!(template.raw_r2().is_some());
+    }
+
+    // ========================================================================
+    // from_raw_records fast path tests
+    // ========================================================================
+
+    #[test]
+    fn test_from_raw_records_fast_path_normal_order() {
+        // R1 first, R2 second — fast path with no swap
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
+        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+
+        assert!(template.is_raw_byte_mode());
+        assert!(template.raw_r1().is_some());
+        assert!(template.raw_r2().is_some());
+        // Verify R1 is at index 0 (has FIRST_SEGMENT flag)
+        let r1_flags = crate::sort::bam_fields::flags(template.raw_r1().unwrap());
+        assert_ne!(r1_flags & FLAG_READ1, 0);
+    }
+
+    #[test]
+    fn test_from_raw_records_fast_path_swap() {
+        // R2 first, R1 second — fast path should swap them
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
+        let template = Template::from_raw_records(vec![r2, r1]).unwrap();
+
+        assert!(template.is_raw_byte_mode());
+        // After swap, R1 should be at index 0
+        let r1_flags = crate::sort::bam_fields::flags(template.raw_r1().unwrap());
+        assert_ne!(r1_flags & FLAG_READ1, 0);
+        let r2_flags = crate::sort::bam_fields::flags(template.raw_r2().unwrap());
+        assert_ne!(r2_flags & FLAG_READ2, 0);
+    }
+
+    #[test]
+    fn test_from_raw_records_fast_path_fallthrough_both_r1() {
+        // Both records are R1 — fast path should fall through to general path (error)
+        let r1a = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r1b = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let result = Template::from_raw_records(vec![r1a, r1b]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_raw_records_fast_path_with_secondary() {
+        // 2 records but one is secondary — should skip fast path
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let sec = make_minimal_raw_bam(
+            b"read1",
+            FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SECONDARY,
+        );
+        let template = Template::from_raw_records(vec![r1, sec]).unwrap();
+        assert!(template.is_raw_byte_mode());
+        assert!(template.raw_r1().is_some());
+    }
+
+    #[test]
+    fn test_from_raw_records_with_supplementary() {
+        // R1 primary + R1 supplementary + R2 primary — general path
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r1_supp = make_minimal_raw_bam(
+            b"read1",
+            FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SUPPLEMENTARY,
+        );
+        let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
+        let template = Template::from_raw_records(vec![r1, r1_supp, r2]).unwrap();
+        assert!(template.is_raw_byte_mode());
+        assert!(template.raw_r1().is_some());
+        assert!(template.raw_r2().is_some());
+    }
+
+    #[test]
+    fn test_from_raw_records_single_unpaired() {
+        // Single unpaired record — should be treated as R1
+        let r = make_minimal_raw_bam(b"read1", 0); // no PAIRED flag
+        let template = Template::from_raw_records(vec![r]).unwrap();
+        assert!(template.is_raw_byte_mode());
+        assert!(template.raw_r1().is_some());
+        assert!(template.raw_r2().is_none());
+    }
+
+    #[test]
+    fn test_from_raw_records_empty() {
+        let result = Template::from_raw_records(vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_raw_records_name_mismatch() {
+        // Two records with different names — should error in general path
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r1_supp = make_minimal_raw_bam(
+            b"read1",
+            FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SUPPLEMENTARY,
+        );
+        let r2_wrong = make_minimal_raw_bam(b"read2", FLAG_PAIRED | FLAG_READ2);
+        let result = Template::from_raw_records(vec![r1, r1_supp, r2_wrong]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_raw_records_all_raw_records_mut() {
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
+        let mut template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        // Should be able to get mutable access
+        let recs = template.all_raw_records_mut().unwrap();
+        assert_eq!(recs.len(), 2);
+    }
+
+    #[test]
+    fn test_from_raw_records_into_raw_records() {
+        let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
+        let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
+        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        let recs = template.into_raw_records().unwrap();
+        assert_eq!(recs.len(), 2);
+    }
+
+    #[test]
+    fn test_from_raw_records_truncated_header() {
+        // Record too short (< 32 bytes)
+        let short = vec![0u8; 20];
+        let err = Template::from_raw_records(vec![short]).unwrap_err();
+        assert!(err.to_string().contains("too short"), "Error: {err}");
+    }
+
+    #[test]
+    fn test_from_raw_records_truncated_read_name() {
+        // Record has 32 bytes but l_read_name claims more bytes than available
+        let mut buf = vec![0u8; 34]; // 32 header + 2 bytes
+        buf[8] = 10; // l_read_name=10, but only 2 bytes after header
+        let err = Template::from_raw_records(vec![buf]).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "Error: {err}");
+    }
+
+    #[test]
+    fn test_from_raw_records_valid_l_read_name() {
+        // Record with l_read_name that exactly fits
+        let rec = make_minimal_raw_bam(b"test", FLAG_PAIRED | FLAG_READ1);
+        assert!(Template::from_raw_records(vec![rec]).is_ok());
+    }
+
+    // ========================================================================
+    // write_with_offset tests
+    // ========================================================================
+
+    #[test]
+    fn test_write_with_offset_none() {
+        let mi = MoleculeId::None;
+        let mut buf = String::new();
+        let result = mi.write_with_offset(100, &mut buf);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_write_with_offset_single() {
+        let mi = MoleculeId::Single(5);
+        let mut buf = String::new();
+        let result = mi.write_with_offset(100, &mut buf);
+        assert_eq!(result, b"105");
+    }
+
+    #[test]
+    fn test_write_with_offset_paired_a() {
+        let mi = MoleculeId::PairedA(3);
+        let mut buf = String::new();
+        let result = mi.write_with_offset(10, &mut buf);
+        assert_eq!(result, b"13/A");
+    }
+
+    #[test]
+    fn test_write_with_offset_paired_b() {
+        let mi = MoleculeId::PairedB(3);
+        let mut buf = String::new();
+        let result = mi.write_with_offset(10, &mut buf);
+        assert_eq!(result, b"13/B");
+    }
+
+    #[test]
+    fn test_write_with_offset_reuses_buffer() {
+        let mut buf = String::new();
+        let mi1 = MoleculeId::Single(1);
+        let _ = mi1.write_with_offset(0, &mut buf);
+        assert_eq!(buf, "1");
+
+        // Reuse buffer — should clear and overwrite
+        let mi2 = MoleculeId::PairedA(99);
+        let result = mi2.write_with_offset(0, &mut buf);
+        assert_eq!(result, b"99/A");
+        assert_eq!(buf, "99/A");
+    }
+
+    #[test]
+    fn test_write_with_offset_matches_to_string() {
+        // Verify write_with_offset produces identical output to to_string_with_offset
+        let mut buf = String::new();
+        for mi in [
+            MoleculeId::None,
+            MoleculeId::Single(0),
+            MoleculeId::Single(42),
+            MoleculeId::PairedA(7),
+            MoleculeId::PairedB(7),
+        ] {
+            let expected = mi.to_string_with_offset(100);
+            let result = mi.write_with_offset(100, &mut buf);
+            assert_eq!(result, expected.as_bytes(), "Mismatch for {mi:?}");
+        }
     }
 }
