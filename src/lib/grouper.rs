@@ -10,6 +10,7 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
+use crate::sort::bam_fields;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
 
@@ -57,7 +58,17 @@ impl Grouper for SingleRecordGrouper {
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
         // Each record is its own group - extract and return them directly
-        Ok(records.into_iter().map(|d| d.record).collect())
+        records
+            .into_iter()
+            .map(|d| {
+                d.into_record().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SingleRecordGrouper requires parsed records, got raw bytes",
+                    )
+                })
+            })
+            .collect()
     }
 
     fn finish(&mut self) -> io::Result<Option<Self::Group>> {
@@ -99,8 +110,10 @@ pub struct TemplateGrouper {
     current_name: Option<Vec<u8>>,
     /// Hash of current template name (for fast comparison).
     current_name_hash: Option<u64>,
-    /// Records for current template.
+    /// Records for current template (non-raw mode).
     current_records: Vec<RecordBuf>,
+    /// Raw byte records for current template (raw-byte mode).
+    current_raw_records: Vec<Vec<u8>>,
     /// Completed templates waiting to be batched.
     pending_templates: VecDeque<Template>,
 }
@@ -117,13 +130,25 @@ impl TemplateGrouper {
             current_name: None,
             current_name_hash: None,
             current_records: Vec::new(),
+            current_raw_records: Vec::new(),
             pending_templates: VecDeque::new(),
         }
     }
 
     /// Flush current template to pending queue if non-empty.
     fn flush_current_template(&mut self) -> io::Result<()> {
-        if !self.current_records.is_empty() {
+        debug_assert!(
+            self.current_raw_records.is_empty() || self.current_records.is_empty(),
+            "mixed raw/parsed records in same template group"
+        );
+        if !self.current_raw_records.is_empty() {
+            let template =
+                Template::from_raw_records(std::mem::take(&mut self.current_raw_records))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            self.pending_templates.push_back(template);
+            self.current_name = None;
+            self.current_name_hash = None;
+        } else if !self.current_records.is_empty() {
             let template = Template::from_records(std::mem::take(&mut self.current_records))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.pending_templates.push_back(template);
@@ -155,29 +180,40 @@ impl Grouper for TemplateGrouper {
     type Group = TemplateBatch;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+        use crate::unified_pipeline::DecodedRecordData;
+
         // Group records by QNAME (using pre-computed name_hash for fast comparison)
         for decoded in records {
-            let record = decoded.record;
             let name_hash = decoded.key.name_hash;
-            let name = record.name().map(|n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
 
-            match (self.current_name_hash, name_hash) {
-                (Some(current_hash), new_hash) if current_hash == new_hash => {
-                    // Same template (based on hash) - add record
-                    self.current_records.push(record);
+            match decoded.data {
+                DecodedRecordData::Raw(raw) => {
+                    // Raw-byte mode: only extract name when starting a new template
+                    match (self.current_name_hash, name_hash) {
+                        (Some(current_hash), new_hash) if current_hash == new_hash => {
+                            self.current_raw_records.push(raw);
+                        }
+                        _ => {
+                            self.flush_current_template()?;
+                            self.current_name = Some(bam_fields::read_name(&raw).to_vec());
+                            self.current_name_hash = Some(name_hash);
+                            self.current_raw_records.push(raw);
+                        }
+                    }
                 }
-                (Some(_), _) => {
-                    // Different template - flush current and start new
-                    self.flush_current_template()?;
-                    self.current_name = name;
-                    self.current_name_hash = Some(name_hash);
-                    self.current_records.push(record);
-                }
-                (None, _) => {
-                    // First record
-                    self.current_name = name;
-                    self.current_name_hash = Some(name_hash);
-                    self.current_records.push(record);
+                DecodedRecordData::Parsed(record) => {
+                    let name = record.name().map(|n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
+                    match (self.current_name_hash, name_hash) {
+                        (Some(current_hash), new_hash) if current_hash == new_hash => {
+                            self.current_records.push(record);
+                        }
+                        _ => {
+                            self.flush_current_template()?;
+                            self.current_name = name;
+                            self.current_name_hash = Some(name_hash);
+                            self.current_records.push(record);
+                        }
+                    }
                 }
             }
         }
@@ -203,7 +239,10 @@ impl Grouper for TemplateGrouper {
     }
 
     fn has_pending(&self) -> bool {
-        self.current_name.is_some() || !self.pending_templates.is_empty()
+        self.current_name.is_some()
+            || !self.pending_templates.is_empty()
+            || !self.current_raw_records.is_empty()
+            || !self.current_records.is_empty()
     }
 }
 
@@ -378,25 +417,58 @@ impl RecordPositionGrouper {
     /// Skips validation for records that are unmapped or whose mates are unmapped,
     /// since unmapped reads have no CIGAR to report in an MC tag.
     fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
+        use crate::sort::bam_fields;
+
         if self.mc_validated {
             return Ok(());
         }
-        let flags = decoded.record.flags();
-        if flags.is_segmented()
-            && !flags.is_secondary()
-            && !flags.is_supplementary()
-            && !flags.is_unmapped()
-            && !flags.is_mate_unmapped()
-        {
-            let mc_tag = Tag::from([b'M', b'C']);
-            if decoded.record.data().get(&mc_tag).is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "RecordPositionGrouper requires MC tags on paired-end reads. \
-                     Run `fgumi zipper` to add MC tags before `fgumi group`.",
-                ));
+
+        use crate::unified_pipeline::DecodedRecordData;
+
+        match &decoded.data {
+            DecodedRecordData::Raw(raw) => {
+                let flg = bam_fields::flags(raw);
+                let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
+                let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
+                let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+                let is_unmapped = (flg & bam_fields::flags::UNMAPPED) != 0;
+                let is_mate_unmapped = (flg & bam_fields::flags::MATE_UNMAPPED) != 0;
+
+                if is_paired
+                    && !is_secondary
+                    && !is_supplementary
+                    && !is_unmapped
+                    && !is_mate_unmapped
+                {
+                    if bam_fields::find_mc_tag_in_record(raw).is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "RecordPositionGrouper requires MC tags on paired-end reads. \
+                             Run `fgumi zipper` to add MC tags before `fgumi group`.",
+                        ));
+                    }
+                    self.mc_validated = true;
+                }
             }
-            self.mc_validated = true;
+            DecodedRecordData::Parsed(record) => {
+                let flags = record.flags();
+                if flags.is_segmented()
+                    && !flags.is_secondary()
+                    && !flags.is_supplementary()
+                    && !flags.is_unmapped()
+                    && !flags.is_mate_unmapped()
+                {
+                    let mc_tag = Tag::from([b'M', b'C']);
+                    if record.data().get(&mc_tag).is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "RecordPositionGrouper requires MC tags on paired-end reads. \
+                             Run `fgumi zipper` to add MC tags before `fgumi group`.",
+                        ));
+                    }
+                    self.mc_validated = true;
+                }
+            }
         }
         Ok(())
     }
@@ -514,28 +586,40 @@ pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<V
         return Ok(Vec::new());
     }
 
+    // Check if this is raw-byte mode based on the first record
+    use crate::unified_pipeline::DecodedRecordData;
+
+    let raw_byte_mode = matches!(records[0].data, DecodedRecordData::Raw(_));
+
+    if raw_byte_mode {
+        return build_templates_from_raw_records(records);
+    }
+
     let mut templates = Vec::new();
     let mut current_name_hash: Option<u64> = None;
     let mut current_records: Vec<RecordBuf> = Vec::new();
 
     for decoded in records {
         let name_hash = decoded.key.name_hash;
+        let record = match decoded.data {
+            DecodedRecordData::Parsed(r) => r,
+            DecodedRecordData::Raw(_) => unreachable!("checked above"),
+        };
 
         match current_name_hash {
             Some(h) if h == name_hash => {
-                current_records.push(decoded.record);
+                current_records.push(record);
             }
             Some(_) => {
-                // Different template — flush current
                 let template = Template::from_records(std::mem::take(&mut current_records))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 templates.push(template);
                 current_name_hash = Some(name_hash);
-                current_records.push(decoded.record);
+                current_records.push(record);
             }
             None => {
                 current_name_hash = Some(name_hash);
-                current_records.push(decoded.record);
+                current_records.push(record);
             }
         }
     }
@@ -543,6 +627,48 @@ pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<V
     // Flush last template
     if !current_records.is_empty() {
         let template = Template::from_records(current_records)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        templates.push(template);
+    }
+
+    Ok(templates)
+}
+
+/// Build templates from raw-byte mode decoded records.
+fn build_templates_from_raw_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
+    use crate::unified_pipeline::DecodedRecordData;
+
+    let mut templates = Vec::new();
+    let mut current_name_hash: Option<u64> = None;
+    let mut current_raw: Vec<Vec<u8>> = Vec::new();
+
+    for decoded in records {
+        let name_hash = decoded.key.name_hash;
+        let raw = match decoded.data {
+            DecodedRecordData::Raw(v) => v,
+            DecodedRecordData::Parsed(_) => unreachable!("raw-byte mode checked by caller"),
+        };
+
+        match current_name_hash {
+            Some(h) if h == name_hash => {
+                current_raw.push(raw);
+            }
+            Some(_) => {
+                let template = Template::from_raw_records(std::mem::take(&mut current_raw))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                templates.push(template);
+                current_name_hash = Some(name_hash);
+                current_raw.push(raw);
+            }
+            None => {
+                current_name_hash = Some(name_hash);
+                current_raw.push(raw);
+            }
+        }
+    }
+
+    if !current_raw.is_empty() {
+        let template = Template::from_raw_records(current_raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         templates.push(template);
     }

@@ -34,6 +34,7 @@ use super::base::{
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
 use crate::read_info::{LibraryIndex, compute_group_key};
+use crate::sort::bam_fields;
 
 /// Buffer size for buffered I/O (8 MB).
 /// This reduces syscalls by batching reads/writes into larger chunks.
@@ -353,16 +354,137 @@ pub fn decode_records(
         // Skip the 4-byte block_size prefix
         let record_data = &batch.buffer[start + 4..end];
 
-        let mut record = RecordBuf::default();
-        decode(&mut &record_data[..], &mut record)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if group_key_config.raw_byte_mode {
+            let raw = record_data.to_vec();
+            if raw.len() < 32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("BAM record too short: len={}", raw.len()),
+                ));
+            }
+            // Validate l_read_name fits within the record to prevent
+            // panics in read_name() and downstream CIGAR/aux access.
+            let l_rn = raw[8] as usize;
+            if raw.len() < 32 + l_rn {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "BAM record truncated: len={}, l_read_name={l_rn} (need >= {})",
+                        raw.len(),
+                        32 + l_rn
+                    ),
+                ));
+            }
+            let key = compute_group_key_from_raw(
+                &raw,
+                &group_key_config.library_index,
+                group_key_config.cell_tag,
+            );
+            records.push(DecodedRecord::from_raw_bytes(raw, key));
+        } else {
+            let mut record = RecordBuf::default();
+            decode(&mut &record_data[..], &mut record)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let key =
-            compute_group_key(&record, &group_key_config.library_index, group_key_config.cell_tag);
-        records.push(DecodedRecord::new(record, key));
+            let key = compute_group_key(
+                &record,
+                &group_key_config.library_index,
+                group_key_config.cell_tag,
+            );
+            records.push(DecodedRecord::new(record, key));
+        }
     }
 
     Ok(records)
+}
+
+/// Compute a `GroupKey` directly from raw BAM bytes, matching `compute_group_key()` exactly.
+///
+/// Uses 1-based coordinate helpers to produce identical keys to the noodles path.
+fn compute_group_key_from_raw(
+    raw: &[u8],
+    library_index: &LibraryIndex,
+    cell_tag: Option<noodles::sam::alignment::record::data::field::Tag>,
+) -> super::base::GroupKey {
+    use super::base::GroupKey;
+
+    // Extract name hash (match noodles path: empty name → None → hash 0)
+    let name = bam_fields::read_name(raw);
+    let name_hash = if name.is_empty() {
+        LibraryIndex::hash_name(None)
+    } else {
+        LibraryIndex::hash_name(Some(name))
+    };
+
+    // Check secondary/supplementary
+    let flg = bam_fields::flags(raw);
+    let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
+    let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+    if is_secondary || is_supplementary {
+        return GroupKey { name_hash, ..GroupKey::default() };
+    }
+
+    // Own position (1-based, matching noodles) — zero-allocation CIGAR iteration
+    let reverse = (flg & bam_fields::flags::REVERSE) != 0;
+    let own_pos = bam_fields::unclipped_5prime_from_raw_bam(raw);
+
+    let own_ref_id = bam_fields::ref_id(raw);
+    let strand = u8::from(reverse);
+
+    // Single-pass aux tag extraction (RG, cell barcode, MC)
+    let aux_data = bam_fields::aux_data_slice(raw);
+    let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
+    let aux_tags = bam_fields::extract_aux_string_tags(aux_data, &cell_tag_bytes);
+
+    let library_idx = if let Some(rg) = aux_tags.rg {
+        let rg_hash = LibraryIndex::hash_rg(rg);
+        library_index.get(rg_hash)
+    } else {
+        0
+    };
+
+    let cell_hash =
+        if let Some(cb) = aux_tags.cell { LibraryIndex::hash_cell_barcode(Some(cb)) } else { 0 };
+
+    // Check if paired
+    let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
+    if !is_paired {
+        return GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash);
+    }
+
+    // Mate info — guard against MATE_UNMAPPED (matching noodles path)
+    let mate_unmapped = (flg & bam_fields::flags::MATE_UNMAPPED) != 0;
+    let mate_reverse = (flg & bam_fields::flags::MATE_REVERSE) != 0;
+    let mate_strand = u8::from(mate_reverse);
+    let raw_mate_ref_id = bam_fields::mate_ref_id(raw);
+    let raw_mate_pos = bam_fields::mate_pos(raw);
+
+    // Get mate unclipped 5' position via MC tag (skip if mate is unmapped)
+    let mate_pos_result = if mate_unmapped {
+        None
+    } else {
+        aux_tags
+            .mc
+            .map(|mc| bam_fields::mate_unclipped_5prime_1based(raw_mate_pos, mate_reverse, mc))
+    };
+
+    match mate_pos_result {
+        Some(mp) => GroupKey::paired(
+            own_ref_id,
+            own_pos,
+            strand,
+            raw_mate_ref_id,
+            mp,
+            mate_strand,
+            library_idx,
+            cell_hash,
+            name_hash,
+        ),
+        None => {
+            // No MC tag — fall back to single-end behavior
+            GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash)
+        }
+    }
 }
 
 // ============================================================================

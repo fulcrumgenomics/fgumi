@@ -1288,26 +1288,83 @@ impl Default for GroupKey {
 /// This is the output of the Decode step and input to the Group step.
 /// The key is computed during the parallel Decode step so that the
 /// serial Group step only needs to do fast integer comparisons.
+///
+/// Uses an enum for the record data to avoid carrying both `RecordBuf` and
+/// `Vec<u8>` — saving ~24 bytes per record in parsed mode and ~200 bytes
+/// in raw mode.
 #[derive(Debug)]
 pub struct DecodedRecord {
-    /// The decoded BAM record.
-    pub record: RecordBuf,
     /// Pre-computed grouping key.
     pub key: GroupKey,
+    /// The record data — either a parsed `RecordBuf` or raw bytes.
+    pub(crate) data: DecodedRecordData,
+}
+
+/// Record data: either a parsed noodles `RecordBuf` or raw BAM bytes.
+#[derive(Debug)]
+pub enum DecodedRecordData {
+    Parsed(RecordBuf),
+    Raw(Vec<u8>),
 }
 
 impl DecodedRecord {
     /// Create a new decoded record with its grouping key.
     #[must_use]
     pub fn new(record: RecordBuf, key: GroupKey) -> Self {
-        Self { record, key }
+        Self { key, data: DecodedRecordData::Parsed(record) }
+    }
+
+    /// Create a decoded record from raw bytes, skipping noodles decode.
+    #[must_use]
+    pub fn from_raw_bytes(raw: Vec<u8>, key: GroupKey) -> Self {
+        Self { key, data: DecodedRecordData::Raw(raw) }
+    }
+
+    /// Returns the raw bytes if this is a raw-mode record.
+    #[must_use]
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        match &self.data {
+            DecodedRecordData::Raw(v) => Some(v),
+            DecodedRecordData::Parsed(_) => None,
+        }
+    }
+
+    /// Takes the raw bytes out if this is a raw-mode record.
+    #[must_use]
+    pub fn into_raw_bytes(self) -> Option<Vec<u8>> {
+        match self.data {
+            DecodedRecordData::Raw(v) => Some(v),
+            DecodedRecordData::Parsed(_) => None,
+        }
+    }
+
+    /// Returns a reference to the `RecordBuf` if this is a parsed-mode record.
+    #[must_use]
+    pub fn record(&self) -> Option<&RecordBuf> {
+        match &self.data {
+            DecodedRecordData::Parsed(r) => Some(r),
+            DecodedRecordData::Raw(_) => None,
+        }
+    }
+
+    /// Takes the `RecordBuf` out if this is a parsed-mode record.
+    #[must_use]
+    pub fn into_record(self) -> Option<RecordBuf> {
+        match self.data {
+            DecodedRecordData::Parsed(r) => Some(r),
+            DecodedRecordData::Raw(_) => None,
+        }
     }
 }
 
 impl MemoryEstimate for DecodedRecord {
     fn estimate_heap_size(&self) -> usize {
-        // Delegate to the shared estimator to avoid divergence between add/remove tracking
-        crate::template::estimate_record_buf_heap_size(&self.record)
+        match &self.data {
+            DecodedRecordData::Parsed(record) => {
+                crate::template::estimate_record_buf_heap_size(record)
+            }
+            DecodedRecordData::Raw(raw) => raw.capacity(),
+        }
     }
 }
 
@@ -1345,15 +1402,37 @@ impl MemoryEstimate for Vec<RecordBuf> {
 pub struct GroupKeyConfig {
     /// Library index for fast RG → library lookup.
     pub library_index: Arc<LibraryIndex>,
-    /// Tag used for cell barcode extraction.
-    pub cell_tag: Tag,
+    /// Tag used for cell barcode extraction. None skips cell extraction.
+    pub cell_tag: Option<Tag>,
+    /// When true, skip noodles decode and work with raw BAM bytes.
+    pub raw_byte_mode: bool,
 }
 
 impl GroupKeyConfig {
     /// Create a new `GroupKeyConfig`.
     #[must_use]
     pub fn new(library_index: LibraryIndex, cell_tag: Tag) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag }
+        Self {
+            library_index: Arc::new(library_index),
+            cell_tag: Some(cell_tag),
+            raw_byte_mode: false,
+        }
+    }
+
+    /// Create a `GroupKeyConfig` for raw-byte mode.
+    #[must_use]
+    pub fn new_raw(library_index: LibraryIndex, cell_tag: Tag) -> Self {
+        Self {
+            library_index: Arc::new(library_index),
+            cell_tag: Some(cell_tag),
+            raw_byte_mode: true,
+        }
+    }
+
+    /// Create a `GroupKeyConfig` for raw-byte mode without cell barcode extraction.
+    #[must_use]
+    pub fn new_raw_no_cell(library_index: LibraryIndex) -> Self {
+        Self { library_index: Arc::new(library_index), cell_tag: None, raw_byte_mode: true }
     }
 }
 
@@ -1361,7 +1440,8 @@ impl Default for GroupKeyConfig {
     fn default() -> Self {
         Self {
             library_index: Arc::new(LibraryIndex::default()),
-            cell_tag: Tag::from([b'C', b'B']), // Default cell barcode tag
+            cell_tag: Some(Tag::from([b'C', b'B'])), // Default cell barcode tag
+            raw_byte_mode: false,
         }
     }
 }
@@ -5457,6 +5537,18 @@ mod tests {
     fn test_memory_estimate_unit() {
         let unit = ();
         assert_eq!(unit.estimate_heap_size(), 0);
+    }
+
+    #[test]
+    fn test_decoded_record_record_accessor() {
+        let rec = RecordBuf::default();
+        let parsed = DecodedRecord::new(rec, GroupKey::default());
+        assert!(parsed.record().is_some());
+        assert!(parsed.raw_bytes().is_none());
+
+        let raw = DecodedRecord::from_raw_bytes(vec![0u8; 32], GroupKey::default());
+        assert!(raw.record().is_none());
+        assert!(raw.raw_bytes().is_some());
     }
 
     #[test]

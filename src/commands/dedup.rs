@@ -55,6 +55,7 @@ use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 use fgumi_lib::sort::PA_TAG;
+use fgumi_lib::sort::bam_fields;
 
 /// Duplicate flag bit in SAM flags (0x400)
 const DUPLICATE_FLAG: u16 = 0x400;
@@ -217,6 +218,10 @@ struct DedupFilterConfig {
 /// matching HTSJDK/Picard's `SUM_OF_BASE_QUALITIES` strategy.
 #[inline]
 fn score_template(template: &Template) -> i64 {
+    if template.is_raw_byte_mode() {
+        return score_template_raw(template);
+    }
+
     let mut score: u32 = 0;
 
     // Score R1 primary
@@ -227,6 +232,32 @@ fn score_template(template: &Template) -> i64 {
     // Score R2 primary
     if let Some(r2) = template.r2() {
         score += sum_base_qualities(r2);
+    }
+
+    i64::from(score)
+}
+
+/// Raw-byte version of `score_template`. Sums base qualities from raw BAM bytes,
+/// capping each quality at 15 per base (matching Picard/HTSJDK behavior).
+#[inline]
+fn score_template_raw(template: &Template) -> i64 {
+    use fgumi_lib::sort::bam_fields;
+
+    let mut score: u32 = 0;
+
+    for raw in [template.raw_r1(), template.raw_r2()].into_iter().flatten() {
+        if raw.len() < 32 {
+            continue;
+        }
+        let qo = bam_fields::qual_offset(raw);
+        let seq_len = bam_fields::l_seq(raw) as usize;
+        if qo >= raw.len() {
+            continue;
+        }
+        let max_len = std::cmp::min(seq_len, raw.len() - qo);
+        // Slice-iterate for auto-vectorization (compiler can use SIMD min+sum)
+        score +=
+            raw[qo..qo + max_len].iter().map(|&q| u32::from(std::cmp::min(q, 15))).sum::<u32>();
     }
 
     i64::from(score)
@@ -244,6 +275,148 @@ fn sum_base_qualities(record: &noodles::sam::alignment::RecordBuf) -> u32 {
 //////////////////////////////////////////////////////////////////////////////
 // Template filtering (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
+
+/// Raw-byte version of `filter_template`.
+fn filter_template_raw(
+    template: &Template,
+    config: &DedupFilterConfig,
+    metrics: &mut FilterMetrics,
+) -> bool {
+    use fgumi_lib::sort::bam_fields;
+
+    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_HEADER_LEN);
+    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_HEADER_LEN);
+
+    metrics.total_templates += 1;
+
+    if raw_r1.is_none() && raw_r2.is_none() {
+        metrics.discarded_poor_alignment += 1;
+        return false;
+    }
+
+    let both_unmapped = raw_r1
+        .is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0)
+        && raw_r2.is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0);
+    if both_unmapped {
+        metrics.discarded_poor_alignment += 1;
+        return false;
+    }
+
+    // Phase 1: Flag-based checks
+    for raw in [raw_r1, raw_r2].into_iter().flatten() {
+        let flg = bam_fields::flags(raw);
+
+        if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
+            metrics.discarded_non_pf += 1;
+            return false;
+        }
+
+        if (flg & bam_fields::flags::UNMAPPED) == 0 {
+            let mapq = bam_fields::mapq(raw);
+            if mapq < config.min_mapq {
+                metrics.discarded_poor_alignment += 1;
+                return false;
+            }
+        }
+    }
+
+    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
+    for raw in [raw_r1, raw_r2].into_iter().flatten() {
+        let flg = bam_fields::flags(raw);
+        let aux = bam_fields::aux_data_slice(raw);
+        let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
+
+        let mut found_mq: Option<i64> = None;
+        let mut found_umi: Option<&[u8]> = None;
+        let mut p = 0;
+        while p + 3 <= aux.len() {
+            let t = [aux[p], aux[p + 1]];
+            let val_type = aux[p + 2];
+
+            if t == config.umi_tag && val_type == b'Z' {
+                let start = p + 3;
+                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
+                    found_umi = Some(&aux[start..start + end]);
+                    p = start + end + 1;
+                } else {
+                    break;
+                }
+                if !check_mq || found_mq.is_some() {
+                    break;
+                }
+                continue;
+            }
+
+            if check_mq && t == *b"MQ" {
+                found_mq = match val_type {
+                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
+                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
+                    b'S' if p + 5 <= aux.len() => {
+                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
+                    }
+                    b's' if p + 5 <= aux.len() => {
+                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
+                    }
+                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
+                        aux[p + 3],
+                        aux[p + 4],
+                        aux[p + 5],
+                        aux[p + 6],
+                    ]))),
+                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
+                        aux[p + 3],
+                        aux[p + 4],
+                        aux[p + 5],
+                        aux[p + 6],
+                    ]))),
+                    _ => None,
+                };
+            }
+
+            if let Some(size) = bam_fields::tag_value_size(val_type, &aux[p + 3..]) {
+                p += 3 + size;
+            } else {
+                break;
+            }
+            if found_umi.is_some() && (!check_mq || found_mq.is_some()) {
+                break;
+            }
+        }
+
+        if check_mq {
+            if let Some(mq) = found_mq {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                if (mq as u8) < config.min_mapq {
+                    metrics.discarded_poor_alignment += 1;
+                    return false;
+                }
+            }
+        }
+
+        if let Some(umi_bytes) = found_umi {
+            match validate_umi(umi_bytes) {
+                UmiValidation::ContainsN => {
+                    metrics.discarded_ns_in_umi += 1;
+                    return false;
+                }
+                UmiValidation::Valid(base_count) => {
+                    if let Some(min_len) = config.min_umi_length {
+                        if base_count < min_len {
+                            metrics.discarded_umi_too_short += 1;
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else {
+            metrics.discarded_poor_alignment += 1;
+            return false;
+        }
+    }
+
+    metrics.accepted_templates += 1;
+    true
+}
 
 /// Filter a template based on filtering criteria.
 /// Returns true if the template should be kept.
@@ -381,8 +554,20 @@ fn umi_for_read(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> R
 
 /// Get pair orientation for a template.
 fn get_pair_orientation(template: &Template) -> (bool, bool) {
+    if template.is_raw_byte_mode() {
+        return get_pair_orientation_raw(template);
+    }
     let r1_positive = template.r1().is_none_or(|r| !r.flags().is_reverse_complemented());
     let r2_positive = template.r2().is_none_or(|r| !r.flags().is_reverse_complemented());
+    (r1_positive, r2_positive)
+}
+
+/// Raw-byte pair orientation using `bam_fields::flags()`.
+fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
+    let r1_positive =
+        template.raw_r1().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
+    let r2_positive =
+        template.raw_r2().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
 
@@ -391,9 +576,26 @@ fn is_r1_genomically_earlier(
     r1: &noodles::sam::alignment::RecordBuf,
     r2: &noodles::sam::alignment::RecordBuf,
 ) -> Result<bool> {
+    let ref1 = r1.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
+    let ref2 = r2.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
+    if ref1 != ref2 {
+        return Ok(ref1 < ref2);
+    }
     let r1_pos = unclipped_five_prime_position(r1).unwrap_or(0);
     let r2_pos = unclipped_five_prime_position(r2).unwrap_or(0);
     Ok(r1_pos <= r2_pos)
+}
+
+/// Raw-byte version: check if R1 is genomically earlier than R2.
+fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
+    let ref1 = bam_fields::ref_id(r1);
+    let ref2 = bam_fields::ref_id(r2);
+    if ref1 != ref2 {
+        return ref1 < ref2;
+    }
+    let r1_pos = bam_fields::unclipped_5prime_from_raw_bam(r1);
+    let r2_pos = bam_fields::unclipped_5prime_from_raw_bam(r2);
+    r1_pos <= r2_pos
 }
 
 /// Truncate UMIs to minimum length if specified.
@@ -423,35 +625,57 @@ fn assign_umi_groups_for_indices(
     }
 
     let mut umis = Vec::with_capacity(indices.len());
+    let raw_mode = templates[indices[0]].is_raw_byte_mode();
 
     for &idx in indices {
         let template = &templates[idx];
-        let umi_bytes = if let Some(r1) = template.r1() {
-            if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
-                bytes
+
+        let (umi_str_ref, is_r1_earlier) = if raw_mode {
+            let umi_bytes = if let Some(r1_raw) = template.raw_r1() {
+                let aux = bam_fields::aux_data_slice(r1_raw);
+                bam_fields::find_string_tag(aux, &raw_tag)
+            } else if let Some(r2_raw) = template.raw_r2() {
+                let aux = bam_fields::aux_data_slice(r2_raw);
+                bam_fields::find_string_tag(aux, &raw_tag)
             } else {
-                bail!("UMI tag is not a string");
-            }
-        } else if let Some(r2) = template.r2() {
-            if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
-                bytes
+                None
+            };
+            let umi_bytes = umi_bytes.ok_or_else(|| anyhow::anyhow!("No UMI tag found"))?;
+            let umi_str = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
+            let earlier = if let (Some(r1), Some(r2)) = (template.raw_r1(), template.raw_r2()) {
+                is_r1_genomically_earlier_raw(r1, r2)
             } else {
-                bail!("UMI tag is not a string");
-            }
+                true
+            };
+            (umi_str, earlier)
         } else {
-            bail!("Template has no reads");
+            let umi_bytes = if let Some(r1) = template.r1() {
+                if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
+                    bytes
+                } else {
+                    bail!("UMI tag is not a string");
+                }
+            } else if let Some(r2) = template.r2() {
+                if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
+                    bytes
+                } else {
+                    bail!("UMI tag is not a string");
+                }
+            } else {
+                bail!("Template has no reads");
+            };
+            let umi_str = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
+            let earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
+                is_r1_genomically_earlier(r1, r2)?
+            } else {
+                true
+            };
+            (umi_str, earlier)
         };
 
-        let umi_str =
-            std::str::from_utf8(umi_bytes).map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
-
-        let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
-            is_r1_genomically_earlier(r1, r2)?
-        } else {
-            true
-        };
-
-        let processed_umi = umi_for_read(umi_str, is_r1_earlier, assigner)?;
+        let processed_umi = umi_for_read(umi_str_ref, is_r1_earlier, assigner)?;
         umis.push(processed_umi);
     }
 
@@ -562,11 +786,19 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
 
 /// Marks all reads in a template as duplicates.
 fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
-    for record in &mut template.records {
-        let current_flags = u16::from(record.flags());
-        let new_flags = Flags::from(current_flags | DUPLICATE_FLAG);
-        *record.flags_mut() = new_flags;
-        dedup_metrics.duplicate_reads += 1;
+    if let Some(raw_records) = template.all_raw_records_mut() {
+        for raw in raw_records.iter_mut() {
+            let flg = bam_fields::flags(raw);
+            bam_fields::set_flags(raw, flg | DUPLICATE_FLAG);
+            dedup_metrics.duplicate_reads += 1;
+        }
+    } else {
+        for record in &mut template.records {
+            let current_flags = u16::from(record.flags());
+            let new_flags = Flags::from(current_flags | DUPLICATE_FLAG);
+            *record.flags_mut() = new_flags;
+            dedup_metrics.duplicate_reads += 1;
+        }
     }
 }
 
@@ -590,9 +822,16 @@ fn process_position_group(
 
     // Filter templates
     let mut filter_metrics = FilterMetrics::new();
+    let raw_mode = all_templates.first().is_some_and(Template::is_raw_byte_mode);
     let filtered_templates: Vec<Template> = all_templates
         .into_iter()
-        .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
+        .filter(|t| {
+            if raw_mode {
+                filter_template_raw(t, filter_config, &mut filter_metrics)
+            } else {
+                filter_template(t, filter_config, &mut filter_metrics)
+            }
+        })
         .collect();
 
     dedup_metrics.filter_metrics = filter_metrics;
@@ -610,10 +849,17 @@ fn process_position_group(
     let mut templates: Vec<Template> = filtered_templates
         .into_iter()
         .map(|mut t| {
-            for record in &mut t.records {
-                let current_flags = u16::from(record.flags());
-                let new_flags = Flags::from(current_flags & !DUPLICATE_FLAG);
-                *record.flags_mut() = new_flags;
+            if let Some(raw_records) = t.all_raw_records_mut() {
+                for raw in raw_records.iter_mut() {
+                    let flg = bam_fields::flags(raw);
+                    bam_fields::set_flags(raw, flg & !DUPLICATE_FLAG);
+                }
+            } else {
+                for record in &mut t.records {
+                    let current_flags = u16::from(record.flags());
+                    let new_flags = Flags::from(current_flags & !DUPLICATE_FLAG);
+                    *record.flags_mut() = new_flags;
+                }
             }
             t
         })
@@ -666,23 +912,48 @@ fn process_position_group(
     }
 
     // Count reads and check for missing pa tags
+    let pa_tag_bytes: [u8; 2] = *PA_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;
-        for record in &template.records {
-            dedup_metrics.total_reads += 1;
-            let flags = record.flags();
-            let is_secondary = flags.is_secondary();
-            let is_supplementary = flags.is_supplementary();
+        if let Some(raw_records) = template.all_raw_records() {
+            for raw in raw_records {
+                dedup_metrics.total_reads += 1;
+                let flg = bam_fields::flags(raw);
+                let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
+                let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
 
-            if is_secondary {
-                dedup_metrics.secondary_reads += 1;
+                if is_secondary {
+                    dedup_metrics.secondary_reads += 1;
+                }
+                if is_supplementary {
+                    dedup_metrics.supplementary_reads += 1;
+                }
+                if is_secondary || is_supplementary {
+                    let aux = bam_fields::aux_data_slice(raw);
+                    if bam_fields::find_string_tag(aux, &pa_tag_bytes).is_none()
+                        && bam_fields::find_int_tag(aux, &pa_tag_bytes).is_none()
+                    {
+                        dedup_metrics.missing_pa_tag += 1;
+                    }
+                }
             }
-            if is_supplementary {
-                dedup_metrics.supplementary_reads += 1;
-            }
-            // Single PA_TAG lookup for both secondary and supplementary
-            if (is_secondary || is_supplementary) && record.data().get(&PA_TAG).is_none() {
-                dedup_metrics.missing_pa_tag += 1;
+        } else {
+            for record in &template.records {
+                dedup_metrics.total_reads += 1;
+                let flags = record.flags();
+                let is_secondary = flags.is_secondary();
+                let is_supplementary = flags.is_supplementary();
+
+                if is_secondary {
+                    dedup_metrics.secondary_reads += 1;
+                }
+                if is_supplementary {
+                    dedup_metrics.supplementary_reads += 1;
+                }
+                // Single PA_TAG lookup for both secondary and supplementary
+                if (is_secondary || is_supplementary) && record.data().get(&PA_TAG).is_none() {
+                    dedup_metrics.missing_pa_tag += 1;
+                }
             }
         }
     }
@@ -912,9 +1183,9 @@ impl Command for MarkDuplicates {
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 
-        // Wire cell_tag into the pipeline's Decode step so records are grouped by cell barcode.
+        // Enable raw-byte mode: skip noodles decode/encode for ~30% CPU savings
         let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
 
         // Counter for contiguous MI assignment (incremented in the serial serialize step).
         let next_mi_base = std::sync::atomic::AtomicU64::new(0);
@@ -963,20 +1234,68 @@ impl Command for MarkDuplicates {
                 );
                 let assign_tag = Tag::from(assign_tag_bytes);
 
+                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
+                output.reserve(processed.templates.len() * 2 * 400);
                 // Serialize templates
-                for template in processed.templates {
-                    let mi = template.mi;
-                    for mut record in template.records {
-                        // Skip duplicates if remove mode is enabled
-                        if remove_duplicates && (u16::from(record.flags()) & DUPLICATE_FLAG) != 0 {
-                            continue;
+                let raw_mode = processed.templates.first().is_some_and(Template::is_raw_byte_mode);
+                if raw_mode {
+                    let mut scratch = Vec::with_capacity(512);
+                    let mut mi_buf = String::with_capacity(16);
+                    for template in &processed.templates {
+                        let mi = template.mi;
+                        let has_mi = mi.is_assigned();
+                        if has_mi {
+                            mi.write_with_offset(base_mi, &mut mi_buf);
                         }
+                        let raw_records = template.all_raw_records();
+                        debug_assert!(
+                            raw_records.is_some(),
+                            "raw_mode template missing raw_records"
+                        );
+                        if let Some(raw_records) = raw_records {
+                            for raw in raw_records {
+                                // Skip duplicates if remove mode
+                                if remove_duplicates
+                                    && (bam_fields::flags(raw) & DUPLICATE_FLAG) != 0
+                                {
+                                    continue;
+                                }
+                                if has_mi {
+                                    scratch.clear();
+                                    scratch.extend_from_slice(raw);
+                                    bam_fields::update_string_tag(
+                                        &mut scratch,
+                                        &assign_tag_bytes,
+                                        mi_buf.as_bytes(),
+                                    );
+                                    let block_size = scratch.len() as u32;
+                                    output.extend_from_slice(&block_size.to_le_bytes());
+                                    output.extend_from_slice(&scratch);
+                                } else {
+                                    let block_size = raw.len() as u32;
+                                    output.extend_from_slice(&block_size.to_le_bytes());
+                                    output.extend_from_slice(raw);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for template in processed.templates {
+                        let mi = template.mi;
+                        for mut record in template.records {
+                            // Skip duplicates if remove mode is enabled
+                            if remove_duplicates
+                                && (u16::from(record.flags()) & DUPLICATE_FLAG) != 0
+                            {
+                                continue;
+                            }
 
-                        // Set MI tag
-                        set_mi_tag_on_record(&mut record, mi, assign_tag, base_mi);
+                            // Set MI tag
+                            set_mi_tag_on_record(&mut record, mi, assign_tag, base_mi);
 
-                        // Serialize to output buffer
-                        serialize_bam_records_into(&[record], header, output)?;
+                            // Serialize to output buffer
+                            serialize_bam_records_into(&[record], header, output)?;
+                        }
                     }
                 }
 
@@ -2097,5 +2416,406 @@ mod tests {
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
         assert_eq!(output.missing_pa_tag, 2);
+    }
+
+    // ========================================================================
+    // Bounds check panic tests for raw-byte pipeline
+    // ========================================================================
+
+    /// Helper to create a minimal raw BAM record bytes for testing.
+    /// The record has mapq=30 so it passes the Phase 1 MAPQ check.
+    fn make_raw_bam_record_truncated_aux() -> Vec<u8> {
+        // Create a BAM record where aux_data_offset will be beyond the record length
+        let mut rec = vec![0u8; 40]; // Small record
+
+        // Set l_seq to a large value that will make aux_data_offset too big
+        // aux_data_offset = 32 + l_read_name + n_cigar_op*4 + l_seq.div_ceil(2) + l_seq
+        // With l_seq=1000: offset = 32 + 4 + 0 + 500 + 1000 = 1536 >> 40 (record length)
+        rec[8] = 4; // l_read_name = 4 (3 chars + null)
+        rec[9] = 30; // mapq = 30 (must be >= min_mapq to reach Phase 2 tag checks)
+        rec[12..14].copy_from_slice(&0u16.to_le_bytes()); // n_cigar_op = 0
+        rec[16..20].copy_from_slice(&1000u32.to_le_bytes()); // l_seq = 1000 (too large)
+        rec[32..36].copy_from_slice(b"tst\0"); // read name
+
+        rec
+    }
+
+    #[test]
+    fn test_filter_template_raw_truncated_record_no_panic() {
+        // After fix: truncated records no longer panic -- they gracefully return false
+        // (rejected as poor alignment due to missing UMI tag).
+
+        let raw = make_raw_bam_record_truncated_aux();
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 20,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+
+        // Should not panic; should reject gracefully due to missing UMI
+        let result = filter_template_raw(&template, &config, &mut metrics);
+        assert!(!result, "Truncated record should be rejected");
+        assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    // Test that the raw-byte mode MQ tag issue actually occurs in filter_template_raw
+    #[test]
+    fn test_filter_template_raw_mq_tag_type_mismatch_bypasses_filter() {
+        // Build a BAM record with exact sizes so aux data is contiguous.
+        // Header(32) + name(4) + cigar(4) + seq(2) + qual(4) = 46 bytes before aux
+        let mut rec = vec![0u8; 46];
+
+        rec[0..4].copy_from_slice(&0i32.to_le_bytes()); // ref_id = 0 (mapped)
+        rec[4..8].copy_from_slice(&100i32.to_le_bytes()); // pos = 100
+        rec[8] = 4; // l_read_name = 4
+        rec[9] = 30; // mapq = 30 (passes the direct MAPQ check)
+        rec[12..14].copy_from_slice(&1u16.to_le_bytes()); // n_cigar_op = 1
+        // flags: PAIRED but NOT MATE_UNMAPPED (so mate MQ check triggers)
+        rec[14..16].copy_from_slice(&(fgumi_lib::sort::bam_fields::flags::PAIRED).to_le_bytes());
+        rec[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
+        rec[32..36].copy_from_slice(b"tst\0"); // read name
+        rec[36..40].copy_from_slice(&(4u32 << 4).to_le_bytes()); // CIGAR: 4M
+
+        // Aux data starts immediately at byte 46.
+        // Add RX tag first (needed to pass UMI check)
+        rec.extend_from_slice(b"RXZACGTACGT\x00"); // RX:Z:ACGTACGT
+
+        // Add MQ tag as signed byte with low value (should trigger filtering)
+        rec.extend_from_slice(b"MQc"); // tag=MQ, type=c (signed byte)
+        rec.push(10); // MAPQ = 10 (< min_mapq of 20)
+
+        let template = Template::from_raw_records(vec![rec]).unwrap();
+
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 20,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+
+        // After fix: filter_template_raw now uses find_int_tag which handles all integer types.
+        // The template should be REJECTED because mate MAPQ=10 < min_mapq=20.
+        let result = filter_template_raw(&template, &config, &mut metrics);
+
+        assert!(!result, "Template with low mate MAPQ should be rejected");
+        assert_eq!(metrics.accepted_templates, 0);
+        assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    // ========================================================================
+    // Raw BAM record builder helper for dedup tests
+    // ========================================================================
+
+    /// Build a raw BAM record with specified qualities and UMI for testing.
+    fn make_raw_bam_for_dedup(
+        name: &[u8],
+        flag: u16,
+        mapq: u8,
+        seq_len: usize,
+        qualities: &[u8],
+        umi: &[u8],
+    ) -> Vec<u8> {
+        use fgumi_lib::sort::bam_fields;
+
+        let l_read_name = (name.len() + 1) as u8;
+        let cigar_ops: &[u32] = if (flag & bam_fields::flags::UNMAPPED) == 0 {
+            &[(seq_len as u32) << 4] // NM cigar
+        } else {
+            &[]
+        };
+        let n_cigar_op = cigar_ops.len() as u16;
+        let seq_bytes = seq_len.div_ceil(2);
+        let total = 32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len;
+        let mut buf = vec![0u8; total];
+
+        buf[0..4].copy_from_slice(&0i32.to_le_bytes()); // tid
+        buf[4..8].copy_from_slice(&100i32.to_le_bytes()); // pos
+        buf[8] = l_read_name;
+        buf[9] = mapq;
+        buf[12..14].copy_from_slice(&n_cigar_op.to_le_bytes());
+        buf[14..16].copy_from_slice(&flag.to_le_bytes());
+        buf[16..20].copy_from_slice(&(seq_len as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&(-1i32).to_le_bytes()); // mate_tid
+        buf[24..28].copy_from_slice(&(-1i32).to_le_bytes()); // mate_pos
+
+        let name_start = 32;
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        buf[name_start + name.len()] = 0;
+
+        let cigar_start = name_start + l_read_name as usize;
+        for (i, &op) in cigar_ops.iter().enumerate() {
+            let off = cigar_start + i * 4;
+            buf[off..off + 4].copy_from_slice(&op.to_le_bytes());
+        }
+
+        // Write quality scores
+        let qo = bam_fields::qual_offset(&buf);
+        let copy_len = std::cmp::min(qualities.len(), seq_len);
+        buf[qo..qo + copy_len].copy_from_slice(&qualities[..copy_len]);
+
+        // Append UMI tag: RX:Z:<umi>\0
+        buf.extend_from_slice(b"RXZ");
+        buf.extend_from_slice(umi);
+        buf.push(0);
+
+        buf
+    }
+
+    // ========================================================================
+    // score_template_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_score_template_raw_basic() {
+        // 4 bases with quality 20 each, capped at 15 → 4 * 15 = 60
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            30,
+            4,
+            &[20, 20, 20, 20],
+            b"ACGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        assert_eq!(score_template_raw(&template), 60);
+    }
+
+    #[test]
+    fn test_score_template_raw_low_quality() {
+        // 4 bases with quality 10 each, no capping → 4 * 10 = 40
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            30,
+            4,
+            &[10, 10, 10, 10],
+            b"ACGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        assert_eq!(score_template_raw(&template), 40);
+    }
+
+    #[test]
+    fn test_score_template_raw_paired() {
+        // Paired: R1 (4 bases * 15) + R2 (4 bases * 10) = 60 + 40 = 100
+        let r1 = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            30,
+            4,
+            &[20, 20, 20, 20],
+            b"ACGT",
+        );
+        let r2 = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::LAST_SEGMENT,
+            30,
+            4,
+            &[10, 10, 10, 10],
+            b"ACGT",
+        );
+        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        assert_eq!(score_template_raw(&template), 100);
+    }
+
+    #[test]
+    fn test_score_template_raw_matches_recordbuf() {
+        // Verify raw scoring matches RecordBuf scoring
+        let qualities = &[20, 15, 10, 5];
+        let template_rb = create_test_template("q1", qualities);
+        let template_raw = {
+            let raw = make_raw_bam_for_dedup(
+                b"q01",
+                fgumi_lib::sort::bam_fields::flags::PAIRED
+                    | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+                30,
+                4,
+                qualities,
+                b"ACGT",
+            );
+            Template::from_raw_records(vec![raw]).unwrap()
+        };
+        assert_eq!(score_template(&template_rb), score_template(&template_raw));
+    }
+
+    // ========================================================================
+    // filter_template_raw passing/rejecting tests
+    // ========================================================================
+
+    #[test]
+    fn test_filter_template_raw_accepts_valid() {
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
+                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            30,
+            4,
+            &[20, 20, 20, 20],
+            b"ACGTACGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 20,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(filter_template_raw(&template, &config, &mut metrics));
+        assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    #[test]
+    fn test_filter_template_raw_rejects_low_mapq() {
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
+                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            10, // below threshold
+            4,
+            &[20, 20, 20, 20],
+            b"ACGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 20,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    #[test]
+    fn test_filter_template_raw_rejects_qc_fail() {
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
+                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED
+                | fgumi_lib::sort::bam_fields::flags::QC_FAIL,
+            30,
+            4,
+            &[20, 20, 20, 20],
+            b"ACGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 0,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_non_pf, 1);
+    }
+
+    #[test]
+    fn test_filter_template_raw_rejects_umi_with_n() {
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
+                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            30,
+            4,
+            &[20, 20, 20, 20],
+            b"ANGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 0,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_ns_in_umi, 1);
+    }
+
+    #[test]
+    fn test_filter_template_raw_rejects_short_umi() {
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::PAIRED
+                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
+                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            30,
+            4,
+            &[20, 20, 20, 20],
+            b"AC",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 0,
+            include_non_pf: false,
+            min_umi_length: Some(6),
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_umi_too_short, 1);
+    }
+
+    #[test]
+    fn test_filter_template_raw_rejects_unmapped() {
+        let raw = make_raw_bam_for_dedup(
+            b"rea",
+            fgumi_lib::sort::bam_fields::flags::UNMAPPED
+                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            0,
+            4,
+            &[20, 20, 20, 20],
+            b"ACGT",
+        );
+        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let config = DedupFilterConfig {
+            umi_tag: [b'R', b'X'],
+            min_mapq: 0,
+            include_non_pf: false,
+            min_umi_length: None,
+        };
+        let mut metrics = FilterMetrics::new();
+        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert_eq!(metrics.discarded_poor_alignment, 1);
+    }
+
+    // ========================================================================
+    // Duplicate flag manipulation on raw bytes
+    // ========================================================================
+
+    #[test]
+    fn test_set_duplicate_flag_on_raw_record() {
+        use fgumi_lib::sort::bam_fields;
+
+        let raw =
+            make_raw_bam_for_dedup(b"rea", bam_fields::flags::PAIRED, 30, 4, &[20; 4], b"ACGT");
+        let mut rec = raw;
+        let orig_flags = bam_fields::flags(&rec);
+        assert_eq!(orig_flags & bam_fields::flags::DUPLICATE, 0);
+
+        // Set duplicate flag
+        bam_fields::set_flags(&mut rec, orig_flags | bam_fields::flags::DUPLICATE);
+        assert_ne!(bam_fields::flags(&rec) & bam_fields::flags::DUPLICATE, 0);
+
+        // Clear duplicate flag
+        let flags_with_dup = bam_fields::flags(&rec);
+        bam_fields::set_flags(&mut rec, flags_with_dup & !bam_fields::flags::DUPLICATE);
+        assert_eq!(bam_fields::flags(&rec) & bam_fields::flags::DUPLICATE, 0);
     }
 }
