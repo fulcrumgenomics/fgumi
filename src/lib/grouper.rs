@@ -207,45 +207,9 @@ impl Grouper for TemplateGrouper {
     }
 }
 
-// ============================================================================
-// PositionGrouper
-// ============================================================================
-
 use noodles::sam::alignment::record::data::field::Tag;
 
-use crate::read_info::LibraryLookup;
 use crate::unified_pipeline::GroupKey;
-
-/// A position group containing all templates at the same genomic position.
-#[derive(Debug)]
-pub struct PositionGroup {
-    /// The position key for this group (pre-computed from first record).
-    pub group_key: GroupKey,
-    /// All templates at this position.
-    pub templates: Vec<Template>,
-    /// Pre-assigned MI base offset for global uniqueness.
-    /// Each position group gets a unique range of MIs: `[base_mi, base_mi + num_umis)`.
-    pub base_mi: u64,
-}
-
-impl BatchWeight for PositionGroup {
-    /// Returns the number of templates in this group.
-    fn batch_weight(&self) -> usize {
-        self.templates.len()
-    }
-}
-
-impl MemoryEstimate for PositionGroup {
-    fn estimate_heap_size(&self) -> usize {
-        // group_key: GroupKey is a Copy type (no heap allocation)
-        // templates: Vec<Template>
-        let templates_size: usize =
-            self.templates.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        let templates_vec_overhead = self.templates.capacity() * std::mem::size_of::<Template>();
-        // base_mi: u64 is inline
-        templates_size + templates_vec_overhead
-    }
-}
 
 impl MemoryEstimate for ProcessedPositionGroup {
     fn estimate_heap_size(&self) -> usize {
@@ -304,7 +268,7 @@ impl FilterMetrics {
 #[derive(Debug)]
 pub struct ProcessedPositionGroup {
     /// Templates with MI tags assigned, sorted by MI then name.
-    /// `Template.mi` contains local IDs (0, 1, 2, ...) - add `base_mi` for global IDs.
+    /// `Template.mi` contains local IDs (0, 1, 2, ...) - the serialize step adds a global offset.
     pub templates: Vec<Template>,
     /// Family size counts for this position group.
     pub family_sizes: ahash::AHashMap<usize, u64>,
@@ -312,309 +276,278 @@ pub struct ProcessedPositionGroup {
     pub filter_metrics: FilterMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
-    /// Base MI offset for this position group (for global uniqueness).
-    pub base_mi: u64,
 }
 
-/// Configuration for position grouping.
-#[derive(Clone)]
-pub struct PositionGrouperConfig {
-    /// Cell barcode tag (e.g., "CB").
-    pub cell_tag: Tag,
-    /// Library lookup from read group to library.
-    pub library_lookup: LibraryLookup,
-    /// Whether to include secondary and supplementary reads in templates.
-    /// When true, secondary/supplementary reads are included in the template
-    /// that contains their corresponding primary read. Requires the input to be
-    /// template-coordinate sorted with `pa` tags on secondary/supplementary reads.
-    /// Default: false (secondary/supplementary reads are skipped).
-    pub include_secondary_supplementary: bool,
-}
+// ============================================================================
+// RawPositionGroup + RecordPositionGrouper
+// ============================================================================
 
-impl PositionGrouperConfig {
-    /// Creates a new configuration.
-    #[must_use]
-    pub fn new(cell_tag: Tag, library_lookup: LibraryLookup) -> Self {
-        Self { cell_tag, library_lookup, include_secondary_supplementary: false }
-    }
+/// Position key tuple returned by [`GroupKey::position_key`].
+type PositionKeyTuple = (i32, i32, u8, i32, i32, u8, u16, u64);
 
-    /// Creates a new configuration that includes secondary/supplementary reads.
-    #[must_use]
-    pub fn with_secondary_supplementary(cell_tag: Tag, library_lookup: LibraryLookup) -> Self {
-        Self { cell_tag, library_lookup, include_secondary_supplementary: true }
-    }
-}
-
-/// A grouper that groups templates by genomic position.
+/// A position group containing decoded records at the same genomic position.
 ///
-/// Used by the `group` command to collect all templates at the same position
-/// for UMI assignment. Expects input sorted by template-coordinate (mates adjacent,
-/// sorted by position).
+/// Contains raw [`DecodedRecord`]s rather than built [`Template`]s. Template
+/// construction is deferred to the parallel Process step via
+/// [`build_templates_from_records`].
 ///
-/// Groups records by query name into Templates, then groups Templates by
-/// position (using pre-computed `GroupKey`) into position groups.
-pub struct PositionGrouper {
-    /// Configuration for grouping.
-    config: PositionGrouperConfig,
-    /// Current template name hash being accumulated.
-    current_name_hash: Option<u64>,
-    /// Records for current template.
-    current_template_records: Vec<RecordBuf>,
-    /// `GroupKeys` for all records in the current template.
-    current_template_keys: Vec<GroupKey>,
-    /// Current position group key being accumulated.
-    current_position_key: Option<GroupKey>,
-    /// Templates at current position.
-    current_templates: Vec<Template>,
-    /// Next available MI base offset for global uniqueness.
-    /// Incremented by template count when emitting each position group.
-    next_mi_base: u64,
+/// Used by [`RecordPositionGrouper`] which requires MC tags so that each record's
+/// pre-computed [`GroupKey`] contains the complete paired position.
+#[derive(Debug)]
+pub struct RawPositionGroup {
+    /// The position key for this group (from the first record's `GroupKey`).
+    pub group_key: GroupKey,
+    /// Raw decoded records at this position (not yet grouped into Templates).
+    pub records: Vec<DecodedRecord>,
 }
 
-impl PositionGrouper {
-    /// Create a new position grouper with the specified configuration.
+impl BatchWeight for RawPositionGroup {
+    fn batch_weight(&self) -> usize {
+        // Estimate ~2 records per template for paired-end data
+        self.records.len().div_ceil(2)
+    }
+}
+
+impl MemoryEstimate for RawPositionGroup {
+    fn estimate_heap_size(&self) -> usize {
+        let records_size: usize = self.records.iter().map(MemoryEstimate::estimate_heap_size).sum();
+        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<DecodedRecord>();
+        records_size + records_vec_overhead
+    }
+}
+
+/// A lightweight position grouper that compares per-record [`GroupKey::position_key`]
+/// values to detect group boundaries.
+///
+/// Does **not** build Templates or combine keys — it accumulates raw
+/// [`DecodedRecord`]s and emits [`RawPositionGroup`]s. Template construction
+/// is deferred to the parallel Process step via [`build_templates_from_records`].
+///
+/// **Requirement:** Paired-end reads must have MC tags so that [`compute_group_key`]
+/// produces complete [`GroupKey::paired`] values. Without MC tags, R1 and R2 would
+/// get different `position_key()` values and be incorrectly split.
+///
+/// By default, secondary/supplementary reads are skipped (they have UNKNOWN
+/// position keys). Use [`with_secondary_supplementary`](Self::with_secondary_supplementary)
+/// to include them — they are coalesced by `name_hash` into the group of their
+/// adjacent primary read (requires template-coordinate sorted input).
+///
+/// [`compute_group_key`]: crate::read_info::compute_group_key
+pub struct RecordPositionGrouper {
+    /// Current position key being accumulated (tuple for fast comparison).
+    current_position_key: Option<PositionKeyTuple>,
+    /// Full `GroupKey` for emitting with the group.
+    current_group_key: Option<GroupKey>,
+    /// Records at the current position.
+    current_records: Vec<DecodedRecord>,
+    /// Whether MC tags have been validated on paired records.
+    mc_validated: bool,
+    /// Whether to include secondary and supplementary reads in groups.
+    /// When true, secondary/supplementary reads (which have UNKNOWN position keys)
+    /// are kept and coalesced by `name_hash` into the group of their primary read.
+    /// When false (default), they are skipped.
+    include_secondary_supplementary: bool,
+}
+
+impl RecordPositionGrouper {
+    /// Create a new record-level position grouper.
+    ///
+    /// Secondary/supplementary reads are skipped by default.
     #[must_use]
-    pub fn new(config: PositionGrouperConfig) -> Self {
+    pub fn new() -> Self {
         Self {
-            config,
-            current_name_hash: None,
-            current_template_records: Vec::new(),
-            current_template_keys: Vec::new(),
             current_position_key: None,
-            current_templates: Vec::new(),
-            next_mi_base: 0,
+            current_group_key: None,
+            current_records: Vec::new(),
+            mc_validated: false,
+            include_secondary_supplementary: false,
         }
     }
 
-    /// Combine multiple `GroupKeys` from a template's records into a single position key.
+    /// Create a record-level position grouper that includes secondary/supplementary reads.
     ///
-    /// For paired-end reads without MC tag, each record only has its own position.
-    /// We combine them to get the full position info.
-    ///
-    /// Secondary and supplementary reads have default UNKNOWN position values in their keys
-    /// (because `compute_group_key` skips them). We filter these out before combining
-    /// to avoid corrupting the template's position key.
-    ///
-    /// This implementation avoids allocation by finding valid keys through iteration
-    /// rather than collecting into a Vec.
-    fn combine_keys(keys: &[GroupKey]) -> GroupKey {
-        if keys.is_empty() {
-            return GroupKey::default();
-        }
-
-        // Fast path: single key (very common case)
-        if keys.len() == 1 {
-            return if keys[0].ref_id1 == GroupKey::UNKNOWN_REF {
-                // Preserve library/cell metadata to avoid merging across libraries
-                let k = keys[0];
-                GroupKey {
-                    library_idx: k.library_idx,
-                    cell_hash: k.cell_hash,
-                    name_hash: k.name_hash,
-                    ..GroupKey::default()
-                }
-            } else {
-                keys[0]
-            };
-        }
-
-        // Find first two valid keys without allocation.
-        // Valid keys have ref_id1 != UNKNOWN_REF (i.e., not secondary/supplementary).
-        let mut first: Option<&GroupKey> = None;
-        let mut second: Option<&GroupKey> = None;
-
-        for key in keys {
-            if key.ref_id1 != GroupKey::UNKNOWN_REF {
-                if first.is_none() {
-                    // Check if this key has valid mate info - if so, use it directly
-                    if key.ref_id2 != GroupKey::UNKNOWN_REF {
-                        return *key;
-                    }
-                    first = Some(key);
-                } else if second.is_none() {
-                    second = Some(key);
-                    break; // We have two valid keys, no need to continue
-                }
-            }
-        }
-
-        // Handle cases based on how many valid keys we found
-        match (first, second) {
-            (None, _) => {
-                // No valid keys - preserve library/cell/name metadata for template grouping
-                let k = keys[0];
-                GroupKey {
-                    library_idx: k.library_idx,
-                    cell_hash: k.cell_hash,
-                    name_hash: k.name_hash,
-                    ..GroupKey::default()
-                }
-            }
-            (Some(f), None) => {
-                // Single valid key
-                *f
-            }
-            (Some(f), Some(s)) => {
-                // Two valid keys without mate info - combine their positions
-                GroupKey::paired(
-                    f.ref_id1,
-                    f.pos1,
-                    f.strand1,
-                    s.ref_id1,
-                    s.pos1,
-                    s.strand1,
-                    f.library_idx,
-                    f.cell_hash,
-                    f.name_hash,
-                )
-            }
-        }
+    /// Secondary/supplementary reads have UNKNOWN position keys and are coalesced
+    /// by `name_hash` into the group of their adjacent primary read.
+    #[must_use]
+    pub fn with_secondary_supplementary() -> Self {
+        Self { include_secondary_supplementary: true, ..Self::new() }
     }
 
-    /// Build a Template from accumulated records.
-    fn build_current_template(&mut self) -> io::Result<Option<(Template, GroupKey)>> {
-        if self.current_template_records.is_empty() {
+    /// Validate that a paired primary record has an MC tag.
+    ///
+    /// Skips validation for records that are unmapped or whose mates are unmapped,
+    /// since unmapped reads have no CIGAR to report in an MC tag.
+    fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
+        if self.mc_validated {
+            return Ok(());
+        }
+        let flags = decoded.record.flags();
+        if flags.is_segmented()
+            && !flags.is_secondary()
+            && !flags.is_supplementary()
+            && !flags.is_unmapped()
+            && !flags.is_mate_unmapped()
+        {
+            let mc_tag = Tag::from([b'M', b'C']);
+            if decoded.record.data().get(&mc_tag).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RecordPositionGrouper requires MC tags on paired-end reads. \
+                     Run `fgumi zipper` to add MC tags before `fgumi group`.",
+                ));
+            }
+            self.mc_validated = true;
+        }
+        Ok(())
+    }
+
+    /// Process a single decoded record, potentially emitting a completed group.
+    fn process_record(&mut self, decoded: DecodedRecord) -> io::Result<Option<RawPositionGroup>> {
+        // Skip secondary and supplementary reads (they have UNKNOWN ref_id1)
+        // unless configured to include them (for dedup, which needs them in templates).
+        if decoded.key.ref_id1 == GroupKey::UNKNOWN_REF && !self.include_secondary_supplementary {
             return Ok(None);
         }
 
-        let records = std::mem::take(&mut self.current_template_records);
-        let keys = std::mem::take(&mut self.current_template_keys);
-        self.current_name_hash = None;
+        // Validate MC tag on first paired primary record
+        self.validate_mc_tag(&decoded)?;
 
-        let combined_key = Self::combine_keys(&keys);
+        let record_pos_key = decoded.key.position_key();
 
-        Template::from_records(records)
-            .map(|t| Some((t, combined_key)))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    /// Process a single record, potentially emitting completed groups.
-    fn process_record(&mut self, decoded: DecodedRecord) -> io::Result<Vec<PositionGroup>> {
-        let record = decoded.record;
-        let key = decoded.key;
-
-        // Skip secondary and supplementary reads unless configured to include them
-        let flags = record.flags();
-        if !self.config.include_secondary_supplementary
-            && (flags.is_secondary() || flags.is_supplementary())
-        {
-            return Ok(Vec::new());
-        }
-
-        let mut completed_groups = Vec::new();
-        let name_hash = key.name_hash;
-
-        // Check if this record belongs to the current template (using name hash)
-        let same_template = self.current_name_hash.is_none_or(|h| h == name_hash);
-
-        if same_template || self.current_template_records.is_empty() {
-            // Add to current template
-            if self.current_name_hash.is_none() {
-                self.current_name_hash = Some(name_hash);
+        match self.current_position_key {
+            Some(current_pos) if current_pos == record_pos_key => {
+                // Same position — accumulate
+                self.current_records.push(decoded);
+                Ok(None)
             }
-            self.current_template_keys.push(key);
-            self.current_template_records.push(record);
-        } else {
-            // New template - finish current one
-            if let Some((template, template_key)) = self.build_current_template()? {
-                // Compare position keys (ignoring name_hash)
-                let template_pos_key = template_key.position_key();
-
-                if let Some(ref current_key) = self.current_position_key {
-                    if current_key.position_key() == template_pos_key {
-                        // Same position - add to current group
-                        self.current_templates.push(template);
-                    } else {
-                        // New position - emit current group
-                        let finished_templates = std::mem::take(&mut self.current_templates);
-                        let finished_key =
-                            self.current_position_key.take().expect("inside Some branch");
-
-                        // Assign MI base and reserve range for this group
-                        let base_mi = self.next_mi_base;
-                        self.next_mi_base += finished_templates.len() as u64;
-
-                        completed_groups.push(PositionGroup {
-                            group_key: finished_key,
-                            templates: finished_templates,
-                            base_mi,
-                        });
-
-                        // Start new position group
-                        self.current_position_key = Some(template_key);
-                        self.current_templates.push(template);
-                    }
-                } else {
-                    // First template - start new position group
-                    self.current_position_key = Some(template_key);
-                    self.current_templates.push(template);
-                }
+            Some(_)
+                if self
+                    .current_records
+                    .last()
+                    .is_some_and(|last| last.key.name_hash == decoded.key.name_hash) =>
+            {
+                // Different position but same template (name_hash match with previous
+                // record). This happens for paired reads with unmapped mates in
+                // template-coordinate sorted input: R1 is mapped at some position while
+                // R2 is unmapped (position -1:0), but they're adjacent by QNAME.
+                // Keep them in the same group so they form a complete template.
+                self.current_records.push(decoded);
+                Ok(None)
             }
+            Some(_) => {
+                // Different position — emit current group, start new one
+                let finished_records = std::mem::take(&mut self.current_records);
+                let finished_key = self
+                    .current_group_key
+                    .take()
+                    .expect("current_group_key set when current_position_key is set");
 
-            // Start new template
-            self.current_name_hash = Some(name_hash);
-            self.current_template_keys.push(key);
-            self.current_template_records.push(record);
+                let group = RawPositionGroup { group_key: finished_key, records: finished_records };
+
+                // Start new position group
+                self.current_position_key = Some(record_pos_key);
+                self.current_group_key = Some(decoded.key);
+                self.current_records.push(decoded);
+
+                Ok(Some(group))
+            }
+            None => {
+                // First record
+                self.current_position_key = Some(record_pos_key);
+                self.current_group_key = Some(decoded.key);
+                self.current_records.push(decoded);
+                Ok(None)
+            }
         }
-
-        Ok(completed_groups)
     }
 }
 
-impl Grouper for PositionGrouper {
-    type Group = PositionGroup;
+impl Default for RecordPositionGrouper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Grouper for RecordPositionGrouper {
+    type Group = RawPositionGroup;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
-        // Process each record using pre-computed GroupKey for fast comparison
         let mut completed_groups = Vec::new();
         for decoded in records {
-            let groups = self.process_record(decoded)?;
-            completed_groups.extend(groups);
+            if let Some(group) = self.process_record(decoded)? {
+                completed_groups.push(group);
+            }
         }
-
         Ok(completed_groups)
     }
 
     fn finish(&mut self) -> io::Result<Option<Self::Group>> {
-        // Build any remaining template
-        if let Some((template, template_key)) = self.build_current_template()? {
-            let template_pos_key = template_key.position_key();
-
-            if let Some(ref current_key) = self.current_position_key {
-                if current_key.position_key() == template_pos_key {
-                    // Same position - add to current group
-                    self.current_templates.push(template);
-                } else {
-                    // Different position - this shouldn't happen at EOF, but handle it
-                    // Just add to current group as a fallback
-                    self.current_templates.push(template);
-                }
-            } else {
-                // First template
-                self.current_position_key = Some(template_key);
-                self.current_templates.push(template);
+        if !self.current_records.is_empty() {
+            debug_assert!(
+                self.current_group_key.is_some(),
+                "RecordPositionGrouper has {} buffered records but no group key",
+                self.current_records.len()
+            );
+            if let Some(key) = self.current_group_key.take() {
+                let records = std::mem::take(&mut self.current_records);
+                self.current_position_key = None;
+                return Ok(Some(RawPositionGroup { group_key: key, records }));
             }
         }
-
-        // Emit final position group
-        if !self.current_templates.is_empty() {
-            if let Some(key) = self.current_position_key.take() {
-                let templates = std::mem::take(&mut self.current_templates);
-
-                // Assign MI base and reserve range for this group
-                let base_mi = self.next_mi_base;
-                self.next_mi_base += templates.len() as u64;
-
-                return Ok(Some(PositionGroup { group_key: key, templates, base_mi }));
-            }
-        }
-
         Ok(None)
     }
 
     fn has_pending(&self) -> bool {
-        !self.current_template_records.is_empty() || !self.current_templates.is_empty()
+        !self.current_records.is_empty()
     }
+}
+
+/// Build [`Template`]s from raw decoded records.
+///
+/// Groups records by `name_hash` (QNAME) and builds a [`Template`] from each group.
+/// Records must be grouped by QNAME (guaranteed by template-coordinate sort order).
+///
+/// Designed to run in the parallel Process step after [`RecordPositionGrouper`]
+/// emits [`RawPositionGroup`]s.
+pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut templates = Vec::new();
+    let mut current_name_hash: Option<u64> = None;
+    let mut current_records: Vec<RecordBuf> = Vec::new();
+
+    for decoded in records {
+        let name_hash = decoded.key.name_hash;
+
+        match current_name_hash {
+            Some(h) if h == name_hash => {
+                current_records.push(decoded.record);
+            }
+            Some(_) => {
+                // Different template — flush current
+                let template = Template::from_records(std::mem::take(&mut current_records))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                templates.push(template);
+                current_name_hash = Some(name_hash);
+                current_records.push(decoded.record);
+            }
+            None => {
+                current_name_hash = Some(name_hash);
+                current_records.push(decoded.record);
+            }
+        }
+    }
+
+    // Flush last template
+    if !current_records.is_empty() {
+        let template = Template::from_records(current_records)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        templates.push(template);
+    }
+
+    Ok(templates)
 }
 
 // ============================================================================
@@ -1117,102 +1050,474 @@ mod tests {
     }
 
     // ========================================================================
-    // combine_keys tests
+    // RecordPositionGrouper tests
+    // ========================================================================
+
+    use crate::sam::builder::RecordBuilder;
+
+    /// Helper: create a `DecodedRecord` with the given `GroupKey` and flags/tags.
+    fn make_decoded(
+        key: GroupKey,
+        paired: bool,
+        first_segment: bool,
+        mc: Option<&str>,
+    ) -> DecodedRecord {
+        let mut builder = RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .cigar("4M")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .paired(paired);
+        if first_segment {
+            builder = builder.first_segment(true);
+        }
+        if let Some(mc_val) = mc {
+            builder = builder.tag("MC", mc_val);
+        }
+        DecodedRecord::new(builder.build(), key)
+    }
+
+    /// Helper: create a secondary/supplementary `DecodedRecord` with UNKNOWN key.
+    fn make_secondary_decoded(name_hash: u64) -> DecodedRecord {
+        let key = GroupKey { name_hash, ..GroupKey::default() };
+        let record = RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .secondary(true)
+            .build();
+        DecodedRecord::new(record, key)
+    }
+
+    #[test]
+    fn test_record_position_grouper_empty() {
+        let mut grouper = RecordPositionGrouper::new();
+        assert!(!grouper.has_pending());
+        let result = grouper.finish().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_record_position_grouper_single_unpaired_record() {
+        let mut grouper = RecordPositionGrouper::new();
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let decoded = make_decoded(key, false, false, None);
+
+        let groups = grouper.add_records(vec![decoded]).unwrap();
+        assert!(groups.is_empty()); // Not emitted yet
+        assert!(grouper.has_pending());
+
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.records.len(), 1);
+        assert_eq!(final_group.group_key.ref_id1, 0);
+        assert_eq!(final_group.group_key.pos1, 100);
+    }
+
+    #[test]
+    fn test_record_position_grouper_same_position_multiple_records() {
+        let mut grouper = RecordPositionGrouper::new();
+        let key1 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 11111);
+        let key2 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 22222);
+        let key3 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 33333);
+
+        let records = vec![
+            make_decoded(key1, true, true, Some("4M")),
+            make_decoded(key2, true, true, Some("4M")),
+            make_decoded(key3, true, true, Some("4M")),
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        assert!(groups.is_empty()); // All same position — not emitted yet
+
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.records.len(), 3);
+    }
+
+    #[test]
+    fn test_record_position_grouper_different_positions() {
+        let mut grouper = RecordPositionGrouper::new();
+        let key_pos1 = GroupKey::single(0, 100, 0, 0, 0, 11111);
+        let key_pos2 = GroupKey::single(0, 200, 0, 0, 0, 22222);
+        let key_pos3 = GroupKey::single(0, 300, 0, 0, 0, 33333);
+
+        let records = vec![
+            make_decoded(key_pos1, false, false, None),
+            make_decoded(key_pos2, false, false, None),
+            make_decoded(key_pos3, false, false, None),
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        // First two positions emitted when boundary detected
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_key.pos1, 100);
+        assert_eq!(groups[0].records.len(), 1);
+        assert_eq!(groups[1].group_key.pos1, 200);
+        assert_eq!(groups[1].records.len(), 1);
+
+        // Third position still pending
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.group_key.pos1, 300);
+    }
+
+    #[test]
+    fn test_record_position_grouper_skips_secondary() {
+        let mut grouper = RecordPositionGrouper::new();
+        let primary_key = GroupKey::single(0, 100, 0, 0, 0, 11111);
+
+        let records = vec![
+            make_decoded(primary_key, false, false, None),
+            make_secondary_decoded(11111), // Should be skipped
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        assert!(groups.is_empty());
+
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.records.len(), 1); // Only primary kept
+    }
+
+    #[test]
+    fn test_record_position_grouper_paired_same_position_key() {
+        // R1 and R2 with MC tags produce identical position_key after normalization
+        let mut grouper = RecordPositionGrouper::new();
+        // Both R1 and R2 normalize to the same position key
+        let r1_key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        let r2_key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        // position_key() should be identical for r1 and r2
+        assert_eq!(r1_key.position_key(), r2_key.position_key());
+
+        let records = vec![
+            make_decoded(r1_key, true, true, Some("4M")),
+            make_decoded(r2_key, true, false, Some("4M")),
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        assert!(groups.is_empty()); // Same position — all in one group
+
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.records.len(), 2);
+    }
+
+    #[test]
+    fn test_record_position_grouper_groups_records_by_position() {
+        let mut grouper = RecordPositionGrouper::new();
+        // Group 1: 3 records at position 100
+        let key1 = GroupKey::single(0, 100, 0, 0, 0, 11111);
+        let key2 = GroupKey::single(0, 100, 0, 0, 0, 22222);
+        let key3 = GroupKey::single(0, 100, 0, 0, 0, 33333);
+        // Group 2: 2 records at position 200
+        let key4 = GroupKey::single(0, 200, 0, 0, 0, 44444);
+        let key5 = GroupKey::single(0, 200, 0, 0, 0, 55555);
+        // Group 3: 1 record at position 300
+        let key6 = GroupKey::single(0, 300, 0, 0, 0, 66666);
+
+        let records = vec![
+            make_decoded(key1, false, false, None),
+            make_decoded(key2, false, false, None),
+            make_decoded(key3, false, false, None),
+            make_decoded(key4, false, false, None),
+            make_decoded(key5, false, false, None),
+            make_decoded(key6, false, false, None),
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].records.len(), 3);
+        assert_eq!(groups[1].records.len(), 2);
+
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.records.len(), 1);
+    }
+
+    #[test]
+    fn test_record_position_grouper_coalesces_unmapped_mate_by_name_hash() {
+        // In template-coordinate sort, a mapped R1 and its unmapped R2 are adjacent.
+        // R1 gets GroupKey::single(5, 100, ...) and R2 gets GroupKey::single(-1, 0, ...).
+        // They should stay in the same group because they share name_hash.
+        let mut grouper = RecordPositionGrouper::new();
+        let name_hash = 12345_u64;
+
+        // R1: mapped at chr5:100, mate unmapped — no MC tag
+        let r1_key = GroupKey::single(5, 100, 0, 0, 0, name_hash);
+        let r1 = {
+            let record = RecordBuilder::new()
+                .name("read1")
+                .sequence("ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .cigar("4M")
+                .reference_sequence_id(5)
+                .alignment_start(100)
+                .paired(true)
+                .first_segment(true)
+                .mate_unmapped(true)
+                .build();
+            DecodedRecord::new(record, r1_key)
+        };
+
+        // R2: unmapped, mate mapped — different position key
+        let r2_key = GroupKey::single(-1, 0, 0, 0, 0, name_hash);
+        let r2 = {
+            let record = RecordBuilder::new()
+                .name("read1")
+                .sequence("TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .paired(true)
+                .first_segment(false)
+                .unmapped(true)
+                .build();
+            DecodedRecord::new(record, r2_key)
+        };
+
+        // Verify position keys differ (this is the bug scenario)
+        assert_ne!(r1_key.position_key(), r2_key.position_key());
+
+        let groups = grouper.add_records(vec![r1, r2]).unwrap();
+        // Both should be in the same group — no emission yet
+        assert!(groups.is_empty());
+
+        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        assert_eq!(final_group.records.len(), 2, "R1 and R2 should be in the same group");
+        assert_eq!(final_group.group_key.ref_id1, 5, "Group key should use R1's position");
+    }
+
+    #[test]
+    fn test_record_position_grouper_does_not_coalesce_different_name_hash() {
+        // Records with different name_hashes at different positions should NOT coalesce.
+        let mut grouper = RecordPositionGrouper::new();
+
+        let r1_key = GroupKey::single(0, 100, 0, 0, 0, 11111);
+        let r2_key = GroupKey::single(0, 200, 0, 0, 0, 22222);
+
+        let records = vec![
+            make_decoded(r1_key, false, false, None),
+            make_decoded(r2_key, false, false, None),
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        // Position boundary with different name_hash → group emitted
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].records.len(), 1);
+    }
+
+    #[test]
+    fn test_record_position_grouper_mc_validation_skips_unmapped_mate() {
+        // Paired records with unmapped mates have no MC tag — validation should skip them.
+        let mut grouper = RecordPositionGrouper::new();
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let record = RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .cigar("4M")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .paired(true)
+            .first_segment(true)
+            .mate_unmapped(true)
+            .build();
+        let decoded = DecodedRecord::new(record, key);
+
+        // Should NOT error even though there's no MC tag
+        let result = grouper.add_records(vec![decoded]);
+        assert!(result.is_ok());
+        assert!(!grouper.mc_validated); // Not validated — skipped due to unmapped mate
+    }
+
+    #[test]
+    fn test_record_position_grouper_mc_validation_fails_without_mc() {
+        let mut grouper = RecordPositionGrouper::new();
+        // Paired record without MC tag
+        let key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        let decoded = make_decoded(key, true, true, None); // No MC tag
+
+        let result = grouper.add_records(vec![decoded]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("MC tags"), "Error should mention MC tags: {err_msg}");
+    }
+
+    #[test]
+    fn test_record_position_grouper_mc_validation_passes_with_mc() {
+        let mut grouper = RecordPositionGrouper::new();
+        let key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        let decoded = make_decoded(key, true, true, Some("4M"));
+
+        let result = grouper.add_records(vec![decoded]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_record_position_grouper_mc_validation_skips_unpaired() {
+        // Unpaired records should not trigger MC validation
+        let mut grouper = RecordPositionGrouper::new();
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let decoded = make_decoded(key, false, false, None); // Unpaired, no MC tag
+
+        let result = grouper.add_records(vec![decoded]);
+        assert!(result.is_ok());
+        assert!(!grouper.mc_validated); // Should not be validated for unpaired
+    }
+
+    #[test]
+    fn test_record_position_grouper_default_impl() {
+        let grouper = RecordPositionGrouper::default();
+        assert!(!grouper.has_pending());
+    }
+
+    // ========================================================================
+    // build_templates_from_records tests
     // ========================================================================
 
     #[test]
-    fn test_combine_keys_empty() {
-        let keys: Vec<GroupKey> = vec![];
-        let result = PositionGrouper::combine_keys(&keys);
-        assert_eq!(result.ref_id1, GroupKey::UNKNOWN_REF);
+    fn test_build_templates_empty() {
+        let result = build_templates_from_records(vec![]).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn test_combine_keys_single_valid() {
-        let key = GroupKey::single(5, 1000, 0, 0, 0, 12345);
-        let keys = vec![key];
-        let result = PositionGrouper::combine_keys(&keys);
-        assert_eq!(result.ref_id1, 5);
-        assert_eq!(result.pos1, 1000);
-        assert_eq!(result.name_hash, 12345);
+    fn test_build_templates_single_record() {
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let record = RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .cigar("4M")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .paired(true)
+            .first_segment(true)
+            .build();
+        let decoded = DecodedRecord::new(record, key);
+
+        let templates = build_templates_from_records(vec![decoded]).unwrap();
+        assert_eq!(templates.len(), 1);
     }
 
     #[test]
-    fn test_combine_keys_single_unknown() {
-        // Secondary/supplementary reads have UNKNOWN ref_id1
-        let key = GroupKey { name_hash: 99999, ..GroupKey::default() };
-        let keys = vec![key];
-        let result = PositionGrouper::combine_keys(&keys);
-        // Should return default with preserved name_hash
-        assert_eq!(result.ref_id1, GroupKey::UNKNOWN_REF);
-        assert_eq!(result.name_hash, 99999);
+    fn test_build_templates_paired_same_name_hash() {
+        // R1 and R2 with same name_hash should produce one template
+        let r1_key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        let r2_key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+
+        let r1 = DecodedRecord::new(
+            RecordBuilder::new()
+                .name("read1")
+                .sequence("ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .cigar("4M")
+                .reference_sequence_id(0)
+                .alignment_start(100)
+                .paired(true)
+                .first_segment(true)
+                .build(),
+            r1_key,
+        );
+        let r2 = DecodedRecord::new(
+            RecordBuilder::new()
+                .name("read1")
+                .sequence("TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .cigar("4M")
+                .reference_sequence_id(0)
+                .alignment_start(200)
+                .paired(true)
+                .reverse_complement(true)
+                .build(),
+            r2_key,
+        );
+
+        let templates = build_templates_from_records(vec![r1, r2]).unwrap();
+        assert_eq!(templates.len(), 1);
     }
 
     #[test]
-    fn test_combine_keys_two_valid_without_mate_info() {
-        // R1 and R2 each have their own position but no mate info
-        let r1_key = GroupKey::single(0, 100, 0, 0, 0, 12345);
-        let r2_key = GroupKey::single(0, 300, 1, 0, 0, 12345);
-        let keys = vec![r1_key, r2_key];
-        let result = PositionGrouper::combine_keys(&keys);
+    fn test_build_templates_multiple_qnames() {
+        // Records with different name_hashes should produce separate templates
+        let key1 = GroupKey::single(0, 100, 0, 0, 0, 11111);
+        let key2 = GroupKey::single(0, 100, 0, 0, 0, 22222);
+        let key3 = GroupKey::single(0, 100, 0, 0, 0, 33333);
 
-        // Should combine: r1's position as pos1, r2's position as pos2
-        assert_eq!(result.ref_id1, 0);
-        assert_eq!(result.pos1, 100);
-        assert_eq!(result.strand1, 0);
-        assert_eq!(result.ref_id2, 0);
-        assert_eq!(result.pos2, 300);
-        assert_eq!(result.strand2, 1);
+        let records: Vec<DecodedRecord> = vec![
+            DecodedRecord::new(
+                RecordBuilder::new()
+                    .name("readA")
+                    .sequence("ACGT")
+                    .qualities(&[30, 30, 30, 30])
+                    .cigar("4M")
+                    .reference_sequence_id(0)
+                    .alignment_start(100)
+                    .build(),
+                key1,
+            ),
+            DecodedRecord::new(
+                RecordBuilder::new()
+                    .name("readB")
+                    .sequence("ACGT")
+                    .qualities(&[30, 30, 30, 30])
+                    .cigar("4M")
+                    .reference_sequence_id(0)
+                    .alignment_start(100)
+                    .build(),
+                key2,
+            ),
+            DecodedRecord::new(
+                RecordBuilder::new()
+                    .name("readC")
+                    .sequence("ACGT")
+                    .qualities(&[30, 30, 30, 30])
+                    .cigar("4M")
+                    .reference_sequence_id(0)
+                    .alignment_start(100)
+                    .build(),
+                key3,
+            ),
+        ];
+
+        let templates = build_templates_from_records(records).unwrap();
+        assert_eq!(templates.len(), 3);
+    }
+
+    // ========================================================================
+    // RawPositionGroup trait impl tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_position_group_batch_weight() {
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let records = vec![
+            make_decoded(GroupKey::single(0, 100, 0, 0, 0, 11111), false, false, None),
+            make_decoded(GroupKey::single(0, 100, 0, 0, 0, 22222), false, false, None),
+            make_decoded(GroupKey::single(0, 100, 0, 0, 0, 33333), false, false, None),
+            make_decoded(GroupKey::single(0, 100, 0, 0, 0, 44444), false, false, None),
+        ];
+        let group = RawPositionGroup { group_key: key, records };
+
+        // div_ceil(4, 2) = 2 (paired-end estimate)
+        assert_eq!(group.batch_weight(), 2);
     }
 
     #[test]
-    fn test_combine_keys_key_with_mate_info() {
-        // Key that already has mate info should be returned directly
-        let key = GroupKey::paired(0, 100, 0, 0, 300, 1, 0, 0, 12345);
-        let keys = vec![key];
-        let result = PositionGrouper::combine_keys(&keys);
+    fn test_raw_position_group_batch_weight_single() {
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let records =
+            vec![make_decoded(GroupKey::single(0, 100, 0, 0, 0, 11111), false, false, None)];
+        let group = RawPositionGroup { group_key: key, records };
 
-        assert_eq!(result.ref_id1, 0);
-        assert_eq!(result.pos1, 100);
-        assert_eq!(result.ref_id2, 0);
-        assert_eq!(result.pos2, 300);
+        // div_ceil(1, 2) = 1
+        assert_eq!(group.batch_weight(), 1);
     }
 
     #[test]
-    fn test_combine_keys_mixed_valid_and_unknown() {
-        // Mix of valid key (primary) and UNKNOWN key (secondary/supplementary)
-        let valid_key = GroupKey::single(5, 500, 0, 0, 0, 12345);
-        let unknown_key = GroupKey { name_hash: 12345, ..GroupKey::default() };
-        let keys = vec![unknown_key, valid_key];
-        let result = PositionGrouper::combine_keys(&keys);
+    fn test_raw_position_group_memory_estimate() {
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let records =
+            vec![make_decoded(GroupKey::single(0, 100, 0, 0, 0, 11111), false, false, None)];
+        let group = RawPositionGroup { group_key: key, records };
 
-        // Should skip unknown and use valid key
-        assert_eq!(result.ref_id1, 5);
-        assert_eq!(result.pos1, 500);
-    }
-
-    #[test]
-    fn test_combine_keys_all_unknown() {
-        // All secondary/supplementary - no valid primary
-        let unknown_key1 = GroupKey { name_hash: 12345, ..GroupKey::default() };
-        let unknown_key2 = GroupKey { name_hash: 12345, ..GroupKey::default() };
-        let keys = vec![unknown_key1, unknown_key2];
-        let result = PositionGrouper::combine_keys(&keys);
-
-        // Should return default with preserved name_hash
-        assert_eq!(result.ref_id1, GroupKey::UNKNOWN_REF);
-        assert_eq!(result.name_hash, 12345);
-    }
-
-    #[test]
-    fn test_combine_keys_first_has_mate_info() {
-        // First valid key has mate info - should return it directly
-        let key_with_mate = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
-        let key_without_mate = GroupKey::single(0, 100, 0, 0, 0, 12345);
-        let keys = vec![key_with_mate, key_without_mate];
-        let result = PositionGrouper::combine_keys(&keys);
-
-        assert_eq!(result.ref_id2, 0);
-        assert_eq!(result.pos2, 200);
+        // Should return a non-zero value
+        assert!(group.estimate_heap_size() > 0);
     }
 }

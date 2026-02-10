@@ -3405,7 +3405,7 @@ impl BamPipelineConfig {
 ///
 /// # Type Parameters
 ///
-/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `PositionGroup`, `MiGroup`)
+/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `RawPositionGroup`, `MiGroup`)
 /// - `P`: Processed type produced by the process function (e.g., `Vec<RecordBuf>`)
 ///
 /// # Arguments
@@ -3530,7 +3530,7 @@ where
 ///
 /// # Type Parameters
 ///
-/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `PositionGroup`, `MiGroup`)
+/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `RawPositionGroup`, `MiGroup`)
 /// - `P`: Processed type produced by the process function (e.g., `Vec<RecordBuf>`)
 ///
 /// # Arguments
@@ -3658,7 +3658,7 @@ where
 ///
 /// # Type Parameters
 ///
-/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `PositionGroup`, `MiGroup`)
+/// - `G`: Group type produced by the grouper (e.g., `RecordBuf`, `RawPositionGroup`, `MiGroup`)
 /// - `P`: Processed type produced by the process function (e.g., `Vec<RecordBuf>`)
 /// - `R`: Reader type that implements `Read + Send`
 ///

@@ -29,16 +29,18 @@ use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
-use fgumi_lib::grouper::{FilterMetrics, PositionGroup, PositionGrouper, PositionGrouperConfig};
+use fgumi_lib::grouper::{
+    FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
+};
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::metrics::group::FamilySizeMetrics;
-use fgumi_lib::read_info::build_library_lookup;
+use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
 use fgumi_lib::template::{MoleculeId, Template};
 use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, BatchWeight, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
+    BamPipelineConfig, BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
+    run_bam_pipeline_from_reader, serialize_bam_records_into,
 };
 use fgumi_lib::validation::{string_to_tag, validate_file_exists, validate_tag};
 use log::info;
@@ -171,8 +173,6 @@ pub struct ProcessedDedupGroup {
     pub dedup_metrics: DedupMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
-    /// Base MI offset for global uniqueness.
-    pub base_mi: u64,
 }
 
 impl BatchWeight for ProcessedDedupGroup {
@@ -576,20 +576,21 @@ fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut Dedup
 
 /// Process a position group for deduplication.
 fn process_position_group(
-    group: PositionGroup,
+    group: RawPositionGroup,
     filter_config: &DedupFilterConfig,
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
 ) -> io::Result<ProcessedDedupGroup> {
     let mut dedup_metrics = DedupMetrics::default();
-    let input_record_count: u64 = group.templates.iter().map(|t| t.read_count() as u64).sum();
-    let base_mi = group.base_mi;
+    let input_record_count = group.records.len() as u64;
+
+    // Build templates from raw records (deferred from Group step)
+    let all_templates = build_templates_from_records(group.records)?;
 
     // Filter templates
     let mut filter_metrics = FilterMetrics::new();
-    let filtered_templates: Vec<Template> = group
-        .templates
+    let filtered_templates: Vec<Template> = all_templates
         .into_iter()
         .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
         .collect();
@@ -602,7 +603,6 @@ fn process_position_group(
             family_sizes: AHashMap::new(),
             dedup_metrics,
             input_record_count,
-            base_mi,
         });
     }
 
@@ -689,7 +689,7 @@ fn process_position_group(
 
     dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
 
-    Ok(ProcessedDedupGroup { templates, family_sizes, dedup_metrics, input_record_count, base_mi })
+    Ok(ProcessedDedupGroup { templates, family_sizes, dedup_metrics, input_record_count })
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -912,6 +912,13 @@ impl Command for MarkDuplicates {
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 
+        // Wire cell_tag into the pipeline's Decode step so records are grouped by cell barcode.
+        let library_index = LibraryIndex::from_header(&header);
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
+
+        // Counter for contiguous MI assignment (incremented in the serial serialize step).
+        let next_mi_base = std::sync::atomic::AtomicU64::new(0);
+
         // Run the pipeline
         let _records_processed = run_bam_pipeline_from_reader(
             pipeline_config,
@@ -920,15 +927,12 @@ impl Command for MarkDuplicates {
             &self.io.output,
             None,
             // Grouper factory - use with_secondary_supplementary to include all reads
-            move |header: &Header| {
-                let library_lookup = build_library_lookup(header);
-                let config =
-                    PositionGrouperConfig::with_secondary_supplementary(cell_tag, library_lookup);
-                Box::new(PositionGrouper::new(config))
-                    as Box<dyn Grouper<Group = PositionGroup> + Send>
+            move |_header: &Header| {
+                Box::new(RecordPositionGrouper::with_secondary_supplementary())
+                    as Box<dyn Grouper<Group = RawPositionGroup> + Send>
             },
-            // Process function (parallel)
-            move |group: PositionGroup| -> io::Result<ProcessedDedupGroup> {
+            // Process function (parallel) — builds templates from raw records
+            move |group: RawPositionGroup| -> io::Result<ProcessedDedupGroup> {
                 let assigner = strategy.new_assigner_full(effective_edits, 1, index_threshold);
                 process_position_group(
                     group,
@@ -938,7 +942,7 @@ impl Command for MarkDuplicates {
                     min_umi_length,
                 )
             },
-            // Serialize function (parallel)
+            // Serialize function (serial, ordered)
             move |processed: ProcessedDedupGroup,
                   header: &Header,
                   output: &mut Vec<u8>|
@@ -951,7 +955,12 @@ impl Command for MarkDuplicates {
                 collected_metrics_clone.push(metrics);
 
                 let input_record_count = processed.input_record_count;
-                let base_mi = processed.base_mi;
+
+                // Assign contiguous base_mi from serial counter
+                let base_mi = next_mi_base.fetch_add(
+                    processed.templates.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let assign_tag = Tag::from(assign_tag_bytes);
 
                 // Serialize templates
