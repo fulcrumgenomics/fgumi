@@ -212,6 +212,192 @@ pub fn regenerate_alignment_tags(
     Ok(true)
 }
 
+// ============================================================================
+// Raw-byte alignment tag regeneration
+// ============================================================================
+
+use crate::sort::bam_fields;
+
+/// Regenerates NM, UQ, and MD tags for a raw BAM record after base masking.
+///
+/// For unmapped reads, the tags are removed. For mapped reads, the tags are
+/// recalculated based on the alignment and reference.
+///
+/// Returns `Ok(true)` if tags were regenerated, `Ok(false)` for unmapped reads.
+pub fn regenerate_alignment_tags_raw(
+    record: &mut Vec<u8>,
+    header: &Header,
+    reference: &ReferenceReader,
+) -> Result<bool> {
+    if record.len() < bam_fields::MIN_BAM_HEADER_LEN {
+        anyhow::bail!(
+            "BAM record too short ({} bytes, minimum {})",
+            record.len(),
+            bam_fields::MIN_BAM_HEADER_LEN
+        );
+    }
+    let flg = bam_fields::flags(record);
+
+    // For unmapped reads, remove alignment tags
+    if (flg & bam_fields::flags::UNMAPPED) != 0 {
+        bam_fields::remove_tag(record, b"NM");
+        bam_fields::remove_tag(record, b"UQ");
+        bam_fields::remove_tag(record, b"MD");
+        return Ok(false);
+    }
+
+    // Get reference sequence ID and look up name in header
+    let ref_seq_id = bam_fields::ref_id(record);
+    if ref_seq_id < 0 {
+        return Ok(false);
+    }
+    let ref_seqs = header.reference_sequences();
+    let (ref_name_bytes, _) = ref_seqs
+        .get_index(ref_seq_id as usize)
+        .context("Reference sequence ID not found in header")?;
+    let ref_name = std::str::from_utf8(ref_name_bytes.as_ref())?;
+
+    let alignment_start_0based = bam_fields::pos(record);
+    if alignment_start_0based < 0 {
+        anyhow::bail!("Invalid alignment start position: {}", alignment_start_0based);
+    }
+    let ref_start = Position::new((alignment_start_0based + 1) as usize)
+        .context("Invalid alignment start position")?;
+
+    // Get CIGAR ops (one small Vec allocation - typically 1-5 ops)
+    let cigar_ops = bam_fields::get_cigar_ops(record);
+
+    // Calculate reference span from CIGAR ops
+    let ref_span: usize = cigar_ops
+        .iter()
+        .map(|&op| {
+            let op_type = op & 0xF;
+            let op_len = (op >> 4) as usize;
+            match op_type {
+                0 | 2 | 7 | 8 => op_len, // M, D, =, X
+                _ => 0,
+            }
+        })
+        .sum();
+
+    // Handle edge case: CIGAR with no reference-consuming operations
+    if ref_span == 0 {
+        bam_fields::update_int_tag(record, b"NM", 0);
+        bam_fields::update_int_tag(record, b"UQ", 0);
+        bam_fields::update_string_tag(record, b"MD", b"0");
+        return Ok(false);
+    }
+
+    // Fetch entire reference span in one call
+    let ref_end = Position::new(usize::from(ref_start) + ref_span - 1)
+        .context("Invalid reference end position")?;
+    let all_ref_bases = reference.fetch(ref_name, ref_start, ref_end)?;
+
+    // Get seq/qual offsets and validate bounds
+    let seq_off = bam_fields::seq_offset(record);
+    let qual_off = bam_fields::qual_offset(record);
+    let l_seq = bam_fields::l_seq(record) as usize;
+    let seq_bytes = l_seq.div_ceil(2);
+    if seq_off + seq_bytes > record.len() || qual_off + l_seq > record.len() {
+        anyhow::bail!("Truncated BAM record: seq/qual extends past record end");
+    }
+
+    // Calculate NM, UQ, MD
+    let mut nm: i32 = 0;
+    let mut uq: u32 = 0;
+    let mut md_string = String::new();
+    let mut ref_offset = 0;
+    let mut seq_pos = 0;
+    let mut match_count: usize = 0;
+
+    for &op in &cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+
+        match op_type {
+            0 | 7 | 8 => {
+                // M (0), = (7), X (8) — alignment match/mismatch
+                if ref_offset + op_len > all_ref_bases.len() {
+                    anyhow::bail!("CIGAR references beyond fetched reference span");
+                }
+                if seq_pos + op_len > l_seq {
+                    anyhow::bail!("CIGAR consumes more bases than sequence length");
+                }
+                let ref_bases = &all_ref_bases[ref_offset..ref_offset + op_len];
+                for &ref_base in ref_bases {
+                    let seq_base = bam_fields::BAM_BASE_TO_ASCII
+                        [bam_fields::get_base(record, seq_off, seq_pos) as usize];
+                    let qual_score = bam_fields::get_qual(record, qual_off, seq_pos);
+
+                    if seq_base == b'N' {
+                        // Masked base: count as mismatch
+                        nm += 1;
+                        uq += u32::from(qual_score);
+                        md_string.push_str(&match_count.to_string());
+                        match_count = 0;
+                        md_string.push(ref_base as char);
+                    } else if !seq_base.eq_ignore_ascii_case(&ref_base) {
+                        // Mismatch
+                        nm += 1;
+                        uq += u32::from(qual_score);
+                        md_string.push_str(&match_count.to_string());
+                        match_count = 0;
+                        md_string.push(ref_base as char);
+                    } else {
+                        match_count += 1;
+                    }
+                    seq_pos += 1;
+                }
+                ref_offset += op_len;
+            }
+            1 => {
+                // I — insertion
+                if seq_pos + op_len > l_seq {
+                    anyhow::bail!("CIGAR insertion consumes more bases than sequence length");
+                }
+                nm += op_len as i32;
+                seq_pos += op_len;
+            }
+            2 => {
+                // D — deletion
+                if ref_offset + op_len > all_ref_bases.len() {
+                    anyhow::bail!("CIGAR deletion references beyond fetched reference span");
+                }
+                nm += op_len as i32;
+                md_string.push_str(&match_count.to_string());
+                match_count = 0;
+                md_string.push('^');
+                let ref_bases = &all_ref_bases[ref_offset..ref_offset + op_len];
+                for &base in ref_bases {
+                    md_string.push(base as char);
+                }
+                ref_offset += op_len;
+            }
+            4 => {
+                // S — soft clip
+                if seq_pos + op_len > l_seq {
+                    anyhow::bail!("CIGAR soft clip consumes more bases than sequence length");
+                }
+                seq_pos += op_len;
+            }
+            5 | 6 | 3 => {
+                // H (5), P (6), N (3) — no sequence or ref consumed for tag calc
+            }
+            _ => {}
+        }
+    }
+
+    // Add final match count
+    md_string.push_str(&match_count.to_string());
+
+    // Update tags
+    bam_fields::update_int_tag(record, b"NM", nm);
+    bam_fields::update_int_tag(record, b"UQ", uq.min(i32::MAX as u32) as i32);
+    bam_fields::update_string_tag(record, b"MD", md_string.as_bytes());
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +819,109 @@ mod tests {
         assert_eq!(record.data().get(&nm_tag()), Some(&Value::from(2)));
         assert_eq!(record.data().get(&uq_tag()), Some(&Value::from(25)));
         assert_eq!(record.data().get(&md_tag()), Some(&Value::from("2G1A1".to_string())));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regenerate_alignment_tags_raw_validates_bounds() -> Result<()> {
+        // Create a valid record, encode to raw, then truncate it
+        let fasta = create_test_reference()?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header = create_test_header();
+        let record = create_mapped_record("ACGTACGT", &[30, 30, 30, 30, 30, 30, 30, 30], "8M", 1);
+
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record)?;
+
+        // Truncate to remove quality scores (but keep seq)
+        let qual_off = crate::sort::bam_fields::qual_offset(&raw);
+        let mut truncated = raw[..qual_off].to_vec();
+
+        let result = regenerate_alignment_tags_raw(&mut truncated, &header, &reference);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Truncated"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regenerate_alignment_tags_raw_rejects_short_record() -> Result<()> {
+        let fasta = create_test_reference()?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header = create_test_header();
+
+        // Record shorter than MIN_BAM_HEADER_LEN (36 bytes)
+        let mut too_short = vec![0u8; 10];
+        let result = regenerate_alignment_tags_raw(&mut too_short, &header, &reference);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+
+        Ok(())
+    }
+
+    /// Round-trip test: encode `RecordBuf` → regenerate raw tags → verify NM/UQ/MD match `RecordBuf` path.
+    #[test]
+    fn test_regenerate_alignment_tags_raw_happy_path() -> Result<()> {
+        let fasta = create_test_reference()?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header = create_test_header();
+
+        // Record with mismatches: ATGT vs ref ACGT (mismatch at pos 2)
+        let mut record_buf = create_mapped_record("ATGT", &[30, 30, 25, 30], "4M", 1);
+        regenerate_alignment_tags(&mut record_buf, &header, &reference)?;
+
+        // Encode to raw bytes and regenerate tags via raw path
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record_buf)?;
+        regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
+
+        // Read tags back from raw bytes
+        let aux_off =
+            crate::sort::bam_fields::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux = &raw[aux_off..];
+
+        let nm = crate::sort::bam_fields::find_int_tag(aux, b"NM");
+        let uq = crate::sort::bam_fields::find_int_tag(aux, b"UQ");
+        let md = crate::sort::bam_fields::find_string_tag(aux, b"MD");
+
+        // Verify raw path produces same results as RecordBuf path
+        assert_eq!(nm, Some(1i64), "NM should be 1 (one mismatch)");
+        assert_eq!(uq, Some(30i64), "UQ should be 30 (quality at mismatch position)");
+        assert_eq!(md.map(|s| std::str::from_utf8(s).unwrap()), Some("1C2"), "MD should be 1C2");
+
+        Ok(())
+    }
+
+    /// Round-trip test with masked bases (N): verify raw path matches `RecordBuf`.
+    #[test]
+    fn test_regenerate_alignment_tags_raw_with_masked_bases() -> Result<()> {
+        let fasta = create_test_reference()?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header = create_test_header();
+
+        // Record with masked base: ANGT vs ref ACGT
+        let mut record_buf = create_mapped_record("ANGT", &[30, 0, 30, 30], "4M", 1);
+        regenerate_alignment_tags(&mut record_buf, &header, &reference)?;
+
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record_buf)?;
+        regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
+
+        let aux_off =
+            crate::sort::bam_fields::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux = &raw[aux_off..];
+
+        let nm = crate::sort::bam_fields::find_int_tag(aux, b"NM");
+        let uq = crate::sort::bam_fields::find_int_tag(aux, b"UQ");
+        let md = crate::sort::bam_fields::find_string_tag(aux, b"MD");
+
+        assert_eq!(nm, Some(1i64), "NM should be 1 (masked base = mismatch)");
+        assert_eq!(uq, Some(0i64), "UQ should be 0 (masked base quality is 0)");
+        assert_eq!(md.map(|s| std::str::from_utf8(s).unwrap()), Some("1C2"));
 
         Ok(())
     }

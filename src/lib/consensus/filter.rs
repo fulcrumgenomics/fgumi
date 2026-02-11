@@ -184,6 +184,27 @@ impl FilterConfig {
         }
     }
 
+    /// Returns duplex (CC), AB, and BA thresholds, or `None` if any are missing.
+    #[must_use]
+    pub fn duplex_thresholds(
+        &self,
+    ) -> Option<(&FilterThresholds, &FilterThresholds, &FilterThresholds)> {
+        match (
+            self.duplex_thresholds.as_ref(),
+            self.ab_thresholds.as_ref(),
+            self.ba_thresholds.as_ref(),
+        ) {
+            (Some(cc), Some(ab), Some(ba)) => Some((cc, ab, ba)),
+            _ => None,
+        }
+    }
+
+    /// Returns the single-strand thresholds, falling back to duplex thresholds.
+    #[must_use]
+    pub fn effective_single_strand_thresholds(&self) -> Option<&FilterThresholds> {
+        self.single_strand_thresholds.as_ref().or(self.duplex_thresholds.as_ref())
+    }
+
     /// Creates a new filter configuration from parameter vectors
     ///
     /// # Arguments
@@ -797,6 +818,36 @@ pub fn template_passes(template_records: &[RecordBuf], pass_map: &AHashMap<usize
     has_primary && all_primary_pass
 }
 
+/// Checks whether all primary raw records in a template pass their filters.
+///
+/// A template passes if it has at least one primary read and all primary reads pass.
+#[must_use]
+pub fn template_passes_raw(raw_records: &[Vec<u8>], pass_map: &AHashMap<usize, bool>) -> bool {
+    let mut has_primary = false;
+    let mut all_primary_pass = true;
+
+    for (idx, record) in raw_records.iter().enumerate() {
+        let flags = bam_fields::flags(record);
+        let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
+            && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
+
+        if is_primary {
+            has_primary = true;
+            if let Some(&passes) = pass_map.get(&idx) {
+                if !passes {
+                    all_primary_pass = false;
+                    break;
+                }
+            } else {
+                all_primary_pass = false;
+                break;
+            }
+        }
+    }
+
+    has_primary && all_primary_pass
+}
+
 /// Detects if a record is part of a duplex consensus
 ///
 /// Checks for presence of AB/BA specific tags (aD, bD)
@@ -812,6 +863,300 @@ pub fn is_duplex_consensus(record: &RecordBuf) -> bool {
     let bd_tag = per_read::tag("bD");
 
     record.data().get(&ad_tag).is_some() || record.data().get(&bd_tag).is_some()
+}
+
+// ============================================================================
+// Raw-byte equivalents (operate on &[u8] / &mut Vec<u8>)
+// ============================================================================
+
+use crate::sort::bam_fields;
+
+/// Detects if a raw BAM record is a duplex consensus.
+///
+/// Checks for presence of `aD` or `bD` tags in the aux data.
+#[must_use]
+pub fn is_duplex_consensus_raw(aux_data: &[u8]) -> bool {
+    bam_fields::find_tag_type(aux_data, b"aD").is_some()
+        || bam_fields::find_tag_type(aux_data, b"bD").is_some()
+}
+
+/// Filters a raw consensus read based on per-read tags (cD depth, cE error rate).
+pub fn filter_read_raw(aux_data: &[u8], thresholds: &FilterThresholds) -> Result<FilterResult> {
+    // Check minimum reads (cD tag — UInt8)
+    if let Some(depth) = bam_fields::find_uint8_tag(aux_data, b"cD") {
+        if (depth as usize) < thresholds.min_reads {
+            return Ok(FilterResult::InsufficientReads);
+        }
+    }
+
+    // Check maximum error rate (cE tag — Float)
+    if let Some(error_rate) = bam_fields::find_float_tag(aux_data, b"cE") {
+        if f64::from(error_rate) > thresholds.max_read_error_rate {
+            return Ok(FilterResult::ExcessiveErrorRate);
+        }
+    }
+
+    Ok(FilterResult::Pass)
+}
+
+/// Filters a raw duplex consensus read, checking CC / AB / BA thresholds.
+pub fn filter_duplex_read_raw(
+    aux_data: &[u8],
+    cc_thresholds: &FilterThresholds,
+    ab_thresholds: &FilterThresholds,
+    ba_thresholds: &FilterThresholds,
+) -> Result<FilterResult> {
+    // First check final consensus thresholds
+    let result = filter_read_raw(aux_data, cc_thresholds)?;
+    if result != FilterResult::Pass {
+        return Ok(result);
+    }
+
+    // Extract AB and BA depths and error rates
+    let ab_depth = bam_fields::find_int_tag(aux_data, b"aD")
+        .or_else(|| bam_fields::find_int_tag(aux_data, b"aM"));
+    let ba_depth = bam_fields::find_int_tag(aux_data, b"bD")
+        .or_else(|| bam_fields::find_int_tag(aux_data, b"bM"));
+    let ab_error = bam_fields::find_float_tag(aux_data, b"aE");
+    let ba_error = bam_fields::find_float_tag(aux_data, b"bE");
+
+    // Sort depths to identify AB (higher) and BA (lower)
+    let (min_depth, max_depth) = match (ab_depth, ba_depth) {
+        (Some(a), Some(b)) => {
+            if a < b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        }
+        (Some(a), None) => (0, a),
+        (None, Some(b)) => (0, b),
+        (None, None) => return Ok(FilterResult::Pass),
+    };
+
+    let (min_error, max_error) = match (ab_error, ba_error) {
+        (Some(a), Some(b)) => {
+            if a < b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        }
+        (Some(a), None) => (a, a),
+        (None, Some(b)) => (b, b),
+        (None, None) => (0.0, 0.0),
+    };
+
+    // Check AB strand (max depth, min error) against AB thresholds
+    if (max_depth as usize) < ab_thresholds.min_reads {
+        return Ok(FilterResult::InsufficientReads);
+    }
+    if f64::from(min_error) > ab_thresholds.max_read_error_rate {
+        return Ok(FilterResult::ExcessiveErrorRate);
+    }
+
+    // Check BA strand (min depth, max error) against BA thresholds
+    if (min_depth as usize) < ba_thresholds.min_reads {
+        return Ok(FilterResult::InsufficientReads);
+    }
+    if f64::from(max_error) > ba_thresholds.max_read_error_rate {
+        return Ok(FilterResult::ExcessiveErrorRate);
+    }
+
+    Ok(FilterResult::Pass)
+}
+
+/// Computes both no-call count and mean base quality in a single pass over raw BAM bytes.
+///
+/// Returns (`no_call_count`, `mean_base_quality`).
+///
+/// # Panics
+/// Panics if the record is shorter than `MIN_BAM_HEADER_LEN` (36 bytes).
+#[must_use]
+pub fn compute_read_stats_raw(bam: &[u8]) -> (usize, f64) {
+    assert!(bam.len() >= bam_fields::MIN_BAM_HEADER_LEN, "BAM record too short");
+    let seq_off = bam_fields::seq_offset(bam);
+    let qual_off = bam_fields::qual_offset(bam);
+    let len = bam_fields::l_seq(bam) as usize;
+
+    let mut n_count = 0usize;
+    let mut qual_sum = 0u64;
+    let mut non_n_count = 0usize;
+
+    for i in 0..len {
+        if bam_fields::is_base_n(bam, seq_off, i) {
+            n_count += 1;
+        } else {
+            qual_sum += u64::from(bam_fields::get_qual(bam, qual_off, i));
+            non_n_count += 1;
+        }
+    }
+
+    let mean_qual = if non_n_count == 0 { 0.0 } else { qual_sum as f64 / non_n_count as f64 };
+    (n_count, mean_qual)
+}
+
+/// Reads a tag value as either a Z-type string or a B-type `UInt8` array.
+///
+/// Returns `Some(Vec<u8>)` if found as either type, `None` otherwise.
+fn find_string_or_uint8_array(aux_data: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
+    if let Some(s) = bam_fields::find_string_tag(aux_data, &tag) {
+        Some(s.to_vec())
+    } else {
+        let arr = bam_fields::find_array_tag(aux_data, &tag)?;
+        if matches!(arr.elem_type, b'C' | b'c') {
+            Some((0..arr.count).map(|i| bam_fields::array_tag_element_u16(&arr, i) as u8).collect())
+        } else {
+            None
+        }
+    }
+}
+
+/// Masks bases in a raw consensus read based on per-base tags and thresholds.
+///
+/// Modifies sequence and quality bytes in-place (no Vec allocation for the seq/qual data).
+/// Returns the number of newly masked bases.
+#[allow(clippy::similar_names)]
+pub fn mask_bases_raw(
+    record: &mut [u8],
+    thresholds: &FilterThresholds,
+    min_base_quality: Option<u8>,
+) -> Result<usize> {
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_HEADER_LEN, "BAM record too short");
+    let seq_off = bam_fields::seq_offset(record);
+    let qual_off = bam_fields::qual_offset(record);
+    let len = bam_fields::l_seq(record) as usize;
+    let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
+
+    // Pre-read per-base arrays into owned Vecs to release the immutable borrow on record
+    let cd_vals = bam_fields::find_array_tag(&record[aux_off..], b"cd")
+        .map(|r| bam_fields::array_tag_to_vec_u16(&r));
+    let ce_vals = bam_fields::find_array_tag(&record[aux_off..], b"ce")
+        .map(|r| bam_fields::array_tag_to_vec_u16(&r));
+
+    let mut masked_count = 0;
+    for i in 0..len {
+        let depth = cd_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let errors = ce_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let qual = bam_fields::get_qual(record, qual_off, i);
+
+        let should_mask = min_base_quality.is_some_and(|min_qual| qual < min_qual)
+            || (depth as usize) < thresholds.min_reads
+            || (depth > 0
+                && (f64::from(errors) / f64::from(depth)) > thresholds.max_base_error_rate);
+
+        if should_mask {
+            // Only count as newly masked if not already N
+            if !bam_fields::is_base_n(record, seq_off, i) {
+                masked_count += 1;
+            }
+            bam_fields::mask_base(record, seq_off, i);
+            bam_fields::set_qual(record, qual_off, i, MIN_PHRED);
+        }
+    }
+
+    Ok(masked_count)
+}
+
+/// Masks bases in a raw duplex consensus read based on per-base AB/BA tags and thresholds.
+///
+/// Returns the number of newly masked bases.
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
+pub fn mask_duplex_bases_raw(
+    record: &mut [u8],
+    cc_thresholds: &FilterThresholds,
+    ab_thresholds: &FilterThresholds,
+    ba_thresholds: &FilterThresholds,
+    min_base_quality: Option<u8>,
+    require_ss_agreement: bool,
+) -> Result<usize> {
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_HEADER_LEN, "BAM record too short");
+    let seq_off = bam_fields::seq_offset(record);
+    let qual_off = bam_fields::qual_offset(record);
+    let len = bam_fields::l_seq(record) as usize;
+    let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
+
+    // Pre-read per-base arrays and strings into owned data to release the immutable borrow
+    let ad_vals = bam_fields::find_array_tag(&record[aux_off..], b"ad")
+        .map(|r| bam_fields::array_tag_to_vec_u16(&r));
+    let ae_vals = bam_fields::find_array_tag(&record[aux_off..], b"ae")
+        .map(|r| bam_fields::array_tag_to_vec_u16(&r));
+    let bd_vals = bam_fields::find_array_tag(&record[aux_off..], b"bd")
+        .map(|r| bam_fields::array_tag_to_vec_u16(&r));
+    let be_vals = bam_fields::find_array_tag(&record[aux_off..], b"be")
+        .map(|r| bam_fields::array_tag_to_vec_u16(&r));
+
+    // For single-strand agreement checking, get ac/bc tags (copy to owned).
+    // These may be Z-type strings or B-type UInt8 arrays.
+    let ac_owned: Option<Vec<u8>> = if require_ss_agreement {
+        find_string_or_uint8_array(&record[aux_off..], *b"ac")
+    } else {
+        None
+    };
+    let bc_owned: Option<Vec<u8>> = if require_ss_agreement {
+        find_string_or_uint8_array(&record[aux_off..], *b"bc")
+    } else {
+        None
+    };
+
+    let mut masked_count = 0;
+    for i in 0..len {
+        // Skip if already N
+        if bam_fields::is_base_n(record, seq_off, i) {
+            continue;
+        }
+
+        let ab_depth = ad_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ba_depth = bd_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ab_errors = ae_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ba_errors = be_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+
+        let max_depth = std::cmp::max(ab_depth, ba_depth);
+        let min_depth = std::cmp::min(ab_depth, ba_depth);
+
+        let ab_error_rate =
+            if ab_depth > 0 { f64::from(ab_errors) / f64::from(ab_depth) } else { 0.0 };
+        let ba_error_rate =
+            if ba_depth > 0 { f64::from(ba_errors) / f64::from(ba_depth) } else { 0.0 };
+
+        let min_error_rate = ab_error_rate.min(ba_error_rate);
+        let max_error_rate = ab_error_rate.max(ba_error_rate);
+
+        let total_depth = u32::from(ab_depth) + u32::from(ba_depth);
+        let total_error_rate = if total_depth > 0 {
+            f64::from(u32::from(ab_errors) + u32::from(ba_errors)) / f64::from(total_depth)
+        } else {
+            0.0
+        };
+
+        let qual = bam_fields::get_qual(record, qual_off, i);
+
+        let should_mask = min_base_quality.is_some_and(|min_qual| qual < min_qual)
+            || (total_depth as usize) < cc_thresholds.min_reads
+            || total_error_rate > cc_thresholds.max_base_error_rate
+            || (max_depth as usize) < ab_thresholds.min_reads
+            || min_error_rate > ab_thresholds.max_base_error_rate
+            || (min_depth as usize) < ba_thresholds.min_reads
+            || max_error_rate > ba_thresholds.max_base_error_rate;
+
+        // Check single-strand agreement if requested.
+        // Use NO_CALL_BASE as default for missing/short tags, matching RecordBuf path behavior.
+        let ss_disagree = require_ss_agreement && ab_depth > 0 && ba_depth > 0 && {
+            let ac_base =
+                ac_owned.as_ref().and_then(|ac| ac.get(i).copied()).unwrap_or(NO_CALL_BASE);
+            let bc_base =
+                bc_owned.as_ref().and_then(|bc| bc.get(i).copied()).unwrap_or(NO_CALL_BASE);
+            ac_base != bc_base
+        };
+
+        if should_mask || ss_disagree {
+            masked_count += 1;
+            bam_fields::mask_base(record, seq_off, i);
+            bam_fields::set_qual(record, qual_off, i, MIN_PHRED);
+        }
+    }
+
+    Ok(masked_count)
 }
 
 #[cfg(test)]
@@ -1934,5 +2279,55 @@ mod tests {
             true,
         );
         assert!(result.is_ok());
+    }
+
+    // ========== Tests for find_string_or_uint8_array ==========
+
+    #[test]
+    fn test_find_string_or_uint8_array_z_tag() {
+        // Build aux data with a Z-type string tag: ac:Z:ACGT
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"ac"); // tag
+        aux.push(b'Z'); // type
+        aux.extend_from_slice(b"ACGT\0"); // value + NUL
+
+        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        assert_eq!(result, Some(b"ACGT".to_vec()));
+    }
+
+    #[test]
+    fn test_find_string_or_uint8_array_b_uint8_tag() {
+        // Build aux data with a B-type UInt8 array tag: ac:B:C,65,67,71,84
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"ac"); // tag
+        aux.push(b'B'); // type = array
+        aux.push(b'C'); // sub-type = UInt8
+        aux.extend_from_slice(&4u32.to_le_bytes()); // count = 4
+        aux.extend_from_slice(&[65u8, 67, 71, 84]); // A, C, G, T
+
+        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        assert_eq!(result, Some(vec![65u8, 67, 71, 84]));
+    }
+
+    #[test]
+    fn test_find_string_or_uint8_array_missing_tag() {
+        let aux: Vec<u8> = Vec::new();
+        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_string_or_uint8_array_wrong_array_type() {
+        // Build aux data with a B-type Int16 array — should return None since not UInt8
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"ac"); // tag
+        aux.push(b'B'); // type = array
+        aux.push(b's'); // sub-type = Int16
+        aux.extend_from_slice(&2u32.to_le_bytes()); // count = 2
+        aux.extend_from_slice(&1i16.to_le_bytes());
+        aux.extend_from_slice(&2i16.to_le_bytes());
+
+        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        assert!(result.is_none());
     }
 }
