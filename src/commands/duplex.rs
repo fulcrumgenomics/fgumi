@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_lib::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer,
-    create_optional_bam_writer,
+    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader,
 };
 
 use super::common::{
@@ -23,27 +23,29 @@ use crate::commands::consensus_runner::{
 };
 use crossbeam_queue::SegQueue;
 use fgumi_lib::consensus_caller::{
-    ConsensusCaller, ConsensusCallingStats, make_prefix_from_header,
+    ConsensusCaller, ConsensusCallingStats, ConsensusOutput, make_prefix_from_header,
 };
 use fgumi_lib::duplex_consensus_caller::DuplexConsensusCaller;
 use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
-use fgumi_lib::mi_group::{MiGroup, MiGroupBatch, MiGroupIteratorWithTransform, MiGrouper};
+use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
 use fgumi_lib::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
-    apply_overlapping_consensus,
+    apply_overlapping_consensus_raw,
 };
 use fgumi_lib::progress::ProgressTracker;
+use fgumi_lib::read_info::LibraryIndex;
+use fgumi_lib::sort::bam_fields;
 use fgumi_lib::umi::extract_mi_base;
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
+    BamPipelineConfig, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use fgumi_lib::validation::{optional_string_to_tag, validate_file_exists};
+use fgumi_lib::vendored::RawRecord;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::io;
+use std::io::Write as IoWrite;
 use std::sync::Arc;
 
 use super::command::Command;
@@ -55,9 +57,9 @@ use super::command::Command;
 /// Result from processing a batch of MI groups through duplex consensus calling.
 struct DuplexProcessedBatch {
     /// Consensus reads to write to output BAM
-    consensus_reads: Vec<RecordBuf>,
-    /// Rejected reads (written to rejects file if enabled)
-    rejects: Vec<RecordBuf>,
+    consensus_output: ConsensusOutput,
+    /// Rejected reads as raw BAM bytes (written to rejects file if enabled)
+    rejects: Vec<Vec<u8>>,
     /// Number of MI groups in this batch
     groups_count: u64,
     /// Consensus calling statistics for this batch
@@ -68,11 +70,7 @@ struct DuplexProcessedBatch {
 
 impl MemoryEstimate for DuplexProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.consensus_reads
-            .iter()
-            .chain(self.rejects.iter())
-            .map(MemoryEstimate::estimate_heap_size)
-            .sum()
+        self.consensus_output.data.len() + self.rejects.iter().map(Vec::len).sum::<usize>()
     }
 }
 
@@ -85,8 +83,8 @@ struct CollectedDuplexMetrics {
     overlapping_stats: Option<CorrectionStats>,
     /// Number of MI groups processed
     groups_processed: u64,
-    /// Rejected reads for deferred writing
-    rejects: Vec<RecordBuf>,
+    /// Rejected reads as raw BAM bytes for deferred writing
+    rejects: Vec<Vec<u8>>,
 }
 
 /// Call duplex consensus reads from grouped reads with /A and /B MI tags
@@ -343,7 +341,7 @@ impl Command for Duplex {
             return result;
         }
 
-        // Drop the reader for single-threaded mode - we use MiGroupIterator which needs its own reader
+        // Drop the reader for single-threaded mode - we use RawMiGroupIterator which needs its own reader
         drop(reader);
 
         // ============================================================
@@ -389,31 +387,45 @@ impl Command for Duplex {
         let mut consensus_count = 0usize;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Create the MI group iterator for single-threaded streaming
-        let (mut reader, _) = create_bam_reader(&self.io.input, 1)?;
-        // Create filtered record iterator
-        // Filter out secondary and supplementary reads, keep only mapped or mate-mapped
-        let filtered_iter = reader.record_bufs(&header).filter_map(|result| {
-            match result {
-                Err(e) => Some(Err(e.into())),
-                Ok(record) => {
-                    let flags = record.flags();
-                    // Skip secondary and supplementary reads
-                    if flags.is_secondary() || flags.is_supplementary() {
-                        return None;
+        // Create the MI group iterator for single-threaded streaming (raw bytes)
+        let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
+        // Create raw byte iterator, filtering out secondary/supplementary and keeping
+        // only mapped or mate-mapped reads
+        let raw_record_iter = std::iter::from_fn(move || {
+            loop {
+                let mut record = RawRecord::new();
+                match raw_reader.read_record(&mut record) {
+                    Ok(0) => return None, // EOF
+                    Ok(_) => {
+                        let raw = record.into_inner();
+                        let flg = bam_fields::flags(&raw);
+                        // Skip secondary and supplementary reads
+                        if flg & bam_fields::flags::SECONDARY != 0
+                            || flg & bam_fields::flags::SUPPLEMENTARY != 0
+                        {
+                            continue;
+                        }
+                        // Only keep mapped reads or reads with mapped mates
+                        let is_mapped = flg & bam_fields::flags::UNMAPPED == 0;
+                        let has_mapped_mate = flg & bam_fields::flags::PAIRED != 0
+                            && flg & bam_fields::flags::MATE_UNMAPPED == 0;
+                        if is_mapped || has_mapped_mate {
+                            return Some(Ok(raw));
+                        }
+                        // Skip unmapped reads without mapped mates
                     }
-                    // Only keep mapped reads or reads with mapped mates
-                    let is_mapped = !flags.is_unmapped();
-                    let has_mapped_mate = flags.is_segmented() && !flags.is_mate_unmapped();
-                    if is_mapped || has_mapped_mate { Some(Ok(record)) } else { None }
+                    Err(e) => return Some(Err(e.into())),
                 }
             }
         });
 
-        // Group by base MI (strip /A, /B suffix) for streaming
-        let mi_group_iter = MiGroupIteratorWithTransform::new(filtered_iter, "MI", |mi| {
-            extract_mi_base(mi).to_string()
-        });
+        // Group by base MI (strip /A, /B suffix) for streaming using raw bytes
+        let mi_group_iter =
+            RawMiGroupIterator::with_transform(raw_record_iter, "MI", |mi_bytes: &[u8]| {
+                let mi_str = String::from_utf8_lossy(mi_bytes);
+                extract_mi_base(&mi_str).to_string()
+            })
+            .with_cell_tag(cell_tag.map(|ct| *ct.as_ref()));
         // Single-threaded processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -426,25 +438,23 @@ impl Command for Duplex {
         };
 
         for group_result in mi_group_iter {
-            let (_base_mi, mut reads) = group_result.context("Failed to read MI group")?;
+            let (_base_mi, mut records) = group_result.context("Failed to read MI group")?;
 
-            // Apply overlapping consensus if enabled (modifies reads in-place)
+            // Apply overlapping consensus if enabled (modifies raw bytes in-place)
             // Skip if group doesn't have both strands - no duplex possible anyway
             if let Some(ref mut oc) = overlapping_caller {
-                if DuplexConsensusCaller::has_both_strands(&reads) {
-                    apply_overlapping_consensus(&mut reads, oc)?;
+                if has_both_strands_raw(&records) {
+                    apply_overlapping_consensus_raw(&mut records, oc)?;
                 }
             }
 
-            // Call consensus for this group
-            let consensus_reads = consensus_caller.consensus_reads_from_sam_records(reads)?;
+            // Call consensus directly -- records are already raw bytes!
+            let output = consensus_caller.consensus_reads(records)?;
 
-            // Write consensus reads immediately
-            let batch_size = consensus_reads.len();
-            for consensus_read in &consensus_reads {
-                writer.write_alignment_record(&header, consensus_read)?;
-                consensus_count += 1;
-            }
+            // Write pre-serialized consensus reads
+            let batch_size = output.count;
+            consensus_count += batch_size;
+            writer.get_mut().write_all(&output.data).context("Failed to write consensus read")?;
             progress.log_if_needed(batch_size as u64);
         }
 
@@ -454,13 +464,22 @@ impl Command for Duplex {
             merged_overlapping_stats.merge(oc.stats());
         }
 
-        // Write rejected reads if tracking is enabled
+        // Write rejected reads as raw BAM bytes if tracking is enabled
         if let Some(ref mut rw) = rejects_writer {
             let rejected_reads = consensus_caller.rejected_reads();
-            for read in rejected_reads {
-                rw.write_alignment_record(&header, read)?;
+            for raw_record in rejected_reads {
+                let block_size = raw_record.len() as u32;
+                rw.get_mut()
+                    .write_all(&block_size.to_le_bytes())
+                    .context("Failed to write rejected read block size")?;
+                rw.get_mut().write_all(raw_record).context("Failed to write rejected read")?;
             }
             info!("Wrote {} rejected reads", rejected_reads.len());
+        }
+
+        // Finish the rejects writer to ensure BGZF EOF marker is written
+        if let Some(mut rw) = rejects_writer {
+            rw.finish(&header).context("Failed to finish rejects file")?;
         }
 
         progress.log_final();
@@ -552,24 +571,38 @@ impl Duplex {
         let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
         let batch_size = 100; // MI groups per batch
 
-        // Record filter for duplex: skip secondary/supplementary, keep mapped or mate-mapped
-        let record_filter = |record: &RecordBuf| -> bool {
-            let flags = record.flags();
+        // Record filter for duplex on raw bytes: skip secondary/supplementary, keep mapped or mate-mapped
+        let record_filter = |raw: &[u8]| -> bool {
+            let flg = bam_fields::flags(raw);
             // Skip secondary and supplementary reads
-            if flags.is_secondary() || flags.is_supplementary() {
+            if flg & bam_fields::flags::SECONDARY != 0
+                || flg & bam_fields::flags::SUPPLEMENTARY != 0
+            {
                 return false;
             }
             // Only keep mapped reads or reads with mapped mates
-            let is_mapped = !flags.is_unmapped();
-            let has_mapped_mate = flags.is_segmented() && !flags.is_mate_unmapped();
+            let is_mapped = flg & bam_fields::flags::UNMAPPED == 0;
+            let has_mapped_mate =
+                flg & bam_fields::flags::PAIRED != 0 && flg & bam_fields::flags::MATE_UNMAPPED == 0;
             is_mapped || has_mapped_mate
         };
 
-        // MI transform: strip /A and /B suffixes for duplex grouping
-        let mi_transform = |mi: &str| extract_mi_base(mi).to_string();
+        // MI transform for raw bytes: strip /A and /B suffixes for duplex grouping
+        let mi_transform = |mi_bytes: &[u8]| -> String {
+            let mi_str = String::from_utf8_lossy(mi_bytes);
+            extract_mi_base(&mi_str).to_string()
+        };
 
         // Clone input_header before pipeline (needed for rejects writing)
         let rejects_header = input_header.clone();
+
+        // Set raw-byte mode GroupKeyConfig so decode step skips noodles parsing
+        let library_index = LibraryIndex::from_header(&input_header);
+        pipeline_config.group_key_config = Some(if let Some(ct) = cell_tag {
+            GroupKeyConfig::new_raw(library_index, ct)
+        } else {
+            GroupKeyConfig::new_raw_no_cell(library_index)
+        });
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -578,17 +611,17 @@ impl Duplex {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create MiGrouper with filter and transform ==========
+            // ========== grouper_fn: Create RawMiGrouper with filter and transform ==========
             move |_header: &Header| {
-                Box::new(MiGrouper::with_filter_and_transform(
+                Box::new(RawMiGrouper::with_filter_and_transform(
                     "MI",
                     batch_size,
                     record_filter,
                     mi_transform,
-                )) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
+                )) as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
             },
             // ========== process_fn: Duplex consensus calling ==========
-            move |batch: MiGroupBatch| -> io::Result<DuplexProcessedBatch> {
+            move |batch: RawMiGroupBatch| -> io::Result<DuplexProcessedBatch> {
                 // Create per-thread duplex consensus caller
                 let mut caller = DuplexConsensusCaller::new(
                     read_name_prefix.clone(),
@@ -617,31 +650,31 @@ impl Duplex {
                     None
                 };
 
-                let mut all_consensus = Vec::new();
+                let mut all_output = ConsensusOutput::default();
                 let mut all_rejects = Vec::new();
                 let mut batch_stats = ConsensusCallingStats::new();
                 let mut batch_overlapping = CorrectionStats::new();
                 let groups_count = batch.groups.len() as u64;
 
-                for MiGroup { mi, records: mut group_reads } in batch.groups {
+                for RawMiGroup { mi, records: mut group_reads } in batch.groups {
                     caller.clear();
 
-                    // Apply overlapping consensus if enabled (modifies in-place)
+                    // Apply overlapping consensus if enabled (modifies raw bytes in-place)
                     // Skip if group doesn't have both strands - no duplex possible anyway
                     if let Some(ref mut oc) = overlapping_caller {
-                        if DuplexConsensusCaller::has_both_strands(&group_reads) {
+                        if has_both_strands_raw(&group_reads) {
                             oc.reset_stats();
-                            if apply_overlapping_consensus(&mut group_reads, oc).is_err() {
+                            if apply_overlapping_consensus_raw(&mut group_reads, oc).is_err() {
                                 continue;
                             }
                             batch_overlapping.merge(oc.stats());
                         }
                     }
 
-                    // Call duplex consensus
-                    match caller.consensus_reads_from_sam_records(group_reads) {
-                        Ok(consensus_reads) => {
-                            all_consensus.extend(consensus_reads);
+                    // Call duplex consensus directly -- records are already raw bytes!
+                    match caller.consensus_reads(group_reads) {
+                        Ok(batch_output) => {
+                            all_output.extend(&batch_output);
                             batch_stats.merge(&caller.statistics());
                             if track_rejects {
                                 all_rejects.extend(caller.take_rejected_reads());
@@ -654,7 +687,7 @@ impl Duplex {
                 }
 
                 Ok(DuplexProcessedBatch {
-                    consensus_reads: all_consensus,
+                    consensus_output: all_output,
                     rejects: all_rejects,
                     groups_count,
                     stats: batch_stats,
@@ -667,7 +700,7 @@ impl Duplex {
             },
             // ========== serialize_fn: Serialize + collect metrics ==========
             move |processed: DuplexProcessedBatch,
-                  header: &Header,
+                  _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
                 // Collect metrics (lock-free)
@@ -678,8 +711,9 @@ impl Duplex {
                     rejects: processed.rejects,
                 });
 
-                // Serialize consensus reads
-                serialize_bam_records_into(&processed.consensus_reads, header, output)
+                let count = processed.consensus_output.count as u64;
+                output.extend_from_slice(&processed.consensus_output.data);
+                Ok(count)
             },
         )
         .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?;
@@ -688,7 +722,7 @@ impl Duplex {
         let mut total_groups = 0u64;
         let mut merged_stats = ConsensusCallingStats::new();
         let mut merged_overlapping_stats = CorrectionStats::new();
-        let mut all_rejects: Vec<RecordBuf> = Vec::new();
+        let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
         while let Some(metrics) = collected_metrics.pop() {
             total_groups += metrics.groups_processed;
@@ -701,7 +735,7 @@ impl Duplex {
             }
         }
 
-        // Write deferred rejects
+        // Write deferred rejects as raw BAM bytes
         if track_rejects && !all_rejects.is_empty() {
             if let Some(rejects_path) = &self.rejects_opts.rejects {
                 let writer_threads = self.threading.num_threads();
@@ -712,8 +746,13 @@ impl Duplex {
                     self.compression.compression_level,
                 )?;
                 if let Some(ref mut rw) = rejects_writer {
-                    for record in &all_rejects {
-                        rw.write_alignment_record(&rejects_header, record)
+                    for raw_record in &all_rejects {
+                        let block_size = raw_record.len() as u32;
+                        rw.get_mut()
+                            .write_all(&block_size.to_le_bytes())
+                            .context("Failed to write rejected read block size")?;
+                        rw.get_mut()
+                            .write_all(raw_record)
                             .context("Failed to write rejected read")?;
                     }
                     rw.finish(&rejects_header).context("Failed to finish rejects file")?;
@@ -751,13 +790,58 @@ impl Duplex {
     }
 }
 
+/// Check if a group of raw-byte BAM records has both /A and /B strands.
+///
+/// This is the raw-byte equivalent of `DuplexConsensusCaller::has_both_strands`.
+/// It examines the MI tag of each record to check for /A and /B suffixes.
+/// Returns `true` only if there is at least one read with /A suffix AND at least
+/// one read with /B suffix.
+fn has_both_strands_raw(records: &[Vec<u8>]) -> bool {
+    if records.len() < 2 {
+        return false;
+    }
+
+    let mut has_a = false;
+    let mut has_b = false;
+
+    for raw in records {
+        if let Some(mi_bytes) = bam_fields::find_string_tag_in_record(raw, b"MI") {
+            // Strip trailing NUL if present (raw BAM Z-tags may be NUL-terminated)
+            let mi_bytes = mi_bytes.strip_suffix(&[0]).unwrap_or(mi_bytes);
+            if mi_bytes.len() >= 2 {
+                let len = mi_bytes.len();
+                if mi_bytes[len - 2] == b'/' {
+                    match mi_bytes[len - 1] {
+                        b'A' => {
+                            has_a = true;
+                            if has_b {
+                                return true;
+                            }
+                        }
+                        b'B' => {
+                            has_b = true;
+                            if has_a {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Result;
-    use fgumi_lib::bam_io::create_bam_writer;
+    use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer};
     use fgumi_lib::sam::builder::{RecordBuilder, RecordPairBuilder};
     use noodles::sam;
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::data::field::Value;
     use noodles::sam::header::record::value::Map;
