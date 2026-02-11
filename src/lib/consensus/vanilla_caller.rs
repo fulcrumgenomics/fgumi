@@ -6,25 +6,24 @@
 
 use crate::clipper::cigar_utils::{self, SimplifiedCigar};
 use crate::consensus::base_builder::ConsensusBaseBuilder;
-use crate::consensus::caller::{ConsensusCaller, ConsensusCallingStats, RejectionReason};
+use crate::consensus::caller::{
+    ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
+};
 use crate::consensus::simple_umi::consensus_umis;
 use crate::dna::reverse_complement;
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
 };
-use crate::sam::{record_utils, to_smallest_signed_int};
+use crate::sort::bam_fields::{UnmappedBamRecordBuilder, flags};
 use anyhow::{Result, anyhow, bail};
-use bstr::BString;
-use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::data::field::Value;
-use noodles::sam::alignment::record_buf::{Data, QualityScores, RecordBuf, Sequence};
+#[cfg(test)]
+use noodles::sam::alignment::record_buf::RecordBuf;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Indexed source read for alignment filtering: (index, length, `simplified_cigar`)
 pub(crate) type IndexedSourceRead = (usize, usize, SimplifiedCigar);
@@ -139,15 +138,15 @@ pub(crate) struct SourceRead {
     pub(crate) quals: Vec<u8>,
     /// Simplified CIGAR (reversed if originally negative strand, truncated to trimmed length)
     pub(crate) simplified_cigar: SimplifiedCigar,
-    /// Optional reference to the original record for tag retrieval (Arc to avoid deep clones)
-    pub(crate) sam: Option<std::sync::Arc<RecordBuf>>,
+    /// Raw BAM flags from the original record (used by duplex caller for R1/R2 splitting)
+    pub(crate) flags: u16,
 }
 
 /// Vanilla consensus read - matches fgbio's `VanillaConsensusRead`
 ///
 /// This is the intermediate result of calling consensus on reads with the same UMI.
 /// It contains the consensus sequence, quality scores, and per-base depth/error counts.
-/// This struct is converted to a `RecordBuf` for BAM output via `consensus_read_to_record()`.
+/// This struct is converted to raw BAM bytes for output via `build_consensus_record_into()`.
 #[derive(Debug, Clone)]
 pub struct VanillaConsensusRead {
     /// Unique identifier (UMI)
@@ -356,8 +355,8 @@ pub struct VanillaUmiConsensusCaller {
     /// Random number generator for downsampling (seeded or thread-local)
     rng: StdRng,
 
-    /// Rejected reads (if tracking is enabled)
-    rejected_reads: Vec<RecordBuf>,
+    /// Rejected reads as raw bytes (if tracking is enabled)
+    rejected_reads: Vec<Vec<u8>>,
 
     /// Whether to track rejected reads
     track_rejects: bool,
@@ -366,6 +365,9 @@ pub struct VanillaUmiConsensusCaller {
     /// Maps input quality to output quality when only one read contributes.
     /// This accounts for the combined error from sequencing + UMI labeling.
     single_input_consensus_quals: Vec<u8>,
+
+    /// Reusable builder for raw-byte BAM record construction.
+    bam_builder: UnmappedBamRecordBuilder,
 }
 
 #[allow(
@@ -429,6 +431,7 @@ impl VanillaUmiConsensusCaller {
             rejected_reads: Vec::new(),
             track_rejects,
             single_input_consensus_quals,
+            bam_builder: UnmappedBamRecordBuilder::new(),
         }
     }
 
@@ -475,12 +478,12 @@ impl VanillaUmiConsensusCaller {
 
     /// Returns the rejected reads
     #[must_use]
-    pub fn rejected_reads(&self) -> &[RecordBuf] {
+    pub fn rejected_reads(&self) -> &[Vec<u8>] {
         &self.rejected_reads
     }
 
     /// Takes ownership of the rejected reads, leaving an empty Vec
-    pub fn take_rejected_reads(&mut self) -> Vec<RecordBuf> {
+    pub fn take_rejected_reads(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.rejected_reads)
     }
 
@@ -498,20 +501,71 @@ impl VanillaUmiConsensusCaller {
         self.rejected_reads.clear();
     }
 
-    /// Converts a SAM record to a `SourceRead` for use in alignment filtering and consensus calling.
-    /// This is the public wrapper for use by `DuplexConsensusCaller`.
-    ///
-    /// Returns None if the read has zero length after all transformations.
-    pub(crate) fn to_source_read(
+    /// Temporary bridge: converts a `RecordBuf` to a `SourceRead`.
+    /// Used by `DuplexConsensusCaller` until it is rewritten for raw bytes.
+    #[cfg(test)]
+    pub(crate) fn to_source_read_from_record(
         &self,
         read: &RecordBuf,
         original_idx: usize,
     ) -> Option<SourceRead> {
+        use crate::clipper::cigar_utils;
+        use crate::sam::record_utils;
+
         let mate_clip = record_utils::num_bases_extending_past_mate(read);
-        self.create_source_read(read, original_idx, mate_clip).map(|mut sr| {
-            sr.sam = Some(std::sync::Arc::new(read.clone()));
-            sr
-        })
+        let is_negative_strand = read.flags().is_reverse_complemented();
+        let min_bq = self.options.min_input_base_quality;
+
+        let mut bases: Vec<u8> = read.sequence().as_ref().to_vec();
+        let mut quals: Vec<u8> = read.quality_scores().as_ref().to_vec();
+        let read_len = bases.len();
+
+        if quals.is_empty() || quals.len() != read_len {
+            return None;
+        }
+
+        if is_negative_strand {
+            bases = reverse_complement(&bases);
+            quals.reverse();
+        }
+
+        let trim_to_length = if self.options.trim {
+            Self::find_quality_trim_point(&quals, min_bq)
+        } else {
+            read_len
+        };
+
+        bases[..trim_to_length].iter_mut().zip(quals[..trim_to_length].iter_mut()).for_each(
+            |(base, qual)| {
+                if *qual < min_bq {
+                    *base = NO_CALL_BASE;
+                    *qual = MIN_PHRED;
+                }
+            },
+        );
+
+        let clip_position = read_len.saturating_sub(mate_clip);
+        let mut final_len = clip_position.min(trim_to_length);
+
+        while final_len > 0 && bases[final_len - 1] == NO_CALL_BASE {
+            final_len -= 1;
+        }
+
+        if final_len == 0 {
+            return None;
+        }
+
+        bases.truncate(final_len);
+        quals.truncate(final_len);
+
+        let mut simplified_cigar = cigar_utils::simplify_cigar(read.cigar());
+        if is_negative_strand {
+            simplified_cigar = Self::reverse_simplified_cigar(&simplified_cigar);
+        }
+        simplified_cigar = Self::truncate_simplified_cigar(&simplified_cigar, final_len);
+
+        let flg = u16::from(read.flags());
+        Some(SourceRead { original_idx, bases, quals, simplified_cigar, flags: flg })
     }
 
     /// Filters `SourceReads` by common alignment pattern.
@@ -529,8 +583,7 @@ impl VanillaUmiConsensusCaller {
     /// This is used by `DuplexConsensusCaller` after combined X/Y filtering.
     ///
     /// Returns a `VanillaConsensusRead` containing the consensus data,
-    /// or None if consensus cannot be built. The consensus read can be
-    /// converted to a `RecordBuf` using `consensus_read_to_record()`.
+    /// or None if consensus cannot be built.
     pub(crate) fn consensus_call(
         &mut self,
         umi: &str,
@@ -538,15 +591,6 @@ impl VanillaUmiConsensusCaller {
     ) -> Result<Option<VanillaConsensusRead>> {
         if source_reads.is_empty() || source_reads.len() < self.options.min_reads {
             return Ok(None);
-        }
-
-        // Check that we have at least one original record (for tag preservation)
-        // This is a programming error - callers must ensure source_reads have sam set
-        let has_original = source_reads.iter().any(|sr| sr.sam.is_some());
-        if !has_original {
-            bail!(
-                "consensus_call requires at least one SourceRead with sam.is_some() for tag preservation"
-            );
         }
 
         // Build consensus from source reads
@@ -563,48 +607,16 @@ impl VanillaUmiConsensusCaller {
             source_reads: Some(source_reads),
         };
 
-        // Note: record_consensus() is called in process_group() when the read is actually
-        // added to the output. This ensures orphan consensus reads are not counted.
         Ok(Some(consensus_read))
     }
 
-    /// Converts a `VanillaConsensusRead` to a `RecordBuf` for BAM output.
-    ///
-    /// This is the second stage of the two-stage consensus calling process.
-    /// The `VanillaConsensusRead` from `consensus_call()` is converted to a
-    /// SAM/BAM record with appropriate flags, tags, and metadata.
-    ///
-    /// # Arguments
-    /// * `consensus` - The consensus read to convert
-    /// * `read_type` - Whether this is R1, R2, or a fragment read
-    /// * `original_reads` - Original reads for tag preservation (RX, cell tag, etc.)
-    pub(crate) fn consensus_read_to_record(
-        &mut self,
-        consensus: &VanillaConsensusRead,
-        read_type: ReadType,
-        original_reads: &[&RecordBuf],
-    ) -> Result<RecordBuf> {
-        // Get source reads from consensus if available
-        let empty_source_reads = Vec::new();
-        let source_reads = consensus.source_reads.as_ref().unwrap_or(&empty_source_reads);
+    /// Filters reads to remove secondary/supplementary alignments.
+    fn filter_reads(&mut self, reads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        use crate::sort::bam_fields;
 
-        self.build_consensus_record_from_source_reads(
-            &consensus.id,
-            read_type,
-            original_reads,
-            source_reads,
-            consensus.bases.clone(),
-            consensus.quals.clone(),
-            consensus.depths.clone(),
-            consensus.errors.clone(),
-        )
-    }
-
-    /// Filters reads to remove secondary/supplementary and check validity
-    fn filter_reads(&mut self, reads: Vec<RecordBuf>) -> Vec<RecordBuf> {
-        let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|read| {
-            let flags = read.flags();
-            !flags.is_secondary() && !flags.is_supplementary()
+        let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|raw| {
+            let flg = bam_fields::flags(raw);
+            flg & flags::SECONDARY == 0 && flg & flags::SUPPLEMENTARY == 0
         });
 
         if self.track_rejects {
@@ -615,7 +627,7 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Downsamples reads if there are more than `max_reads`
-    fn downsample_reads(&mut self, mut reads: Vec<RecordBuf>) -> Vec<RecordBuf> {
+    fn downsample_reads(&mut self, mut reads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         if let Some(max_reads) = self.options.max_reads {
             if reads.len() > max_reads {
                 reads.shuffle(&mut self.rng);
@@ -707,7 +719,7 @@ impl VanillaUmiConsensusCaller {
         result
     }
 
-    /// Creates a `SourceRead` from a `RecordBuf`, matching fgbio's toSourceRead logic.
+    /// Creates a `SourceRead` from raw BAM bytes, matching fgbio's toSourceRead logic.
     ///
     /// This applies:
     /// 1. Orientation normalization (RC for negative strand reads)
@@ -718,22 +730,23 @@ impl VanillaUmiConsensusCaller {
     /// 6. CIGAR transformation (reverse if negative strand, truncate to final length)
     ///
     /// Returns None if the final length is 0 (`ZeroPostAfterTrimming`).
-    fn create_source_read(
+    pub(crate) fn create_source_read(
         &self,
-        read: &RecordBuf,
+        raw: &[u8],
         original_idx: usize,
         mate_overlap_clip: usize,
     ) -> Option<SourceRead> {
-        let is_negative_strand = read.flags().is_reverse_complemented();
+        use crate::sort::bam_fields;
+
+        let flg = bam_fields::flags(raw);
+        let is_negative_strand = flg & flags::REVERSE != 0;
         let min_bq = self.options.min_input_base_quality;
 
-        // Get bases and quals
-        let mut bases: Vec<u8> = read.sequence().as_ref().to_vec();
-        let mut quals: Vec<u8> = read.quality_scores().as_ref().to_vec();
+        // Get bases and quals from raw bytes
+        let mut bases = bam_fields::extract_sequence(raw);
+        let mut quals = bam_fields::quality_scores_slice(raw).to_vec();
         let read_len = bases.len();
 
-        // If qualities are empty or don't match bases, return None
-        // (fgbio throws an exception in this case)
         if quals.is_empty() || quals.len() != read_len {
             return None;
         }
@@ -742,10 +755,9 @@ impl VanillaUmiConsensusCaller {
         if is_negative_strand {
             bases = reverse_complement(&bases);
             quals.reverse();
-            // Note: we reverse the cigar when we simplify
         }
 
-        // Quality trim the reads if requested (phred-style, from 3' end only)
+        // Quality trim if requested
         let trim_to_length = if self.options.trim {
             Self::find_quality_trim_point(&quals, min_bq)
         } else {
@@ -753,21 +765,17 @@ impl VanillaUmiConsensusCaller {
         };
 
         // Quality mask: set low quality bases to N with qual 2
-        // Only mask up to trim_to_length (matching fgbio's behavior)
-        // Iterator-based approach allows LLVM to eliminate bounds checks
         bases[..trim_to_length].iter_mut().zip(quals[..trim_to_length].iter_mut()).for_each(
             |(base, qual)| {
                 if *qual < min_bq {
                     *base = NO_CALL_BASE;
-                    *qual = MIN_PHRED; // NoCallQual
+                    *qual = MIN_PHRED;
                 }
             },
         );
 
         // Calculate trim position based on mate overlap
         let clip_position = read_len.saturating_sub(mate_overlap_clip);
-
-        // Final length before trailing N removal: min of mate clip and quality trim
         let mut final_len = clip_position.min(trim_to_length);
 
         // Remove trailing N's
@@ -775,33 +783,24 @@ impl VanillaUmiConsensusCaller {
             final_len -= 1;
         }
 
-        // Return None if no usable bases
         if final_len == 0 {
             return None;
         }
 
-        // Truncate bases and quals
         bases.truncate(final_len);
         quals.truncate(final_len);
 
-        // Get simplified CIGAR
-        let mut simplified_cigar = cigar_utils::simplify_cigar(read.cigar());
+        // Get simplified CIGAR from raw ops
+        let cigar_ops = bam_fields::get_cigar_ops(raw);
+        let mut simplified_cigar = bam_fields::simplify_cigar_from_raw(&cigar_ops);
 
-        // If negative strand, reverse the CIGAR (matching fgbio's behavior)
         if is_negative_strand {
             simplified_cigar = Self::reverse_simplified_cigar(&simplified_cigar);
         }
 
-        // Truncate CIGAR to the final query length
         simplified_cigar = Self::truncate_simplified_cigar(&simplified_cigar, final_len);
 
-        Some(SourceRead {
-            original_idx,
-            bases,
-            quals,
-            simplified_cigar,
-            sam: Some(std::sync::Arc::new(read.clone())),
-        })
+        Some(SourceRead { original_idx, bases, quals, simplified_cigar, flags: flg })
     }
 
     /// Filters `SourceReads` to only include those with the most common alignment pattern.
@@ -862,46 +861,44 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Sub-groups reads by read type (fragment, R1, R2)
-    fn subgroup_reads(&self, reads: Vec<RecordBuf>) -> HashMap<ReadType, Vec<RecordBuf>> {
-        let mut groups: HashMap<ReadType, Vec<RecordBuf>> = HashMap::new();
+    #[allow(clippy::type_complexity)]
+    fn subgroup_reads(&self, reads: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        use crate::sort::bam_fields;
 
-        for read in reads {
-            let read_type = if !read.flags().is_segmented() {
-                ReadType::Fragment
-            } else if read.flags().is_first_segment() {
-                ReadType::R1
-            } else if read.flags().is_last_segment() {
-                ReadType::R2
-            } else {
-                // Skip reads with unclear pairing
-                continue;
-            };
+        let mut fragment_reads = Vec::new();
+        let mut r1_reads = Vec::new();
+        let mut r2_reads = Vec::new();
 
-            groups.entry(read_type).or_default().push(read);
+        for raw in reads {
+            let flg = bam_fields::flags(&raw);
+            if flg & flags::PAIRED == 0 {
+                fragment_reads.push(raw);
+            } else if flg & flags::FIRST_SEGMENT != 0 {
+                r1_reads.push(raw);
+            } else if flg & flags::LAST_SEGMENT != 0 {
+                r2_reads.push(raw);
+            }
         }
 
-        groups
+        (fragment_reads, r1_reads, r2_reads)
     }
 
     /// Processes a single UMI group to produce consensus reads
-    fn process_group(&mut self, umi: &str, mut reads: Vec<RecordBuf>) -> Result<Vec<RecordBuf>> {
-        let input_count = reads.len();
+    fn process_group(&mut self, umi: &str, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+        let input_count = records.len();
         self.stats.record_input(input_count);
 
         // Filter reads
-        let pre_filter_count = reads.len();
-        reads = self.filter_reads(reads);
+        let pre_filter_count = records.len();
+        let mut reads = self.filter_reads(records);
         let filtered_count = pre_filter_count - reads.len();
         if filtered_count > 0 {
             self.stats.record_rejection(RejectionReason::SecondaryOrSupplementary, filtered_count);
         }
 
         if reads.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
-
-        // Note: Quality trimming (if enabled via options.trim) is now applied
-        // inside create_source_read using phred-style trimming, matching fgbio's behavior
 
         // Check minimum read requirement
         if reads.len() < self.options.min_reads {
@@ -909,118 +906,101 @@ impl VanillaUmiConsensusCaller {
             if self.track_rejects {
                 self.rejected_reads.extend(reads);
             }
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
 
         // Downsample if necessary
         reads = self.downsample_reads(reads);
 
         // Sub-group by read type
-        let subgroups = self.subgroup_reads(reads);
+        let (fragment_reads, r1_reads, r2_reads) = self.subgroup_reads(reads);
 
-        // Separate fragment reads from paired reads (R1/R2)
-        let fragment_reads = subgroups.get(&ReadType::Fragment).cloned().unwrap_or_default();
-        let r1_reads = subgroups.get(&ReadType::R1).cloned().unwrap_or_default();
-        let r2_reads = subgroups.get(&ReadType::R2).cloned().unwrap_or_default();
-
-        // Track original read counts before filtering (for OrphanConsensus stats matching fgbio)
         let original_r1_count = r1_reads.len();
         let original_r2_count = r2_reads.len();
 
-        // Process each subgroup and collect results
-        let fragment_consensus = self.process_subgroup(umi, ReadType::Fragment, fragment_reads)?;
-        let r1_consensus = self.process_subgroup(umi, ReadType::R1, r1_reads.clone())?;
-        let r2_consensus = self.process_subgroup(umi, ReadType::R2, r2_reads.clone())?;
+        let mut output = ConsensusOutput::default();
 
-        // Build final consensus reads with OrphanConsensus check
-        // Pre-allocate: max 3 consensus reads (fragment + R1 + R2)
-        let mut consensus_reads = Vec::with_capacity(3);
-
-        // Add fragment consensus (no orphan check needed)
-        if let Some(rec) = fragment_consensus {
+        // Process fragment subgroup
+        let fragment_ok =
+            self.process_subgroup(&mut output, umi, ReadType::Fragment, fragment_reads)?;
+        if fragment_ok {
             self.stats.record_consensus();
-            consensus_reads.push(rec);
         }
 
-        // For paired reads, both R1 and R2 must have consensus (OrphanConsensus check)
-        match (r1_consensus, r2_consensus) {
-            (Some(r1), Some(r2)) => {
-                // Both R1 and R2 have consensus - output both
+        // Process R1/R2 subgroups
+        let mut r1r2_output = ConsensusOutput::default();
+        let r1_reads_clone = if self.track_rejects { r1_reads.clone() } else { Vec::new() };
+        let r2_reads_clone = if self.track_rejects { r2_reads.clone() } else { Vec::new() };
+        let r1_ok = self.process_subgroup(&mut r1r2_output, umi, ReadType::R1, r1_reads)?;
+        let r2_ok = self.process_subgroup(&mut r1r2_output, umi, ReadType::R2, r2_reads)?;
+
+        match (r1_ok, r2_ok) {
+            (true, true) => {
                 self.stats.record_consensus();
                 self.stats.record_consensus();
-                consensus_reads.push(r1);
-                consensus_reads.push(r2);
+                output.extend(&r1r2_output);
             }
-            (Some(_), None) => {
-                // Only R1 has consensus - reject ALL original R1 reads as orphan (matching fgbio)
+            (true, false) => {
                 self.stats.record_rejection(RejectionReason::OrphanConsensus, original_r1_count);
                 if self.track_rejects {
-                    self.rejected_reads.extend(r1_reads);
+                    self.rejected_reads.extend(r1_reads_clone);
                 }
             }
-            (None, Some(_)) => {
-                // Only R2 has consensus - reject ALL original R2 reads as orphan (matching fgbio)
+            (false, true) => {
                 self.stats.record_rejection(RejectionReason::OrphanConsensus, original_r2_count);
                 if self.track_rejects {
-                    self.rejected_reads.extend(r2_reads);
+                    self.rejected_reads.extend(r2_reads_clone);
                 }
             }
-            (None, None) => {
-                // Neither has consensus - already rejected in process_subgroup
-            }
+            (false, false) => {}
         }
 
-        Ok(consensus_reads)
+        Ok(output)
     }
 
-    /// Processes a single subgroup (Fragment, R1, or R2) and returns the consensus record if successful.
-    ///
-    /// This follows fgbio's order of operations:
-    /// 1. Calculate mate overlap clips (using original records)
-    /// 2. Create `SourceReads` (normalize orientation, quality mask, mate trim, trailing N removal)
-    /// 3. Filter `SourceReads` by common alignment (using transformed lengths and CIGARs)
-    /// 4. Build consensus from filtered `SourceReads`
+    /// Processes a single subgroup (Fragment, R1, or R2) and writes the consensus record
+    /// into the output buffer if successful. Returns `true` if a consensus was produced.
     fn process_subgroup(
         &mut self,
+        output: &mut ConsensusOutput,
         umi: &str,
         read_type: ReadType,
-        group_reads: Vec<RecordBuf>,
-    ) -> Result<Option<RecordBuf>> {
+        group_reads: Vec<Vec<u8>>,
+    ) -> Result<bool> {
+        use crate::sort::bam_fields;
+
         if group_reads.is_empty() {
-            return Ok(None);
+            return Ok(false);
         }
 
-        // Check if we have enough reads initially
         if group_reads.len() < self.options.min_reads {
             self.stats.record_rejection(RejectionReason::InsufficientReads, group_reads.len());
             if self.track_rejects {
                 self.rejected_reads.extend(group_reads);
             }
-            return Ok(None);
+            return Ok(false);
         }
 
-        // Step 1: Calculate mate overlap clips for each read (using original records)
-        // This must be done BEFORE normalization since it uses the original strand info
-        let mate_overlap_clips: Vec<usize> =
-            group_reads.iter().map(record_utils::num_bases_extending_past_mate).collect();
+        // Calculate mate overlap clips from raw bytes
+        let mate_overlap_clips: Vec<usize> = group_reads
+            .iter()
+            .map(|raw| bam_fields::num_bases_extending_past_mate_raw(raw))
+            .collect();
 
-        // Step 2: Create SourceReads from all reads
-        // This applies: orientation normalization, quality masking, mate trimming, trailing N removal
+        // Create SourceReads from raw bytes
         let mut source_reads: Vec<SourceRead> = Vec::new();
         let mut zero_length_indices: Vec<usize> = Vec::new();
 
-        for (idx, (read, &mate_clip)) in
+        for (idx, (raw, &mate_clip)) in
             group_reads.iter().zip(mate_overlap_clips.iter()).enumerate()
         {
-            if let Some(sr) = self.create_source_read(read, idx, mate_clip) {
+            if let Some(sr) = self.create_source_read(raw, idx, mate_clip) {
                 source_reads.push(sr);
             } else {
-                // Read was rejected due to zero length after trimming
                 zero_length_indices.push(idx);
             }
         }
 
-        // Record rejections for zero-length reads
         if !zero_length_indices.is_empty() {
             self.stats.record_rejection(
                 RejectionReason::ZeroLengthAfterTrimming,
@@ -1033,7 +1013,6 @@ impl VanillaUmiConsensusCaller {
             }
         }
 
-        // Check if we have enough reads after zero-length filtering
         if source_reads.len() < self.options.min_reads {
             if !source_reads.is_empty() {
                 self.stats.record_rejection(RejectionReason::InsufficientReads, source_reads.len());
@@ -1043,22 +1022,19 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok(None);
+            return Ok(false);
         }
 
-        // Step 3: Filter SourceReads by common alignment
-        // This uses the transformed lengths and CIGARs (matching fgbio's behavior)
+        // Filter by alignment
         let (filtered_source_reads, rejected_indices) =
             self.filter_source_reads_by_alignment(source_reads);
 
-        // Track rejected reads from alignment filtering
         if self.track_rejects {
             for idx in rejected_indices {
                 self.rejected_reads.push(group_reads[idx].clone());
             }
         }
 
-        // Check if we have enough reads after alignment filtering
         if filtered_source_reads.len() < self.options.min_reads {
             if !filtered_source_reads.is_empty() {
                 self.stats.record_rejection(
@@ -1071,28 +1047,31 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok(None);
+            return Ok(false);
         }
 
-        // Step 4: Build consensus using two-stage approach (matching fgbio)
-        // First stage: consensus_call returns VanillaConsensusRead
-        let Some(consensus) = self.consensus_call(umi, filtered_source_reads)? else {
-            return Ok(None);
-        };
+        // Build consensus from source reads
+        let (bases, quals, depths, errors) =
+            self.create_consensus_from_source_reads(&filtered_source_reads)?;
 
-        // Build consensus record (we need the original reads for tag preservation)
-        // Get original reads from the SourceReads' sam field
-        let original_reads: Vec<&RecordBuf> = consensus
-            .source_reads
-            .as_ref()
-            .map(|srs| srs.iter().filter_map(|sr| sr.sam.as_ref().map(AsRef::as_ref)).collect())
-            .unwrap_or_default();
+        // Get raw records for tag extraction
+        let original_raws: Vec<&[u8]> = filtered_source_reads
+            .iter()
+            .map(|sr| group_reads[sr.original_idx].as_slice())
+            .collect();
 
-        // Second stage: consensus_read_to_record converts to RecordBuf
-        let consensus_record =
-            self.consensus_read_to_record(&consensus, read_type, &original_reads)?;
+        self.build_consensus_record_into(
+            output,
+            umi,
+            read_type,
+            &original_raws,
+            &bases,
+            &quals,
+            &depths,
+            &errors,
+        )?;
 
-        Ok(Some(consensus_record))
+        Ok(true)
     }
 
     /// Creates consensus from `SourceReads` (which already have transformed bases/quals).
@@ -1111,6 +1090,11 @@ impl VanillaUmiConsensusCaller {
         let mut lengths: Vec<usize> = source_reads.iter().map(|sr| sr.bases.len()).collect();
         lengths.sort_by(|a, b| b.cmp(a)); // Sort descending
         let min_reads = self.options.min_reads;
+        debug_assert!(
+            min_reads <= source_reads.len(),
+            "min_reads ({min_reads}) exceeds source_reads count ({})",
+            source_reads.len()
+        );
         let consensus_len = lengths[min_reads - 1];
 
         let mut consensus_bases = Vec::with_capacity(consensus_len);
@@ -1201,162 +1185,124 @@ impl VanillaUmiConsensusCaller {
         Ok((consensus_bases, consensus_quals, depths, errors))
     }
 
-    /// Builds a consensus record from `SourceReads`.
+    /// Builds a consensus record as raw BAM bytes and writes it into a `ConsensusOutput`.
     #[allow(clippy::too_many_arguments)]
-    fn build_consensus_record_from_source_reads(
+    fn build_consensus_record_into(
         &mut self,
+        output: &mut ConsensusOutput,
         umi: &str,
         read_type: ReadType,
-        original_reads: &[&RecordBuf],
-        _source_reads: &[SourceRead],
-        bases: Vec<u8>,
-        quals: Vec<PhredScore>,
-        depths: Vec<u16>,
-        errors: Vec<u16>,
-    ) -> Result<RecordBuf> {
-        // Generate read name: prefix:UMI (matches fgbio format)
+        original_raws: &[&[u8]],
+        bases: &[u8],
+        quals: &[u8],
+        depths: &[u16],
+        errors: &[u16],
+    ) -> Result<()> {
+        use crate::sort::bam_fields;
+
         let read_name = format!("{}:{}", self.read_name_prefix, umi);
 
-        // Set flags based on read type
-        let mut flags = Flags::empty();
+        let mut flag = flags::UNMAPPED;
         match read_type {
             ReadType::R1 => {
-                flags.insert(Flags::SEGMENTED);
-                flags.insert(Flags::FIRST_SEGMENT);
-                flags.insert(Flags::MATE_UNMAPPED); // Mate (R2) is also unmapped
+                flag |= flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED;
             }
             ReadType::R2 => {
-                flags.insert(Flags::SEGMENTED);
-                flags.insert(Flags::LAST_SEGMENT);
-                flags.insert(Flags::MATE_UNMAPPED); // Mate (R1) is also unmapped
+                flag |= flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_UNMAPPED;
             }
-            ReadType::Fragment => {} // No flags for fragment reads
+            ReadType::Fragment => {}
         }
-        flags.insert(Flags::UNMAPPED);
 
-        // Calculate depth statistics
-        let max_depth = *depths.iter().max().unwrap_or(&0);
-        let min_depth = *depths.iter().min().unwrap_or(&0);
+        self.bam_builder.build_record(read_name.as_bytes(), flag, bases, quals);
 
-        // Calculate error rate
+        // RG tag
+        self.bam_builder.append_string_tag(b"RG", self.read_group_id.as_bytes());
+
+        // Consensus summary tags: cD, cM, cE
+        let max_depth = i32::from(*depths.iter().max().unwrap_or(&0));
+        let min_depth = i32::from(*depths.iter().min().unwrap_or(&0));
         let total_errors: u64 = errors.iter().map(|&e| u64::from(e)).sum();
         let total_depth: u64 = depths.iter().map(|&d| u64::from(d)).sum();
         let error_rate =
             if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
 
-        // Build data tags
-        let mut data = Data::default();
+        self.bam_builder.append_int_tag(b"cD", max_depth);
+        self.bam_builder.append_int_tag(b"cM", min_depth);
+        self.bam_builder.append_float_tag(b"cE", error_rate);
 
-        // Add read group
-        let rg_tag = Tag::READ_GROUP;
-        data.insert(rg_tag, Value::from(self.read_group_id.as_str()));
-
-        // Add consensus tags (cD, cM, cE)
-        let consensus_depth_tag = Tag::from([b'c', b'D']);
-        let consensus_min_depth_tag = Tag::from([b'c', b'M']);
-        let consensus_error_rate_tag = Tag::from([b'c', b'E']);
-
-        data.insert(consensus_depth_tag, to_smallest_signed_int(i32::from(max_depth)));
-        data.insert(consensus_min_depth_tag, to_smallest_signed_int(i32::from(min_depth)));
-        data.insert(consensus_error_rate_tag, Value::from(error_rate));
-
-        // Add per-base tags if requested
+        // Per-base tags if requested: cd, ce
         if self.options.produce_per_base_tags {
-            let cd_tag = Tag::from([b'c', b'd']);
-            let ce_tag = Tag::from([b'c', b'e']);
-
-            let depth_array: Vec<i16> = depths.iter().map(|&d| d as i16).collect();
-            let error_array: Vec<i16> = errors.iter().map(|&e| e as i16).collect();
-
-            data.insert(cd_tag, Value::from(depth_array));
-            data.insert(ce_tag, Value::from(error_array));
+            let depth_i16: Vec<i16> =
+                depths.iter().map(|&d| d.min(i16::MAX as u16) as i16).collect();
+            let error_i16: Vec<i16> =
+                errors.iter().map(|&e| e.min(i16::MAX as u16) as i16).collect();
+            self.bam_builder.append_i16_array_tag(b"cd", &depth_i16);
+            self.bam_builder.append_i16_array_tag(b"ce", &error_i16);
         }
 
-        // Preserve UMI tag (MI)
-        let mi_tag = Tag::from([b'M', b'I']);
-        data.insert(mi_tag, Value::from(umi));
+        // MI tag
+        self.bam_builder.append_string_tag(b"MI", umi.as_bytes());
 
-        // Preserve cell barcode tag if configured and present
+        // Cell barcode tag (if configured and present in original reads)
         if let Some(cell_tag) = self.options.cell_tag {
-            if let Some(first_read) = original_reads.first() {
-                if let Some(cell_value) = first_read.data().get(&cell_tag) {
-                    data.insert(cell_tag, cell_value.clone());
+            if let Some(first_raw) = original_raws.first() {
+                let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
+                if let Some(value) = bam_fields::find_string_tag_in_record(first_raw, &tag_bytes) {
+                    self.bam_builder.append_string_tag(&tag_bytes, value);
                 }
             }
         }
 
-        // Consensus call the RX (UMI) tags from all reads
-        // This matches fgbio's behavior of calling consensus on all UMIs in the group
-        let rx_tag = Tag::from([b'R', b'X']);
-        let umis: Vec<String> = original_reads
+        // RX tag — consensus UMI from all reads
+        let umis: Vec<String> = original_raws
             .iter()
-            .filter_map(|read| {
-                read.data().get(&rx_tag).and_then(|v| match v {
-                    Value::String(s) => Some(s.to_string()),
-                    _ => None,
-                })
+            .filter_map(|raw| {
+                bam_fields::find_string_tag_in_record(raw, b"RX")
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
             })
             .collect();
 
         if !umis.is_empty() {
             let consensus_umi = consensus_umis(&umis);
-            data.insert(rx_tag, Value::from(consensus_umi));
+            self.bam_builder.append_string_tag(b"RX", consensus_umi.as_bytes());
         }
 
-        // Build the record
-        // Note: MAPQ should be 0 for unmapped reads per SAM spec
-        let record = RecordBuf::builder()
-            .set_name(BString::from(read_name))
-            .set_flags(flags)
-            .set_mapping_quality(noodles::sam::alignment::record::MappingQuality::new(0).unwrap())
-            .set_sequence(Sequence::from(bases))
-            .set_quality_scores(QualityScores::from(quals))
-            .set_data(data)
-            .build();
+        // Write record with block_size prefix
+        self.bam_builder.write_with_block_size(&mut output.data);
+        output.count += 1;
 
-        // Note: consensus is already recorded in consensus_call, so don't record here
-
-        Ok(record)
+        Ok(())
     }
 }
 
 impl ConsensusCaller for VanillaUmiConsensusCaller {
-    fn consensus_reads_from_sam_records(
-        &mut self,
-        reads: Vec<RecordBuf>,
-    ) -> Result<Vec<RecordBuf>> {
-        // Extract UMI from first read (all should have same UMI)
-        let umi = if let Some(first_read) = reads.first() {
-            let read_name = first_read.name().map_or_else(
-                || "unknown".to_string(),
-                |n| String::from_utf8_lossy(n.as_ref()).to_string(),
-            );
+    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+        use crate::sort::bam_fields;
 
-            // Convert tag string to Tag bytes
-            let tag_bytes = self.options.tag.as_bytes();
-            if tag_bytes.len() != 2 {
-                bail!("Tag '{}' must be exactly 2 characters", self.options.tag);
-            }
-            let tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
+        if records.is_empty() {
+            return Ok(ConsensusOutput::default());
+        }
 
-            let tag_value = first_read.data().get(&tag).ok_or_else(|| {
+        // Extract UMI from first record
+        let tag_bytes = self.options.tag.as_bytes();
+        if tag_bytes.len() != 2 {
+            bail!("Tag '{}' must be exactly 2 characters", self.options.tag);
+        }
+        let tag_key = [tag_bytes[0], tag_bytes[1]];
+
+        // Safe to unwrap: records.is_empty() is checked above
+        let first_raw = records.first().unwrap();
+        let read_name_bytes = bam_fields::read_name(first_raw);
+        let read_name = String::from_utf8_lossy(read_name_bytes);
+
+        let tag_value =
+            bam_fields::find_string_tag_in_record(first_raw, &tag_key).ok_or_else(|| {
                 anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name)
             })?;
 
-            match tag_value {
-                Value::String(s) => s.to_string(),
-                _ => bail!(
-                    "UMI tag '{}' for read '{}' must be a string, found {:?}",
-                    self.options.tag,
-                    read_name,
-                    std::mem::discriminant(tag_value)
-                ),
-            }
-        } else {
-            return Ok(Vec::new());
-        };
+        let umi = String::from_utf8_lossy(tag_value).into_owned();
 
-        self.process_group(&umi, reads)
+        self.process_group(&umi, records)
     }
 
     fn total_reads(&self) -> usize {
@@ -1403,10 +1349,43 @@ pub(crate) enum ReadType {
 mod tests {
     use super::*;
     use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
+    use crate::sam::record_utils;
+    use crate::sort::bam_fields::ParsedBamRecord;
+    use bstr::BString;
     use noodles::core::Position;
+    use noodles::sam::alignment::record::Flags as NoodlesFlags;
     use noodles::sam::alignment::record::cigar::op::Op;
-    use noodles::sam::alignment::record::data::field::Tag as RecordTag;
-    use noodles::sam::alignment::record_buf::Cigar;
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence, data::field::Value};
+
+    /// Build a SAM header with a dummy reference sequence so that records
+    /// with `reference_sequence_id(0)` or `mate_reference_sequence_id(0)` can be encoded.
+    fn test_header() -> noodles::sam::Header {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+        let ref_seq =
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(1_000_000).expect("non-zero"));
+        noodles::sam::Header::builder().add_reference_sequence("chr1", ref_seq).build()
+    }
+
+    /// Encode a `RecordBuf` into raw BAM bytes for use with the raw-byte API.
+    fn encode_to_raw(rec: &RecordBuf) -> Vec<u8> {
+        let header = test_header();
+        let mut buf = Vec::new();
+        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec).unwrap();
+        buf
+    }
+
+    /// Encode a batch of `RecordBuf` records and run `consensus_reads` directly,
+    /// bypassing the bridge function that uses a headerless default.
+    fn consensus_reads_from_records(
+        caller: &mut VanillaUmiConsensusCaller,
+        records: Vec<RecordBuf>,
+    ) -> anyhow::Result<ConsensusOutput> {
+        let raw: Vec<Vec<u8>> = records.iter().map(encode_to_raw).collect();
+        caller.consensus_reads(raw)
+    }
 
     fn create_test_read(
         name: &str,
@@ -1556,9 +1535,9 @@ mod tests {
         let mut read2 = create_test_read("read2", b"ACGT", b"####", false, false);
 
         // Mark read2 as secondary
-        *read2.flags_mut() = Flags::SECONDARY;
+        *read2.flags_mut() = NoodlesFlags::SECONDARY;
 
-        let filtered = caller.filter_reads(vec![read1, read2]);
+        let filtered = caller.filter_reads(vec![encode_to_raw(&read1), encode_to_raw(&read2)]);
         assert_eq!(filtered.len(), 1);
     }
 
@@ -1572,12 +1551,16 @@ mod tests {
         let r1 = create_test_read("r1", b"ACGT", b"####", true, true);
         let r2 = create_test_read("r2", b"ACGT", b"####", true, false);
 
-        let groups = caller.subgroup_reads(vec![fragment, r1, r2]);
+        let (frag_reads, r1_reads, r2_reads) = caller.subgroup_reads(vec![
+            encode_to_raw(&fragment),
+            encode_to_raw(&r1),
+            encode_to_raw(&r2),
+        ]);
 
-        assert_eq!(groups.len(), 3);
-        assert!(groups.contains_key(&ReadType::Fragment));
-        assert!(groups.contains_key(&ReadType::R1));
-        assert!(groups.contains_key(&ReadType::R2));
+        // Should have one read in each subgroup
+        assert_eq!(frag_reads.len(), 1, "Should have 1 fragment read");
+        assert_eq!(r1_reads.len(), 1, "Should have 1 R1 read");
+        assert_eq!(r2_reads.len(), 1, "Should have 1 R2 read");
     }
 
     #[test]
@@ -1591,36 +1574,17 @@ mod tests {
         let read2 = create_test_read("r2", b"ACGT", b"####", false, false);
         let read3 = create_test_read("r3", b"ACGT", b"####", false, false);
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2, read3]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Check sequence
-        assert_eq!(consensus.sequence().as_ref(), b"ACGT");
+        assert_eq!(consensus.bases, b"ACGT");
 
         // Check tags
-        let data = consensus.data();
-        let cd_tag = RecordTag::from([b'c', b'D']);
-
-        // The value type will be the smallest integer type that fits
-        match data.get(&cd_tag) {
-            Some(Value::UInt8(count)) => {
-                assert_eq!(*count, 3);
-            }
-            Some(Value::Int8(count)) => {
-                assert_eq!(*count, 3);
-            }
-            Some(Value::Int32(count)) => {
-                assert_eq!(*count, 3);
-            }
-            Some(Value::UInt32(count)) => {
-                assert_eq!(*count, 3);
-            }
-            other => {
-                panic!("Missing or wrong type for cD tag: {other:?}");
-            }
-        }
+        assert_eq!(consensus.get_int_tag(b"cD").unwrap(), 3);
     }
 
     #[test]
@@ -1632,13 +1596,15 @@ mod tests {
         let read1 = create_test_read("r1", b"ACGT", b"####", false, false);
         let read2 = create_test_read("r2", b"ACGT", b"####", false, false);
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 0);
+        assert_eq!(output.count, 0);
     }
 
     #[test]
     fn test_deterministic_downsampling() {
+        use crate::sort::bam_fields;
+
         // Test that downsampling with a seed produces deterministic results
         let seed = 42u64;
         let options = VanillaUmiConsensusOptions {
@@ -1653,7 +1619,7 @@ mod tests {
         for i in 0..10 {
             let name = format!("read{i}");
             let read = create_test_read(&name, b"ACGT", b"####", false, false);
-            reads.push(read);
+            reads.push(encode_to_raw(&read));
         }
 
         // Create two callers with the same seed
@@ -1675,7 +1641,10 @@ mod tests {
 
         // Both should select the same reads in the same order
         for i in 0..3 {
-            assert_eq!(downsampled1[i].name(), downsampled2[i].name());
+            assert_eq!(
+                bam_fields::read_name(&downsampled1[i]),
+                bam_fields::read_name(&downsampled2[i])
+            );
         }
     }
 
@@ -1694,7 +1663,7 @@ mod tests {
         for i in 0..10 {
             let name = format!("read{i}");
             let read = create_test_read(&name, b"ACGT", b"####", false, false);
-            reads.push(read);
+            reads.push(encode_to_raw(&read));
         }
 
         let mut caller =
@@ -1916,18 +1885,18 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Check sequence matches
-        assert_eq!(consensus.sequence().as_ref(), b"GATTACA");
+        assert_eq!(consensus.bases, b"GATTACA");
 
         // Check that quality scores are higher than input (due to depth)
         // With two Q10 reads agreeing, consensus quality should be higher than Q10
-        let consensus_quals = consensus.quality_scores();
-        for &q in consensus_quals.as_ref() {
+        for &q in &consensus.quals {
             assert!(q > 10, "Expected consensus qual > 10 with two agreeing reads, got {q}");
         }
     }
@@ -1951,20 +1920,19 @@ mod tests {
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
         let read3 = create_consensus_test_read("r3", b"GATTTCA", &quals, "UMI1"); // T instead of A at pos 4
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2, read3]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Consensus should be GATTACA (2 vs 1)
-        assert_eq!(consensus.sequence().as_ref(), b"GATTACA");
+        assert_eq!(consensus.bases, b"GATTACA");
 
         // Quality at disagreeing position should be lower
-        let consensus_quals: Vec<u8> = consensus.quality_scores().as_ref().to_vec();
-
         // Position 4 has disagreement, should have lower quality
-        let agreeing_qual = consensus_quals[0]; // Position 0 - all agree
-        let disagreeing_qual = consensus_quals[4]; // Position 4 - one disagrees
+        let agreeing_qual = consensus.quals[0]; // Position 0 - all agree
+        let disagreeing_qual = consensus.quals[4]; // Position 4 - one disagrees
 
         assert!(
             disagreeing_qual < agreeing_qual,
@@ -1990,19 +1958,20 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals7, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTAC", &quals6, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Consensus should be 6 bases (length where minReads=2 is satisfied)
         assert_eq!(
-            consensus.sequence().as_ref().len(),
+            consensus.bases.len(),
             6,
             "Expected consensus length 6, got {}",
-            consensus.sequence().as_ref().len()
+            consensus.bases.len()
         );
-        assert_eq!(consensus.sequence().as_ref(), b"GATTAC");
+        assert_eq!(consensus.bases, b"GATTAC");
     }
 
     /// Port of fgbio test: "produce a consensus even when most of the bases have < minReads"
@@ -2023,19 +1992,20 @@ mod tests {
         let read1 = create_consensus_test_read("r1", &[b'A'; 10], &quals10, "UMI1");
         let read2 = create_consensus_test_read("r2", &[b'A'; 20], &quals20, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Should produce 10bp consensus (not 20bp with Ns)
         assert_eq!(
-            consensus.sequence().as_ref().len(),
+            consensus.bases.len(),
             10,
             "Expected 10bp consensus (truncated at minReads coverage)"
         );
         // Should be all A's, not contain N's
-        assert_eq!(consensus.sequence().as_ref(), &vec![b'A'; 10]);
+        assert_eq!(consensus.bases, vec![b'A'; 10]);
     }
 
     /// Port of fgbio test: "mask bases with too low of a consensus quality"
@@ -2056,18 +2026,17 @@ mod tests {
         let quals: Vec<u8> = vec![10, 10, 10, 10, 10, 10, 5];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Last base should be masked to N
-        let seq = consensus.sequence().as_ref();
-        assert_eq!(seq[6], b'N', "Expected last base to be N due to low quality");
+        assert_eq!(consensus.bases[6], b'N', "Expected last base to be N due to low quality");
 
         // Last base quality should be TooLowQualityQual (2)
-        let quals_out = consensus.quality_scores().as_ref();
-        assert_eq!(quals_out[6], 2, "Expected masked base qual to be 2");
+        assert_eq!(consensus.quals[6], 2, "Expected masked base qual to be 2");
     }
 
     /// Port of fgbio test: "apply the pre-umi-error-rate when it has probability zero"
@@ -2088,14 +2057,14 @@ mod tests {
         let quals = vec![10u8; 7];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // With zero error rate adjustment, qualities should be close to input
-        let consensus_quals = consensus.quality_scores().as_ref();
-        for (i, &q) in consensus_quals.iter().enumerate() {
+        for (i, &q) in consensus.quals.iter().enumerate() {
             // Should be very close to 10 (within 1 due to rounding)
             assert!(
                 (i32::from(q) - 10).abs() <= 1,
@@ -2122,15 +2091,15 @@ mod tests {
         let quals = vec![10u8; 7];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // With Q10 error rate combined with Q10 input, output should be lower than Q10
         // The probabilityOfErrorTwoTrials formula gives combined error
-        let consensus_quals = consensus.quality_scores().as_ref();
-        for (i, &q) in consensus_quals.iter().enumerate() {
+        for (i, &q) in consensus.quals.iter().enumerate() {
             // Output should be less than input Q10 due to error rate adjustment
             assert!(q < 10, "Position {i}: expected qual < 10 with positive error rate, got {q}");
         }
@@ -2154,14 +2123,14 @@ mod tests {
         let quals = vec![10u8; 7];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // With Q10 post-UMI error rate combined with Q10 input, output should be different
-        let consensus_quals = consensus.quality_scores().as_ref();
-        for (i, &q) in consensus_quals.iter().enumerate() {
+        for (i, &q) in consensus.quals.iter().enumerate() {
             // Output should be affected by error rate
             assert!(q < 10, "Position {i}: expected qual < 10 with post-UMI error rate, got {q}");
         }
@@ -2188,17 +2157,17 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals_low, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals_high, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Consensus should be GATTACA (from the high-quality read)
-        assert_eq!(consensus.sequence().as_ref(), b"GATTACA");
+        assert_eq!(consensus.bases, b"GATTACA");
 
         // Quality should be approximately Q30 (only one read contributed)
-        let consensus_quals = consensus.quality_scores().as_ref();
-        for &q in consensus_quals {
+        for &q in &consensus.quals {
             assert!(q <= 35, "Expected quals around 30 (single contributing read), got {q}");
         }
     }
@@ -2227,76 +2196,42 @@ mod tests {
         bases4[5] = b'C';
         let read4 = create_consensus_test_read("r4", &bases4, &quals, "UMI1");
 
-        let result =
-            caller.consensus_reads_from_sam_records(vec![read1, read2, read3, read4]).unwrap();
+        let output =
+            consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Consensus should be all A's
-        assert_eq!(consensus.sequence().as_ref(), &vec![b'A'; 10]);
-
-        // Check per-read tags
-        let cd_tag = RecordTag::from([b'c', b'D']);
-        let cm_tag = RecordTag::from([b'c', b'M']);
-        let ce_tag = RecordTag::from([b'c', b'E']);
-
-        let data = consensus.data();
+        assert_eq!(consensus.bases, vec![b'A'; 10]);
 
         // cD (max depth) should be 4
-        match data.get(&cd_tag) {
-            Some(Value::Int32(depth)) => assert_eq!(*depth, 4, "cD should be 4"),
-            Some(Value::Int8(depth)) => assert_eq!(*depth, 4, "cD should be 4"),
-            Some(Value::UInt8(depth)) => assert_eq!(*depth, 4, "cD should be 4"),
-            other => panic!("cD tag wrong type or missing: {other:?}"),
-        }
+        assert_eq!(consensus.get_int_tag(b"cD").unwrap(), 4, "cD should be 4");
 
         // cM (min depth) should be 4
-        match data.get(&cm_tag) {
-            Some(Value::Int32(depth)) => assert_eq!(*depth, 4, "cM should be 4"),
-            Some(Value::Int8(depth)) => assert_eq!(*depth, 4, "cM should be 4"),
-            Some(Value::UInt8(depth)) => assert_eq!(*depth, 4, "cM should be 4"),
-            other => panic!("cM tag wrong type or missing: {other:?}"),
-        }
+        assert_eq!(consensus.get_int_tag(b"cM").unwrap(), 4, "cM should be 4");
 
         // cE (error rate) should be 1/40 = 0.025 (1 error in 40 bases)
-        match data.get(&ce_tag) {
-            Some(Value::Float(rate)) => {
-                assert!((*rate - 0.025).abs() < 0.01, "cE should be ~0.025, got {rate}");
-            }
-            other => panic!("cE tag wrong type or missing: {other:?}"),
-        }
+        let error_rate = consensus.get_float_tag(b"cE").unwrap();
+        assert!((error_rate - 0.025).abs() < 0.01, "cE should be ~0.025, got {error_rate}");
 
         // Check per-base depth tag (cd)
-        let cd_per_base_tag = RecordTag::from([b'c', b'd']);
-        match data.get(&cd_per_base_tag) {
-            Some(Value::Array(
-                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(depths),
-            )) => {
-                // All depths should be 4
-                for (i, &d) in depths.iter().enumerate() {
-                    assert_eq!(d, 4, "Position {i} depth should be 4");
-                }
-            }
-            other => panic!("cd tag wrong type or missing: {other:?}"),
+        let depths = consensus.get_i16_array_tag(b"cd").expect("cd tag should be present");
+        // All depths should be 4
+        for (i, &d) in depths.iter().enumerate() {
+            assert_eq!(d, 4, "Position {i} depth should be 4");
         }
 
         // Check per-base error tag (ce)
-        let ce_per_base_tag = RecordTag::from([b'c', b'e']);
-        match data.get(&ce_per_base_tag) {
-            Some(Value::Array(
-                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(errors),
-            )) => {
-                // Position 5 should have 1 error, others should have 0
-                for (i, &e) in errors.iter().enumerate() {
-                    if i == 5 {
-                        assert_eq!(e, 1, "Position 5 should have 1 error");
-                    } else {
-                        assert_eq!(e, 0, "Position {i} should have 0 errors");
-                    }
-                }
+        let errors = consensus.get_i16_array_tag(b"ce").expect("ce tag should be present");
+        // Position 5 should have 1 error, others should have 0
+        for (i, &e) in errors.iter().enumerate() {
+            if i == 5 {
+                assert_eq!(e, 1, "Position 5 should have 1 error");
+            } else {
+                assert_eq!(e, 0, "Position {i} should have 0 errors");
             }
-            other => panic!("ce tag wrong type or missing: {other:?}"),
         }
     }
 
@@ -2329,38 +2264,24 @@ mod tests {
         let read3 = create_consensus_test_read("r3", b"GATGACAG", &quals, "UMI1"); // G at pos 3
         let read4 = create_consensus_test_read("r4", b"GATTACAG", &quals, "UMI1"); // T at pos 3
 
-        let result =
-            caller.consensus_reads_from_sam_records(vec![read1, read2, read3, read4]).unwrap();
+        let output =
+            consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Consensus at position 3 should be G (majority)
-        assert_eq!(consensus.sequence().as_ref()[3], b'G', "Position 3 consensus should be G");
+        assert_eq!(consensus.bases[3], b'G', "Position 3 consensus should be G");
 
         // Check per-base depth tag (cd) - position 3 should have depth 3 (N ignored)
-        let cd_per_base_tag = RecordTag::from([b'c', b'd']);
-        let data = consensus.data();
-        match data.get(&cd_per_base_tag) {
-            Some(Value::Array(
-                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(depths),
-            )) => {
-                assert_eq!(depths.len(), 8, "Should have 8 depth values, got {}", depths.len());
-                assert_eq!(depths[3], 3, "Position 3 depth should be 3 (N ignored)");
-            }
-            other => panic!("cd tag wrong type or missing: {other:?}"),
-        }
+        let depths = consensus.get_i16_array_tag(b"cd").expect("cd tag should be present");
+        assert_eq!(depths.len(), 8, "Should have 8 depth values, got {}", depths.len());
+        assert_eq!(depths[3], 3, "Position 3 depth should be 3 (N ignored)");
 
         // Check per-base error tag (ce) - position 3 should have 1 error (T vs G consensus)
-        let ce_per_base_tag = RecordTag::from([b'c', b'e']);
-        match data.get(&ce_per_base_tag) {
-            Some(Value::Array(
-                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(errors),
-            )) => {
-                assert_eq!(errors[3], 1, "Position 3 should have 1 error (T vs G consensus)");
-            }
-            other => panic!("ce tag wrong type or missing: {other:?}"),
-        }
+        let errors = consensus.get_i16_array_tag(b"ce").expect("ce tag should be present");
+        assert_eq!(errors[3], 1, "Position 3 should have 1 error (T vs G consensus)");
     }
 
     /// Port of fgbio test: "produce a consensus with Ns with per-base zero depths when consensus
@@ -2391,37 +2312,28 @@ mod tests {
         let read3 = create_consensus_test_read("r3", b"GATTACA", &quals_low, "UMI1");
         let read4 = create_consensus_test_read("r4", b"CTAATGT", &quals_high, "UMI1");
 
-        let result =
-            caller.consensus_reads_from_sam_records(vec![read1, read2, read3, read4]).unwrap();
+        let output =
+            consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // With minConsensusBaseQuality=40 and only Q30 input, consensus should be all Ns
         // because single Q30 input produces ~Q30 output, below the Q40 threshold
-        let seq = consensus.sequence().as_ref();
-        for (i, &base) in seq.iter().enumerate() {
+        for (i, &base) in consensus.bases.iter().enumerate() {
             assert_eq!(base, b'N', "Position {i} should be N due to low consensus quality");
         }
 
         // Quality should be TooLowQualityQual (2)
-        let quals = consensus.quality_scores().as_ref();
-        for (i, &q) in quals.iter().enumerate() {
+        for (i, &q) in consensus.quals.iter().enumerate() {
             assert_eq!(q, 2, "Position {i} quality should be 2 (TooLowQualityQual)");
         }
 
         // Check per-base depth tag - all should be 1 (only one read contributed)
-        let cd_per_base_tag = RecordTag::from([b'c', b'd']);
-        let data = consensus.data();
-        match data.get(&cd_per_base_tag) {
-            Some(Value::Array(
-                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(depths),
-            )) => {
-                for (i, &d) in depths.iter().enumerate() {
-                    assert_eq!(d, 1, "Position {i} depth should be 1");
-                }
-            }
-            other => panic!("cd tag wrong type or missing: {other:?}"),
+        let depths = consensus.get_i16_array_tag(b"cd").expect("cd tag should be present");
+        for (i, &d) in depths.iter().enumerate() {
+            assert_eq!(d, 1, "Position {i} depth should be 1");
         }
     }
 
@@ -2441,27 +2353,32 @@ mod tests {
         let read1 = create_consensus_test_read("r1", &[b'A'; 10], &quals, "UMI1");
         let read2 = create_consensus_test_read("r2", &[b'A'; 10], &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Per-read tags should still be present
-        let cd_tag = RecordTag::from([b'c', b'D']);
-        let cm_tag = RecordTag::from([b'c', b'M']);
-        let ce_tag = RecordTag::from([b'c', b'E']);
-
-        let data = consensus.data();
-        assert!(data.get(&cd_tag).is_some(), "cD (per-read depth) should be present");
-        assert!(data.get(&cm_tag).is_some(), "cM (per-read min depth) should be present");
-        assert!(data.get(&ce_tag).is_some(), "cE (per-read error rate) should be present");
+        assert!(consensus.get_int_tag(b"cD").is_some(), "cD (per-read depth) should be present");
+        assert!(
+            consensus.get_int_tag(b"cM").is_some(),
+            "cM (per-read min depth) should be present"
+        );
+        assert!(
+            consensus.get_float_tag(b"cE").is_some(),
+            "cE (per-read error rate) should be present"
+        );
 
         // Per-base tags should NOT be present
-        let cd_per_base_tag = RecordTag::from([b'c', b'd']);
-        let ce_per_base_tag = RecordTag::from([b'c', b'e']);
-
-        assert!(data.get(&cd_per_base_tag).is_none(), "cd (per-base depth) should NOT be present");
-        assert!(data.get(&ce_per_base_tag).is_none(), "ce (per-base error) should NOT be present");
+        assert!(
+            consensus.get_i16_array_tag(b"cd").is_none(),
+            "cd (per-base depth) should NOT be present"
+        );
+        assert!(
+            consensus.get_i16_array_tag(b"ce").is_none(),
+            "ce (per-base error) should NOT be present"
+        );
     }
 
     // =====================================================================
@@ -2522,7 +2439,7 @@ mod tests {
             quals: vec![30u8; query_len],
             simplified_cigar,
             original_idx: 0,
-            sam: None,
+            flags: 0,
         }
     }
 
@@ -2720,7 +2637,7 @@ mod tests {
             .cigar("10M")
             .build();
 
-        let source = caller.create_source_read(&record, 0, 0);
+        let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.unwrap();
@@ -2756,7 +2673,7 @@ mod tests {
             .cigar("10M")
             .build();
 
-        let source = caller.create_source_read(&record, 0, 0);
+        let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.unwrap();
@@ -2785,7 +2702,7 @@ mod tests {
             .cigar("10M")
             .build();
 
-        let source = caller.create_source_read(&record, 0, 0);
+        let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.unwrap();
@@ -2816,7 +2733,7 @@ mod tests {
             .reverse_complement(true)
             .build();
 
-        let source = caller.create_source_read(&record, 0, 0);
+        let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.unwrap();
@@ -2850,7 +2767,7 @@ mod tests {
             .cigar("10M")
             .build();
 
-        let source = caller.create_source_read(&record, 0, 0);
+        let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         // fgbio expected: None
         assert!(source.is_none(), "Should return None when all bases are masked or N");
     }
@@ -2886,7 +2803,7 @@ mod tests {
         let clip = record_utils::num_bases_extending_past_mate(&r1);
         assert_eq!(clip, 0, "FF pair should not trigger mate overlap clipping");
 
-        let source = caller.create_source_read(&r1, 0, clip);
+        let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.unwrap();
@@ -2923,7 +2840,7 @@ mod tests {
             .build();
 
         let clip = record_utils::num_bases_extending_past_mate(&r1);
-        let source = caller.create_source_read(&r1, 0, clip);
+        let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some(), "Should produce a SourceRead");
 
         let sr = source.unwrap();
@@ -2965,7 +2882,7 @@ mod tests {
         // R1 ends at 149, mate ends at 169, so R1 doesn't extend past mate
         assert_eq!(clip, 0, "R1 should not extend past mate");
 
-        let source = caller.create_source_read(&r1, 0, clip);
+        let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some());
         assert_eq!(source.unwrap().bases.len(), 50);
     }
@@ -3004,7 +2921,7 @@ mod tests {
         // R1 ends at 149, mate ends at 129, so R1 extends 20 bases past mate
         assert_eq!(clip, 20, "R1 should extend 20 bases past mate");
 
-        let source = caller.create_source_read(&r1, 0, clip);
+        let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some());
         let sr = source.unwrap();
         assert_eq!(sr.bases.len(), 30, "Should be trimmed to 30 bases");
@@ -3117,7 +3034,7 @@ mod tests {
         // R1 extends 10 bases past mate's end
         assert_eq!(clip_r1, 10, "R1 should extend 10 bases past mate");
 
-        let source_r1 = caller.create_source_read(&r1, 0, clip_r1);
+        let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.unwrap();
 
@@ -3149,7 +3066,7 @@ mod tests {
         // R2's first 10 bases (positions 1-10) extend before mate's start (11)
         assert_eq!(clip_r2, 10, "R2 should extend 10 bases before mate start");
 
-        let source_r2 = caller.create_source_read(&r2, 0, clip_r2);
+        let source_r2 = caller.create_source_read(&encode_to_raw(&r2), 0, clip_r2);
         assert!(source_r2.is_some(), "R2 should produce SourceRead");
         let sr2 = source_r2.unwrap();
 
@@ -3190,7 +3107,7 @@ mod tests {
 
         let clip_r1 = record_utils::num_bases_extending_past_mate(&r1);
 
-        let source_r1 = caller.create_source_read(&r1, 0, clip_r1);
+        let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.unwrap();
 
@@ -3231,7 +3148,7 @@ mod tests {
 
         let clip_r1 = record_utils::num_bases_extending_past_mate(&r1);
 
-        let source_r1 = caller.create_source_read(&r1, 0, clip_r1);
+        let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.unwrap();
 
@@ -3277,7 +3194,7 @@ mod tests {
         // R2 unclipped end is 57 (20+30-1+8=57)
         // R1 extends 2 bases past R2's end
 
-        let source_r1 = caller.create_source_read(&r1, 0, clip_r1);
+        let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
         let sr1 = source_r1.unwrap();
 
@@ -3331,19 +3248,19 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Bases should match
-        assert_eq!(consensus.sequence().as_ref(), b"GATTACA");
+        assert_eq!(consensus.bases, b"GATTACA");
 
         // Expected quality from fgbio formula for 2 agreeing Q10 reads
         let expected_qual = expected_consensus_quality(10, 2);
 
-        let consensus_quals = consensus.quality_scores().as_ref();
-        for (i, &q) in consensus_quals.iter().enumerate() {
+        for (i, &q) in consensus.quals.iter().enumerate() {
             // Allow +/- 1 for rounding differences
             let diff = (i32::from(q) - i32::from(expected_qual)).abs();
             assert!(
@@ -3375,36 +3292,28 @@ mod tests {
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
         let read3 = create_consensus_test_read("r3", b"GATTTCA", &quals, "UMI1"); // disagreement at pos 4
 
-        let result = caller.consensus_reads_from_sam_records(vec![read1, read2, read3]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
 
-        assert_eq!(result.len(), 1);
-        let consensus = &result[0];
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Consensus should follow majority - position 4 should be A (2 vs 1)
-        assert_eq!(consensus.sequence().as_ref(), b"GATTACA", "Consensus should follow majority");
+        assert_eq!(consensus.bases, b"GATTACA", "Consensus should follow majority");
 
         // Check per-base errors - position 4 should have 1 error
-        let ce_per_base_tag = RecordTag::from([b'c', b'e']);
-        let data = consensus.data();
-        match data.get(&ce_per_base_tag) {
-            Some(Value::Array(
-                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(errors),
-            )) => {
-                assert_eq!(errors[4], 1, "Position 4 should have 1 error (T vs A consensus)");
-                // Other positions should have 0 errors
-                for (i, &e) in errors.iter().enumerate() {
-                    if i != 4 {
-                        assert_eq!(e, 0, "Position {i} should have 0 errors");
-                    }
-                }
+        let errors = consensus.get_i16_array_tag(b"ce").expect("ce tag should be present");
+        assert_eq!(errors[4], 1, "Position 4 should have 1 error (T vs A consensus)");
+        // Other positions should have 0 errors
+        for (i, &e) in errors.iter().enumerate() {
+            if i != 4 {
+                assert_eq!(e, 0, "Position {i} should have 0 errors");
             }
-            other => panic!("ce tag wrong type or missing: {other:?}"),
         }
 
         // Positions with agreement (3 reads) should have higher quality than position with disagreement
-        let consensus_quals = consensus.quality_scores().as_ref();
-        let agreement_qual = consensus_quals[0]; // Position 0 has full agreement
-        let disagreement_qual = consensus_quals[4]; // Position 4 has disagreement
+        let agreement_qual = consensus.quals[0]; // Position 0 has full agreement
+        let disagreement_qual = consensus.quals[4]; // Position 4 has disagreement
 
         // The disagreement position should have lower quality
         assert!(
@@ -3625,16 +3534,14 @@ mod tests {
         let mut caller2 =
             VanillaUmiConsensusCaller::new("c2".to_string(), "ACATTAG".to_string(), options);
 
-        let consensus1 = caller1
-            .consensus_reads_from_sam_records(vec![read1, read2])
+        let consensus1 = consensus_reads_from_records(&mut caller1, vec![read1, read2])
             .expect("consensus should succeed");
-        let consensus2 = caller2
-            .consensus_reads_from_sam_records(vec![read3, read4])
+        let consensus2 = consensus_reads_from_records(&mut caller2, vec![read3, read4])
             .expect("consensus should succeed");
 
         // Should have 1 consensus per UMI group (fragment reads only produce 1 consensus)
-        assert_eq!(consensus1.len(), 1, "First UMI group should produce 1 consensus");
-        assert_eq!(consensus2.len(), 1, "Second UMI group should produce 1 consensus");
+        assert_eq!(consensus1.count, 1, "First UMI group should produce 1 consensus");
+        assert_eq!(consensus2.count, 1, "Second UMI group should produce 1 consensus");
     }
 
     /// Port of fgbio test: "should create two consensus for a read pair"
@@ -3657,26 +3564,25 @@ mod tests {
         let mut caller =
             VanillaUmiConsensusCaller::new("c".to_string(), "GATTACA".to_string(), options);
 
-        let consensus = caller
-            .consensus_reads_from_sam_records(vec![r1, r2])
+        let output = consensus_reads_from_records(&mut caller, vec![r1, r2])
             .expect("consensus should succeed");
 
         // Should have 2 consensus reads: one for R1, one for R2
-        assert_eq!(consensus.len(), 2, "Read pair should produce 2 consensus reads");
+        assert_eq!(output.count, 2, "Read pair should produce 2 consensus reads");
+        let records = ParsedBamRecord::parse_all(&output.data);
 
         // Both should be paired
-        for rec in &consensus {
-            assert!(rec.flags().is_segmented(), "Consensus reads should be paired");
+        for rec in &records {
+            assert!(rec.flag & flags::PAIRED != 0, "Consensus reads should be paired");
         }
 
         // First should be R1, second should be R2
-        assert!(consensus[0].flags().is_first_segment(), "First consensus should be R1");
-        assert!(consensus[1].flags().is_last_segment(), "Second consensus should be R2");
+        assert!(records[0].flag & flags::FIRST_SEGMENT != 0, "First consensus should be R1");
+        assert!(records[1].flag & flags::LAST_SEGMENT != 0, "Second consensus should be R2");
 
         // Should have the same name
         assert_eq!(
-            consensus[0].name(),
-            consensus[1].name(),
+            records[0].name, records[1].name,
             "Paired consensus reads should have same name"
         );
     }
@@ -3708,36 +3614,36 @@ mod tests {
         let mut caller2 =
             VanillaUmiConsensusCaller::new("c2".to_string(), "ACATTAG".to_string(), options);
 
-        let consensus1 = caller1
-            .consensus_reads_from_sam_records(vec![r1a, r2a])
+        let consensus1 = consensus_reads_from_records(&mut caller1, vec![r1a, r2a])
             .expect("consensus should succeed");
-        let consensus2 = caller2
-            .consensus_reads_from_sam_records(vec![r1b, r2b])
+        let consensus2 = consensus_reads_from_records(&mut caller2, vec![r1b, r2b])
             .expect("consensus should succeed");
 
         // Each pair should produce 2 consensus reads (R1 + R2)
-        assert_eq!(consensus1.len(), 2, "First pair should produce 2 consensus");
-        assert_eq!(consensus2.len(), 2, "Second pair should produce 2 consensus");
+        assert_eq!(consensus1.count, 2, "First pair should produce 2 consensus");
+        assert_eq!(consensus2.count, 2, "Second pair should produce 2 consensus");
+
+        let records1 = ParsedBamRecord::parse_all(&consensus1.data);
+        let records2 = ParsedBamRecord::parse_all(&consensus2.data);
 
         // All should be paired
-        for rec in consensus1.iter().chain(consensus2.iter()) {
-            assert!(rec.flags().is_segmented(), "All should be paired");
+        for rec in records1.iter().chain(records2.iter()) {
+            assert!(rec.flag & flags::PAIRED != 0, "All should be paired");
         }
 
         // Check R1/R2 pattern for first pair
-        assert!(consensus1[0].flags().is_first_segment());
-        assert!(consensus1[1].flags().is_last_segment());
-        assert_eq!(consensus1[0].name(), consensus1[1].name());
+        assert!(records1[0].flag & flags::FIRST_SEGMENT != 0);
+        assert!(records1[1].flag & flags::LAST_SEGMENT != 0);
+        assert_eq!(records1[0].name, records1[1].name);
 
         // Check R1/R2 pattern for second pair
-        assert!(consensus2[0].flags().is_first_segment());
-        assert!(consensus2[1].flags().is_last_segment());
-        assert_eq!(consensus2[0].name(), consensus2[1].name());
+        assert!(records2[0].flag & flags::FIRST_SEGMENT != 0);
+        assert!(records2[1].flag & flags::LAST_SEGMENT != 0);
+        assert_eq!(records2[0].name, records2[1].name);
 
         // Names should differ between pairs
         assert_ne!(
-            consensus1[0].name(),
-            consensus2[0].name(),
+            records1[0].name, records2[0].name,
             "Different UMI groups should have different names"
         );
     }
@@ -3763,7 +3669,7 @@ mod tests {
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::try_from(1).unwrap())
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, bases.len())]))
-            .set_flags(Flags::empty())
+            .set_flags(NoodlesFlags::empty())
             .build();
 
         // Add MI tag
@@ -3779,7 +3685,7 @@ mod tests {
         let caller =
             VanillaUmiConsensusCaller::new("test".to_string(), "UMI1".to_string(), options);
 
-        let source = caller.to_source_read(&rec, 0); // 0 is original_idx
+        let source = caller.to_source_read_from_record(&rec, 0); // 0 is original_idx
 
         assert!(source.is_some(), "Should produce a source read");
         let sr = source.unwrap();
@@ -3807,7 +3713,7 @@ mod tests {
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::try_from(1).unwrap())
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, bases.len())]))
-            .set_flags(Flags::empty())
+            .set_flags(NoodlesFlags::empty())
             .build();
 
         let mi_tag = Tag::from([b'M', b'I']);
@@ -3819,7 +3725,7 @@ mod tests {
 
         // Calling to_source_read on a read without qualities should return None
         // (fgbio throws an exception, but in Rust we can handle it gracefully)
-        let result = caller.to_source_read(&rec, 0); // 0 is original_idx
+        let result = caller.to_source_read_from_record(&rec, 0); // 0 is original_idx
 
         // The read has empty qualities, so it should return None or an empty/masked read
         if let Some(sr) = result {
@@ -3862,11 +3768,10 @@ mod tests {
             VanillaUmiConsensusCaller::new("c".to_string(), "GATTACA".to_string(), options);
 
         // Should succeed even without MC tag
-        let consensus = caller
-            .consensus_reads_from_sam_records(vec![r1, r2])
+        let output = consensus_reads_from_records(&mut caller, vec![r1, r2])
             .expect("consensus should succeed without MC tag");
 
-        assert_eq!(consensus.len(), 2, "Should produce 2 consensus reads even without MC tag");
+        assert_eq!(output.count, 2, "Should produce 2 consensus reads even without MC tag");
     }
 
     // =========================================================================
@@ -3900,7 +3805,7 @@ mod tests {
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::try_from(1).unwrap())
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 10)]))
-            .set_flags(Flags::empty())
+            .set_flags(NoodlesFlags::empty())
             .build();
         read1.data_mut().insert(mi_tag, Value::from("AAA"));
         read1.data_mut().insert(rx_tag, Value::from("TTT"));
@@ -3917,7 +3822,7 @@ mod tests {
                 Op::new(Kind::Deletion, 5),
                 Op::new(Kind::Match, 5),
             ]))
-            .set_flags(Flags::empty())
+            .set_flags(NoodlesFlags::empty())
             .build();
         read2.data_mut().insert(mi_tag, Value::from("AAA"));
         read2.data_mut().insert(rx_tag, Value::from("ATT"));
@@ -3930,7 +3835,7 @@ mod tests {
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::try_from(1).unwrap())
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 10)]))
-            .set_flags(Flags::empty())
+            .set_flags(NoodlesFlags::empty())
             .build();
         read3.data_mut().insert(mi_tag, Value::from("AAA"));
         read3.data_mut().insert(rx_tag, Value::from("TAT"));
@@ -3947,7 +3852,7 @@ mod tests {
                 Op::new(Kind::Insertion, 2),
                 Op::new(Kind::Match, 4),
             ]))
-            .set_flags(Flags::empty())
+            .set_flags(NoodlesFlags::empty())
             .build();
         read4.data_mut().insert(mi_tag, Value::from("AAA"));
         read4.data_mut().insert(rx_tag, Value::from("TTA"));
@@ -3961,21 +3866,19 @@ mod tests {
         let mut caller =
             VanillaUmiConsensusCaller::new("c".to_string(), "AAA".to_string(), options);
 
-        let consensus = caller
-            .consensus_reads_from_sam_records(vec![read1, read2, read3, read4])
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4])
             .expect("consensus should succeed");
 
-        assert_eq!(consensus.len(), 1, "Should produce 1 consensus");
+        assert_eq!(output.count, 1, "Should produce 1 consensus");
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
 
         // Check the RX tag - should be consensus of TTT and TAT = TNT
-        let consensus_rx = consensus[0].data().get(&rx_tag).and_then(|v| match v {
-            Value::String(s) => Some(s.to_string()),
-            _ => None,
-        });
+        let consensus_rx = consensus.get_string_tag(b"RX");
 
         assert_eq!(
             consensus_rx,
-            Some("TNT".to_string()),
+            Some(b"TNT".to_vec()),
             "Consensus RX should be TNT (from filtered reads TTT and TAT)"
         );
     }
@@ -4120,12 +4023,12 @@ mod tests {
             VanillaUmiConsensusCaller::new("test".to_string(), "A".to_string(), options);
 
         // Process first UMI group (2 reads -> 2 consensus reads: R1 and R2)
-        let result1 = caller.consensus_reads_from_sam_records(vec![r1_umi1, r2_umi1]).unwrap();
-        assert_eq!(result1.len(), 2, "Should produce 2 consensus reads (R1 and R2)");
+        let output1 = consensus_reads_from_records(&mut caller, vec![r1_umi1, r2_umi1]).unwrap();
+        assert_eq!(output1.count, 2, "Should produce 2 consensus reads (R1 and R2)");
 
         // Process second UMI group (2 reads -> 2 consensus reads: R1 and R2)
-        let result2 = caller.consensus_reads_from_sam_records(vec![r1_umi2, r2_umi2]).unwrap();
-        assert_eq!(result2.len(), 2, "Should produce 2 consensus reads (R1 and R2)");
+        let output2 = consensus_reads_from_records(&mut caller, vec![r1_umi2, r2_umi2]).unwrap();
+        assert_eq!(output2.count, 2, "Should produce 2 consensus reads (R1 and R2)");
 
         // Check statistics
         let stats = caller.statistics();

@@ -1,4 +1,8 @@
 #![deny(unsafe_code)]
+// Clippy can misattribute large_stack_arrays to byte_offset 0 when monomorphizing
+// generic code in test builds. Allow it crate-wide in test config since the actual
+// allocations are heap-based (`vec![]`), not stack arrays.
+#![cfg_attr(test, allow(clippy::large_stack_arrays))]
 // Clippy lint configuration for CI
 // These lints are allowed because:
 // - cast_*: Scientific/bioinformatics code intentionally casts between numeric types

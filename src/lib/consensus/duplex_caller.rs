@@ -188,18 +188,26 @@
 
 #[cfg(test)]
 use ahash::AHashMap;
-use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{Result, bail};
+#[cfg(test)]
 use bstr::BString;
+#[cfg(test)]
 use bstr::ByteSlice;
 use log::{debug, info};
 use noodles::sam::alignment::record::data::field::Tag;
+// Used by #[cfg(test)] functions (call_duplex_from_ss_pair) and tests
+#[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
 
+use crate::consensus::caller::ConsensusOutput;
 use crate::consensus::simple_umi::consensus_umis;
 use crate::consensus::{ReadType, SourceRead};
 use crate::consensus_caller::{ConsensusCaller, ConsensusCallingStats, RejectionReason};
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
+use crate::sort::bam_fields::{self, UnmappedBamRecordBuilder, flags};
 use crate::vanilla_consensus_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
@@ -294,8 +302,8 @@ pub struct DuplexConsensusCaller {
     /// Single-strand consensus caller (used for both /A and /B families)
     /// Uses `min_reads=1` like fgbio; filtering happens at duplex level
     ss_caller: VanillaUmiConsensusCaller,
-    /// Rejected reads (if tracking is enabled)
-    rejected_reads: Vec<RecordBuf>,
+    /// Rejected reads as raw BAM bytes (if tracking is enabled).
+    rejected_reads: Vec<Vec<u8>>,
     /// Whether to track rejected reads
     track_rejects: bool,
 }
@@ -404,14 +412,14 @@ impl DuplexConsensusCaller {
         })
     }
 
-    /// Returns the rejected reads
+    /// Returns the rejected reads as raw BAM bytes
     #[must_use]
-    pub fn rejected_reads(&self) -> &[RecordBuf] {
+    pub fn rejected_reads(&self) -> &[Vec<u8>] {
         &self.rejected_reads
     }
 
     /// Takes ownership of the rejected reads, leaving an empty Vec
-    pub fn take_rejected_reads(&mut self) -> Vec<RecordBuf> {
+    pub fn take_rejected_reads(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.rejected_reads)
     }
 
@@ -430,9 +438,38 @@ impl DuplexConsensusCaller {
         self.ss_caller.clear();
     }
 
+    /// Test helper: accepts `Vec<RecordBuf>`, encodes to raw bytes, and delegates to `consensus_reads`.
+    #[cfg(test)]
+    pub(crate) fn consensus_reads_from_sam_records(
+        &mut self,
+        records: Vec<noodles::sam::alignment::RecordBuf>,
+    ) -> anyhow::Result<ConsensusOutput> {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+        // Build header with a reference sequence for mapped records
+        let header = noodles::sam::Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(1_000_000).unwrap()),
+            )
+            .build();
+        let raw: Vec<Vec<u8>> = records
+            .iter()
+            .map(|rec| {
+                let mut buf = Vec::new();
+                crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode RecordBuf: {e}"))?;
+                Ok(buf)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.consensus_reads(raw)
+    }
+
     /// Parses MI tag to extract base UMI and strand (/A or /B)
     ///
     /// Returns (`base_umi`, strand) where strand is 'A', 'B', or None if no suffix
+    #[cfg(test)]
     fn parse_mi_tag(mi: &str) -> (String, Option<char>) {
         if let Some(stripped) = mi.strip_suffix("/A") {
             (stripped.to_string(), Some('A'))
@@ -487,6 +524,7 @@ impl DuplexConsensusCaller {
     ///
     /// This check is O(n) in the worst case but typically returns early once both
     /// strands are found.
+    #[cfg(test)]
     #[must_use]
     pub fn has_both_strands(reads: &[RecordBuf]) -> bool {
         if reads.len() < 2 {
@@ -522,71 +560,68 @@ impl DuplexConsensusCaller {
         false
     }
 
-    /// Partitions reads by strand (A or B) using optimized byte-level operations.
+    /// Partitions records by strand (A or B) using optimized byte-level operations on raw BAM bytes.
     ///
     /// This is an optimized version that avoids `HashMap` allocation since reads
     /// are already grouped by base MI (without /A or /B suffix) by the MI group iterator.
     ///
-    /// Returns (`Option<base_mi>`, `a_reads`, `b_reads`) or an error if any read has an invalid MI tag.
+    /// Returns (`Option<base_mi>`, `a_records`, `b_records`) or an error if any read has an invalid MI tag.
     ///
     /// IMPORTANT: This function requires that all reads have MI tags with /A or /B suffixes.
     /// The duplex command MUST be used with reads grouped using the "paired" strategy.
-    fn partition_reads_by_strand_simple(
-        reads: Vec<RecordBuf>,
-    ) -> Result<(Option<String>, Vec<RecordBuf>, Vec<RecordBuf>)> {
-        if reads.is_empty() {
+    #[allow(clippy::type_complexity)]
+    fn partition_records_by_strand(
+        records: Vec<Vec<u8>>,
+    ) -> Result<(Option<String>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+        if records.is_empty() {
             return Ok((None, Vec::new(), Vec::new()));
         }
 
         // Pre-allocate with estimated capacity (assume roughly even split)
-        let half_capacity = (reads.len() / 2).max(1);
-        let mut a_reads = Vec::with_capacity(half_capacity);
-        let mut b_reads = Vec::with_capacity(half_capacity);
+        let half_capacity = (records.len() / 2).max(1);
+        let mut a_records = Vec::with_capacity(half_capacity);
+        let mut b_records = Vec::with_capacity(half_capacity);
 
-        let mi_tag = Tag::from([b'M', b'I']);
         let mut base_mi: Option<String> = None;
 
-        for read in reads {
-            // Get MI tag bytes directly without String allocation
-            let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi_bytes)) =
-                read.data().get(&mi_tag)
-            else {
-                // No MI tag, skip this read
-                continue;
+        for record in records {
+            // Extract strand info before moving the record (drop borrow before push)
+            let is_a_strand = {
+                let Some(mi_bytes) = bam_fields::find_string_tag_in_record(&record, b"MI") else {
+                    let read_name = String::from_utf8_lossy(bam_fields::read_name(&record));
+                    bail!(
+                        "Read '{read_name}' is missing MI tag. \
+                        The duplex command requires all reads to have MI tags. \
+                        Please run 'fgumi group' on your input BAM first."
+                    );
+                };
+                if base_mi.is_none() {
+                    base_mi = Some(Self::base_mi_from_bytes(mi_bytes));
+                }
+                match Self::extract_strand_from_mi_bytes(mi_bytes) {
+                    Some('A') => true,
+                    Some('B') => false,
+                    _ => {
+                        let mi_str = String::from_utf8_lossy(mi_bytes).into_owned();
+                        bail!(
+                            "Read has MI tag '{mi_str}' without /A or /B suffix. \
+                            The duplex command requires reads to be grouped using the 'paired' strategy, \
+                            which adds /A and /B suffixes to MI tags to indicate the strand of the source \
+                            duplex molecule. Please run 'fgumi group --strategy paired' on your input BAM \
+                            before running duplex consensus calling."
+                        );
+                    }
+                }
             };
 
-            // Extract strand using fast byte-level check
-            let strand = Self::extract_strand_from_mi_bytes(mi_bytes);
-
-            match strand {
-                Some('A') => {
-                    // Extract base_mi from first read only (all reads have same base_mi)
-                    if base_mi.is_none() {
-                        base_mi = Some(Self::base_mi_from_bytes(mi_bytes));
-                    }
-                    a_reads.push(read);
-                }
-                Some('B') => {
-                    if base_mi.is_none() {
-                        base_mi = Some(Self::base_mi_from_bytes(mi_bytes));
-                    }
-                    b_reads.push(read);
-                }
-                // No valid strand suffix - this is an error!
-                _ => {
-                    let mi_str = String::from_utf8_lossy(mi_bytes);
-                    bail!(
-                        "Read has MI tag '{mi_str}' without /A or /B suffix. \
-                        The duplex command requires reads to be grouped using the 'paired' strategy, \
-                        which adds /A and /B suffixes to MI tags to indicate the strand of the source \
-                        duplex molecule. Please run 'fgumi group --strategy paired' on your input BAM \
-                        before running duplex consensus calling."
-                    );
-                }
+            if is_a_strand {
+                a_records.push(record);
+            } else {
+                b_records.push(record);
             }
         }
 
-        Ok((base_mi, a_reads, b_reads))
+        Ok((base_mi, a_records, b_records))
     }
 
     /// Groups reads by base MI tag (without /A or /B suffix) and strand.
@@ -649,6 +684,7 @@ impl DuplexConsensusCaller {
     }
 
     /// Helper function to extract integer value from SAM tag, handling different integer types
+    #[cfg(test)]
     fn extract_int_tag(
         data: &noodles::sam::alignment::record_buf::Data,
         tag: noodles::sam::alignment::record::data::field::Tag,
@@ -660,7 +696,7 @@ impl DuplexConsensusCaller {
             Value::Int16(v) => Some(i32::from(*v)),
             Value::UInt16(v) => Some(i32::from(*v)),
             Value::Int32(v) => Some(*v),
-            Value::UInt32(v) => Some(*v as i32),
+            Value::UInt32(v) => i32::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -671,26 +707,26 @@ impl DuplexConsensusCaller {
     /// Counts only R1 reads (first of pair) for each strand, sorts them so XY >= YX,
     /// then checks: `total >= min_total AND xy >= min_xy AND yx >= min_yx`
     fn has_minimum_number_of_reads(
-        a_reads: &[RecordBuf],
-        b_reads: &[RecordBuf],
+        a_records: &[Vec<u8>],
+        b_records: &[Vec<u8>],
         min_total_reads: usize,
         min_xy_reads: usize,
         min_yx_reads: usize,
     ) -> bool {
         // Count R1s only (first of pair) for each strand
         // Match fgbio: x.count(r => r.paired && r.firstOfPair)
-        let num_a = a_reads
+        let num_a = a_records
             .iter()
             .filter(|r| {
-                let flags = r.flags();
-                flags.is_segmented() && flags.is_first_segment()
+                let flg = bam_fields::flags(r);
+                (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
             })
             .count();
-        let num_b = b_reads
+        let num_b = b_records
             .iter()
             .filter(|r| {
-                let flags = r.flags();
-                flags.is_segmented() && flags.is_first_segment()
+                let flg = bam_fields::flags(r);
+                (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
             })
             .count();
 
@@ -725,12 +761,12 @@ impl DuplexConsensusCaller {
     /// Check if all reads in an iterator are on the same strand.
     /// Returns true if all reads have the same orientation (all forward or all reverse).
     /// Also returns true for empty iterators.
-    fn are_all_same_strand<'a>(mut reads: impl Iterator<Item = &'a RecordBuf>) -> bool {
+    fn are_all_same_strand<'a>(mut reads: impl Iterator<Item = &'a Vec<u8>>) -> bool {
         let Some(first) = reads.next() else {
             return true;
         };
-        let first_is_reverse = first.flags().is_reverse_complemented();
-        reads.all(|r| r.flags().is_reverse_complemented() == first_is_reverse)
+        let first_is_reverse = bam_fields::flags(first) & flags::REVERSE != 0;
+        reads.all(|r| (bam_fields::flags(r) & flags::REVERSE != 0) == first_is_reverse)
     }
 
     // Helper function to cap quality scores to valid range [2, 93]
@@ -905,95 +941,75 @@ impl DuplexConsensusCaller {
         }
     }
 
-    /// Converts a `DuplexConsensusRead` to a `RecordBuf` for BAM output.
+    /// Writes a `DuplexConsensusRead` as raw BAM bytes into `output`.
     ///
     /// This is the second stage of the two-stage consensus calling process.
     /// Matches fgbio's `createSamRecord` for duplex consensus.
     ///
     /// # Arguments
+    /// * `builder` - Reusable builder for raw BAM record construction
+    /// * `output` - `ConsensusOutput` to append the record into
     /// * `consensus` - The duplex consensus read to convert
     /// * `read_type` - Whether this is R1 or R2
     /// * `umi` - The UMI string (base MI without /A or /B suffix)
-    /// * `source_reads` - Original source reads for RX tag consensus
+    /// * `source_reads_a` - Source reads from A strand for RX tag consensus
+    /// * `source_reads_b` - Source reads from B strand for RX tag consensus
     /// * `produce_per_base_tags` - Whether to include per-base tags
     /// * `read_name_prefix` - Prefix for the read name
     /// * `read_group_id` - Read group ID
+    /// * `first_of_pair` - Whether this is first of pair (for RX orientation)
     /// * `cell_tag` - Optional cell barcode tag (e.g., CB)
     /// * `cell_barcode` - Optional cell barcode value to add to record
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn duplex_read_to_record(
+    pub(crate) fn duplex_read_into(
+        builder: &mut UnmappedBamRecordBuilder,
+        output: &mut ConsensusOutput,
         consensus: &DuplexConsensusRead,
         read_type: ReadType,
         umi: &str,
-        source_reads_a: &[std::sync::Arc<RecordBuf>],
-        source_reads_b: &[std::sync::Arc<RecordBuf>],
+        source_reads_a: &[&[u8]],
+        source_reads_b: &[&[u8]],
         produce_per_base_tags: bool,
         read_name_prefix: &str,
         read_group_id: &str,
         first_of_pair: bool,
         cell_tag: Option<Tag>,
         cell_barcode: Option<&str>,
-    ) -> Result<RecordBuf> {
-        use noodles::sam::alignment::record::Flags;
-        use noodles::sam::alignment::record::data::field::Tag;
-        use noodles::sam::alignment::record_buf::Data;
-        use noodles::sam::alignment::record_buf::data::field::Value;
-        use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
-
-        use crate::sam::to_smallest_signed_int;
-
+    ) -> Result<()> {
         // Build flags
-        let mut flags = Flags::UNMAPPED;
+        let mut flag = flags::UNMAPPED;
         match read_type {
             ReadType::R1 => {
-                flags |= Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_UNMAPPED;
+                flag |= flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED;
             }
             ReadType::R2 => {
-                flags |= Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::MATE_UNMAPPED;
+                flag |= flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_UNMAPPED;
             }
             ReadType::Fragment => {
                 // No pair flags for fragment
             }
         }
 
-        // Build all tags first (more efficient than inserting one by one after record creation)
-        let mut data = Data::default();
+        // Build the record (name, flags, bases, quals)
+        let read_name = format!("{read_name_prefix}:{umi}");
+        builder.build_record(read_name.as_bytes(), flag, &consensus.bases, &consensus.quals);
 
-        // Add MI tag
-        let mi_tag = Tag::from([b'M', b'I']);
-        data.insert(mi_tag, Value::from(umi.to_string()));
+        // 1. MI tag (string)
+        builder.append_string_tag(b"MI", umi.as_bytes());
 
-        // Add cell barcode tag if present (matches fgbio's cellTag/cellBarcode handling)
+        // 2. Cell barcode tag if present
         if let (Some(tag), Some(barcode)) = (cell_tag, cell_barcode) {
-            data.insert(tag, Value::from(barcode.to_string()));
+            let tag_bytes: [u8; 2] = <[u8; 2]>::from(tag);
+            builder.append_string_tag(&tag_bytes, barcode.as_bytes());
         }
 
-        // Add RG tag
-        let rg_tag = Tag::from([b'R', b'G']);
-        data.insert(rg_tag, Value::from(read_group_id.to_string()));
+        // 3. RG tag (string)
+        builder.append_string_tag(b"RG", read_group_id.as_bytes());
 
-        // Calculate combined depths for duplex tags
+        // Calculate AB strand metrics
         let ab = &consensus.ab_consensus;
         let ba_opt = consensus.ba_consensus.as_ref();
 
-        let combined_depths: Vec<i32> = (0..consensus.len())
-            .map(|i| {
-                let ab_d = i32::from(ab.depths.get(i).copied().unwrap_or(0));
-                let ba_d = i32::from(ba_opt.and_then(|b| b.depths.get(i).copied()).unwrap_or(0));
-                ab_d + ba_d
-            })
-            .collect();
-
-        let duplex_depth_max = combined_depths.iter().copied().max().unwrap_or(0);
-        let duplex_depth_min = combined_depths.iter().copied().min().unwrap_or(0);
-
-        // Calculate duplex error rate
-        let total_depth: i64 = combined_depths.iter().map(|&d| i64::from(d)).sum();
-        let total_errors: i64 = consensus.errors.iter().map(|&e| i64::from(e)).sum();
-        let duplex_error_rate =
-            if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
-
-        // AB strand tags (aD, aM, aE)
         let ab_depth_max = i32::from(ab.depths.iter().copied().max().unwrap_or(0));
         let ab_depth_min = i32::from(ab.depths.iter().copied().min().unwrap_or(0));
         let ab_total_depth: i64 = ab.depths.iter().map(|&d| i64::from(d)).sum();
@@ -1001,28 +1017,27 @@ impl DuplexConsensusCaller {
         let ab_error_rate =
             if ab_total_depth > 0 { ab_total_errors as f32 / ab_total_depth as f32 } else { 0.0 };
 
-        data.insert(Tag::from([b'a', b'D']), to_smallest_signed_int(ab_depth_max));
-        data.insert(Tag::from([b'a', b'E']), Value::from(ab_error_rate));
-        data.insert(Tag::from([b'a', b'M']), to_smallest_signed_int(ab_depth_min));
+        // 4. AB strand tags: aD (int, max depth), aE (float, error rate), aM (int, min depth)
+        builder.append_int_tag(b"aD", ab_depth_max);
+        builder.append_float_tag(b"aE", ab_error_rate);
+        builder.append_int_tag(b"aM", ab_depth_min);
 
-        // Per-base tags for AB strand if requested
+        // 5. Per-base AB tags if requested
         if produce_per_base_tags {
-            let ab_bases_str = String::from_utf8_lossy(&ab.bases).to_string();
-            data.insert(Tag::from([b'a', b'c']), Value::from(ab_bases_str));
+            builder.append_string_tag(b"ac", &ab.bases);
 
-            let ab_depths_i16: Vec<i16> = ab.depths.iter().map(|&d| d as i16).collect();
-            data.insert(Tag::from([b'a', b'd']), Value::from(ab_depths_i16));
+            let ab_depths_i16: Vec<i16> =
+                ab.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
+            builder.append_i16_array_tag(b"ad", &ab_depths_i16);
 
-            let ab_errors_i16: Vec<i16> = ab.errors.iter().map(|&e| e as i16).collect();
-            data.insert(Tag::from([b'a', b'e']), Value::from(ab_errors_i16));
+            let ab_errors_i16: Vec<i16> =
+                ab.errors.iter().map(|&e| i16::try_from(e).unwrap_or(i16::MAX)).collect();
+            builder.append_i16_array_tag(b"ae", &ab_errors_i16);
 
-            data.insert(
-                Tag::from([b'a', b'q']),
-                crate::consensus_tags::qualities_to_tag_value(&ab.quals),
-            );
+            builder.append_phred33_string_tag(b"aq", &ab.quals);
         }
 
-        // BA strand tags (bD, bM, bE)
+        // Calculate BA strand metrics
         let (ba_depth_max, ba_depth_min, ba_error_rate) = if let Some(ba) = ba_opt {
             let ba_depth_max = i32::from(ba.depths.iter().copied().max().unwrap_or(0));
             let ba_depth_min = i32::from(ba.depths.iter().copied().min().unwrap_or(0));
@@ -1038,42 +1053,57 @@ impl DuplexConsensusCaller {
             (0i32, 0i32, 0.0f32)
         };
 
-        data.insert(Tag::from([b'b', b'D']), to_smallest_signed_int(ba_depth_max));
-        data.insert(Tag::from([b'b', b'E']), Value::from(ba_error_rate));
-        data.insert(Tag::from([b'b', b'M']), to_smallest_signed_int(ba_depth_min));
+        // 6. BA strand tags: bD (int), bE (float), bM (int)
+        builder.append_int_tag(b"bD", ba_depth_max);
+        builder.append_float_tag(b"bE", ba_error_rate);
+        builder.append_int_tag(b"bM", ba_depth_min);
 
-        // Per-base tags for BA strand if requested and BA strand exists
+        // 7. Per-base BA tags if requested and BA strand exists
         if produce_per_base_tags {
             if let Some(ba) = ba_opt {
-                let ba_bases_str = String::from_utf8_lossy(&ba.bases).to_string();
-                data.insert(Tag::from([b'b', b'c']), Value::from(ba_bases_str));
+                builder.append_string_tag(b"bc", &ba.bases);
 
-                let ba_depths_i16: Vec<i16> = ba.depths.iter().map(|&d| d as i16).collect();
-                data.insert(Tag::from([b'b', b'd']), Value::from(ba_depths_i16));
+                let ba_depths_i16: Vec<i16> =
+                    ba.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
+                builder.append_i16_array_tag(b"bd", &ba_depths_i16);
 
-                let ba_errors_i16: Vec<i16> = ba.errors.iter().map(|&e| e as i16).collect();
-                data.insert(Tag::from([b'b', b'e']), Value::from(ba_errors_i16));
+                let ba_errors_i16: Vec<i16> =
+                    ba.errors.iter().map(|&e| i16::try_from(e).unwrap_or(i16::MAX)).collect();
+                builder.append_i16_array_tag(b"be", &ba_errors_i16);
 
-                data.insert(
-                    Tag::from([b'b', b'q']),
-                    crate::consensus_tags::qualities_to_tag_value(&ba.quals),
-                );
+                builder.append_phred33_string_tag(b"bq", &ba.quals);
             }
         }
 
-        // Duplex consensus tags (cD, cM, cE)
-        data.insert(Tag::from([b'c', b'D']), to_smallest_signed_int(duplex_depth_max));
-        data.insert(Tag::from([b'c', b'E']), Value::from(duplex_error_rate));
-        data.insert(Tag::from([b'c', b'M']), to_smallest_signed_int(duplex_depth_min));
+        // 8. Duplex consensus tags (cD, cM, cE)
+        let combined_depths: Vec<i32> = (0..consensus.len())
+            .map(|i| {
+                let ab_d = i32::from(ab.depths.get(i).copied().unwrap_or(0));
+                let ba_d = i32::from(ba_opt.and_then(|b| b.depths.get(i).copied()).unwrap_or(0));
+                ab_d + ba_d
+            })
+            .collect();
 
-        // Build RX consensus from source reads
-        let rx_tag = Tag::from([b'R', b'X']);
+        let duplex_depth_max = combined_depths.iter().copied().max().unwrap_or(0);
+        let duplex_depth_min = combined_depths.iter().copied().min().unwrap_or(0);
+
+        let total_depth: i64 = combined_depths.iter().map(|&d| i64::from(d)).sum();
+        let total_errors: i64 = consensus.errors.iter().map(|&e| i64::from(e)).sum();
+        let duplex_error_rate =
+            if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
+
+        builder.append_int_tag(b"cD", duplex_depth_max);
+        builder.append_float_tag(b"cE", duplex_error_rate);
+        builder.append_int_tag(b"cM", duplex_depth_min);
+
+        // 9. Build RX consensus from source reads
         let mut all_umis = Vec::new();
 
-        for read in source_reads_a {
-            if let Some(Value::String(rx_bytes)) = read.data().get(&rx_tag) {
-                let rx = String::from_utf8_lossy(rx_bytes.as_ref()).to_string();
-                if read.flags().is_first_segment() == first_of_pair {
+        for raw in source_reads_a {
+            if let Some(rx_bytes) = bam_fields::find_string_tag_in_record(raw, b"RX") {
+                let rx = String::from_utf8_lossy(rx_bytes).to_string();
+                let is_first = bam_fields::flags(raw) & flags::FIRST_SEGMENT != 0;
+                if is_first == first_of_pair {
                     all_umis.push(rx);
                 } else {
                     let reversed: Vec<&str> = rx.split('-').rev().collect();
@@ -1082,10 +1112,11 @@ impl DuplexConsensusCaller {
             }
         }
 
-        for read in source_reads_b {
-            if let Some(Value::String(rx_bytes)) = read.data().get(&rx_tag) {
-                let rx = String::from_utf8_lossy(rx_bytes.as_ref()).to_string();
-                if read.flags().is_first_segment() == first_of_pair {
+        for raw in source_reads_b {
+            if let Some(rx_bytes) = bam_fields::find_string_tag_in_record(raw, b"RX") {
+                let rx = String::from_utf8_lossy(rx_bytes).to_string();
+                let is_first = bam_fields::flags(raw) & flags::FIRST_SEGMENT != 0;
+                if is_first == first_of_pair {
                     all_umis.push(rx);
                 } else {
                     let reversed: Vec<&str> = rx.split('-').rev().collect();
@@ -1096,25 +1127,18 @@ impl DuplexConsensusCaller {
 
         if !all_umis.is_empty() {
             let consensus_umi = consensus_umis(&all_umis);
-            data.insert(rx_tag, Value::from(consensus_umi));
+            builder.append_string_tag(b"RX", consensus_umi.as_bytes());
         }
 
-        // Create record with all tags at once
-        let read_name = format!("{read_name_prefix}:{umi}");
-        let record = RecordBuf::builder()
-            .set_name(BString::from(read_name.as_bytes().to_vec()))
-            .set_flags(flags)
-            .set_mapping_quality(noodles::sam::alignment::record::MappingQuality::new(0).unwrap())
-            .set_sequence(Sequence::from(consensus.bases.clone()))
-            .set_quality_scores(QualityScores::from(consensus.quals.clone()))
-            .set_data(data)
-            .build();
+        // 10. Write to output
+        builder.write_with_block_size(&mut output.data);
+        output.count += 1;
 
-        Ok(record)
+        Ok(())
     }
 
     /// Extracts a per-base array (cd or ce tag) from single-strand consensus data
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn extract_per_base_array(
         data: &noodles::sam::alignment::record_buf::Data,
         tag: noodles::sam::alignment::record::data::field::Tag,
@@ -1135,7 +1159,7 @@ impl DuplexConsensusCaller {
     }
 
     /// Calls duplex consensus from paired single-strand consensuses
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn call_duplex_from_ss_pair(
         ss_a: RecordBuf,
         ss_b: RecordBuf,
@@ -1170,7 +1194,7 @@ impl DuplexConsensusCaller {
         // This matches fgbio's behavior where source reads are stored in consensus orientation
         let mut source_reads: Vec<SourceRead> = Vec::new();
         for (idx, read) in source_reads_a.iter().chain(source_reads_b.iter()).enumerate() {
-            if let Some(src_read) = ss_caller.to_source_read(read.as_ref(), idx) {
+            if let Some(src_read) = ss_caller.to_source_read_from_record(read.as_ref(), idx) {
                 source_reads.push(src_read);
             }
         }
@@ -1522,8 +1546,8 @@ impl DuplexConsensusCaller {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn process_group(
         base_mi: String,
-        a_reads: Vec<RecordBuf>,
-        b_reads: Vec<RecordBuf>,
+        a_records: Vec<Vec<u8>>,
+        b_records: Vec<Vec<u8>>,
         ss_caller: &mut VanillaUmiConsensusCaller,
         produce_per_base_tags: bool,
         min_total_reads: usize,
@@ -1532,52 +1556,49 @@ impl DuplexConsensusCaller {
         read_name_prefix: &str,
         read_group_id: &str,
         cell_tag: Option<Tag>,
-    ) -> Result<(Option<Vec<RecordBuf>>, ConsensusCallingStats)> {
+    ) -> Result<(ConsensusOutput, ConsensusCallingStats)> {
         let mut stats = ConsensusCallingStats::new();
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = ConsensusOutput::default();
 
         // Check if we have both strands
-        if a_reads.is_empty() && b_reads.is_empty() {
-            return Ok((None, stats));
+        if a_records.is_empty() && b_records.is_empty() {
+            return Ok((ConsensusOutput::default(), stats));
         }
 
         // Check if we have enough input reads (matching fgbio's hasMinimumNumberOfReads)
         if !Self::has_minimum_number_of_reads(
-            &a_reads,
-            &b_reads,
+            &a_records,
+            &b_records,
             min_total_reads,
             min_xy_reads,
             min_yx_reads,
         ) {
             stats.record_rejection(
                 RejectionReason::InsufficientReads,
-                a_reads.len() + b_reads.len(),
+                a_records.len() + b_records.len(),
             );
-            return Ok((None, stats));
+            return Ok((ConsensusOutput::default(), stats));
         }
 
         // Extract cell barcode from source reads (matching fgbio: recs.head.get[String](cellTag))
         let cell_barcode: Option<String> = cell_tag.and_then(|tag| {
-            // Try A reads first, then B reads (avoid Vec allocation)
-            a_reads.first().or_else(|| b_reads.first()).and_then(|r| {
-                r.data().get(&tag).and_then(|v| {
-                    use noodles::sam::alignment::record_buf::data::field::Value;
-                    match v {
-                        Value::String(s) => Some(s.to_string()),
-                        _ => None,
-                    }
-                })
+            let tag_bytes: [u8; 2] = <[u8; 2]>::from(tag);
+            a_records.first().or_else(|| b_records.first()).and_then(|r| {
+                bam_fields::find_string_tag_in_record(r, &tag_bytes)
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
             })
         });
 
         // Split reads into R1/R2 groups for AB and BA strands (done once, reused below)
-        let ab_r1s: Vec<&RecordBuf> =
-            a_reads.iter().filter(|r| r.flags().is_first_segment()).collect();
-        let ab_r2s: Vec<&RecordBuf> =
-            a_reads.iter().filter(|r| !r.flags().is_first_segment()).collect();
-        let ba_r1s: Vec<&RecordBuf> =
-            b_reads.iter().filter(|r| r.flags().is_first_segment()).collect();
-        let ba_r2s: Vec<&RecordBuf> =
-            b_reads.iter().filter(|r| !r.flags().is_first_segment()).collect();
+        let ab_r1s: Vec<&Vec<u8>> =
+            a_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT != 0).collect();
+        let ab_r2s: Vec<&Vec<u8>> =
+            a_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT == 0).collect();
+        let ba_r1s: Vec<&Vec<u8>> =
+            b_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT != 0).collect();
+        let ba_r2s: Vec<&Vec<u8>> =
+            b_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT == 0).collect();
 
         // Validate strand orientations before processing
         // The expected orientations are:
@@ -1585,25 +1606,25 @@ impl DuplexConsensusCaller {
         // BA R1: -  BA R2: +
         // (or the reverse of all)
         // Therefore: AB-R1 + BA-R2 should all be same strand, and AB-R2 + BA-R1 should all be same strand
-        if !a_reads.is_empty() && !b_reads.is_empty() {
-            // Check singleStrand1 (AB-R1 + BA-R2) - use iterator to avoid Vec allocation
+        if !a_records.is_empty() && !b_records.is_empty() {
+            // Check singleStrand1 (AB-R1 + BA-R2)
             let strand_1_iter = ab_r1s.iter().chain(ba_r2s.iter()).copied();
             if !Self::are_all_same_strand(strand_1_iter) {
                 stats.record_rejection(
                     RejectionReason::PotentialCollision,
-                    a_reads.len() + b_reads.len(),
+                    a_records.len() + b_records.len(),
                 );
-                return Ok((None, stats));
+                return Ok((ConsensusOutput::default(), stats));
             }
 
-            // Check singleStrand2 (AB-R2 + BA-R1) - use iterator to avoid Vec allocation
+            // Check singleStrand2 (AB-R2 + BA-R1)
             let strand_2_iter = ab_r2s.iter().chain(ba_r1s.iter()).copied();
             if !Self::are_all_same_strand(strand_2_iter) {
                 stats.record_rejection(
                     RejectionReason::PotentialCollision,
-                    a_reads.len() + b_reads.len(),
+                    a_records.len() + b_records.len(),
                 );
-                return Ok((None, stats));
+                return Ok((ConsensusOutput::default(), stats));
             }
         }
 
@@ -1616,7 +1637,7 @@ impl DuplexConsensusCaller {
             ba_r2s.len()
         );
 
-        // Combine RecordBufs and convert to SourceReads in one pass (matching fgbio's approach)
+        // Combine raw records and convert to SourceReads in one pass (matching fgbio's approach)
         // X = AB-R1 + BA-R2, Y = AB-R2 + BA-R1
         debug!(
             "MI {}: Combined records (X={}, Y={})",
@@ -1625,18 +1646,25 @@ impl DuplexConsensusCaller {
             ab_r2s.len() + ba_r1s.len()
         );
 
-        // Convert combined RecordBufs to SourceReads directly (avoid intermediate Vec)
-        let x_sources: Vec<SourceRead> = ab_r1s
+        // Keep references to original raw bytes for later tag extraction
+        let x_raws: Vec<&[u8]> = ab_r1s.iter().chain(ba_r2s.iter()).map(|r| r.as_slice()).collect();
+        let x_sources: Vec<SourceRead> = x_raws
             .iter()
-            .chain(ba_r2s.iter())
             .enumerate()
-            .filter_map(|(i, r)| ss_caller.to_source_read(r, i))
+            .filter_map(|(i, r)| {
+                let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+                ss_caller.create_source_read(r, i, mate_clip)
+            })
             .collect();
-        let y_sources: Vec<SourceRead> = ab_r2s
+
+        let y_raws: Vec<&[u8]> = ab_r2s.iter().chain(ba_r1s.iter()).map(|r| r.as_slice()).collect();
+        let y_sources: Vec<SourceRead> = y_raws
             .iter()
-            .chain(ba_r1s.iter())
             .enumerate()
-            .filter_map(|(i, r)| ss_caller.to_source_read(r, i))
+            .filter_map(|(i, r)| {
+                let mate_clip = bam_fields::num_bases_extending_past_mate_raw(r);
+                ss_caller.create_source_read(r, i, mate_clip)
+            })
             .collect();
 
         debug!(
@@ -1659,31 +1687,15 @@ impl DuplexConsensusCaller {
 
         // Split filtered results back by firstOfPair flag (matching fgbio lines 347-350)
         // X = AB-R1 + BA-R2, Y = AB-R2 + BA-R1 (combined for alignment filtering)
-        // Now split them back into the four groups:
-        // - filtered_AB-R1 = filteredXs.filter(_.sam.exists(_.firstOfPair))
-        // - filtered_BA-R2 = filteredXs.filter(_.sam.exists(_.secondOfPair))
-        // - filtered_AB-R2 = filteredYs.filter(_.sam.exists(_.secondOfPair))
-        // - filtered_BA-R1 = filteredYs.filter(_.sam.exists(_.firstOfPair))
-        let filtered_ab_r1s: Vec<SourceRead> = filtered_xs
-            .iter()
-            .filter(|sr| sr.sam.as_ref().is_some_and(|r| r.flags().is_first_segment()))
-            .cloned()
-            .collect();
-        let filtered_ba_r2s: Vec<SourceRead> = filtered_xs
-            .iter()
-            .filter(|sr| sr.sam.as_ref().is_some_and(|r| !r.flags().is_first_segment()))
-            .cloned()
-            .collect();
-        let filtered_ab_r2s: Vec<SourceRead> = filtered_ys
-            .iter()
-            .filter(|sr| sr.sam.as_ref().is_some_and(|r| !r.flags().is_first_segment()))
-            .cloned()
-            .collect();
-        let filtered_ba_r1s: Vec<SourceRead> = filtered_ys
-            .iter()
-            .filter(|sr| sr.sam.as_ref().is_some_and(|r| r.flags().is_first_segment()))
-            .cloned()
-            .collect();
+        // Now split them back into the four groups using sr.flags:
+        let filtered_ab_r1s: Vec<SourceRead> =
+            filtered_xs.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT != 0).cloned().collect();
+        let filtered_ba_r2s: Vec<SourceRead> =
+            filtered_xs.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT == 0).cloned().collect();
+        let filtered_ab_r2s: Vec<SourceRead> =
+            filtered_ys.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT == 0).cloned().collect();
+        let filtered_ba_r1s: Vec<SourceRead> =
+            filtered_ys.iter().filter(|sr| sr.flags & flags::FIRST_SEGMENT != 0).cloned().collect();
 
         debug!(
             "MI {}: After split (filtered_AB-R1={}, filtered_AB-R2={}, filtered_BA-R1={}, filtered_BA-R2={})",
@@ -1694,17 +1706,35 @@ impl DuplexConsensusCaller {
             filtered_ba_r2s.len()
         );
 
-        // Extract RecordBufs from filtered SourceReads for later use in duplex error calculation
-        // We need to do this BEFORE calling consensus_call since that consumes the vectors
-        // Using Arc::clone is cheap (just refcount increment)
-        let filtered_ab_r1_records: Vec<std::sync::Arc<RecordBuf>> =
-            filtered_ab_r1s.iter().filter_map(|sr| sr.sam.clone()).collect();
-        let filtered_ab_r2_records: Vec<std::sync::Arc<RecordBuf>> =
-            filtered_ab_r2s.iter().filter_map(|sr| sr.sam.clone()).collect();
-        let filtered_ba_r1_records: Vec<std::sync::Arc<RecordBuf>> =
-            filtered_ba_r1s.iter().filter_map(|sr| sr.sam.clone()).collect();
-        let filtered_ba_r2_records: Vec<std::sync::Arc<RecordBuf>> =
-            filtered_ba_r2s.iter().filter_map(|sr| sr.sam.clone()).collect();
+        // Extract raw records for tag extraction using original_idx to map back
+        let filtered_ab_r1_raws: Vec<&[u8]> = filtered_ab_r1s
+            .iter()
+            .map(|sr| {
+                debug_assert!(sr.original_idx < x_raws.len());
+                x_raws[sr.original_idx]
+            })
+            .collect();
+        let filtered_ba_r2_raws: Vec<&[u8]> = filtered_ba_r2s
+            .iter()
+            .map(|sr| {
+                debug_assert!(sr.original_idx < x_raws.len());
+                x_raws[sr.original_idx]
+            })
+            .collect();
+        let filtered_ab_r2_raws: Vec<&[u8]> = filtered_ab_r2s
+            .iter()
+            .map(|sr| {
+                debug_assert!(sr.original_idx < y_raws.len());
+                y_raws[sr.original_idx]
+            })
+            .collect();
+        let filtered_ba_r1_raws: Vec<&[u8]> = filtered_ba_r1s
+            .iter()
+            .map(|sr| {
+                debug_assert!(sr.original_idx < y_raws.len());
+                y_raws[sr.original_idx]
+            })
+            .collect();
 
         // Build UMI for consensus read names (format: base_mi/A or base_mi/B)
         let ab_umi = format!("{base_mi}/A");
@@ -1817,13 +1847,15 @@ impl DuplexConsensusCaller {
                         min_xy_reads,
                         min_yx_reads,
                     ) {
-                        // Convert DuplexConsensusRead to RecordBuf
-                        let record_r1 = Self::duplex_read_to_record(
+                        // Write DuplexConsensusReads as raw bytes
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut output,
                             &dr1,
                             ReadType::R1,
                             &base_mi,
-                            &filtered_ab_r1_records,
-                            &filtered_ba_r2_records,
+                            &filtered_ab_r1_raws,
+                            &filtered_ba_r2_raws,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -1831,12 +1863,14 @@ impl DuplexConsensusCaller {
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
-                        let record_r2 = Self::duplex_read_to_record(
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut output,
                             &dr2,
                             ReadType::R2,
                             &base_mi,
-                            &filtered_ab_r2_records,
-                            &filtered_ba_r1_records,
+                            &filtered_ab_r2_raws,
+                            &filtered_ba_r1_raws,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -1845,13 +1879,13 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus();
-                        return Ok((Some(vec![record_r1, record_r2]), stats));
+                        return Ok((output, stats));
                     }
                     stats.record_rejection(
                         RejectionReason::InsufficientReads,
-                        a_reads.len() + b_reads.len(),
+                        a_records.len() + b_records.len(),
                     );
-                    return Ok((None, stats));
+                    return Ok((ConsensusOutput::default(), stats));
                 }
             }
             (Some(ref r1_a), Some(ref r2_a), None, None) => {
@@ -1862,12 +1896,15 @@ impl DuplexConsensusCaller {
                     let duplex_r2 = Self::duplex_consensus(Some(r2_a), None, None);
 
                     if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
-                        let record_r1 = Self::duplex_read_to_record(
+                        let empty: &[&[u8]] = &[];
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut output,
                             &dr1,
                             ReadType::R1,
                             &base_mi,
-                            &filtered_ab_r1_records,
-                            &[],
+                            &filtered_ab_r1_raws,
+                            empty,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -1875,12 +1912,14 @@ impl DuplexConsensusCaller {
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
-                        let record_r2 = Self::duplex_read_to_record(
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut output,
                             &dr2,
                             ReadType::R2,
                             &base_mi,
-                            &filtered_ab_r2_records,
-                            &[],
+                            &filtered_ab_r2_raws,
+                            empty,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -1889,7 +1928,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus();
-                        return Ok((Some(vec![record_r1, record_r2]), stats));
+                        return Ok((output, stats));
                     }
                 }
             }
@@ -1902,12 +1941,15 @@ impl DuplexConsensusCaller {
                     let duplex_r2 = Self::duplex_consensus(Some(r2_b), None, None);
 
                     if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
-                        let record_r1 = Self::duplex_read_to_record(
+                        let empty: &[&[u8]] = &[];
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut output,
                             &dr1,
                             ReadType::R1,
                             &base_mi,
-                            &filtered_ba_r1_records,
-                            &[],
+                            &filtered_ba_r1_raws,
+                            empty,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -1915,12 +1957,14 @@ impl DuplexConsensusCaller {
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
-                        let record_r2 = Self::duplex_read_to_record(
+                        Self::duplex_read_into(
+                            &mut builder,
+                            &mut output,
                             &dr2,
                             ReadType::R2,
                             &base_mi,
-                            &filtered_ba_r2_records,
-                            &[],
+                            &filtered_ba_r2_raws,
+                            empty,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -1929,7 +1973,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus();
-                        return Ok((Some(vec![record_r1, record_r2]), stats));
+                        return Ok((output, stats));
                     }
                 }
             }
@@ -1944,33 +1988,27 @@ impl DuplexConsensusCaller {
             "MI {base_mi}: No duplex consensus created - insufficient reads or conversion failed"
         );
         stats.record_rejection(RejectionReason::InsufficientReads, 1);
-        Ok((None, stats))
+        Ok((ConsensusOutput::default(), stats))
     }
 }
 
 impl ConsensusCaller for DuplexConsensusCaller {
-    fn consensus_reads_from_sam_records(
-        &mut self,
-        reads: Vec<RecordBuf>,
-    ) -> Result<Vec<RecordBuf>> {
-        self.stats.record_input(reads.len());
+    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+        self.stats.record_input(records.len());
 
-        // Partition reads by strand using optimized byte-level operations.
-        // Since reads are already grouped by base MI by the MiGroupIterator,
-        // we only need to partition by strand (A or B) - no HashMap needed.
-        let (base_mi_opt, a_reads, b_reads) = Self::partition_reads_by_strand_simple(reads)?;
+        // Partition records by strand using raw byte-level operations.
+        let (base_mi_opt, a_records, b_records) = Self::partition_records_by_strand(records)?;
 
-        // If no reads with valid MI tags, return empty
         let Some(base_mi) = base_mi_opt else {
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         };
 
         let produce_per_base_tags = self.produce_per_base_tags;
 
-        let (duplex_opt, group_stats) = Self::process_group(
+        let (output, group_stats) = Self::process_group(
             base_mi,
-            a_reads,
-            b_reads,
+            a_records,
+            b_records,
             &mut self.ss_caller,
             produce_per_base_tags,
             self.min_total_reads,
@@ -1981,16 +2019,13 @@ impl ConsensusCaller for DuplexConsensusCaller {
             self.cell_tag,
         )?;
 
-        // Merge group statistics
         self.stats.merge(&group_stats);
 
-        // Collect rejected reads from single-strand caller
         if self.track_rejects {
-            self.rejected_reads.extend(self.ss_caller.rejected_reads().to_vec());
-            self.ss_caller.clear_rejected_reads();
+            self.rejected_reads.extend(self.ss_caller.take_rejected_reads());
         }
 
-        Ok(duplex_opt.unwrap_or_default())
+        Ok(output)
     }
 
     fn total_reads(&self) -> usize {
@@ -2031,7 +2066,15 @@ impl ConsensusCaller for DuplexConsensusCaller {
 mod tests {
     use super::*;
     use crate::sam::builder::RecordBuilder;
+    use crate::sort::bam_fields::ParsedBamRecord;
     use noodles::sam::alignment::record_buf::data::field::Value;
+
+    fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
+        let header = noodles::sam::Header::default();
+        let mut buf = Vec::new();
+        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec).unwrap();
+        buf
+    }
 
     #[test]
     fn test_parse_mi_tag() {
@@ -2987,10 +3030,10 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(vec![frag_a, frag_b])?;
 
         // Fragments should be rejected - no consensus output
-        assert!(
-            result.is_empty(),
+        assert_eq!(
+            result.count, 0,
             "Fragment reads should not produce consensus, got {} reads",
-            result.len()
+            result.count
         );
 
         Ok(())
@@ -3084,10 +3127,9 @@ mod tests {
 
         // Should produce 2 consensus reads (R1 and R2)
         assert_eq!(
-            result.len(),
-            2,
+            result.count, 2,
             "Should produce 2 duplex consensus reads (R1 and R2), got {}",
-            result.len()
+            result.count
         );
 
         Ok(())
@@ -3187,18 +3229,13 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
 
         // Should produce consensus reads with CB tag preserved
-        assert_eq!(result.len(), 2, "Should produce 2 consensus reads");
+        assert_eq!(result.count, 2, "Should produce 2 consensus reads");
 
         // Check that CB tag is preserved on consensus reads
-        let cb_tag = noodles::sam::alignment::record::data::field::Tag::from([b'C', b'B']);
-        for rec in &result {
-            if let Some(Value::String(cb)) = rec.data().get(&cb_tag) {
-                let cb_str = String::from_utf8(cb.iter().copied().collect::<Vec<u8>>())
-                    .expect("CB tag should be valid UTF-8");
-                assert_eq!(cb_str, "ACGT", "CB tag should be preserved");
-            } else {
-                panic!("CB tag should be present on consensus read");
-            }
+        let records = ParsedBamRecord::parse_all(&result.data);
+        for rec in &records {
+            let cb = rec.get_string_tag(b"CB").expect("CB tag should be present on consensus read");
+            assert_eq!(cb, b"ACGT", "CB tag should be preserved");
         }
 
         Ok(())
@@ -3209,8 +3246,6 @@ mod tests {
     /// (indicated by "-" in the RX tag)
     #[test]
     fn test_handle_absent_umi_right() -> Result<()> {
-        use noodles::sam::alignment::record::data::field::Tag;
-
         let mut caller = DuplexConsensusCaller::new(
             "consensus".to_string(),
             "RG1".to_string(),
@@ -3298,18 +3333,13 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
 
         // Should produce 2 consensus reads
-        assert_eq!(result.len(), 2, "Should produce 2 duplex consensus reads");
+        assert_eq!(result.count, 2, "Should produce 2 duplex consensus reads");
 
         // Check RX tag is inherited from the A family (leftUmi pattern "ACT-")
-        let rx_tag = Tag::from([b'R', b'X']);
-        for rec in &result {
-            if let Some(Value::String(rx)) = rec.data().get(&rx_tag) {
-                let rx_str = String::from_utf8(rx.iter().copied().collect::<Vec<u8>>())
-                    .expect("RX tag should be valid UTF-8");
-                assert_eq!(rx_str, "ACT-", "RX tag should be inherited from A family");
-            } else {
-                panic!("RX tag should be present on consensus read");
-            }
+        let records = ParsedBamRecord::parse_all(&result.data);
+        for rec in &records {
+            let rx = rec.get_string_tag(b"RX").expect("RX tag should be present on consensus read");
+            assert_eq!(rx, b"ACT-", "RX tag should be inherited from A family");
         }
 
         Ok(())
@@ -3319,8 +3349,6 @@ mod tests {
     /// Tests the reverse case where left UMI is absent in A family
     #[test]
     fn test_handle_absent_umi_left() -> Result<()> {
-        use noodles::sam::alignment::record::data::field::Tag;
-
         let mut caller = DuplexConsensusCaller::new(
             "consensus".to_string(),
             "RG1".to_string(),
@@ -3408,18 +3436,13 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
 
         // Should produce 2 consensus reads
-        assert_eq!(result.len(), 2, "Should produce 2 duplex consensus reads");
+        assert_eq!(result.count, 2, "Should produce 2 duplex consensus reads");
 
         // Check RX tag is inherited from the A family (leftUmi pattern "-ACT")
-        let rx_tag = Tag::from([b'R', b'X']);
-        for rec in &result {
-            if let Some(Value::String(rx)) = rec.data().get(&rx_tag) {
-                let rx_str = String::from_utf8(rx.iter().copied().collect::<Vec<u8>>())
-                    .expect("RX tag should be valid UTF-8");
-                assert_eq!(rx_str, "-ACT", "RX tag should be inherited from A family");
-            } else {
-                panic!("RX tag should be present on consensus read");
-            }
+        let records = ParsedBamRecord::parse_all(&result.data);
+        for rec in &records {
+            let rx = rec.get_string_tag(b"RX").expect("RX tag should be present on consensus read");
+            assert_eq!(rx, b"-ACT", "RX tag should be inherited from A family");
         }
 
         Ok(())
@@ -3430,8 +3453,6 @@ mod tests {
     /// and minReads=[3,3,0] allows BA=0
     #[test]
     fn test_create_single_strand_consensus_a_only() -> Result<()> {
-        use noodles::sam::alignment::record::data::field::Tag;
-
         // Create caller with minReads=[1,1,0] to allow single-strand consensus
         let mut caller = DuplexConsensusCaller::new(
             "consensus".to_string(),
@@ -3488,19 +3509,17 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(reads)?;
 
         // Should produce 2 consensus reads (R1 and R2) from single strand
-        assert_eq!(result.len(), 2, "Should produce 2 consensus reads from single A strand");
+        assert_eq!(result.count, 2, "Should produce 2 consensus reads from single A strand");
 
         // Check per-read tags show 3 AB reads and 0 BA reads
-        let ad_tag = Tag::from([b'a', b'D']);
-        let bd_tag = Tag::from([b'b', b'D']);
+        let records = ParsedBamRecord::parse_all(&result.data);
 
-        for rec in &result {
-            let ab_depth =
-                DuplexConsensusCaller::extract_int_tag(rec.data(), ad_tag).expect("Missing aD tag");
+        for rec in &records {
+            let ab_depth = rec.get_int_tag(b"aD").expect("Missing aD tag");
             assert_eq!(ab_depth, 3, "AB depth should be 3");
 
             // BA depth should be 0 or tag should not exist
-            if let Some(ba_depth) = DuplexConsensusCaller::extract_int_tag(rec.data(), bd_tag) {
+            if let Some(ba_depth) = rec.get_int_tag(b"bD") {
                 assert_eq!(ba_depth, 0, "BA depth should be 0");
             }
             // If tag doesn't exist, that's also correct for single-strand
@@ -3513,8 +3532,6 @@ mod tests {
     /// Tests single-strand pipeline when only B-strand reads are present
     #[test]
     fn test_create_single_strand_consensus_b_only() -> Result<()> {
-        use noodles::sam::alignment::record::data::field::Tag;
-
         // Create caller with minReads=[1,1,0] to allow single-strand consensus
         let mut caller = DuplexConsensusCaller::new(
             "consensus".to_string(),
@@ -3571,14 +3588,14 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(reads)?;
 
         // Should produce 2 consensus reads (R1 and R2) from single strand
-        assert_eq!(result.len(), 2, "Should produce 2 consensus reads from single B strand");
+        assert_eq!(result.count, 2, "Should produce 2 consensus reads from single B strand");
 
         // Check per-read tags - for B-only, fgbio swaps AB/BA so AB has the data
-        let ad_tag = Tag::from([b'a', b'D']);
+        let records = ParsedBamRecord::parse_all(&result.data);
 
-        for rec in &result {
+        for rec in &records {
             // After swap, AB should have the depth
-            if let Some(ab_depth) = DuplexConsensusCaller::extract_int_tag(rec.data(), ad_tag) {
+            if let Some(ab_depth) = rec.get_int_tag(b"aD") {
                 assert_eq!(ab_depth, 3, "AB depth should be 3 after swap");
             }
         }
@@ -3646,8 +3663,8 @@ mod tests {
         let result = caller.consensus_reads_from_sam_records(reads)?;
 
         // Should produce empty result since BA=0 doesn't meet minReads[2]=1
-        assert!(
-            result.is_empty(),
+        assert_eq!(
+            result.count, 0,
             "Should not produce consensus when single strand doesn't meet min_reads"
         );
 
@@ -3769,11 +3786,11 @@ mod tests {
 
         // With minReads=3: should fail (BA only has 2 reads)
         let result_3 = caller_3.consensus_reads_from_sam_records(reads.clone())?;
-        assert!(result_3.is_empty(), "minReads=3 should fail with only 2 BA reads");
+        assert_eq!(result_3.count, 0, "minReads=3 should fail with only 2 BA reads");
 
         // With minReads=2: should pass
         let result_2 = caller_2.consensus_reads_from_sam_records(reads.clone())?;
-        assert_eq!(result_2.len(), 2, "minReads=2 should produce 2 consensus reads");
+        assert_eq!(result_2.count, 2, "minReads=2 should produce 2 consensus reads");
 
         // Now add a BA read with different CIGAR (will be filtered out)
         let dissimilar = vec![
@@ -3831,8 +3848,8 @@ mod tests {
         // minReads=3 should still fail
         let result_dissimilar =
             caller_3_new.consensus_reads_from_sam_records(reads_with_dissimilar)?;
-        assert!(
-            result_dissimilar.is_empty(),
+        assert_eq!(
+            result_dissimilar.count, 0,
             "minReads=3 should still fail when dissimilar read is filtered out"
         );
 
@@ -3974,7 +3991,6 @@ mod tests {
     #[test]
     fn test_tie_breaking_for_simplex_consensus() -> Result<()> {
         use crate::sam::builder::{SamBuilder, Strand};
-        use noodles::sam::alignment::record::data::field::Tag;
 
         // This test reproduces the tie-breaking scenario:
         // 8 BA read pairs with 4 having 'A' at position 5 and 4 having 'C' at position 5
@@ -4140,25 +4156,22 @@ mod tests {
         )?;
 
         // Call consensus on these reads
-        let consensus_records =
+        let consensus_output =
             caller.consensus_reads_from_sam_records(builder.records().to_vec())?;
 
-        assert_eq!(consensus_records.len(), 2, "Should generate 2 consensus records (R1 and R2)");
+        assert_eq!(consensus_output.count, 2, "Should generate 2 consensus records (R1 and R2)");
+
+        // Parse the raw records
+        let records = ParsedBamRecord::parse_all(&consensus_output.data);
 
         // Find the R1 record (flag should indicate first of pair)
-        let r1 = consensus_records
+        let r1 = records
             .iter()
-            .find(|r| r.flags().is_first_segment())
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
             .expect("Should have R1 consensus");
 
         // Get the bc tag (BA simplex consensus)
-        let bc_tag_key = Tag::new(b'b', b'c'); // "bc" tag
-        let bc_tag = r1.data().get(&bc_tag_key).expect("Should have bc tag");
-
-        let bc_bases = match bc_tag {
-            noodles::sam::alignment::record_buf::data::field::Value::String(s) => s.to_string(),
-            _ => panic!("bc tag should be a string"),
-        };
+        let bc_bases = r1.get_string_tag(b"bc").expect("Should have bc tag");
 
         // Check base at position 5
         // With 4 'A' and 4 'C', this appears to be a tie. However, the order of
@@ -4166,7 +4179,7 @@ mod tests {
         // affects the floating-point result. With reads sorted by descending length
         // (matching fgbio's filterToMostCommonAlignment behavior), the order of
         // base addition produces 'A' as the winner due to floating-point accumulation.
-        let base_at_5 = bc_bases.chars().nth(5).expect("bc tag should have position 5");
+        let base_at_5 = bc_bases[5] as char;
 
         assert_eq!(base_at_5, 'A', "Position 5 in bc tag should be 'A', got '{base_at_5}'");
 
@@ -4270,8 +4283,8 @@ mod tests {
     }
 
     #[test]
-    fn test_duplex_read_to_record_mapping_quality_zero() {
-        // Test that duplex_read_to_record sets MAPQ=0
+    fn test_duplex_read_into_unmapped_flag() {
+        // Test that duplex_read_into sets UNMAPPED flag
         let ab_consensus = VanillaConsensusRead {
             id: "test".to_string(),
             bases: vec![b'A', b'C', b'G', b'T'],
@@ -4290,7 +4303,11 @@ mod tests {
             ba_consensus: None,
         };
 
-        let record = DuplexConsensusCaller::duplex_read_to_record(
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
             &duplex,
             ReadType::Fragment,
             "UMI123",
@@ -4305,11 +4322,10 @@ mod tests {
         )
         .unwrap();
 
-        // Mapping quality should be 0 for unmapped consensus reads
-        assert_eq!(
-            record.mapping_quality(),
-            Some(noodles::sam::alignment::record::MappingQuality::new(0).unwrap())
-        );
+        // Verify UNMAPPED flag is set
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].flag & flags::UNMAPPED != 0, "UNMAPPED flag should be set");
     }
 
     // ==========================================================================
@@ -4468,24 +4484,28 @@ mod tests {
         // has_minimum_number_of_reads only counts R1s (first segment of paired reads)
 
         // Create 3 AB R1 reads
-        let a_reads: Vec<RecordBuf> = (0..3)
+        let a_reads: Vec<Vec<u8>> = (0..3)
             .map(|_| {
-                RecordBuilder::new()
-                    .sequence("ACGT")
-                    .first_segment(true)
-                    .tag("MI", "test/A")
-                    .build()
+                encode_to_raw(
+                    &RecordBuilder::new()
+                        .sequence("ACGT")
+                        .first_segment(true)
+                        .tag("MI", "test/A")
+                        .build(),
+                )
             })
             .collect();
 
         // Create 2 BA R1 reads
-        let b_reads: Vec<RecordBuf> = (0..2)
+        let b_reads: Vec<Vec<u8>> = (0..2)
             .map(|_| {
-                RecordBuilder::new()
-                    .sequence("ACGT")
-                    .first_segment(true)
-                    .tag("MI", "test/B")
-                    .build()
+                encode_to_raw(
+                    &RecordBuilder::new()
+                        .sequence("ACGT")
+                        .first_segment(true)
+                        .tag("MI", "test/B")
+                        .build(),
+                )
             })
             .collect();
 
@@ -4507,20 +4527,22 @@ mod tests {
         // Test asymmetric min_reads [D, M_AB, M_BA] configuration
 
         // Create 3 AB R1 reads
-        let a_reads: Vec<RecordBuf> = (0..3)
+        let a_reads: Vec<Vec<u8>> = (0..3)
             .map(|_| {
-                RecordBuilder::new()
-                    .sequence("ACGT")
-                    .first_segment(true)
-                    .tag("MI", "test/A")
-                    .build()
+                encode_to_raw(
+                    &RecordBuilder::new()
+                        .sequence("ACGT")
+                        .first_segment(true)
+                        .tag("MI", "test/A")
+                        .build(),
+                )
             })
             .collect();
 
         // Create 1 BA R1 read
-        let b_reads = vec![
-            RecordBuilder::new().sequence("ACGT").first_segment(true).tag("MI", "test/B").build(),
-        ];
+        let b_reads = vec![encode_to_raw(
+            &RecordBuilder::new().sequence("ACGT").first_segment(true).tag("MI", "test/B").build(),
+        )];
 
         // [3, 2, 1]: min_total=3, min_xy=2, min_yx=1
         // A=3, B=1, xy=max(3,1)=3, yx=min(3,1)=1
@@ -4556,23 +4578,22 @@ mod tests {
     #[test]
     fn test_are_all_same_strand() {
         // Create test records
-        let fwd_record = RecordBuilder::new().sequence("ACGT").build();
+        let fwd_raw = encode_to_raw(&RecordBuilder::new().sequence("ACGT").build());
 
-        let rev_record = RecordBuilder::new().sequence("ACGT").reverse_complement(true).build();
+        let rev_raw =
+            encode_to_raw(&RecordBuilder::new().sequence("ACGT").reverse_complement(true).build());
 
         // Empty collection
-        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty()));
+        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&Vec<u8>>()));
 
         // All forward
-        assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_record, &fwd_record].into_iter()));
+        assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &fwd_raw].into_iter()));
 
         // All reverse
-        assert!(DuplexConsensusCaller::are_all_same_strand([&rev_record, &rev_record].into_iter()));
+        assert!(DuplexConsensusCaller::are_all_same_strand([&rev_raw, &rev_raw].into_iter()));
 
         // Mixed strands
-        assert!(!DuplexConsensusCaller::are_all_same_strand(
-            [&fwd_record, &rev_record].into_iter()
-        ));
+        assert!(!DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &rev_raw].into_iter()));
     }
 
     #[test]
@@ -4637,7 +4658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplex_read_to_record_with_cell_tag() {
+    fn test_duplex_read_into_with_cell_tag() {
         // Test that cell barcode is properly included
         let ab_consensus = VanillaConsensusRead {
             id: "test".to_string(),
@@ -4660,7 +4681,11 @@ mod tests {
         let cell_tag = Tag::new(b'C', b'B');
         let cell_barcode = "ACGTACGT-1";
 
-        let record = DuplexConsensusCaller::duplex_read_to_record(
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
             &duplex,
             ReadType::Fragment,
             "UMI123",
@@ -4676,17 +4701,14 @@ mod tests {
         .unwrap();
 
         // Check cell barcode tag is present
-        let cb_value = record.data().get(&cell_tag);
-        assert!(cb_value.is_some());
-        if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) = cb_value {
-            assert_eq!(s.to_string(), cell_barcode);
-        } else {
-            panic!("CB tag should be a string");
-        }
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        let cb = records[0].get_string_tag(b"CB").expect("CB tag should be present");
+        assert_eq!(String::from_utf8(cb).unwrap(), cell_barcode);
     }
 
     #[test]
-    fn test_duplex_read_to_record_without_cell_tag() {
+    fn test_duplex_read_into_without_cell_tag() {
         // Test that record is created correctly without cell barcode
         let ab_consensus = VanillaConsensusRead {
             id: "test".to_string(),
@@ -4706,7 +4728,11 @@ mod tests {
             ba_consensus: None,
         };
 
-        let record = DuplexConsensusCaller::duplex_read_to_record(
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
             &duplex,
             ReadType::Fragment,
             "UMI123",
@@ -4722,8 +4748,9 @@ mod tests {
         .unwrap();
 
         // Check CB tag is not present
-        let cell_tag = Tag::new(b'C', b'B');
-        assert!(record.data().get(&cell_tag).is_none());
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].get_string_tag(b"CB").is_none());
     }
 
     #[test]
@@ -4806,10 +4833,8 @@ mod tests {
     }
 
     #[test]
-    fn test_duplex_read_to_record_ba_none_tags() {
+    fn test_duplex_read_into_ba_none_tags() {
         // Test that BA=None produces correct zero tags for bD, bM, bE
-        use noodles::sam::alignment::record::data::field::Tag;
-
         let ab_consensus = VanillaConsensusRead {
             id: "test".to_string(),
             bases: vec![b'A', b'C', b'G', b'T'],
@@ -4828,7 +4853,11 @@ mod tests {
             ba_consensus: None, // BA is None
         };
 
-        let record = DuplexConsensusCaller::duplex_read_to_record(
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
             &duplex,
             ReadType::R1,
             "UMI123",
@@ -4843,66 +4872,49 @@ mod tests {
         )
         .unwrap();
 
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+
         // Check BA tags are set to zero
-        // Note: noodles encodes small integers as Int8 or UInt8, so we use extract_int_tag
-        let bd_tag = Tag::from([b'b', b'D']);
-        let bm_tag = Tag::from([b'b', b'M']);
-        let be_tag = Tag::from([b'b', b'E']);
+        assert_eq!(rec.get_int_tag(b"bD"), Some(0));
+        assert_eq!(rec.get_int_tag(b"bM"), Some(0));
 
-        let bd_value = DuplexConsensusCaller::extract_int_tag(record.data(), bd_tag);
-        assert_eq!(bd_value, Some(0));
-
-        let bm_value = DuplexConsensusCaller::extract_int_tag(record.data(), bm_tag);
-        assert_eq!(bm_value, Some(0));
-
-        if let Some(Value::Float(v)) = record.data().get(&be_tag) {
-            assert!((v - 0.0).abs() < 0.001);
-        } else {
-            panic!("bE tag should be Float");
-        }
+        let be_val = rec.get_float_tag(b"bE").expect("bE tag should be present");
+        assert!((be_val - 0.0).abs() < 0.001);
 
         // Verify AB tags are set correctly
-        let ad_tag = Tag::from([b'a', b'D']);
-        let am_tag = Tag::from([b'a', b'M']);
-        let _ae_tag = Tag::from([b'a', b'E']);
-
-        let ad_value = DuplexConsensusCaller::extract_int_tag(record.data(), ad_tag);
-        assert_eq!(ad_value, Some(5)); // max depth from AB
-
-        let am_value = DuplexConsensusCaller::extract_int_tag(record.data(), am_tag);
-        assert_eq!(am_value, Some(5)); // min depth from AB
+        assert_eq!(rec.get_int_tag(b"aD"), Some(5)); // max depth from AB
+        assert_eq!(rec.get_int_tag(b"aM"), Some(5)); // min depth from AB
     }
 
     #[test]
     fn test_are_all_same_strand_mixed() {
         // Test are_all_same_strand with mixed strands
-        let fwd_record = RecordBuilder::new().sequence("ACGT").build();
+        let fwd_raw = encode_to_raw(&RecordBuilder::new().sequence("ACGT").build());
 
-        let rev_record = RecordBuilder::new().sequence("ACGT").reverse_complement(true).build();
+        let rev_raw =
+            encode_to_raw(&RecordBuilder::new().sequence("ACGT").reverse_complement(true).build());
 
         // All forward
-        assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_record, &fwd_record].into_iter()));
+        assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &fwd_raw].into_iter()));
 
         // All reverse
-        assert!(DuplexConsensusCaller::are_all_same_strand([&rev_record, &rev_record].into_iter()));
+        assert!(DuplexConsensusCaller::are_all_same_strand([&rev_raw, &rev_raw].into_iter()));
 
         // Mixed strands - should return false
-        assert!(!DuplexConsensusCaller::are_all_same_strand(
-            [&fwd_record, &rev_record].into_iter()
-        ));
+        assert!(!DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &rev_raw].into_iter()));
 
         // Empty - should return true
-        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty()));
+        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&Vec<u8>>()));
 
         // Single record
-        assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_record].into_iter()));
+        assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_raw].into_iter()));
     }
 
     #[test]
-    fn test_duplex_read_to_record_with_per_base_tags() {
+    fn test_duplex_read_into_with_per_base_tags() {
         // Test that per-base tags are generated when produce_per_base_tags=true
-        use noodles::sam::alignment::record::data::field::Tag;
-
         let ab_consensus = VanillaConsensusRead {
             id: "test".to_string(),
             bases: vec![b'A', b'C', b'G', b'T'],
@@ -4930,7 +4942,11 @@ mod tests {
             ba_consensus: Some(ba_consensus),
         };
 
-        let record = DuplexConsensusCaller::duplex_read_to_record(
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = ConsensusOutput::default();
+        DuplexConsensusCaller::duplex_read_into(
+            &mut builder,
+            &mut output,
             &duplex,
             ReadType::R1,
             "UMI123",
@@ -4945,33 +4961,23 @@ mod tests {
         )
         .unwrap();
 
-        // Check per-base AB tags
-        let ad_base_tag = Tag::from([b'a', b'd']);
-        let ae_base_tag = Tag::from([b'a', b'e']);
-        let ac_tag = Tag::from([b'a', b'c']);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
 
-        // ad tag should have AB depths
-        assert!(record.data().get(&ad_base_tag).is_some());
-        // ae tag should have AB errors
-        assert!(record.data().get(&ae_base_tag).is_some());
-        // ac tag should have AB bases
-        assert!(record.data().get(&ac_tag).is_some());
+        // Check per-base AB tags
+        assert!(rec.get_i16_array_tag(b"ad").is_some(), "ad tag should be present");
+        assert!(rec.get_i16_array_tag(b"ae").is_some(), "ae tag should be present");
+        assert!(rec.get_string_tag(b"ac").is_some(), "ac tag should be present");
 
         // Check per-base BA tags
-        let bd_base_tag = Tag::from([b'b', b'd']);
-        let be_base_tag = Tag::from([b'b', b'e']);
-        let bc_tag = Tag::from([b'b', b'c']);
-
-        // bd tag should have BA depths
-        assert!(record.data().get(&bd_base_tag).is_some());
-        // be tag should have BA errors
-        assert!(record.data().get(&be_base_tag).is_some());
-        // bc tag should have BA bases
-        assert!(record.data().get(&bc_tag).is_some());
+        assert!(rec.get_i16_array_tag(b"bd").is_some(), "bd tag should be present");
+        assert!(rec.get_i16_array_tag(b"be").is_some(), "be tag should be present");
+        assert!(rec.get_string_tag(b"bc").is_some(), "bc tag should be present");
     }
 
     #[test]
-    fn test_duplex_read_to_record_read_types() {
+    fn test_duplex_read_into_read_types() {
         // Test different read types (R1, R2, Fragment)
         let ab_consensus = VanillaConsensusRead {
             id: "test".to_string(),
@@ -4991,61 +4997,47 @@ mod tests {
             ba_consensus: None,
         };
 
+        // Helper to build and parse a single record
+        let build_and_parse = |read_type: ReadType| -> ParsedBamRecord {
+            let mut builder = UnmappedBamRecordBuilder::new();
+            let mut output = ConsensusOutput::default();
+            DuplexConsensusCaller::duplex_read_into(
+                &mut builder,
+                &mut output,
+                &duplex,
+                read_type,
+                "UMI123",
+                &[],
+                &[],
+                false,
+                "consensus",
+                "RG1",
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+            let records = ParsedBamRecord::parse_all(&output.data);
+            assert_eq!(records.len(), 1);
+            records.into_iter().next().unwrap()
+        };
+
         // R1 read type
-        let record_r1 = DuplexConsensusCaller::duplex_read_to_record(
-            &duplex,
-            ReadType::R1,
-            "UMI123",
-            &[],
-            &[],
-            false,
-            "consensus",
-            "RG1",
-            true,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(record_r1.flags().is_segmented());
-        assert!(record_r1.flags().is_first_segment());
-        assert!(!record_r1.flags().is_last_segment());
+        let rec_r1 = build_and_parse(ReadType::R1);
+        assert!(rec_r1.flag & flags::PAIRED != 0);
+        assert!(rec_r1.flag & flags::FIRST_SEGMENT != 0);
+        assert!(rec_r1.flag & flags::LAST_SEGMENT == 0);
 
         // R2 read type
-        let record_r2 = DuplexConsensusCaller::duplex_read_to_record(
-            &duplex,
-            ReadType::R2,
-            "UMI123",
-            &[],
-            &[],
-            false,
-            "consensus",
-            "RG1",
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(record_r2.flags().is_segmented());
-        assert!(!record_r2.flags().is_first_segment());
-        assert!(record_r2.flags().is_last_segment());
+        let rec_r2 = build_and_parse(ReadType::R2);
+        assert!(rec_r2.flag & flags::PAIRED != 0);
+        assert!(rec_r2.flag & flags::FIRST_SEGMENT == 0);
+        assert!(rec_r2.flag & flags::LAST_SEGMENT != 0);
 
         // Fragment read type
-        let record_frag = DuplexConsensusCaller::duplex_read_to_record(
-            &duplex,
-            ReadType::Fragment,
-            "UMI123",
-            &[],
-            &[],
-            false,
-            "consensus",
-            "RG1",
-            true,
-            None,
-            None,
-        )
-        .unwrap();
-        // Fragment should not have segmented flag
-        assert!(!record_frag.flags().is_segmented());
+        let rec_frag = build_and_parse(ReadType::Fragment);
+        // Fragment should not have PAIRED flag
+        assert!(rec_frag.flag & flags::PAIRED == 0);
     }
 
     // ============================================================================
@@ -5205,12 +5197,16 @@ mod tests {
     #[test]
     fn test_has_minimum_number_of_reads_basic() {
         // Create mock reads with paired + first segment flags for R1 counting
-        let a_reads: Vec<RecordBuf> = (0..3)
-            .map(|_| RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+        let a_reads: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+            })
             .collect();
 
-        let b_reads: Vec<RecordBuf> = (0..3)
-            .map(|_| RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+        let b_reads: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+            })
             .collect();
 
         // Test with sufficient reads: total=6, xy=3, yx=3
@@ -5232,12 +5228,14 @@ mod tests {
     #[test]
     fn test_has_minimum_number_of_reads_empty_strand() {
         // Create 3 A reads
-        let a_reads: Vec<RecordBuf> = (0..3)
-            .map(|_| RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+        let a_reads: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+            })
             .collect();
 
         // Empty B reads
-        let b_reads: Vec<RecordBuf> = vec![];
+        let b_reads: Vec<Vec<u8>> = vec![];
 
         // XY = 3, YX = 0, total = 3
 
@@ -5259,16 +5257,20 @@ mod tests {
     #[test]
     fn test_has_minimum_number_of_reads_only_counts_r1() {
         // Create R1 and R2 reads for A strand
-        let a_r1 = RecordBuilder::new().sequence("ACGT").first_segment(true).build();
+        let a_r1 =
+            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build());
 
-        let a_r2 = RecordBuilder::new()
-            .sequence("ACGT")
-            .first_segment(false) // R2, should not be counted
-            .build();
+        let a_r2 = encode_to_raw(
+            &RecordBuilder::new()
+                .sequence("ACGT")
+                .first_segment(false) // R2, should not be counted
+                .build(),
+        );
 
         let a_reads = vec![a_r1, a_r2]; // Only 1 R1
 
-        let b_r1 = RecordBuilder::new().sequence("ACGT").first_segment(true).build();
+        let b_r1 =
+            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build());
 
         let b_reads = vec![b_r1]; // 1 R1
 
@@ -5367,5 +5369,89 @@ mod tests {
             1, // min_xy
             1, // min_yx (0 < 1)
         ));
+    }
+
+    // ========================================================================
+    // partition_records_by_strand tests
+    // ========================================================================
+
+    #[test]
+    fn test_partition_records_by_strand_basic() {
+        let a1 = encode_to_raw(
+            &RecordBuilder::new()
+                .name("r1")
+                .sequence("ACGT")
+                .qualities(&[30; 4])
+                .tag("MI", "UMI1/A")
+                .build(),
+        );
+        let a2 = encode_to_raw(
+            &RecordBuilder::new()
+                .name("r2")
+                .sequence("ACGT")
+                .qualities(&[30; 4])
+                .tag("MI", "UMI1/A")
+                .build(),
+        );
+        let b1 = encode_to_raw(
+            &RecordBuilder::new()
+                .name("r3")
+                .sequence("ACGT")
+                .qualities(&[30; 4])
+                .tag("MI", "UMI1/B")
+                .build(),
+        );
+
+        let records = vec![a1, a2, b1];
+        let (base_mi, a_records, b_records) =
+            DuplexConsensusCaller::partition_records_by_strand(records).unwrap();
+
+        assert_eq!(base_mi.as_deref(), Some("UMI1"));
+        assert_eq!(a_records.len(), 2);
+        assert_eq!(b_records.len(), 1);
+    }
+
+    #[test]
+    fn test_partition_records_by_strand_empty() {
+        let (base_mi, a_records, b_records) =
+            DuplexConsensusCaller::partition_records_by_strand(Vec::new()).unwrap();
+
+        assert!(base_mi.is_none());
+        assert!(a_records.is_empty());
+        assert!(b_records.is_empty());
+    }
+
+    #[test]
+    fn test_partition_records_by_strand_missing_suffix() {
+        let rec = encode_to_raw(
+            &RecordBuilder::new()
+                .name("r1")
+                .sequence("ACGT")
+                .qualities(&[30; 4])
+                .tag("MI", "UMI1") // No /A or /B suffix
+                .build(),
+        );
+
+        let result = DuplexConsensusCaller::partition_records_by_strand(vec![rec]);
+        assert!(result.is_err(), "Should error on MI tag without /A or /B suffix");
+    }
+
+    #[test]
+    fn test_partition_records_by_strand_a_only() {
+        let a1 = encode_to_raw(
+            &RecordBuilder::new()
+                .name("r1")
+                .sequence("ACGT")
+                .qualities(&[30; 4])
+                .tag("MI", "UMI1/A")
+                .build(),
+        );
+
+        let (base_mi, a_records, b_records) =
+            DuplexConsensusCaller::partition_records_by_strand(vec![a1]).unwrap();
+
+        assert_eq!(base_mi.as_deref(), Some("UMI1"));
+        assert_eq!(a_records.len(), 1);
+        assert!(b_records.is_empty());
     }
 }

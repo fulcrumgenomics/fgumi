@@ -72,10 +72,9 @@
 //!   - `ac, bc` - Single-strand consensus bases (string)
 //!   - `aq, bq` - Single-strand consensus qualities (string)
 
-use crate::clipper::cigar_utils;
-use crate::clipper::{ClippingMode, SamRecordClipper};
 use crate::consensus::caller::{
-    ConsensusCaller, ConsensusCallingStats, RejectionReason as CallerRejectionReason,
+    ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
+    RejectionReason as CallerRejectionReason,
 };
 use crate::consensus::simple_umi::consensus_umis;
 use crate::consensus::vanilla_caller::{
@@ -84,15 +83,9 @@ use crate::consensus::vanilla_caller::{
 use crate::consensus::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use crate::dna::reverse_complement;
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
-use crate::sam::{record_utils, to_smallest_signed_int};
-use anyhow::{Result, anyhow};
-use bstr::BString;
-use noodles::sam::alignment::record::Flags;
-use noodles::sam::alignment::record::cigar::Cigar as CigarTrait;
-use noodles::sam::alignment::record::cigar::op::Kind;
+use crate::sort::bam_fields::{self, UnmappedBamRecordBuilder, flags};
+use anyhow::Result;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::data::field::Value;
-use noodles::sam::alignment::record_buf::{Data, QualityScores, RecordBuf, Sequence};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -235,6 +228,27 @@ struct SingleStrandConsensus {
     is_negative_strand: bool,
 }
 
+/// Precomputed clip metadata for a single record in the raw-byte codec pipeline.
+///
+/// Holds all information needed for filtering, overlap calculation, and
+/// `SourceRead` construction without materializing a `RecordBuf`.
+struct ClippedRecordInfo {
+    /// Index into the original raw records vec.
+    raw_idx: usize,
+    /// Number of query bases to clip.
+    clip_amount: usize,
+    /// `true` ⟹ clip from start (negative-strand reads).
+    clip_from_start: bool,
+    /// Sequence length after clipping.
+    clipped_seq_len: usize,
+    /// CIGAR ops after clipping (raw u32 words).
+    clipped_cigar: Vec<u32>,
+    /// 1-based alignment start after clipping.
+    adjusted_pos: usize,
+    /// BAM flags.
+    flags: u16,
+}
+
 /// CODEC consensus caller
 ///
 /// Calls consensus from CODEC sequencing data where R1 and R2 from a single read-pair
@@ -252,24 +266,24 @@ pub struct CodecConsensusCaller {
     /// Statistics tracker
     stats: CodecConsensusStats,
 
-    /// Clipper for clipping reads past mate ends
-    clipper: SamRecordClipper,
-
     /// Random number generator for downsampling
     rng: StdRng,
 
     /// Counter for consensus read naming
     consensus_counter: u64,
 
-    /// Whether to track rejected reads
-    track_rejects: bool,
-
-    /// Rejected reads (only populated if `track_rejects` is true)
-    rejected_reads: Vec<RecordBuf>,
-
     /// Single-strand consensus caller (matches fgbio's ssCaller delegation pattern)
     /// CODEC delegates to `VanillaUmiConsensusCaller` for single-strand consensus building
     ss_caller: VanillaUmiConsensusCaller,
+
+    /// Reusable builder for raw-byte BAM record output
+    bam_builder: UnmappedBamRecordBuilder,
+
+    /// Whether to store rejected reads (raw bytes) for output
+    track_rejects: bool,
+
+    /// Rejected raw BAM records (only populated when `track_rejects` is true)
+    rejected_reads: Vec<Vec<u8>>,
 }
 
 #[allow(
@@ -292,24 +306,6 @@ impl CodecConsensusCaller {
         read_group_id: String,
         options: CodecConsensusOptions,
     ) -> Self {
-        Self::new_with_rejects_tracking(read_name_prefix, read_group_id, options, false)
-    }
-
-    /// Creates a new CODEC consensus caller with optional rejected reads tracking
-    ///
-    /// # Arguments
-    /// * `read_name_prefix` - Prefix for consensus read names
-    /// * `read_group_id` - Read group ID for consensus reads
-    /// * `options` - CODEC consensus calling options
-    /// * `track_rejects` - Whether to store rejected reads for later retrieval
-    #[must_use]
-    pub fn new_with_rejects_tracking(
-        read_name_prefix: String,
-        read_group_id: String,
-        options: CodecConsensusOptions,
-        track_rejects: bool,
-    ) -> Self {
-        let clipper = SamRecordClipper::new(ClippingMode::Hard);
         let rng = StdRng::seed_from_u64(42);
 
         // Create VanillaUmiConsensusCaller for single-strand consensus building
@@ -342,13 +338,29 @@ impl CodecConsensusCaller {
             read_group_id,
             options,
             stats: CodecConsensusStats::default(),
-            clipper,
             rng,
             consensus_counter: 0,
-            track_rejects,
-            rejected_reads: Vec::new(),
             ss_caller,
+            bam_builder: UnmappedBamRecordBuilder::new(),
+            track_rejects: false,
+            rejected_reads: Vec::new(),
         }
+    }
+
+    /// Creates a new CODEC consensus caller with optional rejected-reads tracking.
+    ///
+    /// When `track_rejects` is `true`, raw BAM bytes of rejected reads are stored
+    /// and can be retrieved via [`rejected_reads`] / [`take_rejected_reads`].
+    #[must_use]
+    pub fn new_with_rejects_tracking(
+        read_name_prefix: String,
+        read_group_id: String,
+        options: CodecConsensusOptions,
+        track_rejects: bool,
+    ) -> Self {
+        let mut caller = Self::new(read_name_prefix, read_group_id, options);
+        caller.track_rejects = track_rejects;
+        caller
     }
 
     /// Returns the statistics for this caller
@@ -357,70 +369,80 @@ impl CodecConsensusCaller {
         &self.stats
     }
 
-    /// Returns a slice of rejected reads (only populated if tracking is enabled)
+    /// Clears all per-group state to prepare for reuse
+    ///
+    /// This resets statistics while preserving the caller's
+    /// configuration and reusable components (consensus builder, RNG, etc.).
+    pub fn clear(&mut self) {
+        self.stats = CodecConsensusStats::default();
+        self.ss_caller.clear();
+        self.rejected_reads.clear();
+    }
+
+    /// Returns a reference to the rejected reads (raw BAM bytes).
     #[must_use]
-    pub fn rejected_reads(&self) -> &[RecordBuf] {
+    pub fn rejected_reads(&self) -> &[Vec<u8>] {
         &self.rejected_reads
     }
 
-    /// Takes ownership of the rejected reads, leaving an empty Vec
-    pub fn take_rejected_reads(&mut self) -> Vec<RecordBuf> {
-        std::mem::take(&mut self.rejected_reads)
-    }
-
-    /// Clears the rejected reads buffer
+    /// Clears the stored rejected reads.
     pub fn clear_rejected_reads(&mut self) {
         self.rejected_reads.clear();
     }
 
-    /// Clears all per-group state to prepare for reuse
-    ///
-    /// This resets statistics and rejected reads while preserving the caller's
-    /// configuration and reusable components (consensus builder, RNG, etc.).
-    pub fn clear(&mut self) {
-        self.stats = CodecConsensusStats::default();
-        self.rejected_reads.clear();
-        self.ss_caller.clear();
+    /// Takes ownership of the stored rejected reads, leaving an empty vec.
+    pub fn take_rejected_reads(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.rejected_reads)
     }
 
-    /// Converts a `RecordBuf` to `SourceRead` for CODEC consensus calling.
+    /// Converts raw BAM bytes to `SourceRead` for CODEC consensus calling,
+    /// applying virtual clipping.
     ///
-    /// Matches fgbio's `toSourceReadForCodec` exactly:
-    /// - Clones bases and quals from the record
-    /// - Reverses CIGAR if read is on negative strand
-    /// - Reverse complements bases and reverses quals if on negative strand
-    /// - Creates `SourceRead` with sam field set for tag preservation
-    ///
-    /// KEY: This is SIMPLER than vanilla's `to_source_read`:
-    /// - NO quality masking
-    /// - NO mate trimming
-    /// - NO trailing N removal
-    fn to_source_read_for_codec(read: &RecordBuf, original_idx: usize) -> SourceRead {
-        let mut bases = read.sequence().as_ref().to_vec();
-        let mut quals: Vec<u8> = read.quality_scores().as_ref().to_vec();
+    /// Simpler than vanilla's `create_source_read`: no quality masking,
+    /// no trailing N removal, no quality trimming.
+    fn to_source_read_for_codec_raw(
+        raw: &[u8],
+        original_idx: usize,
+        clip_amount: usize,
+        clip_from_start: bool,
+        clipped_cigar: Option<&[u32]>,
+    ) -> SourceRead {
+        let mut bases = bam_fields::extract_sequence(raw);
+        let mut quals = bam_fields::quality_scores_slice(raw).to_vec();
+        let flg = bam_fields::flags(raw);
 
-        // Get simplified CIGAR, reverse if negative strand
-        let simplified_cigar = if read.flags().is_reverse_complemented() {
-            let mut cigar = cigar_utils::simplify_cigar(read.cigar());
-            cigar.reverse();
-            cigar
+        // Apply clipping: truncate bases and quals
+        // Clamp clip_amount to avoid panic on malformed input (e.g., CIGAR/MC mismatch)
+        let clip_amount = clip_amount.min(bases.len());
+        if clip_amount > 0 {
+            if clip_from_start {
+                bases = bases[clip_amount..].to_vec();
+                quals = quals[clip_amount..].to_vec();
+            } else {
+                let new_len = bases.len() - clip_amount;
+                bases.truncate(new_len);
+                quals.truncate(new_len);
+            }
+        }
+
+        // Get simplified CIGAR — use pre-clipped CIGAR if available to avoid redundant work
+        let mut simplified = if let Some(ops) = clipped_cigar {
+            bam_fields::simplify_cigar_from_raw(ops)
         } else {
-            cigar_utils::simplify_cigar(read.cigar())
+            let original_ops = bam_fields::get_cigar_ops(raw);
+            let (clipped_ops, _) =
+                bam_fields::clip_cigar_ops_raw(&original_ops, clip_amount, clip_from_start);
+            bam_fields::simplify_cigar_from_raw(&clipped_ops)
         };
 
-        // Revcomp bases and reverse quals if negative strand
-        if read.flags().is_reverse_complemented() {
+        let is_negative = flg & flags::REVERSE != 0;
+        if is_negative {
+            simplified.reverse();
             bases = reverse_complement(&bases);
             quals.reverse();
         }
 
-        SourceRead {
-            original_idx,
-            bases,
-            quals,
-            simplified_cigar,
-            sam: Some(std::sync::Arc::new(read.clone())),
-        }
+        SourceRead { original_idx, bases, quals, simplified_cigar: simplified, flags: flg }
     }
 
     /// Converts a `VanillaConsensusRead` to a `SingleStrandConsensus`.
@@ -469,372 +491,368 @@ impl CodecConsensusCaller {
         }
     }
 
-    /// Calls consensus reads from SAM records for a single molecule
+    /// Calls consensus reads from raw BAM byte records for a single molecule.
     ///
-    /// # Arguments
-    /// * `recs` - All reads for a single molecule (same MI tag)
-    ///
-    /// # Returns
-    /// Vector of consensus reads (usually 0 or 1)
-    pub fn consensus_reads_from_sam_records(
-        &mut self,
-        recs: Vec<RecordBuf>,
-    ) -> Result<Vec<RecordBuf>> {
-        self.stats.total_input_reads += recs.len() as u64;
+    /// This is the primary entry point, working directly on raw bytes without
+    /// materializing `RecordBuf`. Virtual clipping is computed and applied as
+    /// offsets when extracting data for consensus.
+    fn consensus_reads_raw(&mut self, records: &[Vec<u8>]) -> Result<ConsensusOutput> {
+        self.stats.total_input_reads += records.len() as u64;
 
-        if recs.is_empty() {
-            return Ok(Vec::new());
+        if records.is_empty() {
+            return Ok(ConsensusOutput::default());
         }
 
         // Extract MI tag from first record for naming
-        let mi_tag = Tag::from([b'M', b'I']);
-        let umi = recs.first().and_then(|r| {
-            if let Some(Value::String(s)) = r.data().get(&mi_tag) {
-                Some(String::from_utf8_lossy(s.as_ref()).to_string())
-            } else {
-                None
+        let umi: Option<String> = bam_fields::find_string_tag_in_record(&records[0], b"MI")
+            .map(|b| String::from_utf8_lossy(b).to_string());
+
+        // Phase 1: Filter on raw bytes — keep paired, primary, mapped, FR-pair reads
+        let mut paired_indices: Vec<usize> = Vec::new();
+        let mut frag_count = 0usize;
+        for (i, raw) in records.iter().enumerate() {
+            let flg = bam_fields::flags(raw);
+            if flg & flags::PAIRED == 0 {
+                frag_count += 1;
+                continue;
             }
-        });
-
-        // Partition into paired and fragment reads
-        let (pairs, frags): (Vec<_>, Vec<_>) =
-            recs.into_iter().partition(|r| r.flags().is_segmented());
-
-        // Reject fragment reads - CODEC requires paired-end
-        if !frags.is_empty() {
-            self.reject_records(&frags, CallerRejectionReason::FragmentRead);
-        }
-
-        if pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Keep a reference to all paired reads for UMI consensus (matching fgbio behavior)
-        // fgbio uses all source reads for UMI consensus, not just filtered ones
-        let all_pairs = pairs.clone();
-
-        // Filter to primary alignments only, mapped reads, and FR pairs
-        let primaries: Vec<_> = pairs
-            .into_iter()
-            .filter(|r| {
-                let flags = r.flags();
-                !flags.is_secondary() && !flags.is_supplementary() && !flags.is_unmapped()
-            })
-            .filter(|r| self.is_fr_pair(r))
-            .collect();
-
-        if primaries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Group by read name to form pairs
-        // Note: we have to be VERY CAREFUL to preserve order
-        let mut by_name: HashMap<String, Vec<RecordBuf>> = HashMap::new();
-        let mut names: Vec<String> = Vec::with_capacity(primaries.len() / 2);
-        for rec in primaries {
-            let name =
-                rec.name().map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
-            if !by_name.contains_key(&name) {
-                names.push(name.clone());
+            // Filter: primary, mapped, FR pair
+            if flg & (flags::SECONDARY | flags::SUPPLEMENTARY | flags::UNMAPPED) != 0 {
+                continue;
             }
-            by_name.entry(name).or_default().push(rec);
+            if !bam_fields::is_fr_pair_raw(raw) {
+                continue;
+            }
+            paired_indices.push(i);
         }
 
-        // Clip each pair where they extend past mate ends, and collect valid pairs
-        let mut clipped_pairs: Vec<(RecordBuf, RecordBuf)> = Vec::new();
-        for name in names {
-            // Safe: names was collected from by_name.keys()
-            let pair_reads = by_name.get(&name).expect("name from keys()");
-            if pair_reads.len() == 2 {
-                let (mut r1, mut r2) = if pair_reads[0].flags().is_first_segment() {
-                    (pair_reads[0].clone(), pair_reads[1].clone())
+        if frag_count > 0 {
+            self.reject_records_count(frag_count, CallerRejectionReason::FragmentRead);
+        }
+
+        if paired_indices.is_empty() {
+            return Ok(ConsensusOutput::default());
+        }
+
+        // Phase 2: Group by name, pair R1/R2, compute clip amounts
+        let mut by_name: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        let mut name_order: Vec<&[u8]> = Vec::new();
+        for &idx in &paired_indices {
+            let name = bam_fields::read_name(&records[idx]);
+            if !by_name.contains_key(name) {
+                name_order.push(name);
+            }
+            by_name.entry(name).or_default().push(idx);
+        }
+
+        let mut r1_infos: Vec<ClippedRecordInfo> = Vec::new();
+        let mut r2_infos: Vec<ClippedRecordInfo> = Vec::new();
+
+        for name in name_order {
+            let indices = by_name.get(name).expect("name from iteration");
+            if indices.len() != 2 {
+                continue;
+            }
+
+            let (i1, i2) = {
+                let flg0 = bam_fields::flags(&records[indices[0]]);
+                if flg0 & flags::FIRST_SEGMENT != 0 {
+                    (indices[0], indices[1])
                 } else {
-                    (pair_reads[1].clone(), pair_reads[0].clone())
-                };
+                    (indices[1], indices[0])
+                }
+            };
 
-                // fgbio DOES clip reads extending past mate ends using Hard clipping mode.
-                // This is done BEFORE the overlap calculation and phase check.
-                // The clipping removes bases (hard clips) from reads that extend past their mate.
-                self.clipper.clip_extending_past_mate_ends(&mut r1, &mut r2);
+            // Compute clip amounts from raw bytes
+            let clip_r1 = bam_fields::num_bases_extending_past_mate_raw(&records[i1]);
+            let clip_r2 = bam_fields::num_bases_extending_past_mate_raw(&records[i2]);
 
-                clipped_pairs.push((r1, r2));
-            }
+            // Build ClippedRecordInfo for R1
+            let r1_info = Self::build_clipped_info(&records[i1], i1, clip_r1);
+            // Build ClippedRecordInfo for R2
+            let r2_info = Self::build_clipped_info(&records[i2], i2, clip_r2);
+
+            r1_infos.push(r1_info);
+            r2_infos.push(r2_info);
         }
 
-        if clipped_pairs.is_empty() {
-            return Ok(Vec::new());
+        if r1_infos.is_empty() {
+            return Ok(ConsensusOutput::default());
         }
-
-        // Separate R1s and R2s
-        let (r1s, r2s): (Vec<_>, Vec<_>) = clipped_pairs.into_iter().unzip();
 
         // Check we have enough reads
-        if r1s.len() < self.options.min_reads_per_strand {
+        if r1_infos.len() < self.options.min_reads_per_strand {
             self.reject_records_count(
-                r1s.len() + r2s.len(),
+                r1_infos.len() + r2_infos.len(),
                 CallerRejectionReason::InsufficientReads,
             );
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
 
         // Downsample if needed
-        let (r1s, r2s) = self.downsample_pairs(r1s, r2s);
+        if let Some(max_reads) = self.options.max_reads_per_strand {
+            if r1_infos.len() > max_reads {
+                let mut indices: Vec<usize> = (0..r1_infos.len()).collect();
+                indices.shuffle(&mut self.rng);
+                indices.truncate(max_reads);
+                indices.sort_unstable();
 
-        // Filter R1s and R2s to most common alignment pattern
-        let r1s = self.filter_to_most_common_alignment(r1s);
-        let r2s = self.filter_to_most_common_alignment(r2s);
-
-        if r1s.is_empty() || r2s.is_empty() {
-            return Ok(Vec::new());
+                let new_r1: Vec<_> = indices
+                    .iter()
+                    .map(|&i| std::mem::replace(&mut r1_infos[i], Self::dummy_info()))
+                    .collect();
+                let new_r2: Vec<_> = indices
+                    .iter()
+                    .map(|&i| std::mem::replace(&mut r2_infos[i], Self::dummy_info()))
+                    .collect();
+                r1_infos = new_r1;
+                r2_infos = new_r2;
+            }
         }
 
-        // Check we still have enough reads after filtering
-        if r1s.len() < self.options.min_reads_per_strand
-            || r2s.len() < self.options.min_reads_per_strand
+        // Phase 3: Filter to most common alignment on ClippedRecordInfo
+        let r1_infos = self.filter_to_most_common_alignment_raw(r1_infos);
+        let r2_infos = self.filter_to_most_common_alignment_raw(r2_infos);
+
+        if r1_infos.is_empty() || r2_infos.is_empty() {
+            return Ok(ConsensusOutput::default());
+        }
+
+        if r1_infos.len() < self.options.min_reads_per_strand
+            || r2_infos.len() < self.options.min_reads_per_strand
         {
             self.reject_records_count(
-                r1s.len() + r2s.len(),
+                r1_infos.len() + r2_infos.len(),
                 CallerRejectionReason::InsufficientReads,
             );
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
 
-        // Get the longest R1 and R2 alignments (like fgbio)
-        // Note: reverse the iterator so we return the first maximum value to match fgbio
-        // Safe: we checked r1s.is_empty() and r2s.is_empty() above
-        let longest_r1 = r1s
+        // Phase 4: Overlap/phase calculation on ClippedRecordInfo
+        // Find longest R1 and R2 by reference length (reverse iter for first-max tie-break)
+        let longest_r1 = r1_infos
             .iter()
             .rev()
-            .max_by_key(|r| cigar_utils::reference_length(&r.cigar()))
-            .expect("r1s is non-empty");
-        let longest_r2 = r2s
+            .max_by_key(|info| bam_fields::reference_length_from_cigar(&info.clipped_cigar))
+            .expect("non-empty");
+        let longest_r2 = r2_infos
             .iter()
             .rev()
-            .max_by_key(|r| cigar_utils::reference_length(&r.cigar()))
-            .expect("r2s is non-empty");
+            .max_by_key(|info| bam_fields::reference_length_from_cigar(&info.clipped_cigar))
+            .expect("non-empty");
 
-        // Determine which alignment is positive strand and which is negative
-        let r1_is_negative = longest_r1.flags().is_reverse_complemented();
-        let (longest_pos_aln, longest_neg_aln) =
+        let r1_is_negative = longest_r1.flags & flags::REVERSE != 0;
+        let (longest_pos, longest_neg) =
             if r1_is_negative { (longest_r2, longest_r1) } else { (longest_r1, longest_r2) };
 
-        // Calculate overlap region on reference using fgbio's formula:
-        // overlapStart = negativeStrandAlignment.start
-        // overlapEnd = positiveStrandAlignment.end
-        // This only works because we have an FR pair that sequences towards each other.
-        let neg_start = longest_neg_aln
-            .alignment_start()
-            .map(usize::from)
-            .ok_or_else(|| anyhow!("Negative strand alignment missing start position"))?;
-        let pos_start = longest_pos_aln
-            .alignment_start()
-            .map(usize::from)
-            .ok_or_else(|| anyhow!("Positive strand alignment missing start position"))?;
-        let pos_end =
-            pos_start + cigar_utils::reference_length(&longest_pos_aln.cigar()).saturating_sub(1);
+        let neg_start = longest_neg.adjusted_pos;
+        let pos_start = longest_pos.adjusted_pos;
+        let pos_ref_len =
+            bam_fields::reference_length_from_cigar(&longest_pos.clipped_cigar) as usize;
+        let pos_end = pos_start + pos_ref_len.saturating_sub(1);
 
         let (overlap_start, overlap_end) = (neg_start, pos_end);
-
-        // Calculate duplex length (can be negative if no overlap)
         let duplex_length = overlap_end as i64 - overlap_start as i64 + 1;
 
         if duplex_length < self.options.min_duplex_length as i64 {
             self.reject_records_count(
-                r1s.len() + r2s.len(),
+                r1_infos.len() + r2_infos.len(),
                 CallerRejectionReason::InsufficientOverlap,
             );
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
 
-        // Check that overlap boundaries don't land in indels (matches fgbio behavior)
-        if !self.check_overlap_phase(longest_r1, longest_r2, overlap_start, overlap_end) {
+        // Phase check using raw CIGAR ops
+        if !Self::check_overlap_phase_raw(longest_r1, longest_r2, overlap_start, overlap_end) {
             self.reject_records_count(
-                r1s.len() + r2s.len(),
+                r1_infos.len() + r2_infos.len(),
                 CallerRejectionReason::IndelErrorBetweenStrands,
             );
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
 
-        // r1_is_negative and longest_pos_aln/longest_neg_aln already determined above
-        let r2_is_negative = longest_r2.flags().is_reverse_complemented();
+        let r2_is_negative = longest_r2.flags & flags::REVERSE != 0;
 
-        // Compute the total consensus length (including soft-clipped bases)
-        // This matches fgbio's computeConsensusLength
-        let consensus_length_result =
-            Self::compute_codec_consensus_length(longest_pos_aln, longest_neg_aln, overlap_end);
-
-        let Some(consensus_length) = consensus_length_result else {
+        // Compute consensus length using clipped info
+        let consensus_length =
+            Self::compute_consensus_length_raw(longest_pos, longest_neg, overlap_end);
+        let Some(consensus_length) = consensus_length else {
             self.reject_records_count(
-                r1s.len() + r2s.len(),
+                r1_infos.len() + r2_infos.len(),
                 CallerRejectionReason::IndelErrorBetweenStrands,
             );
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         };
 
-        // Build single-strand consensus from R1s using query-based approach
-        // Following fgbio's flow: convert to SourceReads, then delegate to ssCaller
-        let r1_is_neg_strand = r1s.first().is_some_and(|r| r.flags().is_reverse_complemented());
-        let r1_source_reads: Vec<SourceRead> = r1s
+        // Phase 5: Build SourceReads and call single-strand consensus
+        let r1_is_neg_strand = r1_infos.first().is_some_and(|i| i.flags & flags::REVERSE != 0);
+        let r1_source_reads: Vec<SourceRead> = r1_infos
             .iter()
             .enumerate()
-            .map(|(idx, read)| Self::to_source_read_for_codec(read, idx))
+            .map(|(idx, info)| {
+                Self::to_source_read_for_codec_raw(
+                    &records[info.raw_idx],
+                    idx,
+                    info.clip_amount,
+                    info.clip_from_start,
+                    Some(&info.clipped_cigar),
+                )
+            })
             .collect();
 
         let umi_str = umi.as_deref().unwrap_or("");
         let ss_r1 = match self.ss_caller.consensus_call(umi_str, r1_source_reads)? {
-            Some(vcr) => Self::vanilla_to_single_strand(vcr, r1_is_neg_strand, r1s.len()),
-            None => return Ok(Vec::new()),
+            Some(vcr) => Self::vanilla_to_single_strand(vcr, r1_is_neg_strand, r1_infos.len()),
+            None => return Ok(ConsensusOutput::default()),
         };
 
-        // Build single-strand consensus from R2s using query-based approach
-        // Following fgbio's flow: convert to SourceReads, then delegate to ssCaller
-        let r2_is_neg_strand = r2s.first().is_some_and(|r| r.flags().is_reverse_complemented());
-        let r2_source_reads: Vec<SourceRead> = r2s
+        let r2_is_neg_strand = r2_infos.first().is_some_and(|i| i.flags & flags::REVERSE != 0);
+        let r2_source_reads: Vec<SourceRead> = r2_infos
             .iter()
             .enumerate()
-            .map(|(idx, read)| Self::to_source_read_for_codec(read, idx))
+            .map(|(idx, info)| {
+                Self::to_source_read_for_codec_raw(
+                    &records[info.raw_idx],
+                    idx,
+                    info.clip_amount,
+                    info.clip_from_start,
+                    Some(&info.clipped_cigar),
+                )
+            })
             .collect();
 
         let ss_r2 = match self.ss_caller.consensus_call(umi_str, r2_source_reads)? {
-            Some(vcr) => Self::vanilla_to_single_strand(vcr, r2_is_neg_strand, r2s.len()),
-            None => return Ok(Vec::new()),
+            Some(vcr) => Self::vanilla_to_single_strand(vcr, r2_is_neg_strand, r2_infos.len()),
+            None => return Ok(ConsensusOutput::default()),
         };
 
-        // Check that consensus length is at least as long as each SS consensus
-        // This matches fgbio's check: `n < r1Consensus.length || n < r2Consensus.length`
         if consensus_length < ss_r1.bases.len() || consensus_length < ss_r2.bases.len() {
             self.reject_records_count(
-                r1s.len() + r2s.len(),
-                CallerRejectionReason::IndelErrorBetweenStrands, // ClipOverlapFailed in fgbio
+                r1_infos.len() + r2_infos.len(),
+                CallerRejectionReason::IndelErrorBetweenStrands,
             );
-            return Ok(Vec::new());
+            return Ok(ConsensusOutput::default());
         }
 
-        // FIRST reverse complement the negative strand consensus so it aligns with positive strand
-        // fgbio does: if (longestR1Alignment.negativeStrand) r1Consensus.revcomp() else r2Consensus.revcomp()
+        // Orient and pad
         let (ss_r1_oriented, ss_r2_oriented) = if r1_is_negative {
             (Self::reverse_complement_ss(&ss_r1), ss_r2.clone())
         } else {
             (ss_r1.clone(), Self::reverse_complement_ss(&ss_r2))
         };
 
-        // THEN pad out the consensus reads to the full length
-        // fgbio: paddedR1 = r1Consensus.padded(newLength=consensusLength, left=longestR1Alignment.negativeStrand)
-        // fgbio: paddedR2 = r2Consensus.padded(newLength=consensusLength, left=longestR2Alignment.negativeStrand)
-        // NOTE: After revcomp, padding "left" means prepending N's which extends the genomic 5' end
         let padded_r1 = Self::pad_consensus(&ss_r1_oriented, consensus_length, r1_is_negative);
         let padded_r2 = Self::pad_consensus(&ss_r2_oriented, consensus_length, r2_is_negative);
 
-        // Build duplex consensus from padded and oriented SS consensuses
         let consensus = self.build_duplex_consensus_from_padded(&padded_r1, &padded_r2)?;
-
-        // Apply quality masking for single-strand regions and outer bases
-        // Pass padded consensuses so we can identify single-strand regions
         let consensus = self.mask_consensus_quals_query_based(consensus, &padded_r1, &padded_r2);
-
-        // If R1 was on negative strand, reverse complement the final consensus
-        // This matches fgbio line 253: if (longestR1Alignment.negativeStrand) consensus.revcomp()
         let consensus =
             if r1_is_negative { self.reverse_complement_consensus(consensus) } else { consensus };
 
-        // NOTE: fgbio does NOT filter empty positions for CODEC consensus.
-        // Positions where neither strand has data are kept as 'N' in the output.
-
-        // Build the output RecordBuf
-        // Pass the padded and oriented single-strand consensuses for ac/bc tags
-        // These are padded_r1 and padded_r2, which have been oriented and padded to match fgbio
-
-        // IMPORTANT: The ac/bc tags must be in the SAME coordinate system as the final consensus.
-        // Since the final consensus gets reverse complemented when r1_is_negative=true,
-        // we need to also reverse complement the ac/bc tags in that case.
-        //
-        // The assignment is always: ac=paddedR1, bc=paddedR2 (no swap).
-        // But when r1_is_negative, both need to be reverse complemented to match the final consensus.
         let (ss_for_ac, ss_for_bc) = if r1_is_negative {
-            // R1 is negative: reverse complement both to match final consensus (but don't swap)
             (Self::reverse_complement_ss(&padded_r1), Self::reverse_complement_ss(&padded_r2))
         } else {
-            // R1 is positive: no revcomp needed, no swap
             (padded_r1.clone(), padded_r2.clone())
         };
 
-        let record = self.build_output_record(
+        // Phase 6: Build output from raw bytes
+        // Collect raw record refs from filtered reads only (r1_infos/r2_infos)
+        // to avoid deriving tags from rejected reads (secondary/unmapped/FR mismatch)
+        let all_paired_raws: Vec<&[u8]> = r1_infos
+            .iter()
+            .chain(r2_infos.iter())
+            .map(|info| records[info.raw_idx].as_slice())
+            .collect();
+
+        let mut output = ConsensusOutput::default();
+        self.build_output_record_into(
+            &mut output,
             consensus,
-            &ss_for_ac, // becomes ac tag
-            &ss_for_bc, // becomes bc tag
+            &ss_for_ac,
+            &ss_for_bc,
             umi.as_deref(),
-            overlap_start,
-            overlap_end,
-            &all_pairs, // Use all paired reads for UMI consensus, matching fgbio
+            &all_paired_raws,
         )?;
 
         self.stats.consensus_reads_generated += 1;
-
-        Ok(vec![record])
+        Ok(output)
     }
 
-    /// Checks if a read is part of an FR pair (forward-reverse orientation)
-    /// Uses proper orientation check including position information, matching fgbio's isFrPair.
-    fn is_fr_pair(&self, read: &RecordBuf) -> bool {
-        record_utils::is_fr_pair_from_tags(read)
+    /// Build `ClippedRecordInfo` for a single raw record.
+    fn build_clipped_info(raw: &[u8], raw_idx: usize, clip_amount: usize) -> ClippedRecordInfo {
+        let flg = bam_fields::flags(raw);
+        let is_reverse = flg & flags::REVERSE != 0;
+        let clip_from_start = is_reverse; // negative strand ⟹ clip from start
+
+        let original_ops = bam_fields::get_cigar_ops(raw);
+        let (clipped_cigar, ref_bases_consumed) =
+            bam_fields::clip_cigar_ops_raw(&original_ops, clip_amount, clip_from_start);
+
+        let original_seq_len = bam_fields::l_seq(raw) as usize;
+        let clipped_seq_len = original_seq_len.saturating_sub(clip_amount);
+
+        // 1-based alignment start, adjusted for start-clipping
+        let pos_0based = bam_fields::pos(raw);
+        debug_assert!(
+            pos_0based >= 0,
+            "build_clipped_info called on unmapped record (pos={pos_0based})"
+        );
+        let adjusted_pos = if clip_from_start {
+            (pos_0based + 1) as usize + ref_bases_consumed
+        } else {
+            (pos_0based + 1) as usize
+        };
+
+        ClippedRecordInfo {
+            raw_idx,
+            clip_amount,
+            clip_from_start,
+            clipped_seq_len,
+            clipped_cigar,
+            adjusted_pos,
+            flags: flg,
+        }
     }
 
-    /// Downsamples pairs if we have more than `max_reads_per_strand`
-    fn downsample_pairs(
+    /// Dummy `ClippedRecordInfo` used as a swap placeholder during downsample.
+    fn dummy_info() -> ClippedRecordInfo {
+        ClippedRecordInfo {
+            raw_idx: 0,
+            clip_amount: 0,
+            clip_from_start: false,
+            clipped_seq_len: 0,
+            clipped_cigar: Vec::new(),
+            adjusted_pos: 0,
+            flags: 0,
+        }
+    }
+
+    /// Filter `ClippedRecordInfo`s to the most common alignment pattern.
+    fn filter_to_most_common_alignment_raw(
         &mut self,
-        mut r1s: Vec<RecordBuf>,
-        mut r2s: Vec<RecordBuf>,
-    ) -> (Vec<RecordBuf>, Vec<RecordBuf>) {
-        if let Some(max_reads) = self.options.max_reads_per_strand {
-            if r1s.len() > max_reads {
-                // Create indices and shuffle
-                let mut indices: Vec<usize> = (0..r1s.len()).collect();
-                indices.shuffle(&mut self.rng);
-                indices.truncate(max_reads);
-                indices.sort_unstable();
-
-                // Select corresponding pairs
-                let new_r1s: Vec<_> = indices.iter().map(|&i| r1s[i].clone()).collect();
-                let new_r2s: Vec<_> = indices.iter().map(|&i| r2s[i].clone()).collect();
-                r1s = new_r1s;
-                r2s = new_r2s;
-            }
-        }
-        (r1s, r2s)
-    }
-
-    /// Filters reads to only include those with the most common alignment pattern.
-    /// This uses the shared `select_most_common_alignment_group` logic from `vanilla_caller`,
-    /// matching fgbio's `filterToMostCommonAlignment` behavior with deterministic tie-breaking.
-    fn filter_to_most_common_alignment(&mut self, reads: Vec<RecordBuf>) -> Vec<RecordBuf> {
-        if reads.len() < 2 {
-            return reads;
+        infos: Vec<ClippedRecordInfo>,
+    ) -> Vec<ClippedRecordInfo> {
+        if infos.len() < 2 {
+            return infos;
         }
 
-        // Create indexed data: (read_index, query_length, simplified_cigar)
-        // For negative strand reads, reverse the CIGAR to match fgbio's toSourceReadForCodec
-        // which reverses the CIGAR before filterToMostCommonAlignment
-        let mut indexed: Vec<IndexedSourceRead> = reads
+        let mut indexed: Vec<IndexedSourceRead> = infos
             .iter()
             .enumerate()
-            .map(|(i, read)| {
-                let mut cigar = cigar_utils::simplify_cigar(read.cigar());
-                // Reverse CIGAR for negative strand reads (matching fgbio's behavior)
-                if read.flags().is_reverse_complemented() {
+            .map(|(i, info)| {
+                let mut cigar = bam_fields::simplify_cigar_from_raw(&info.clipped_cigar);
+                if info.flags & flags::REVERSE != 0 {
                     cigar.reverse();
                 }
-                let query_len = read.sequence().len();
-                (i, query_len, cigar)
+                (i, info.clipped_seq_len, cigar)
             })
             .collect();
 
-        // Sort by descending length for prefix matching
         indexed.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Use shared grouping logic with deterministic tie-breaking
         let best_indices = select_most_common_alignment_group(&indexed);
 
-        let rejected_count = reads.len() - best_indices.len();
+        let rejected_count = infos.len() - best_indices.len();
         if rejected_count > 0 {
             *self
                 .stats
@@ -844,118 +862,73 @@ impl CodecConsensusCaller {
             self.stats.reads_filtered += rejected_count as u64;
         }
 
-        // Return only the reads in the best group
         let best_set: std::collections::HashSet<usize> = best_indices.into_iter().collect();
-        reads
+        infos
             .into_iter()
             .enumerate()
             .filter(|(i, _)| best_set.contains(i))
-            .map(|(_, r)| r)
+            .map(|(_, info)| info)
             .collect()
     }
 
-    /// Returns the query position (1-based) at a given reference position.
-    ///
-    /// Parameters:
-    /// - `read`: The read record
-    /// - `ref_pos`: The reference position to query
-    /// - `return_last_base_if_deleted`: If true and position falls in deletion, return last query
-    ///   position before deletion. If false, return None when position falls in deletion.
-    ///
-    /// This matches fgbio's `readPosAtRefPos(pos, returnLastBaseIfDeleted)` behavior.
-    fn read_pos_at_ref_pos(
-        read: &RecordBuf,
-        ref_pos: usize,
-        return_last_base_if_deleted: bool,
-    ) -> Option<usize> {
-        let start = read.alignment_start()?;
-        let start_pos = usize::from(start);
+    /// Phase check using `ClippedRecordInfo`.
+    fn check_overlap_phase_raw(
+        r1: &ClippedRecordInfo,
+        r2: &ClippedRecordInfo,
+        overlap_start: usize,
+        overlap_end: usize,
+    ) -> bool {
+        let r1s = bam_fields::read_pos_at_ref_pos_raw(
+            &r1.clipped_cigar,
+            r1.adjusted_pos,
+            overlap_start,
+            true,
+        );
+        let r2s = bam_fields::read_pos_at_ref_pos_raw(
+            &r2.clipped_cigar,
+            r2.adjusted_pos,
+            overlap_start,
+            true,
+        );
+        let r1e = bam_fields::read_pos_at_ref_pos_raw(
+            &r1.clipped_cigar,
+            r1.adjusted_pos,
+            overlap_end,
+            true,
+        );
+        let r2e = bam_fields::read_pos_at_ref_pos_raw(
+            &r2.clipped_cigar,
+            r2.adjusted_pos,
+            overlap_end,
+            true,
+        );
 
-        if ref_pos < start_pos {
-            return None;
+        match (r1s, r2s, r1e, r2e) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a as i64 - b as i64) == (c as i64 - d as i64),
+            _ => false,
         }
-
-        let mut ref_offset = 0;
-        let mut query_offset = 0;
-
-        for op_result in read.cigar().iter() {
-            let op = op_result.ok()?;
-            let (kind, len) = (op.kind(), op.len());
-
-            let consumes_ref = matches!(
-                kind,
-                Kind::Match
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch
-                    | Kind::Deletion
-                    | Kind::Skip
-            );
-            let consumes_query = matches!(
-                kind,
-                Kind::Match
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch
-                    | Kind::Insertion
-                    | Kind::SoftClip
-            );
-
-            let op_ref_start = start_pos + ref_offset;
-
-            if consumes_ref {
-                let op_ref_end = op_ref_start + len - 1;
-
-                // Check if target ref_pos is within this CIGAR operation
-                if ref_pos >= op_ref_start && ref_pos <= op_ref_end {
-                    if consumes_query {
-                        // M, =, X operations - we have a base at this position
-                        let offset_in_op = ref_pos - op_ref_start;
-                        return Some(query_offset + offset_in_op + 1); // 1-based
-                    }
-                    // D, N operations - position falls in a deletion
-                    if return_last_base_if_deleted {
-                        // Return the last query position before this deletion (1-based)
-                        // If query_offset is 0, we're at the start, so return 1
-                        return Some(if query_offset > 0 { query_offset } else { 1 });
-                    }
-                    return None;
-                }
-            }
-
-            if consumes_ref {
-                ref_offset += len;
-            }
-            if consumes_query {
-                query_offset += len;
-            }
-        }
-
-        None
     }
 
-    /// Computes the total consensus length including soft-clipped bases.
-    /// This matches fgbio's `computeConsensusLength` function.
-    ///
-    /// The formula is: `posReadPos + neg.length - negReadPos`
-    /// where:
-    /// - `posReadPos` = query position at overlap end for positive strand read
-    /// - `negReadPos` = query position at overlap end for negative strand read
-    /// - `neg.length` = total length of negative strand read (including soft-clips)
-    ///
-    /// Returns None if the position falls within a deletion (indel error).
-    fn compute_codec_consensus_length(
-        pos_read: &RecordBuf,
-        neg_read: &RecordBuf,
+    /// Compute consensus length from `ClippedRecordInfo`.
+    fn compute_consensus_length_raw(
+        pos_info: &ClippedRecordInfo,
+        neg_info: &ClippedRecordInfo,
         overlap_end: usize,
     ) -> Option<usize> {
-        // Use returnLastBaseIfDeleted=false (strict check for consensus length calculation)
-        let pos_read_pos = Self::read_pos_at_ref_pos(pos_read, overlap_end, false)?;
-        let neg_read_pos = Self::read_pos_at_ref_pos(neg_read, overlap_end, false)?;
+        let pos_read_pos = bam_fields::read_pos_at_ref_pos_raw(
+            &pos_info.clipped_cigar,
+            pos_info.adjusted_pos,
+            overlap_end,
+            false,
+        )?;
+        let neg_read_pos = bam_fields::read_pos_at_ref_pos_raw(
+            &neg_info.clipped_cigar,
+            neg_info.adjusted_pos,
+            overlap_end,
+            false,
+        )?;
 
-        // Match fgbio exactly: posReadPos + neg.length - negReadPos
-        // Use full sequence length (including soft clips)
-        let neg_length = neg_read.sequence().len();
-
-        Some(pos_read_pos + neg_length - neg_read_pos)
+        Some(pos_read_pos + neg_info.clipped_seq_len - neg_read_pos)
     }
 
     /// Pads a single-strand consensus to a new length.
@@ -1168,38 +1141,6 @@ impl CodecConsensusCaller {
         })
     }
 
-    /// Checks that the overlap boundaries don't land in indels.
-    /// This matches fgbio's check that readPosAtRefPos for start and end are consistent.
-    fn check_overlap_phase(
-        &self,
-        r1_aln: &RecordBuf,
-        r2_aln: &RecordBuf,
-        overlap_start: usize,
-        overlap_end: usize,
-    ) -> bool {
-        // Get query positions at overlap start and end for both reads
-        // Use returnLastBaseIfDeleted=true to match fgbio's behavior
-        let r1_start_pos = Self::read_pos_at_ref_pos(r1_aln, overlap_start, true);
-        let r2_start_pos = Self::read_pos_at_ref_pos(r2_aln, overlap_start, true);
-        let r1_end_pos = Self::read_pos_at_ref_pos(r1_aln, overlap_end, true);
-        let r2_end_pos = Self::read_pos_at_ref_pos(r2_aln, overlap_end, true);
-
-        // If any position is completely outside the read alignment, reject
-        match (r1_start_pos, r2_start_pos, r1_end_pos, r2_end_pos) {
-            (Some(r1s), Some(r2s), Some(r1e), Some(r2e)) => {
-                // Check that the length of overlapping region in query bases is the same
-                // i.e., r1_end - r1_start == r2_end - r2_start
-                // Or equivalently: r1_start - r2_start == r1_end - r2_end
-                let r1_diff = r1s as i64 - r2s as i64;
-                let r2_diff = r1e as i64 - r2e as i64;
-                r1_diff == r2_diff
-            }
-            _ => {
-                false // A position is outside the read alignment
-            }
-        }
-    }
-
     /// Masks consensus qualities for query-based consensus.
     /// Identifies single-strand regions by checking if either padded consensus has 'N'.
     /// This matches fgbio's maskCodecConsensusQuals behavior.
@@ -1242,20 +1183,16 @@ impl CodecConsensusCaller {
         Self::reverse_complement_ss(&ss)
     }
 
-    /// Builds the output `RecordBuf` from the consensus
-    #[allow(clippy::too_many_arguments)]
-    fn build_output_record(
+    /// Builds the output record from the consensus and writes raw bytes into `output`.
+    fn build_output_record_into(
         &mut self,
+        output: &mut ConsensusOutput,
         consensus: SingleStrandConsensus,
         ss_a: &SingleStrandConsensus,
         ss_b: &SingleStrandConsensus,
         umi: Option<&str>,
-        overlap_start: usize,
-        overlap_end: usize,
-        source_reads: &[RecordBuf],
-    ) -> Result<RecordBuf> {
-        let mut record = RecordBuf::default();
-
+        source_raws: &[&[u8]],
+    ) -> Result<()> {
         // Generate read name - use ':' delimiter to match fgbio format
         self.consensus_counter += 1;
         let read_name = if let Some(umi_str) = umi {
@@ -1263,28 +1200,23 @@ impl CodecConsensusCaller {
         } else {
             format!("{}:{}", self.read_name_prefix, self.consensus_counter)
         };
-        *record.name_mut() = Some(BString::from(read_name.into_bytes()));
 
-        // Set flags - unmapped fragment
-        *record.flags_mut() = Flags::UNMAPPED;
+        // Codec always outputs unmapped fragments
+        let flag = flags::UNMAPPED;
 
-        // Set mapping quality to 0 (matching fgbio)
-        *record.mapping_quality_mut() = noodles::sam::alignment::record::MappingQuality::new(0);
+        self.bam_builder.build_record(
+            read_name.as_bytes(),
+            flag,
+            &consensus.bases,
+            &consensus.quals,
+        );
 
-        // Set sequence and quality
-        *record.sequence_mut() = Sequence::from(consensus.bases.clone());
-        *record.quality_scores_mut() = QualityScores::from(consensus.quals.clone());
-
-        // Build tags
-        let mut data = Data::default();
-
-        // Read group
-        data.insert(Tag::READ_GROUP, Value::from(self.read_group_id.clone()));
+        // RG tag
+        self.bam_builder.append_string_tag(b"RG", self.read_group_id.as_bytes());
 
         // MI tag
         if let Some(umi_str) = umi {
-            let mi_tag = Tag::from([b'M', b'I']);
-            data.insert(mi_tag, Value::from(umi_str.to_string()));
+            self.bam_builder.append_string_tag(b"MI", umi_str.as_bytes());
         }
 
         // Duplex consensus tags (cD, cM, cE)
@@ -1303,12 +1235,9 @@ impl CodecConsensusCaller {
         let error_rate =
             if total_bases > 0 { total_errors as f32 / total_bases as f32 } else { 0.0 };
 
-        let cd_tag = Tag::from([b'c', b'D']);
-        let cm_tag = Tag::from([b'c', b'M']);
-        let ce_tag = Tag::from([b'c', b'E']);
-        data.insert(cd_tag, to_smallest_signed_int(total_depth));
-        data.insert(cm_tag, to_smallest_signed_int(min_depth));
-        data.insert(ce_tag, Value::from(error_rate));
+        self.bam_builder.append_int_tag(b"cD", total_depth);
+        self.bam_builder.append_int_tag(b"cM", min_depth);
+        self.bam_builder.append_float_tag(b"cE", error_rate);
 
         // AB strand tags (aD, aM, aE)
         let a_max_depth = ss_a.depths.iter().map(|&d| i32::from(d)).max().unwrap_or(0);
@@ -1318,12 +1247,9 @@ impl CodecConsensusCaller {
         let a_error_rate =
             if a_total_bases > 0 { a_total_errors as f32 / a_total_bases as f32 } else { 0.0 };
 
-        let ad_tag = Tag::from([b'a', b'D']);
-        let am_tag = Tag::from([b'a', b'M']);
-        let ae_tag = Tag::from([b'a', b'E']);
-        data.insert(ad_tag, to_smallest_signed_int(a_max_depth));
-        data.insert(am_tag, to_smallest_signed_int(a_min_depth));
-        data.insert(ae_tag, Value::from(a_error_rate));
+        self.bam_builder.append_int_tag(b"aD", a_max_depth);
+        self.bam_builder.append_int_tag(b"aM", a_min_depth);
+        self.bam_builder.append_float_tag(b"aE", a_error_rate);
 
         // BA strand tags (bD, bM, bE)
         let b_max_depth = ss_b.depths.iter().map(|&d| i32::from(d)).max().unwrap_or(0);
@@ -1333,97 +1259,67 @@ impl CodecConsensusCaller {
         let b_error_rate =
             if b_total_bases > 0 { b_total_errors as f32 / b_total_bases as f32 } else { 0.0 };
 
-        let bd_tag = Tag::from([b'b', b'D']);
-        let bm_tag = Tag::from([b'b', b'M']);
-        let be_tag = Tag::from([b'b', b'E']);
-        data.insert(bd_tag, to_smallest_signed_int(b_max_depth));
-        data.insert(bm_tag, to_smallest_signed_int(b_min_depth));
-        data.insert(be_tag, Value::from(b_error_rate));
+        self.bam_builder.append_int_tag(b"bD", b_max_depth);
+        self.bam_builder.append_int_tag(b"bM", b_min_depth);
+        self.bam_builder.append_float_tag(b"bE", b_error_rate);
 
         // Per-base tags if enabled
         if self.options.produce_per_base_tags {
             // Per-base depth arrays - convert to signed integers to match fgbio/simplex/duplex
-            let ad_base_tag = Tag::from([b'a', b'd']);
-            let bd_base_tag = Tag::from([b'b', b'd']);
             let ad_array: Vec<i16> = ss_a.depths.iter().map(|&d| d as i16).collect();
             let bd_array: Vec<i16> = ss_b.depths.iter().map(|&d| d as i16).collect();
-            data.insert(ad_base_tag, Value::from(ad_array));
-            data.insert(bd_base_tag, Value::from(bd_array));
+            self.bam_builder.append_i16_array_tag(b"ad", &ad_array);
+            self.bam_builder.append_i16_array_tag(b"bd", &bd_array);
 
             // Per-base error arrays - convert to signed integers to match fgbio/simplex/duplex
-            let ae_base_tag = Tag::from([b'a', b'e']);
-            let be_base_tag = Tag::from([b'b', b'e']);
             let ae_array: Vec<i16> = ss_a.errors.iter().map(|&e| e as i16).collect();
             let be_array: Vec<i16> = ss_b.errors.iter().map(|&e| e as i16).collect();
-            data.insert(ae_base_tag, Value::from(ae_array));
-            data.insert(be_base_tag, Value::from(be_array));
+            self.bam_builder.append_i16_array_tag(b"ae", &ae_array);
+            self.bam_builder.append_i16_array_tag(b"be", &be_array);
 
-            // Single-strand consensus sequences - convert to String format to match fgbio
-            let ac_tag = Tag::from([b'a', b'c']);
-            let bc_tag = Tag::from([b'b', b'c']);
-            data.insert(ac_tag, crate::consensus_tags::sequence_to_tag_value(&ss_a.bases));
-            data.insert(bc_tag, crate::consensus_tags::sequence_to_tag_value(&ss_b.bases));
+            // Single-strand consensus sequences
+            self.bam_builder.append_string_tag(b"ac", &ss_a.bases);
+            self.bam_builder.append_string_tag(b"bc", &ss_b.bases);
 
-            // Single-strand consensus qualities - convert to Phred+33 ASCII string to match fgbio
-            let aq_tag = Tag::from([b'a', b'q']);
-            let bq_tag = Tag::from([b'b', b'q']);
-            data.insert(aq_tag, crate::consensus_tags::qualities_to_tag_value(&ss_a.quals));
-            data.insert(bq_tag, crate::consensus_tags::qualities_to_tag_value(&ss_b.quals));
+            // Single-strand consensus qualities - Phred+33 encoded
+            self.bam_builder.append_phred33_string_tag(b"aq", &ss_a.quals);
+            self.bam_builder.append_phred33_string_tag(b"bq", &ss_b.quals);
         }
 
         // Cell barcode tag - extract from first source read if configured
         if let Some(cell_tag) = &self.options.cell_tag {
-            for read in source_reads {
-                if let Some(Value::String(cell_bytes)) = read.data().get(cell_tag) {
-                    let cell_bc =
-                        String::from_utf8(cell_bytes.iter().copied().collect::<Vec<u8>>())
-                            .unwrap_or_default();
+            let cell_tag_bytes: [u8; 2] = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
+            for raw in source_raws {
+                if let Some(cell_bc) = bam_fields::find_string_tag_in_record(raw, &cell_tag_bytes) {
                     if !cell_bc.is_empty() {
-                        data.insert(*cell_tag, Value::from(cell_bc));
-                        break; // Use the first non-empty cell barcode found
+                        self.bam_builder.append_string_tag(&cell_tag_bytes, cell_bc);
+                        break;
                     }
                 }
             }
         }
 
         // RX tag (UmiBases) - extract from all source reads and build consensus
-        let rx_tag = Tag::from([b'R', b'X']);
-        let umis: Vec<String> = source_reads
+        let umis: Vec<String> = source_raws
             .iter()
-            .filter_map(|read| {
-                if let Some(Value::String(rx_bytes)) = read.data().get(&rx_tag) {
-                    String::from_utf8(rx_bytes.iter().copied().collect::<Vec<u8>>()).ok()
-                } else {
-                    None
-                }
+            .filter_map(|raw| {
+                bam_fields::find_string_tag_in_record(raw, b"RX")
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
             })
             .collect();
 
         if !umis.is_empty() {
             let consensus_umi = consensus_umis(&umis);
             if !consensus_umi.is_empty() {
-                data.insert(rx_tag, Value::from(consensus_umi));
+                self.bam_builder.append_string_tag(b"RX", consensus_umi.as_bytes());
             }
         }
 
-        *record.data_mut() = data;
+        // Write the completed record with block_size prefix
+        self.bam_builder.write_with_block_size(&mut output.data);
+        output.count += 1;
 
-        // Suppress unused variable warning
-        let _ = (overlap_start, overlap_end);
-
-        Ok(record)
-    }
-
-    /// Rejects a set of records with the given reason
-    fn reject_records(&mut self, records: &[RecordBuf], reason: CallerRejectionReason) {
-        let count = records.len();
-        *self.stats.rejection_reasons.entry(reason).or_insert(0) += count;
-        self.stats.reads_filtered += count as u64;
-
-        // Store rejected reads if tracking is enabled
-        if self.track_rejects {
-            self.rejected_reads.extend(records.iter().cloned());
-        }
+        Ok(())
     }
 
     /// Rejects a count of records with the given reason (without storing the actual records)
@@ -1438,12 +1334,13 @@ impl CodecConsensusCaller {
 /// This allows `CodecConsensusCaller` to be used polymorphically with other
 /// consensus callers (e.g., `VanillaUmiConsensusCaller`, `DuplexConsensusCaller`).
 impl ConsensusCaller for CodecConsensusCaller {
-    fn consensus_reads_from_sam_records(
-        &mut self,
-        reads: Vec<RecordBuf>,
-    ) -> Result<Vec<RecordBuf>> {
-        // Delegate to the existing implementation
-        CodecConsensusCaller::consensus_reads_from_sam_records(self, reads)
+    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+        let result = self.consensus_reads_raw(&records)?;
+        // When a group fails to produce consensus, all its records are rejected
+        if self.track_rejects && result.count == 0 && !records.is_empty() {
+            self.rejected_reads.extend(records);
+        }
+        Ok(result)
     }
 
     fn total_reads(&self) -> usize {
@@ -1485,11 +1382,145 @@ impl ConsensusCaller for CodecConsensusCaller {
     }
 }
 
+/// Bridge methods for encoding `RecordBuf` to raw bytes.
+/// Used by tests (both unit and integration) to call the raw-byte pipeline.
+impl CodecConsensusCaller {
+    /// Encode a single `RecordBuf` to raw BAM bytes.
+    fn record_buf_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
+        use crate::vendored::bam_codec::encode_record_buf;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let mut header = noodles::sam::Header::default();
+        // Add reference sequences so records with reference_sequence_id encode correctly
+        for name in &["chr1", "chr2", "chr3"] {
+            let rs = Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).unwrap());
+            header.reference_sequences_mut().insert(bstr::BString::from(*name), rs);
+        }
+
+        let mut buf = Vec::new();
+        encode_record_buf(&mut buf, &header, rec).expect("encode_record_buf failed");
+        buf
+    }
+
+    /// Encode `RecordBuf`s to raw bytes and delegate to `consensus_reads`.
+    pub fn consensus_reads_from_sam_records(
+        &mut self,
+        recs: Vec<noodles::sam::alignment::RecordBuf>,
+    ) -> Result<ConsensusOutput> {
+        let raw_records: Vec<Vec<u8>> = recs.iter().map(Self::record_buf_to_raw).collect();
+        self.consensus_reads(raw_records)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::must_use_candidate)]
+impl CodecConsensusCaller {
+    /// Test-only wrapper: check if a `RecordBuf` is part of an FR pair.
+    pub fn is_fr_pair(&self, rec: &noodles::sam::alignment::RecordBuf) -> bool {
+        let raw = Self::record_buf_to_raw(rec);
+        bam_fields::is_fr_pair_raw(&raw)
+    }
+
+    /// Test-only wrapper: filter `RecordBuf`s to most common alignment.
+    pub fn filter_to_most_common_alignment(
+        &mut self,
+        recs: Vec<noodles::sam::alignment::RecordBuf>,
+    ) -> Vec<noodles::sam::alignment::RecordBuf> {
+        let raws: Vec<Vec<u8>> = recs.iter().map(Self::record_buf_to_raw).collect();
+        let infos: Vec<ClippedRecordInfo> =
+            raws.iter().enumerate().map(|(i, raw)| Self::build_clipped_info(raw, i, 0)).collect();
+        let filtered = self.filter_to_most_common_alignment_raw(infos);
+        filtered.into_iter().map(|info| recs[info.raw_idx].clone()).collect()
+    }
+
+    /// Test-only wrapper: `read_pos_at_ref_pos` on a `RecordBuf`.
+    pub fn read_pos_at_ref_pos(
+        rec: &noodles::sam::alignment::RecordBuf,
+        ref_pos: usize,
+        return_last_base_if_deleted: bool,
+    ) -> Option<usize> {
+        let raw = Self::record_buf_to_raw(rec);
+        let cigar_ops = bam_fields::get_cigar_ops(&raw);
+        let alignment_start = (bam_fields::pos(&raw) + 1) as usize; // 1-based
+        bam_fields::read_pos_at_ref_pos_raw(
+            &cigar_ops,
+            alignment_start,
+            ref_pos,
+            return_last_base_if_deleted,
+        )
+    }
+
+    /// Test-only wrapper: `check_overlap_phase` on `RecordBuf`s.
+    pub fn check_overlap_phase(
+        &self,
+        r1: &noodles::sam::alignment::RecordBuf,
+        r2: &noodles::sam::alignment::RecordBuf,
+        overlap_start: usize,
+        overlap_end: usize,
+    ) -> bool {
+        let raw1 = Self::record_buf_to_raw(r1);
+        let raw2 = Self::record_buf_to_raw(r2);
+        let info1 = Self::build_clipped_info(&raw1, 0, 0);
+        let info2 = Self::build_clipped_info(&raw2, 1, 0);
+        Self::check_overlap_phase_raw(&info1, &info2, overlap_start, overlap_end)
+    }
+
+    /// Test-only wrapper: `to_source_read_for_codec` on a `RecordBuf`.
+    pub(crate) fn to_source_read_for_codec(
+        rec: &noodles::sam::alignment::RecordBuf,
+        original_idx: usize,
+    ) -> SourceRead {
+        let raw = Self::record_buf_to_raw(rec);
+        Self::to_source_read_for_codec_raw(&raw, original_idx, 0, false, None)
+    }
+
+    /// Test-only wrapper: `compute_codec_consensus_length` on two `RecordBuf`s.
+    pub fn compute_codec_consensus_length(
+        pos_rec: &noodles::sam::alignment::RecordBuf,
+        neg_rec: &noodles::sam::alignment::RecordBuf,
+        overlap_end: usize,
+    ) -> Option<usize> {
+        let raw_pos = Self::record_buf_to_raw(pos_rec);
+        let raw_neg = Self::record_buf_to_raw(neg_rec);
+        let info_pos = Self::build_clipped_info(&raw_pos, 0, 0);
+        let info_neg = Self::build_clipped_info(&raw_neg, 1, 0);
+        Self::compute_consensus_length_raw(&info_pos, &info_neg, overlap_end)
+    }
+
+    /// Test-only wrapper: downsample pairs using `max_reads_per_strand` option.
+    pub fn downsample_pairs(
+        &mut self,
+        r1s: Vec<noodles::sam::alignment::RecordBuf>,
+        r2s: Vec<noodles::sam::alignment::RecordBuf>,
+    ) -> (Vec<noodles::sam::alignment::RecordBuf>, Vec<noodles::sam::alignment::RecordBuf>) {
+        let Some(max_reads) = self.options.max_reads_per_strand else {
+            return (r1s, r2s);
+        };
+        if r1s.len() <= max_reads {
+            return (r1s, r2s);
+        }
+        let mut indices: Vec<usize> = (0..r1s.len()).collect();
+        indices.shuffle(&mut self.rng);
+        indices.truncate(max_reads);
+        indices.sort_unstable();
+        let new_r1: Vec<_> = indices.iter().map(|&i| r1s[i].clone()).collect();
+        let new_r2: Vec<_> = indices.iter().map(|&i| r2s[i].clone()).collect();
+        (new_r1, new_r2)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
+    use crate::clipper::cigar_utils;
     use crate::sam::builder::RecordBuilder;
+    use crate::sort::bam_fields::ParsedBamRecord;
+    use noodles::sam::alignment::RecordBuf;
+    use noodles::sam::alignment::record::Cigar as CigarTrait;
+    use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::cigar::op::Kind;
 
     #[test]
@@ -1516,8 +1547,8 @@ mod tests {
         let options = CodecConsensusOptions::default();
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let result = caller.consensus_reads_from_sam_records(Vec::new()).unwrap();
-        assert!(result.is_empty());
+        let output = caller.consensus_reads_from_sam_records(Vec::new()).unwrap();
+        assert_eq!(output.count, 0);
         assert_eq!(caller.stats.total_input_reads, 0);
     }
 
@@ -1864,7 +1895,7 @@ mod tests {
         // Verify that the filtered reads are the 3M1D1M reads (r3_del and r4_del)
         for read in &filtered {
             let cigar = read.cigar();
-            assert_eq!(cigar.len(), 3, "Expected 3-op cigar (3M1D1M)");
+            assert_eq!(cigar.as_ref().len(), 3, "Expected 3-op cigar (3M1D1M)");
             let ops: Vec<_> = cigar.iter().map(|r| r.unwrap()).collect();
             assert_eq!(ops[0].kind(), Kind::Match);
             assert_eq!(ops[0].len(), 3);
@@ -2172,25 +2203,22 @@ mod tests {
             true,  // R2 reverse
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
-        let consensus = &cons[0];
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
         // Check read name format
-        let name = consensus.name().map(std::string::ToString::to_string).unwrap_or_default();
+        let name = String::from_utf8_lossy(&consensus.name);
         assert!(name.contains("hi"), "Consensus name should contain MI tag: {name}");
 
         // Consensus should cover from pos 1 to pos 40 (R1: 1-30, R2: 11-40)
-        assert_eq!(consensus.sequence().len(), 40, "Consensus should be 40bp");
+        assert_eq!(consensus.bases.len(), 40, "Consensus should be 40bp");
 
         // Check RX tag is preserved (UmiBases consensus)
-        let rx_tag = Tag::from([b'R', b'X']);
-        if let Some(Value::String(rx)) = consensus.data().get(&rx_tag) {
-            assert_eq!(&rx[..], b"ACC-TGA", "RX tag should be preserved");
-        } else {
-            panic!("RX tag not found in consensus");
-        }
+        let rx = consensus.get_string_tag(b"RX").expect("RX tag not found in consensus");
+        assert_eq!(&rx[..], b"ACC-TGA", "RX tag should be preserved");
     }
 
     /// Port of fgbio test: "make a consensus where R1 has a deletion outside of the overlap region"
@@ -2218,14 +2246,15 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
         // Should produce consensus
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
         // Consensus should cover the region with deletion accounted for
-        let consensus = &cons[0];
-        assert!(!consensus.sequence().is_empty(), "Should have sequence");
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        assert!(!consensus.bases.is_empty(), "Should have sequence");
     }
 
     /// Port of fgbio test: "not emit a consensus when the reads are an RF pair"
@@ -2253,9 +2282,9 @@ mod tests {
             false, // R2 forward
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert!(cons.is_empty(), "Should not emit consensus for RF pair");
+        assert_eq!(output.count, 0, "Should not emit consensus for RF pair");
     }
 
     /// Port of fgbio test: "not emit a consensus when there are insufficient reads"
@@ -2284,9 +2313,9 @@ mod tests {
             true,
         );
 
-        let cons = caller2.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller2.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert!(cons.is_empty(), "Should not emit consensus with insufficient reads");
+        assert_eq!(output.count, 0, "Should not emit consensus with insufficient reads");
 
         // With minReadsPerStrand=1, it should succeed
         let options1 = CodecConsensusOptions {
@@ -2311,9 +2340,9 @@ mod tests {
             true,
         );
 
-        let cons = caller1.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller1.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert_eq!(cons.len(), 1, "Should emit consensus with minReadsPerStrand=1");
+        assert_eq!(output.count, 1, "Should emit consensus with minReadsPerStrand=1");
     }
 
     /// Port of fgbio test: "not emit a consensus when there is insufficient overlap between R1 and R2"
@@ -2343,8 +2372,11 @@ mod tests {
             true,
         );
 
-        let cons = caller20.consensus_reads_from_sam_records(reads).unwrap();
-        assert_eq!(cons.len(), 1, "Should emit consensus with minDuplexLength=20 and 20bp overlap");
+        let output = caller20.consensus_reads_from_sam_records(reads).unwrap();
+        assert_eq!(
+            output.count, 1,
+            "Should emit consensus with minDuplexLength=20 and 20bp overlap"
+        );
 
         // With minDuplexLength=21, should fail
         let options21 = CodecConsensusOptions {
@@ -2369,9 +2401,9 @@ mod tests {
             true,
         );
 
-        let cons = caller21.consensus_reads_from_sam_records(reads).unwrap();
-        assert!(
-            cons.is_empty(),
+        let output = caller21.consensus_reads_from_sam_records(reads).unwrap();
+        assert_eq!(
+            output.count, 0,
             "Should not emit consensus with minDuplexLength=21 and 20bp overlap"
         );
     }
@@ -2405,9 +2437,9 @@ mod tests {
         let r2 = &mut reads[1];
         *r2.flags_mut() = r2.flags() | Flags::UNMAPPED;
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert!(cons.is_empty(), "Should not emit consensus when mate is unmapped");
+        assert_eq!(output.count, 0, "Should not emit consensus when mate is unmapped");
     }
 
     /// Port of fgbio test: "emit the consensus in the orientation of R1"
@@ -2442,15 +2474,17 @@ mod tests {
             true,  // R2 reverse
         );
 
-        let cons_fwd = caller_fwd.consensus_reads_from_sam_records(reads_fwd).unwrap();
-        assert_eq!(cons_fwd.len(), 1, "Should produce one consensus read");
+        let output_fwd = caller_fwd.consensus_reads_from_sam_records(reads_fwd).unwrap();
+        assert_eq!(output_fwd.count, 1, "Should produce one consensus read");
 
+        let records_fwd = ParsedBamRecord::parse_all(&output_fwd.data);
         // Consensus should cover from pos 1 to pos 40 (R1: 1-30, R2: 11-40)
-        assert_eq!(cons_fwd[0].sequence().len(), 40, "Forward R1 should produce 40bp consensus");
+        assert_eq!(records_fwd[0].bases.len(), 40, "Forward R1 should produce 40bp consensus");
 
-        // Verify orientation flag is set correctly (forward R1 = not reverse-complemented)
-        assert!(
-            !cons_fwd[0].flags().is_reverse_complemented(),
+        // Verify orientation flag is set correctly (forward R1 = unmapped flag only, not reverse)
+        assert_eq!(
+            records_fwd[0].flag & flags::REVERSE,
+            0,
             "Forward R1 should produce forward-oriented consensus"
         );
     }
@@ -2488,8 +2522,8 @@ mod tests {
             true,
         );
 
-        let cons = caller_permissive.consensus_reads_from_sam_records(reads).unwrap();
-        assert_eq!(cons.len(), 1, "Should emit consensus with permissive settings");
+        let output = caller_permissive.consensus_reads_from_sam_records(reads).unwrap();
+        assert_eq!(output.count, 1, "Should emit consensus with permissive settings");
 
         // Now test with strict disagreement limits - should fail because
         // positions covered by only one strand (10 on each side) count as disagreements
@@ -2553,15 +2587,16 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
         // Should produce consensus
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
         // fgbio produces 40bp consensus (skipping the deleted region in R2)
         // fgumi now matches this behavior by filtering out positions with depth=0
-        let consensus = &cons[0];
-        let len = consensus.sequence().len();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        let len = consensus.bases.len();
         assert_eq!(len, 40, "Consensus should be 40bp (skipping the 5bp deletion), got {len}");
     }
 
@@ -2596,14 +2631,15 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
         // Should produce consensus
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
         // fgbio expects length 45: 5 (R1 soft-clip) + 35 (REF[0..35]) + 5 (R2 soft-clip)
-        let consensus = &cons[0];
-        let len = consensus.sequence().len();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        let len = consensus.bases.len();
         // Currently fgumi doesn't include soft-clips, so length is just the reference span
         // TODO: Update to expect 45 when soft-clip handling is implemented
         assert_eq!(
@@ -2639,17 +2675,15 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
         // Should produce consensus
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
         // fgbio expects length 30: 5 (soft-clip) + 25 (aligned)
-        let consensus = &cons[0];
-        assert!(
-            !consensus.sequence().is_empty(),
-            "Should have sequence with both reads soft-clipped"
-        );
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        assert!(!consensus.bases.is_empty(), "Should have sequence with both reads soft-clipped");
     }
 
     /// Port of fgbio test: "not emit a consensus when the reads are a cross-chromosomal chimeric pair"
@@ -2683,10 +2717,13 @@ mod tests {
         // Update mate's reference for consistency
         *reads[1].mate_reference_sequence_id_mut() = Some(2);
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
         // Should not emit consensus for chimeric pairs
-        assert!(cons.is_empty(), "Should not emit consensus for cross-chromosomal chimeric pair");
+        assert_eq!(
+            output.count, 0,
+            "Should not emit consensus for cross-chromosomal chimeric pair"
+        );
     }
 
     /// Port of fgbio test: "not emit a consensus when R1's end lands in an indel in R2"
@@ -2718,11 +2755,14 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
         // fgbio rejects this because R1's end lands in an indel in R2
         // fgumi now implements this check and should also reject
-        assert!(cons.is_empty(), "Should not emit consensus when R1's end lands in an indel in R2");
+        assert_eq!(
+            output.count, 0,
+            "Should not emit consensus when R1's end lands in an indel in R2"
+        );
     }
 
     /// Port of fgbio test: "mask end qualities"
@@ -2754,12 +2794,13 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
-        let consensus = &cons[0];
-        let quals = consensus.quality_scores().as_ref();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        let quals = &consensus.quals;
 
         // Check that outer bases have reduced quality
         // First 7 bases should have qual <= 5
@@ -2805,15 +2846,16 @@ mod tests {
             true,
         );
 
-        let cons = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert_eq!(cons.len(), 1, "Should produce one consensus read");
+        assert_eq!(output.count, 1, "Should produce one consensus read");
 
         // The consensus should have single-strand regions masked
         // The exact quality values depend on the implementation details
         // This test verifies the option is respected
-        let consensus = &cons[0];
-        let quals = consensus.quality_scores().as_ref();
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+        let quals = &consensus.quals;
 
         // Single-strand regions should have lower quality
         // In fgbio, these get masked to single_strand_qual (4)
@@ -2963,6 +3005,155 @@ mod tests {
         assert_eq!(source.bases, b"GGTT");
         assert_eq!(source.quals, vec![40, 30, 20, 10]); // reversed
         assert_eq!(source.original_idx, 2);
+    }
+
+    #[test]
+    fn test_to_source_read_clip_exceeds_sequence_length() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        // Create a 4bp read and clip more than 4bp - should not panic
+        let read = create_test_paired_read(
+            "read1",
+            b"ACGT",
+            &[30, 31, 32, 33],
+            true,
+            false, // forward strand
+            true,
+            100,
+            &[(Kind::Match, 4)],
+        );
+
+        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
+
+        // Clip 10 bases from a 4bp read (clip_from_start = false)
+        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&raw, 0, 10, false, None);
+        assert!(source.bases.is_empty(), "Bases should be empty after over-clipping");
+        assert!(source.quals.is_empty(), "Quals should be empty after over-clipping");
+
+        // Clip 10 bases from start of a 4bp read (clip_from_start = true)
+        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&raw, 0, 10, true, None);
+        assert!(source.bases.is_empty(), "Bases should be empty after over-clipping from start");
+    }
+
+    #[test]
+    fn test_to_source_read_clip_exact_sequence_length() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        // Clip exactly the sequence length - should produce empty but not panic
+        let read = create_test_paired_read(
+            "read1",
+            b"ACGT",
+            &[30, 31, 32, 33],
+            true,
+            false,
+            true,
+            100,
+            &[(Kind::Match, 4)],
+        );
+
+        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
+        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&raw, 0, 4, false, None);
+        assert!(source.bases.is_empty());
+        assert!(source.quals.is_empty());
+    }
+
+    // ========================================================================
+    // build_clipped_info tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_clipped_info_no_clip_forward() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let read = create_test_paired_read(
+            "read1",
+            b"ACGTACGT",
+            &[30; 8],
+            true,
+            false, // forward strand
+            true,
+            100, // 1-based pos -> 0-based = 99
+            &[(Kind::Match, 8)],
+        );
+        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
+        let info = CodecConsensusCaller::build_clipped_info(&raw, 0, 0);
+
+        assert_eq!(info.raw_idx, 0);
+        assert_eq!(info.clip_amount, 0);
+        assert!(!info.clip_from_start, "Forward strand should not clip from start");
+        assert_eq!(info.clipped_seq_len, 8);
+        assert_eq!(info.adjusted_pos, 100); // 1-based
+    }
+
+    #[test]
+    fn test_build_clipped_info_clip_from_end_forward() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let read = create_test_paired_read(
+            "read1",
+            b"ACGTACGT",
+            &[30; 8],
+            true,
+            false, // forward strand
+            true,
+            100,
+            &[(Kind::Match, 8)],
+        );
+        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
+        let info = CodecConsensusCaller::build_clipped_info(&raw, 5, 3);
+
+        assert_eq!(info.raw_idx, 5);
+        assert_eq!(info.clip_amount, 3);
+        assert!(!info.clip_from_start, "Forward strand clips from end");
+        assert_eq!(info.clipped_seq_len, 5); // 8 - 3
+        assert_eq!(info.adjusted_pos, 100); // Position unchanged for end clipping
+    }
+
+    #[test]
+    fn test_build_clipped_info_clip_from_start_reverse() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let read = create_test_paired_read(
+            "read1",
+            b"ACGTACGT",
+            &[30; 8],
+            true,
+            true, // reverse strand
+            false,
+            100,
+            &[(Kind::Match, 8)],
+        );
+        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
+        let info = CodecConsensusCaller::build_clipped_info(&raw, 2, 3);
+
+        assert_eq!(info.raw_idx, 2);
+        assert_eq!(info.clip_amount, 3);
+        assert!(info.clip_from_start, "Reverse strand should clip from start");
+        assert_eq!(info.clipped_seq_len, 5); // 8 - 3
+        // Position adjusts forward by clipped reference bases
+        assert!(info.adjusted_pos > 100);
+    }
+
+    #[test]
+    fn test_build_clipped_info_zero_clip_preserves_all() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+
+        let read = create_test_paired_read(
+            "read1",
+            b"ACGT",
+            &[30; 4],
+            true,
+            false,
+            true,
+            50,
+            &[(Kind::Match, 4)],
+        );
+        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
+        let info = CodecConsensusCaller::build_clipped_info(&raw, 0, 0);
+
+        assert_eq!(info.clipped_seq_len, 4);
+        assert_eq!(info.adjusted_pos, 50);
+        assert_eq!(info.clipped_cigar.len(), 1); // Single 4M op
     }
 
     #[test]
@@ -3615,9 +3806,9 @@ mod tests {
             true,
         );
 
-        let result = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert!(result.is_empty());
+        assert_eq!(output.count, 0);
         assert!(
             caller.stats.rejection_reasons.contains_key(&CallerRejectionReason::InsufficientReads)
         );
@@ -3652,9 +3843,9 @@ mod tests {
             true,
         );
 
-        let result = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
 
-        assert!(result.is_empty());
+        assert_eq!(output.count, 0);
         // Rejected reads should be tracked
         assert!(!caller.rejected_reads().is_empty() || caller.statistics().reads_filtered > 0);
     }

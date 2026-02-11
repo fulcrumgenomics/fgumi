@@ -87,8 +87,7 @@
 //! To implement a custom consensus caller, implement the `ConsensusCaller` trait:
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::caller::{ConsensusCaller, ConsensusCallingStats, RejectionReason};
-//! use noodles::sam::alignment::RecordBuf;
+//! use fgumi_lib::consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 //! use anyhow::Result;
 //!
 //! pub struct MyConsensusCaller {
@@ -97,37 +96,14 @@
 //! }
 //!
 //! impl ConsensusCaller for MyConsensusCaller {
-//!     fn consensus_reads_from_sam_records(
-//!         &mut self,
-//!         reads: Vec<RecordBuf>
-//!     ) -> Result<Vec<RecordBuf>> {
-//!         // 1. Record input
-//!         self.stats.record_input(reads.len());
+//!     fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+//!         // Each Vec<u8> is a raw BAM record (without block_size prefix)
+//!         self.stats.record_input(records.len());
 //!
-//!         // 2. Filter reads
-//!         let filtered_reads: Vec<_> = reads.into_iter()
-//!             .filter(|r| {
-//!                 if r.flags().is_unmapped() {
-//!                     self.stats.record_rejection(RejectionReason::Unmapped, 1);
-//!                     return false;
-//!                 }
-//!                 true
-//!             })
-//!             .collect();
-//!
-//!         // 3. Call consensus
-//!         if filtered_reads.len() < self.min_reads {
-//!             self.stats.record_rejection(
-//!                 RejectionReason::InsufficientReads,
-//!                 filtered_reads.len()
-//!             );
-//!             return Ok(vec![]);
-//!         }
-//!
-//!         // ... perform consensus calling ...
+//!         // ... filter reads, call consensus, write into output ...
 //!
 //!         self.stats.record_consensus();
-//!         Ok(vec![consensus_read])
+//!         Ok(output)
 //!     }
 //!
 //!     fn total_reads(&self) -> usize { self.stats.total_reads }
@@ -153,9 +129,9 @@
 //!     options,                   // configuration options
 //! );
 //!
-//! // Process a group of reads with the same UMI
-//! let reads = vec![read1, read2, read3, /* ... */];
-//! let consensus = caller.consensus_reads_from_sam_records(reads)?;
+//! // Process a group of raw-byte BAM records with the same UMI
+//! let records: Vec<Vec<u8>> = vec![raw_record1, raw_record2, raw_record3];
+//! let consensus = caller.consensus_reads(records)?;
 //!
 //! // Check statistics
 //! println!("Consensus reads: {}", caller.consensus_reads_constructed());
@@ -184,20 +160,54 @@
 
 use anyhow::Result;
 use noodles::sam::Header;
-use noodles::sam::alignment::RecordBuf;
 use std::collections::HashMap;
 
-/// The main trait for consensus callers that generate consensus reads from groups of raw reads
+/// Pre-serialized consensus output.
+///
+/// Contains concatenated BAM records (each prefixed with 4-byte `block_size`)
+/// ready for direct BGZF compression, bypassing noodles encoding.
+#[derive(Default)]
+pub struct ConsensusOutput {
+    /// Concatenated BAM records with `block_size` prefixes.
+    pub data: Vec<u8>,
+    /// Number of consensus records in the buffer.
+    pub count: usize,
+}
+
+impl ConsensusOutput {
+    /// Creates a new empty `ConsensusOutput`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends another `ConsensusOutput`'s data to this one (copies).
+    pub fn extend(&mut self, other: &ConsensusOutput) {
+        self.data.extend_from_slice(&other.data);
+        self.count += other.count;
+    }
+
+    /// Merges another `ConsensusOutput` by moving its data (avoids copy).
+    pub fn merge(&mut self, mut other: ConsensusOutput) {
+        self.data.append(&mut other.data);
+        self.count += other.count;
+    }
+}
+
+/// The main trait for consensus callers that generate consensus reads from groups of raw reads.
+///
+/// All consensus callers operate on raw BAM byte records (`Vec<u8>`) to avoid the overhead
+/// of noodles `RecordBuf` parsing. Each `Vec<u8>` is a complete BAM record without the
+/// 4-byte `block_size` prefix.
 pub trait ConsensusCaller: Send + Sync {
-    /// Takes a group of reads with the same UMI and generates zero or more consensus reads
+    /// Takes a group of raw-byte BAM records with the same UMI and generates consensus reads.
     ///
     /// # Arguments
-    /// * `reads` - A vector of reads from the same source molecule (same MI tag)
+    /// * `records` - Raw BAM byte records from the same source molecule (same MI tag)
     ///
     /// # Returns
-    /// A vector of consensus reads (may be empty if the group doesn't meet minimum requirements)
-    fn consensus_reads_from_sam_records(&mut self, reads: Vec<RecordBuf>)
-    -> Result<Vec<RecordBuf>>;
+    /// Pre-serialized consensus output (may be empty if the group doesn't meet minimum requirements)
+    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput>;
 
     /// Returns the total number of input reads examined by the consensus caller
     fn total_reads(&self) -> usize;
@@ -353,38 +363,38 @@ pub struct RejectionTracker {
     /// Whether to track rejected reads
     pub track_rejects: bool,
 
-    /// Rejected reads (only populated if `track_rejects` is true)
-    rejected_reads: Vec<RecordBuf>,
+    /// Rejected reads as raw bytes (only populated if `track_rejects` is true)
+    rejected_records: Vec<Vec<u8>>,
 }
 
 impl RejectionTracker {
     /// Creates a new rejection tracker.
     #[must_use]
     pub fn new(track_rejects: bool) -> Self {
-        Self { track_rejects, rejected_reads: Vec::new() }
+        Self { track_rejects, rejected_records: Vec::new() }
     }
 
-    /// Adds rejected reads to the tracker (if tracking is enabled).
-    pub fn add_rejected(&mut self, reads: impl IntoIterator<Item = RecordBuf>) {
+    /// Adds rejected raw-byte records to the tracker (if tracking is enabled).
+    pub fn add_rejected(&mut self, records: impl IntoIterator<Item = Vec<u8>>) {
         if self.track_rejects {
-            self.rejected_reads.extend(reads);
+            self.rejected_records.extend(records);
         }
     }
 
-    /// Returns a reference to the rejected reads.
+    /// Returns a reference to the rejected records.
     #[must_use]
-    pub fn rejected_reads(&self) -> &[RecordBuf] {
-        &self.rejected_reads
+    pub fn rejected_records(&self) -> &[Vec<u8>] {
+        &self.rejected_records
     }
 
-    /// Takes ownership of the rejected reads, leaving an empty vector.
-    pub fn take_rejected_reads(&mut self) -> Vec<RecordBuf> {
-        std::mem::take(&mut self.rejected_reads)
+    /// Takes ownership of the rejected records, leaving an empty vector.
+    pub fn take_rejected_records(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.rejected_records)
     }
 
-    /// Clears the rejected reads without returning them.
-    pub fn clear_rejected_reads(&mut self) {
-        self.rejected_reads.clear();
+    /// Clears the rejected records without returning them.
+    pub fn clear(&mut self) {
+        self.rejected_records.clear();
     }
 
     /// Returns whether rejection tracking is enabled.

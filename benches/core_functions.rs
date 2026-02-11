@@ -17,6 +17,7 @@ use fgumi_lib::phred::{
 };
 use fgumi_lib::sam::record_utils::parse_cigar_string;
 use fgumi_lib::umi::assigner::{Strategy, count_mismatches, matches_within_threshold};
+use fgumi_lib::vendored::bam_codec::encode_record_buf;
 use noodles::core::Position;
 use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::record::cigar::op::Kind;
@@ -338,16 +339,26 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
             })
             .collect();
 
+        let header = noodles::sam::Header::default();
+        let raw_reads: Vec<Vec<u8>> = reads
+            .iter()
+            .map(|rec| {
+                let mut buf = Vec::new();
+                encode_record_buf(&mut buf, &header, rec).unwrap();
+                buf
+            })
+            .collect();
+
         group.throughput(Throughput::Elements(num_reads as u64));
         group.bench_with_input(
             BenchmarkId::new("call_consensus", num_reads),
-            &reads,
-            |b, reads| {
+            &raw_reads,
+            |b, raw_reads| {
                 let options = VanillaUmiConsensusOptions::default();
                 let mut caller =
                     VanillaUmiConsensusCaller::new("bench".to_string(), "RG1".to_string(), options);
                 b.iter(|| {
-                    let result = caller.consensus_reads_from_sam_records(black_box(reads.clone()));
+                    let result = caller.consensus_reads(black_box(raw_reads.clone()));
                     black_box(result)
                 });
             },
@@ -359,17 +370,30 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
         let seq: Vec<u8> = (0..read_len).map(|i| b"ACGT"[i % 4]).collect();
         let reads: Vec<RecordBuf> =
             (0..5).map(|i| create_test_read(&format!("read{i}"), &seq, 35, 1, "1")).collect();
+        let header = noodles::sam::Header::default();
+        let raw_reads: Vec<Vec<u8>> = reads
+            .iter()
+            .map(|rec| {
+                let mut buf = Vec::new();
+                encode_record_buf(&mut buf, &header, rec).unwrap();
+                buf
+            })
+            .collect();
 
         group.throughput(Throughput::Bytes(read_len as u64 * 5));
-        group.bench_with_input(BenchmarkId::new("read_length", read_len), &reads, |b, reads| {
-            let options = VanillaUmiConsensusOptions::default();
-            let mut caller =
-                VanillaUmiConsensusCaller::new("bench".to_string(), "RG1".to_string(), options);
-            b.iter(|| {
-                let result = caller.consensus_reads_from_sam_records(black_box(reads.clone()));
-                black_box(result)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("read_length", read_len),
+            &raw_reads,
+            |b, raw_reads| {
+                let options = VanillaUmiConsensusOptions::default();
+                let mut caller =
+                    VanillaUmiConsensusCaller::new("bench".to_string(), "RG1".to_string(), options);
+                b.iter(|| {
+                    let result = caller.consensus_reads(black_box(raw_reads.clone()));
+                    black_box(result)
+                });
+            },
+        );
     }
 
     group.finish();

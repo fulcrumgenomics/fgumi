@@ -13,8 +13,8 @@ use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 use fgumi_lib::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer,
-    create_optional_bam_writer,
+    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader,
 };
 
 use super::common::{
@@ -24,21 +24,21 @@ use super::common::{
 use fgumi_lib::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats,
 };
-use fgumi_lib::consensus_caller::make_prefix_from_header;
+use fgumi_lib::consensus_caller::{ConsensusCaller, ConsensusOutput, make_prefix_from_header};
 use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
-use fgumi_lib::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
+use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
 use fgumi_lib::progress::ProgressTracker;
+use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
+    BamPipelineConfig, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
+use fgumi_lib::vendored::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use fgumi_lib::validation::{optional_string_to_tag, validate_file_exists};
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
-use std::io;
+use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
 
 // ============================================================================
@@ -48,9 +48,9 @@ use std::sync::Arc;
 /// Result from processing a batch of MI groups through CODEC consensus calling.
 struct CodecProcessedBatch {
     /// Consensus reads to write to output BAM
-    consensus_reads: Vec<RecordBuf>,
-    /// Rejected reads (written to rejects file if enabled)
-    rejects: Vec<RecordBuf>,
+    consensus_output: ConsensusOutput,
+    /// Rejected reads as raw BAM bytes (written to rejects file if enabled)
+    rejects: Vec<Vec<u8>>,
     /// Number of MI groups in this batch
     groups_count: u64,
     /// CODEC consensus calling statistics for this batch
@@ -59,11 +59,7 @@ struct CodecProcessedBatch {
 
 impl MemoryEstimate for CodecProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.consensus_reads
-            .iter()
-            .chain(self.rejects.iter())
-            .map(MemoryEstimate::estimate_heap_size)
-            .sum()
+        self.consensus_output.data.len() + self.rejects.iter().map(Vec::len).sum::<usize>()
     }
 }
 
@@ -74,8 +70,8 @@ struct CollectedCodecMetrics {
     stats: CodecConsensusStats,
     /// Number of MI groups processed
     groups_processed: u64,
-    /// Rejected reads for deferred writing
-    rejects: Vec<RecordBuf>,
+    /// Rejected reads as raw BAM bytes for deferred writing
+    rejects: Vec<Vec<u8>>,
 }
 
 /// Call CODEC consensus reads from template-coordinate sorted BAM
@@ -366,10 +362,18 @@ impl Command for Codec {
         let mut record_count: usize = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Create the MI group iterator for single-threaded streaming
-        let (mut reader, _) = create_bam_reader(&self.io.input, 1)?;
-        let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-        let mi_group_iter = MiGroupIterator::new(record_iter, "MI");
+        // Create the MI group iterator for single-threaded streaming (raw bytes)
+        let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
+        let raw_record_iter = std::iter::from_fn(move || {
+            let mut record = RawRecord::new();
+            match raw_reader.read_record(&mut record) {
+                Ok(0) => None, // EOF
+                Ok(_) => Some(Ok(record.into_inner())),
+                Err(e) => Some(Err(e.into())),
+            }
+        });
+        let mi_group_iter = RawMiGroupIterator::new(raw_record_iter, "MI")
+            .with_cell_tag(cell_tag.map(|ct| *ct.as_ref()));
 
         let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
             read_name_prefix,
@@ -379,19 +383,18 @@ impl Command for Codec {
         );
 
         for result in mi_group_iter {
-            let (umi, reads) = result.context("Failed to read MI group")?;
+            let (umi, records) = result.context("Failed to read MI group")?;
 
-            // Call consensus for this group
-            match caller.consensus_reads_from_sam_records(reads) {
-                Ok(consensus_reads) => {
-                    // Count records before writing
-                    let batch_size = consensus_reads.len();
+            // Call consensus directly — records are already raw bytes!
+            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+            match result {
+                Ok(output) => {
+                    let batch_size = output.count;
                     record_count += batch_size;
-                    for record in &consensus_reads {
-                        writer
-                            .write_alignment_record(&output_header, record)
-                            .context("Failed to write consensus read")?;
-                    }
+                    writer
+                        .get_mut()
+                        .write_all(&output.data)
+                        .context("Failed to write consensus read")?;
                     progress.log_if_needed(batch_size as u64);
                 }
                 Err(e) => {
@@ -402,11 +405,14 @@ impl Command for Codec {
                 }
             }
 
-            // Write rejected reads if tracking is enabled
+            // Write rejected reads if tracking is enabled (already raw BAM bytes)
             if let Some(ref mut rw) = rejects_writer {
-                for record in caller.rejected_reads() {
-                    rw.write_alignment_record(&header, record)
-                        .context("Failed to write rejected read")?;
+                for raw_record in caller.rejected_reads() {
+                    let block_size = raw_record.len() as u32;
+                    rw.get_mut()
+                        .write_all(&block_size.to_le_bytes())
+                        .context("Failed to write rejected read block size")?;
+                    rw.get_mut().write_all(raw_record).context("Failed to write rejected read")?;
                 }
                 caller.clear_rejected_reads();
             }
@@ -547,6 +553,14 @@ impl Codec {
         // Clone input_header before pipeline (needed for rejects writing)
         let rejects_header = input_header.clone();
 
+        // Enable raw-byte mode: skip noodles decode/encode for CPU savings
+        let library_index = LibraryIndex::from_header(&input_header);
+        pipeline_config.group_key_config = Some(if let Some(ct) = cell_tag {
+            GroupKeyConfig::new_raw(library_index, ct)
+        } else {
+            GroupKeyConfig::new_raw_no_cell(library_index)
+        });
+
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
             pipeline_config,
@@ -554,13 +568,13 @@ impl Codec {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create MiGrouper ==========
+            // ========== grouper_fn: Create RawMiGrouper ==========
             move |_header: &Header| {
-                Box::new(MiGrouper::new("MI", batch_size))
-                    as Box<dyn Grouper<Group = MiGroupBatch> + Send>
+                Box::new(RawMiGrouper::new("MI", batch_size))
+                    as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
             },
             // ========== process_fn: CODEC consensus calling ==========
-            move |batch: MiGroupBatch| -> io::Result<CodecProcessedBatch> {
+            move |batch: RawMiGroupBatch| -> io::Result<CodecProcessedBatch> {
                 // Create per-thread CODEC consensus caller
                 let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
                     read_name_prefix.clone(),
@@ -569,18 +583,19 @@ impl Codec {
                     track_rejects,
                 );
 
-                let mut all_consensus = Vec::new();
+                let mut all_output = ConsensusOutput::default();
                 let mut all_rejects = Vec::new();
                 let mut batch_stats = CodecConsensusStats::default();
                 let groups_count = batch.groups.len() as u64;
 
-                for MiGroup { mi, records: group_reads } in batch.groups {
+                for RawMiGroup { mi, records } in batch.groups {
                     caller.clear();
 
-                    // Call CODEC consensus
-                    match caller.consensus_reads_from_sam_records(group_reads) {
-                        Ok(consensus_reads) => {
-                            all_consensus.extend(consensus_reads);
+                    // Call CODEC consensus directly — records are already raw bytes!
+                    let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+                    match result {
+                        Ok(batch_output) => {
+                            all_output.merge(batch_output);
                             batch_stats.merge(caller.statistics());
                             if track_rejects {
                                 all_rejects.extend(caller.take_rejected_reads());
@@ -598,7 +613,7 @@ impl Codec {
                 }
 
                 Ok(CodecProcessedBatch {
-                    consensus_reads: all_consensus,
+                    consensus_output: all_output,
                     rejects: all_rejects,
                     groups_count,
                     stats: batch_stats,
@@ -606,7 +621,7 @@ impl Codec {
             },
             // ========== serialize_fn: Serialize + collect metrics ==========
             move |processed: CodecProcessedBatch,
-                  header: &Header,
+                  _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
                 // Collect metrics (lock-free)
@@ -617,7 +632,9 @@ impl Codec {
                 });
 
                 // Serialize consensus reads
-                serialize_bam_records_into(&processed.consensus_reads, header, output)
+                let count = processed.consensus_output.count as u64;
+                output.extend_from_slice(&processed.consensus_output.data);
+                Ok(count)
             },
         )
         .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?;
@@ -625,7 +642,7 @@ impl Codec {
         // ========== Post-pipeline: Aggregate metrics and write rejects ==========
         let mut total_groups = 0u64;
         let mut merged_stats = CodecConsensusStats::default();
-        let mut all_rejects: Vec<RecordBuf> = Vec::new();
+        let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
         while let Some(metrics) = collected_metrics.pop() {
             total_groups += metrics.groups_processed;
@@ -635,7 +652,7 @@ impl Codec {
             }
         }
 
-        // Write deferred rejects
+        // Write deferred rejects as raw BAM bytes
         if track_rejects && !all_rejects.is_empty() {
             if let Some(rejects_path) = &self.rejects_opts.rejects {
                 let writer_threads = self.threading.num_threads();
@@ -646,8 +663,13 @@ impl Codec {
                     self.compression.compression_level,
                 )?;
                 if let Some(ref mut rw) = rejects_writer {
-                    for record in &all_rejects {
-                        rw.write_alignment_record(&rejects_header, record)
+                    for raw_record in &all_rejects {
+                        let block_size = raw_record.len() as u32;
+                        rw.get_mut()
+                            .write_all(&block_size.to_le_bytes())
+                            .context("Failed to write rejected read block size")?;
+                        rw.get_mut()
+                            .write_all(raw_record)
                             .context("Failed to write rejected read")?;
                     }
                     rw.finish(&rejects_header).context("Failed to finish rejects file")?;

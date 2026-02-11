@@ -679,6 +679,66 @@ pub fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8]) {
     record.push(0); // null terminator
 }
 
+/// Append an integer tag using the smallest signed type that fits.
+///
+/// Encodes as:
+/// - `i8` (type `'c'`): if value in `[-128, 127]`
+/// - `i16` (type `'s'`): if value in `[-32768, 32767]`
+/// - `i32` (type `'i'`): otherwise
+///
+/// This matches the behavior of [`crate::sam::to_smallest_signed_int`].
+pub fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    if let Ok(v) = i8::try_from(value) {
+        record.push(b'c');
+        record.push(v as u8);
+    } else if let Ok(v) = i16::try_from(value) {
+        record.push(b's');
+        record.extend_from_slice(&v.to_le_bytes());
+    } else {
+        record.push(b'i');
+        record.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Append a float (`f`-type) tag to a BAM record.
+pub fn append_float_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: f32) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'f');
+    record.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Append an `i16` array (`B:s`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 's', count_u32_le, values_i16_le...]`
+pub fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b's');
+    record.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for &v in values {
+        record.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Append a Phred+33 encoded quality string (`Z`-type) tag.
+///
+/// Converts raw Phred scores (0-93) to ASCII (Phred+33) and writes
+/// directly as a null-terminated string tag. Avoids intermediate String allocation.
+pub fn append_phred33_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], quals: &[u8]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'Z');
+    for &q in quals {
+        debug_assert!(q <= 93, "Phred score out of range: {q}");
+        record.push(q.saturating_add(33));
+    }
+    record.push(0); // null terminator
+}
+
 /// Remove a tag from a BAM record. No-op if the tag is not found.
 pub fn remove_tag(record: &mut Vec<u8>, tag: &[u8; 2]) {
     let Some(aux_start) = aux_data_offset_from_record(record) else {
@@ -745,6 +805,561 @@ pub fn mask_base(bam: &mut [u8], seq_off: usize, position: usize) {
 #[inline]
 pub fn set_qual(bam: &mut [u8], qual_off: usize, position: usize, value: u8) {
     bam[qual_off + position] = value;
+}
+
+// ============================================================================
+// Sequence Packing (ASCII bases -> 4-bit packed BAM format)
+// ============================================================================
+
+/// Lookup table mapping ASCII base characters to 4-bit BAM codes.
+///
+/// Duplicated from `vendored/bam_codec/encoder/sequence.rs` to keep
+/// `bam_fields` self-contained. The table is `const` so there is zero
+/// runtime cost.
+const SEQ_CODES: [u8; 256] = build_seq_codes();
+
+const fn build_seq_codes() -> [u8; 256] {
+    // SAM spec §4.2.3: =ACMGRSVTWYHKDBN -> 0..15
+    const BASES: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
+    const N: u8 = 0x0F;
+    let mut codes = [N; 256];
+    let mut i = 0;
+    while i < BASES.len() {
+        let base = BASES[i];
+        let code = i as u8;
+        codes[base as usize] = code;
+        codes[base.to_ascii_lowercase() as usize] = code;
+        i += 1;
+    }
+    codes
+}
+
+/// Pack ASCII bases into BAM 4-bit-per-base format, appending to `dst`.
+///
+/// Uses 16-base chunked processing for cache efficiency, matching the
+/// htslib/vendored encoder strategy. When `l_seq` is odd the bottom
+/// 4 bits of the last byte are zero-padded per the SAM spec.
+#[inline]
+pub fn pack_sequence_into(dst: &mut Vec<u8>, bases: &[u8]) {
+    if bases.is_empty() {
+        return;
+    }
+    let packed_len = bases.len().div_ceil(2);
+    dst.reserve(packed_len);
+
+    const CHUNK: usize = 16;
+    let mut chunks = bases.chunks_exact(CHUNK);
+    for chunk in chunks.by_ref() {
+        dst.push((SEQ_CODES[chunk[0] as usize] << 4) | SEQ_CODES[chunk[1] as usize]);
+        dst.push((SEQ_CODES[chunk[2] as usize] << 4) | SEQ_CODES[chunk[3] as usize]);
+        dst.push((SEQ_CODES[chunk[4] as usize] << 4) | SEQ_CODES[chunk[5] as usize]);
+        dst.push((SEQ_CODES[chunk[6] as usize] << 4) | SEQ_CODES[chunk[7] as usize]);
+        dst.push((SEQ_CODES[chunk[8] as usize] << 4) | SEQ_CODES[chunk[9] as usize]);
+        dst.push((SEQ_CODES[chunk[10] as usize] << 4) | SEQ_CODES[chunk[11] as usize]);
+        dst.push((SEQ_CODES[chunk[12] as usize] << 4) | SEQ_CODES[chunk[13] as usize]);
+        dst.push((SEQ_CODES[chunk[14] as usize] << 4) | SEQ_CODES[chunk[15] as usize]);
+    }
+
+    let remainder = chunks.remainder();
+    let mut pairs = remainder.chunks_exact(2);
+    for pair in pairs.by_ref() {
+        dst.push((SEQ_CODES[pair[0] as usize] << 4) | SEQ_CODES[pair[1] as usize]);
+    }
+    if let Some(&last) = pairs.remainder().first() {
+        dst.push(SEQ_CODES[last as usize] << 4);
+    }
+}
+
+// ============================================================================
+// Unmapped BAM Record Builder
+// ============================================================================
+
+/// Reusable builder for constructing unmapped BAM records as raw bytes.
+///
+/// Produces BAM record bytes directly, bypassing noodles `RecordBuf`
+/// serialization. Designed for the consensus output hot path where
+/// records are always unmapped (`ref_id=-1`, `pos=-1`, no CIGAR).
+///
+/// The internal buffer is reused across calls to [`Self::build_record`] +
+/// [`Self::clear`] to avoid repeated allocation.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let mut builder = UnmappedBamRecordBuilder::new();
+///
+/// builder.build_record(b"cons:1:ACG-TCG", my_flags, &bases, &quals);
+/// builder.append_string_tag(b"RG", b"sample1");
+/// builder.append_int_tag(b"cD", max_depth);
+/// builder.append_float_tag(b"cE", error_rate);
+/// builder.append_i16_array_tag(b"cd", &depth_array);
+/// builder.write_with_block_size(&mut output);
+///
+/// builder.clear();
+/// // ... build next record ...
+/// ```
+pub struct UnmappedBamRecordBuilder {
+    buf: Vec<u8>,
+    sealed: bool,
+}
+
+/// Unmapped BAM bin (SAM spec §4.2.1: `reg2bin(-1, 0)` = 4680).
+const UNMAPPED_BIN: u16 = 4680;
+
+impl UnmappedBamRecordBuilder {
+    /// Create a new builder with default capacity (512 bytes).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(512)
+    }
+
+    /// Create a new builder with the given initial capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self { buf: Vec::with_capacity(capacity), sealed: false }
+    }
+
+    /// Clear the builder for reuse without deallocating.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.sealed = false;
+    }
+
+    /// Write the 32-byte fixed header, read name, packed sequence, and
+    /// quality scores for an unmapped record.
+    ///
+    /// After calling this, append tags via the `append_*_tag` methods,
+    /// then call [`Self::write_with_block_size`] or [`Self::as_bytes`].
+    ///
+    /// Hardcoded unmapped fields: `ref_id=-1`, `pos=-1`, `mapq=0`,
+    /// `bin=4680`, `n_cigar_op=0`, `next_ref_id=-1`, `next_pos=-1`,
+    /// `tlen=0`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`  — read name **without** null terminator
+    /// * `flag`  — BAM flags (`u16`)
+    /// * `bases` — ASCII sequence (e.g. `b"ACGT"`)
+    /// * `quals` — raw Phred quality scores (0-93, **not** Phred+33)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `quals` is non-empty and `bases.len() != quals.len()`.
+    pub fn build_record(&mut self, name: &[u8], flag: u16, bases: &[u8], quals: &[u8]) {
+        assert!(
+            bases.len() == quals.len() || quals.is_empty(),
+            "bases.len() ({}) != quals.len() ({})",
+            bases.len(),
+            quals.len(),
+        );
+
+        self.buf.clear();
+        self.sealed = false;
+
+        assert!(name.len() < 255, "read name too long ({} bytes, max 254)", name.len());
+        let l_read_name = (name.len() + 1) as u8; // +1 for NUL
+        let l_seq = bases.len() as u32;
+        let packed_seq_len = bases.len().div_ceil(2);
+
+        // Pre-reserve for header + name + seq + qual + typical tag overhead
+        self.buf.reserve(32 + l_read_name as usize + packed_seq_len + bases.len() + 100);
+
+        // === Fixed 32-byte header ===
+        self.buf.extend_from_slice(&(-1i32).to_le_bytes()); // ref_id = -1
+        self.buf.extend_from_slice(&(-1i32).to_le_bytes()); // pos = -1
+        self.buf.push(l_read_name); // l_read_name
+        self.buf.push(0); // mapq = 0
+        self.buf.extend_from_slice(&UNMAPPED_BIN.to_le_bytes()); // bin = 4680
+        self.buf.extend_from_slice(&0u16.to_le_bytes()); // n_cigar_op = 0
+        self.buf.extend_from_slice(&flag.to_le_bytes()); // flags
+        self.buf.extend_from_slice(&l_seq.to_le_bytes()); // l_seq
+        self.buf.extend_from_slice(&(-1i32).to_le_bytes()); // next_ref_id = -1
+        self.buf.extend_from_slice(&(-1i32).to_le_bytes()); // next_pos = -1
+        self.buf.extend_from_slice(&0i32.to_le_bytes()); // tlen = 0
+
+        // === Read name + NUL ===
+        self.buf.extend_from_slice(name);
+        self.buf.push(0);
+
+        // === Packed sequence ===
+        pack_sequence_into(&mut self.buf, bases);
+
+        // === Quality scores ===
+        if quals.is_empty() && !bases.is_empty() {
+            // Missing quality: 0xFF per SAM spec
+            self.buf.resize(self.buf.len() + bases.len(), 0xFF);
+        } else {
+            self.buf.extend_from_slice(quals);
+        }
+
+        self.sealed = true;
+    }
+
+    /// Append a string (`Z`-type) tag.
+    #[inline]
+    pub fn append_string_tag(&mut self, tag: &[u8; 2], value: &[u8]) {
+        debug_assert!(self.sealed, "must call build_record before appending tags");
+        append_string_tag(&mut self.buf, tag, value);
+    }
+
+    /// Append an integer tag using the smallest signed type that fits.
+    #[inline]
+    pub fn append_int_tag(&mut self, tag: &[u8; 2], value: i32) {
+        debug_assert!(self.sealed, "must call build_record before appending tags");
+        append_int_tag(&mut self.buf, tag, value);
+    }
+
+    /// Append a float (`f`-type) tag.
+    #[inline]
+    pub fn append_float_tag(&mut self, tag: &[u8; 2], value: f32) {
+        debug_assert!(self.sealed, "must call build_record before appending tags");
+        append_float_tag(&mut self.buf, tag, value);
+    }
+
+    /// Append an `i16` array (`B:s`-type) tag.
+    #[inline]
+    pub fn append_i16_array_tag(&mut self, tag: &[u8; 2], values: &[i16]) {
+        debug_assert!(self.sealed, "must call build_record before appending tags");
+        append_i16_array_tag(&mut self.buf, tag, values);
+    }
+
+    /// Append a Phred+33 encoded quality string (`Z`-type) tag.
+    #[inline]
+    pub fn append_phred33_string_tag(&mut self, tag: &[u8; 2], quals: &[u8]) {
+        debug_assert!(self.sealed, "must call build_record before appending tags");
+        append_phred33_string_tag(&mut self.buf, tag, quals);
+    }
+
+    /// Get the completed record bytes (**without** the 4-byte `block_size` prefix).
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        debug_assert!(self.sealed, "must call build_record first");
+        &self.buf
+    }
+
+    /// Write the record with a 4-byte little-endian `block_size` prefix to `output`.
+    ///
+    /// This matches the output format expected by the pipeline serialize
+    /// functions and the BGZF compression step.
+    #[inline]
+    pub fn write_with_block_size(&self, output: &mut Vec<u8>) {
+        debug_assert!(self.sealed, "must call build_record first");
+        let block_size = self.buf.len() as u32;
+        output.extend_from_slice(&block_size.to_le_bytes());
+        output.extend_from_slice(&self.buf);
+    }
+}
+
+impl Default for UnmappedBamRecordBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parsed BAM record for test assertions.
+///
+/// Provides convenient access to fields extracted from raw BAM bytes
+/// produced by `UnmappedBamRecordBuilder`. Used only in tests.
+#[cfg(test)]
+pub struct ParsedBamRecord {
+    pub name: Vec<u8>,
+    pub flag: u16,
+    pub bases: Vec<u8>,
+    pub quals: Vec<u8>,
+    pub aux_data: Vec<u8>,
+}
+
+#[cfg(test)]
+impl ParsedBamRecord {
+    /// Parse a single record from raw bytes (without `block_size` prefix).
+    #[must_use]
+    pub fn from_bytes(data: &[u8]) -> Self {
+        let l_read_name = data[8] as usize;
+        let n_cigar_op = u16::from_le_bytes([data[12], data[13]]) as usize;
+        let flag = u16::from_le_bytes([data[14], data[15]]);
+        let l_seq = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
+
+        let name_start = 32;
+        let name_end = name_start + l_read_name - 1; // exclude NUL
+        let name = data[name_start..name_end].to_vec();
+
+        let cigar_start = name_start + l_read_name;
+        let seq_start = cigar_start + n_cigar_op * 4;
+        let packed_seq_len = l_seq.div_ceil(2);
+        let qual_start = seq_start + packed_seq_len;
+        let aux_start = qual_start + l_seq;
+
+        // Unpack bases from 4-bit encoding
+        let packed = &data[seq_start..seq_start + packed_seq_len];
+        let bases = unpack_sequence_for_test(packed, l_seq);
+
+        let quals = data[qual_start..qual_start + l_seq].to_vec();
+        let aux_data = data[aux_start..].to_vec();
+
+        Self { name, flag, bases, quals, aux_data }
+    }
+
+    /// Parse all records from a `ConsensusOutput` (`block_size`-prefixed concatenation).
+    #[must_use]
+    pub fn parse_all(data: &[u8]) -> Vec<Self> {
+        let mut records = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= data.len() {
+            let block_size = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            records.push(Self::from_bytes(&data[offset..offset + block_size]));
+            offset += block_size;
+        }
+        records
+    }
+
+    /// Find a Z-type string tag value by tag name.
+    #[must_use]
+    pub fn get_string_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+        find_z_tag_in_aux(&self.aux_data, *tag)
+    }
+
+    /// Find an integer tag value (c/s/i type) by tag name.
+    #[must_use]
+    pub fn get_int_tag(&self, tag: &[u8; 2]) -> Option<i32> {
+        find_int_tag_in_aux(&self.aux_data, *tag)
+    }
+
+    /// Find a float tag value by tag name.
+    #[must_use]
+    pub fn get_float_tag(&self, tag: &[u8; 2]) -> Option<f32> {
+        find_float_tag_in_aux(&self.aux_data, *tag)
+    }
+
+    /// Find a B:s (i16 array) tag value by tag name.
+    #[must_use]
+    pub fn get_i16_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<i16>> {
+        find_i16_array_tag_in_aux(&self.aux_data, *tag)
+    }
+}
+
+#[cfg(test)]
+fn unpack_sequence_for_test(packed: &[u8], l_seq: usize) -> Vec<u8> {
+    const DECODE: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
+    let mut bases = Vec::with_capacity(l_seq);
+    for i in 0..l_seq {
+        let byte = packed[i / 2];
+        let code = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+        bases.push(DECODE[code as usize]);
+    }
+    bases
+}
+
+#[cfg(test)]
+fn find_z_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
+    let mut i = 0;
+    while i + 3 <= aux.len() {
+        let t = [aux[i], aux[i + 1]];
+        let typ = aux[i + 2];
+        i += 3;
+        match typ {
+            b'Z' => {
+                let start = i;
+                while i < aux.len() && aux[i] != 0 {
+                    i += 1;
+                }
+                if t == tag {
+                    return Some(aux[start..i].to_vec());
+                }
+                i += 1; // skip NUL
+            }
+            b'c' => {
+                i += 1;
+            }
+            b's' => {
+                i += 2;
+            }
+            b'i' | b'f' => {
+                i += 4;
+            }
+            b'B' => {
+                let sub = aux[i];
+                i += 1;
+                let count =
+                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
+                i += 4;
+                let elem_size = match sub {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    b'i' | b'I' | b'f' => 4,
+                    _ => 1,
+                };
+                i += count * elem_size;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn find_int_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<i32> {
+    let mut i = 0;
+    while i + 3 <= aux.len() {
+        let t = [aux[i], aux[i + 1]];
+        let typ = aux[i + 2];
+        i += 3;
+        match typ {
+            b'c' => {
+                let v = i32::from(aux[i] as i8);
+                if t == tag {
+                    return Some(v);
+                }
+                i += 1;
+            }
+            b's' => {
+                let v = i32::from(i16::from_le_bytes([aux[i], aux[i + 1]]));
+                if t == tag {
+                    return Some(v);
+                }
+                i += 2;
+            }
+            b'i' => {
+                let v = i32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]);
+                if t == tag {
+                    return Some(v);
+                }
+                i += 4;
+            }
+            b'f' => {
+                i += 4;
+            }
+            b'Z' => {
+                while i < aux.len() && aux[i] != 0 {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'B' => {
+                let sub = aux[i];
+                i += 1;
+                let count =
+                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
+                i += 4;
+                let elem_size = match sub {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    b'i' | b'I' | b'f' => 4,
+                    _ => 1,
+                };
+                i += count * elem_size;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn find_float_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<f32> {
+    let mut i = 0;
+    while i + 3 <= aux.len() {
+        let t = [aux[i], aux[i + 1]];
+        let typ = aux[i + 2];
+        i += 3;
+        match typ {
+            b'f' => {
+                let v = f32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]);
+                if t == tag {
+                    return Some(v);
+                }
+                i += 4;
+            }
+            b'c' => {
+                i += 1;
+            }
+            b's' => {
+                i += 2;
+            }
+            b'i' => {
+                i += 4;
+            }
+            b'Z' => {
+                while i < aux.len() && aux[i] != 0 {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'B' => {
+                let sub = aux[i];
+                i += 1;
+                let count =
+                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
+                i += 4;
+                let elem_size = match sub {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    b'i' | b'I' | b'f' => 4,
+                    _ => 1,
+                };
+                i += count * elem_size;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
+    let mut i = 0;
+    while i + 3 <= aux.len() {
+        let t = [aux[i], aux[i + 1]];
+        let typ = aux[i + 2];
+        i += 3;
+        match typ {
+            b'B' => {
+                let sub = aux[i];
+                i += 1;
+                let count =
+                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
+                i += 4;
+                if t == tag && sub == b's' {
+                    let mut vals = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        vals.push(i16::from_le_bytes([aux[i], aux[i + 1]]));
+                        i += 2;
+                    }
+                    return Some(vals);
+                }
+                let elem_size = match sub {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    b'i' | b'I' | b'f' => 4,
+                    _ => 1,
+                };
+                i += count * elem_size;
+            }
+            b'c' => {
+                i += 1;
+            }
+            b's' => {
+                i += 2;
+            }
+            b'i' | b'f' => {
+                i += 4;
+            }
+            b'Z' => {
+                while i < aux.len() && aux[i] != 0 {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -1439,6 +2054,884 @@ pub fn mate_unclipped_5prime(mate_pos: i32, mate_reverse: bool, mc_cigar: &str) 
     } else {
         unclipped_other_start(mate_pos, mc_cigar)
     }
+}
+
+// ============================================================================
+// Consensus-oriented read primitives
+// ============================================================================
+
+/// Decode table: 4-bit BAM base code → ASCII base.
+const BASE_DECODE: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
+
+/// Set a single base at a position in packed 4-bit BAM sequence data.
+///
+/// Converts the given ASCII base to a 4-bit BAM code and writes it in place.
+/// Unknown bases are encoded as N (0xF).
+#[inline]
+pub fn set_base(bam: &mut [u8], seq_off: usize, position: usize, base: u8) {
+    let encoded = SEQ_CODES[base as usize];
+    let byte_idx = seq_off + position / 2;
+    if position.is_multiple_of(2) {
+        bam[byte_idx] = (encoded << 4) | (bam[byte_idx] & 0x0F);
+    } else {
+        bam[byte_idx] = (bam[byte_idx] & 0xF0) | encoded;
+    }
+}
+
+/// Bulk-extract the full sequence from a BAM record as ASCII bases.
+///
+/// Decodes the packed 4-bit sequence data into a `Vec<u8>` of ASCII bases.
+#[must_use]
+pub fn extract_sequence(bam: &[u8]) -> Vec<u8> {
+    let l = l_seq(bam) as usize;
+    let off = seq_offset(bam);
+    let mut bases = Vec::with_capacity(l);
+    for i in 0..l {
+        let code = get_base(bam, off, i);
+        bases.push(BASE_DECODE[code as usize]);
+    }
+    bases
+}
+
+/// Zero-copy access to quality scores in a BAM record.
+///
+/// Returns a slice of the raw Phred quality scores (not Phred+33).
+#[inline]
+#[must_use]
+pub fn quality_scores_slice(bam: &[u8]) -> &[u8] {
+    let l = l_seq(bam) as usize;
+    let off = qual_offset(bam);
+    &bam[off..off + l]
+}
+
+/// Mutable zero-copy access to quality scores in a BAM record.
+#[inline]
+pub fn quality_scores_slice_mut(bam: &mut [u8]) -> &mut [u8] {
+    let l = l_seq(bam) as usize;
+    let off = qual_offset(bam);
+    &mut bam[off..off + l]
+}
+
+/// Compute 1-based alignment end position from raw BAM bytes.
+///
+/// Returns `pos + ref_len` (1-based inclusive end, matching noodles convention).
+/// Returns `None` if the record is unmapped or has no CIGAR.
+#[inline]
+#[must_use]
+pub fn alignment_end_from_raw(bam: &[u8]) -> Option<usize> {
+    let p = pos(bam);
+    if p < 0 {
+        return None;
+    }
+    let ref_len = reference_length_from_raw_bam(bam);
+    if ref_len == 0 {
+        return None;
+    }
+    // pos is 0-based, convert to 1-based and add ref_len - 1 for inclusive end
+    Some((p + ref_len) as usize)
+}
+
+/// Compute 1-based alignment start position from raw BAM bytes.
+///
+/// Returns `None` if `pos < 0` (unmapped).
+#[inline]
+#[must_use]
+pub fn alignment_start_from_raw(bam: &[u8]) -> Option<usize> {
+    let p = pos(bam);
+    if p < 0 { None } else { Some((p + 1) as usize) }
+}
+
+/// Simplify CIGAR operations from raw BAM u32 ops.
+///
+/// Same logic as `cigar_utils::simplify_cigar` but operates on raw BAM CIGAR
+/// u32 words instead of noodles `Cigar`. Converts S, =, X, H operations to M
+/// and coalesces adjacent operations of the same type.
+///
+/// Uses `noodles::sam::alignment::record::cigar::op::Kind` for the output
+/// representation to stay compatible with the existing `SimplifiedCigar` type.
+#[must_use]
+pub fn simplify_cigar_from_raw(
+    cigar_ops: &[u32],
+) -> Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+
+    let mut simplified = Vec::new();
+
+    for &raw_op in cigar_ops {
+        let op_len = (raw_op >> 4) as usize;
+        let op_type = raw_op & 0xF;
+
+        // Map BAM CIGAR op to Kind
+        let kind = match op_type {
+            0 => Kind::Match,
+            1 => Kind::Insertion,
+            2 => Kind::Deletion,
+            3 => Kind::Skip,
+            4 => Kind::SoftClip,
+            5 => Kind::HardClip,
+            6 => Kind::Pad,
+            7 => Kind::SequenceMatch,
+            8 => Kind::SequenceMismatch,
+            _ => continue,
+        };
+
+        // Simplify: convert S, =, X, H to M
+        let new_kind = match kind {
+            Kind::SoftClip | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::HardClip => {
+                Kind::Match
+            }
+            _ => kind,
+        };
+
+        // Coalesce adjacent operations of the same type
+        if let Some((last_kind, last_len)) = simplified.last_mut() {
+            if *last_kind == new_kind {
+                *last_len += op_len;
+                continue;
+            }
+        }
+
+        simplified.push((new_kind, op_len));
+    }
+
+    simplified
+}
+
+/// Extract template length (tlen) from a BAM record.
+#[inline]
+#[must_use]
+pub fn template_length(bam: &[u8]) -> i32 {
+    i32::from_le_bytes([bam[28], bam[29], bam[30], bam[31]])
+}
+
+/// Check if a single read is part of an FR (forward-reverse) pair using raw BAM bytes.
+///
+/// This is the raw-byte equivalent of `record_utils::is_fr_pair_from_tags`.
+/// Returns `true` if the read is paired, both read and mate are mapped,
+/// on the same reference, and in FR orientation (positive strand 5' < negative strand 5').
+#[must_use]
+pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
+    let flg = flags(bam);
+
+    // Must be paired
+    if flg & flags::PAIRED == 0 {
+        return false;
+    }
+
+    // Both read and mate must be mapped
+    if flg & flags::UNMAPPED != 0 || flg & flags::MATE_UNMAPPED != 0 {
+        return false;
+    }
+
+    // Must be on the same reference
+    let this_ref_id = ref_id(bam);
+    let m_ref_id = mate_ref_id(bam);
+    if this_ref_id != m_ref_id {
+        return false;
+    }
+
+    // Must be on opposite strands for FR or RF
+    let is_reverse = flg & flags::REVERSE != 0;
+    let mate_is_reverse = flg & flags::MATE_REVERSE != 0;
+    if is_reverse == mate_is_reverse {
+        return false;
+    }
+
+    // Determine if FR or RF using htsjdk's logic:
+    // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
+    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
+    let alignment_start = (pos(bam) + 1) as usize; // 1-based
+    let m_start = (mate_pos(bam) + 1) as usize; // 1-based
+    let insert_size = template_length(bam);
+
+    let (positive_five_prime, negative_five_prime) = if is_reverse {
+        // This read is on reverse strand, mate is on positive strand
+        let ref_len = reference_length_from_raw_bam(bam) as usize;
+        let end = alignment_start + ref_len.saturating_sub(1);
+        (m_start as i32, end as i32)
+    } else {
+        // This read is on positive strand, mate is on reverse strand
+        (alignment_start as i32, alignment_start as i32 + insert_size)
+    };
+
+    // FR if positive strand 5' < negative strand 5'
+    positive_five_prime < negative_five_prime
+}
+
+/// Virtual CIGAR clipping on raw u32 CIGAR ops.
+///
+/// Computes clipped CIGAR ops and the number of reference bases consumed by clipping,
+/// without modifying any record. This is the raw-byte equivalent of
+/// `SamRecordClipper::clip_start_of_read` / `clip_end_of_read` with Hard clipping mode.
+///
+/// Like the Clipper, this first accounts for existing H+S clips at the relevant end.
+/// If `clip_amount` <= existing clips, only soft clips are upgraded to hard clips
+/// (no alignment change). Otherwise, `clip_amount - existing_clips` bases are clipped
+/// from the alignment.
+///
+/// Returns `(new_cigar_ops, ref_bases_consumed)`.
+/// `ref_bases_consumed` is used to adjust `alignment_start` for start-clipping.
+#[must_use]
+pub fn clip_cigar_ops_raw(
+    cigar_ops: &[u32],
+    clip_amount: usize,
+    from_start: bool,
+) -> (Vec<u32>, usize) {
+    if clip_amount == 0 || cigar_ops.is_empty() {
+        return (cigar_ops.to_vec(), 0);
+    }
+
+    // Helper to encode a CIGAR op as raw u32
+    let encode_op = |op_type: u32, len: usize| -> u32 { ((len as u32) << 4) | op_type };
+
+    // Count existing H+S clips at the relevant end (matching clip_*_of_read)
+    let existing_clip: usize = if from_start {
+        cigar_ops
+            .iter()
+            .take_while(|&&op| matches!(op & 0xF, 4 | 5))
+            .map(|&op| (op >> 4) as usize)
+            .sum()
+    } else {
+        cigar_ops
+            .iter()
+            .rev()
+            .take_while(|&&op| matches!(op & 0xF, 4 | 5))
+            .map(|&op| (op >> 4) as usize)
+            .sum()
+    };
+
+    if clip_amount <= existing_clip {
+        // Just upgrade soft clips to hard clips (no alignment change)
+        upgrade_clipping_raw(cigar_ops, clip_amount, from_start, encode_op)
+    } else {
+        // Clip into alignment: clip (clip_amount - existing_clip) additional bases
+        let alignment_clip = clip_amount - existing_clip;
+        if from_start {
+            clip_cigar_start_raw(cigar_ops, alignment_clip, encode_op)
+        } else {
+            clip_cigar_end_raw(cigar_ops, alignment_clip, encode_op)
+        }
+    }
+}
+
+/// Upgrade existing soft clips to hard clips without changing alignment.
+///
+/// Matches `SamRecordClipper::upgrade_clipping` in Hard mode.
+/// Used when `clip_amount` <= existing H+S clips.
+fn upgrade_clipping_raw(
+    cigar_ops: &[u32],
+    clip_amount: usize,
+    from_start: bool,
+    encode_op: impl Fn(u32, usize) -> u32,
+) -> (Vec<u32>, usize) {
+    if from_start {
+        let mut existing_hard = 0usize;
+        let mut existing_soft = 0usize;
+        let mut skip_count = 0usize;
+
+        for &op in cigar_ops {
+            if op & 0xF == 5 {
+                existing_hard += (op >> 4) as usize;
+                skip_count += 1;
+            } else {
+                break;
+            }
+        }
+        for &op in &cigar_ops[skip_count..] {
+            if op & 0xF == 4 {
+                existing_soft += (op >> 4) as usize;
+                skip_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let length_to_upgrade = existing_soft.min(clip_amount.saturating_sub(existing_hard));
+        let new_hard = existing_hard + length_to_upgrade;
+        let remaining_soft = existing_soft - length_to_upgrade;
+
+        let mut result = Vec::new();
+        result.push(encode_op(5, new_hard));
+        if remaining_soft > 0 {
+            result.push(encode_op(4, remaining_soft));
+        }
+        result.extend_from_slice(&cigar_ops[skip_count..]);
+
+        (result, 0)
+    } else {
+        let mut existing_hard = 0usize;
+        let mut existing_soft = 0usize;
+        let mut skip_count = 0usize;
+
+        for &op in cigar_ops.iter().rev() {
+            if op & 0xF == 5 {
+                existing_hard += (op >> 4) as usize;
+                skip_count += 1;
+            } else {
+                break;
+            }
+        }
+        let end_idx = cigar_ops.len() - skip_count;
+        for &op in cigar_ops[..end_idx].iter().rev() {
+            if op & 0xF == 4 {
+                existing_soft += (op >> 4) as usize;
+                skip_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let length_to_upgrade = existing_soft.min(clip_amount.saturating_sub(existing_hard));
+        let new_hard = existing_hard + length_to_upgrade;
+        let remaining_soft = existing_soft - length_to_upgrade;
+
+        let end_content = cigar_ops.len() - skip_count;
+        let mut result = cigar_ops[..end_content].to_vec();
+        if remaining_soft > 0 {
+            result.push(encode_op(4, remaining_soft));
+        }
+        result.push(encode_op(5, new_hard));
+
+        (result, 0)
+    }
+}
+
+/// Clip from the start of alignment (hard clip mode).
+fn clip_cigar_start_raw(
+    cigar_ops: &[u32],
+    clip_amount: usize,
+    encode_op: impl Fn(u32, usize) -> u32,
+) -> (Vec<u32>, usize) {
+    // Extract existing hard and soft clips from the start
+    let mut existing_hard_clip = 0usize;
+    let mut existing_soft_clip = 0usize;
+    let mut skip_count = 0usize;
+
+    for &op in cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        if op_type == 5 {
+            // H
+            existing_hard_clip += op_len;
+            skip_count += 1;
+        } else {
+            break;
+        }
+    }
+    for &op in &cigar_ops[skip_count..] {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        if op_type == 4 {
+            // S
+            existing_soft_clip += op_len;
+            skip_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    let post_clip_ops = &cigar_ops[skip_count..];
+
+    let mut read_bases_clipped = 0usize;
+    let mut ref_bases_clipped = 0usize;
+    let mut new_ops: Vec<u32> = Vec::new();
+    let mut idx = 0;
+
+    // Clip operations from the start
+    while idx < post_clip_ops.len() {
+        let op = post_clip_ops[idx];
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+
+        // Check if we've clipped enough but need to skip trailing deletions
+        if read_bases_clipped == clip_amount && new_ops.is_empty() && op_type == 2 {
+            // Deletion: skip it (ref-consuming only)
+            ref_bases_clipped += op_len;
+            idx += 1;
+            continue;
+        }
+
+        if read_bases_clipped >= clip_amount {
+            break;
+        }
+
+        // Note: S (soft clip) is NOT read-consuming here, matching the Clipper.
+        // After stripping leading H+S, remaining S ops (e.g. trailing) should not
+        // count toward read bases clipped.
+        let consumes_read = matches!(op_type, 0 | 1 | 7 | 8); // M, I, =, X
+        let consumes_ref = matches!(op_type, 0 | 2 | 3 | 7 | 8); // M, D, N, =, X
+
+        if consumes_read && op_len > (clip_amount - read_bases_clipped) {
+            if op_type == 1 {
+                // Insertion: consume entire at clip boundary
+                read_bases_clipped += op_len;
+            } else {
+                // Split the operation
+                let remaining_clip = clip_amount - read_bases_clipped;
+                let remaining_length = op_len - remaining_clip;
+                read_bases_clipped += remaining_clip;
+                if consumes_ref {
+                    ref_bases_clipped += remaining_clip;
+                }
+                new_ops.push(encode_op(op_type, remaining_length));
+            }
+        } else {
+            if consumes_read {
+                read_bases_clipped += op_len;
+            }
+            if consumes_ref {
+                ref_bases_clipped += op_len;
+            }
+        }
+
+        idx += 1;
+    }
+
+    // Add remaining operations
+    new_ops.extend_from_slice(&post_clip_ops[idx..]);
+
+    // Hard clip mode: convert all existing soft clips to hard clips
+    let added_hard_clip = existing_soft_clip + read_bases_clipped;
+    let total_hard_clip = existing_hard_clip + added_hard_clip;
+    let mut result = Vec::with_capacity(1 + new_ops.len());
+    result.push(encode_op(5, total_hard_clip)); // H
+    result.extend(new_ops);
+
+    (result, ref_bases_clipped)
+}
+
+/// Clip from the end of alignment (hard clip mode).
+fn clip_cigar_end_raw(
+    cigar_ops: &[u32],
+    clip_amount: usize,
+    encode_op: impl Fn(u32, usize) -> u32,
+) -> (Vec<u32>, usize) {
+    // Extract existing hard and soft clips from the end
+    let mut existing_hard_clip = 0usize;
+    let mut existing_soft_clip = 0usize;
+    let mut skip_count = 0usize;
+
+    for &op in cigar_ops.iter().rev() {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        if op_type == 5 {
+            // H
+            existing_hard_clip += op_len;
+            skip_count += 1;
+        } else {
+            break;
+        }
+    }
+    let end_idx = cigar_ops.len() - skip_count;
+    for &op in cigar_ops[..end_idx].iter().rev() {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        if op_type == 4 {
+            // S
+            existing_soft_clip += op_len;
+            skip_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    let post_clip_end = cigar_ops.len() - skip_count;
+    let post_clip_ops = &cigar_ops[..post_clip_end];
+
+    let mut read_bases_clipped = 0usize;
+    let mut new_ops: Vec<u32> = Vec::new();
+    let mut idx = post_clip_ops.len();
+
+    // Clip operations from the end (working backwards)
+    while idx > 0 {
+        let op = post_clip_ops[idx - 1];
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+
+        // Check if we've clipped enough but need to skip adjacent deletions
+        if read_bases_clipped == clip_amount && new_ops.is_empty() && op_type == 2 {
+            // Deletion: skip it
+            idx -= 1;
+            continue;
+        }
+
+        if read_bases_clipped >= clip_amount {
+            break;
+        }
+
+        // Note: S (soft clip) is NOT read-consuming here, matching the Clipper.
+        let consumes_read = matches!(op_type, 0 | 1 | 7 | 8); // M, I, =, X
+
+        if consumes_read && op_len > (clip_amount - read_bases_clipped) {
+            if op_type == 1 {
+                // Insertion: consume entire at clip boundary
+                read_bases_clipped += op_len;
+            } else {
+                // Split the operation
+                let remaining_clip = clip_amount - read_bases_clipped;
+                let remaining_length = op_len - remaining_clip;
+                read_bases_clipped += remaining_clip;
+                new_ops.push(encode_op(op_type, remaining_length));
+            }
+        } else if consumes_read {
+            read_bases_clipped += op_len;
+        }
+
+        idx -= 1;
+    }
+
+    // Add remaining operations (new_ops is in reverse, remaining are forward)
+    let remaining: Vec<u32> = post_clip_ops[..idx].to_vec();
+    let mut result = remaining;
+    // new_ops collected in reverse order, need to reverse
+    new_ops.reverse();
+    result.extend(new_ops);
+
+    // Hard clip mode: convert all existing soft clips to hard clips
+    let added_hard_clip = existing_soft_clip + read_bases_clipped;
+    let total_hard_clip = existing_hard_clip + added_hard_clip;
+    result.push(encode_op(5, total_hard_clip)); // H
+
+    (result, 0) // ref_bases_consumed is 0 for end clipping (no position adjustment)
+}
+
+/// Returns the query position (1-based) at a given reference position, from raw CIGAR ops.
+///
+/// This is the raw-byte equivalent of `CodecConsensusCaller::read_pos_at_ref_pos`.
+///
+/// # Arguments
+/// * `cigar_ops` - Raw u32 CIGAR operations
+/// * `alignment_start` - 1-based alignment start position
+/// * `ref_pos` - 1-based reference position to query
+/// * `return_last_base_if_deleted` - If true, returns last query position before deletion
+///
+/// Returns `None` if the position falls outside the alignment or in a deletion
+/// (when `return_last_base_if_deleted` is false).
+#[must_use]
+pub fn read_pos_at_ref_pos_raw(
+    cigar_ops: &[u32],
+    alignment_start: usize,
+    ref_pos: usize,
+    return_last_base_if_deleted: bool,
+) -> Option<usize> {
+    if ref_pos < alignment_start {
+        return None;
+    }
+
+    let mut ref_offset = 0usize;
+    let mut query_offset = 0usize;
+
+    for &op in cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+
+        let consumes_ref = matches!(op_type, 0 | 2 | 3 | 7 | 8); // M, D, N, =, X
+        let consumes_query = matches!(op_type, 0 | 1 | 4 | 7 | 8); // M, I, S, =, X
+
+        let op_ref_start = alignment_start + ref_offset;
+
+        if consumes_ref {
+            let op_ref_end = op_ref_start + op_len - 1;
+
+            if ref_pos >= op_ref_start && ref_pos <= op_ref_end {
+                if consumes_query {
+                    // M, =, X: we have a base at this position
+                    let offset_in_op = ref_pos - op_ref_start;
+                    return Some(query_offset + offset_in_op + 1); // 1-based
+                }
+                // D, N: position falls in a deletion
+                if return_last_base_if_deleted {
+                    return Some(if query_offset > 0 { query_offset } else { 1 });
+                }
+                return None;
+            }
+        }
+
+        if consumes_ref {
+            ref_offset += op_len;
+        }
+        if consumes_query {
+            query_offset += op_len;
+        }
+    }
+
+    None
+}
+
+/// Compute the query-consuming length of CIGAR operations (the "read length").
+///
+/// This is the sum of M/I/S/=/X operations.
+#[inline]
+#[must_use]
+pub fn query_length_from_cigar(cigar_ops: &[u32]) -> usize {
+    let mut len = 0usize;
+    for &op in cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        if matches!(op_type, 0 | 1 | 4 | 7 | 8) {
+            len += op_len;
+        }
+    }
+    len
+}
+
+/// Compute mate overlap clip count directly from raw BAM bytes.
+///
+/// This is the raw-byte equivalent of `record_utils::num_bases_extending_past_mate`.
+/// Uses MC tag, mate position, and flags from raw bytes to determine how many
+/// bases extend past the mate's unclipped boundary.
+///
+/// Returns 0 if not an FR pair or if required information is missing.
+#[must_use]
+pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
+    let flg = flags(bam);
+
+    // Only applies to paired, mapped reads with mapped mates
+    if flg & flags::PAIRED == 0 || flg & flags::UNMAPPED != 0 || flg & flags::MATE_UNMAPPED != 0 {
+        return 0;
+    }
+
+    // Check FR pair: read and mate on same reference, opposite strands
+    let is_reverse = flg & flags::REVERSE != 0;
+    let mate_is_reverse = flg & flags::MATE_REVERSE != 0;
+
+    // FR pair requires opposite strand orientations
+    if is_reverse == mate_is_reverse {
+        return 0;
+    }
+
+    let this_ref_id = ref_id(bam);
+    let m_ref_id = mate_ref_id(bam);
+    if this_ref_id != m_ref_id {
+        return 0;
+    }
+
+    // Need MC tag for mate CIGAR information
+    let aux = aux_data_slice(bam);
+    let Some(mc_bytes) = find_string_tag(aux, b"MC") else {
+        return 0;
+    };
+    let Ok(mc_cigar) = std::str::from_utf8(mc_bytes) else {
+        return 0;
+    };
+
+    let this_pos_0based = pos(bam);
+    let m_pos_0based = mate_pos(bam);
+    // Convert to 1-based for coordinate calculations
+    let this_pos = this_pos_0based + 1;
+    let m_pos = m_pos_0based + 1;
+
+    // Calculate read length from CIGAR (query-consuming ops)
+    let cigar_ops = get_cigar_ops(bam);
+    let read_length: usize = cigar_ops
+        .iter()
+        .map(|&op| {
+            let op_type = op & 0xF;
+            let op_len = (op >> 4) as usize;
+            // M(0), I(1), S(4), =(7), X(8) consume query
+            if matches!(op_type, 0 | 1 | 4 | 7 | 8) { op_len } else { 0 }
+        })
+        .sum();
+
+    if is_reverse {
+        // Negative strand: check if read extends before mate's unclipped start
+        let mate_us = unclipped_other_start(m_pos, mc_cigar) as usize;
+
+        if (this_pos as usize) <= mate_us {
+            compute_bases_before_ref_pos(bam, &cigar_ops, this_pos, mate_us)
+        } else {
+            // Only clip excess soft-clipped bases at the start
+            let leading_sc = leading_soft_clip_from_ops(&cigar_ops);
+            let gap = this_pos as usize - mate_us;
+            leading_sc.saturating_sub(gap)
+        }
+    } else {
+        // Positive strand: check if read extends past mate's unclipped end
+        let ref_len = reference_length_from_cigar(&cigar_ops);
+        let alignment_end = (this_pos + ref_len - 1) as usize;
+        let mate_ue = unclipped_other_end(m_pos, mc_cigar) as usize;
+
+        if alignment_end >= mate_ue {
+            // Compute read position at mate's unclipped end
+            // Simplified: use reference position mapping
+            let bases_past = compute_bases_past_ref_pos(bam, &cigar_ops, this_pos, mate_ue);
+            read_length.saturating_sub(bases_past)
+        } else {
+            // Only clip excess soft-clipped bases
+            let trailing_sc = trailing_soft_clip_from_ops(&cigar_ops);
+            let gap = mate_ue - alignment_end;
+            trailing_sc.saturating_sub(gap)
+        }
+    }
+}
+
+/// Compute number of read bases at or past a reference position (for positive strand).
+///
+/// Returns the 1-based read position at the given reference position,
+/// or 0 if the position falls in a deletion or outside the alignment.
+fn compute_bases_past_ref_pos(
+    _bam: &[u8],
+    cigar_ops: &[u32],
+    alignment_start_1based: i32,
+    target_ref_pos: usize,
+) -> usize {
+    let mut ref_pos = alignment_start_1based as usize;
+    let mut read_pos: usize = 0;
+
+    for &op in cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+
+        match op_type {
+            0 | 7 | 8 => {
+                // M, =, X: consume both query and reference
+                for _ in 0..op_len {
+                    read_pos += 1;
+                    if ref_pos == target_ref_pos {
+                        return read_pos;
+                    }
+                    ref_pos += 1;
+                }
+            }
+            1 => {
+                // I: consume query only
+                read_pos += op_len;
+            }
+            4 => {
+                // S: consume query only
+                read_pos += op_len;
+            }
+            2 | 3 => {
+                // D, N: consume reference only
+                for _ in 0..op_len {
+                    if ref_pos == target_ref_pos {
+                        return 0; // Position in deletion
+                    }
+                    ref_pos += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    0
+}
+
+/// Compute number of read bases before a reference position (for negative strand).
+fn compute_bases_before_ref_pos(
+    _bam: &[u8],
+    cigar_ops: &[u32],
+    alignment_start_1based: i32,
+    target_ref_pos: usize,
+) -> usize {
+    let mut ref_pos = alignment_start_1based as usize;
+    let mut read_pos: usize = 0;
+
+    for &op in cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+
+        match op_type {
+            0 | 7 | 8 => {
+                // M, =, X: consume both query and reference
+                for _ in 0..op_len {
+                    read_pos += 1;
+                    if ref_pos == target_ref_pos {
+                        return read_pos.saturating_sub(1);
+                    }
+                    ref_pos += 1;
+                }
+            }
+            1 => {
+                // I: consume query only
+                read_pos += op_len;
+            }
+            4 => {
+                // S: consume query only
+                read_pos += op_len;
+            }
+            2 | 3 => {
+                // D, N: consume reference only
+                for _ in 0..op_len {
+                    if ref_pos == target_ref_pos {
+                        return 0;
+                    }
+                    ref_pos += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    0
+}
+
+/// Count trailing soft clips from CIGAR ops.
+fn trailing_soft_clip_from_ops(cigar_ops: &[u32]) -> usize {
+    let mut trailing = 0usize;
+    for &op in cigar_ops.iter().rev() {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        match op_type {
+            4 => trailing += op_len, // S
+            5 => {}                  // H - skip
+            _ => break,
+        }
+    }
+    trailing
+}
+
+/// Count leading soft clips from CIGAR ops.
+fn leading_soft_clip_from_ops(cigar_ops: &[u32]) -> usize {
+    let mut leading = 0usize;
+    for &op in cigar_ops {
+        let op_type = op & 0xF;
+        let op_len = (op >> 4) as usize;
+        match op_type {
+            4 => leading += op_len, // S
+            5 => {}                 // H - skip
+            _ => break,
+        }
+    }
+    leading
+}
+
+/// Decode raw BAM byte records to noodles `RecordBuf`.
+///
+/// This is a temporary bridge for consensus callers (duplex, codec) that still
+/// use `RecordBuf` internally. It constructs a minimal BAM stream and uses
+/// noodles reader to parse records.
+pub fn raw_records_to_record_bufs(
+    records: &[Vec<u8>],
+) -> anyhow::Result<Vec<noodles::sam::alignment::RecordBuf>> {
+    use std::io::Cursor;
+
+    let header = noodles::sam::Header::default();
+    let mut bam_data: Vec<u8> = Vec::new();
+
+    // BAM magic
+    bam_data.extend_from_slice(b"BAM\x01");
+    // Header text length = 0
+    bam_data.extend_from_slice(&0u32.to_le_bytes());
+    // n_ref = 0
+    bam_data.extend_from_slice(&0u32.to_le_bytes());
+
+    for raw in records {
+        let block_size = raw.len() as u32;
+        bam_data.extend_from_slice(&block_size.to_le_bytes());
+        bam_data.extend_from_slice(raw);
+    }
+
+    let cursor = Cursor::new(bam_data);
+    let mut reader = noodles::bam::io::Reader::from(cursor);
+    let _ = reader.read_header()?;
+
+    let mut result = Vec::with_capacity(records.len());
+    for record_result in reader.record_bufs(&header) {
+        result.push(record_result?);
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -3517,5 +5010,2083 @@ mod tests {
 
         // But find_tag_type correctly finds it
         assert!(find_tag_type(&aux, &pa_tag_bytes).is_some());
+    }
+
+    // ========================================================================
+    // pack_sequence_into
+    // ========================================================================
+
+    #[test]
+    fn test_pack_sequence_into_empty() {
+        let mut dst = Vec::new();
+        pack_sequence_into(&mut dst, b"");
+        assert!(dst.is_empty());
+    }
+
+    #[test]
+    fn test_pack_sequence_into_even() {
+        let mut dst = Vec::new();
+        pack_sequence_into(&mut dst, b"ACGT");
+        // A=1, C=2, G=4, T=8
+        assert_eq!(dst, [0x12, 0x48]);
+    }
+
+    #[test]
+    fn test_pack_sequence_into_odd() {
+        let mut dst = Vec::new();
+        pack_sequence_into(&mut dst, b"ACG");
+        // A=1, C=2, G=4, pad=0
+        assert_eq!(dst, [0x12, 0x40]);
+    }
+
+    #[test]
+    fn test_pack_sequence_into_single_base() {
+        let mut dst = Vec::new();
+        pack_sequence_into(&mut dst, b"T");
+        // T=8, pad=0
+        assert_eq!(dst, [0x80]);
+    }
+
+    #[test]
+    fn test_pack_sequence_into_17_bases() {
+        // 17 bases: exercises 16-base chunked path + 1-base remainder
+        let mut dst = Vec::new();
+        pack_sequence_into(&mut dst, b"ACGTACGTACGTACGTA");
+        assert_eq!(dst.len(), 9); // ceil(17/2)
+        // First 8 bytes (16 bases chunked)
+        assert_eq!(dst[0], 0x12); // AC
+        assert_eq!(dst[1], 0x48); // GT
+        assert_eq!(dst[2], 0x12); // AC
+        assert_eq!(dst[3], 0x48); // GT
+        assert_eq!(dst[4], 0x12); // AC
+        assert_eq!(dst[5], 0x48); // GT
+        assert_eq!(dst[6], 0x12); // AC
+        assert_eq!(dst[7], 0x48); // GT
+        // Last byte (1 base + padding)
+        assert_eq!(dst[8], 0x10); // A=1, pad=0
+    }
+
+    #[test]
+    fn test_pack_sequence_into_n_bases() {
+        let mut dst = Vec::new();
+        pack_sequence_into(&mut dst, b"NN");
+        assert_eq!(dst, [0xFF]); // N=15, N=15
+    }
+
+    // ========================================================================
+    // append_int_tag
+    // ========================================================================
+
+    #[test]
+    fn test_append_int_tag_i8() {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"cD", 42);
+        assert_eq!(rec, [b'c', b'D', b'c', 42]);
+    }
+
+    #[test]
+    fn test_append_int_tag_negative_i8() {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"cM", -5);
+        assert_eq!(rec, [b'c', b'M', b'c', (-5i8) as u8]);
+    }
+
+    #[test]
+    fn test_append_int_tag_i16() {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"cD", 200);
+        let v = 200i16.to_le_bytes();
+        assert_eq!(rec, [b'c', b'D', b's', v[0], v[1]]);
+    }
+
+    #[test]
+    fn test_append_int_tag_i32() {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"cD", 100_000);
+        let v = 100_000i32.to_le_bytes();
+        assert_eq!(rec, [b'c', b'D', b'i', v[0], v[1], v[2], v[3]]);
+    }
+
+    // ========================================================================
+    // append_float_tag
+    // ========================================================================
+
+    #[test]
+    fn test_append_float_tag() {
+        let mut rec = Vec::new();
+        append_float_tag(&mut rec, b"cE", 0.05);
+        let v = 0.05f32.to_le_bytes();
+        assert_eq!(rec, [b'c', b'E', b'f', v[0], v[1], v[2], v[3]]);
+    }
+
+    // ========================================================================
+    // append_i16_array_tag
+    // ========================================================================
+
+    #[test]
+    fn test_append_i16_array_tag_empty() {
+        let mut rec = Vec::new();
+        append_i16_array_tag(&mut rec, b"cd", &[]);
+        assert_eq!(rec, [b'c', b'd', b'B', b's', 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_append_i16_array_tag_values() {
+        let mut rec = Vec::new();
+        append_i16_array_tag(&mut rec, b"cd", &[10, 20, 5]);
+        let mut expected = vec![b'c', b'd', b'B', b's'];
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(&10i16.to_le_bytes());
+        expected.extend_from_slice(&20i16.to_le_bytes());
+        expected.extend_from_slice(&5i16.to_le_bytes());
+        assert_eq!(rec, expected);
+    }
+
+    // ========================================================================
+    // UnmappedBamRecordBuilder
+    // ========================================================================
+
+    #[test]
+    fn test_builder_basic_unmapped_record() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"read1", flags::UNMAPPED, b"ACGT", &[30, 25, 35, 40]);
+
+        let bam = builder.as_bytes();
+
+        // Verify fixed header fields via read primitives
+        assert_eq!(ref_id(bam), -1);
+        assert_eq!(pos(bam), -1);
+        assert_eq!(l_read_name(bam), 6); // "read1" + NUL
+        assert_eq!(mapq(bam), 0);
+        assert_eq!(n_cigar_op(bam), 0);
+        assert_eq!(flags(bam), flags::UNMAPPED);
+        assert_eq!(l_seq(bam), 4);
+        assert_eq!(mate_ref_id(bam), -1);
+        assert_eq!(mate_pos(bam), -1);
+        assert_eq!(read_name(bam), b"read1");
+
+        // Verify packed sequence via read primitives
+        let so = seq_offset(bam);
+        assert_eq!(get_base(bam, so, 0), 1); // A
+        assert_eq!(get_base(bam, so, 1), 2); // C
+        assert_eq!(get_base(bam, so, 2), 4); // G
+        assert_eq!(get_base(bam, so, 3), 8); // T
+
+        // Verify quality scores via read primitives
+        let qo = qual_offset(bam);
+        assert_eq!(get_qual(bam, qo, 0), 30);
+        assert_eq!(get_qual(bam, qo, 1), 25);
+        assert_eq!(get_qual(bam, qo, 2), 35);
+        assert_eq!(get_qual(bam, qo, 3), 40);
+
+        // Verify no aux data
+        assert!(aux_data_slice(bam).is_empty());
+    }
+
+    #[test]
+    fn test_builder_with_tags() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"cons:1:ACG", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+        builder.append_string_tag(b"RG", b"sample1");
+        builder.append_string_tag(b"MI", b"42");
+        builder.append_int_tag(b"cD", 10);
+        builder.append_int_tag(b"cM", 3);
+        builder.append_float_tag(b"cE", 0.05);
+        builder.append_i16_array_tag(b"cd", &[10, 8, 12, 9]);
+
+        let bam = builder.as_bytes();
+        let aux = aux_data_slice(bam);
+
+        // Verify string tags
+        assert_eq!(find_string_tag(aux, b"RG"), Some(b"sample1" as &[u8]));
+        assert_eq!(find_string_tag(aux, b"MI"), Some(b"42" as &[u8]));
+
+        // Verify integer tags
+        assert_eq!(find_int_tag(aux, b"cD"), Some(10));
+        assert_eq!(find_int_tag(aux, b"cM"), Some(3));
+
+        // Verify float tag
+        let ce = find_float_tag(aux, b"cE").unwrap();
+        assert!((ce - 0.05).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_builder_reuse() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+
+        // Build first record
+        builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+        builder.append_string_tag(b"MI", b"1");
+        let len1 = builder.as_bytes().len();
+        assert_eq!(l_seq(builder.as_bytes()), 4);
+        assert_eq!(read_name(builder.as_bytes()), b"r1");
+
+        // Reuse for different-length record
+        builder.clear();
+        builder.build_record(b"r2", flags::UNMAPPED, b"AC", &[30, 30]);
+        builder.append_string_tag(b"MI", b"2");
+
+        let bam = builder.as_bytes();
+        assert_ne!(bam.len(), len1);
+        assert_eq!(l_seq(bam), 2);
+        assert_eq!(read_name(bam), b"r2");
+        assert_eq!(find_string_tag(aux_data_slice(bam), b"MI"), Some(b"2" as &[u8]));
+    }
+
+    #[test]
+    fn test_builder_write_with_block_size() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+
+        let mut output = Vec::new();
+        builder.write_with_block_size(&mut output);
+
+        // First 4 bytes = block_size
+        let block_size = u32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+        assert_eq!(block_size as usize, builder.as_bytes().len());
+        assert_eq!(&output[4..], builder.as_bytes());
+    }
+
+    #[test]
+    fn test_builder_paired_consensus_flags() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+
+        // R1
+        let r1_flags =
+            flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED | flags::FIRST_SEGMENT;
+        builder.build_record(b"cons:1:ACG", r1_flags, b"ACGT", &[30, 30, 30, 30]);
+        assert_eq!(flags(builder.as_bytes()), r1_flags);
+
+        // R2
+        builder.clear();
+        let r2_flags = flags::PAIRED | flags::UNMAPPED | flags::MATE_UNMAPPED | flags::LAST_SEGMENT;
+        builder.build_record(b"cons:1:ACG", r2_flags, b"TGCA", &[25, 35, 30, 40]);
+        assert_eq!(flags(builder.as_bytes()), r2_flags);
+    }
+
+    #[test]
+    fn test_builder_empty_sequence() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"empty", flags::UNMAPPED, b"", &[]);
+        builder.append_string_tag(b"RG", b"rg0");
+
+        let bam = builder.as_bytes();
+        assert_eq!(l_seq(bam), 0);
+        assert_eq!(find_string_tag(aux_data_slice(bam), b"RG"), Some(b"rg0" as &[u8]));
+    }
+
+    #[test]
+    fn test_builder_missing_quality() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        // Empty quals with non-empty bases -> fills with 0xFF
+        builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[]);
+
+        let bam = builder.as_bytes();
+        let qo = qual_offset(bam);
+        for i in 0..4 {
+            assert_eq!(get_qual(bam, qo, i), 0xFF);
+        }
+    }
+
+    #[test]
+    fn test_builder_header_matches_vendored_default() {
+        // Cross-validate header layout against known bytes from
+        // vendored encoder test_encode_with_default_fields.
+        // Default RecordBuf: name="*", flags=UNMAPPED, mapq=255, seq=empty
+        // Our builder: custom name, flags, mapq=0 (hardcoded for consensus)
+        //
+        // Verify shared unmapped constants: ref_id=-1, pos=-1, bin=4680,
+        // n_cigar_op=0, next_ref_id=-1, next_pos=-1, tlen=0
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"*", flags::UNMAPPED, b"", &[]);
+
+        let bam = builder.as_bytes();
+        // ref_id = -1
+        assert_eq!(&bam[0..4], &0xFF_FF_FF_FFu32.to_le_bytes());
+        // pos = -1
+        assert_eq!(&bam[4..8], &0xFF_FF_FF_FFu32.to_le_bytes());
+        // l_read_name = 2 ("*" + NUL)
+        assert_eq!(bam[8], 0x02);
+        // mapq = 0 (consensus-specific, vendored default is 255)
+        assert_eq!(bam[9], 0x00);
+        // bin = 4680 = 0x1248
+        assert_eq!(&bam[10..12], &[0x48, 0x12]);
+        // n_cigar_op = 0
+        assert_eq!(&bam[12..14], &[0x00, 0x00]);
+        // flags = UNMAPPED = 4
+        assert_eq!(&bam[14..16], &[0x04, 0x00]);
+        // l_seq = 0
+        assert_eq!(&bam[16..20], &[0x00, 0x00, 0x00, 0x00]);
+        // next_ref_id = -1
+        assert_eq!(&bam[20..24], &0xFF_FF_FF_FFu32.to_le_bytes());
+        // next_pos = -1
+        assert_eq!(&bam[24..28], &0xFF_FF_FF_FFu32.to_le_bytes());
+        // tlen = 0
+        assert_eq!(&bam[28..32], &[0x00, 0x00, 0x00, 0x00]);
+        // name = "*\0"
+        assert_eq!(&bam[32..34], &[b'*', 0x00]);
+    }
+
+    #[test]
+    fn test_append_phred33_string_tag() {
+        let mut buf = Vec::new();
+        append_phred33_string_tag(&mut buf, b"aq", &[0, 10, 30, 40]);
+        assert_eq!(buf[0], b'a');
+        assert_eq!(buf[1], b'q');
+        assert_eq!(buf[2], b'Z');
+        assert_eq!(buf[3], b'!'); // 0 + 33
+        assert_eq!(buf[4], b'+'); // 10 + 33
+        assert_eq!(buf[5], b'?'); // 30 + 33
+        assert_eq!(buf[6], b'I'); // 40 + 33
+        assert_eq!(buf[7], 0); // NUL
+    }
+
+    #[test]
+    fn test_builder_phred33_string_tag() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"test", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+        builder.append_phred33_string_tag(b"aq", &[0, 10, 30, 40]);
+        let bytes = builder.as_bytes();
+        let parsed = ParsedBamRecord::from_bytes(bytes);
+        let aq = parsed.get_string_tag(b"aq").unwrap();
+        assert_eq!(aq, b"!+?I");
+    }
+
+    #[test]
+    fn test_parsed_bam_record_roundtrip() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(
+            b"myread",
+            flags::UNMAPPED | flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED,
+            b"ACGTNN",
+            &[30, 25, 20, 15, 10, 5],
+        );
+        builder.append_string_tag(b"RG", b"sample1");
+        builder.append_int_tag(b"cD", 5);
+        builder.append_float_tag(b"cE", 0.01);
+        builder.append_i16_array_tag(b"cd", &[3, 4, 5, 3, 2, 1]);
+
+        let mut output = Vec::new();
+        builder.write_with_block_size(&mut output);
+
+        let records = ParsedBamRecord::parse_all(&output);
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.name, b"myread");
+        assert_eq!(
+            rec.flag,
+            flags::UNMAPPED | flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED
+        );
+        assert_eq!(rec.bases, b"ACGTNN");
+        assert_eq!(rec.quals, vec![30, 25, 20, 15, 10, 5]);
+        assert_eq!(rec.get_string_tag(b"RG").unwrap(), b"sample1");
+        assert_eq!(rec.get_int_tag(b"cD").unwrap(), 5);
+        let ce = rec.get_float_tag(b"cE").unwrap();
+        assert!((ce - 0.01).abs() < 0.001);
+        assert_eq!(rec.get_i16_array_tag(b"cd").unwrap(), vec![3, 4, 5, 3, 2, 1]);
+    }
+
+    // ========================================================================
+    // Helper: encode a CIGAR op as raw u32 (op_type in low 4 bits, length in upper 28)
+    // ========================================================================
+
+    /// Encode a single CIGAR op.  `op_type`: M=0, I=1, D=2, N=3, S=4, H=5, P=6, `=7`, X=8.
+    fn encode_op(op_type: u32, len: usize) -> u32 {
+        ((len as u32) << 4) | op_type
+    }
+
+    /// Build a `make_bam_bytes` record with a custom template length (tlen).
+    #[allow(clippy::too_many_arguments)]
+    fn make_bam_bytes_with_tlen(
+        tid: i32,
+        pos: i32,
+        flag: u16,
+        name: &[u8],
+        cigar_ops: &[u32],
+        seq_len: usize,
+        mate_tid: i32,
+        mate_pos: i32,
+        tlen: i32,
+        aux_data: &[u8],
+    ) -> Vec<u8> {
+        let mut rec =
+            make_bam_bytes(tid, pos, flag, name, cigar_ops, seq_len, mate_tid, mate_pos, aux_data);
+        rec[28..32].copy_from_slice(&tlen.to_le_bytes());
+        rec
+    }
+
+    // ========================================================================
+    // upgrade_clipping_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_start_soft_only() {
+        // 5S10M: clip_amount=3, should upgrade 3S to H
+        // existing: H=0, S=5, clip_amount=3 => upgrade 3 => new_hard=3, remaining_soft=2
+        let cigar = &[encode_op(4, 5), encode_op(0, 10)]; // 5S10M
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 3, true, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 3); // 3H, 2S, 10M
+        assert_eq!(result[0], encode_op(5, 3)); // 3H
+        assert_eq!(result[1], encode_op(4, 2)); // 2S
+        assert_eq!(result[2], encode_op(0, 10)); // 10M
+    }
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_start_hard_and_soft() {
+        // 2H5S10M: clip_amount=4, existing_hard=2, existing_soft=5
+        // length_to_upgrade = min(5, 4-2) = 2
+        // new_hard = 2+2 = 4, remaining_soft = 5-2 = 3
+        let cigar = &[encode_op(5, 2), encode_op(4, 5), encode_op(0, 10)]; // 2H5S10M
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 4, true, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 3); // 4H, 3S, 10M
+        assert_eq!(result[0], encode_op(5, 4)); // 4H
+        assert_eq!(result[1], encode_op(4, 3)); // 3S
+        assert_eq!(result[2], encode_op(0, 10)); // 10M
+    }
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_start_all_soft_to_hard() {
+        // 5S10M: clip_amount=5, upgrade all 5S to H
+        let cigar = &[encode_op(4, 5), encode_op(0, 10)]; // 5S10M
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 5, true, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 2); // 5H, 10M (no remaining S)
+        assert_eq!(result[0], encode_op(5, 5)); // 5H
+        assert_eq!(result[1], encode_op(0, 10)); // 10M
+    }
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_start_clip_amount_equals_hard() {
+        // 3H5S10M: clip_amount=3, existing_hard=3
+        // length_to_upgrade = min(5, 3-3) = 0
+        // new_hard=3, remaining_soft=5
+        let cigar = &[encode_op(5, 3), encode_op(4, 5), encode_op(0, 10)]; // 3H5S10M
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 3, true, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 3); // 3H, 5S, 10M
+        assert_eq!(result[0], encode_op(5, 3));
+        assert_eq!(result[1], encode_op(4, 5));
+        assert_eq!(result[2], encode_op(0, 10));
+    }
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_end_soft_only() {
+        // 10M5S: clip_amount=3, upgrade 3S at end to H
+        let cigar = &[encode_op(0, 10), encode_op(4, 5)]; // 10M5S
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 3, false, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 3); // 10M, 2S, 3H
+        assert_eq!(result[0], encode_op(0, 10)); // 10M
+        assert_eq!(result[1], encode_op(4, 2)); // 2S
+        assert_eq!(result[2], encode_op(5, 3)); // 3H
+    }
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_end_hard_and_soft() {
+        // 10M5S2H: clip_amount=5, existing_hard=2, existing_soft=5
+        // length_to_upgrade = min(5, 5-2) = 3
+        // new_hard = 2+3 = 5, remaining_soft = 5-3 = 2
+        let cigar = &[encode_op(0, 10), encode_op(4, 5), encode_op(5, 2)]; // 10M5S2H
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 5, false, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 3); // 10M, 2S, 5H
+        assert_eq!(result[0], encode_op(0, 10));
+        assert_eq!(result[1], encode_op(4, 2));
+        assert_eq!(result[2], encode_op(5, 5));
+    }
+
+    #[test]
+    fn test_upgrade_clipping_raw_from_end_all_soft_to_hard() {
+        // 10M5S: clip_amount=5, upgrade all soft
+        let cigar = &[encode_op(0, 10), encode_op(4, 5)]; // 10M5S
+        let (result, ref_consumed) = upgrade_clipping_raw(cigar, 5, false, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 2); // 10M, 5H (no remaining S)
+        assert_eq!(result[0], encode_op(0, 10));
+        assert_eq!(result[1], encode_op(5, 5));
+    }
+
+    // ========================================================================
+    // clip_cigar_ops_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_clip_cigar_ops_raw_zero_clip() {
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 0, true);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result, cigar);
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_empty_cigar() {
+        let (result, ref_consumed) = clip_cigar_ops_raw(&[], 5, true);
+        assert_eq!(ref_consumed, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_upgrade_path_from_start() {
+        // 5S10M: clip_amount=3, existing_clip=5, 3<=5 => upgrade path
+        let cigar = &[encode_op(4, 5), encode_op(0, 10)]; // 5S10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 3, true);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result[0], encode_op(5, 3)); // 3H
+        assert_eq!(result[1], encode_op(4, 2)); // 2S
+        assert_eq!(result[2], encode_op(0, 10)); // 10M
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_upgrade_path_from_end() {
+        // 10M5S: clip_amount=3, existing_clip=5, 3<=5 => upgrade path
+        let cigar = &[encode_op(0, 10), encode_op(4, 5)]; // 10M5S
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 3, false);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result[0], encode_op(0, 10)); // 10M
+        assert_eq!(result[1], encode_op(4, 2)); // 2S
+        assert_eq!(result[2], encode_op(5, 3)); // 3H
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_alignment_clip_from_start() {
+        // 10M: clip_amount=3, no existing clips => clips 3 bases from alignment
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 3, true);
+        assert_eq!(ref_consumed, 3);
+        assert_eq!(result.len(), 2); // 3H, 7M
+        assert_eq!(result[0], encode_op(5, 3)); // 3H
+        assert_eq!(result[1], encode_op(0, 7)); // 7M
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_alignment_clip_from_end() {
+        // 10M: clip_amount=3, no existing clips => clips 3 bases from alignment end
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 3, false);
+        assert_eq!(ref_consumed, 0); // end-clipping doesn't consume ref for position adjustment
+        assert_eq!(result.len(), 2); // 7M, 3H
+        assert_eq!(result[0], encode_op(0, 7)); // 7M
+        assert_eq!(result[1], encode_op(5, 3)); // 3H
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_clip_past_existing_from_start() {
+        // 2S10M: clip_amount=5, existing_clip=2, alignment_clip=3
+        let cigar = &[encode_op(4, 2), encode_op(0, 10)]; // 2S10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 5, true);
+        assert_eq!(ref_consumed, 3);
+        assert_eq!(result.len(), 2); // 5H, 7M
+        assert_eq!(result[0], encode_op(5, 5)); // 5H (2S + 3 from alignment)
+        assert_eq!(result[1], encode_op(0, 7)); // 7M
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_clip_past_existing_from_end() {
+        // 10M2S: clip_amount=5, existing_clip=2, alignment_clip=3
+        let cigar = &[encode_op(0, 10), encode_op(4, 2)]; // 10M2S
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 5, false);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 2); // 7M, 5H
+        assert_eq!(result[0], encode_op(0, 7)); // 7M
+        assert_eq!(result[1], encode_op(5, 5)); // 5H (2S + 3 from alignment)
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_with_insertion_at_boundary_start() {
+        // 10M3I5M: clip 10 from start should clip through 10M and consume entire 3I
+        let cigar = &[encode_op(0, 10), encode_op(1, 3), encode_op(0, 5)]; // 10M3I5M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 10, true);
+        // Clips 10M (10 read bases, 10 ref bases), then hits I:
+        // After 10M, read_bases_clipped=10 == clip_amount=10, done
+        assert_eq!(ref_consumed, 10);
+        assert_eq!(result.len(), 3); // 10H, 3I, 5M
+        assert_eq!(result[0], encode_op(5, 10)); // 10H
+        assert_eq!(result[1], encode_op(1, 3)); // 3I preserved
+        assert_eq!(result[2], encode_op(0, 5)); // 5M preserved
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_with_deletion_at_boundary_start() {
+        // 5M2D10M: clip 5 from start should clip 5M and skip the 2D
+        let cigar = &[encode_op(0, 5), encode_op(2, 2), encode_op(0, 10)]; // 5M2D10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 5, true);
+        // Clips 5M (5 read + 5 ref), then hits deletion at boundary (read_bases_clipped==5),
+        // skip 2D (ref_consumed += 2)
+        assert_eq!(ref_consumed, 7); // 5 from M + 2 from D
+        assert_eq!(result.len(), 2); // 5H, 10M
+        assert_eq!(result[0], encode_op(5, 5)); // 5H
+        assert_eq!(result[1], encode_op(0, 10)); // 10M
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_with_deletion_at_boundary_end() {
+        // 10M2D5M: clip 5 from end should clip 5M and skip the 2D
+        let cigar = &[encode_op(0, 10), encode_op(2, 2), encode_op(0, 5)]; // 10M2D5M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 5, false);
+        // Clips 5M from end (5 read bases), then skip 2D adjacent
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 2); // 10M, 5H
+        assert_eq!(result[0], encode_op(0, 10)); // 10M
+        assert_eq!(result[1], encode_op(5, 5)); // 5H
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_split_match_from_start() {
+        // 10M: clip 4, splits the M
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 4, true);
+        assert_eq!(ref_consumed, 4);
+        assert_eq!(result.len(), 2); // 4H, 6M
+        assert_eq!(result[0], encode_op(5, 4));
+        assert_eq!(result[1], encode_op(0, 6));
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_split_match_from_end() {
+        // 10M: clip 4, splits the M from end
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 4, false);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 2); // 6M, 4H
+        assert_eq!(result[0], encode_op(0, 6));
+        assert_eq!(result[1], encode_op(5, 4));
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_insertion_consumed_at_boundary_start() {
+        // 5M3I5M: clip 6 from start
+        // First 5M: 5 read bases clipped, 5 ref bases consumed
+        // Then 3I: need 1 more, but insertion is consumed entirely
+        // read_bases_clipped = 5 + 3 = 8 > 6 (entire I consumed at boundary)
+        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)]; // 5M3I5M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 6, true);
+        // 5M consumed (5 read, 5 ref), then 3I consumed entirely (3 read)
+        // total read bases = 8, ref_consumed = 5
+        assert_eq!(ref_consumed, 5);
+        assert_eq!(result.len(), 2); // 8H, 5M
+        assert_eq!(result[0], encode_op(5, 8)); // 8H
+        assert_eq!(result[1], encode_op(0, 5)); // 5M
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_with_eq_and_x_ops() {
+        // 5=3X: clip 4 from start splits the = op, consuming 4 ref bases
+        let cigar = &[encode_op(7, 5), encode_op(8, 3)]; // 5= 3X
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 4, true);
+        assert_eq!(ref_consumed, 4);
+        assert_eq!(result.len(), 3); // 4H, 1=, 3X
+        assert_eq!(result[0], encode_op(5, 4));
+        assert_eq!(result[1], encode_op(7, 1));
+        assert_eq!(result[2], encode_op(8, 3));
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_clip_entire_alignment_from_start() {
+        // 10M: clip all 10 bases from start
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 10, true);
+        assert_eq!(ref_consumed, 10);
+        assert_eq!(result.len(), 1); // 10H only
+        assert_eq!(result[0], encode_op(5, 10));
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_clip_entire_alignment_from_end() {
+        // 10M: clip all 10 bases from end
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 10, false);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 1); // 10H only
+        assert_eq!(result[0], encode_op(5, 10));
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_complex_cigar_start() {
+        // 3S10M2I5M4S: clip_amount=8
+        // existing_clip = 3 (3S), alignment_clip = 8 - 3 = 5
+        // After stripping S: 10M2I5M4S
+        // Clip 5 from 10M: split into 5 clipped + 5M remaining, ref=5
+        let cigar = &[
+            encode_op(4, 3),  // 3S
+            encode_op(0, 10), // 10M
+            encode_op(1, 2),  // 2I
+            encode_op(0, 5),  // 5M
+            encode_op(4, 4),  // 4S
+        ];
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 8, true);
+        assert_eq!(ref_consumed, 5);
+        // Result: 8H (3S+5 from alignment), 5M, 2I, 5M, 4S
+        assert_eq!(result[0], encode_op(5, 8)); // 8H
+        assert_eq!(result[1], encode_op(0, 5)); // 5M (remaining from 10M)
+        assert_eq!(result[2], encode_op(1, 2)); // 2I
+        assert_eq!(result[3], encode_op(0, 5)); // 5M
+        assert_eq!(result[4], encode_op(4, 4)); // 4S (trailing)
+    }
+
+    #[test]
+    fn test_clip_cigar_ops_raw_complex_cigar_end() {
+        // 3S10M2I5M4S: clip_amount=8
+        // existing_clip at end = 4 (4S), alignment_clip = 8 - 4 = 4
+        // After stripping trailing S: 3S10M2I5M
+        // Clip 4 from end of 5M: split into 1M remaining + 4 clipped
+        let cigar = &[
+            encode_op(4, 3),  // 3S
+            encode_op(0, 10), // 10M
+            encode_op(1, 2),  // 2I
+            encode_op(0, 5),  // 5M
+            encode_op(4, 4),  // 4S
+        ];
+        let (result, ref_consumed) = clip_cigar_ops_raw(cigar, 8, false);
+        assert_eq!(ref_consumed, 0);
+        // Result: 3S, 10M, 2I, 1M, 8H (4S+4 from alignment)
+        assert_eq!(result[0], encode_op(4, 3)); // 3S (leading)
+        assert_eq!(result[1], encode_op(0, 10)); // 10M
+        assert_eq!(result[2], encode_op(1, 2)); // 2I
+        assert_eq!(result[3], encode_op(0, 1)); // 1M (remaining from 5M)
+        assert_eq!(result[4], encode_op(5, 8)); // 8H (4S+4)
+    }
+
+    // ========================================================================
+    // is_fr_pair_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_fr_pair_raw_not_paired() {
+        // Not paired => false
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[encode_op(0, 10)], 10, 0, 200, &[]);
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_unmapped() {
+        // Paired but unmapped => false
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::UNMAPPED,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_mate_unmapped() {
+        // Paired, mapped but mate unmapped => false
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_UNMAPPED,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            -1,
+            -1,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_different_references() {
+        // Paired, both mapped, but different references => false
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            1,
+            200,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_same_strand_ff() {
+        // Paired, same reference, but both forward (FF) => false
+        let rec =
+            make_bam_bytes(0, 100, flags::PAIRED, b"rea", &[encode_op(0, 10)], 10, 0, 200, &[]);
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_same_strand_rr() {
+        // Paired, same reference, both reverse (RR) => false
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::REVERSE | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_fr_positive_strand_read() {
+        // FR pair: this read is forward, mate is reverse, on same reference
+        // positive_five_prime = alignment_start = 101
+        // negative_five_prime = alignment_start + insert_size = 101 + 200 = 301
+        // 101 < 301 => FR => true
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            200,
+            &[],
+        );
+        assert!(is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_fr_negative_strand_read() {
+        // FR pair: this read is reverse, mate is forward
+        // positive_five_prime = mate_start = 101
+        // negative_five_prime = alignment_end = 101 + 10 - 1 = 110
+        // Since mate at 101 < end at 110, this is FR => true
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            100,
+            -10,
+            &[],
+        );
+        assert!(is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_rf_orientation() {
+        // RF pair: this read is forward, mate is reverse, but mate is upstream
+        // Read at pos 200, mate at pos 100
+        // positive_five_prime = alignment_start = 201
+        // negative_five_prime = alignment_start + insert_size = 201 + (-100) = 101
+        // 201 > 101 => NOT FR (it's RF) => false
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            200,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            100,
+            -100,
+            &[],
+        );
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    // ========================================================================
+    // compute_bases_past_ref_pos tests
+    // ========================================================================
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_simple_match() {
+        // 10M starting at ref pos 100 (1-based)
+        // target_ref_pos = 105: should find read_pos at offset 5
+        let cigar = &[encode_op(0, 10)]; // 10M
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 105);
+        assert_eq!(result, 6); // 1-based: read pos 6 at ref pos 105
+    }
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_at_start() {
+        // 10M starting at ref pos 100
+        // target_ref_pos = 100: first position
+        let cigar = &[encode_op(0, 10)];
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 100);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_at_end() {
+        // 10M starting at ref pos 100
+        // target_ref_pos = 109: last position
+        let cigar = &[encode_op(0, 10)];
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 109);
+        assert_eq!(result, 10);
+    }
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_past_alignment() {
+        // 10M starting at ref pos 100
+        // target_ref_pos = 110: beyond alignment
+        let cigar = &[encode_op(0, 10)];
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 110);
+        assert_eq!(result, 0); // outside alignment
+    }
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_with_insertion() {
+        // 5M3I5M: insertion adds 3 query bases without consuming reference
+        // At ref 100: 5M covers ref 100-104, 3I adds 3 query bases,
+        // then 5M covers ref 105-109
+        // target=107: in second 5M, offset 2 from ref 105
+        // query pos = 5 (from first M) + 3 (from I) + 3 (offset in second M) = 11
+        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)]; // 5M3I5M
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 107);
+        assert_eq!(result, 11);
+    }
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_in_deletion() {
+        // 5M3D5M: deletion spans ref 105-107 without consuming query
+        // target=106: falls in the deletion
+        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)]; // 5M3D5M
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 106);
+        assert_eq!(result, 0); // position is in a deletion
+    }
+
+    #[test]
+    fn test_compute_bases_past_ref_pos_with_soft_clip() {
+        // 3S10M: soft clip consumes 3 query bases but no reference
+        // Alignment starts at ref 100, so 10M covers ref 100-109
+        // target=102: offset 2 in the M, query pos = 3 (from S) + 3 = 6
+        let cigar = &[encode_op(4, 3), encode_op(0, 10)]; // 3S10M
+        let result = compute_bases_past_ref_pos(&[], cigar, 100, 102);
+        assert_eq!(result, 6);
+    }
+
+    // ========================================================================
+    // compute_bases_before_ref_pos tests
+    // ========================================================================
+
+    #[test]
+    fn test_compute_bases_before_ref_pos_simple_match() {
+        // 10M starting at ref pos 100
+        // target_ref_pos = 105: read_pos increments to 6, but returns 6-1=5
+        let cigar = &[encode_op(0, 10)];
+        let result = compute_bases_before_ref_pos(&[], cigar, 100, 105);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn test_compute_bases_before_ref_pos_at_start() {
+        // 10M starting at ref pos 100
+        // target_ref_pos = 100: first position, read_pos=1, returns 1-1=0
+        let cigar = &[encode_op(0, 10)];
+        let result = compute_bases_before_ref_pos(&[], cigar, 100, 100);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_compute_bases_before_ref_pos_past_alignment() {
+        // 10M starting at ref pos 100
+        // target_ref_pos = 110: beyond alignment
+        let cigar = &[encode_op(0, 10)];
+        let result = compute_bases_before_ref_pos(&[], cigar, 100, 110);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_compute_bases_before_ref_pos_with_insertion() {
+        // 5M3I5M: at ref 107 (in second M block)
+        // query consumed: 5(M) + 3(I) + 3(into second M) = 11, returns 11-1=10
+        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)]; // 5M3I5M
+        let result = compute_bases_before_ref_pos(&[], cigar, 100, 107);
+        assert_eq!(result, 10);
+    }
+
+    #[test]
+    fn test_compute_bases_before_ref_pos_in_deletion() {
+        // 5M3D5M: deletion at ref 105-107
+        // target=106: falls in deletion
+        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)]; // 5M3D5M
+        let result = compute_bases_before_ref_pos(&[], cigar, 100, 106);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_compute_bases_before_ref_pos_with_soft_clip() {
+        // 3S10M: soft clip consumes 3 query bases
+        // At ref 102: query = 3(S) + 3(into M) = 6, returns 6-1=5
+        let cigar = &[encode_op(4, 3), encode_op(0, 10)]; // 3S10M
+        let result = compute_bases_before_ref_pos(&[], cigar, 100, 102);
+        assert_eq!(result, 5);
+    }
+
+    // ========================================================================
+    // num_bases_extending_past_mate_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_not_paired() {
+        // Not paired => 0
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[encode_op(0, 10)], 10, 0, 200, &[]);
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_unmapped() {
+        // Paired but unmapped => 0
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::UNMAPPED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            &[],
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_mate_unmapped() {
+        // Paired, mapped but mate unmapped => 0
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_UNMAPPED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            -1,
+            -1,
+            &[],
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_same_strand() {
+        // Both same strand => 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED, // both forward
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_different_references() {
+        // Different references => 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            1,
+            200,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_no_mc_tag() {
+        // Paired FR but no MC tag => 0
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            &[],
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_positive_strand_overlap() {
+        // Positive strand read extending past reverse mate's unclipped end
+        // Read: forward at pos 100, 20M (alignment_end = 101 + 20 - 1 = 120, 1-based)
+        // Mate: reverse at pos 105, MC=10M (mate unclipped_end = 106 + 10 - 1 = 115, 1-based)
+        // alignment_end (120) >= mate_ue (115), so need to compute bases past ref 115
+        // At ref 115 (1-based), starting from alignment_start=101:
+        // offset in 20M = 115 - 101 + 1 = 15 -> read_pos 15
+        // read_length = 20
+        // result = 20 - 15 = 5
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            100, // 0-based pos
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 20)],
+            20,
+            0,
+            105, // 0-based mate pos
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 5);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_positive_strand_no_overlap() {
+        // Positive strand read NOT extending past reverse mate's unclipped end
+        // Read: forward at pos 100, 10M (alignment_end = 101 + 10 - 1 = 110)
+        // Mate: reverse at pos 200, MC=10M (mate unclipped_end = 201 + 10 - 1 = 210)
+        // alignment_end (110) < mate_ue (210), check trailing soft clips
+        // No trailing soft clips => trailing_sc.saturating_sub(gap) = 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_negative_strand_overlap() {
+        // Negative strand read extending before forward mate's unclipped start
+        // Read: reverse at pos 100, 20M
+        // Mate: forward at pos 105, MC=10M (mate unclipped_start = 106)
+        // this_pos (101) <= mate_us (106), so compute bases before ref pos 106
+        // 20M from pos 101: at ref 106, read_pos = 6, returns 6-1 = 5
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            100, // 0-based pos
+            flags::PAIRED | flags::REVERSE,
+            b"rea",
+            &[encode_op(0, 20)],
+            20,
+            0,
+            105, // 0-based mate pos
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 5);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_negative_strand_no_overlap() {
+        // Negative strand read NOT extending before forward mate
+        // Read: reverse at pos 200, 10M
+        // Mate: forward at pos 100, MC=10M (mate unclipped_start = 101)
+        // this_pos (201) > mate_us (101), check leading soft clips
+        // No leading soft clips, gap = 201 - 101 = 100, 0.saturating_sub(100) = 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            200,
+            flags::PAIRED | flags::REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            100,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_negative_strand_gap_with_soft_clip() {
+        // Negative strand read with soft clip, this_pos > mate_us
+        // Read: reverse at pos 110 (0-based), 3S10M (query_len=13)
+        // Mate: forward at pos 105 (0-based), MC=10M (mate unclipped_start = 106)
+        // this_pos = 111, mate_us = 106
+        // this_pos > mate_us, so gap = 111 - 106 = 5
+        // leading_soft_clip = 3, 3.saturating_sub(5) = 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            110,
+            flags::PAIRED | flags::REVERSE,
+            b"rea",
+            &[encode_op(4, 3), encode_op(0, 10)],
+            13,
+            0,
+            105,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_positive_strand_gap_with_soft_clip() {
+        // Positive strand read with trailing soft clip, alignment_end < mate_ue
+        // Read: forward at pos 100 (0-based), 10M3S (query_len=13)
+        // Mate: reverse at pos 200 (0-based), MC=10M (mate unclipped_end = 201+10-1=210)
+        // alignment_end = 101+10-1 = 110, mate_ue = 210
+        // 110 < 210, gap = 210 - 110 = 100
+        // trailing_soft_clip = 3, 3.saturating_sub(100) = 0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10), encode_op(4, 3)],
+            13,
+            0,
+            200,
+            &aux,
+        );
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    // ========================================================================
+    // read_pos_at_ref_pos_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_simple() {
+        // 10M starting at position 100: ref pos 102 => query pos 3
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 102, false), Some(3));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_before_alignment() {
+        // ref_pos < alignment_start => None
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 99, false), None);
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_after_alignment() {
+        // ref_pos after alignment => None
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 110, false), None);
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_in_deletion() {
+        // 5M3D5M: deletion at ref 105-107
+        // ref_pos=106 is in deletion => None (without return_last_base_if_deleted)
+        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 106, false), None);
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_in_deletion_return_last() {
+        // 5M3D5M: deletion at ref 105-107
+        // ref_pos=106 is in deletion, return_last_base_if_deleted=true => returns 5
+        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 106, true), Some(5));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_with_insertion() {
+        // 5M3I5M: insertion doesn't consume reference
+        // ref 105 is first base of second 5M, query pos = 5 (from first M) + 3 (from I) + 1 = 9
+        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 105, false), Some(9));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_with_soft_clip() {
+        // 3S10M: soft clip consumes query but not reference
+        // ref 100 = first ref base in 10M, query pos = 3 (from S) + 1 = 4
+        let cigar = &[encode_op(4, 3), encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, false), Some(4));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_at_exact_start() {
+        // 10M at position 100: query at ref 100 = 1
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, false), Some(1));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_at_exact_end() {
+        // 10M at position 100: query at ref 109 = 10
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 109, false), Some(10));
+    }
+
+    // ========================================================================
+    // query_length_from_cigar tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_length_from_cigar_simple() {
+        let cigar = &[encode_op(0, 10)]; // 10M
+        assert_eq!(query_length_from_cigar(cigar), 10);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_with_clips_and_insertion() {
+        // 3S10M2I5M4S: query consuming = 3+10+2+5+4 = 24
+        let cigar = &[
+            encode_op(4, 3),  // 3S
+            encode_op(0, 10), // 10M
+            encode_op(1, 2),  // 2I
+            encode_op(0, 5),  // 5M
+            encode_op(4, 4),  // 4S
+        ];
+        assert_eq!(query_length_from_cigar(cigar), 24);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_deletion_not_counted() {
+        // 10M3D5M: deletion doesn't consume query
+        let cigar = &[encode_op(0, 10), encode_op(2, 3), encode_op(0, 5)];
+        assert_eq!(query_length_from_cigar(cigar), 15);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_hard_clip_not_counted() {
+        // 3H10M2H: hard clips don't consume query
+        let cigar = &[encode_op(5, 3), encode_op(0, 10), encode_op(5, 2)];
+        assert_eq!(query_length_from_cigar(cigar), 10);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_eq_and_x() {
+        // 5=3X: both consume query, total 8
+        let cigar = &[encode_op(7, 5), encode_op(8, 3)];
+        assert_eq!(query_length_from_cigar(cigar), 8);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_empty() {
+        assert_eq!(query_length_from_cigar(&[]), 0);
+    }
+
+    // ========================================================================
+    // trailing_soft_clip_from_ops and leading_soft_clip_from_ops tests
+    // ========================================================================
+
+    #[test]
+    fn test_trailing_soft_clip_from_ops_none() {
+        let cigar = &[encode_op(0, 10)]; // 10M
+        assert_eq!(trailing_soft_clip_from_ops(cigar), 0);
+    }
+
+    #[test]
+    fn test_trailing_soft_clip_from_ops_with_soft() {
+        let cigar = &[encode_op(0, 10), encode_op(4, 5)]; // 10M5S
+        assert_eq!(trailing_soft_clip_from_ops(cigar), 5);
+    }
+
+    #[test]
+    fn test_trailing_soft_clip_from_ops_with_hard_after_soft() {
+        let cigar = &[encode_op(0, 10), encode_op(4, 5), encode_op(5, 3)]; // 10M5S3H
+        assert_eq!(trailing_soft_clip_from_ops(cigar), 5);
+    }
+
+    #[test]
+    fn test_leading_soft_clip_from_ops_none() {
+        let cigar = &[encode_op(0, 10)]; // 10M
+        assert_eq!(leading_soft_clip_from_ops(cigar), 0);
+    }
+
+    #[test]
+    fn test_leading_soft_clip_from_ops_with_soft() {
+        let cigar = &[encode_op(4, 5), encode_op(0, 10)]; // 5S10M
+        assert_eq!(leading_soft_clip_from_ops(cigar), 5);
+    }
+
+    #[test]
+    fn test_leading_soft_clip_from_ops_with_hard_before_soft() {
+        let cigar = &[encode_op(5, 3), encode_op(4, 5), encode_op(0, 10)]; // 3H5S10M
+        assert_eq!(leading_soft_clip_from_ops(cigar), 5);
+    }
+
+    // ========================================================================
+    // UnmappedBamRecordBuilder additional tests
+    // ========================================================================
+
+    #[test]
+    fn test_builder_default() {
+        let builder = UnmappedBamRecordBuilder::default();
+        // Default builder has empty buffer and is not sealed
+        assert!(builder.buf.is_empty());
+        assert!(!builder.sealed);
+    }
+
+    #[test]
+    fn test_builder_with_capacity() {
+        let builder = UnmappedBamRecordBuilder::with_capacity(1024);
+        assert!(builder.buf.capacity() >= 1024);
+    }
+
+    #[test]
+    fn test_builder_odd_length_sequence() {
+        // Odd-length sequence to exercise the packing edge case
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"read1", flags::UNMAPPED, b"ACG", &[30, 25, 20]);
+
+        let bam = builder.as_bytes();
+        assert_eq!(l_seq(bam), 3);
+        let so = seq_offset(bam);
+        assert_eq!(get_base(bam, so, 0), 1); // A
+        assert_eq!(get_base(bam, so, 1), 2); // C
+        assert_eq!(get_base(bam, so, 2), 4); // G
+    }
+
+    #[test]
+    fn test_builder_long_sequence() {
+        // Longer sequence to exercise multi-byte packing
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let bases = b"ACGTACGTACGTACGT"; // 16 bases
+        let quals = vec![30u8; 16];
+        builder.build_record(b"r1", flags::UNMAPPED, bases, &quals);
+
+        let bam = builder.as_bytes();
+        assert_eq!(l_seq(bam), 16);
+        let so = seq_offset(bam);
+        for (i, &base) in bases.iter().enumerate() {
+            let expected = match base {
+                b'A' => 1,
+                b'C' => 2,
+                b'G' => 4,
+                b'T' => 8,
+                _ => 0,
+            };
+            assert_eq!(get_base(bam, so, i), expected, "base mismatch at position {i}");
+        }
+    }
+
+    #[test]
+    fn test_builder_multiple_records_via_write_with_block_size() {
+        // Build two records into the same output buffer
+        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut output = Vec::new();
+
+        builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+        builder.append_string_tag(b"MI", b"1");
+        builder.write_with_block_size(&mut output);
+
+        builder.clear();
+        builder.build_record(b"r2", flags::UNMAPPED, b"TGCA", &[25, 25, 25, 25]);
+        builder.append_string_tag(b"MI", b"2");
+        builder.write_with_block_size(&mut output);
+
+        let records = ParsedBamRecord::parse_all(&output);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, b"r1");
+        assert_eq!(records[0].bases, b"ACGT");
+        assert_eq!(records[0].get_string_tag(b"MI").unwrap(), b"1");
+        assert_eq!(records[1].name, b"r2");
+        assert_eq!(records[1].bases, b"TGCA");
+        assert_eq!(records[1].get_string_tag(b"MI").unwrap(), b"2");
+    }
+
+    // ========================================================================
+    // clip_cigar_start_raw / clip_cigar_end_raw additional edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_clip_cigar_start_raw_with_existing_hard_clip() {
+        // 3H10M: clip 5 from start
+        // existing_hard=3, existing_soft=0, post_clip_ops=[10M]
+        // alignment_clip = 5 (called from clip_cigar_ops_raw: 5 - 3 = 2)
+        // But directly calling clip_cigar_start_raw with clip_amount=2:
+        // clips 2 from 10M => 8M remains, ref_consumed=2
+        // total_hard = 3 + 0 + 2 = 5
+        let cigar = &[encode_op(5, 3), encode_op(0, 10)]; // 3H10M
+        let (result, ref_consumed) = clip_cigar_start_raw(cigar, 2, encode_op);
+        assert_eq!(ref_consumed, 2);
+        assert_eq!(result.len(), 2); // 5H, 8M
+        assert_eq!(result[0], encode_op(5, 5)); // 3 existing + 2 new
+        assert_eq!(result[1], encode_op(0, 8));
+    }
+
+    #[test]
+    fn test_clip_cigar_end_raw_with_existing_hard_clip() {
+        // 10M3H: clip 2 from end
+        // existing_hard=3, existing_soft=0, post_clip_ops=[10M]
+        // clips 2 from end of 10M => 8M remains
+        // total_hard = 3 + 0 + 2 = 5
+        let cigar = &[encode_op(0, 10), encode_op(5, 3)]; // 10M3H
+        let (result, ref_consumed) = clip_cigar_end_raw(cigar, 2, encode_op);
+        assert_eq!(ref_consumed, 0);
+        assert_eq!(result.len(), 2); // 8M, 5H
+        assert_eq!(result[0], encode_op(0, 8));
+        assert_eq!(result[1], encode_op(5, 5)); // 3 existing + 2 new
+    }
+
+    #[test]
+    fn test_clip_cigar_start_raw_insertion_at_exact_boundary() {
+        // 3I10M: clip 1 from start
+        // The insertion has 3 read bases. clip_amount=1, but I consumes entire (3 bases)
+        // total read bases clipped = 3, ref_consumed = 0
+        let cigar = &[encode_op(1, 3), encode_op(0, 10)]; // 3I10M
+        let (result, ref_consumed) = clip_cigar_start_raw(cigar, 1, encode_op);
+        assert_eq!(ref_consumed, 0);
+        // 3I consumed entirely => 3H, 10M
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], encode_op(5, 3));
+        assert_eq!(result[1], encode_op(0, 10));
+    }
+
+    #[test]
+    fn test_clip_cigar_end_raw_insertion_at_exact_boundary() {
+        // 10M3I: clip 1 from end
+        // The insertion has 3 read bases. clip_amount=1, but I consumes entire (3 bases)
+        let cigar = &[encode_op(0, 10), encode_op(1, 3)]; // 10M3I
+        let (result, ref_consumed) = clip_cigar_end_raw(cigar, 1, encode_op);
+        assert_eq!(ref_consumed, 0);
+        // 3I consumed entirely => 10M, 3H
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], encode_op(0, 10));
+        assert_eq!(result[1], encode_op(5, 3));
+    }
+
+    // ========================================================================
+    // alignment_start_from_raw / alignment_end_from_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_alignment_start_from_raw_mapped() {
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[encode_op(0, 10)], 10, -1, -1, &[]);
+        assert_eq!(alignment_start_from_raw(&rec), Some(101));
+    }
+
+    #[test]
+    fn test_alignment_start_from_raw_unmapped() {
+        let rec = make_bam_bytes(-1, -1, flags::UNMAPPED, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(alignment_start_from_raw(&rec), None);
+    }
+
+    #[test]
+    fn test_alignment_end_from_raw_mapped() {
+        // 10M at pos 100 (0-based): end = 100 + 10 = 110 (exclusive)
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[encode_op(0, 10)], 10, -1, -1, &[]);
+        assert_eq!(alignment_end_from_raw(&rec), Some(110));
+    }
+
+    #[test]
+    fn test_alignment_end_from_raw_unmapped() {
+        let rec = make_bam_bytes(-1, -1, flags::UNMAPPED, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(alignment_end_from_raw(&rec), None);
+    }
+
+    #[test]
+    fn test_alignment_end_from_raw_no_cigar() {
+        // Mapped but no CIGAR => ref_len=0 => None
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(alignment_end_from_raw(&rec), None);
+    }
+
+    // ========================================================================
+    // template_length tests
+    // ========================================================================
+
+    #[test]
+    fn test_template_length_zero() {
+        let rec = make_bam_bytes(0, 100, 0, b"rea", &[], 0, -1, -1, &[]);
+        assert_eq!(template_length(&rec), 0);
+    }
+
+    #[test]
+    fn test_template_length_positive() {
+        let rec = make_bam_bytes_with_tlen(0, 100, 0, b"rea", &[], 0, 0, 200, 150, &[]);
+        assert_eq!(template_length(&rec), 150);
+    }
+
+    #[test]
+    fn test_template_length_negative() {
+        let rec = make_bam_bytes_with_tlen(0, 200, 0, b"rea", &[], 0, 0, 100, -150, &[]);
+        assert_eq!(template_length(&rec), -150);
+    }
+
+    // ========================================================================
+    // simplify_cigar_from_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_simplify_cigar_from_raw_basic() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // 5S10M3I5M4S => all S/= become M, so: 5M+10M+3I+5M+4M => 15M+3I+9M
+        let cigar = &[
+            encode_op(4, 5),  // 5S
+            encode_op(0, 10), // 10M
+            encode_op(1, 3),  // 3I
+            encode_op(0, 5),  // 5M
+            encode_op(4, 4),  // 4S
+        ];
+        let result = simplify_cigar_from_raw(cigar);
+        assert_eq!(
+            result,
+            vec![
+                (Kind::Match, 15), // 5S+10M coalesced
+                (Kind::Insertion, 3),
+                (Kind::Match, 9), // 5M+4S coalesced
+            ]
+        );
+    }
+
+    #[test]
+    fn test_simplify_cigar_from_raw_eq_and_x() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // 5=3X2D4= => all =, X become M: 5M+3M+2D+4M => 8M+2D+4M
+        let cigar = &[
+            encode_op(7, 5), // 5=
+            encode_op(8, 3), // 3X
+            encode_op(2, 2), // 2D
+            encode_op(7, 4), // 4=
+        ];
+        let result = simplify_cigar_from_raw(cigar);
+        assert_eq!(result, vec![(Kind::Match, 8), (Kind::Deletion, 2), (Kind::Match, 4),]);
+    }
+
+    #[test]
+    fn test_simplify_cigar_from_raw_empty() {
+        let result = simplify_cigar_from_raw(&[]);
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // extract_sequence / quality_scores_slice tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sequence() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0x12; // A, C
+        rec[so + 1] = 0x48; // G, T
+        let seq = extract_sequence(&rec);
+        assert_eq!(seq, b"ACGT");
+    }
+
+    #[test]
+    fn test_quality_scores_slice() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let qo = qual_offset(&rec);
+        rec[qo] = 30;
+        rec[qo + 1] = 25;
+        rec[qo + 2] = 20;
+        rec[qo + 3] = 15;
+        let quals = quality_scores_slice(&rec);
+        assert_eq!(quals, &[30, 25, 20, 15]);
+    }
+
+    #[test]
+    fn test_quality_scores_slice_mut() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let quals = quality_scores_slice_mut(&mut rec);
+        quals[0] = 30;
+        quals[1] = 25;
+        assert_eq!(quality_scores_slice(&rec), &[30, 25, 0, 0]);
+    }
+
+    // ========================================================================
+    // set_base tests
+    // ========================================================================
+
+    #[test]
+    fn test_set_base() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        // Start with AAAA (all 0x11 pairs)
+        rec[so] = 0x11; // A=1, A=1
+        rec[so + 1] = 0x11;
+
+        // set_base takes ASCII bases, not codes
+        // Set position 0 to T (code 8)
+        set_base(&mut rec, so, 0, b'T');
+        assert_eq!(get_base(&rec, so, 0), 8); // T
+        assert_eq!(get_base(&rec, so, 1), 1); // A unchanged
+
+        // Set position 1 to C (code 2)
+        set_base(&mut rec, so, 1, b'C');
+        assert_eq!(get_base(&rec, so, 0), 8); // T unchanged
+        assert_eq!(get_base(&rec, so, 1), 2); // C
+
+        // Set position 3 to G (code 4) - odd position
+        set_base(&mut rec, so, 3, b'G');
+        assert_eq!(get_base(&rec, so, 2), 1); // A unchanged
+        assert_eq!(get_base(&rec, so, 3), 4); // G
+    }
+
+    // ========================================================================
+    // Field accessor tests — documents the BAM binary format layout
+    // ========================================================================
+
+    #[test]
+    fn test_field_accessors_roundtrip() {
+        // Build a record with known values and verify every accessor
+        let mut rec = make_bam_bytes_with_tlen(
+            3,                                                     // tid
+            200,                                                   // pos
+            flags::PAIRED | flags::REVERSE | flags::FIRST_SEGMENT, // flag
+            b"read1",                                              // name
+            &[encode_op(0, 10)],                                   // 10M cigar
+            6,                                                     // seq_len
+            5,                                                     // mate_tid
+            400,                                                   // mate_pos
+            150,                                                   // tlen
+            &[],                                                   // aux
+        );
+        rec[9] = 42; // mapq
+
+        assert_eq!(ref_id(&rec), 3);
+        assert_eq!(pos(&rec), 200);
+        assert_eq!(l_read_name(&rec), 6); // "read1" + null
+        assert_eq!(mapq(&rec), 42);
+        assert_eq!(n_cigar_op(&rec), 1);
+        assert_eq!(flags(&rec), flags::PAIRED | flags::REVERSE | flags::FIRST_SEGMENT);
+        assert_eq!(l_seq(&rec), 6);
+        assert_eq!(mate_ref_id(&rec), 5);
+        assert_eq!(mate_pos(&rec), 400);
+        assert_eq!(template_length(&rec), 150);
+        assert_eq!(read_name(&rec), b"read1");
+    }
+
+    #[test]
+    fn test_flags_unmapped_record() {
+        let rec = make_bam_bytes(-1, -1, flags::UNMAPPED, b"r", &[], 0, -1, -1, &[]);
+        assert_eq!(flags(&rec), flags::UNMAPPED);
+        assert_eq!(ref_id(&rec), -1);
+        assert_eq!(pos(&rec), -1);
+    }
+
+    // ========================================================================
+    // aux_data_offset_from_record / aux_data_slice / seq_offset / qual_offset
+    // ========================================================================
+
+    #[test]
+    fn test_aux_data_offset_from_record_basic() {
+        let rec = make_bam_bytes(0, 0, 0, b"rd", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let offset = aux_data_offset_from_record(&rec).unwrap();
+        // 32 + l_read_name(3) + cigar(4) + seq_bytes(2) + qual(4) = 45
+        assert_eq!(offset, 32 + 3 + 4 + 2 + 4);
+    }
+
+    #[test]
+    fn test_aux_data_offset_from_record_too_short() {
+        let short = vec![0u8; 10];
+        assert!(aux_data_offset_from_record(&short).is_none());
+    }
+
+    #[test]
+    fn test_aux_data_slice_with_tags() {
+        let aux = b"MIZtest\0";
+        let rec = make_bam_bytes(0, 0, 0, b"rd", &[], 4, -1, -1, aux);
+        let slice = aux_data_slice(&rec);
+        assert_eq!(slice, aux.as_slice());
+    }
+
+    #[test]
+    fn test_aux_data_slice_empty() {
+        let rec = make_bam_bytes(0, 0, 0, b"rd", &[], 4, -1, -1, &[]);
+        let slice = aux_data_slice(&rec);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn test_seq_offset_and_qual_offset() {
+        let rec = make_bam_bytes(0, 0, 0, b"rd", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        let qo = qual_offset(&rec);
+        // seq_offset = 32 + l_read_name(3) + cigar(4) = 39
+        assert_eq!(so, 32 + 3 + 4);
+        // qual_offset = seq_offset + seq_bytes(2) = 41
+        assert_eq!(qo, so + 2);
+        // quality should be 4 bytes at that offset
+        assert_eq!(&rec[qo..qo + 4], &[0, 0, 0, 0]);
+    }
+
+    // ========================================================================
+    // alignment_end_from_raw — additional cases
+    // ========================================================================
+
+    #[test]
+    fn test_alignment_end_from_raw_with_deletion() {
+        // 5M2D5M at pos=0 → ref_len = 5+2+5 = 12
+        let cigar = &[encode_op(0, 5), encode_op(2, 2), encode_op(0, 5)];
+        let rec = make_bam_bytes(0, 0, 0, b"rd", cigar, 10, -1, -1, &[]);
+        assert_eq!(alignment_end_from_raw(&rec), Some(12));
+    }
+
+    // ========================================================================
+    // simplify_cigar_from_raw — additional complex patterns
+    // ========================================================================
+
+    #[test]
+    fn test_simplify_cigar_from_raw_hard_clips() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // 5H10M5H → H becomes M, coalesced: 20M
+        let cigar = &[encode_op(5, 5), encode_op(0, 10), encode_op(5, 5)];
+        let result = simplify_cigar_from_raw(cigar);
+        assert_eq!(result, vec![(Kind::Match, 20)]);
+    }
+
+    #[test]
+    fn test_simplify_cigar_from_raw_mixed_operations() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // 2H3S5M2I3M1D4M4S1H → H,S,M coalesce to M; I,D stay
+        // 2M+3M+5M = 10M, 2I, 3M, 1D, 4M+4M+1M = 9M
+        let cigar = &[
+            encode_op(5, 2), // 2H
+            encode_op(4, 3), // 3S
+            encode_op(0, 5), // 5M
+            encode_op(1, 2), // 2I
+            encode_op(0, 3), // 3M
+            encode_op(2, 1), // 1D
+            encode_op(0, 4), // 4M
+            encode_op(4, 4), // 4S
+            encode_op(5, 1), // 1H
+        ];
+        let result = simplify_cigar_from_raw(cigar);
+        assert_eq!(
+            result,
+            vec![
+                (Kind::Match, 10),
+                (Kind::Insertion, 2),
+                (Kind::Match, 3),
+                (Kind::Deletion, 1),
+                (Kind::Match, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_simplify_cigar_from_raw_skip_and_pad() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // 5M3N5M → N (skip) preserved, not converted to M
+        let cigar = &[encode_op(0, 5), encode_op(3, 3), encode_op(0, 5)];
+        let result = simplify_cigar_from_raw(cigar);
+        assert_eq!(result, vec![(Kind::Match, 5), (Kind::Skip, 3), (Kind::Match, 5)]);
+    }
+
+    #[test]
+    fn test_simplify_cigar_from_raw_all_soft_clips() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // 10S → becomes 10M
+        let cigar = &[encode_op(4, 10)];
+        let result = simplify_cigar_from_raw(cigar);
+        assert_eq!(result, vec![(Kind::Match, 10)]);
+    }
+
+    // ========================================================================
+    // extract_sequence — additional edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sequence_odd_length() {
+        // Odd-length seq: the last nibble in the packed byte is in the high nibble
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 3, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0x12; // A(1), C(2)
+        rec[so + 1] = 0x40; // G(4), padding(0)
+        let seq = extract_sequence(&rec);
+        assert_eq!(seq, b"ACG");
+    }
+
+    #[test]
+    fn test_extract_sequence_all_n() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0xFF; // N(15), N(15)
+        rec[so + 1] = 0xFF; // N(15), N(15)
+        let seq = extract_sequence(&rec);
+        assert_eq!(seq, b"NNNN");
+    }
+
+    #[test]
+    fn test_extract_sequence_single_base() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 1, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0x80; // T(8)
+        let seq = extract_sequence(&rec);
+        assert_eq!(seq, b"T");
+    }
+
+    // ========================================================================
+    // quality_scores_slice — additional edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_quality_scores_slice_high_qualities() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 3, -1, -1, &[]);
+        let qo = qual_offset(&rec);
+        rec[qo] = 40;
+        rec[qo + 1] = 93; // max Phred
+        rec[qo + 2] = 0; // min Phred
+        let quals = quality_scores_slice(&rec);
+        assert_eq!(quals, &[40, 93, 0]);
+    }
+
+    #[test]
+    fn test_quality_scores_slice_mut_modify_all() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 4, -1, -1, &[]);
+        let quals = quality_scores_slice_mut(&mut rec);
+        for (i, q) in quals.iter_mut().enumerate() {
+            *q = (i * 10) as u8;
+        }
+        assert_eq!(quality_scores_slice(&rec), &[0, 10, 20, 30]);
+    }
+
+    // ========================================================================
+    // set_base — additional edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_set_base_all_bases() {
+        // Verify set_base/get_base roundtrip for all standard bases
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 8, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        let bases = [b'A', b'C', b'G', b'T', b'N', b'R', b'Y', b'M'];
+        let codes: [u8; 8] = [1, 2, 4, 8, 15, 5, 10, 3];
+        for (i, &base) in bases.iter().enumerate() {
+            set_base(&mut rec, so, i, base);
+        }
+        for (i, &expected_code) in codes.iter().enumerate() {
+            assert_eq!(
+                get_base(&rec, so, i),
+                expected_code,
+                "base {} at pos {i}",
+                bases[i] as char
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_base_preserves_neighbor() {
+        // Ensure setting an even position doesn't corrupt the odd neighbor and vice versa
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 2, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        set_base(&mut rec, so, 0, b'A');
+        set_base(&mut rec, so, 1, b'T');
+        assert_eq!(get_base(&rec, so, 0), 1); // A
+        assert_eq!(get_base(&rec, so, 1), 8); // T
+        // Now change only position 0
+        set_base(&mut rec, so, 0, b'G');
+        assert_eq!(get_base(&rec, so, 0), 4); // G
+        assert_eq!(get_base(&rec, so, 1), 8); // T still intact
+    }
+
+    // ========================================================================
+    // set_flags
+    // ========================================================================
+
+    #[test]
+    fn test_set_flags_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 0, -1, -1, &[]);
+        assert_eq!(flags(&rec), 0);
+        set_flags(&mut rec, flags::PAIRED | flags::REVERSE | flags::DUPLICATE);
+        assert_eq!(flags(&rec), flags::PAIRED | flags::REVERSE | flags::DUPLICATE);
+        set_flags(&mut rec, 0);
+        assert_eq!(flags(&rec), 0);
+    }
+
+    // ========================================================================
+    // raw_records_to_record_bufs
+    // ========================================================================
+
+    #[test]
+    fn test_raw_records_to_record_bufs_single() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"read1", 0, b"ACGT", &[30, 25, 20, 15]);
+        builder.append_string_tag(b"MI", b"1");
+        let raw = builder.as_bytes().to_vec();
+
+        let bufs = raw_records_to_record_bufs(&[raw]).unwrap();
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(bufs[0].name().map(std::convert::AsRef::as_ref), Some(b"read1".as_ref()));
+    }
+
+    #[test]
+    fn test_raw_records_to_record_bufs_multiple() {
+        let mut records = Vec::new();
+        for i in 0..3 {
+            let mut builder = UnmappedBamRecordBuilder::new();
+            let name = format!("read{i}");
+            builder.build_record(name.as_bytes(), 0, b"AC", &[30, 25]);
+            records.push(builder.as_bytes().to_vec());
+        }
+
+        let bufs = raw_records_to_record_bufs(&records).unwrap();
+        assert_eq!(bufs.len(), 3);
+        for (i, buf) in bufs.iter().enumerate() {
+            let expected = format!("read{i}");
+            assert_eq!(buf.name().map(<_ as AsRef<[u8]>>::as_ref), Some(expected.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn test_raw_records_to_record_bufs_empty() {
+        let bufs = raw_records_to_record_bufs(&[]).unwrap();
+        assert!(bufs.is_empty());
+    }
+
+    // ========================================================================
+    // set_qual — additional edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_set_qual_boundary_values() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 3, -1, -1, &[]);
+        let qo = qual_offset(&rec);
+        set_qual(&mut rec, qo, 0, 0); // min
+        set_qual(&mut rec, qo, 1, 93); // max typical
+        set_qual(&mut rec, qo, 2, 255); // max possible
+        assert_eq!(get_qual(&rec, qo, 0), 0);
+        assert_eq!(get_qual(&rec, qo, 1), 93);
+        assert_eq!(get_qual(&rec, qo, 2), 255);
+    }
+
+    // ========================================================================
+    // mask_base
+    // ========================================================================
+
+    #[test]
+    fn test_mask_base_sets_n() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        // Set all bases to ACGT
+        set_base(&mut rec, so, 0, b'A');
+        set_base(&mut rec, so, 1, b'C');
+        set_base(&mut rec, so, 2, b'G');
+        set_base(&mut rec, so, 3, b'T');
+        // Mask positions 1 and 3
+        mask_base(&mut rec, so, 1);
+        mask_base(&mut rec, so, 3);
+        assert_eq!(get_base(&rec, so, 0), 1); // A preserved
+        assert_eq!(get_base(&rec, so, 1), 15); // N
+        assert_eq!(get_base(&rec, so, 2), 4); // G preserved
+        assert_eq!(get_base(&rec, so, 3), 15); // N
     }
 }
