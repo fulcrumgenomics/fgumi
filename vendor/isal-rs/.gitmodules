@@ -1,3 +1,0 @@
-[submodule "isa-l"]
-	path = isal-sys/isa-l
-	url = https://github.com/intel/isa-l.git

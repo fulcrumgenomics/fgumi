@@ -4938,7 +4938,6 @@ contributors.
 
 Nota Bene: This is same as the Rust Project's own license.
 
-
 [1]: <http://opensource.org/licenses/MIT>, which is reproduced below:
 
 ~~~~
@@ -4964,7 +4963,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ~~~~
-
 
 [2]: <http://www.apache.org/licenses/LICENSE-2.0>, which is reproduced below:
 
@@ -5183,7 +5181,6 @@ contributors.
 
 Nota Bene: This is same as the Rust Project's own license.
 
-
 [1]: <http://opensource.org/licenses/MIT>, which is reproduced below:
 
 ~~~~
@@ -5209,7 +5206,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ~~~~
-
 
 [2]: <http://www.apache.org/licenses/LICENSE-2.0>, which is reproduced below:
 
@@ -13412,15 +13408,6 @@ text = """
 
 """
 
-[[third_party_libraries]]
-package_name = "isal-rs"
-package_version = "0.5.3+496255c"
-repository = "https://github.com/milesgranger/isal-rs"
-license = "BSD-3-Clause"
-
-[[third_party_libraries.licenses]]
-license = "BSD-3-Clause"
-text = """
 BSD 3-Clause License
 
 Copyright (c) 2022, Miles Granger
@@ -13452,15 +13439,6 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-[[third_party_libraries]]
-package_name = "isal-sys"
-package_version = "0.5.3+496255c"
-repository = "https://github.com/milesgranger/isal-rs"
-license = "BSD-3-Clause"
-
-[[third_party_libraries.licenses]]
-license = "BSD-3-Clause"
-text = """
 BSD 3-Clause License
 
 Copyright (c) 2022, Miles Granger
@@ -17723,7 +17701,6 @@ text = """
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
-
 
 --- LLVM Exceptions to the Apache 2.0 License ----
 
@@ -27529,7 +27506,6 @@ text = """
    See the License for the specific language governing permissions and
    limitations under the License.
 
-
 --- LLVM Exceptions to the Apache 2.0 License ----
 
 As an exception, if, as a result of your compiling your source code, portions
@@ -32884,7 +32860,6 @@ text = """
    See the License for the specific language governing permissions and
    limitations under the License.
 
-
 --- LLVM Exceptions to the Apache 2.0 License ----
 
 As an exception, if, as a result of your compiling your source code, portions
@@ -36030,7 +36005,6 @@ text = """
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
-
 
 --- LLVM Exceptions to the Apache 2.0 License ----
 

@@ -39,7 +39,6 @@ crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 parking_lot = "0.12"
 libdeflater = "1.22"
-isal-rs = { version = "0.5.3", path = "vendor/isal-rs", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 itertools = "0.14.0"
 indexmap = "2"
@@ -72,8 +71,6 @@ compare = []
 simulate = []
 # Enable profiling output for adjacency UMI assigner
 profile-adjacency = []
-# Use ISA-L/igzip for BGZF compression instead of libdeflate
-isal = ["dep:isal-rs"]
 
 [dev-dependencies]
 rstest = "0"

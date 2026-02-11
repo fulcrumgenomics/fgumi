@@ -1,3 +1,0 @@
-[submodule "vendor/isal-rs"]
-	path = vendor/isal-rs
-	url = https://github.com/milesgranger/isal-rs.git

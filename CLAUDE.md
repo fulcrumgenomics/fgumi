@@ -39,7 +39,6 @@ cargo bench
 - `compare` - Enable compare subcommand (developer tools)
 - `simulate` - Enable simulate command for test data generation
 - `profile-adjacency` - Enable profiling output for adjacency UMI assigner
-- `isal` - Use ISA-L/igzip instead of libdeflate for BGZF compression
 
 Build with features: `cargo build --release --features compare,simulate`
 
