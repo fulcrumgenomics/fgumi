@@ -930,9 +930,7 @@ fn process_position_group(
                 }
                 if is_secondary || is_supplementary {
                     let aux = bam_fields::aux_data_slice(raw);
-                    if bam_fields::find_string_tag(aux, &pa_tag_bytes).is_none()
-                        && bam_fields::find_int_tag(aux, &pa_tag_bytes).is_none()
-                    {
+                    if bam_fields::find_tag_type(aux, &pa_tag_bytes).is_none() {
                         dedup_metrics.missing_pa_tag += 1;
                     }
                 }

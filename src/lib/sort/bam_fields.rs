@@ -3059,4 +3059,463 @@ mod tests {
         b[8] = 0;
         assert_eq!(compare_names_raw(&a, &b), Ordering::Equal);
     }
+
+    // ========================================================================
+    // Tag lookup coverage for all BAM aux tag types
+    //
+    // The pa tag (used in dedup for secondary/supplementary tracking) is a
+    // B:i array.  find_string_tag only handles Z-type, find_int_tag only
+    // handles scalar int types (c/C/s/S/i/I).  Neither can find B-array
+    // tags, so the dedup pa-tag validation falsely reports them as missing.
+    //
+    // find_tag_type handles all types correctly since it only checks for
+    // tag presence regardless of type.
+    // ========================================================================
+
+    /// Helper: build raw aux bytes for a B-type array tag.
+    fn make_b_array_tag(tag: [u8; 2], elem_type: u8, count: u32, elements: &[u8]) -> Vec<u8> {
+        let mut aux = vec![tag[0], tag[1], b'B', elem_type];
+        aux.extend_from_slice(&count.to_le_bytes());
+        aux.extend_from_slice(elements);
+        aux
+    }
+
+    fn make_b_int_array_tag(tag: [u8; 2], values: &[i32]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        make_b_array_tag(tag, b'i', values.len() as u32, &bytes)
+    }
+
+    fn make_b_float_array_tag(tag: [u8; 2], values: &[f32]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        make_b_array_tag(tag, b'f', values.len() as u32, &bytes)
+    }
+
+    fn make_b_uint8_array_tag(tag: [u8; 2], values: &[u8]) -> Vec<u8> {
+        make_b_array_tag(tag, b'C', values.len() as u32, values)
+    }
+
+    fn make_b_int8_array_tag(tag: [u8; 2], values: &[i8]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+        make_b_array_tag(tag, b'c', values.len() as u32, &bytes)
+    }
+
+    fn make_b_int16_array_tag(tag: [u8; 2], values: &[i16]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        make_b_array_tag(tag, b's', values.len() as u32, &bytes)
+    }
+
+    fn make_b_uint16_array_tag(tag: [u8; 2], values: &[u16]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        make_b_array_tag(tag, b'S', values.len() as u32, &bytes)
+    }
+
+    fn make_b_uint32_array_tag(tag: [u8; 2], values: &[u32]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        make_b_array_tag(tag, b'I', values.len() as u32, &bytes)
+    }
+
+    // --- B:c array (int8 array) ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_int8_array() {
+        let aux = make_b_int8_array_tag(*b"Xc", &[-1, 0, 1]);
+        assert_eq!(find_string_tag(&aux, b"Xc"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_int8_array() {
+        let aux = make_b_int8_array_tag(*b"Xc", &[-1, 0, 1]);
+        assert_eq!(find_int_tag(&aux, b"Xc"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_int8_array() {
+        let aux = make_b_int8_array_tag(*b"Xc", &[-1, 0, 1]);
+        assert_eq!(find_tag_type(&aux, b"Xc"), Some(b'B'));
+    }
+
+    // --- B:s array (int16 array) ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_int16_array() {
+        let aux = make_b_int16_array_tag(*b"Xs", &[-100, 0, 200]);
+        assert_eq!(find_string_tag(&aux, b"Xs"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_int16_array() {
+        let aux = make_b_int16_array_tag(*b"Xs", &[-100, 0, 200]);
+        assert_eq!(find_int_tag(&aux, b"Xs"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_int16_array() {
+        let aux = make_b_int16_array_tag(*b"Xs", &[-100, 0, 200]);
+        assert_eq!(find_tag_type(&aux, b"Xs"), Some(b'B'));
+    }
+
+    // --- B:S array (uint16 array) ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_uint16_array() {
+        let aux = make_b_uint16_array_tag(*b"XS", &[100, 200, 300]);
+        assert_eq!(find_string_tag(&aux, b"XS"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_uint16_array() {
+        let aux = make_b_uint16_array_tag(*b"XS", &[100, 200, 300]);
+        assert_eq!(find_int_tag(&aux, b"XS"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_uint16_array() {
+        let aux = make_b_uint16_array_tag(*b"XS", &[100, 200, 300]);
+        assert_eq!(find_tag_type(&aux, b"XS"), Some(b'B'));
+    }
+
+    // --- B:I array (uint32 array) ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_uint32_array() {
+        let aux = make_b_uint32_array_tag(*b"XI", &[1000, 2000, 3000]);
+        assert_eq!(find_string_tag(&aux, b"XI"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_uint32_array() {
+        let aux = make_b_uint32_array_tag(*b"XI", &[1000, 2000, 3000]);
+        assert_eq!(find_int_tag(&aux, b"XI"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_uint32_array() {
+        let aux = make_b_uint32_array_tag(*b"XI", &[1000, 2000, 3000]);
+        assert_eq!(find_tag_type(&aux, b"XI"), Some(b'B'));
+    }
+
+    // --- B:i array (the pa tag type) ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_int_array() {
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        // BUG: find_string_tag returns None for B:i tags
+        assert_eq!(find_string_tag(&aux, b"pa"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_int_array() {
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        // BUG: find_int_tag returns None for B:i tags
+        assert_eq!(find_int_tag(&aux, b"pa"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_int_array() {
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        // find_tag_type correctly finds B-array tags
+        assert_eq!(find_tag_type(&aux, b"pa"), Some(b'B'));
+    }
+
+    // --- B:f array ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_float_array() {
+        let aux = make_b_float_array_tag(*b"XF", &[1.0, 2.5, 3.0]);
+        assert_eq!(find_string_tag(&aux, b"XF"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_float_array() {
+        let aux = make_b_float_array_tag(*b"XF", &[1.0, 2.5, 3.0]);
+        assert_eq!(find_int_tag(&aux, b"XF"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_float_array() {
+        let aux = make_b_float_array_tag(*b"XF", &[1.0, 2.5, 3.0]);
+        assert_eq!(find_tag_type(&aux, b"XF"), Some(b'B'));
+    }
+
+    // --- B:C array (uint8 array) ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_b_uint8_array() {
+        let aux = make_b_uint8_array_tag(*b"XC", &[10, 20, 30]);
+        assert_eq!(find_string_tag(&aux, b"XC"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_b_uint8_array() {
+        let aux = make_b_uint8_array_tag(*b"XC", &[10, 20, 30]);
+        assert_eq!(find_int_tag(&aux, b"XC"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_b_uint8_array() {
+        let aux = make_b_uint8_array_tag(*b"XC", &[10, 20, 30]);
+        assert_eq!(find_tag_type(&aux, b"XC"), Some(b'B'));
+    }
+
+    // --- H (hex string) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_h_type() {
+        // H-type hex string: tag, 'H', hex bytes, NUL
+        let aux: &[u8] = b"XHH1A2B\x00";
+        // find_string_tag only handles Z, not H
+        assert_eq!(find_string_tag(aux, b"XH"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_h_type() {
+        let aux: &[u8] = b"XHH1A2B\x00";
+        assert_eq!(find_int_tag(aux, b"XH"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_h_type() {
+        let aux: &[u8] = b"XHH1A2B\x00";
+        assert_eq!(find_tag_type(aux, b"XH"), Some(b'H'));
+    }
+
+    // --- Z (NUL-terminated string) type ---
+
+    #[test]
+    fn test_find_string_tag_finds_z_type() {
+        let aux: &[u8] = b"RXZhello\x00";
+        assert_eq!(find_string_tag(aux, b"RX"), Some(b"hello".as_ref()));
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_z_type() {
+        let aux: &[u8] = b"RXZhello\x00";
+        assert_eq!(find_int_tag(aux, b"RX"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_z_type() {
+        let aux: &[u8] = b"RXZhello\x00";
+        assert_eq!(find_tag_type(aux, b"RX"), Some(b'Z'));
+    }
+
+    // --- c (int8) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_c_type() {
+        let aux: &[u8] = &[b'X', b'c', b'c', 0xFE]; // Xc:c:-2
+        assert_eq!(find_string_tag(aux, b"Xc"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_finds_c_type() {
+        let aux: &[u8] = &[b'X', b'c', b'c', 5];
+        assert_eq!(find_int_tag(aux, b"Xc"), Some(5));
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_c_type() {
+        let aux: &[u8] = &[b'X', b'c', b'c', 5];
+        assert_eq!(find_tag_type(aux, b"Xc"), Some(b'c'));
+    }
+
+    // --- C (uint8) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_upper_c_type() {
+        let aux: &[u8] = &[b'X', b'C', b'C', 200];
+        assert_eq!(find_string_tag(aux, b"XC"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_finds_upper_c_type() {
+        let aux: &[u8] = &[b'N', b'M', b'C', 42];
+        assert_eq!(find_int_tag(aux, b"NM"), Some(42));
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_upper_c_type() {
+        let aux: &[u8] = &[b'N', b'M', b'C', 42];
+        assert_eq!(find_tag_type(aux, b"NM"), Some(b'C'));
+    }
+
+    // --- s (int16) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_s_type() {
+        let val = 300i16.to_le_bytes();
+        let aux: &[u8] = &[b'X', b's', b's', val[0], val[1]];
+        assert_eq!(find_string_tag(aux, b"Xs"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_finds_s_type() {
+        let val = 300i16.to_le_bytes();
+        let aux: &[u8] = &[b'X', b's', b's', val[0], val[1]];
+        assert_eq!(find_int_tag(aux, b"Xs"), Some(300));
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_s_type() {
+        let val = 300i16.to_le_bytes();
+        let aux: &[u8] = &[b'X', b's', b's', val[0], val[1]];
+        assert_eq!(find_tag_type(aux, b"Xs"), Some(b's'));
+    }
+
+    // --- S (uint16) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_upper_s_type() {
+        let val = 50_000_u16.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'S', b'S', val[0], val[1]];
+        assert_eq!(find_string_tag(aux, b"XS"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_finds_upper_s_type() {
+        let val = 50_000_u16.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'S', b'S', val[0], val[1]];
+        assert_eq!(find_int_tag(aux, b"XS"), Some(50_000));
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_upper_s_type() {
+        let val = 50_000_u16.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'S', b'S', val[0], val[1]];
+        assert_eq!(find_tag_type(aux, b"XS"), Some(b'S'));
+    }
+
+    // --- i (int32) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_i_type() {
+        let val = 100_000_i32.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'i', b'i', val[0], val[1], val[2], val[3]];
+        assert_eq!(find_string_tag(aux, b"Xi"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_finds_i_type() {
+        let val = 100_000_i32.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'i', b'i', val[0], val[1], val[2], val[3]];
+        assert_eq!(find_int_tag(aux, b"Xi"), Some(100_000));
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_i_type() {
+        let val = 100_000_i32.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'i', b'i', val[0], val[1], val[2], val[3]];
+        assert_eq!(find_tag_type(aux, b"Xi"), Some(b'i'));
+    }
+
+    // --- I (uint32) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_upper_i_type() {
+        let val = 3_000_000_000_u32.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'I', b'I', val[0], val[1], val[2], val[3]];
+        assert_eq!(find_string_tag(aux, b"XI"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_finds_upper_i_type() {
+        let val = 3_000_000_000_u32.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'I', b'I', val[0], val[1], val[2], val[3]];
+        // find_int_tag returns i64, so this should work for large uint32 values
+        assert_eq!(find_int_tag(aux, b"XI"), Some(3_000_000_000));
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_upper_i_type() {
+        let val = 3_000_000_000_u32.to_le_bytes();
+        let aux: &[u8] = &[b'X', b'I', b'I', val[0], val[1], val[2], val[3]];
+        assert_eq!(find_tag_type(aux, b"XI"), Some(b'I'));
+    }
+
+    // --- A (single char) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_a_type() {
+        let aux = [b'X', b'A', b'A', b'G']; // XA:A:G
+        assert_eq!(find_string_tag(&aux, b"XA"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_a_type() {
+        let aux = [b'X', b'A', b'A', b'G'];
+        assert_eq!(find_int_tag(&aux, b"XA"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_a_type() {
+        let aux = [b'X', b'A', b'A', b'G'];
+        assert_eq!(find_tag_type(&aux, b"XA"), Some(b'A'));
+    }
+
+    // --- f (float) type ---
+
+    #[test]
+    fn test_find_string_tag_cannot_find_f_type() {
+        let mut aux = vec![b'X', b'F', b'f'];
+        aux.extend_from_slice(&1.5f32.to_le_bytes());
+        assert_eq!(find_string_tag(&aux, b"XF"), None);
+    }
+
+    #[test]
+    fn test_find_int_tag_cannot_find_f_type() {
+        let mut aux = vec![b'X', b'F', b'f'];
+        aux.extend_from_slice(&1.5f32.to_le_bytes());
+        assert_eq!(find_int_tag(&aux, b"XF"), None);
+    }
+
+    #[test]
+    fn test_find_tag_type_finds_f_type() {
+        let mut aux = vec![b'X', b'F', b'f'];
+        aux.extend_from_slice(&1.5f32.to_le_bytes());
+        assert_eq!(find_tag_type(&aux, b"XF"), Some(b'f'));
+    }
+
+    // --- Tag after a B-array tag (verifies traversal works) ---
+
+    #[test]
+    fn test_find_string_tag_after_b_array() {
+        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        aux.extend_from_slice(b"RXZhello\x00");
+        // Can find the Z-tag after the B-array
+        assert_eq!(find_string_tag(&aux, b"RX"), Some(b"hello".as_ref()));
+    }
+
+    #[test]
+    fn test_find_int_tag_after_b_array() {
+        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
+        assert_eq!(find_int_tag(&aux, b"NM"), Some(5));
+    }
+
+    #[test]
+    fn test_find_tag_type_after_b_array() {
+        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        aux.extend_from_slice(b"RXZhello\x00");
+        assert_eq!(find_tag_type(&aux, b"RX"), Some(b'Z'));
+    }
+
+    // --- Dedup pa-tag validation bug reproduction ---
+    // This test mirrors the exact check in dedup.rs lines 932-935
+
+    #[test]
+    fn test_dedup_pa_tag_check_fails_on_b_array() {
+        // Simulate the exact pa tag as produced by fgumi zipper: pa:B:i,0,27_056_961,0,207,60005,1
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let pa_tag_bytes: [u8; 2] = *b"pa";
+
+        // This is the exact check from dedup.rs:932-934
+        let found_by_dedup = find_string_tag(&aux, &pa_tag_bytes).is_some()
+            || find_int_tag(&aux, &pa_tag_bytes).is_some();
+
+        // BUG: dedup thinks the pa tag is missing even though it's present
+        assert!(!found_by_dedup, "dedup check should fail to find B:i pa tag");
+
+        // But find_tag_type correctly finds it
+        assert!(find_tag_type(&aux, &pa_tag_bytes).is_some());
+    }
 }
