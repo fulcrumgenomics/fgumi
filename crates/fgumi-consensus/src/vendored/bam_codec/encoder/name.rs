@@ -22,8 +22,11 @@ pub(super) fn write_length(dst: &mut Vec<u8>, name: Option<&BStr>) -> io::Result
 pub(super) fn write_name(dst: &mut Vec<u8>, name: Option<&BStr>) -> io::Result<()> {
     const NUL: u8 = 0x00;
 
+    let orig_len = dst.len();
+
     if let Some(name) = name {
         if !is_valid(name) {
+            dst.truncate(orig_len);
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
 

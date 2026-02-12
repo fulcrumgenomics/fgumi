@@ -134,6 +134,7 @@ fn try_write_common_tag(dst: &mut Vec<u8>, tag: Tag, value: &RecordBufValue) -> 
             {
                 // Write header: tag + 'B' + 's' + count
                 dst.extend([tag_bytes[0], tag_bytes[1], b'B', b's']);
+                debug_assert!(values.len() <= u32::MAX as usize, "array length exceeds u32::MAX");
                 write_u32_le(dst, values.len() as u32);
 
                 // Write each i16 value in little-endian format

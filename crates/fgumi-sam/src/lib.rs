@@ -277,7 +277,7 @@ pub fn reverse_buf_value(value: &BufValue) -> BufValue {
 /// in per-base tags. It reverses the order of bases and complements each base:
 /// - A <-> T
 /// - C <-> G
-/// - Preserves case (a <-> t, c <-> g)
+/// - Normalizes to uppercase (a -> T, t -> A, c -> G, g -> C)
 /// - Other characters are left unchanged
 ///
 /// This is essential for per-base sequence tags (like consensus bases) when reads

@@ -3,6 +3,9 @@ use std::{io, iter};
 
 use super::num::write_u8;
 
+const MAX_SCORE: u8 = 93;
+const MISSING: u8 = 255;
+
 pub(super) fn write_quality_scores<S>(
     dst: &mut Vec<u8>,
     base_count: usize,
@@ -11,8 +14,6 @@ pub(super) fn write_quality_scores<S>(
 where
     S: QualityScores,
 {
-    // § 4.2.3 SEQ and QUAL encoding (2022-08-22)
-    const MISSING: u8 = 255;
 
     if quality_scores.len() == base_count {
         for result in quality_scores.iter() {
@@ -51,8 +52,6 @@ pub(super) fn write_quality_scores_from_slice(
     base_count: usize,
     scores: &[u8],
 ) -> io::Result<()> {
-    const MAX_SCORE: u8 = 93;
-    const MISSING: u8 = 255;
 
     if scores.len() == base_count {
         // Validate entire slice first - this can be auto-vectorized by LLVM
@@ -81,7 +80,6 @@ pub(super) fn write_quality_scores_from_slice(
 fn is_valid_score(score: u8) -> bool {
     // § 4.2.3 "SEQ and QUAL encoding" (2023-05-24): "Base qualities are stored as bytes in the
     // range [0, 93]..."
-    const MAX_SCORE: u8 = 93;
     score <= MAX_SCORE
 }
 
@@ -117,6 +115,14 @@ mod tests {
         buf.clear();
         assert!(matches!(
             write_quality_scores(&mut buf, 3, &quality_scores),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput
+        ));
+
+        // Out-of-range score (> 93) should be rejected
+        let quality_scores = QualityScoresBuf::from(vec![45, 94, 43, 50]);
+        buf.clear();
+        assert!(matches!(
+            write_quality_scores(&mut buf, 4, &quality_scores),
             Err(e) if e.kind() == io::ErrorKind::InvalidInput
         ));
 

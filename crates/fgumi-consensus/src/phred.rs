@@ -338,7 +338,7 @@ pub fn ln_not(x: LogProbability) -> LogProbability {
 }
 
 #[cfg(test)]
-#[allow(clippy::similar_names)]
+#[expect(clippy::similar_names, reason = "test variables use short math-related names like ln_p, ln_q")]
 mod tests {
     use super::*;
 

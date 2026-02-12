@@ -371,12 +371,11 @@ pub struct VanillaUmiConsensusCaller {
     bam_builder: UnmappedBamRecordBuilder,
 }
 
-#[allow(
-    clippy::similar_names,
+#[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    reason = "consensus calling uses numeric casts for quality/position math"
 )]
 impl VanillaUmiConsensusCaller {
     /// Creates a new vanilla consensus caller
@@ -862,7 +861,7 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Sub-groups reads by read type (fragment, R1, R2)
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "tuple return type is clearer than a one-off struct for internal grouping")]
     #[expect(clippy::unused_self, reason = "method signature kept for consistency with other caller trait methods")]
     fn subgroup_reads(&self, reads: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
         use noodles_raw_bam as bam_fields;
@@ -1188,7 +1187,7 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Builds a consensus record as raw BAM bytes and writes it into a `ConsensusOutput`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "consensus record building requires many parameters from the calling context")]
     fn build_consensus_record_into(
         &mut self,
         output: &mut ConsensusOutput,
@@ -1345,7 +1344,13 @@ pub(crate) enum ReadType {
 }
 
 #[cfg(test)]
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::needless_pass_by_value,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "test helpers use owned values and numeric casts for quality score math"
+)]
 mod tests {
     use super::*;
     use fgumi_sam::builder::{RecordBuilder, RecordPairBuilder};

@@ -28,6 +28,8 @@ pub enum RejectionReason {
     LowMappingQuality,
     /// UMI contained N bases
     NBasesInUmi,
+    /// Read lacks required UMI tag
+    MissingUmi,
     /// Reads were marked as not passing filter (PF flag)
     NotPassingFilter,
     /// Consensus read had too low mean quality
@@ -61,6 +63,7 @@ impl RejectionReason {
             Self::NoValidAlignment => "Template had no valid alignments",
             Self::LowMappingQuality => "Reads failed mapping quality threshold",
             Self::NBasesInUmi => "UMI contained N bases",
+            Self::MissingUmi => "Read lacks required UMI tag",
             Self::NotPassingFilter => "Reads were marked as not passing filter",
             Self::LowMeanQuality => "Consensus read had too low mean quality",
             Self::InsufficientMinDepth => "Consensus read had insufficient minimum depth",

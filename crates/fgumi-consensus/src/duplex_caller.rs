@@ -308,12 +308,12 @@ pub struct DuplexConsensusCaller {
     track_rejects: bool,
 }
 
-#[allow(
+#[expect(
     clippy::similar_names,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    reason = "consensus calling uses numeric casts for quality/position math and has domain-specific variable names"
 )]
 impl DuplexConsensusCaller {
     /// Creates a new duplex consensus caller
@@ -342,7 +342,7 @@ impl DuplexConsensusCaller {
     /// # Panics
     ///
     /// Panics if `min_reads` is empty (though this is checked and returns an error first).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "constructor needs all configuration parameters from CLI options")]
     #[expect(clippy::needless_pass_by_value, reason = "changing to &[usize] would require updating many call sites across the codebase")]
     pub fn new(
         read_name_prefix: String,
@@ -450,6 +450,7 @@ impl DuplexConsensusCaller {
 
     /// Test helper: accepts `Vec<RecordBuf>`, encodes to raw bytes, and delegates to `consensus_reads`.
     #[cfg(test)]
+    #[expect(clippy::needless_pass_by_value, reason = "test helper takes ownership for convenience")]
     pub(crate) fn consensus_reads_from_sam_records(
         &mut self,
         records: Vec<noodles::sam::alignment::RecordBuf>,
@@ -579,7 +580,7 @@ impl DuplexConsensusCaller {
     ///
     /// IMPORTANT: This function requires that all reads have MI tags with /A or /B suffixes.
     /// The duplex command MUST be used with reads grouped using the "paired" strategy.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "tuple return type is clearer than a one-off struct for strand partitioning")]
     fn partition_records_by_strand(
         records: Vec<Vec<u8>>,
     ) -> Result<(Option<String>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
@@ -643,7 +644,7 @@ impl DuplexConsensusCaller {
     /// NOTE: This function is used only in tests. Production code uses
     /// [`partition_reads_by_strand_simple`] which is more efficient.
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "tuple return type is clearer than a one-off struct for test grouping")]
     fn group_by_mi_and_strand(
         reads: Vec<RecordBuf>,
     ) -> Result<AHashMap<String, (Vec<RecordBuf>, Vec<RecordBuf>)>> {
@@ -971,7 +972,7 @@ impl DuplexConsensusCaller {
     /// * `first_of_pair` - Whether this is first of pair (for RX orientation)
     /// * `cell_tag` - Optional cell barcode tag (e.g., CB)
     /// * `cell_barcode` - Optional cell barcode value to add to record
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "duplex record construction requires many parameters from the calling context")]
     #[expect(clippy::too_many_lines, reason = "BAM record construction has many sequential tag-writing steps")]
     #[expect(clippy::unnecessary_wraps, reason = "Result return type kept for API consistency with other consensus record builders")]
     pub(crate) fn duplex_read_into(
@@ -1173,6 +1174,13 @@ impl DuplexConsensusCaller {
 
     /// Calls duplex consensus from paired single-strand consensuses
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value,
+        clippy::items_after_statements,
+        clippy::cast_possible_wrap,
+        reason = "test-only duplex calling helper with complex setup"
+    )]
     fn call_duplex_from_ss_pair(
         ss_a: RecordBuf,
         ss_b: RecordBuf,
@@ -1556,7 +1564,7 @@ impl DuplexConsensusCaller {
     }
 
     /// Processes a single UMI group to generate duplex consensus
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "group processing requires many parameters")]
     #[expect(clippy::too_many_lines, reason = "duplex group processing has many sequential steps including strand separation, SS calling, duplex calling, and output")]
     #[expect(clippy::needless_pass_by_value, reason = "owned values consumed by downstream consensus pipeline")]
     fn process_group(
@@ -2077,7 +2085,12 @@ impl ConsensusCaller for DuplexConsensusCaller {
 }
 
 #[cfg(test)]
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    reason = "test code uses domain-specific names and has long integration tests"
+)]
 mod tests {
     use super::*;
     use fgumi_sam::builder::RecordBuilder;

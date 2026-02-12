@@ -92,6 +92,9 @@ pub struct ConsensusMetrics {
     /// Reads rejected due to N bases in UMI
     pub rejected_n_bases_in_umi: u64,
 
+    /// Reads rejected due to missing UMI tag
+    pub rejected_missing_umi: u64,
+
     /// Reads rejected due to not passing filter
     pub rejected_not_passing_filter: u64,
 
@@ -143,6 +146,7 @@ impl ConsensusMetrics {
             rejected_no_valid_alignment: 0,
             rejected_low_mapping_quality: 0,
             rejected_n_bases_in_umi: 0,
+            rejected_missing_umi: 0,
             rejected_not_passing_filter: 0,
             rejected_low_mean_quality: 0,
             rejected_insufficient_min_depth: 0,
@@ -170,6 +174,7 @@ impl ConsensusMetrics {
             RejectionReason::NoValidAlignment => self.rejected_no_valid_alignment += count,
             RejectionReason::LowMappingQuality => self.rejected_low_mapping_quality += count,
             RejectionReason::NBasesInUmi => self.rejected_n_bases_in_umi += count,
+            RejectionReason::MissingUmi => self.rejected_missing_umi += count,
             RejectionReason::NotPassingFilter => self.rejected_not_passing_filter += count,
             RejectionReason::LowMeanQuality => self.rejected_low_mean_quality += count,
             RejectionReason::InsufficientMinDepth => self.rejected_insufficient_min_depth += count,
@@ -195,6 +200,7 @@ impl ConsensusMetrics {
             + self.rejected_no_valid_alignment
             + self.rejected_low_mapping_quality
             + self.rejected_n_bases_in_umi
+            + self.rejected_missing_umi
             + self.rejected_not_passing_filter
             + self.rejected_low_mean_quality
             + self.rejected_insufficient_min_depth
@@ -240,6 +246,9 @@ impl ConsensusMetrics {
         }
         if self.rejected_n_bases_in_umi > 0 {
             summary.insert(RejectionReason::NBasesInUmi, self.rejected_n_bases_in_umi);
+        }
+        if self.rejected_missing_umi > 0 {
+            summary.insert(RejectionReason::MissingUmi, self.rejected_missing_umi);
         }
         if self.rejected_not_passing_filter > 0 {
             summary.insert(RejectionReason::NotPassingFilter, self.rejected_not_passing_filter);
@@ -304,7 +313,7 @@ impl ConsensusMetrics {
             ("raw_reads_used", raw_reads_used.to_string(), "Total count of raw reads used in consensus reads"),
             ("frac_raw_reads_used", format_float(frac_used), "Fraction of raw reads used in consensus reads"),
             ("raw_reads_rejected_for_insufficient_support", self.rejected_insufficient_support.to_string(), "Insufficient reads to generate a consensus"),
-            ("raw_reads_rejected_for_minority_alignment", self.rejected_minority_alignment.to_string(), "Reads has a different, and minority, set of indels"),
+            ("raw_reads_rejected_for_minority_alignment", self.rejected_minority_alignment.to_string(), "Read has a different, and minority, set of indels"),
             ("raw_reads_rejected_for_orphan_consensus", self.rejected_orphan_consensus.to_string(), "Only one of R1 or R2 consensus generated"),
             ("raw_reads_rejected_for_zero_bases_post_trimming", self.rejected_zero_bases_post_trimming.to_string(), "Read or mate had zero bases post trimming"),
         ];
@@ -334,6 +343,7 @@ impl ConsensusMetrics {
             ("raw_reads_rejected_for_no_valid_alignment", self.rejected_no_valid_alignment, "No valid alignment found"),
             ("raw_reads_rejected_for_low_mapping_quality", self.rejected_low_mapping_quality, "Low mapping quality"),
             ("raw_reads_rejected_for_n_bases_in_umi", self.rejected_n_bases_in_umi, "N bases in UMI sequence"),
+            ("raw_reads_rejected_for_missing_umi", self.rejected_missing_umi, "Read lacks required UMI tag"),
             ("raw_reads_rejected_for_not_passing_filter", self.rejected_not_passing_filter, "Read did not pass vendor filter"),
             ("raw_reads_rejected_for_low_mean_quality", self.rejected_low_mean_quality, "Low mean base quality"),
             ("raw_reads_rejected_for_insufficient_min_depth", self.rejected_insufficient_min_depth, "Insufficient minimum read depth"),

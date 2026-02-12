@@ -515,7 +515,7 @@ impl RejectionReason {
             Self::MinorityAlignment => CentralReason::MinorityAlignment,
             Self::QualityTooLow | Self::QualityTrimmed => CentralReason::LowBaseQuality,
             Self::FailedQC => CentralReason::NotPassingFilter,
-            Self::MissingUmi => CentralReason::NBasesInUmi, // Closest match
+            Self::MissingUmi => CentralReason::MissingUmi,
             // For reasons that don't have a direct centralized equivalent,
             // we use the closest semantic match
             Self::FragmentRead => CentralReason::SameStrandOnly,
