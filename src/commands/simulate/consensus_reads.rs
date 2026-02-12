@@ -14,7 +14,7 @@ use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rand_distr::{Distribution, LogNormal, Normal};
 use rayon::prelude::*;
 use std::fs::File;

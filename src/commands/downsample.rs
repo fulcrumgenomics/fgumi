@@ -121,7 +121,7 @@ impl Command for Downsample {
         // Initialize RNG
         let mut rng = match self.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
-            None => StdRng::from_os_rng(),
+            None => rand::make_rng(),
         };
 
         // Open input BAM
@@ -193,7 +193,7 @@ impl Command for Downsample {
             }
 
             // Random sampling decision
-            let keep = rand::Rng::random::<f64>(&mut rng) < self.fraction;
+            let keep = rand::RngExt::random::<f64>(&mut rng) < self.fraction;
 
             // Count all records processed (kept + rejected)
             record_count += family_size;
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn test_deterministic_sampling_with_seed() {
         // Test that the same seed produces the same results
-        use rand::Rng;
+        use rand::RngExt;
 
         let seed = 12345u64;
 

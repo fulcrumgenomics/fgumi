@@ -414,7 +414,7 @@ impl VanillaUmiConsensusCaller {
         let rng = if let Some(seed) = options.seed {
             StdRng::seed_from_u64(seed)
         } else {
-            StdRng::from_os_rng()
+            rand::make_rng()
         };
 
         // Pre-compute single-input consensus quals lookup table (matching fgbio)

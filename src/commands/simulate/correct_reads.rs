@@ -13,7 +13,7 @@ use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
