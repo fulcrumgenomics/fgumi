@@ -2061,7 +2061,8 @@ pub fn mate_unclipped_5prime(mate_pos: i32, mate_reverse: bool, mc_cigar: &str) 
 // ============================================================================
 
 /// Decode table: 4-bit BAM base code → ASCII base.
-const BASE_DECODE: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
+/// Alias for `BAM_BASE_TO_ASCII` to avoid table duplication.
+const BASE_DECODE: [u8; 16] = BAM_BASE_TO_ASCII;
 
 /// Set a single base at a position in packed 4-bit BAM sequence data.
 ///
@@ -2765,6 +2766,204 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
     }
 }
 
+// Array Tag Reading / In-Place Mutation (for raw-byte filter pipeline)
+// ============================================================================
+
+/// BAM 4-bit base encoding → ASCII lookup table.
+///
+/// Index is the 4-bit nibble value: 0=`=`, 1=`A`, 2=`C`, 4=`G`, 8=`T`, 15=`N`.
+pub const BAM_BASE_TO_ASCII: [u8; 16] = [
+    b'=', b'A', b'C', b'M', b'G', b'R', b'S', b'V', b'T', b'W', b'Y', b'H', b'K', b'D', b'B', b'N',
+];
+
+/// Zero-allocation reference to a B-type array tag in aux data.
+pub struct ArrayTagRef<'a> {
+    /// Element bytes (raw, little-endian).
+    pub data: &'a [u8],
+    /// Sub-type byte (`b'c'`, `b'C'`, `b's'`, `b'S'`, `b'i'`, `b'I'`, `b'f'`).
+    pub elem_type: u8,
+    /// Number of elements.
+    pub count: usize,
+    /// Size of each element in bytes (1, 2, or 4).
+    pub elem_size: usize,
+}
+
+/// Find a B-type (array) tag in auxiliary data, returning a zero-allocation reference.
+///
+/// Scans aux linearly (same pattern as `find_string_tag`). Returns `None` if
+/// the tag is absent or is not of type `B`.
+#[must_use]
+pub fn find_array_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<ArrayTagRef<'a>> {
+    let mut p = 0;
+    while p + 3 <= aux_data.len() {
+        let t = &aux_data[p..p + 2];
+        let val_type = aux_data[p + 2];
+
+        if t == tag && val_type == b'B' {
+            let data_start = p + 3;
+            if data_start + 5 > aux_data.len() {
+                return None;
+            }
+            let elem_type = aux_data[data_start];
+            let count = u32::from_le_bytes([
+                aux_data[data_start + 1],
+                aux_data[data_start + 2],
+                aux_data[data_start + 3],
+                aux_data[data_start + 4],
+            ]) as usize;
+            let elem_size = TAG_FIXED_SIZES[elem_type as usize] as usize;
+            if elem_size == 0 {
+                return None;
+            }
+            let elements_start = data_start + 5;
+            let total_bytes = count.checked_mul(elem_size)?;
+            let elements_end = elements_start.checked_add(total_bytes)?;
+            if elements_end > aux_data.len() {
+                return None;
+            }
+            return Some(ArrayTagRef {
+                data: &aux_data[elements_start..elements_end],
+                elem_type,
+                count,
+                elem_size,
+            });
+        }
+
+        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+            p += 3 + size;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// Read one element from an `ArrayTagRef` as `u16`.
+///
+/// Handles `C` (u8), `S` (u16), `s` (i16, clamped to 0), `c` (i8, clamped to 0) sub-types.
+/// Other sub-types return 0.
+#[inline]
+#[must_use]
+pub fn array_tag_element_u16(tag_ref: &ArrayTagRef, index: usize) -> u16 {
+    if index >= tag_ref.count {
+        return 0;
+    }
+    let off = index * tag_ref.elem_size;
+    match tag_ref.elem_type {
+        b'C' => u16::from(tag_ref.data[off]),
+        b'S' => u16::from_le_bytes([tag_ref.data[off], tag_ref.data[off + 1]]),
+        b's' => {
+            let v = i16::from_le_bytes([tag_ref.data[off], tag_ref.data[off + 1]]);
+            v.max(0) as u16
+        }
+        b'c' => {
+            let v = tag_ref.data[off] as i8;
+            v.max(0) as u16
+        }
+        _ => 0,
+    }
+}
+
+/// Read all elements from an `ArrayTagRef` as a `Vec<u16>`.
+///
+/// This is useful when you need to release the immutable borrow on the record
+/// before mutating it (e.g., masking bases while reading per-base depth/error tags).
+#[must_use]
+pub fn array_tag_to_vec_u16(tag_ref: &ArrayTagRef) -> Vec<u16> {
+    (0..tag_ref.count).map(|i| array_tag_element_u16(tag_ref, i)).collect()
+}
+
+/// Reverse elements of a B-type array tag in place. No-op if tag not found.
+pub fn reverse_array_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
+    if aux_offset >= record.len() {
+        return;
+    }
+    let aux_data = &record[aux_offset..];
+    // First find the tag to get its offset and element info
+    let mut p = 0;
+    while p + 3 <= aux_data.len() {
+        let t = &aux_data[p..p + 2];
+        let val_type = aux_data[p + 2];
+
+        if t == tag && val_type == b'B' {
+            let data_start = p + 3;
+            if data_start + 5 > aux_data.len() {
+                return;
+            }
+            let elem_type = aux_data[data_start];
+            let count = u32::from_le_bytes([
+                aux_data[data_start + 1],
+                aux_data[data_start + 2],
+                aux_data[data_start + 3],
+                aux_data[data_start + 4],
+            ]) as usize;
+            let elem_size = TAG_FIXED_SIZES[elem_type as usize] as usize;
+            if elem_size == 0 || count == 0 {
+                return;
+            }
+            let Some(total_bytes) = count.checked_mul(elem_size) else {
+                return;
+            };
+            let elements_start = aux_offset + data_start + 5;
+            let Some(elements_end) = elements_start.checked_add(total_bytes) else {
+                return;
+            };
+            if elements_end > record.len() {
+                return;
+            }
+            // Reverse elements by swapping elem_size-byte chunks
+            let mut i = 0;
+            let mut j = count - 1;
+            while i < j {
+                let off_i = elements_start + i * elem_size;
+                let off_j = elements_start + j * elem_size;
+                for k in 0..elem_size {
+                    record.swap(off_i + k, off_j + k);
+                }
+                i += 1;
+                j -= 1;
+            }
+            return;
+        }
+
+        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+            p += 3 + size;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Reverse bytes of a Z-type string tag value in place. No-op if tag not found.
+pub fn reverse_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
+    if aux_offset >= record.len() {
+        return;
+    }
+    let aux_data = &record[aux_offset..];
+    let mut p = 0;
+    while p + 3 <= aux_data.len() {
+        let t = &aux_data[p..p + 2];
+        let val_type = aux_data[p + 2];
+
+        if t == tag && val_type == b'Z' {
+            let start = aux_offset + p + 3;
+            if let Some(nul_off) = record[start..].iter().position(|&b| b == 0) {
+                let end = start + nul_off;
+                if end > start {
+                    record[start..end].reverse();
+                }
+            }
+            return;
+        }
+
+        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+            p += 3 + size;
+        } else {
+            break;
+        }
+    }
+}
+
 /// Compute number of read bases at or past a reference position (for positive strand).
 ///
 /// Returns the 1-based read position at the given reference position,
@@ -2932,6 +3131,107 @@ pub fn raw_records_to_record_bufs(
     }
 
     Ok(result)
+}
+
+/// Reverse-complement a Z-type string tag value in place (A<->T, C<->G).
+pub fn reverse_complement_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
+    if aux_offset >= record.len() {
+        return;
+    }
+    let aux_data = &record[aux_offset..];
+    let mut p = 0;
+    while p + 3 <= aux_data.len() {
+        let t = &aux_data[p..p + 2];
+        let val_type = aux_data[p + 2];
+
+        if t == tag && val_type == b'Z' {
+            let start = aux_offset + p + 3;
+            if let Some(nul_off) = record[start..].iter().position(|&b| b == 0) {
+                let end = start + nul_off;
+                if end > start {
+                    // Reverse
+                    record[start..end].reverse();
+                    // Complement each base
+                    for b in &mut record[start..end] {
+                        *b = match *b {
+                            b'A' => b'T',
+                            b'T' => b'A',
+                            b'C' => b'G',
+                            b'G' => b'C',
+                            b'a' => b't',
+                            b't' => b'a',
+                            b'c' => b'g',
+                            b'g' => b'c',
+                            b'R' => b'Y',
+                            b'Y' => b'R',
+                            b'M' => b'K',
+                            b'K' => b'M',
+                            b'r' => b'y',
+                            b'y' => b'r',
+                            b'm' => b'k',
+                            b'k' => b'm',
+                            b'S' => b'S',
+                            b'W' => b'W',
+                            b's' => b's',
+                            b'w' => b'w',
+                            b'B' => b'V',
+                            b'V' => b'B',
+                            b'D' => b'H',
+                            b'H' => b'D',
+                            b'b' => b'v',
+                            b'v' => b'b',
+                            b'd' => b'h',
+                            b'h' => b'd',
+                            b'N' => b'N',
+                            b'n' => b'n',
+                            other => other,
+                        };
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+            p += 3 + size;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Update an existing int tag in-place, or append if absent.
+///
+/// If the existing tag is a 4-byte `i`/`I` type, the value is overwritten in-place.
+/// Otherwise the tag is removed and re-appended using `append_int_tag`
+/// (smallest signed type that fits).
+pub fn update_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+    let aux_start = aux_data_offset_from_record(record).unwrap_or(record.len());
+    if aux_start < record.len() {
+        if let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag) {
+            let abs_start = aux_start + start;
+            let abs_end = aux_start + end;
+            let val_type = record[abs_start + 2];
+            // If 4-byte integer type, overwrite in-place
+            if matches!(val_type, b'i' | b'I') && (abs_end - abs_start) == 7 {
+                record[abs_start + 3..abs_start + 7].copy_from_slice(&value.to_le_bytes());
+                return;
+            }
+            // Different size — remove and re-append
+            record.drain(abs_start..abs_end);
+            append_int_tag(record, tag, value);
+            return;
+        }
+    }
+    // Tag not found — append
+    append_int_tag(record, tag, value);
+}
+
+/// Check if a 4-bit encoded base at position is N (0xF).
+#[inline]
+#[must_use]
+pub fn is_base_n(bam: &[u8], seq_off: usize, position: usize) -> bool {
+    get_base(bam, seq_off, position) == 0xF
 }
 
 #[cfg(test)]

@@ -25,6 +25,13 @@ impl BatchWeight for RecordBuf {
     }
 }
 
+/// Raw byte records have weight 1 (for batch_size-like behavior).
+impl BatchWeight for Vec<u8> {
+    fn batch_weight(&self) -> usize {
+        1
+    }
+}
+
 /// Template batches have weight equal to the number of templates.
 impl BatchWeight for TemplateBatch {
     fn batch_weight(&self) -> usize {
@@ -78,6 +85,51 @@ impl Grouper for SingleRecordGrouper {
 
     fn has_pending(&self) -> bool {
         // Never has pending state
+        false
+    }
+}
+
+// ============================================================================
+// SingleRawRecordGrouper
+// ============================================================================
+
+/// A grouper that emits each raw-byte record as its own "group".
+///
+/// Used by commands that process records independently using raw bytes
+/// (e.g., filter with raw-byte pipeline).
+#[derive(Default)]
+pub struct SingleRawRecordGrouper;
+
+impl SingleRawRecordGrouper {
+    /// Create a new single raw record grouper.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Grouper for SingleRawRecordGrouper {
+    type Group = Vec<u8>;
+
+    fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
+        records
+            .into_iter()
+            .map(|d| {
+                d.into_raw_bytes().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SingleRawRecordGrouper requires raw bytes, got parsed record",
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn finish(&mut self) -> io::Result<Option<Self::Group>> {
+        Ok(None)
+    }
+
+    fn has_pending(&self) -> bool {
         false
     }
 }
@@ -1050,6 +1102,46 @@ mod tests {
 
         let result = grouper.finish().unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_single_raw_record_grouper_empty() {
+        let mut grouper = SingleRawRecordGrouper::new();
+        assert!(!grouper.has_pending());
+
+        let result = grouper.finish().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_single_raw_record_grouper_emits_each_record() {
+        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+
+        let mut grouper = SingleRawRecordGrouper::new();
+        let raw1 = vec![1u8; 36];
+        let raw2 = vec![2u8; 36];
+        let records = vec![
+            DecodedRecord::from_raw_bytes(raw1.clone(), GroupKey::default()),
+            DecodedRecord::from_raw_bytes(raw2.clone(), GroupKey::default()),
+        ];
+
+        let groups = grouper.add_records(records).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], raw1);
+        assert_eq!(groups[1], raw2);
+    }
+
+    #[test]
+    fn test_single_raw_record_grouper_rejects_parsed() {
+        use crate::sam::builder::RecordBuilder;
+        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+
+        let mut grouper = SingleRawRecordGrouper::new();
+        let rec = RecordBuilder::new().sequence("ACGT").build();
+        let records = vec![DecodedRecord::new(rec, GroupKey::default())];
+
+        let result = grouper.add_records(records);
+        assert!(result.is_err());
     }
 
     // FASTQ parsing tests

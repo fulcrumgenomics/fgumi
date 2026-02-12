@@ -12,30 +12,29 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
-use fgumi_lib::alignment_tags::regenerate_alignment_tags;
+use fgumi_lib::alignment_tags::regenerate_alignment_tags_raw;
 use fgumi_lib::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer,
-    create_optional_bam_writer,
+    create_bam_reader, create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer,
 };
 use fgumi_lib::consensus_filter::{
-    FilterConfig, FilterResult, count_no_calls, filter_duplex_read, filter_read,
-    is_duplex_consensus, mask_bases, mask_duplex_bases, mean_base_quality, template_passes,
+    FilterConfig, FilterResult, compute_read_stats_raw, filter_duplex_read_raw, filter_read_raw,
+    is_duplex_consensus_raw, mask_bases_raw, mask_duplex_bases_raw, template_passes_raw,
 };
-use fgumi_lib::grouper::{SingleRecordGrouper, TemplateGrouper};
+use fgumi_lib::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
+use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::reference::ReferenceReader;
-use fgumi_lib::tag_reversal::reverse_per_base_tags;
+use fgumi_lib::sort::bam_fields;
+use fgumi_lib::tag_reversal::reverse_per_base_tags_raw;
 use fgumi_lib::template::{TemplateBatch, TemplateIterator};
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
+    BamPipelineConfig, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::vendored::raw_bam_record::RawRecord;
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -190,12 +189,12 @@ pub struct Filter {
 // 7-Step Pipeline Types
 // ============================================================================
 
-/// Result from processing a batch of records through filtering.
-struct FilterProcessedBatch {
-    /// Records that passed filtering.
-    kept_records: Vec<RecordBuf>,
-    /// Records that failed filtering (if tracking rejects).
-    rejected_records: Vec<RecordBuf>,
+/// Result from processing a batch of records through raw-byte filtering.
+struct FilterProcessedBatchRaw {
+    /// Records that passed filtering (raw bytes).
+    kept_records: Vec<Vec<u8>>,
+    /// Records that failed filtering (raw bytes, if tracking rejects).
+    rejected_records: Vec<Vec<u8>>,
     /// Number of records processed.
     records_count: u64,
     /// Number of records that passed.
@@ -204,14 +203,29 @@ struct FilterProcessedBatch {
     bases_masked: u64,
 }
 
-impl MemoryEstimate for FilterProcessedBatch {
+impl MemoryEstimate for FilterProcessedBatchRaw {
     fn estimate_heap_size(&self) -> usize {
-        self.kept_records
-            .iter()
-            .chain(self.rejected_records.iter())
-            .map(MemoryEstimate::estimate_heap_size)
-            .sum()
+        let vec_overhead = std::mem::size_of::<Vec<u8>>();
+        let kept: usize = self.kept_records.iter().map(|v| v.capacity() + vec_overhead).sum();
+        let rejected: usize =
+            self.rejected_records.iter().map(|v| v.capacity() + vec_overhead).sum();
+        kept + rejected
     }
+}
+
+/// Serialize raw BAM records directly (bypasses `bam_codec` encoder).
+fn serialize_raw_records(records: &[Vec<u8>], output: &mut Vec<u8>) -> io::Result<u64> {
+    for record in records {
+        let len = u32::try_from(record.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("BAM record too large ({} bytes) for u32 block_size", record.len()),
+            )
+        })?;
+        output.extend_from_slice(&len.to_le_bytes());
+        output.extend_from_slice(record);
+    }
+    Ok(records.len() as u64)
 }
 
 /// Metrics collected from filter processing, aggregated post-pipeline.
@@ -226,7 +240,7 @@ struct CollectedFilterMetrics {
     /// Total bases masked.
     total_bases_masked: u64,
     /// Rejected records (if tracking).
-    rejects: Vec<RecordBuf>,
+    rejects: Vec<Vec<u8>>,
 }
 
 impl Command for Filter {
@@ -310,9 +324,9 @@ impl Filter {
             self.max_no_call_fraction,
         );
 
-        // Open input BAM with MT BGZF decompression
+        // Read header from input BAM (we need it before branching to set up writers)
         let reader_threads = self.threading.num_threads();
-        let (mut reader, header) = create_bam_reader(&self.io.input, reader_threads)?;
+        let (_, header) = create_bam_reader(&self.io.input, reader_threads)?;
 
         // Add @PG record with PP chaining to input's last program
         let header = fgumi_lib::header::add_pg_record(
@@ -321,9 +335,9 @@ impl Filter {
             command_line,
         )?;
 
-        // Create output BAM with multi-threaded BGZF writer
+        // Create output BAM with multi-threaded BGZF writer (raw byte writer)
         let writer_threads = self.threading.num_threads();
-        let mut writer = create_bam_writer(
+        let mut writer = create_raw_bam_writer(
             &self.io.output,
             &header,
             writer_threads,
@@ -331,12 +345,15 @@ impl Filter {
         )?;
 
         // Create optional rejects writer
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects.as_ref(),
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
+        let mut rejects_writer = match self.rejects.as_ref() {
+            Some(path) => Some(create_raw_bam_writer(
+                path,
+                &header,
+                writer_threads,
+                self.compression.compression_level,
+            )?),
+            None => None,
+        };
 
         // Create reference reader for tag regeneration (always enabled, matching fgbio behavior)
         info!("Loading reference genome into memory...");
@@ -346,237 +363,122 @@ impl Filter {
         info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
 
         // Process reads
-        let mut total_reads = 0;
-        let mut passed_reads = 0;
-        let mut failed_reads = 0;
-        let mut total_bases_masked = 0;
+        let mut total_reads: u64 = 0;
+        let mut passed_reads: u64 = 0;
+        let mut failed_reads: u64 = 0;
+        let mut total_bases_masked: u64 = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         info!("Processing consensus reads...");
 
         if self.filter_by_template {
             // Template-aware filtering using streaming TemplateIterator
+            // TODO: Use raw-byte template grouper to avoid RecordBuf decode/re-encode overhead
             info!("Using template-aware filtering (streaming)");
 
-            // Create streaming template iterator
+            let (mut reader, _) = create_bam_reader(&self.io.input, reader_threads)?;
             let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
             let template_iter = TemplateIterator::new(record_iter);
-            let mut total_templates = 0;
+            let mut total_templates = 0u64;
 
-            // Single-threaded streaming (tag regeneration requires single-threaded access to reference)
-            // Process each template from the streaming iterator
             for template_result in template_iter {
                 let template = template_result?;
-                let mut template_records = template.records;
-                total_reads += template_records.len();
+                // Convert template records to raw bytes
+                let mut template_records: Vec<Vec<u8>> = template
+                    .records
+                    .iter()
+                    .map(|r| {
+                        let mut buf = Vec::new();
+                        fgumi_lib::vendored::bam_codec::encode_record_buf(&mut buf, &header, r)?;
+                        Ok(buf)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                total_reads += template_records.len() as u64;
                 total_templates += 1;
 
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
 
-                // Apply filtering to each record in the template
                 for (idx, record) in template_records.iter_mut().enumerate() {
-                    // Reverse per-base tags for negative-strand reads if requested
-                    if self.reverse_per_base_tags {
-                        reverse_per_base_tags(record)?;
-                    }
-
-                    // Detect duplex and select appropriate thresholds
-                    let is_duplex = is_duplex_consensus(record);
-
-                    // Mask bases (duplex-aware if applicable)
-                    let masked_count = if is_duplex {
-                        let cc_thresh = config
-                            .duplex_thresholds
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
-                        let ab_thresh = config
-                            .ab_thresholds
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("No AB thresholds configured"))?;
-                        let ba_thresh = config
-                            .ba_thresholds
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("No BA thresholds configured"))?;
-
-                        mask_duplex_bases(
-                            record,
-                            cc_thresh,
-                            ab_thresh,
-                            ba_thresh,
-                            self.min_base_quality,
-                            self.require_single_strand_agreement,
-                        )?
-                    } else {
-                        let thresholds = config
-                            .single_strand_thresholds
-                            .as_ref()
-                            .or(config.duplex_thresholds.as_ref())
-                            .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
-
-                        mask_bases(record, thresholds, self.min_base_quality)?
-                    };
-                    total_bases_masked += masked_count;
-
-                    // Regenerate alignment tags if requested
-                    if let Some(ref reference) = reference_reader {
-                        regenerate_alignment_tags(record, &header, reference)?;
-                    }
-
-                    // Check filters (duplex-aware if applicable)
-                    let pass = if is_duplex {
-                        let cc_thresh = config
-                            .duplex_thresholds
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
-                        let ab_thresh = config
-                            .ab_thresholds
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("No AB thresholds configured"))?;
-                        let ba_thresh = config
-                            .ba_thresholds
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("No BA thresholds configured"))?;
-
-                        self.check_duplex_filters(record, cc_thresh, ab_thresh, ba_thresh)?
-                    } else {
-                        let thresholds = config
-                            .single_strand_thresholds
-                            .as_ref()
-                            .or(config.duplex_thresholds.as_ref())
-                            .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
-
-                        self.check_filters(record, thresholds)?
-                    };
+                    let (masked, pass) = Self::process_record_raw(
+                        record,
+                        &config,
+                        reference_reader.as_ref(),
+                        &header,
+                        self.reverse_per_base_tags,
+                        self.min_base_quality,
+                        self.require_single_strand_agreement,
+                        self.min_mean_base_quality,
+                        self.max_no_call_fraction,
+                    )?;
+                    total_bases_masked += masked;
                     pass_map.insert(idx, pass);
                 }
 
-                // Check if template passes (all primary reads must pass)
-                let template_pass = template_passes(&template_records, &pass_map);
+                let template_pass = template_passes_raw(&template_records, &pass_map);
 
-                // Write passing or rejected reads
-                // Primary reads: write if template passes
-                // Supplementary/secondary: filter individually (matching fgbio behavior)
                 for (idx, record) in template_records.iter().enumerate() {
-                    let flags = record.flags();
-                    let is_primary = !flags.is_secondary() && !flags.is_supplementary();
+                    let flags = bam_fields::flags(record);
+                    let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
+                        && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
 
                     if is_primary {
-                        // Primary reads depend on template pass status
                         if template_pass {
-                            writer.write_alignment_record(&header, record)?;
+                            writer.write_raw_record(record)?;
                             passed_reads += 1;
                         } else {
                             if let Some(ref mut rw) = rejects_writer {
-                                rw.write_alignment_record(&header, record)?;
+                                rw.write_raw_record(record)?;
                             }
                             failed_reads += 1;
                         }
                     } else {
-                        // Supplementary/secondary: only write if template passes AND individual record passes
                         let record_pass = pass_map.get(&idx).copied().unwrap_or(false);
                         if template_pass && record_pass {
-                            writer.write_alignment_record(&header, record)?;
+                            writer.write_raw_record(record)?;
                             passed_reads += 1;
                         } else {
                             if let Some(ref mut rw) = rejects_writer {
-                                rw.write_alignment_record(&header, record)?;
+                                rw.write_raw_record(record)?;
                             }
                             failed_reads += 1;
                         }
                     }
                 }
 
-                if total_templates % 100_000 == 0 {
+                if total_templates.is_multiple_of(100_000) {
                     info!("Processed {total_templates} templates");
                 }
             }
         } else {
-            // Single-read filtering: process reads independently
+            // Single-read filtering: process reads independently using raw bytes
             info!("Using single-read filtering");
 
-            for result in reader.record_bufs(&header) {
-                let mut record = result?;
+            let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, reader_threads)?;
+            let mut raw_record = RawRecord::new();
+
+            while raw_reader.read_record(&mut raw_record)? > 0 {
+                let mut record = raw_record.as_ref().to_vec();
                 total_reads += 1;
 
-                // Reverse per-base tags for negative-strand reads if requested
-                if self.reverse_per_base_tags {
-                    reverse_per_base_tags(&mut record)?;
-                }
-
-                // Detect duplex and select appropriate thresholds
-                let is_duplex = is_duplex_consensus(&record);
-
-                // Mask bases (duplex-aware if applicable)
-                let masked_count = if is_duplex {
-                    let cc_thresh = config
-                        .duplex_thresholds
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
-                    let ab_thresh = config
-                        .ab_thresholds
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No AB thresholds configured"))?;
-                    let ba_thresh = config
-                        .ba_thresholds
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No BA thresholds configured"))?;
-
-                    mask_duplex_bases(
-                        &mut record,
-                        cc_thresh,
-                        ab_thresh,
-                        ba_thresh,
-                        self.min_base_quality,
-                        self.require_single_strand_agreement,
-                    )?
-                } else {
-                    let thresholds = config
-                        .single_strand_thresholds
-                        .as_ref()
-                        .or(config.duplex_thresholds.as_ref())
-                        .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
-
-                    mask_bases(&mut record, thresholds, self.min_base_quality)?
-                };
-                total_bases_masked += masked_count;
-
-                // Regenerate alignment tags if requested
-                if let Some(ref reference) = reference_reader {
-                    regenerate_alignment_tags(&mut record, &header, reference)?;
-                }
-
-                // Check filters (duplex-aware if applicable)
-                let pass = if is_duplex {
-                    let cc_thresh = config
-                        .duplex_thresholds
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
-                    let ab_thresh = config
-                        .ab_thresholds
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No AB thresholds configured"))?;
-                    let ba_thresh = config
-                        .ba_thresholds
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No BA thresholds configured"))?;
-
-                    self.check_duplex_filters(&record, cc_thresh, ab_thresh, ba_thresh)?
-                } else {
-                    let thresholds = config
-                        .single_strand_thresholds
-                        .as_ref()
-                        .or(config.duplex_thresholds.as_ref())
-                        .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
-
-                    self.check_filters(&record, thresholds)?
-                };
+                let (masked, pass) = Self::process_record_raw(
+                    &mut record,
+                    &config,
+                    reference_reader.as_ref(),
+                    &header,
+                    self.reverse_per_base_tags,
+                    self.min_base_quality,
+                    self.require_single_strand_agreement,
+                    self.min_mean_base_quality,
+                    self.max_no_call_fraction,
+                )?;
+                total_bases_masked += masked;
 
                 if pass {
-                    writer.write_alignment_record(&header, &record)?;
+                    writer.write_raw_record(&record)?;
                     passed_reads += 1;
                 } else {
                     if let Some(ref mut rw) = rejects_writer {
-                        rw.write_alignment_record(&header, &record)?;
+                        rw.write_raw_record(&record)?;
                     }
                     failed_reads += 1;
                 }
@@ -596,24 +498,27 @@ impl Filter {
         if let Some(stats_path) = &self.stats {
             self.write_statistics(
                 stats_path,
-                total_reads,
-                passed_reads,
-                failed_reads,
-                total_bases_masked,
+                total_reads as usize,
+                passed_reads as usize,
+                failed_reads as usize,
+                total_bases_masked as usize,
             )?;
         }
 
-        // Flush and finish the writer
-        writer.into_inner().finish()?;
+        // Flush and finish the writers
+        writer.finish()?;
+        if let Some(rw) = rejects_writer {
+            rw.finish()?;
+        }
 
-        Ok(total_reads as u64)
+        Ok(total_reads)
     }
 
     // ========================================================================
     // 7-Step Unified Pipeline Implementation
     // ========================================================================
 
-    /// Execute using the 7-step unified pipeline (single-read mode).
+    /// Execute using the 7-step unified pipeline (single-read mode, raw bytes).
     ///
     /// Each record is filtered independently without template awareness.
     /// This mode is used when `--filter-by-template` is false.
@@ -636,6 +541,10 @@ impl Filter {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Enable raw-byte mode: skip noodles decode
+        let library_index = LibraryIndex::from_header(&header);
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
 
         // Calculate and apply queue memory limit
         let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
@@ -677,110 +586,30 @@ impl Filter {
         let progress_counter = Arc::new(AtomicU64::new(0));
         let progress_for_process = Arc::clone(&progress_counter);
 
-        // Grouper: process individual records (no template grouping)
+        // Grouper: process individual raw-byte records
         let grouper_fn = move |_header: &Header| {
-            Box::new(SingleRecordGrouper::new()) as Box<dyn Grouper<Group = RecordBuf> + Send>
+            Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = Vec<u8>> + Send>
         };
 
-        // Process function: filter each record
+        // Process function: filter each raw record
         let header_for_process = header.clone();
-        let process_fn = move |record: RecordBuf| -> io::Result<FilterProcessedBatch> {
+        let process_fn = move |mut record: Vec<u8>| -> io::Result<FilterProcessedBatchRaw> {
             let mut kept_records = Vec::new();
             let mut rejected_records = Vec::new();
-            let mut bases_masked = 0u64;
             let mut passed_count = 0u64;
 
-            // Process single record
-            let mut record = record;
-
-            // Reverse per-base tags for negative-strand reads if requested
-            if should_reverse_tags {
-                reverse_per_base_tags(&mut record).map_err(io::Error::other)?;
-            }
-
-            // Detect duplex and select appropriate thresholds
-            let is_duplex = is_duplex_consensus(&record);
-
-            // Mask bases (duplex-aware if applicable)
-            let masked_count = if is_duplex {
-                let cc_thresh = config_for_process
-                    .duplex_thresholds
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("No duplex thresholds configured"))?;
-                let ab_thresh = config_for_process
-                    .ab_thresholds
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("No AB thresholds configured"))?;
-                let ba_thresh = config_for_process
-                    .ba_thresholds
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("No BA thresholds configured"))?;
-
-                mask_duplex_bases(
-                    &mut record,
-                    cc_thresh,
-                    ab_thresh,
-                    ba_thresh,
-                    min_base_quality,
-                    require_single_strand_agreement,
-                )
-                .map_err(io::Error::other)?
-            } else {
-                let thresholds = config_for_process
-                    .single_strand_thresholds
-                    .as_ref()
-                    .or(config_for_process.duplex_thresholds.as_ref())
-                    .ok_or_else(|| io::Error::other("No thresholds configured"))?;
-
-                mask_bases(&mut record, thresholds, min_base_quality).map_err(io::Error::other)?
-            };
-            bases_masked += masked_count as u64;
-
-            // Regenerate alignment tags (always when reference available, matching fgbio)
-            if let Some(ref reference) = reference_for_process {
-                regenerate_alignment_tags(&mut record, &header_for_process, reference)
-                    .map_err(io::Error::other)?;
-            }
-
-            // Check filters (duplex-aware if applicable) using static methods
-            let pass = if is_duplex {
-                let cc_thresh = config_for_process
-                    .duplex_thresholds
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("No duplex thresholds configured"))?;
-                let ab_thresh = config_for_process
-                    .ab_thresholds
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("No AB thresholds configured"))?;
-                let ba_thresh = config_for_process
-                    .ba_thresholds
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("No BA thresholds configured"))?;
-
-                Self::check_duplex_filters_static(
-                    &record,
-                    cc_thresh,
-                    ab_thresh,
-                    ba_thresh,
-                    min_mean_base_quality,
-                    max_no_call_fraction,
-                )
-                .map_err(io::Error::other)?
-            } else {
-                let thresholds = config_for_process
-                    .single_strand_thresholds
-                    .as_ref()
-                    .or(config_for_process.duplex_thresholds.as_ref())
-                    .ok_or_else(|| io::Error::other("No thresholds configured"))?;
-
-                Self::check_filters_static(
-                    &record,
-                    thresholds,
-                    min_mean_base_quality,
-                    max_no_call_fraction,
-                )
-                .map_err(io::Error::other)?
-            };
+            let (bases_masked, pass) = Self::process_record_raw(
+                &mut record,
+                &config_for_process,
+                reference_for_process.as_deref(),
+                &header_for_process,
+                should_reverse_tags,
+                min_base_quality,
+                require_single_strand_agreement,
+                min_mean_base_quality,
+                max_no_call_fraction,
+            )
+            .map_err(io::Error::other)?;
 
             if pass {
                 passed_count = 1;
@@ -795,7 +624,7 @@ impl Filter {
                 info!("Processed {} records", count + 1);
             }
 
-            Ok(FilterProcessedBatch {
+            Ok(FilterProcessedBatchRaw {
                 kept_records,
                 rejected_records,
                 records_count: 1,
@@ -804,9 +633,9 @@ impl Filter {
             })
         };
 
-        // Serialize function: convert records to bytes and collect metrics
-        let serialize_fn = move |processed: FilterProcessedBatch,
-                                 header: &Header,
+        // Serialize function: raw bytes directly (bypasses bam_codec)
+        let serialize_fn = move |processed: FilterProcessedBatchRaw,
+                                 _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
             // Push metrics to lock-free queue
@@ -818,8 +647,8 @@ impl Filter {
                 rejects: processed.rejected_records,
             });
 
-            // Serialize kept records
-            serialize_bam_records_into(&processed.kept_records, header, output)
+            // Serialize kept records directly as raw BAM bytes
+            serialize_raw_records(&processed.kept_records, output)
         };
 
         // Clone header before pipeline (needed for post-pipeline aggregation)
@@ -864,6 +693,10 @@ impl Filter {
             self.scheduler_opts.deadlock_timeout_secs();
         pipeline_config.pipeline.deadlock_recover_enabled =
             self.scheduler_opts.deadlock_recover_enabled();
+
+        // Enable raw-byte mode: skip noodles decode
+        let library_index = LibraryIndex::from_header(&header);
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
 
         // Calculate and apply queue memory limit
         let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
@@ -918,122 +751,47 @@ impl Filter {
 
         // Process function: filter each template batch
         let header_for_process = header.clone();
-        let process_fn = move |batch: TemplateBatch| -> io::Result<FilterProcessedBatch> {
-            let mut kept_records = Vec::new();
-            let mut rejected_records = Vec::new();
+        let process_fn = move |batch: TemplateBatch| -> io::Result<FilterProcessedBatchRaw> {
+            let mut kept_records: Vec<Vec<u8>> = Vec::new();
+            let mut rejected_records: Vec<Vec<u8>> = Vec::new();
             let mut total_records = 0u64;
             let mut passed_count = 0u64;
             let mut bases_masked = 0u64;
 
             for template in batch {
-                let mut template_records = template.records;
+                let mut template_records = template
+                    .into_raw_records()
+                    .ok_or_else(|| io::Error::other("template has no raw records"))?;
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
 
                 // Process each record in the template
                 for (idx, record) in template_records.iter_mut().enumerate() {
                     total_records += 1;
 
-                    // Reverse per-base tags for negative-strand reads if requested
-                    if should_reverse_tags {
-                        reverse_per_base_tags(record).map_err(io::Error::other)?;
-                    }
-
-                    // Detect duplex and select appropriate thresholds
-                    let is_duplex = is_duplex_consensus(record);
-
-                    // Mask bases (duplex-aware if applicable)
-                    let masked_count = if is_duplex {
-                        let cc_thresh = config_for_process
-                            .duplex_thresholds
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("No duplex thresholds configured"))?;
-                        let ab_thresh = config_for_process
-                            .ab_thresholds
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("No AB thresholds configured"))?;
-                        let ba_thresh = config_for_process
-                            .ba_thresholds
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("No BA thresholds configured"))?;
-
-                        mask_duplex_bases(
-                            record,
-                            cc_thresh,
-                            ab_thresh,
-                            ba_thresh,
-                            min_base_quality,
-                            require_single_strand_agreement,
-                        )
-                        .map_err(io::Error::other)?
-                    } else {
-                        let thresholds = config_for_process
-                            .single_strand_thresholds
-                            .as_ref()
-                            .or(config_for_process.duplex_thresholds.as_ref())
-                            .ok_or_else(|| io::Error::other("No thresholds configured"))?;
-
-                        mask_bases(record, thresholds, min_base_quality)
-                            .map_err(io::Error::other)?
-                    };
-                    bases_masked += masked_count as u64;
-
-                    // Regenerate alignment tags (always when reference available, matching fgbio)
-                    if let Some(ref reference) = reference_for_process {
-                        regenerate_alignment_tags(record, &header_for_process, reference)
-                            .map_err(io::Error::other)?;
-                    }
-
-                    // Check filters (duplex-aware if applicable) using static methods
-                    let pass = if is_duplex {
-                        let cc_thresh = config_for_process
-                            .duplex_thresholds
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("No duplex thresholds configured"))?;
-                        let ab_thresh = config_for_process
-                            .ab_thresholds
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("No AB thresholds configured"))?;
-                        let ba_thresh = config_for_process
-                            .ba_thresholds
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("No BA thresholds configured"))?;
-
-                        Self::check_duplex_filters_static(
-                            record,
-                            cc_thresh,
-                            ab_thresh,
-                            ba_thresh,
-                            min_mean_base_quality,
-                            max_no_call_fraction,
-                        )
-                        .map_err(io::Error::other)?
-                    } else {
-                        let thresholds = config_for_process
-                            .single_strand_thresholds
-                            .as_ref()
-                            .or(config_for_process.duplex_thresholds.as_ref())
-                            .ok_or_else(|| io::Error::other("No thresholds configured"))?;
-
-                        Self::check_filters_static(
-                            record,
-                            thresholds,
-                            min_mean_base_quality,
-                            max_no_call_fraction,
-                        )
-                        .map_err(io::Error::other)?
-                    };
+                    let (masked, pass) = Self::process_record_raw(
+                        record,
+                        &config_for_process,
+                        reference_for_process.as_deref(),
+                        &header_for_process,
+                        should_reverse_tags,
+                        min_base_quality,
+                        require_single_strand_agreement,
+                        min_mean_base_quality,
+                        max_no_call_fraction,
+                    )
+                    .map_err(io::Error::other)?;
+                    bases_masked += masked;
                     pass_map.insert(idx, pass);
                 }
 
                 // Check if template passes (all primary reads must pass)
-                let template_pass = template_passes(&template_records, &pass_map);
+                let template_pass = template_passes_raw(&template_records, &pass_map);
 
                 // Collect kept/rejected records
-                // Primary reads: write if template passes
-                // Supplementary/secondary: filter individually (matching fgbio behavior)
                 for (idx, record) in template_records.into_iter().enumerate() {
-                    let flags = record.flags();
-                    let is_primary = !flags.is_secondary() && !flags.is_supplementary();
+                    let flags = bam_fields::flags(&record);
+                    let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
+                        && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
 
                     if is_primary {
                         if template_pass {
@@ -1061,7 +819,7 @@ impl Filter {
                 info!("Processed {} records", count + total_records);
             }
 
-            Ok(FilterProcessedBatch {
+            Ok(FilterProcessedBatchRaw {
                 kept_records,
                 rejected_records,
                 records_count: total_records,
@@ -1071,8 +829,8 @@ impl Filter {
         };
 
         // Serialize function: convert records to bytes and collect metrics
-        let serialize_fn = move |processed: FilterProcessedBatch,
-                                 header: &Header,
+        let serialize_fn = move |processed: FilterProcessedBatchRaw,
+                                 _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
             // Push metrics to lock-free queue
@@ -1084,8 +842,8 @@ impl Filter {
                 rejects: processed.rejected_records,
             });
 
-            // Serialize kept records
-            serialize_bam_records_into(&processed.kept_records, header, output)
+            // Serialize kept records as raw bytes
+            serialize_raw_records(&processed.kept_records, output)
         };
 
         // Clone header before pipeline (needed for post-pipeline aggregation)
@@ -1120,7 +878,25 @@ impl Filter {
         let mut passed_reads = 0u64;
         let mut failed_reads = 0u64;
         let mut total_bases_masked = 0u64;
-        let mut all_rejects: Vec<RecordBuf> = Vec::new();
+        let mut total_rejects_written = 0u64;
+
+        // Create rejects writer up front so we can stream rejects incrementally
+        let mut rejects_writer = if track_rejects {
+            self.rejects
+                .as_ref()
+                .map(|rejects_path| {
+                    let writer_threads = self.threading.num_threads();
+                    create_raw_bam_writer(
+                        rejects_path,
+                        header,
+                        writer_threads,
+                        self.compression.compression_level,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
         while let Some(metrics) = collected_metrics.pop() {
             total_reads += metrics.total_records;
@@ -1128,27 +904,19 @@ impl Filter {
             failed_reads += metrics.failed_records;
             total_bases_masked += metrics.total_bases_masked;
 
-            if track_rejects {
-                all_rejects.extend(metrics.rejects);
+            if let Some(ref mut rw) = rejects_writer {
+                for record in &metrics.rejects {
+                    rw.write_raw_record(record)?;
+                    total_rejects_written += 1;
+                }
             }
         }
 
-        // Write rejects file if requested
-        if track_rejects && !all_rejects.is_empty() {
-            if let Some(rejects_path) = &self.rejects {
-                let writer_threads = self.threading.num_threads();
-                let mut rejects_writer = create_optional_bam_writer(
-                    Some(rejects_path),
-                    header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?
-                .expect("rejects path is Some");
-                for record in &all_rejects {
-                    rejects_writer.write_alignment_record(header, record)?;
-                }
-                rejects_writer.finish(header)?;
-                info!("Wrote {} rejected records to rejects file", all_rejects.len());
+        // Finalize rejects writer
+        if let Some(rw) = rejects_writer {
+            rw.finish()?;
+            if total_rejects_written > 0 {
+                info!("Wrote {total_rejects_written} rejected records to rejects file");
             }
         }
 
@@ -1185,241 +953,151 @@ impl Filter {
         Ok(())
     }
 
-    // ========================================================================
-    // Existing Methods
-    // ========================================================================
+    /// Process a single raw BAM record: reverse tags, mask bases, regenerate alignment
+    /// tags, and check filters.
+    ///
+    /// Returns `(bases_masked, pass)`.
+    #[allow(clippy::too_many_arguments)]
+    fn process_record_raw(
+        record: &mut Vec<u8>,
+        config: &FilterConfig,
+        reference: Option<&ReferenceReader>,
+        header: &Header,
+        reverse_tags: bool,
+        min_base_quality: Option<u8>,
+        require_ss_agreement: bool,
+        min_mean_base_quality: Option<f64>,
+        max_no_call_fraction: f64,
+    ) -> Result<(u64, bool)> {
+        if reverse_tags {
+            reverse_per_base_tags_raw(record)?;
+        }
 
-    /// Checks all filters for a single consensus record (static version for parallel processing).
+        let is_duplex = {
+            let aux = bam_fields::aux_data_slice(record);
+            is_duplex_consensus_raw(aux)
+        };
+
+        let masked_count = if is_duplex {
+            let (cc_thresh, ab_thresh, ba_thresh) = config
+                .duplex_thresholds()
+                .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
+            mask_duplex_bases_raw(
+                record,
+                cc_thresh,
+                ab_thresh,
+                ba_thresh,
+                min_base_quality,
+                require_ss_agreement,
+            )?
+        } else {
+            let thresholds = config
+                .effective_single_strand_thresholds()
+                .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
+            mask_bases_raw(record, thresholds, min_base_quality)?
+        };
+
+        if let Some(reference) = reference {
+            regenerate_alignment_tags_raw(record, header, reference)?;
+        }
+
+        let pass = {
+            let aux = bam_fields::aux_data_slice(record);
+            if is_duplex {
+                let (cc_thresh, ab_thresh, ba_thresh) = config
+                    .duplex_thresholds()
+                    .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
+                Self::check_duplex_filters_raw(
+                    record,
+                    aux,
+                    cc_thresh,
+                    ab_thresh,
+                    ba_thresh,
+                    min_mean_base_quality,
+                    max_no_call_fraction,
+                )?
+            } else {
+                let thresholds = config
+                    .effective_single_strand_thresholds()
+                    .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
+                Self::check_filters_raw(
+                    record,
+                    aux,
+                    thresholds,
+                    min_mean_base_quality,
+                    max_no_call_fraction,
+                )?
+            }
+        };
+
+        Ok((masked_count as u64, pass))
+    }
+
+    /// Checks read-level filters on a raw simplex consensus record.
     ///
-    /// This static method performs the same filtering as `check_filters` but does not
-    /// require a `&self` reference, making it suitable for use in parallel contexts where
-    /// passing `&self` would be problematic.
-    ///
-    /// The method applies:
-    /// 1. Read-level filters from the filter configuration
-    /// 2. Mean base quality threshold (if specified)
-    /// 3. No-call fraction threshold
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The consensus record to check
-    /// * `thresholds` - Filter thresholds for this consensus level
-    /// * `min_mean_qual` - Optional minimum mean base quality
-    /// * `max_no_call_frac` - Maximum allowed fraction of N bases
-    ///
-    /// # Returns
-    ///
-    /// `Ok(true)` if the record passes all filters, `Ok(false)` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if filter evaluation fails.
-    fn check_filters_static(
-        record: &RecordBuf,
+    /// Returns `true` if the record passes all filters (depth, error rate, mean quality,
+    /// no-call fraction/count).
+    fn check_filters_raw(
+        bam: &[u8],
+        aux_data: &[u8],
         thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
-        // Check read-level filters
-        let filter_result = filter_read(record, thresholds)?;
-
-        // Check additional filters
-        let pass = match filter_result {
-            FilterResult::Pass => {
-                // Check mean base quality if specified
-                if let Some(min_qual) = min_mean_qual {
-                    let mean_qual = mean_base_quality(record);
-                    mean_qual >= min_qual
-                } else {
-                    true
-                }
+        let filter_result = filter_read_raw(aux_data, thresholds)?;
+        if filter_result != FilterResult::Pass {
+            return Ok(false);
+        }
+        let (no_calls, mean_qual) = compute_read_stats_raw(bam);
+        if let Some(min_qual) = min_mean_qual {
+            if mean_qual < min_qual {
+                return Ok(false);
             }
-            _ => false,
-        };
-
-        // Check no-call fraction
-        let pass = if pass {
-            let no_calls = count_no_calls(record);
-            let seq_len = record.sequence().len();
-            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
-            no_call_frac <= max_no_call_frac
+        }
+        let seq_len = bam_fields::l_seq(bam) as usize;
+        if max_no_call_frac >= 1.0 {
+            // Count mode: threshold is an absolute base count
+            Ok((no_calls as f64) <= max_no_call_frac)
         } else {
-            pass
-        };
-
-        Ok(pass)
+            // Fraction mode
+            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
+            Ok(no_call_frac <= max_no_call_frac)
+        }
     }
 
-    /// Checks all filters for a duplex consensus record (static version for parallel processing).
+    /// Checks read-level filters on a raw duplex consensus record.
     ///
-    /// This static method performs duplex-specific filtering by checking thresholds for the
-    /// final duplex consensus (cc), AB single-strand consensus, and BA single-strand consensus.
-    /// It does not require a `&self` reference for use in parallel contexts.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The duplex consensus record to check
-    /// * `cc_thresholds` - Filter thresholds for duplex consensus level
-    /// * `ab_thresholds` - Filter thresholds for AB single-strand consensus
-    /// * `ba_thresholds` - Filter thresholds for BA single-strand consensus
-    /// * `min_mean_qual` - Optional minimum mean base quality
-    /// * `max_no_call_frac` - Maximum allowed fraction of N bases
-    ///
-    /// # Returns
-    ///
-    /// `Ok(true)` if the record passes all duplex filters, `Ok(false)` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if filter evaluation fails.
-    fn check_duplex_filters_static(
-        record: &RecordBuf,
+    /// Returns `true` if the record passes all filters (CC/AB/BA depth and error rate,
+    /// mean quality, no-call fraction/count).
+    fn check_duplex_filters_raw(
+        bam: &[u8],
+        aux_data: &[u8],
         cc_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
         ab_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
         ba_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
-        // Check read-level filters (includes AB/BA strand checks)
         let filter_result =
-            filter_duplex_read(record, cc_thresholds, ab_thresholds, ba_thresholds)?;
-
-        // Check additional filters
-        let pass = match filter_result {
-            FilterResult::Pass => {
-                // Check mean base quality if specified
-                if let Some(min_qual) = min_mean_qual {
-                    let mean_qual = mean_base_quality(record);
-                    mean_qual >= min_qual
-                } else {
-                    true
-                }
+            filter_duplex_read_raw(aux_data, cc_thresholds, ab_thresholds, ba_thresholds)?;
+        if filter_result != FilterResult::Pass {
+            return Ok(false);
+        }
+        let (no_calls, mean_qual) = compute_read_stats_raw(bam);
+        if let Some(min_qual) = min_mean_qual {
+            if mean_qual < min_qual {
+                return Ok(false);
             }
-            _ => false,
-        };
-
-        // Check no-call fraction
-        let pass = if pass {
-            let no_calls = count_no_calls(record);
-            let seq_len = record.sequence().len();
-            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
-            no_call_frac <= max_no_call_frac
+        }
+        let seq_len = bam_fields::l_seq(bam) as usize;
+        if max_no_call_frac >= 1.0 {
+            // Count mode: threshold is an absolute base count
+            Ok((no_calls as f64) <= max_no_call_frac)
         } else {
-            pass
-        };
-
-        Ok(pass)
-    }
-
-    /// Checks all filters for a single consensus record.
-    ///
-    /// Evaluates whether a consensus record passes the configured filtering criteria by
-    /// checking read-level filters, mean base quality, and no-call fraction thresholds.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The consensus record to check
-    /// * `thresholds` - Filter thresholds for this consensus level
-    ///
-    /// # Returns
-    ///
-    /// `Ok(true)` if the record passes all filters, `Ok(false)` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if filter evaluation fails.
-    fn check_filters(
-        &self,
-        record: &RecordBuf,
-        thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
-    ) -> Result<bool> {
-        // Check read-level filters
-        let filter_result = filter_read(record, thresholds)?;
-
-        // Check additional filters
-        let pass = match filter_result {
-            FilterResult::Pass => {
-                // Check mean base quality if specified
-                if let Some(min_mean_qual) = self.min_mean_base_quality {
-                    let mean_qual = mean_base_quality(record);
-                    mean_qual >= min_mean_qual
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-
-        // Check no-call fraction
-        let pass = if pass {
-            let no_calls = count_no_calls(record);
-            let seq_len = record.sequence().len();
+            // Fraction mode
             let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
-            no_call_frac <= self.max_no_call_fraction
-        } else {
-            pass
-        };
-
-        Ok(pass)
-    }
-
-    /// Checks all filters for a duplex consensus record with strand-specific filtering.
-    ///
-    /// Evaluates whether a duplex consensus record passes filtering criteria by checking
-    /// thresholds for the final duplex consensus and both AB and BA single-strand consensuses.
-    /// This method is more stringent than single-strand filtering as it requires passing
-    /// criteria at multiple consensus levels.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The duplex consensus record to check
-    /// * `cc_thresholds` - Filter thresholds for duplex consensus level
-    /// * `ab_thresholds` - Filter thresholds for AB single-strand consensus
-    /// * `ba_thresholds` - Filter thresholds for BA single-strand consensus
-    ///
-    /// # Returns
-    ///
-    /// `Ok(true)` if the record passes all duplex filters, `Ok(false)` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if filter evaluation fails.
-    fn check_duplex_filters(
-        &self,
-        record: &RecordBuf,
-        cc_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
-        ab_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
-        ba_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
-    ) -> Result<bool> {
-        // Check read-level filters (includes AB/BA strand checks)
-        let filter_result =
-            filter_duplex_read(record, cc_thresholds, ab_thresholds, ba_thresholds)?;
-
-        // Check additional filters
-        let pass = match filter_result {
-            FilterResult::Pass => {
-                // Check mean base quality if specified
-                if let Some(min_mean_qual) = self.min_mean_base_quality {
-                    let mean_qual = mean_base_quality(record);
-                    mean_qual >= min_mean_qual
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-
-        // Check no-call fraction
-        let pass = if pass {
-            let no_calls = count_no_calls(record);
-            let seq_len = record.sequence().len();
-            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
-            no_call_frac <= self.max_no_call_fraction
-        } else {
-            pass
-        };
-
-        Ok(pass)
+            Ok(no_call_frac <= max_no_call_frac)
+        }
     }
 
     /// Validates that parameter vectors have 1-3 values and are in valid ranges
@@ -1618,6 +1296,8 @@ impl Filter {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
+    use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
 
     /// Helper function to create a Filter command with commonly used test defaults.
@@ -4466,6 +4146,207 @@ mod tests {
 
         let records = read_bam_records(&output_path)?;
         assert_eq!(records.len(), 1, "Should have 1 record");
+
+        Ok(())
+    }
+
+    // ========== Tests for max_no_call_fraction count mode ==========
+
+    #[test]
+    fn test_check_filters_raw_no_call_fraction_mode() -> Result<()> {
+        // Test fraction mode (threshold < 1.0) with max_no_call_fraction = 0.2
+        // Build a record with 10 bases, 2 Ns => 0.2 fraction => should pass
+        use fgumi_lib::consensus_filter::FilterThresholds;
+        use fgumi_lib::sam::builder::RecordBuilder;
+        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use noodles::sam::Header;
+
+        let mut record = RecordBuilder::new()
+            .sequence("AANNTTGGCC") // 10 bases, 2 Ns
+            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
+            .build();
+
+        // Add required cD and cE tags for filter_read_raw to pass
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'E']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
+        );
+
+        let header = Header::default();
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record)?;
+
+        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let thresholds =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
+
+        // Fraction mode: 2/10 = 0.2, threshold = 0.2 => should pass
+        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 0.2)?;
+        assert!(result, "Should pass with 2/10 Ns and threshold 0.2");
+
+        // Fraction mode: 2/10 = 0.2, threshold = 0.19 => should fail
+        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 0.19)?;
+        assert!(!result, "Should fail with 2/10 Ns and threshold 0.19");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_filters_raw_no_call_count_mode_pass() -> Result<()> {
+        // Test count mode (threshold >= 1.0) with max_no_call_fraction = 5.0
+        // Build a record with 10 bases, 3 Ns => 3 < 5 => should pass
+        use fgumi_lib::consensus_filter::FilterThresholds;
+        use fgumi_lib::sam::builder::RecordBuilder;
+        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use noodles::sam::Header;
+
+        let mut record = RecordBuilder::new()
+            .sequence("AANNNTTGGC") // 10 bases, 3 Ns
+            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
+            .build();
+
+        // Add required cD and cE tags
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'E']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
+        );
+
+        let header = Header::default();
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record)?;
+
+        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let thresholds =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
+
+        // Count mode: 3 Ns <= 5.0 threshold => should pass
+        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 5.0)?;
+        assert!(result, "Should pass with 3 Ns and count threshold 5.0");
+
+        // Count mode: 3 Ns <= 3.0 threshold => should pass (boundary)
+        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 3.0)?;
+        assert!(result, "Should pass with 3 Ns and count threshold 3.0 (boundary)");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_filters_raw_no_call_count_mode_fail() -> Result<()> {
+        // Test count mode (threshold >= 1.0) with max_no_call_fraction = 2.0
+        // Build a record with 10 bases, 3 Ns => 3 > 2 => should fail
+        use fgumi_lib::consensus_filter::FilterThresholds;
+        use fgumi_lib::sam::builder::RecordBuilder;
+        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use noodles::sam::Header;
+
+        let mut record = RecordBuilder::new()
+            .sequence("AANNNTTGGC") // 10 bases, 3 Ns
+            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
+            .build();
+
+        // Add required cD and cE tags
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'E']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
+        );
+
+        let header = Header::default();
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record)?;
+
+        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let thresholds =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
+
+        // Count mode: 3 Ns > 2.0 threshold => should fail
+        let result = Filter::check_filters_raw(&raw, aux, &thresholds, None, 2.0)?;
+        assert!(!result, "Should fail with 3 Ns and count threshold 2.0");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_duplex_filters_raw_no_call_count_mode() -> Result<()> {
+        // Test duplex filtering with count mode for no-call counting
+        use fgumi_lib::consensus_filter::FilterThresholds;
+        use fgumi_lib::sam::builder::RecordBuilder;
+        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use noodles::sam::Header;
+
+        let mut record = RecordBuilder::new()
+            .sequence("AANNNTTGGC") // 10 bases, 3 Ns
+            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
+            .build();
+
+        // Add required duplex tags: aD, bD, aE, bE, aM, bM
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'a', b'D']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'b', b'D']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(8u8),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'a', b'E']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'b', b'E']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'a', b'M']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
+        );
+        record.data_mut().insert(
+            noodles::sam::alignment::record::data::field::Tag::from([b'b', b'M']),
+            noodles::sam::alignment::record_buf::data::field::Value::from(8u8),
+        );
+
+        let header = Header::default();
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record)?;
+
+        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let thresholds =
+            FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
+
+        // Count mode: 3 Ns <= 5.0 threshold => should pass
+        let result = Filter::check_duplex_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            &thresholds,
+            &thresholds,
+            None,
+            5.0,
+        )?;
+        assert!(result, "Should pass with 3 Ns and count threshold 5.0");
+
+        // Count mode: 3 Ns > 2.0 threshold => should fail
+        let result = Filter::check_duplex_filters_raw(
+            &raw,
+            aux,
+            &thresholds,
+            &thresholds,
+            &thresholds,
+            None,
+            2.0,
+        )?;
+        assert!(!result, "Should fail with 3 Ns and count threshold 2.0");
 
         Ok(())
     }

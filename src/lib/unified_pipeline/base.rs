@@ -1388,6 +1388,12 @@ impl MemoryEstimate for Vec<RecordBuf> {
     }
 }
 
+impl MemoryEstimate for Vec<u8> {
+    fn estimate_heap_size(&self) -> usize {
+        self.capacity()
+    }
+}
+
 // ============================================================================
 // GroupKeyConfig - Configuration for computing `GroupKey` during Decode
 // ============================================================================
