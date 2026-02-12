@@ -285,6 +285,20 @@ pub fn decompress_block(
             )
         })?;
 
+    // Verify CRC32 to detect corruption
+    let expected_crc = block.crc32();
+    let actual_crc = crc32fast::hash(&uncompressed);
+    if expected_crc != actual_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
+                 block_size={}, uncompressed_size={uncompressed_size}",
+                block.len(),
+            ),
+        ));
+    }
+
     Ok(uncompressed)
 }
 
