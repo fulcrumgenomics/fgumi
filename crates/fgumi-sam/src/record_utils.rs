@@ -158,12 +158,11 @@ pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
         return false;
     }
 
-    // Now determine if FR or RF using htsjdk's logic:
+    // Determine if FR or RF:
     // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
-    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
+    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : mateAlignmentEnd (from MC tag)
     let alignment_start = read.alignment_start().map_or(0, usize::from);
     let mate_start = read.mate_alignment_start().map_or(0, usize::from);
-    let insert_size = read.template_length();
 
     // Genomic positions fit in i32 (SAM format uses i32 for positions)
     #[expect(
@@ -179,14 +178,19 @@ pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
         // Need alignment end for this read's 5' position
         let ref_len = reference_length(&read.cigar());
         let end = alignment_start + ref_len.saturating_sub(1);
-        // positiveStrandFivePrimePos = mateStart
-        // negativeStrandFivePrimePos = alignmentEnd (this read)
         (mate_start as i32, end as i32)
     } else {
         // This read is on positive strand, mate is on reverse strand
-        // positiveStrandFivePrimePos = alignmentStart (this read)
-        // negativeStrandFivePrimePos = alignmentStart + insertSize
-        (alignment_start as i32, alignment_start as i32 + insert_size)
+        // Compute mate's alignment end from MC tag instead of using TLEN
+        let mc_tag = Tag::from([b'M', b'C']);
+        let Some(Value::String(mc_str)) = read.data().get(&mc_tag) else {
+            return false;
+        };
+        let mc_cigar = String::from_utf8_lossy(mc_str.as_ref());
+        let ops = parse_cigar_string(&mc_cigar);
+        let mate_ref_len = cigar_reference_length(&ops);
+        let mate_end = mate_start + mate_ref_len.saturating_sub(1);
+        (alignment_start as i32, mate_end as i32)
     };
 
     // FR if positive strand 5' < negative strand 5'
@@ -721,6 +725,7 @@ mod tests {
         tlen: i32,
         ref_id: usize,
         mate_ref_id: usize,
+        mc_cigar: Option<&str>,
     ) -> RecordBuf {
         let is_reverse = (flags & FLAG_REVERSE) != 0;
         let is_mate_reverse = (flags & FLAG_MATE_REVERSE) != 0;
@@ -748,14 +753,18 @@ mod tests {
             builder = builder.first_segment(is_read1);
         }
 
+        if let Some(mc) = mc_cigar {
+            builder = builder.tag("MC", mc);
+        }
+
         builder.build()
     }
 
     #[test]
     fn test_is_fr_pair_true_for_fr_orientation() {
-        // FR pair: positive strand read at pos 100, mate on negative strand
-        // Insert size positive (300), so negative 5' = 100 + 300 = 400
-        // positive 5' (100) < negative 5' (400) -> FR
+        // FR pair: positive strand read at pos 100, mate on negative strand at pos 200
+        // Mate MC=100M: mate_end = 200 + 100 - 1 = 299
+        // positive 5' (100) < negative 5' (299) -> FR
         let read = create_fr_test_read(
             "fr_pair",
             FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
@@ -764,13 +773,16 @@ mod tests {
             300,
             0,
             0,
+            Some("100M"),
         );
         assert!(is_fr_pair_from_tags(&read), "Should be FR pair");
     }
 
     #[test]
     fn test_is_fr_pair_false_for_rf_orientation() {
-        // RF pair: negative insert size
+        // RF pair: read at pos 63837, mate at pos 62870 with MC=100M
+        // mate_end = 62870 + 100 - 1 = 62969
+        // positive 5' (63837) > negative 5' (62969) -> RF
         let read = create_fr_test_read(
             "rf_pair",
             FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
@@ -779,6 +791,7 @@ mod tests {
             -967,
             0,
             0,
+            Some("100M"),
         );
         assert!(!is_fr_pair_from_tags(&read), "Should NOT be FR pair: RF orientation");
     }
@@ -794,6 +807,7 @@ mod tests {
             300,
             0,
             0,
+            None,
         );
         assert!(!is_fr_pair_from_tags(&read), "Should NOT be FR pair: tandem");
     }
@@ -815,6 +829,7 @@ mod tests {
             300,
             0,
             0,
+            None,
         );
         assert!(!is_fr_pair_from_tags(&read), "Should NOT be FR pair: unmapped");
     }
@@ -829,6 +844,7 @@ mod tests {
             300,
             0,
             0,
+            None,
         );
         assert!(!is_fr_pair_from_tags(&read), "Should NOT be FR pair: mate unmapped");
     }
@@ -843,6 +859,7 @@ mod tests {
             300,
             0,
             1, // different reference
+            None,
         );
         assert!(!is_fr_pair_from_tags(&read), "Should NOT be FR pair: different refs");
     }
@@ -851,19 +868,18 @@ mod tests {
     fn test_is_fr_pair_false_for_rf_when_read_on_negative_strand() {
         // RF pair: read on negative strand, mate on positive strand
         // For negative strand read:
-        //   positive 5' = mate_start (100)
-        //   negative 5' = alignment_end (this read, pos 200 + 100bp = 300)
-        // If mate_start (100) > alignment_end... wait, that would be FR
-        // Let's make mate_start > alignment_end: mate at 400, read ends at 300
-        // positive 5' (400) < negative 5' (300) is FALSE -> RF
+        //   positive 5' = mate_start (400)
+        //   negative 5' = alignment_end = 200 + 100 - 1 = 299
+        // positive 5' (400) > negative 5' (299) -> RF
         let read = create_fr_test_read(
             "rf_negative_strand",
             FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE, // negative strand, mate positive
-            200,                                     // alignment_start (alignment_end will be ~300)
+            200,                                     // alignment_start (alignment_end will be ~299)
             400,                                     // mate_alignment_start (positive strand 5')
             -200,                                    // template_length
             0,                                       // ref_id
             0,                                       // mate_ref_id
+            None,
         );
 
         assert!(
@@ -876,21 +892,22 @@ mod tests {
     fn test_is_fr_pair_true_for_fr_when_read_on_negative_strand() {
         // FR pair: read on negative strand, mate on positive strand
         // For negative strand read:
-        //   positive 5' = mate_start
-        //   negative 5' = alignment_end (this read's end)
+        //   positive 5' = mate_start (100)
+        //   negative 5' = alignment_end = 200 + 100 - 1 = 299
         // FR when positive 5' < negative 5'
-        // mate at 100, read ends at 300 -> 100 < 300 -> FR
+        // 100 < 299 -> FR
         let read = create_fr_test_read(
             "fr_negative_strand",
             FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE, // negative strand, mate positive
-            200,                                     // alignment_start (alignment_end will be ~300)
+            200,                                     // alignment_start (alignment_end will be ~299)
             100,                                     // mate_alignment_start (positive strand 5')
             200,                                     // template_length
             0,                                       // ref_id
             0,                                       // mate_ref_id
+            None,
         );
 
-        assert!(is_fr_pair_from_tags(&read), "Should be FR pair: mate 5' (100) < read end (300)");
+        assert!(is_fr_pair_from_tags(&read), "Should be FR pair: mate 5' (100) < read end (299)");
     }
 
     #[test]
@@ -904,11 +921,77 @@ mod tests {
             300,
             0,
             0,
+            None,
         );
 
         assert!(
             !is_fr_pair_from_tags(&read),
             "Should NOT be FR pair: tandem orientation (both reverse)"
+        );
+    }
+
+    #[test]
+    fn test_is_fr_pair_from_tags_no_mc_tag_returns_false() {
+        // Forward strand read with no MC tag should return false
+        let read = create_fr_test_read(
+            "no_mc",
+            FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
+            100,
+            200,
+            300,
+            0,
+            0,
+            None, // no MC tag
+        );
+        assert!(
+            !is_fr_pair_from_tags(&read),
+            "Should return false when MC tag is missing"
+        );
+    }
+
+    #[test]
+    fn test_is_fr_pair_from_tags_ignores_wrong_tlen_zero() {
+        // FR pair with TLEN=0 (wrong) but correct MC tag
+        // Read: forward at pos 100, 100M
+        // Mate: reverse at pos 200, MC=100M
+        // mate_end = 200 + 100 - 1 = 299
+        // positive 5' (100) < negative 5' (299) -> FR (TLEN=0 is ignored)
+        let read = create_fr_test_read(
+            "wrong_tlen_zero",
+            FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
+            100,
+            200,
+            0, // wrong TLEN
+            0,
+            0,
+            Some("100M"),
+        );
+        assert!(
+            is_fr_pair_from_tags(&read),
+            "Should be FR pair: TLEN=0 ignored, MC tag used instead"
+        );
+    }
+
+    #[test]
+    fn test_is_fr_pair_from_tags_ignores_wrong_tlen_negative() {
+        // FR pair with TLEN=-200 (wrong, would make it look RF) but correct MC tag
+        // Read: forward at pos 100, 100M
+        // Mate: reverse at pos 200, MC=100M
+        // mate_end = 200 + 100 - 1 = 299
+        // positive 5' (100) < negative 5' (299) -> FR (negative TLEN is ignored)
+        let read = create_fr_test_read(
+            "wrong_tlen_negative",
+            FLAG_PAIRED | FLAG_READ1 | FLAG_MATE_REVERSE,
+            100,
+            200,
+            -200, // wrong TLEN
+            0,
+            0,
+            Some("100M"),
+        );
+        assert!(
+            is_fr_pair_from_tags(&read),
+            "Should be FR pair: negative TLEN ignored, MC tag used instead"
         );
     }
 
@@ -1071,6 +1154,7 @@ mod tests {
             200,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::FR);
     }
@@ -1086,6 +1170,7 @@ mod tests {
             100,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::FR);
     }
@@ -1103,6 +1188,7 @@ mod tests {
             -100,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::RF);
     }
@@ -1118,6 +1204,7 @@ mod tests {
             200,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::Tandem);
     }
@@ -1133,6 +1220,7 @@ mod tests {
             200,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::Tandem);
     }
@@ -1152,6 +1240,7 @@ mod tests {
             200,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::FR);
     }
@@ -1171,6 +1260,7 @@ mod tests {
             -200,
             0,
             0,
+            None,
         );
         assert_eq!(get_pair_orientation(&read), PairOrientation::RF);
     }

@@ -829,6 +829,8 @@ mod tests {
 
         let insert_size: i32 = (start2 + read_len) as i32 - start1 as i32;
 
+        let cigar_str = format!("{read_len}M");
+
         // R1: Forward strand, first segment
         let r1 = RecordBuilder::new()
             .name(&format!("read_{mi_value}"))
@@ -842,12 +844,13 @@ mod tests {
             )
             .reference_sequence_id(0)
             .alignment_start(start1)
-            .cigar(&format!("{read_len}M"))
+            .cigar(&cigar_str)
             .mate_reference_sequence_id(0)
             .mate_alignment_start(start2)
             .template_length(insert_size)
             .tag("MI", mi_value)
             .tag("RG", "A")
+            .tag("MC", cigar_str.as_str())
             .build();
 
         // R2: Reverse strand, last segment (stored as revcomp in BAM)
@@ -863,12 +866,13 @@ mod tests {
             )
             .reference_sequence_id(0)
             .alignment_start(start2)
-            .cigar(&format!("{read_len}M"))
+            .cigar(&cigar_str)
             .mate_reference_sequence_id(0)
             .mate_alignment_start(start1)
             .template_length(-insert_size)
             .tag("MI", mi_value)
             .tag("RG", "A")
+            .tag("MC", cigar_str.as_str())
             .build();
 
         (r1, r2)

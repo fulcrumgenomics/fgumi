@@ -32,6 +32,7 @@ fn create_codec_read(
     mate_start: usize,
     cigar_ops: &[(Kind, usize)],
     umi: &str,
+    mc_cigar: &str,
 ) -> RecordBuf {
     // Build CIGAR and calculate reference length
     let mut cigar = Cigar::default();
@@ -70,6 +71,7 @@ fn create_codec_read(
         .mate_reference_sequence_id(0)
         .mate_alignment_start(mate_start)
         .tag("MI", umi)
+        .tag("MC", mc_cigar)
         .build();
 
     // Set CIGAR (built from ops) and template length
@@ -91,6 +93,10 @@ fn create_codec_read_pair(
     r2_start: usize,
     umi: &str,
 ) -> (RecordBuf, RecordBuf) {
+    // MC tags: each read gets the mate's CIGAR string
+    let r1_mc = format!("{}M", r2_seq.len());
+    let r2_mc = format!("{}M", r1_seq.len());
+
     let r1 = create_codec_read(
         name,
         r1_seq,
@@ -102,6 +108,7 @@ fn create_codec_read_pair(
         r2_start, // mate_start
         &[(Kind::Match, r1_seq.len())],
         umi,
+        &r1_mc,
     );
 
     let r2 = create_codec_read(
@@ -115,6 +122,7 @@ fn create_codec_read_pair(
         r1_start, // mate_start
         &[(Kind::Match, r2_seq.len())],
         umi,
+        &r2_mc,
     );
 
     (r1, r2)

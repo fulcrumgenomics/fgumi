@@ -259,6 +259,18 @@ pub fn mate_unclipped_5prime_1based(
     }
 }
 
+/// Calculate mate's alignment end (1-based inclusive) from MC tag CIGAR string.
+///
+/// Returns `mate_pos + ref_len - 1` where `ref_len` is computed from MC tag.
+/// This gives the rightmost aligned position of the mate, which is the negative
+/// strand 5' position for FR pair detection.
+#[inline]
+#[must_use]
+pub fn mate_alignment_end(mate_pos: i32, mc_cigar: &str) -> i32 {
+    let (ref_len, _trailing_clips) = parse_ref_len_and_trailing_clips(mc_cigar);
+    mate_pos + ref_len - 1
+}
+
 /// Calculate mate's unclipped start from MC tag CIGAR string.
 ///
 /// For forward strand mates, this is the 5' position.

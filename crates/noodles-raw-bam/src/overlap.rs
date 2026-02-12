@@ -1,8 +1,8 @@
 use crate::cigar::{
-    get_cigar_ops, reference_length_from_cigar, reference_length_from_raw_bam, unclipped_other_end,
-    unclipped_other_start,
+    get_cigar_ops, mate_alignment_end, reference_length_from_cigar, reference_length_from_raw_bam,
+    unclipped_other_end, unclipped_other_start,
 };
-use crate::fields::{aux_data_slice, flags, mate_pos, mate_ref_id, pos, ref_id, template_length};
+use crate::fields::{aux_data_slice, flags, mate_pos, mate_ref_id, pos, ref_id};
 use crate::tags::find_string_tag;
 
 /// Check if a single read is part of an FR (forward-reverse) pair using raw BAM bytes.
@@ -38,12 +38,11 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
         return false;
     }
 
-    // Determine if FR or RF using htsjdk's logic:
+    // Determine if FR or RF:
     // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
-    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
+    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : mateAlignmentEnd (from MC tag)
     let alignment_start = pos(bam) + 1; // 1-based
     let m_start = mate_pos(bam) + 1; // 1-based
-    let insert_size = template_length(bam);
 
     let (positive_five_prime, negative_five_prime) = if is_reverse {
         // This read is on reverse strand, mate is on positive strand
@@ -52,7 +51,16 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
         (m_start, end)
     } else {
         // This read is on positive strand, mate is on reverse strand
-        (alignment_start, alignment_start + insert_size)
+        // Compute mate's alignment end from MC tag instead of using TLEN
+        let aux = aux_data_slice(bam);
+        let Some(mc_bytes) = find_string_tag(aux, b"MC") else {
+            return false;
+        };
+        let Ok(mc_cigar) = std::str::from_utf8(mc_bytes) else {
+            return false;
+        };
+        let mate_end = mate_alignment_end(m_start, mc_cigar);
+        (alignment_start, mate_end)
     };
 
     // FR if positive strand 5' < negative strand 5'
@@ -368,9 +376,11 @@ mod tests {
     fn test_is_fr_pair_raw_fr_positive_strand_read() {
         // FR pair: this read is forward, mate is reverse, on same reference
         // positive_five_prime = alignment_start = 101
-        // negative_five_prime = alignment_start + insert_size = 101 + 200 = 301
-        // 101 < 301 => FR => true
-        let rec = make_bam_bytes_with_tlen(
+        // negative_five_prime = mate_alignment_end = 201 + 100 - 1 = 300
+        // 101 < 300 => FR => true
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ100M\x00");
+        let rec = make_bam_bytes(
             0,
             100,
             flags::PAIRED | flags::MATE_REVERSE,
@@ -379,8 +389,7 @@ mod tests {
             10,
             0,
             200,
-            200,
-            &[],
+            &aux,
         );
         assert!(is_fr_pair_raw(&rec));
     }
@@ -411,9 +420,11 @@ mod tests {
         // RF pair: this read is forward, mate is reverse, but mate is upstream
         // Read at pos 200, mate at pos 100
         // positive_five_prime = alignment_start = 201
-        // negative_five_prime = alignment_start + insert_size = 201 + (-100) = 101
-        // 201 > 101 => NOT FR (it's RF) => false
-        let rec = make_bam_bytes_with_tlen(
+        // negative_five_prime = mate_alignment_end = 101 + 10 - 1 = 110
+        // 201 > 110 => NOT FR (it's RF) => false
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes(
             0,
             200,
             flags::PAIRED | flags::MATE_REVERSE,
@@ -422,10 +433,76 @@ mod tests {
             10,
             0,
             100,
-            -100,
+            &aux,
+        );
+        assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_no_mc_tag_returns_false() {
+        // Forward strand read with no MC tag should return false
+        let rec = make_bam_bytes(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
             &[],
         );
         assert!(!is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_ignores_wrong_tlen_zero() {
+        // FR pair with TLEN=0 (wrong) but correct MC tag
+        // Read: forward at pos 100 (0-based), 10M
+        // Mate: reverse at pos 200 (0-based), MC=10M
+        // positive_five_prime = 101
+        // negative_five_prime = mate_alignment_end = 201 + 10 - 1 = 210
+        // 101 < 210 => FR => true (TLEN=0 is ignored)
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            0, // wrong TLEN
+            &aux,
+        );
+        assert!(is_fr_pair_raw(&rec));
+    }
+
+    #[test]
+    fn test_is_fr_pair_raw_ignores_wrong_tlen_negative() {
+        // FR pair with TLEN=-200 (wrong, would make it look RF) but correct MC tag
+        // Read: forward at pos 100 (0-based), 10M
+        // Mate: reverse at pos 200 (0-based), MC=10M
+        // positive_five_prime = 101
+        // negative_five_prime = mate_alignment_end = 201 + 10 - 1 = 210
+        // 101 < 210 => FR => true (negative TLEN is ignored)
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ10M\x00");
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            100,
+            flags::PAIRED | flags::MATE_REVERSE,
+            b"rea",
+            &[encode_op(0, 10)],
+            10,
+            0,
+            200,
+            -200, // wrong TLEN
+            &aux,
+        );
+        assert!(is_fr_pair_raw(&rec));
     }
 
     // ========================================================================

@@ -1690,6 +1690,7 @@ mod tests {
             .mate_alignment_start(mate_start)
             .template_length(tlen)
             .tag("MI", "UMI123")
+            .tag("MC", &cigar_str)
             .build()
     }
 
