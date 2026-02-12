@@ -22,25 +22,33 @@
 //! - [`clip`] - Clip overlapping read pairs
 //! - [`duplex_metrics`] - Calculate duplex sequencing metrics
 
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_possible_wrap)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::cast_lossless)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::unused_self)]
-#![allow(clippy::unnecessary_wraps)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::needless_pass_by_value)]
-#![allow(clippy::match_same_arms)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::fn_params_excessive_bools)]
-#![allow(clippy::redundant_else)]
-#![allow(clippy::manual_let_else)]
-#![allow(clippy::needless_continue)]
+// Blanket clippy pedantic allows for command implementations.
+// These will be removed incrementally as commands are refactored.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::unused_self,
+    clippy::unnecessary_wraps,
+    clippy::similar_names,
+    clippy::needless_pass_by_value,
+    clippy::match_same_arms,
+    clippy::must_use_candidate,
+    clippy::items_after_statements,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
+    clippy::redundant_else,
+    clippy::manual_let_else,
+    clippy::needless_continue,
+    clippy::redundant_closure_for_method_calls,
+    clippy::explicit_iter_loop,
+    clippy::uninlined_format_args,
+    clippy::map_unwrap_or
+)]
 
 pub mod clip;
 pub mod codec;

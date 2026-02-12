@@ -3,15 +3,8 @@
 // generic code in test builds. Allow it crate-wide in test config since the actual
 // allocations are heap-based (`vec![]`), not stack arrays.
 #![cfg_attr(test, allow(clippy::large_stack_arrays))]
-// Clippy lint configuration for CI
-// These lints are allowed because:
-// - cast_*: Scientific/bioinformatics code intentionally casts between numeric types
-// - missing_*_doc: Documentation improvements tracked separately
-// - needless_pass_by_value: Some APIs designed for ownership transfer
-// - items_after_statements: Some test code uses late item declarations
-// - unused_self: Trait implementations may not use self
-// - match_same_arms: Sometimes clearer to list arms explicitly
-// - unnecessary_wraps: Some Result returns are for API consistency
+// Blanket clippy pedantic allows for remaining main-crate code.
+// These will be removed incrementally as modules are extracted or fixed.
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -156,12 +149,12 @@
 
 pub mod bam_io;
 pub mod batched_sam_reader;
-pub mod bgzf_reader;
-pub mod bgzf_writer;
-pub mod bitenc;
-pub mod clipper;
+pub use fgumi_bgzf::reader as bgzf_reader;
+pub use fgumi_bgzf::writer as bgzf_writer;
+pub use fgumi_dna::bitenc;
+pub use fgumi_sam::clipper;
 pub mod consensus;
-pub mod dna;
+pub use fgumi_dna::dna;
 pub mod errors;
 pub mod fastq;
 pub mod grouper;
@@ -169,11 +162,11 @@ pub mod header;
 pub mod logging;
 pub mod metrics;
 pub mod mi_group;
-pub mod phred;
+pub use fgumi_consensus::phred;
 pub mod progress;
 pub mod read_info;
 pub mod reference;
-pub mod rejection;
+pub use fgumi_metrics::rejection;
 pub mod reorder_buffer;
 pub mod sam;
 pub mod sort;

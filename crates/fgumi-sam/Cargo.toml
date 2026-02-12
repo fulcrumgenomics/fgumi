@@ -1,0 +1,18 @@
+[package]
+name = "fgumi-sam"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87.0"
+description = "SAM/BAM record utilities, CIGAR parsing, and read-pair clipping for fgumi"
+license = "MIT"
+
+[dependencies]
+noodles = { version = "0.104.0", features = ["bam", "sam", "core"] }
+bstr = "1.12.1"
+log = "0"
+anyhow = "1.0"
+fgumi-dna = { path = "../fgumi-dna" }
+tempfile = "3.3.0"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

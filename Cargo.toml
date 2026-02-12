@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/noodles-raw-bam"]
+members = [".", "crates/noodles-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-umi", "crates/fgumi-consensus"]
 resolver = "2"
 
 [package]
@@ -64,6 +64,12 @@ rand_distr = "0.5"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
 noodles-raw-bam = { path = "crates/noodles-raw-bam", features = ["noodles"] }
+fgumi-dna = { path = "crates/fgumi-dna" }
+fgumi-bgzf = { path = "crates/fgumi-bgzf" }
+fgumi-metrics = { path = "crates/fgumi-metrics" }
+fgumi-sam = { path = "crates/fgumi-sam" }
+fgumi-umi = { path = "crates/fgumi-umi" }
+fgumi-consensus = { path = "crates/fgumi-consensus" }
 
 [features]
 default = []
