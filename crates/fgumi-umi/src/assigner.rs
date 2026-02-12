@@ -1093,65 +1093,6 @@ impl AdjacencyUmiAssigner {
         self.counter.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Check if two UMIs match within threshold
-    ///
-    /// Returns true if the number of mismatches between the two UMIs is less than or
-    /// equal to the maximum allowed.
-    ///
-    /// # Arguments
-    ///
-    /// * `lhs` - First UMI
-    /// * `rhs` - Second UMI
-    ///
-    /// # Returns
-    ///
-    /// `true` if UMIs are within edit distance threshold
-    #[expect(dead_code, reason = "useful helper kept for future use and testing")]
-    fn matches(&self, lhs: &str, rhs: &str) -> bool {
-        matches_within_threshold(lhs, rhs, self.max_mismatches as usize)
-    }
-
-    /// Assign IDs to nodes in the graph
-    ///
-    /// Given the graph structure and root nodes, assigns the same molecule ID to each
-    /// root and all of its descendants.
-    ///
-    /// # Arguments
-    ///
-    /// * `nodes` - Slice of all nodes in the graph
-    /// * `roots` - Indices of root nodes
-    ///
-    /// # Returns
-    ///
-    /// `HashMap` mapping each UMI to its assigned molecule ID
-    #[expect(dead_code, reason = "string-based variant kept alongside BitEnc-based version")]
-    fn assign_ids_to_nodes(
-        &self,
-        nodes: &[Node],
-        roots: &[usize],
-        umi_counts: &[(Umi, usize)],
-    ) -> HashMap<Umi, MoleculeId> {
-        let mut mappings = HashMap::new();
-
-        for &root_idx in roots {
-            let id = MoleculeId::Single(self.next_id());
-            let root = &nodes[root_idx];
-
-            // Assign ID to root (look up UMI by node index)
-            mappings.insert(umi_counts[root_idx].0.clone(), id);
-
-            // Assign ID to all descendants
-            let mut stack = root.children.clone();
-            while let Some(child_idx) = stack.pop() {
-                let child = &nodes[child_idx];
-                mappings.insert(umi_counts[child_idx].0.clone(), id);
-                stack.extend(&child.children);
-            }
-        }
-
-        mappings
-    }
-
     /// Assign IDs to nodes using `BitEnc`-based `umi_counts`.
     ///
     /// Returns a `Vec<MoleculeId>` where `result[i]` is the `MoleculeId` for `umi_counts[i]`.
