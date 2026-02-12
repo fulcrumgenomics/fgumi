@@ -7,15 +7,14 @@
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer, create_optional_bam_writer};
+use fgumi_lib::bam_io::{create_raw_bam_reader, create_raw_bam_writer};
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::sam::is_template_coordinate_sorted;
+use fgumi_lib::sort::bam_fields;
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::vendored::RawRecord;
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashSet};
@@ -26,8 +25,8 @@ use std::path::PathBuf;
 use crate::commands::command::Command;
 use crate::commands::common::{BamIoOptions, CompressionOptions};
 
-/// MI tag for molecular identifier
-const MI_TAG: Tag = Tag::new(b'M', b'I');
+/// MI tag represented as `(integer_value, is_A_suffix)`.
+type MiTag = (u64, bool);
 
 /// Downsample a BAM file by UMI family using streaming.
 ///
@@ -124,8 +123,8 @@ impl Command for Downsample {
             None => rand::make_rng(),
         };
 
-        // Open input BAM
-        let (mut reader, header) = create_bam_reader(&self.io.input, 1)?;
+        // Open input BAM using raw byte reader
+        let (mut raw_reader, header) = create_raw_bam_reader(&self.io.input, 1)?;
 
         // Validate header - input must be template-coordinate sorted (output from group)
         if !is_template_coordinate_sorted(&header) {
@@ -144,17 +143,17 @@ impl Command for Downsample {
             command_line,
         )?;
 
-        // Create output BAM writer (single-threaded, downsample doesn't have threads parameter)
+        // Create output raw BAM writer (single-threaded)
         let mut writer =
-            create_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
+            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
 
         // Create optional rejects writer
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects.as_ref(),
-            &header,
-            1,
-            self.compression.compression_level,
-        )?;
+        let mut rejects_writer = match self.rejects.as_ref() {
+            Some(path) => {
+                Some(create_raw_bam_writer(path, &header, 1, self.compression.compression_level)?)
+            }
+            None => None,
+        };
 
         // Statistics
         let mut total_families: u64 = 0;
@@ -169,12 +168,21 @@ impl Command for Downsample {
         let mut hist_rejected: BTreeMap<usize, u64> = BTreeMap::new();
 
         // For MI order validation
-        let mut seen_mis: HashSet<String> = HashSet::new();
+        let mut seen_mis: HashSet<MiTag> = HashSet::new();
 
         info!("Processing reads...");
 
+        // Create raw byte iterator
+        let record_iter = std::iter::from_fn(move || {
+            let mut record = RawRecord::new();
+            match raw_reader.read_record(&mut record) {
+                Ok(0) => None, // EOF
+                Ok(_) => Some(Ok(record.into_inner())),
+                Err(e) => Some(Err(e.into())),
+            }
+        });
+
         // Process families using streaming iteration
-        let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
         let mut family_iter = FamilyIterator::new(record_iter);
 
         while let Some(family_result) = family_iter.next_family()? {
@@ -186,7 +194,8 @@ impl Command for Downsample {
             if self.validate_mi_order {
                 if seen_mis.contains(&mi) {
                     bail!(
-                        "MI tag '{mi}' seen non-consecutively. Input BAM may not be properly grouped by MI."
+                        "MI tag '{}' seen non-consecutively. Input BAM may not be properly grouped by MI.",
+                        format_mi(mi),
                     );
                 }
                 seen_mis.insert(mi);
@@ -204,7 +213,7 @@ impl Command for Downsample {
                 *hist_kept.entry(family_size).or_insert(0) += 1;
 
                 for record in &family {
-                    writer.write_alignment_record(&header, record)?;
+                    writer.write_raw_record(record)?;
                 }
             } else {
                 rejected_reads += family_size as u64;
@@ -212,7 +221,7 @@ impl Command for Downsample {
 
                 if let Some(ref mut rw) = rejects_writer {
                     for record in &family {
-                        rw.write_alignment_record(&header, record)?;
+                        rw.write_raw_record(record)?;
                     }
                 }
             }
@@ -220,6 +229,12 @@ impl Command for Downsample {
         }
 
         progress.log_final();
+
+        // Finish writers
+        writer.finish()?;
+        if let Some(rw) = rejects_writer {
+            rw.finish()?;
+        }
 
         // Write histograms
         if let Some(ref path) = self.histogram_kept {
@@ -264,19 +279,33 @@ fn write_histogram(histogram: &BTreeMap<usize, u64>, path: &PathBuf) -> Result<(
     Ok(())
 }
 
-/// Iterator that groups consecutive records by MI tag.
+/// Format an MI tag tuple as a human-readable string for error messages.
+fn format_mi(mi: MiTag) -> String {
+    if mi.1 { mi.0.to_string() } else { format!("{}/B", mi.0) }
+}
+
+/// Extract the MI tag value from raw BAM record bytes.
+fn get_mi_tag_raw(bam: &[u8]) -> Result<MiTag> {
+    let aux = bam_fields::aux_data_slice(bam);
+    bam_fields::find_mi_tag(aux).ok_or_else(|| {
+        let name = String::from_utf8_lossy(bam_fields::read_name(bam));
+        anyhow::anyhow!("Read '{name}' is missing required MI tag")
+    })
+}
+
+/// Iterator that groups consecutive raw BAM records by MI tag.
 ///
 /// This provides streaming iteration over UMI families without loading the entire BAM into memory.
 struct FamilyIterator<I>
 where
-    I: Iterator<Item = Result<RecordBuf>>,
+    I: Iterator<Item = Result<Vec<u8>>>,
 {
     records: std::iter::Peekable<I>,
 }
 
 impl<I> FamilyIterator<I>
 where
-    I: Iterator<Item = Result<RecordBuf>>,
+    I: Iterator<Item = Result<Vec<u8>>>,
 {
     fn new(records: I) -> Self {
         Self { records: records.peekable() }
@@ -284,33 +313,31 @@ where
 
     /// Get the next family of records sharing the same MI tag.
     ///
-    /// Returns `Ok(Some((mi_tag`, records))) for each family, or Ok(None) when exhausted.
-    fn next_family(&mut self) -> Result<Option<(String, Vec<RecordBuf>)>> {
-        // Peek at the first record to get the MI tag
-        let mi = match self.records.peek() {
-            Some(Ok(record)) => get_mi_tag(record)?,
+    /// Returns `Ok(Some((mi_tag, records)))` for each family, or `Ok(None)` when exhausted.
+    fn next_family(&mut self) -> Result<Option<(MiTag, Vec<Vec<u8>>)>> {
+        // Consume the first record to get the family's MI tag
+        let first = match self.records.peek() {
+            Some(Ok(_)) => self.records.next().unwrap()?,
             Some(Err(_)) => {
-                // Consume the error
                 return Err(self.records.next().unwrap().unwrap_err());
             }
             None => return Ok(None),
         };
+        let mi = get_mi_tag_raw(&first)?;
 
-        // Collect all records with the same MI tag
-        let mut family = Vec::new();
+        // Collect all remaining records with the same MI tag
+        let mut family = vec![first];
 
         while let Some(peek_result) = self.records.peek() {
             match peek_result {
                 Ok(record) => {
-                    let record_mi = get_mi_tag(record)?;
+                    let record_mi = get_mi_tag_raw(record)?;
                     if record_mi != mi {
                         break;
                     }
-                    // Consume the record
                     family.push(self.records.next().unwrap()?);
                 }
                 Err(_) => {
-                    // Consume and return the error
                     return Err(self.records.next().unwrap().unwrap_err());
                 }
             }
@@ -320,84 +347,157 @@ where
     }
 }
 
-/// Extract the MI tag value from a record.
-fn get_mi_tag(record: &RecordBuf) -> Result<String> {
-    let mi = record.data().get(&MI_TAG).ok_or_else(|| {
-        let name = record.name().map_or_else(
-            || "<unknown>".to_string(),
-            |n| String::from_utf8_lossy(n.as_ref()).to_string(),
-        );
-        anyhow::anyhow!("Read '{name}' is missing required MI tag")
-    })?;
-
-    // MI tag can be an integer or string
-    use noodles::sam::alignment::record_buf::data::field::Value;
-    match mi {
-        Value::Int8(v) => Ok(v.to_string()),
-        Value::UInt8(v) => Ok(v.to_string()),
-        Value::Int16(v) => Ok(v.to_string()),
-        Value::UInt16(v) => Ok(v.to_string()),
-        Value::Int32(v) => Ok(v.to_string()),
-        Value::UInt32(v) => Ok(v.to_string()),
-        Value::String(s) => Ok(s.to_string()),
-        _ => bail!("Unexpected MI tag type"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::sam::builder::RecordBuilder;
 
-    /// Create a test record with an MI tag
-    fn create_test_record(name: &str, mi: &str) -> RecordBuf {
-        RecordBuilder::new().name(name).tag("MI", mi).build()
+    /// Create a minimal raw BAM record with an MI:Z string tag.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_raw_record_with_mi(name: &str, mi: &str) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
+        let mut record = vec![0u8; 32];
+
+        // refID = -1 (unmapped)
+        record[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        // pos = -1
+        record[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        // l_read_name
+        record[8] = l_read_name;
+        // flag = 4 (unmapped)
+        record[14..16].copy_from_slice(&4u16.to_le_bytes());
+        // next_refID = -1
+        record[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        // next_pos = -1
+        record[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+
+        // Read name + null terminator
+        record.extend_from_slice(name.as_bytes());
+        record.push(0);
+
+        // No CIGAR, no seq, no qual (all lengths are 0)
+
+        // MI:Z:value\0
+        record.extend_from_slice(b"MI");
+        record.push(b'Z');
+        record.extend_from_slice(mi.as_bytes());
+        record.push(0);
+
+        record
     }
 
-    /// Create a test record with an integer MI tag
-    fn create_test_record_int_mi(name: &str, mi: i32) -> RecordBuf {
-        RecordBuilder::new().name(name).tag("MI", mi).build()
+    /// Create a minimal raw BAM record with an MI:i (int32) tag.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_raw_record_with_int_mi(name: &str, mi: i32) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8;
+        let mut record = vec![0u8; 32];
+
+        record[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        record[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        record[8] = l_read_name;
+        record[14..16].copy_from_slice(&4u16.to_le_bytes());
+        record[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        record[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+
+        record.extend_from_slice(name.as_bytes());
+        record.push(0);
+
+        // MI:i:value (32-bit signed int)
+        record.extend_from_slice(b"MI");
+        record.push(b'i');
+        record.extend_from_slice(&mi.to_le_bytes());
+
+        record
     }
 
-    /// Create a test record without an MI tag
-    fn create_test_record_no_mi(name: &str) -> RecordBuf {
-        RecordBuilder::new().name(name).build()
+    /// Create a minimal raw BAM record without an MI tag.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_raw_record_no_mi(name: &str) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8;
+        let mut record = vec![0u8; 32];
+
+        record[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        record[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        record[8] = l_read_name;
+        record[14..16].copy_from_slice(&4u16.to_le_bytes());
+        record[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        record[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+
+        record.extend_from_slice(name.as_bytes());
+        record.push(0);
+
+        record
     }
 
     #[test]
     fn test_get_mi_tag_string() {
-        let record = create_test_record("read1", "12345");
-        let mi = get_mi_tag(&record).unwrap();
-        assert_eq!(mi, "12345");
+        let record = create_raw_record_with_mi("read1", "12345");
+        let mi = get_mi_tag_raw(&record).unwrap();
+        assert_eq!(mi, (12345, true));
     }
 
     #[test]
     fn test_get_mi_tag_integer() {
-        let record = create_test_record_int_mi("read1", 42);
-        let mi = get_mi_tag(&record).unwrap();
-        assert_eq!(mi, "42");
+        let record = create_raw_record_with_int_mi("read1", 42);
+        let mi = get_mi_tag_raw(&record).unwrap();
+        assert_eq!(mi, (42, true));
+    }
+
+    #[test]
+    fn test_get_mi_tag_string_with_a_suffix() {
+        let record = create_raw_record_with_mi("read1", "100/A");
+        let mi = get_mi_tag_raw(&record).unwrap();
+        assert_eq!(mi, (100, true));
+    }
+
+    #[test]
+    fn test_get_mi_tag_string_with_b_suffix() {
+        let record = create_raw_record_with_mi("read1", "100/B");
+        let mi = get_mi_tag_raw(&record).unwrap();
+        assert_eq!(mi, (100, false));
+    }
+
+    #[test]
+    fn test_family_iterator_a_b_suffixes_same_family() {
+        // Records with same numeric ID but different suffixes have different MiTags
+        let records: Vec<Result<Vec<u8>>> = vec![
+            Ok(create_raw_record_with_mi("r1", "100/A")),
+            Ok(create_raw_record_with_mi("r2", "100/A")),
+            Ok(create_raw_record_with_mi("r3", "100/B")),
+        ];
+
+        let mut iter = FamilyIterator::new(records.into_iter());
+
+        let family1 = iter.next_family().unwrap().unwrap();
+        assert_eq!(family1.0, (100, true)); // /A
+        assert_eq!(family1.1.len(), 2);
+
+        let family2 = iter.next_family().unwrap().unwrap();
+        assert_eq!(family2.0, (100, false)); // /B
+        assert_eq!(family2.1.len(), 1);
+
+        assert!(iter.next_family().unwrap().is_none());
     }
 
     #[test]
     fn test_get_mi_tag_missing() {
-        let record = create_test_record_no_mi("read1");
-        let result = get_mi_tag(&record);
+        let record = create_raw_record_no_mi("read1");
+        let result = get_mi_tag_raw(&record);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing required MI tag"));
     }
 
     #[test]
     fn test_family_iterator_single_family() {
-        let records = vec![
-            Ok(create_test_record("r1", "100")),
-            Ok(create_test_record("r2", "100")),
-            Ok(create_test_record("r3", "100")),
+        let records: Vec<Result<Vec<u8>>> = vec![
+            Ok(create_raw_record_with_mi("r1", "100")),
+            Ok(create_raw_record_with_mi("r2", "100")),
+            Ok(create_raw_record_with_mi("r3", "100")),
         ];
 
         let mut iter = FamilyIterator::new(records.into_iter());
 
         let family1 = iter.next_family().unwrap().unwrap();
-        assert_eq!(family1.0, "100");
+        assert_eq!(family1.0, (100, true));
         assert_eq!(family1.1.len(), 3);
 
         let family2 = iter.next_family().unwrap();
@@ -406,27 +506,27 @@ mod tests {
 
     #[test]
     fn test_family_iterator_multiple_families() {
-        let records = vec![
-            Ok(create_test_record("r1", "100")),
-            Ok(create_test_record("r2", "100")),
-            Ok(create_test_record("r3", "200")),
-            Ok(create_test_record("r4", "200")),
-            Ok(create_test_record("r5", "200")),
-            Ok(create_test_record("r6", "300")),
+        let records: Vec<Result<Vec<u8>>> = vec![
+            Ok(create_raw_record_with_mi("r1", "100")),
+            Ok(create_raw_record_with_mi("r2", "100")),
+            Ok(create_raw_record_with_mi("r3", "200")),
+            Ok(create_raw_record_with_mi("r4", "200")),
+            Ok(create_raw_record_with_mi("r5", "200")),
+            Ok(create_raw_record_with_mi("r6", "300")),
         ];
 
         let mut iter = FamilyIterator::new(records.into_iter());
 
         let family1 = iter.next_family().unwrap().unwrap();
-        assert_eq!(family1.0, "100");
+        assert_eq!(family1.0, (100, true));
         assert_eq!(family1.1.len(), 2);
 
         let family2 = iter.next_family().unwrap().unwrap();
-        assert_eq!(family2.0, "200");
+        assert_eq!(family2.0, (200, true));
         assert_eq!(family2.1.len(), 3);
 
         let family3 = iter.next_family().unwrap().unwrap();
-        assert_eq!(family3.0, "300");
+        assert_eq!(family3.0, (300, true));
         assert_eq!(family3.1.len(), 1);
 
         let family4 = iter.next_family().unwrap();
@@ -435,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_family_iterator_empty() {
-        let records: Vec<Result<RecordBuf>> = vec![];
+        let records: Vec<Result<Vec<u8>>> = vec![];
         let mut iter = FamilyIterator::new(records.into_iter());
 
         let family = iter.next_family().unwrap();
@@ -574,5 +674,12 @@ mod tests {
         // BTreeMap maintains sorted order
         let sizes: Vec<usize> = hist.keys().copied().collect();
         assert_eq!(sizes, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_format_mi() {
+        assert_eq!(format_mi((100, true)), "100");
+        assert_eq!(format_mi((100, false)), "100/B");
+        assert_eq!(format_mi((0, true)), "0");
     }
 }
