@@ -32,9 +32,50 @@
 //! - [`record_utils::num_bases_extending_past_mate`] - Calculate overlap with mate
 //! - [`record_utils::parse_cigar_string`] - Parse CIGAR string to operations
 
+pub mod alignment_tags;
 pub mod builder;
 pub mod clipper;
 pub mod record_utils;
+
+/// Abstraction over reference genome access for alignment tag calculation.
+///
+/// This trait allows alignment tag functions to work with any reference
+/// provider without pulling in heavy dependencies like FASTA file I/O.
+///
+/// A blanket implementation is provided for all types that dereference to a
+/// `ReferenceProvider` (e.g., `Arc<T>`, `Box<T>`, `&T`), so callers can pass
+/// smart pointers directly.
+pub trait ReferenceProvider {
+    /// Fetches a subsequence from the reference genome.
+    ///
+    /// # Arguments
+    /// * `chrom` - Chromosome/sequence name (e.g., "chr1")
+    /// * `start` - Start position (1-based, inclusive)
+    /// * `end` - End position (1-based, inclusive)
+    ///
+    /// # Errors
+    /// Returns an error if the chromosome is not found or the region is out of bounds.
+    fn fetch(
+        &self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<Vec<u8>>;
+}
+
+impl<T: std::ops::Deref> ReferenceProvider for T
+where
+    T::Target: ReferenceProvider,
+{
+    fn fetch(
+        &self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.deref().fetch(chrom, start, end)
+    }
+}
 
 // Re-export commonly used items from submodules for convenience
 pub use builder::{

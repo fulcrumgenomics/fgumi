@@ -8,11 +8,15 @@ license = "MIT"
 
 [dependencies]
 noodles = { version = "0.104.0", features = ["bam", "sam", "core"] }
+noodles-raw-bam = { path = "../noodles-raw-bam", features = ["noodles"] }
 bstr = "1.12.1"
 log = "0"
 anyhow = "1.0"
 fgumi-dna = { path = "../fgumi-dna" }
 tempfile = "3.3.0"
+
+[dev-dependencies]
+noodles-raw-bam = { path = "../noodles-raw-bam", features = ["test-utils"] }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

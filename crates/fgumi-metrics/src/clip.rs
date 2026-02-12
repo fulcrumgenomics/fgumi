@@ -7,7 +7,7 @@ use noodles::sam::alignment::record::Cigar;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use serde::{Deserialize, Serialize};
 
-use super::Metric;
+use crate::Metric;
 
 /// Type of read for metrics tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,7 +256,7 @@ impl Default for ClippingMetricsCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_sam::builder::RecordBuilder;
 
     /// Creates a test record with the given CIGAR string.
     /// Sequence and qualities are auto-generated from CIGAR length.

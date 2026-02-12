@@ -1,9 +1,10 @@
 //! SAM/BAM file utilities and header manipulation.
 //!
-//! This module re-exports functionality from the `fgumi-sam` crate and provides
+//! This module re-exports functionality from the `fgumi-sam` crate, including
 //! alignment tag regeneration via the `alignment_tags` submodule.
 
-pub mod alignment_tags;
+// Re-export alignment_tags from fgumi-sam
+pub use fgumi_sam::alignment_tags;
 
 // Re-export modules from fgumi-sam
 pub use fgumi_sam::{builder, record_utils};

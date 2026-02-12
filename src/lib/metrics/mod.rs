@@ -17,14 +17,12 @@
 pub use fgumi_metrics::{FLOAT_PRECISION, Metric, ProcessingMetrics, format_float};
 
 // Re-export submodules for path compatibility (e.g. fgumi_lib::metrics::consensus::ConsensusMetrics)
+pub use fgumi_metrics::clip;
 pub use fgumi_metrics::consensus;
 pub use fgumi_metrics::correct;
 pub use fgumi_metrics::duplex;
 pub use fgumi_metrics::group;
 pub use fgumi_metrics::writer;
-
-// Clip module stays in main crate (depends on noodles RecordBuf)
-pub mod clip;
 
 // Re-export commonly used types
 pub use clip::{ClippingMetrics, ClippingMetricsCollection, ReadType};
