@@ -343,10 +343,11 @@ impl DuplexMetricsCollector {
     /// * `error_count` - Number of raw observations that had errors (differed from consensus)
     /// * `is_unique` - Whether this is a unique family observation
     pub fn record_umi(&mut self, umi: &str, raw_count: usize, error_count: usize, is_unique: bool) {
-        *self.umi_raw_counts.entry(umi.to_string()).or_insert(0) += raw_count;
-        *self.umi_raw_error_counts.entry(umi.to_string()).or_insert(0) += error_count;
+        let key = umi.to_string();
+        *self.umi_raw_counts.entry(key.clone()).or_insert(0) += raw_count;
+        *self.umi_raw_error_counts.entry(key.clone()).or_insert(0) += error_count;
         if is_unique {
-            *self.umi_unique_counts.entry(umi.to_string()).or_insert(0) += 1;
+            *self.umi_unique_counts.entry(key).or_insert(0) += 1;
         }
     }
 
@@ -367,10 +368,11 @@ impl DuplexMetricsCollector {
         if !self.collect_duplex_umi_counts {
             return;
         }
-        *self.duplex_umi_raw_counts.entry(umi.to_string()).or_insert(0) += raw_count;
-        *self.duplex_umi_raw_error_counts.entry(umi.to_string()).or_insert(0) += error_count;
+        let key = umi.to_string();
+        *self.duplex_umi_raw_counts.entry(key.clone()).or_insert(0) += raw_count;
+        *self.duplex_umi_raw_error_counts.entry(key.clone()).or_insert(0) += error_count;
         if is_unique {
-            *self.duplex_umi_unique_counts.entry(umi.to_string()).or_insert(0) += 1;
+            *self.duplex_umi_unique_counts.entry(key).or_insert(0) += 1;
         }
     }
 
@@ -474,17 +476,37 @@ impl DuplexMetricsCollector {
 
         // Calculate 2D cumulative fractions: fraction of families with AB >= ab AND BA >= ba
         // This matches fgbio's definition in DuplexFamilySizeMetric
-        for metric in &mut metrics {
-            let cumulative_count: usize = self
-                .duplex_family_sizes
-                .iter()
-                .filter(|((a, b), _)| *a >= metric.ab_size && *b >= metric.ba_size)
-                .map(|(_, count)| count)
-                .sum();
-            #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-            {
-                metric.fraction_gt_or_eq_size =
-                    if total > 0 { cumulative_count as f64 / total as f64 } else { 0.0 };
+        //
+        // Build a 2D suffix sum grid to avoid O(n²) per-metric iteration.
+        if total > 0 {
+            let max_ab = self.duplex_family_sizes.keys().map(|(a, _)| *a).max().unwrap_or(0);
+            let max_ba = self.duplex_family_sizes.keys().map(|(_, b)| *b).max().unwrap_or(0);
+            let cols = max_ba + 1;
+            let mut grid = vec![0usize; (max_ab + 1) * cols];
+            for (&(a, b), &count) in &self.duplex_family_sizes {
+                grid[a * cols + b] = count;
+            }
+            // Accumulate suffix sums: first along ba (columns right-to-left),
+            // then along ab (rows bottom-to-top)
+            for a in 0..=max_ab {
+                for b in (0..max_ba).rev() {
+                    grid[a * cols + b] += grid[a * cols + b + 1];
+                }
+            }
+            for b in 0..=max_ba {
+                for a in (0..max_ab).rev() {
+                    grid[a * cols + b] += grid[(a + 1) * cols + b];
+                }
+            }
+            for metric in &mut metrics {
+                let cumulative_count = grid[metric.ab_size * cols + metric.ba_size];
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "metric counts never exceed 2^53"
+                )]
+                {
+                    metric.fraction_gt_or_eq_size = cumulative_count as f64 / total as f64;
+                }
             }
         }
 
