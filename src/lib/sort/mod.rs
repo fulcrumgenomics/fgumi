@@ -11,7 +11,7 @@
 //! - **Lazy decoding**: Only parses fields needed for sort key extraction
 //! - **Parallel sorting**: Uses rayon for in-memory parallel sort
 //! - **Buffer recycling**: Reuses buffers via channel-based allocation patterns
-//! - **Fast compression**: Uses libdeflate or ISA-L for temporary file compression
+//! - **Fast compression**: Uses libdeflate for temporary file compression
 //!
 //! # Architecture
 //!

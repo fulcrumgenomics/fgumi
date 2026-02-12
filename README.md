@@ -99,17 +99,7 @@ cargo build --release
 | `compare` | Developer tools for comparing BAMs and metrics |
 | `simulate` | Commands for generating synthetic test data |
 | `profile-adjacency` | Enable profiling output for adjacency UMI assigner |
-| `isal` | Use ISA-L/igzip for BGZF compression (benchmarking) |
-
 Enable with: `cargo build --release --features <feature>`
-
-**Note:** The `isal` feature requires the vendored submodule. Clone with submodules:
-
-```
-git clone --recursive https://github.com/fulcrumgenomics/fgumi
-```
-
-Or initialize after cloning: `git submodule update --init`
 
 ## Available Tools
 
@@ -253,7 +243,7 @@ fgumi is written in Rust for maximum performance.
 - **2-bit DNA encoding**: 4 bases in 1 byte, 32 bases in u64
 - **CPU intrinsics**: XOR + popcount for Hamming distance
 - **Work-stealing scheduler**: Unified pipeline with dynamic load balancing
-- **libdeflate**: Fast BGZF compression (optional ISA-L)
+- **libdeflate**: Fast BGZF compression
 
 ## Acknowledgements
 

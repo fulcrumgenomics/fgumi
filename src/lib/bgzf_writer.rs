@@ -4,11 +4,8 @@
 //! Each worker thread compresses data inline using `InlineBgzfCompressor`, producing
 //! `CompressedBlock` instances that can be written directly to output.
 //!
-//! Two compression backends are available:
-//! - **libdeflate** (default): High-performance deflate implementation
-//! - **ISA-L/igzip** (feature `isal`): Intel's optimized compression library
+//! Uses libdeflate (via the `bgzf` crate) for high-performance BGZF compression.
 
-#[cfg(not(feature = "isal"))]
 use bgzf::{CompressionLevel, Compressor as BgzfCompressor};
 use std::io;
 
@@ -17,16 +14,7 @@ use std::io;
 // ============================================================================
 
 /// Maximum uncompressed size for a BGZF block (64KB - header/footer overhead).
-#[cfg(not(feature = "isal"))]
 const BGZF_MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
-
-#[cfg(feature = "isal")]
-const BGZF_MAX_BLOCK_SIZE: usize = 65280;
-
-#[cfg(feature = "isal")]
-const BGZF_HEADER_SIZE: usize = 18;
-#[cfg(feature = "isal")]
-const BGZF_FOOTER_SIZE: usize = 8;
 
 // ============================================================================
 // Block types
@@ -63,7 +51,6 @@ pub struct CompressedBlock {
 /// compressor.flush()?;
 /// let blocks = compressor.take_blocks();
 /// ```
-#[cfg(not(feature = "isal"))]
 pub struct InlineBgzfCompressor {
     /// Buffer accumulating uncompressed data (up to 64KB).
     buffer: Vec<u8>,
@@ -75,19 +62,6 @@ pub struct InlineBgzfCompressor {
     buffer_pool: Vec<Vec<u8>>,
 }
 
-#[cfg(feature = "isal")]
-pub struct InlineBgzfCompressor {
-    /// Buffer accumulating uncompressed data (up to 64KB).
-    buffer: Vec<u8>,
-    /// ISA-L compression level.
-    compression_level: isal::CompressionLevel,
-    /// Completed compressed blocks ready to return.
-    completed_blocks: Vec<CompressedBlock>,
-    /// Pool of reusable compression buffers.
-    buffer_pool: Vec<Vec<u8>>,
-}
-
-#[cfg(not(feature = "isal"))]
 impl InlineBgzfCompressor {
     /// Create a new inline compressor with the specified compression level.
     ///
@@ -234,148 +208,6 @@ impl InlineBgzfCompressor {
         self.completed_blocks.push(CompressedBlock { serial: 0, data: compressed_data });
 
         // Reset buffer for next block
-        self.buffer.clear();
-
-        Ok(())
-    }
-}
-
-// ============================================================================
-// ISA-L Implementation
-// ============================================================================
-
-#[cfg(feature = "isal")]
-impl InlineBgzfCompressor {
-    /// Create a new inline compressor with the specified compression level.
-    #[must_use]
-    pub fn new(compression_level: u32) -> Self {
-        // ISA-L supports levels 0 (none), 1 (fast), 3 (best)
-        let level = match compression_level {
-            0 => isal::CompressionLevel::Zero,
-            1 => isal::CompressionLevel::One,
-            _ => isal::CompressionLevel::Three,
-        };
-        Self {
-            buffer: Vec::with_capacity(BGZF_MAX_BLOCK_SIZE),
-            compression_level: level,
-            completed_blocks: Vec::new(),
-            buffer_pool: Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn buffer_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.buffer
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn buffer_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    #[inline]
-    pub fn maybe_compress(&mut self) -> io::Result<bool> {
-        if self.buffer.len() >= BGZF_MAX_BLOCK_SIZE {
-            self.compress_current_buffer()?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        let mut offset = 0;
-        while offset < data.len() {
-            let remaining_in_buffer = BGZF_MAX_BLOCK_SIZE - self.buffer.len();
-            let to_copy = remaining_in_buffer.min(data.len() - offset);
-            self.buffer.extend_from_slice(&data[offset..offset + to_copy]);
-            offset += to_copy;
-            if self.buffer.len() >= BGZF_MAX_BLOCK_SIZE {
-                self.compress_current_buffer()?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            self.compress_current_buffer()?;
-        }
-        Ok(())
-    }
-
-    pub fn take_blocks(&mut self) -> Vec<CompressedBlock> {
-        std::mem::take(&mut self.completed_blocks)
-    }
-
-    pub fn write_blocks_to<W: io::Write + ?Sized>(&mut self, output: &mut W) -> io::Result<()> {
-        for block in self.completed_blocks.drain(..) {
-            output.write_all(&block.data)?;
-            let mut buf = block.data;
-            buf.clear();
-            self.buffer_pool.push(buf);
-        }
-        Ok(())
-    }
-
-    pub fn recycle_blocks(&mut self, blocks: Vec<CompressedBlock>) {
-        for block in blocks {
-            let mut buf = block.data;
-            buf.clear();
-            self.buffer_pool.push(buf);
-        }
-    }
-
-    fn compress_current_buffer(&mut self) -> io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let mut block_data = self.buffer_pool.pop().unwrap_or_default();
-        block_data.clear();
-
-        // Reserve space for header + compressed data + footer
-        let max_compressed = self.buffer.len() + (self.buffer.len() / 10) + 128;
-        block_data.resize(BGZF_HEADER_SIZE + max_compressed + BGZF_FOOTER_SIZE, 0);
-
-        // Compress using ISA-L with raw deflate
-        let compressed_size = isal::compress_into(
-            &self.buffer,
-            &mut block_data[BGZF_HEADER_SIZE..],
-            self.compression_level,
-            isal::Codec::Deflate,
-        )
-        .map_err(|e| io::Error::other(format!("ISA-L compression failed: {e}")))?;
-
-        // Calculate CRC32 of uncompressed data
-        let crc = crc32fast::hash(&self.buffer);
-
-        // Build BGZF header
-        let total_block_size = BGZF_HEADER_SIZE + compressed_size + BGZF_FOOTER_SIZE;
-        let bsize = (total_block_size - 1) as u16;
-
-        block_data[0] = 0x1f; // Magic byte 1
-        block_data[1] = 0x8b; // Magic byte 2
-        block_data[2] = 0x08; // Compression method (deflate)
-        block_data[3] = 0x04; // Flags (FEXTRA)
-        block_data[4..8].copy_from_slice(&[0, 0, 0, 0]); // MTIME
-        block_data[8] = 0x04; // XFL (fastest compression hint)
-        block_data[9] = 0xff; // OS (unknown)
-        block_data[10..12].copy_from_slice(&6u16.to_le_bytes()); // XLEN
-        block_data[12] = b'B'; // Subfield ID1
-        block_data[13] = b'C'; // Subfield ID2
-        block_data[14..16].copy_from_slice(&2u16.to_le_bytes()); // Subfield length
-        block_data[16..18].copy_from_slice(&bsize.to_le_bytes()); // BSIZE
-
-        // Footer: CRC32 + ISIZE
-        let footer_start = BGZF_HEADER_SIZE + compressed_size;
-        block_data[footer_start..footer_start + 4].copy_from_slice(&crc.to_le_bytes());
-        block_data[footer_start + 4..footer_start + 8]
-            .copy_from_slice(&(self.buffer.len() as u32).to_le_bytes());
-
-        block_data.truncate(total_block_size);
-        self.completed_blocks.push(CompressedBlock { serial: 0, data: block_data });
         self.buffer.clear();
 
         Ok(())
