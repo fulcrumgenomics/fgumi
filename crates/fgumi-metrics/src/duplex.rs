@@ -276,10 +276,6 @@ impl Metric for DuplexUmiMetric {
 ///
 /// Tracks family sizes, UMI frequencies, and yields at multiple sampling levels.
 pub struct DuplexMetricsCollector {
-    /// Minimum AB reads for duplex
-    _min_ab_reads: usize,
-    /// Minimum BA reads for duplex
-    _min_ba_reads: usize,
     /// Whether to collect duplex UMI counts (memory intensive)
     collect_duplex_umi_counts: bool,
 
@@ -296,18 +292,13 @@ pub struct DuplexMetricsCollector {
     duplex_umi_raw_counts: HashMap<String, usize>,
     duplex_umi_raw_error_counts: HashMap<String, usize>,
     duplex_umi_unique_counts: HashMap<String, usize>,
-
-    // Yield metrics at different sampling fractions
-    yield_metrics: Vec<DuplexYieldMetric>,
 }
 
 impl DuplexMetricsCollector {
     /// Creates a new metrics collector
     #[must_use]
-    pub fn new(min_ab_reads: usize, min_ba_reads: usize, collect_duplex_umi_counts: bool) -> Self {
+    pub fn new(collect_duplex_umi_counts: bool) -> Self {
         Self {
-            _min_ab_reads: min_ab_reads,
-            _min_ba_reads: min_ba_reads,
             collect_duplex_umi_counts,
             cs_family_sizes: HashMap::new(),
             ss_family_sizes: HashMap::new(),
@@ -319,7 +310,6 @@ impl DuplexMetricsCollector {
             duplex_umi_raw_counts: HashMap::new(),
             duplex_umi_raw_error_counts: HashMap::new(),
             duplex_umi_unique_counts: HashMap::new(),
-            yield_metrics: Vec::new(),
         }
     }
 
@@ -604,11 +594,6 @@ impl DuplexMetricsCollector {
         metrics
     }
 
-    /// Returns the yield metrics collected at different sampling fractions
-    #[must_use]
-    pub fn yield_metrics(&self) -> &[DuplexYieldMetric] {
-        &self.yield_metrics
-    }
 }
 
 #[cfg(test)]
@@ -708,14 +693,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_collector_new() {
-        let collector = DuplexMetricsCollector::new(1, 1, true);
-        assert!(collector.yield_metrics().is_empty());
-    }
-
-    #[test]
     fn test_record_cs_family() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         collector.record_cs_family(5);
         collector.record_cs_family(5);
         collector.record_cs_family(10);
@@ -731,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_record_ss_family() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         collector.record_ss_family(3);
         collector.record_ss_family(3);
         collector.record_ss_family(3);
@@ -743,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_record_ds_family() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         collector.record_ds_family(2);
 
         let metrics = collector.family_size_metrics();
@@ -753,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_record_duplex_family_normalization() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         // Record with ab < ba - should be normalized
         collector.record_duplex_family(3, 5);
         // Record with ab > ba - already normalized
@@ -769,7 +748,7 @@ mod tests {
 
     #[test]
     fn test_record_umi() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         collector.record_umi("AAAA", 10, 2, true);
         collector.record_umi("AAAA", 5, 1, false); // Not unique
         collector.record_umi("CCCC", 8, 0, true);
@@ -789,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_record_duplex_umi_disabled() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false); // Disabled
+        let mut collector = DuplexMetricsCollector::new(false); // Disabled
         collector.record_duplex_umi("AAAA-TTTT", 10, 0, true);
 
         let umi_metrics = collector.umi_metrics();
@@ -799,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_record_duplex_umi_enabled() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, true); // Enabled
+        let mut collector = DuplexMetricsCollector::new(true); // Enabled
         collector.record_duplex_umi("AAAA-TTTT", 10, 2, true);
 
         // Need to also record individual UMIs for expected calculation
@@ -815,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_family_size_metrics_fractions() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         // 4 families total: 2 size-1, 1 size-2, 1 size-3
         collector.record_cs_family(1);
         collector.record_cs_family(1);
@@ -837,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_duplex_family_size_metrics_sorting() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         collector.record_duplex_family(5, 3);
         collector.record_duplex_family(2, 1);
         collector.record_duplex_family(5, 2);
@@ -854,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_umi_metrics_sorting() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, false);
+        let mut collector = DuplexMetricsCollector::new(false);
         collector.record_umi("ZZZZ", 1, 0, true);
         collector.record_umi("AAAA", 1, 0, true);
         collector.record_umi("MMMM", 1, 0, true);
@@ -868,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_duplex_umi_expected_frequency() {
-        let mut collector = DuplexMetricsCollector::new(1, 1, true);
+        let mut collector = DuplexMetricsCollector::new(true);
 
         // Individual UMIs with known frequencies
         collector.record_umi("AAAA", 10, 0, true);
@@ -888,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_empty_collector() {
-        let collector = DuplexMetricsCollector::new(1, 1, false);
+        let collector = DuplexMetricsCollector::new(false);
 
         let family_metrics = collector.family_size_metrics();
         assert!(family_metrics.is_empty());
@@ -898,12 +877,6 @@ mod tests {
 
         let umi_metrics = collector.umi_metrics();
         assert!(umi_metrics.is_empty());
-    }
-
-    #[test]
-    fn test_yield_metrics_empty() {
-        let collector = DuplexMetricsCollector::new(1, 1, false);
-        assert!(collector.yield_metrics().is_empty());
     }
 
     #[test]
