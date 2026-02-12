@@ -9,7 +9,7 @@ license = "MIT"
 [dependencies]
 ahash = "0.8"
 anyhow = "1.0"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1.10"
 fgumi-dna = { path = "../fgumi-dna" }
 
@@ -18,6 +18,8 @@ rstest = "0.25"
 proptest = "1"
 
 [features]
+default = ["cli"]
+cli = ["dep:clap"]
 profile-adjacency = []
 
 [lints.clippy]

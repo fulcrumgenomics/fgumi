@@ -215,7 +215,6 @@
 
 use ahash::AHashMap;
 use anyhow::Result;
-use clap::ValueEnum;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::any::Any;
@@ -511,7 +510,8 @@ pub const BOTTOM_STRAND_DUPLEX: &str = "/B";
 ///
 /// Determines how reads are grouped based on their UMI sequences. Each strategy makes
 /// different tradeoffs between speed, error tolerance, and grouping behavior.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Strategy {
     /// Only reads with identical UMI sequences are grouped together
     ///

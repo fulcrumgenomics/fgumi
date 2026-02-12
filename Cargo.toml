@@ -69,10 +69,13 @@ fgumi-bgzf = { path = "crates/fgumi-bgzf" }
 fgumi-metrics = { path = "crates/fgumi-metrics" }
 fgumi-sam = { path = "crates/fgumi-sam" }
 fgumi-umi = { path = "crates/fgumi-umi" }
-fgumi-consensus = { path = "crates/fgumi-consensus" }
+fgumi-consensus = { path = "crates/fgumi-consensus", default-features = false }
 
 [features]
-default = []
+default = ["simplex", "duplex", "codec"]
+simplex = ["fgumi-consensus/simplex"]
+duplex = ["fgumi-consensus/duplex"]
+codec = ["fgumi-consensus/codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
 memory-debug = ["dep:libmimalloc-sys", "dep:sysinfo"]
