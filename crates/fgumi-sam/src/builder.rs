@@ -655,9 +655,9 @@ impl<'a> PairBuilder<'a> {
             let pos1 = i32::try_from(self.start1.unwrap()).expect("start1 fits in i32");
             let pos2 = i32::try_from(self.start2.unwrap()).expect("start2 fits in i32");
             let end1 =
-                pos1 + i32::try_from(bases1.len()).expect("bases1 length fits in i32") - 1;
+                pos1 + i32::try_from(cigar_ref_len(&cigar1)).expect("cigar1 ref len fits in i32") - 1;
             let end2 =
-                pos2 + i32::try_from(bases2.len()).expect("bases2 length fits in i32") - 1;
+                pos2 + i32::try_from(cigar_ref_len(&cigar2)).expect("cigar2 ref len fits in i32") - 1;
 
             let (left, right) = if pos1 <= pos2 { (pos1, end2) } else { (pos2, end1) };
             let tlen = right - left + 1;
@@ -1685,9 +1685,9 @@ impl RecordPairBuilder {
             let pos1 = i32::try_from(self.r1_start.unwrap()).expect("r1_start fits in i32");
             let pos2 = i32::try_from(self.r2_start.unwrap()).expect("r2_start fits in i32");
             let end1 =
-                pos1 + i32::try_from(r1_seq.len()).expect("r1_seq length fits in i32") - 1;
+                pos1 + i32::try_from(cigar_ref_len(&r1_cigar)).expect("r1 cigar ref len fits in i32") - 1;
             let end2 =
-                pos2 + i32::try_from(r2_seq.len()).expect("r2_seq length fits in i32") - 1;
+                pos2 + i32::try_from(cigar_ref_len(&r2_cigar)).expect("r2 cigar ref len fits in i32") - 1;
 
             let (left, right) = if pos1 <= pos2 { (pos1, end2) } else { (pos2, end1) };
             let tlen = right - left + 1;
@@ -2058,6 +2058,54 @@ mod tests {
         // Template spans 100-113 = 14bp
         assert_eq!(read_one.template_length(), 14);
         assert_eq!(read_two.template_length(), -14);
+    }
+
+    #[test]
+    fn test_template_length_with_deletion() {
+        let mut builder = SamBuilder::new();
+        // R1: 4bp sequence with 2M2D2M = 6bp ref span (positions 100-105)
+        // R2: 4bp sequence with 4M = 4bp ref span (positions 110-113)
+        let (read_one, read_two) = builder
+            .add_pair()
+            .bases1("AAAA")
+            .cigar1("2M2D2M")
+            .bases2("CCCC")
+            .start1(100)
+            .start2(110)
+            .build();
+
+        // Template spans 100-113 = 14bp
+        assert_eq!(read_one.template_length(), 14);
+        assert_eq!(read_two.template_length(), -14);
+    }
+
+    #[test]
+    fn test_template_length_with_insertion() {
+        let mut builder = SamBuilder::new();
+        // R1: 6bp sequence with 2M2I2M = 4bp ref span (positions 100-103)
+        // R2: 4bp sequence at position 110 = 4bp ref span (positions 110-113)
+        let (read_one, read_two) = builder
+            .add_pair()
+            .bases1("AAAAAA")
+            .cigar1("2M2I2M")
+            .bases2("CCCC")
+            .start1(100)
+            .start2(110)
+            .build();
+
+        // Template spans 100-113 = 14bp (R1 ref span is 4, not 6)
+        assert_eq!(read_one.template_length(), 14);
+        assert_eq!(read_two.template_length(), -14);
+    }
+
+    #[test]
+    fn test_cigar_ref_len_simple() {
+        assert_eq!(cigar_ref_len("10M"), 10);
+        assert_eq!(cigar_ref_len("5M3I5M"), 10); // insertion doesn't consume ref
+        assert_eq!(cigar_ref_len("5M3D5M"), 13); // deletion consumes ref
+        assert_eq!(cigar_ref_len("2S5M3S"), 5); // soft clips don't consume ref
+        assert_eq!(cigar_ref_len("5M2N5M"), 12); // skip consumes ref
+        assert_eq!(cigar_ref_len("5=3X"), 8); // sequence match/mismatch consume ref
     }
 
     // ========================================================================
@@ -2440,6 +2488,23 @@ pub fn cigar_seq_len(cigar: &str) -> usize {
                     | noodles::sam::alignment::record::cigar::op::Kind::SoftClip
                     | noodles::sam::alignment::record::cigar::op::Kind::SequenceMatch
                     | noodles::sam::alignment::record::cigar::op::Kind::SequenceMismatch
+            )
+        })
+        .map(|op| op.len())
+        .sum()
+}
+
+/// Returns the reference (alignment) span consumed by a CIGAR string.
+///
+/// Counts bases consumed by reference-consuming operations: M, D, N, =, X.
+#[must_use]
+pub fn cigar_ref_len(cigar: &str) -> usize {
+    let ops = parse_cigar(cigar);
+    ops.iter()
+        .filter(|op| {
+            matches!(
+                op.kind(),
+                Kind::Match | Kind::Deletion | Kind::Skip | Kind::SequenceMatch | Kind::SequenceMismatch
             )
         })
         .map(|op| op.len())

@@ -60,6 +60,8 @@ pub struct InlineBgzfCompressor {
     completed_blocks: Vec<CompressedBlock>,
     /// Pool of reusable compression buffers.
     buffer_pool: Vec<Vec<u8>>,
+    /// Next serial number for block ordering.
+    next_serial: u64,
 }
 
 impl InlineBgzfCompressor {
@@ -85,6 +87,7 @@ impl InlineBgzfCompressor {
             compressor,
             completed_blocks: Vec::new(),
             buffer_pool: Vec::new(),
+            next_serial: 0,
         }
     }
 
@@ -225,8 +228,10 @@ impl InlineBgzfCompressor {
             .compress(&self.buffer, &mut compressed_data)
             .map_err(|e| io::Error::other(format!("BGZF compression failed: {e}")))?;
 
+        let serial = self.next_serial;
+        self.next_serial += 1;
         self.completed_blocks.push(CompressedBlock {
-            serial: 0,
+            serial,
             data: compressed_data,
         });
 
@@ -381,5 +386,28 @@ mod tests {
 
         // Should be empty since no data was written
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_serial_increments() {
+        let mut compressor = InlineBgzfCompressor::new(6);
+
+        // Write enough data to produce multiple blocks
+        let data = vec![b'X'; BGZF_MAX_BLOCK_SIZE + 100];
+        compressor.write_all(&data).unwrap();
+        compressor.flush().unwrap();
+
+        let blocks = compressor.take_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].serial, 0);
+        assert_eq!(blocks[1].serial, 1);
+
+        // Write another batch — serial should continue from where it left off
+        compressor.write_all(b"more data").unwrap();
+        compressor.flush().unwrap();
+
+        let blocks2 = compressor.take_blocks();
+        assert_eq!(blocks2.len(), 1);
+        assert_eq!(blocks2[0].serial, 2);
     }
 }

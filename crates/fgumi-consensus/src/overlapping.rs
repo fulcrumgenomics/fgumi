@@ -357,19 +357,37 @@ struct ReadMateAndRefPos {
     mate_offset: usize,
 }
 
+/// Converts a noodles CIGAR `Kind` to the BAM integer op code.
+fn kind_to_bam_op(kind: Kind) -> u8 {
+    match kind {
+        Kind::Match => 0,
+        Kind::Insertion => 1,
+        Kind::Deletion => 2,
+        Kind::Skip => 3,
+        Kind::SoftClip => 4,
+        Kind::HardClip => 5,
+        Kind::Pad => 6,
+        Kind::SequenceMatch => 7,
+        Kind::SequenceMismatch => 8,
+    }
+}
+
 /// Iterator that walks through aligned (M/X/=) positions in a read.
 ///
 /// This matches fgbio's `ReadAndRefPosIterator`:
 /// - Only returns positions that are aligned to the reference (M/X/= operations)
 /// - Skips soft clips, insertions, deletions, etc.
 /// - Can be limited to a reference position range
+///
+/// Works with both noodles `RecordBuf` and raw BAM byte records by storing
+/// CIGAR ops as BAM integer codes internally.
 struct ReadAndRefPosIterator {
     /// 1-based current read position (fgbio uses 1-based)
     cur_read_pos: i32,
     /// 1-based current reference position
     cur_ref_pos: i32,
-    /// CIGAR operations
-    cigar_ops: Vec<(Kind, usize)>,
+    /// CIGAR operations as (BAM op code, length)
+    cigar_ops: Vec<(u8, usize)>,
     /// Current element index (0-based)
     element_index: usize,
     /// Current offset within the element (0-based)
@@ -386,11 +404,7 @@ struct ReadAndRefPosIterator {
 
 #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
 impl ReadAndRefPosIterator {
-    /// Create iterator for aligned positions overlapping with mate
-    ///
-    /// # Arguments
-    /// * `record` - The read to iterate
-    /// * `mate` - The mate read (used to determine overlap bounds)
+    /// Create iterator for aligned positions overlapping with mate (noodles `RecordBuf`)
     fn new_with_mate(record: &RecordBuf, mate: &RecordBuf) -> Result<Self> {
         let rec_start = match record.alignment_start() {
             Some(pos) => usize::from(pos) as i32,
@@ -410,42 +424,19 @@ impl ReadAndRefPosIterator {
             None => return Err(anyhow::anyhow!("Mate has no alignment end")),
         };
 
-        // Reference window is the overlap between rec and mate
         let min_ref_pos = rec_start.max(mate_start);
         let max_ref_pos = rec_end.min(mate_end);
-
-        Self::new(record, 1, i32::MAX, min_ref_pos, max_ref_pos)
-    }
-
-    /// Create a new iterator with specified bounds
-    fn new(
-        record: &RecordBuf,
-        min_read_pos: i32,
-        max_read_pos: i32,
-        min_ref_pos: i32,
-        max_ref_pos: i32,
-    ) -> Result<Self> {
-        let rec_start = match record.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
-            None => return Err(anyhow::anyhow!("Record has no alignment start")),
-        };
-        let rec_end = match record.alignment_end() {
-            Some(pos) => usize::from(pos) as i32,
-            None => return Err(anyhow::anyhow!("Record has no alignment end")),
-        };
         let rec_len = record.sequence().len() as i32;
 
-        // Extract CIGAR operations
         let cigar = record.cigar();
         let cigar_ops: Vec<_> = cigar
             .iter()
             .filter_map(std::result::Result::ok)
-            .map(|op| (op.kind(), op.len()))
+            .map(|op| (kind_to_bam_op(op.kind()), op.len()))
             .collect();
 
-        // Calculate bounds (matching fgbio)
-        let start_read_pos = 1.max(min_read_pos);
-        let end_read_pos = rec_len.min(max_read_pos);
+        let start_read_pos = 1i32;
+        let end_read_pos = rec_len;
         let start_ref_pos = rec_start.max(min_ref_pos);
         let end_ref_pos = rec_end.min(max_ref_pos);
 
@@ -461,10 +452,48 @@ impl ReadAndRefPosIterator {
             end_read_pos,
         };
 
-        // Initialize: skip to first position in bounds
         iter.skip_to_start();
-
         Ok(iter)
+    }
+
+    /// Create iterator for aligned positions overlapping with mate (raw BAM bytes)
+    fn new_raw_with_mate(
+        bam: &[u8],
+        rec_start: usize,
+        rec_end: usize,
+        mate_start: usize,
+        mate_end: usize,
+    ) -> Self {
+        let rec_start_i32 = rec_start as i32;
+        let rec_end_i32 = rec_end as i32;
+        let rec_len = noodles_raw_bam::l_seq(bam) as i32;
+
+        let min_ref_pos = rec_start_i32.max(mate_start as i32);
+        let max_ref_pos = rec_end_i32.min(mate_end as i32);
+
+        let raw_ops = noodles_raw_bam::get_cigar_ops(bam);
+        let cigar_ops: Vec<(u8, usize)> =
+            raw_ops.iter().map(|&op| ((op & 0xF) as u8, (op >> 4) as usize)).collect();
+
+        let start_read_pos = 1i32;
+        let end_read_pos = rec_len;
+        let start_ref_pos = rec_start_i32.max(min_ref_pos);
+        let end_ref_pos = rec_end_i32.min(max_ref_pos);
+
+        let mut iter = Self {
+            cur_read_pos: 1,
+            cur_ref_pos: rec_start_i32,
+            cigar_ops,
+            element_index: 0,
+            in_elem_offset: 0,
+            start_ref_pos,
+            end_ref_pos,
+            start_read_pos,
+            end_read_pos,
+        };
+
+        iter.skip_to_start();
+        iter
     }
 
     /// Get current CIGAR element length on reference
@@ -472,15 +501,9 @@ impl ReadAndRefPosIterator {
         if self.element_index >= self.cigar_ops.len() {
             return 0;
         }
-        let (kind, len) = self.cigar_ops[self.element_index];
-        match kind {
-            Kind::Match
-            | Kind::SequenceMatch
-            | Kind::SequenceMismatch
-            | Kind::Deletion
-            | Kind::Skip => len,
-            _ => 0,
-        }
+        let (op_type, len) = self.cigar_ops[self.element_index];
+        // M(0), D(2), N(3), =(7), X(8) consume reference
+        if matches!(op_type, 0 | 2 | 3 | 7 | 8) { len } else { 0 }
     }
 
     /// Get current CIGAR element length on query (read)
@@ -488,15 +511,9 @@ impl ReadAndRefPosIterator {
         if self.element_index >= self.cigar_ops.len() {
             return 0;
         }
-        let (kind, len) = self.cigar_ops[self.element_index];
-        match kind {
-            Kind::Match
-            | Kind::SequenceMatch
-            | Kind::SequenceMismatch
-            | Kind::Insertion
-            | Kind::SoftClip => len,
-            _ => 0,
-        }
+        let (op_type, len) = self.cigar_ops[self.element_index];
+        // M(0), I(1), S(4), =(7), X(8) consume query
+        if matches!(op_type, 0 | 1 | 4 | 7 | 8) { len } else { 0 }
     }
 
     /// Check if current element is an alignment operation (M/X/=)
@@ -504,13 +521,13 @@ impl ReadAndRefPosIterator {
         if self.element_index >= self.cigar_ops.len() {
             return false;
         }
-        let (kind, _) = self.cigar_ops[self.element_index];
-        matches!(kind, Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch)
+        let (op_type, _) = self.cigar_ops[self.element_index];
+        // M(0), =(7), X(8) are alignment operations
+        matches!(op_type, 0 | 7 | 8)
     }
 
     /// Skip to the first position in the ref/read window
     fn skip_to_start(&mut self) {
-        // Skip until we have an element at or past both the read/ref starts
         while self.element_index < self.cigar_ops.len() {
             let cur_ref_end = self.cur_ref_pos + self.cur_elem_length_on_target() as i32 - 1;
             let cur_read_end = self.cur_read_pos + self.cur_elem_length_on_query() as i32 - 1;
@@ -524,7 +541,6 @@ impl ReadAndRefPosIterator {
             self.element_index += 1;
         }
 
-        // Skip non-aligned bases and adjust offset
         self.skip_non_aligned_and_adjust_offset();
     }
 
@@ -532,14 +548,12 @@ impl ReadAndRefPosIterator {
     fn skip_non_aligned_and_adjust_offset(&mut self) {
         self.in_elem_offset = 0;
 
-        // Skip over any non-aligned bases
         while self.element_index < self.cigar_ops.len() && !self.cur_elem_is_alignment() {
             self.cur_ref_pos += self.cur_elem_length_on_target() as i32;
             self.cur_read_pos += self.cur_elem_length_on_query() as i32;
             self.element_index += 1;
         }
 
-        // Update offset if current element spans the read-start or reference-start
         if self.element_index < self.cigar_ops.len()
             && (self.cur_ref_pos < self.start_ref_pos || self.cur_read_pos < self.start_read_pos)
         {
@@ -557,7 +571,6 @@ impl Iterator for ReadAndRefPosIterator {
     type Item = ReadPosition;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Check if we've consumed all bases in current element
         if self.element_index < self.cigar_ops.len() {
             let (_, len) = self.cigar_ops[self.element_index];
             if self.in_elem_offset >= len {
@@ -566,7 +579,6 @@ impl Iterator for ReadAndRefPosIterator {
             }
         }
 
-        // Check bounds
         if self.element_index >= self.cigar_ops.len()
             || self.cur_read_pos > self.end_read_pos
             || self.cur_ref_pos > self.end_ref_pos
@@ -574,9 +586,8 @@ impl Iterator for ReadAndRefPosIterator {
             return None;
         }
 
-        // Return current position and advance
         let pos = ReadPosition {
-            read_offset: (self.cur_read_pos - 1) as usize, // Convert to 0-based
+            read_offset: (self.cur_read_pos - 1) as usize,
             ref_pos: self.cur_ref_pos,
         };
 
@@ -601,12 +612,31 @@ struct ReadMateAndRefPosIterator {
 }
 
 impl ReadMateAndRefPosIterator {
-    /// Create a new iterator for overlapping positions between read and mate
+    /// Create a new iterator for overlapping positions between read and mate (noodles)
     fn new(record: &RecordBuf, mate: &RecordBuf) -> Result<Self> {
         let rec_iter = ReadAndRefPosIterator::new_with_mate(record, mate)?.peekable();
         let mate_iter = ReadAndRefPosIterator::new_with_mate(mate, record)?.peekable();
 
         Ok(Self { rec_iter, mate_iter })
+    }
+
+    /// Create a new iterator for overlapping positions between read and mate (raw BAM)
+    fn new_raw(
+        r1: &[u8],
+        r2: &[u8],
+        r1_start: usize,
+        r1_end: usize,
+        r2_start: usize,
+        r2_end: usize,
+    ) -> Self {
+        let rec_iter =
+            ReadAndRefPosIterator::new_raw_with_mate(r1, r1_start, r1_end, r2_start, r2_end)
+                .peekable();
+        let mate_iter =
+            ReadAndRefPosIterator::new_raw_with_mate(r2, r2_start, r2_end, r1_start, r1_end)
+                .peekable();
+
+        Self { rec_iter, mate_iter }
     }
 }
 
@@ -617,22 +647,17 @@ impl Iterator for ReadMateAndRefPosIterator {
         use std::cmp::Ordering;
 
         loop {
-            // Get heads of both iterators
             let rec_pos = self.rec_iter.peek()?;
             let mate_pos = self.mate_iter.peek()?;
 
             match rec_pos.ref_pos.cmp(&mate_pos.ref_pos) {
                 Ordering::Less => {
-                    // Advance rec iterator
                     self.rec_iter.next();
                 }
                 Ordering::Greater => {
-                    // Advance mate iterator
                     self.mate_iter.next();
                 }
                 Ordering::Equal => {
-                    // ref_pos matches - yield and advance both
-                    // Safe: we just peeked and saw Some values for both iterators
                     let rec = self.rec_iter.next().expect("peeked Some");
                     let mate = self.mate_iter.next().expect("peeked Some");
 
@@ -739,7 +764,7 @@ impl OverlappingBasesConsensusCaller {
 
         // Create merge iterator that yields positions where both reads have aligned bases
         let overlap_iter =
-            RawReadMateAndRefPosIterator::new(r1, r2, r1_start, r1_end, r2_start, r2_end);
+            ReadMateAndRefPosIterator::new_raw(r1, r2, r1_start, r1_end, r2_start, r2_end);
 
         let overlapping_positions: Vec<_> = overlap_iter.collect();
 
@@ -814,219 +839,6 @@ impl OverlappingBasesConsensusCaller {
         }
 
         Ok(true)
-    }
-}
-
-/// Raw-byte version of `ReadAndRefPosIterator`.
-///
-/// Walks through aligned (M/X/=) positions in a raw BAM record's CIGAR.
-struct RawReadAndRefPosIterator {
-    cur_read_pos: i32,
-    cur_ref_pos: i32,
-    cigar_ops: Vec<(u8, usize)>, // (op_type, op_len)
-    element_index: usize,
-    in_elem_offset: usize,
-    start_ref_pos: i32,
-    end_ref_pos: i32,
-    start_read_pos: i32,
-    end_read_pos: i32,
-}
-
-#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
-impl RawReadAndRefPosIterator {
-    /// Create iterator for aligned positions overlapping with mate.
-    fn new_with_mate(
-        bam: &[u8],
-        rec_start: usize,
-        rec_end: usize,
-        mate_start: usize,
-        mate_end: usize,
-    ) -> Self {
-        let rec_start_i32 = rec_start as i32;
-        let rec_end_i32 = rec_end as i32;
-        let rec_len = noodles_raw_bam::l_seq(bam) as i32;
-
-        let min_ref_pos = rec_start_i32.max(mate_start as i32);
-        let max_ref_pos = rec_end_i32.min(mate_end as i32);
-
-        // Extract CIGAR ops from raw BAM
-        let raw_ops = noodles_raw_bam::get_cigar_ops(bam);
-        let cigar_ops: Vec<(u8, usize)> =
-            raw_ops.iter().map(|&op| ((op & 0xF) as u8, (op >> 4) as usize)).collect();
-
-        let start_read_pos = 1i32;
-        let end_read_pos = rec_len;
-        let start_ref_pos = rec_start_i32.max(min_ref_pos);
-        let end_ref_pos = rec_end_i32.min(max_ref_pos);
-
-        let mut iter = Self {
-            cur_read_pos: 1,
-            cur_ref_pos: rec_start_i32,
-            cigar_ops,
-            element_index: 0,
-            in_elem_offset: 0,
-            start_ref_pos,
-            end_ref_pos,
-            start_read_pos,
-            end_read_pos,
-        };
-
-        iter.skip_to_start();
-        iter
-    }
-
-    fn cur_elem_length_on_target(&self) -> usize {
-        if self.element_index >= self.cigar_ops.len() {
-            return 0;
-        }
-        let (op_type, len) = self.cigar_ops[self.element_index];
-        // M(0), D(2), N(3), =(7), X(8) consume reference
-        if matches!(op_type, 0 | 2 | 3 | 7 | 8) { len } else { 0 }
-    }
-
-    fn cur_elem_length_on_query(&self) -> usize {
-        if self.element_index >= self.cigar_ops.len() {
-            return 0;
-        }
-        let (op_type, len) = self.cigar_ops[self.element_index];
-        // M(0), I(1), S(4), =(7), X(8) consume query
-        if matches!(op_type, 0 | 1 | 4 | 7 | 8) { len } else { 0 }
-    }
-
-    fn cur_elem_is_alignment(&self) -> bool {
-        if self.element_index >= self.cigar_ops.len() {
-            return false;
-        }
-        let (op_type, _) = self.cigar_ops[self.element_index];
-        // M(0), =(7), X(8) are alignment operations
-        matches!(op_type, 0 | 7 | 8)
-    }
-
-    fn skip_to_start(&mut self) {
-        while self.element_index < self.cigar_ops.len() {
-            let cur_ref_end = self.cur_ref_pos + self.cur_elem_length_on_target() as i32 - 1;
-            let cur_read_end = self.cur_read_pos + self.cur_elem_length_on_query() as i32 - 1;
-
-            if cur_ref_end >= self.start_ref_pos && cur_read_end >= self.start_read_pos {
-                break;
-            }
-
-            self.cur_ref_pos += self.cur_elem_length_on_target() as i32;
-            self.cur_read_pos += self.cur_elem_length_on_query() as i32;
-            self.element_index += 1;
-        }
-
-        self.skip_non_aligned_and_adjust_offset();
-    }
-
-    fn skip_non_aligned_and_adjust_offset(&mut self) {
-        self.in_elem_offset = 0;
-
-        while self.element_index < self.cigar_ops.len() && !self.cur_elem_is_alignment() {
-            self.cur_ref_pos += self.cur_elem_length_on_target() as i32;
-            self.cur_read_pos += self.cur_elem_length_on_query() as i32;
-            self.element_index += 1;
-        }
-
-        if self.element_index < self.cigar_ops.len()
-            && (self.cur_ref_pos < self.start_ref_pos || self.cur_read_pos < self.start_read_pos)
-        {
-            let offset = (self.start_ref_pos - self.cur_ref_pos)
-                .max(self.start_read_pos - self.cur_read_pos);
-            self.in_elem_offset = offset as usize;
-            self.cur_ref_pos += offset;
-            self.cur_read_pos += offset;
-        }
-    }
-}
-
-#[expect(clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
-impl Iterator for RawReadAndRefPosIterator {
-    type Item = ReadPosition;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.element_index < self.cigar_ops.len() {
-            let (_, len) = self.cigar_ops[self.element_index];
-            if self.in_elem_offset >= len {
-                self.element_index += 1;
-                self.skip_non_aligned_and_adjust_offset();
-            }
-        }
-
-        if self.element_index >= self.cigar_ops.len()
-            || self.cur_read_pos > self.end_read_pos
-            || self.cur_ref_pos > self.end_ref_pos
-        {
-            return None;
-        }
-
-        let pos = ReadPosition {
-            read_offset: (self.cur_read_pos - 1) as usize,
-            ref_pos: self.cur_ref_pos,
-        };
-
-        self.cur_read_pos += 1;
-        self.cur_ref_pos += 1;
-        self.in_elem_offset += 1;
-
-        Some(pos)
-    }
-}
-
-/// Raw-byte version of `ReadMateAndRefPosIterator`.
-struct RawReadMateAndRefPosIterator {
-    rec_iter: std::iter::Peekable<RawReadAndRefPosIterator>,
-    mate_iter: std::iter::Peekable<RawReadAndRefPosIterator>,
-}
-
-impl RawReadMateAndRefPosIterator {
-    fn new(
-        r1: &[u8],
-        r2: &[u8],
-        r1_start: usize,
-        r1_end: usize,
-        r2_start: usize,
-        r2_end: usize,
-    ) -> Self {
-        let rec_iter =
-            RawReadAndRefPosIterator::new_with_mate(r1, r1_start, r1_end, r2_start, r2_end)
-                .peekable();
-        let mate_iter =
-            RawReadAndRefPosIterator::new_with_mate(r2, r2_start, r2_end, r1_start, r1_end)
-                .peekable();
-
-        Self { rec_iter, mate_iter }
-    }
-}
-
-impl Iterator for RawReadMateAndRefPosIterator {
-    type Item = ReadMateAndRefPos;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        use std::cmp::Ordering;
-
-        loop {
-            let rec_pos = self.rec_iter.peek()?;
-            let mate_pos = self.mate_iter.peek()?;
-
-            match rec_pos.ref_pos.cmp(&mate_pos.ref_pos) {
-                Ordering::Less => {
-                    self.rec_iter.next();
-                }
-                Ordering::Greater => {
-                    self.mate_iter.next();
-                }
-                Ordering::Equal => {
-                    let rec = self.rec_iter.next().expect("peeked Some");
-                    let mate = self.mate_iter.next().expect("peeked Some");
-
-                    return Some(ReadMateAndRefPos {
-                        read_offset: rec.read_offset,
-                        mate_offset: mate.read_offset,
-                    });
-                }
-            }
-        }
     }
 }
 
@@ -2335,5 +2147,72 @@ mod tests {
         assert_eq!(total.bases_agreeing, 7);
         assert_eq!(total.bases_disagreeing, 3);
         assert_eq!(total.bases_corrected, 10);
+    }
+
+    #[test]
+    fn test_kind_to_bam_op() {
+        assert_eq!(kind_to_bam_op(Kind::Match), 0);
+        assert_eq!(kind_to_bam_op(Kind::Insertion), 1);
+        assert_eq!(kind_to_bam_op(Kind::Deletion), 2);
+        assert_eq!(kind_to_bam_op(Kind::Skip), 3);
+        assert_eq!(kind_to_bam_op(Kind::SoftClip), 4);
+        assert_eq!(kind_to_bam_op(Kind::HardClip), 5);
+        assert_eq!(kind_to_bam_op(Kind::Pad), 6);
+        assert_eq!(kind_to_bam_op(Kind::SequenceMatch), 7);
+        assert_eq!(kind_to_bam_op(Kind::SequenceMismatch), 8);
+    }
+
+    #[test]
+    fn test_unified_iterator_noodles_and_raw_agree() {
+        // Create two overlapping records via noodles RecordBuf
+        let r1 = create_test_record(b"ACGTACGT", &[30; 8], 100, "8M");
+        let r2 = create_test_record(b"ACGTACGT", &[20; 8], 104, "8M");
+
+        // Collect positions from the noodles-based iterator
+        let noodles_iter = ReadMateAndRefPosIterator::new(&r1, &r2).unwrap();
+        let noodles_positions: Vec<_> = noodles_iter.collect();
+
+        // Build raw BAM bytes for the same records
+        let cigar_8m = [cigar_op(8, 0)]; // 8M
+        let r1_raw = create_raw_test_record(b"ACGTACGT", &[30; 8], 100, &cigar_8m);
+        let r2_raw = create_raw_test_record(b"ACGTACGT", &[20; 8], 104, &cigar_8m);
+
+        // r1: 100-107, r2: 104-111, overlap: 104-107
+        let raw_iter = ReadMateAndRefPosIterator::new_raw(
+            &r1_raw, &r2_raw,
+            100, 107, // r1 start/end
+            104, 111, // r2 start/end
+        );
+        let raw_positions: Vec<_> = raw_iter.collect();
+
+        assert_eq!(noodles_positions.len(), raw_positions.len());
+        for (n, r) in noodles_positions.iter().zip(raw_positions.iter()) {
+            assert_eq!(n.read_offset, r.read_offset);
+            assert_eq!(n.mate_offset, r.mate_offset);
+        }
+        // Overlap is 4 bases (positions 104-107)
+        assert_eq!(noodles_positions.len(), 4);
+    }
+
+    #[test]
+    fn test_unified_iterator_with_deletion() {
+        // R1: 8bp seq, CIGAR 4M2D4M = 10bp ref span, positions 100-109
+        // R2: 4bp seq, CIGAR 4M, positions 106-109
+        let r1 = create_test_record(b"ACGTACGT", &[30; 8], 100, "4M2D4M");
+        let r2 = create_test_record(b"TTTT", &[20; 4], 106, "4M");
+
+        let iter = ReadMateAndRefPosIterator::new(&r1, &r2).unwrap();
+        let positions: Vec<_> = iter.collect();
+
+        // Overlap region: 106-109 (4 ref positions)
+        // R1 deletion at 104-105 means read positions 0-3 map to ref 100-103,
+        // read positions 4-7 map to ref 106-109
+        assert_eq!(positions.len(), 4);
+        // R1 read offsets should be 4,5,6,7 (after the deletion gap)
+        assert_eq!(positions[0].read_offset, 4);
+        assert_eq!(positions[3].read_offset, 7);
+        // R2 read offsets should be 0,1,2,3
+        assert_eq!(positions[0].mate_offset, 0);
+        assert_eq!(positions[3].mate_offset, 3);
     }
 }
