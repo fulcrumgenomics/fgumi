@@ -1,0 +1,12 @@
+[package]
+name = "fgumi-dna"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87.0"
+description = "DNA sequence utilities: complement, reverse-complement, 2-bit encoding"
+license = "MIT"
+
+[dependencies]
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

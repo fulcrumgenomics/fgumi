@@ -1,0 +1,24 @@
+[package]
+name = "fgumi-umi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87.0"
+description = "UMI assignment strategies and utilities for fgumi"
+license = "MIT"
+
+[dependencies]
+ahash = "0.8"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+fgumi-dna = { path = "../fgumi-dna" }
+
+[dev-dependencies]
+rstest = "0.25"
+proptest = "1"
+
+[features]
+profile-adjacency = []
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
