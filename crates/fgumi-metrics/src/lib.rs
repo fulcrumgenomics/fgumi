@@ -8,6 +8,8 @@
 //! - [`rejection`] module for rejection reason tracking
 //! - [`writer`] module for TSV file output
 
+#[cfg(feature = "clip")]
+pub mod clip;
 pub mod consensus;
 pub mod correct;
 pub mod duplex;
@@ -74,6 +76,8 @@ pub trait ProcessingMetrics {
 }
 
 // Re-export commonly used types
+#[cfg(feature = "clip")]
+pub use clip::{ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
 pub use duplex::{

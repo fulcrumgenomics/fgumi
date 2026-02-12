@@ -7,6 +7,20 @@
 //! - **UQ**: Phred likelihood of the segment (sum of mismatch qualities)
 //! - **MD**: Mismatched and deleted reference bases
 
+// These lints are suppressed because the code operates on BAM integer fields
+// where value ranges are well-understood and the casts are safe.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::missing_errors_doc,
+    clippy::too_many_lines,
+    clippy::redundant_closure_for_method_calls,
+    clippy::explicit_iter_loop,
+    clippy::match_same_arms,
+    clippy::uninlined_format_args
+)]
+
 use anyhow::{Context, Result};
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -16,7 +30,7 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
-use crate::reference::ReferenceReader;
+use crate::ReferenceProvider;
 
 /// Tags used for alignment information
 #[must_use]
@@ -42,14 +56,14 @@ pub fn uq_tag() -> Tag {
 /// # Arguments
 /// * `record` - The record to regenerate tags for (modified in place)
 /// * `header` - SAM header (needed to resolve reference sequence names)
-/// * `reference` - Reference genome reader
+/// * `reference` - Reference genome provider
 ///
 /// # Returns
 /// True if tags were regenerated, false if read is unmapped (tags are nulled)
 pub fn regenerate_alignment_tags(
     record: &mut RecordBuf,
     header: &Header,
-    reference: &ReferenceReader,
+    reference: &impl ReferenceProvider,
 ) -> Result<bool> {
     // For unmapped reads, null out the tags (matching fgbio behavior)
     if record.flags().is_unmapped() {
@@ -216,7 +230,7 @@ pub fn regenerate_alignment_tags(
 // Raw-byte alignment tag regeneration
 // ============================================================================
 
-use crate::sort::bam_fields;
+use noodles_raw_bam;
 
 /// Regenerates NM, UQ, and MD tags for a raw BAM record after base masking.
 ///
@@ -227,27 +241,27 @@ use crate::sort::bam_fields;
 pub fn regenerate_alignment_tags_raw(
     record: &mut Vec<u8>,
     header: &Header,
-    reference: &ReferenceReader,
+    reference: &impl ReferenceProvider,
 ) -> Result<bool> {
-    if record.len() < bam_fields::MIN_BAM_HEADER_LEN {
+    if record.len() < noodles_raw_bam::MIN_BAM_HEADER_LEN {
         anyhow::bail!(
             "BAM record too short ({} bytes, minimum {})",
             record.len(),
-            bam_fields::MIN_BAM_HEADER_LEN
+            noodles_raw_bam::MIN_BAM_HEADER_LEN
         );
     }
-    let flg = bam_fields::flags(record);
+    let flg = noodles_raw_bam::flags(record);
 
     // For unmapped reads, remove alignment tags
-    if (flg & bam_fields::flags::UNMAPPED) != 0 {
-        bam_fields::remove_tag(record, b"NM");
-        bam_fields::remove_tag(record, b"UQ");
-        bam_fields::remove_tag(record, b"MD");
+    if (flg & noodles_raw_bam::flags::UNMAPPED) != 0 {
+        noodles_raw_bam::remove_tag(record, b"NM");
+        noodles_raw_bam::remove_tag(record, b"UQ");
+        noodles_raw_bam::remove_tag(record, b"MD");
         return Ok(false);
     }
 
     // Get reference sequence ID and look up name in header
-    let ref_seq_id = bam_fields::ref_id(record);
+    let ref_seq_id = noodles_raw_bam::ref_id(record);
     if ref_seq_id < 0 {
         return Ok(false);
     }
@@ -257,7 +271,7 @@ pub fn regenerate_alignment_tags_raw(
         .context("Reference sequence ID not found in header")?;
     let ref_name = std::str::from_utf8(ref_name_bytes.as_ref())?;
 
-    let alignment_start_0based = bam_fields::pos(record);
+    let alignment_start_0based = noodles_raw_bam::pos(record);
     if alignment_start_0based < 0 {
         anyhow::bail!("Invalid alignment start position: {}", alignment_start_0based);
     }
@@ -265,7 +279,7 @@ pub fn regenerate_alignment_tags_raw(
         .context("Invalid alignment start position")?;
 
     // Get CIGAR ops (one small Vec allocation - typically 1-5 ops)
-    let cigar_ops = bam_fields::get_cigar_ops(record);
+    let cigar_ops = noodles_raw_bam::get_cigar_ops(record);
 
     // Calculate reference span from CIGAR ops
     let ref_span: usize = cigar_ops
@@ -282,9 +296,9 @@ pub fn regenerate_alignment_tags_raw(
 
     // Handle edge case: CIGAR with no reference-consuming operations
     if ref_span == 0 {
-        bam_fields::update_int_tag(record, b"NM", 0);
-        bam_fields::update_int_tag(record, b"UQ", 0);
-        bam_fields::update_string_tag(record, b"MD", b"0");
+        noodles_raw_bam::update_int_tag(record, b"NM", 0);
+        noodles_raw_bam::update_int_tag(record, b"UQ", 0);
+        noodles_raw_bam::update_string_tag(record, b"MD", b"0");
         return Ok(false);
     }
 
@@ -294,9 +308,9 @@ pub fn regenerate_alignment_tags_raw(
     let all_ref_bases = reference.fetch(ref_name, ref_start, ref_end)?;
 
     // Get seq/qual offsets and validate bounds
-    let seq_off = bam_fields::seq_offset(record);
-    let qual_off = bam_fields::qual_offset(record);
-    let l_seq = bam_fields::l_seq(record) as usize;
+    let seq_off = noodles_raw_bam::seq_offset(record);
+    let qual_off = noodles_raw_bam::qual_offset(record);
+    let l_seq = noodles_raw_bam::l_seq(record) as usize;
     let seq_bytes = l_seq.div_ceil(2);
     if seq_off + seq_bytes > record.len() || qual_off + l_seq > record.len() {
         anyhow::bail!("Truncated BAM record: seq/qual extends past record end");
@@ -325,9 +339,9 @@ pub fn regenerate_alignment_tags_raw(
                 }
                 let ref_bases = &all_ref_bases[ref_offset..ref_offset + op_len];
                 for &ref_base in ref_bases {
-                    let seq_base = bam_fields::BAM_BASE_TO_ASCII
-                        [bam_fields::get_base(record, seq_off, seq_pos) as usize];
-                    let qual_score = bam_fields::get_qual(record, qual_off, seq_pos);
+                    let seq_base = noodles_raw_bam::BAM_BASE_TO_ASCII
+                        [noodles_raw_bam::get_base(record, seq_off, seq_pos) as usize];
+                    let qual_score = noodles_raw_bam::get_qual(record, qual_off, seq_pos);
 
                     if seq_base == b'N' {
                         // Masked base: count as mismatch
@@ -391,9 +405,9 @@ pub fn regenerate_alignment_tags_raw(
     md_string.push_str(&match_count.to_string());
 
     // Update tags
-    bam_fields::update_int_tag(record, b"NM", nm);
-    bam_fields::update_int_tag(record, b"UQ", uq.min(i32::MAX as u32) as i32);
-    bam_fields::update_string_tag(record, b"MD", md_string.as_bytes());
+    noodles_raw_bam::update_int_tag(record, b"NM", nm);
+    noodles_raw_bam::update_int_tag(record, b"UQ", uq.min(i32::MAX as u32) as i32);
+    noodles_raw_bam::update_string_tag(record, b"MD", md_string.as_bytes());
 
     Ok(true)
 }
@@ -401,18 +415,68 @@ pub fn regenerate_alignment_tags_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
+    use crate::builder::RecordBuilder;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::header::record::value::map::ReferenceSequence;
+    use std::collections::HashMap;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn create_test_reference() -> Result<NamedTempFile> {
+    /// Mock reference provider for tests
+    struct MockReference {
+        sequences: HashMap<String, Vec<u8>>,
+    }
+
+    impl MockReference {
+        fn from_fasta(path: &std::path::Path) -> Result<Self> {
+            let content = std::fs::read_to_string(path)?;
+            let mut sequences = HashMap::new();
+            let mut current_name = String::new();
+            let mut current_seq = Vec::new();
+
+            for line in content.lines() {
+                if let Some(name) = line.strip_prefix('>') {
+                    if !current_name.is_empty() {
+                        sequences.insert(current_name.clone(), current_seq.clone());
+                        current_seq.clear();
+                    }
+                    current_name = name.to_string();
+                } else {
+                    current_seq.extend_from_slice(line.as_bytes());
+                }
+            }
+            if !current_name.is_empty() {
+                sequences.insert(current_name, current_seq);
+            }
+
+            Ok(Self { sequences })
+        }
+    }
+
+    impl ReferenceProvider for MockReference {
+        fn fetch(
+            &self,
+            chrom: &str,
+            start: Position,
+            end: Position,
+        ) -> Result<Vec<u8>> {
+            let sequence = self
+                .sequences
+                .get(chrom)
+                .ok_or_else(|| anyhow::anyhow!("Reference not found: {chrom}"))?;
+            let start_idx = usize::from(start) - 1;
+            let end_idx = usize::from(end);
+            Ok(sequence[start_idx..end_idx].to_vec())
+        }
+    }
+
+    fn create_test_reference() -> Result<(NamedTempFile, MockReference)> {
         let mut file = NamedTempFile::new()?;
         writeln!(file, ">chr1")?;
         writeln!(file, "ACGTACGTACGTACGT")?;
         file.flush()?;
-        Ok(file)
+        let reference = MockReference::from_fasta(file.path())?;
+        Ok((file, reference))
     }
 
     fn create_test_header() -> Header {
@@ -436,10 +500,32 @@ mod tests {
             .build()
     }
 
+    /// Encode a RecordBuf to raw BAM bytes for testing raw tag regeneration.
+    fn encode_record_buf_to_raw(header: &Header, record: &RecordBuf) -> Result<Vec<u8>> {
+        use std::io::Cursor;
+
+        // Write a complete BAM file in memory
+        let mut bam_data = Vec::new();
+        {
+            let mut writer = noodles::bam::io::Writer::new(&mut bam_data);
+            writer.write_header(header)?;
+            writer.write_alignment_record(header, record)?;
+            writer.get_mut().try_finish()?;
+        }
+
+        // Read it back to extract raw record bytes
+        let mut reader = noodles::bam::io::Reader::new(Cursor::new(&bam_data));
+        let _header = reader.read_header()?;
+
+        let mut bam_record = noodles::bam::Record::default();
+        reader.read_record(&mut bam_record)?;
+
+        Ok(bam_record.as_ref().to_vec())
+    }
+
     #[test]
     fn test_perfect_match() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Perfect match: ACGT
@@ -458,8 +544,7 @@ mod tests {
 
     #[test]
     fn test_one_mismatch() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Mismatch at position 2: ATGT vs ACGT
@@ -477,8 +562,7 @@ mod tests {
 
     #[test]
     fn test_masked_base() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Masked base at position 2: ANGT vs ACGT
@@ -496,8 +580,7 @@ mod tests {
 
     #[test]
     fn test_unmapped_read() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         let mut record = RecordBuilder::new()
@@ -528,7 +611,7 @@ mod tests {
         writeln!(file, ">chr1")?;
         writeln!(file, "AAAAAAAAAAAAAAAAAAAA")?; // 20 A's
         file.flush()?;
-        let reference = ReferenceReader::new(file.path())?;
+        let reference = MockReference::from_fasta(file.path())?;
         let header = create_test_header();
 
         // Sequence "AAACAAAATA" - mismatches at positions 4 (C vs A) and 9 (T vs A)
@@ -556,8 +639,7 @@ mod tests {
 
     #[test]
     fn test_insertion() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Alignment with insertion: 2M2I2M vs AC--GT
@@ -575,8 +657,7 @@ mod tests {
 
     #[test]
     fn test_deletion() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Alignment with deletion: 2M2D2M vs ACGTAC but read is AC--AC
@@ -594,8 +675,7 @@ mod tests {
 
     #[test]
     fn test_soft_clip() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // 2S4M2S: soft clips don't affect tags
@@ -614,8 +694,7 @@ mod tests {
 
     #[test]
     fn test_hard_clip() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // 2H4M2H: hard clips don't affect tags
@@ -633,8 +712,7 @@ mod tests {
 
     #[test]
     fn test_multiple_mismatches() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Multiple mismatches: AATT vs ACGT
@@ -652,8 +730,7 @@ mod tests {
 
     #[test]
     fn test_multiple_masked_bases() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Multiple masked bases: ANNN vs ACGT
@@ -671,8 +748,7 @@ mod tests {
 
     #[test]
     fn test_complex_cigar() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Complex: 2M1I1M1D2M
@@ -692,8 +768,7 @@ mod tests {
 
     #[test]
     fn test_sequence_match_and_mismatch_ops() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Use explicit sequence match/mismatch ops: 2=1X1=
@@ -711,8 +786,7 @@ mod tests {
 
     #[test]
     fn test_pad_operation() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // CIGAR with Pad operation: 2M2P2M (Pad doesn't affect sequence or reference)
@@ -730,8 +804,7 @@ mod tests {
 
     #[test]
     fn test_skip_operation() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // CIGAR with Skip operation (N): 2M2N2M (spliced alignment)
@@ -749,8 +822,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_matching() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Lowercase sequence should match uppercase reference
@@ -768,8 +840,7 @@ mod tests {
 
     #[test]
     fn test_insertion_at_end() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Insertion at end: 4M2I
@@ -787,8 +858,7 @@ mod tests {
 
     #[test]
     fn test_deletion_at_end() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Deletion at end: 2M2D
@@ -806,8 +876,7 @@ mod tests {
 
     #[test]
     fn test_mixed_matches_and_masks() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Mixed: ACNTTC vs ACGTAC (N at pos 3, A->T at pos 4)
@@ -826,17 +895,14 @@ mod tests {
     #[test]
     fn test_regenerate_alignment_tags_raw_validates_bounds() -> Result<()> {
         // Create a valid record, encode to raw, then truncate it
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
         let record = create_mapped_record("ACGTACGT", &[30, 30, 30, 30, 30, 30, 30, 30], "8M", 1);
 
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record)?;
+        let raw = encode_record_buf_to_raw(&header, &record)?;
 
         // Truncate to remove quality scores (but keep seq)
-        let qual_off = crate::sort::bam_fields::qual_offset(&raw);
+        let qual_off = noodles_raw_bam::qual_offset(&raw);
         let mut truncated = raw[..qual_off].to_vec();
 
         let result = regenerate_alignment_tags_raw(&mut truncated, &header, &reference);
@@ -848,8 +914,7 @@ mod tests {
 
     #[test]
     fn test_regenerate_alignment_tags_raw_rejects_short_record() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Record shorter than MIN_BAM_HEADER_LEN (36 bytes)
@@ -864,8 +929,7 @@ mod tests {
     /// Round-trip test: encode `RecordBuf` → regenerate raw tags → verify NM/UQ/MD match `RecordBuf` path.
     #[test]
     fn test_regenerate_alignment_tags_raw_happy_path() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Record with mismatches: ATGT vs ref ACGT (mismatch at pos 2)
@@ -873,19 +937,17 @@ mod tests {
         regenerate_alignment_tags(&mut record_buf, &header, &reference)?;
 
         // Encode to raw bytes and regenerate tags via raw path
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf)?;
+        let mut raw = encode_record_buf_to_raw(&header, &record_buf)?;
         regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
 
         // Read tags back from raw bytes
         let aux_off =
-            crate::sort::bam_fields::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+            noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
-        let nm = crate::sort::bam_fields::find_int_tag(aux, b"NM");
-        let uq = crate::sort::bam_fields::find_int_tag(aux, b"UQ");
-        let md = crate::sort::bam_fields::find_string_tag(aux, b"MD");
+        let nm = noodles_raw_bam::find_int_tag(aux, b"NM");
+        let uq = noodles_raw_bam::find_int_tag(aux, b"UQ");
+        let md = noodles_raw_bam::find_string_tag(aux, b"MD");
 
         // Verify raw path produces same results as RecordBuf path
         assert_eq!(nm, Some(1i64), "NM should be 1 (one mismatch)");
@@ -898,26 +960,23 @@ mod tests {
     /// Round-trip test with masked bases (N): verify raw path matches `RecordBuf`.
     #[test]
     fn test_regenerate_alignment_tags_raw_with_masked_bases() -> Result<()> {
-        let fasta = create_test_reference()?;
-        let reference = ReferenceReader::new(fasta.path())?;
+        let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
         // Record with masked base: ANGT vs ref ACGT
         let mut record_buf = create_mapped_record("ANGT", &[30, 0, 30, 30], "4M", 1);
         regenerate_alignment_tags(&mut record_buf, &header, &reference)?;
 
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf)?;
+        let mut raw = encode_record_buf_to_raw(&header, &record_buf)?;
         regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
 
         let aux_off =
-            crate::sort::bam_fields::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+            noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
-        let nm = crate::sort::bam_fields::find_int_tag(aux, b"NM");
-        let uq = crate::sort::bam_fields::find_int_tag(aux, b"UQ");
-        let md = crate::sort::bam_fields::find_string_tag(aux, b"MD");
+        let nm = noodles_raw_bam::find_int_tag(aux, b"NM");
+        let uq = noodles_raw_bam::find_int_tag(aux, b"UQ");
+        let md = noodles_raw_bam::find_string_tag(aux, b"MD");
 
         assert_eq!(nm, Some(1i64), "NM should be 1 (masked base = mismatch)");
         assert_eq!(uq, Some(0i64), "UQ should be 0 (masked base quality is 0)");

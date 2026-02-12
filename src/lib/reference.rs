@@ -360,6 +360,17 @@ impl ReferenceReader {
     }
 }
 
+impl fgumi_sam::ReferenceProvider for ReferenceReader {
+    fn fetch(
+        &self,
+        chrom: &str,
+        start: noodles::core::Position,
+        end: noodles::core::Position,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.fetch(chrom, start, end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

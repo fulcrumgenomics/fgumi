@@ -772,6 +772,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fgoxide",
+ "fgumi-sam",
+ "noodles",
  "serde",
  "tempfile",
 ]
@@ -785,6 +787,7 @@ dependencies = [
  "fgumi-dna",
  "log",
  "noodles",
+ "noodles-raw-bam",
  "tempfile",
 ]
 
