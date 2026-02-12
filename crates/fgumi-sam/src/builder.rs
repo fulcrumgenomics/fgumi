@@ -1848,6 +1848,20 @@ impl ConsensusTagsBuilder {
     /// Builds the tags as a vector of (Tag, Value) pairs.
     #[must_use]
     pub fn build(self) -> Vec<(Tag, BufValue)> {
+        // Guard against conflicting tag sources
+        debug_assert!(
+            !(self.depth_max.is_some() && self.per_base_depths.is_some()),
+            "depth_max and per_base_depths both set cD tag; use one or the other"
+        );
+        debug_assert!(
+            !(self.error_rate.is_some() && self.per_base_errors.is_some()),
+            "error_rate and per_base_errors both set cE tag; use one or the other"
+        );
+        debug_assert!(
+            !(self.error_count.is_some() && self.per_base_errors.is_some()),
+            "error_count and per_base_errors both set cE tag; use one or the other"
+        );
+
         let mut tags = Vec::new();
 
         // Standard consensus tags
@@ -1901,6 +1915,7 @@ impl ConsensusTagsBuilder {
 }
 
 #[cfg(test)]
+#[expect(clippy::similar_names, reason = "test code uses domain-specific tag names like cd/cm/ce")]
 mod tests {
     use super::*;
     use noodles::sam::alignment::record::Cigar;

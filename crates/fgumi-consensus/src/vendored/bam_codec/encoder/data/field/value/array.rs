@@ -184,8 +184,8 @@ pub(super) mod tests {
             &[
                 b'I', // subtype = UInt32
                 0x02, 0x00, 0x00, 0x00, // count = 2
-                0x90, 0x00, 0x00, 0x00, // values[0] = 55
-                0xdf, 0x00, 0x00, 0x00, // values[1] = -89
+                0x90, 0x00, 0x00, 0x00, // values[0] = 144
+                0xdf, 0x00, 0x00, 0x00, // values[1] = 223
             ],
         )?;
 

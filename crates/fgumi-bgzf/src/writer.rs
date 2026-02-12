@@ -75,7 +75,8 @@ impl InlineBgzfCompressor {
     /// Panics if compression level 6 is rejected by the bgzf library (should never happen).
     #[must_use]
     pub fn new(compression_level: u32) -> Self {
-        let level = u8::try_from(compression_level.clamp(1, 12)).unwrap_or(6);
+        let level = u8::try_from(compression_level.clamp(1, 12))
+            .expect("value in [1, 12] always fits in u8");
         let compression_level_obj =
             CompressionLevel::new(level).unwrap_or_else(|_| CompressionLevel::new(6).unwrap());
         let compressor = BgzfCompressor::new(compression_level_obj);

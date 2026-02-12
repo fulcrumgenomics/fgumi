@@ -287,12 +287,13 @@ pub struct CodecConsensusCaller {
     rejected_reads: Vec<Vec<u8>>,
 }
 
-#[allow(
+#[expect(
     clippy::similar_names,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    reason = "consensus calling uses numeric casts for quality/position math and has domain-specific variable names"
 )]
 impl CodecConsensusCaller {
     /// Creates a new CODEC consensus caller
@@ -1067,10 +1068,10 @@ impl CodecConsensusCaller {
                     } else if ba == raw_base {
                         // We chose A's base (including equal quality disagreements where fgbio uses aBase)
                         // Count A's errors + B's non-errors (which now disagree with consensus)
-                        ea + (db - eb)
+                        ea + db.saturating_sub(eb)
                     } else {
                         // We chose B's base: count B's errors + A's non-errors
-                        eb + (da - ea)
+                        eb + da.saturating_sub(ea)
                     };
 
                     (final_base, final_qual, da + db, duplex_error)
@@ -1422,7 +1423,12 @@ impl CodecConsensusCaller {
 }
 
 #[cfg(test)]
-#[allow(clippy::must_use_candidate)]
+#[expect(
+    clippy::must_use_candidate,
+    clippy::needless_pass_by_value,
+    clippy::cast_sign_loss,
+    reason = "test-only methods use owned values and numeric casts"
+)]
 impl CodecConsensusCaller {
     /// Test-only wrapper: check if a `RecordBuf` is part of an FR pair.
     pub fn is_fr_pair(&self, rec: &noodles::sam::alignment::RecordBuf) -> bool {
@@ -1519,7 +1525,7 @@ impl CodecConsensusCaller {
 }
 
 #[cfg(test)]
-#[allow(clippy::similar_names)]
+#[expect(clippy::similar_names, reason = "test variables use domain-specific names like r1/r2, ad/bd")]
 mod tests {
     use super::*;
     use fgumi_sam::clipper::cigar_utils;
@@ -1567,33 +1573,6 @@ mod tests {
         assert_eq!(reverse_complement(b""), b"".to_vec());
     }
 
-    // FIXME: reenable later?
-    /*
-    #[test]
-    fn test_reverse_complement_ss() {
-        let ss = SingleStrandConsensus {
-            bases: b"ACGT".to_vec(),
-            quals: vec![10, 20, 30, 40],
-            depths: vec![1, 2, 3, 4],
-            errors: vec![0, 0, 1, 0],
-            raw_read_count: 5,
-            ref_start: 100,
-            ref_end: 103,
-            is_negative_strand: false,
-        };
-
-        let rc = CodecConsensusCaller::reverse_complement_ss(&ss);
-
-        // Bases are reverse complemented, quals are reversed, depths/errors stay the same
-        assert_eq!(rc.bases, b"ACGT"); // ACGT → TGCA reversed → ACGT complemented
-        assert_eq!(rc.quals, vec![40, 30, 20, 10]); // reversed
-        assert_eq!(rc.depths, vec![1, 2, 3, 4]); // NOT reversed (per-position metadata)
-        assert_eq!(rc.errors, vec![0, 0, 1, 0]); // NOT reversed (per-position metadata)
-        assert_eq!(rc.raw_read_count, 5);
-        assert!(rc.is_negative_strand); // flipped
-    }
-    */
-
     #[test]
     fn test_stats_duplex_disagreement_rate() {
         let mut stats = CodecConsensusStats::default();
@@ -1605,7 +1584,7 @@ mod tests {
     }
 
     /// Helper function to create a test paired read
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "test helper needs all parameters and uses casts for BAM position math")]
     fn create_test_paired_read(
         name: &str,
         seq: &[u8],
@@ -2028,7 +2007,7 @@ mod tests {
     /// - R1 is `first_segment`, forward (unless strand1=Minus)
     /// - R2 is `last_segment`, reverse (unless strand2=Plus)
     /// - Both reads have proper mate information set
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "test helper needs all parameters, many lines, and uses casts for BAM position math")]
     fn create_fr_pair(
         name: &str,
         start1: usize,

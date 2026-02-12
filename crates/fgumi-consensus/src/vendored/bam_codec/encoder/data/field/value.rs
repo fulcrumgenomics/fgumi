@@ -68,7 +68,7 @@ mod tests {
             &Value::Array(Array::UInt8(Box::new(T::new(&[0])))),
             &[
                 b'C', // subtype = UInt8
-                0x01, 0x00, 0x00, 0x00, // count = 2
+                0x01, 0x00, 0x00, 0x00, // count = 1
                 0x00, // values[0] = 0
             ],
         )?;

@@ -224,7 +224,7 @@ pub fn is_simplex_consensus(rec: &impl noodles::sam::alignment::Record) -> bool 
 ///
 /// A duplex consensus read has both the `aD` (`AbRawReadCount`) and `bD` (`BaRawReadCount`) tags.
 #[must_use]
-#[allow(clippy::similar_names)]
+#[expect(clippy::similar_names, reason = "aD/bD tag names are domain-specific duplex strand identifiers")]
 pub fn is_duplex_consensus(rec: &impl noodles::sam::alignment::Record) -> bool {
     let has_ad = rec.data().get(&per_read::tag("aD")).is_some();
     let has_bd = rec.data().get(&per_read::tag("bD")).is_some();

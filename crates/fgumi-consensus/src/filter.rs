@@ -1058,7 +1058,7 @@ fn find_string_or_uint8_array(aux_data: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> 
 /// # Errors
 ///
 /// Returns an error if the record is too short or the aux data cannot be parsed.
-#[allow(clippy::similar_names)]
+#[expect(clippy::similar_names, reason = "threshold variable names mirror the consensus tag names they check")]
 pub fn mask_bases_raw(
     record: &mut [u8],
     thresholds: &FilterThresholds,
@@ -1107,7 +1107,7 @@ pub fn mask_bases_raw(
 /// # Errors
 ///
 /// Returns an error if the record is too short or the aux data cannot be parsed.
-#[allow(clippy::too_many_arguments, clippy::similar_names)]
+#[expect(clippy::similar_names, reason = "threshold variable names mirror the duplex strand tag names")]
 pub fn mask_duplex_bases_raw(
     record: &mut [u8],
     cc_thresholds: &FilterThresholds,
@@ -1206,7 +1206,6 @@ pub fn mask_duplex_bases_raw(
 }
 
 #[cfg(test)]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use fgumi_sam::builder::RecordBuilder;

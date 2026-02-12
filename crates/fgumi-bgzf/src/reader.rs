@@ -275,8 +275,8 @@ pub fn decompress_block(
     // Allocate output buffer
     let mut uncompressed = vec![0u8; uncompressed_size];
 
-    // Decompress
-    decompressor
+    // Decompress and validate byte count
+    let bytes_written = decompressor
         .deflate_decompress(compressed, &mut uncompressed)
         .map_err(|e| {
             io::Error::new(
@@ -284,6 +284,15 @@ pub fn decompress_block(
                 format!("BGZF decompression failed: {e:?}"),
             )
         })?;
+
+    if bytes_written != uncompressed_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF decompression size mismatch: expected {uncompressed_size}, got {bytes_written}"
+            ),
+        ));
+    }
 
     // Verify CRC32 to detect corruption
     let expected_crc = block.crc32();
@@ -334,8 +343,8 @@ pub fn decompress_block_into(
     let start = output.len();
     output.resize(start + uncompressed_size, 0);
 
-    // Decompress directly into the buffer
-    decompressor
+    // Decompress directly into the buffer and validate byte count
+    let bytes_written = decompressor
         .deflate_decompress(compressed, &mut output[start..])
         .map_err(|e| {
             io::Error::new(
@@ -343,6 +352,15 @@ pub fn decompress_block_into(
                 format!("BGZF decompression failed: {e:?}"),
             )
         })?;
+
+    if bytes_written != uncompressed_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF decompression size mismatch: expected {uncompressed_size}, got {bytes_written}"
+            ),
+        ));
+    }
 
     // Verify CRC32 to detect corruption
     let expected_crc = block.crc32();
@@ -407,7 +425,7 @@ pub fn decompress_block_slice_into(
     let start = output.len();
     output.resize(start + uncompressed_size, 0);
 
-    decompressor
+    let bytes_written = decompressor
         .deflate_decompress(compressed, &mut output[start..])
         .map_err(|e| {
             io::Error::new(
@@ -415,6 +433,15 @@ pub fn decompress_block_slice_into(
                 format!("BGZF decompression failed: {e:?}"),
             )
         })?;
+
+    if bytes_written != uncompressed_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF decompression size mismatch: expected {uncompressed_size}, got {bytes_written}"
+            ),
+        ));
+    }
 
     Ok(())
 }

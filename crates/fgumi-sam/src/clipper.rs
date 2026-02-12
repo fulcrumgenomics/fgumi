@@ -1343,6 +1343,7 @@ pub mod cigar_utils {
 }
 
 #[cfg(test)]
+#[expect(clippy::similar_names, reason = "test code uses clipper/clipped naming pattern")]
 mod tests {
     use super::*;
     use crate::builder::RecordBuilder;

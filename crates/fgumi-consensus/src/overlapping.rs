@@ -85,12 +85,6 @@ pub struct OverlappingBasesConsensusCaller {
     stats: CorrectionStats,
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
 impl OverlappingBasesConsensusCaller {
     /// Create a new overlapping bases consensus caller
     ///
@@ -243,8 +237,8 @@ impl OverlappingBasesConsensusCaller {
     ) -> bool {
         match self.agreement_strategy {
             AgreementStrategy::Consensus => {
-                // Sum qualities, capped at Q93
-                let new_qual = (r1_qual + r2_qual).min(93);
+                // Sum qualities, capped at Q93 (use u16 to avoid u8 overflow)
+                let new_qual = (u16::from(r1_qual) + u16::from(r2_qual)).min(93) as u8;
                 r1_quals[r1_offset] = new_qual;
                 r2_quals[r2_offset] = new_qual;
 
@@ -273,7 +267,7 @@ impl OverlappingBasesConsensusCaller {
     }
 
     /// Process disagreeing bases
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "disagreement processing requires all base/quality parameters from both reads")]
     fn process_disagreement(
         &mut self,
         r1_offset: usize,
@@ -390,7 +384,7 @@ struct ReadAndRefPosIterator {
     end_read_pos: i32,
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
 impl ReadAndRefPosIterator {
     /// Create iterator for aligned positions overlapping with mate
     ///
@@ -558,7 +552,7 @@ impl ReadAndRefPosIterator {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
 impl Iterator for ReadAndRefPosIterator {
     type Item = ReadPosition;
 
@@ -724,12 +718,6 @@ impl OverlappingBasesConsensusCaller {
     /// # Errors
     ///
     /// Returns an error if raw BAM field extraction or CIGAR parsing fails.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
     pub fn call_raw(&mut self, r1: &mut [u8], r2: &mut [u8]) -> Result<bool> {
         // Only process paired reads where both are mapped
         if noodles_raw_bam::flags(r1) & noodles_raw_bam::flags::UNMAPPED != 0
@@ -844,7 +832,7 @@ struct RawReadAndRefPosIterator {
     end_read_pos: i32,
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
 impl RawReadAndRefPosIterator {
     /// Create iterator for aligned positions overlapping with mate.
     fn new_with_mate(
@@ -952,7 +940,7 @@ impl RawReadAndRefPosIterator {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
 impl Iterator for RawReadAndRefPosIterator {
     type Item = ReadPosition;
 
@@ -1088,7 +1076,12 @@ pub fn apply_overlapping_consensus_raw(
 }
 
 #[cfg(test)]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::match_same_arms,
+    reason = "test code uses integer casts for position arithmetic"
+)]
 mod tests {
     use super::*;
     use fgumi_sam::builder::RecordBuilder;
