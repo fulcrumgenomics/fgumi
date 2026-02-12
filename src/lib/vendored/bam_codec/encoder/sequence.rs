@@ -13,6 +13,7 @@ pub(super) fn write_length(dst: &mut Vec<u8>, base_count: usize) -> io::Result<(
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn write_sequence<S>(
     dst: &mut Vec<u8>,
     read_length: usize,
@@ -59,6 +60,10 @@ pub(super) fn write_sequence_from_slice(
     read_length: usize,
     bases: &[u8],
 ) -> io::Result<()> {
+    // Process 16 bases (8 output bytes) at a time for cache efficiency
+    // This matches htslib's NN=16 chunking strategy (sam.c:621-636)
+    const CHUNK_SIZE: usize = 16;
+
     if bases.is_empty() {
         return Ok(());
     }
@@ -74,9 +79,6 @@ pub(super) fn write_sequence_from_slice(
     let packed_len = bases.len().div_ceil(2);
     dst.reserve(packed_len);
 
-    // Process 16 bases (8 output bytes) at a time for cache efficiency
-    // This matches htslib's NN=16 chunking strategy (sam.c:621-636)
-    const CHUNK_SIZE: usize = 16;
     let mut chunks = bases.chunks_exact(CHUNK_SIZE);
 
     for chunk in chunks.by_ref() {
@@ -120,6 +122,7 @@ fn encode_base(n: u8) -> u8 {
     CODES[usize::from(n)]
 }
 
+#[allow(clippy::cast_possible_truncation)]
 const fn build_codes() -> [u8; 256] {
     // § 4.2.3 "SEQ and QUAL encoding" (2024-11-06)
     const BASES: [u8; 16] = *b"=ACMGRSVTWYHKDBN";

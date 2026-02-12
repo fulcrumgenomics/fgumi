@@ -146,17 +146,19 @@ impl Builder {
     /// # Errors
     ///
     /// Returns an error if multiple primary R1s or R2s are encountered
+    ///
+    /// # Panics
+    ///
+    /// Panics if template name is unexpectedly missing when reporting duplicate records.
     pub fn push(&mut self, record: RecordBuf) -> Result<&mut Builder> {
         // Get record name as bytes for comparison (no allocation yet)
-        let record_name_bytes: &[u8] = record.name().map(<_ as AsRef<[u8]>>::as_ref).unwrap_or(&[]);
+        let record_name_bytes: &[u8] = record.name().map_or(&[], <_ as AsRef<[u8]>>::as_ref);
 
         if let Some(cur_name) = &self.name {
             // Compare bytes directly without allocating
             if cur_name.as_slice() != record_name_bytes {
                 bail!(
-                    "Template name mismatch: found '{:?}', expected '{:?}'",
-                    record_name_bytes,
-                    cur_name
+                    "Template name mismatch: found '{record_name_bytes:?}', expected '{cur_name:?}'"
                 );
             }
         } else {
@@ -647,6 +649,7 @@ impl Template {
     /// # Errors
     ///
     /// Returns an error if multiple primary R1s or R2s are found.
+    #[allow(clippy::too_many_lines)]
     pub fn from_raw_records(mut raw_records: Vec<Vec<u8>>) -> Result<Self> {
         use crate::sort::bam_fields;
 
@@ -740,8 +743,7 @@ impl Template {
                     r1_supp.push(i);
                 } else if r1_idx.is_some() {
                     bail!(
-                        "Multiple non-secondary, non-supplemental R1 records for read '{:?}'",
-                        name
+                        "Multiple non-secondary, non-supplemental R1 records for read '{name:?}'"
                     );
                 } else {
                     r1_idx = Some(i);
@@ -751,7 +753,7 @@ impl Template {
             } else if is_supplementary {
                 r2_supp.push(i);
             } else if r2_idx.is_some() {
-                bail!("Multiple non-secondary, non-supplemental R2 records for read '{:?}'", name);
+                bail!("Multiple non-secondary, non-supplemental R2 records for read '{name:?}'");
             } else {
                 r2_idx = Some(i);
             }
@@ -896,6 +898,7 @@ impl Template {
     /// # Errors
     ///
     /// Returns an error if the CIGAR operations cannot be parsed (malformed CIGAR data)
+    #[allow(clippy::too_many_lines)]
     pub fn fix_mate_info(&mut self) -> Result<()> {
         if self.records.is_empty() {
             return Ok(());
@@ -1262,6 +1265,7 @@ fn alignment_length(cigar: &noodles::sam::alignment::record_buf::Cigar) -> i32 {
 /// # Panics
 /// The caller must ensure the record is paired, mapped, has a mapped mate,
 /// and is on the same reference as its mate.
+#[allow(clippy::cast_possible_wrap)]
 fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
     let is_reverse = record.flags().is_reverse_complemented();
     let mate_reverse = record.flags().is_mate_reverse_complemented();
@@ -3734,6 +3738,7 @@ mod tests {
     // ========================================================================
 
     /// Helper to create a minimal raw BAM record for testing raw-byte mode.
+    #[allow(clippy::cast_possible_truncation)]
     fn make_minimal_raw_bam(name: &[u8], flags: u16) -> Vec<u8> {
         let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
         let total = 32 + l_read_name as usize; // minimal: header + name only

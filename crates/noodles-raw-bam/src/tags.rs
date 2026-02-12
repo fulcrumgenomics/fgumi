@@ -1,4 +1,6 @@
-use crate::fields::{TAG_FIXED_SIZES, aux_data_offset, aux_data_offset_from_record, aux_data_slice, tag_value_size};
+use crate::fields::{
+    TAG_FIXED_SIZES, aux_data_offset, aux_data_offset_from_record, aux_data_slice, tag_value_size,
+};
 
 /// Find a string (Z-type) tag in auxiliary data, returning value bytes without null terminator.
 #[must_use]
@@ -547,7 +549,9 @@ pub fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16])
     record.push(tag[1]);
     record.push(b'B');
     record.push(b's');
-    record.extend_from_slice(&u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes());
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
     for &v in values {
         record.extend_from_slice(&v.to_le_bytes());
     }

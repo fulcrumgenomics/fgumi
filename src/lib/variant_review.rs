@@ -131,6 +131,7 @@ pub fn read_number_suffix(is_first_of_pair: bool) -> &'static str {
 ///
 /// Returns a string like "chr1:100-200 | F1R2" for FR pairs, or "NA" for non-FR pairs
 #[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn format_insert_string(
     record: &noodles::sam::alignment::RecordBuf,
     header: &noodles::sam::Header,
@@ -210,10 +211,8 @@ pub fn format_insert_string(
     let start_equals_outer = start == outer;
 
     let pairing = match (is_first, start_equals_outer) {
-        (true, true) => "F1R2",
-        (true, false) => "F2R1",
-        (false, true) => "F2R1",
-        (false, false) => "F1R2",
+        (true, true) | (false, false) => "F1R2",
+        (true, false) | (false, true) => "F2R1",
     };
 
     format!("{ref_name}:{start}-{end} | {pairing}")

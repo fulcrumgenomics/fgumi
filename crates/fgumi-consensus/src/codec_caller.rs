@@ -76,16 +76,16 @@ use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
     RejectionReason as CallerRejectionReason,
 };
+use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
 use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
-use fgumi_dna::dna::reverse_complement;
-use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
-use noodles_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
 use anyhow::Result;
+use fgumi_dna::dna::reverse_complement;
 use noodles::sam::alignment::record::data::field::Tag;
+use noodles_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -196,8 +196,14 @@ impl CodecConsensusStats {
     #[must_use]
     pub fn duplex_disagreement_rate(&self) -> f64 {
         if self.consensus_duplex_bases_emitted > 0 {
-            #[expect(clippy::cast_precision_loss, reason = "acceptable precision loss for rate computation")]
-            { self.duplex_disagreement_base_count as f64 / self.consensus_duplex_bases_emitted as f64 }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "acceptable precision loss for rate computation"
+            )]
+            {
+                self.duplex_disagreement_base_count as f64
+                    / self.consensus_duplex_bases_emitted as f64
+            }
         } else {
             0.0
         }
@@ -498,7 +504,10 @@ impl CodecConsensusCaller {
     /// This is the primary entry point, working directly on raw bytes without
     /// materializing `RecordBuf`. Virtual clipping is computed and applied as
     /// offsets when extracting data for consensus.
-    #[expect(clippy::too_many_lines, reason = "consensus pipeline has many sequential steps that are clearest in one function")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "consensus pipeline has many sequential steps that are clearest in one function"
+    )]
     fn consensus_reads_raw(&mut self, records: &[Vec<u8>]) -> Result<ConsensusOutput> {
         self.stats.total_input_reads += records.len() as u64;
 
@@ -1182,7 +1191,10 @@ impl CodecConsensusCaller {
     }
 
     /// Builds the output record from the consensus and writes raw bytes into `output`.
-    #[expect(clippy::unnecessary_wraps, reason = "Result return type kept for API consistency with other callers")]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "Result return type kept for API consistency with other callers"
+    )]
     fn build_output_record_into(
         &mut self,
         output: &mut ConsensusOutput,
@@ -1342,22 +1354,34 @@ impl ConsensusCaller for CodecConsensusCaller {
         Ok(result)
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "read counts will not exceed usize on any supported platform")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read counts will not exceed usize on any supported platform"
+    )]
     fn total_reads(&self) -> usize {
         self.stats.total_input_reads as usize
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "read counts will not exceed usize on any supported platform")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read counts will not exceed usize on any supported platform"
+    )]
     fn total_filtered(&self) -> usize {
         self.stats.reads_filtered as usize
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "read counts will not exceed usize on any supported platform")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read counts will not exceed usize on any supported platform"
+    )]
     fn consensus_reads_constructed(&self) -> usize {
         self.stats.consensus_reads_generated as usize
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "read counts will not exceed usize on any supported platform")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read counts will not exceed usize on any supported platform"
+    )]
     fn statistics(&self) -> ConsensusCallingStats {
         ConsensusCallingStats {
             total_reads: self.stats.total_input_reads as usize,
@@ -1412,7 +1436,10 @@ impl CodecConsensusCaller {
     /// # Errors
     ///
     /// Returns an error if consensus calling fails on the provided records.
-    #[expect(clippy::needless_pass_by_value, reason = "matches ConsensusCaller trait signature pattern")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "matches ConsensusCaller trait signature pattern"
+    )]
     pub fn consensus_reads_from_sam_records(
         &mut self,
         recs: Vec<noodles::sam::alignment::RecordBuf>,
@@ -1525,16 +1552,19 @@ impl CodecConsensusCaller {
 }
 
 #[cfg(test)]
-#[expect(clippy::similar_names, reason = "test variables use domain-specific names like r1/r2, ad/bd")]
+#[expect(
+    clippy::similar_names,
+    reason = "test variables use domain-specific names like r1/r2, ad/bd"
+)]
 mod tests {
     use super::*;
-    use fgumi_sam::clipper::cigar_utils;
     use fgumi_sam::builder::RecordBuilder;
-    use noodles_raw_bam::ParsedBamRecord;
+    use fgumi_sam::clipper::cigar_utils;
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::Cigar as CigarTrait;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::cigar::op::Kind;
+    use noodles_raw_bam::ParsedBamRecord;
 
     #[test]
     fn test_codec_caller_creation() {
@@ -1584,7 +1614,13 @@ mod tests {
     }
 
     /// Helper function to create a test paired read
-    #[expect(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "test helper needs all parameters and uses casts for BAM position math")]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "test helper needs all parameters and uses casts for BAM position math"
+    )]
     fn create_test_paired_read(
         name: &str,
         seq: &[u8],
@@ -2007,7 +2043,13 @@ mod tests {
     /// - R1 is `first_segment`, forward (unless strand1=Minus)
     /// - R2 is `last_segment`, reverse (unless strand2=Plus)
     /// - Both reads have proper mate information set
-    #[expect(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "test helper needs all parameters, many lines, and uses casts for BAM position math")]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test helper needs all parameters, many lines, and uses casts for BAM position math"
+    )]
     fn create_fr_pair(
         name: &str,
         start1: usize,

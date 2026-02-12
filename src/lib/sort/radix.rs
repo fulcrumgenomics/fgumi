@@ -24,6 +24,7 @@ impl PackedCoordinateKey {
     /// Layout: `[tid:16][pos:32][reverse:1][padding:15]`
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_sign_loss)]
     pub fn new(tid: i32, pos: i32, reverse: bool) -> Self {
         // Handle unmapped (tid=-1) by mapping to max value
         let tid_bits = if tid < 0 { 0xFFFF_u64 } else { (tid as u64) & 0xFFFF };
@@ -108,21 +109,21 @@ pub fn radix_sort_coordinate_adaptive<T: Clone>(
 
         // Count occurrences of each byte value
         let mut counts = [0usize; 256];
-        for (key, _) in src_slice.iter() {
+        for (key, _) in src_slice {
             let byte = ((key >> (byte_idx * 8)) & 0xFF) as usize;
             counts[byte] += 1;
         }
 
         // Convert to cumulative offsets
         let mut total = 0;
-        for count in counts.iter_mut() {
+        for count in &mut counts {
             let c = *count;
             *count = total;
             total += c;
         }
 
         // Scatter elements to destination
-        for item in src_slice.iter() {
+        for item in src_slice {
             let byte = ((item.0 >> (byte_idx * 8)) & 0xFF) as usize;
             let dest_idx = counts[byte];
             counts[byte] += 1;
@@ -166,6 +167,7 @@ fn bytes_needed_u32(val: u32) -> usize {
 /// - Unmapped reads (tid=-1) map to nref to sort at end
 #[inline]
 #[must_use]
+#[allow(clippy::cast_sign_loss)]
 pub fn pack_coordinate_for_radix(tid: i32, pos: i32, reverse: bool, nref: u32) -> u64 {
     // Map unmapped (-1) to nref so they sort to the end
     let tid_val = if tid < 0 { nref } else { tid as u32 };
@@ -211,21 +213,21 @@ pub fn radix_sort_u64<T: Clone>(entries: &mut [(u64, T)]) {
 
         // Count occurrences of each byte value
         let mut counts = [0usize; 256];
-        for (key, _) in src_slice.iter() {
+        for (key, _) in src_slice {
             let byte = ((key >> shift) & 0xFF) as usize;
             counts[byte] += 1;
         }
 
         // Convert to cumulative offsets
         let mut total = 0;
-        for count in counts.iter_mut() {
+        for count in &mut counts {
             let c = *count;
             *count = total;
             total += c;
         }
 
         // Scatter elements to destination
-        for item in src_slice.iter() {
+        for item in src_slice {
             let byte = ((item.0 >> shift) & 0xFF) as usize;
             let dest_idx = counts[byte];
             counts[byte] += 1;
@@ -483,7 +485,7 @@ mod tests {
     #[test]
     fn test_insertion_sort() {
         let mut arr = vec![5, 3, 8, 1, 4, 2, 7, 6];
-        binary_insertion_sort(&mut arr, |a, b| a.cmp(b));
+        binary_insertion_sort(&mut arr, std::cmp::Ord::cmp);
         assert_eq!(arr, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
@@ -498,9 +500,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn test_hybrid_sort() {
         let mut arr: Vec<i32> = (0..100).rev().collect();
-        hybrid_sort(&mut arr, |a, b| a.cmp(b), false);
+        hybrid_sort(&mut arr, std::cmp::Ord::cmp, false);
         for (i, &v) in arr.iter().enumerate() {
             assert_eq!(v, i as i32);
         }

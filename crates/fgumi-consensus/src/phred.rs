@@ -122,8 +122,14 @@ pub fn ln_prob_to_phred(ln_prob: LogProbability) -> PhredScore {
         return MAX_PHRED;
     }
     let phred = (-10.0 * ln_prob / LN_10 + PHRED_PRECISION).floor();
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "value is clamped to [MIN_PHRED, MAX_PHRED] which fits in u8")]
-    { phred.clamp(f64::from(MIN_PHRED), f64::from(MAX_PHRED)) as PhredScore }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is clamped to [MIN_PHRED, MAX_PHRED] which fits in u8"
+    )]
+    {
+        phred.clamp(f64::from(MIN_PHRED), f64::from(MAX_PHRED)) as PhredScore
+    }
 }
 
 /// Precise computation of log(1 + exp(x)).
@@ -338,7 +344,10 @@ pub fn ln_not(x: LogProbability) -> LogProbability {
 }
 
 #[cfg(test)]
-#[expect(clippy::similar_names, reason = "test variables use short math-related names like ln_p, ln_q")]
+#[expect(
+    clippy::similar_names,
+    reason = "test variables use short math-related names like ln_p, ln_q"
+)]
 mod tests {
     use super::*;
 

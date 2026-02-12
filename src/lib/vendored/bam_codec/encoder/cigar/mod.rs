@@ -78,6 +78,8 @@ mod tests {
 
     #[test]
     fn test_overflowing_write_cigar_op_count() -> io::Result<()> {
+        const MAX_CIGAR_OP_COUNT: usize = (1 << 16) - 1;
+
         let mut buf = Vec::new();
 
         buf.clear();
@@ -86,7 +88,6 @@ mod tests {
         assert_eq!(buf, [0x01, 0x00]);
         assert!(overflowing_cigar.is_none());
 
-        const MAX_CIGAR_OP_COUNT: usize = (1 << 16) - 1;
         buf.clear();
         let cigar: CigarBuf =
             iter::repeat_n(Op::new(Kind::Match, 1), MAX_CIGAR_OP_COUNT + 1).collect();

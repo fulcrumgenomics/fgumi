@@ -90,6 +90,7 @@ pub fn format_duration(duration: Duration) -> String {
 /// assert_eq!(format_rate(600, Duration::from_secs(60)), "10 items/s");
 /// ```
 #[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn format_rate(count: u64, duration: Duration) -> String {
     let secs = duration.as_secs_f64();
     if secs < 0.001 {
@@ -127,6 +128,7 @@ pub fn format_rate(count: u64, duration: Duration) -> String {
 ///
 /// log_consensus_summary(&metrics);
 /// ```
+#[allow(clippy::cast_precision_loss)]
 pub fn log_consensus_summary(metrics: &ConsensusMetrics) {
     log::info!("Consensus Calling Summary:");
     log::info!("  Input reads: {}", format_count(metrics.total_input_reads));
@@ -176,6 +178,7 @@ pub fn log_consensus_summary(metrics: &ConsensusMetrics) {
 ///
 /// log_umi_grouping_summary(&metrics);
 /// ```
+#[allow(clippy::cast_precision_loss)]
 pub fn log_umi_grouping_summary(metrics: &UmiGroupingMetrics) {
     log::info!("UMI Grouping Summary:");
     log::info!("  Total records: {}", format_count(metrics.total_records));

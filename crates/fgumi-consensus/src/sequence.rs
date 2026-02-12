@@ -191,7 +191,10 @@ impl ConsensusSequence {
 
     /// Returns the error rate (total errors / total depth).
     #[must_use]
-    #[expect(clippy::cast_precision_loss, reason = "u32 values from u16 sums are small enough for f32 precision")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "u32 values from u16 sums are small enough for f32 precision"
+    )]
     pub fn error_rate(&self) -> f32 {
         let total_depth: u32 = self.depths.iter().map(|&d| u32::from(d)).sum();
         if total_depth == 0 {

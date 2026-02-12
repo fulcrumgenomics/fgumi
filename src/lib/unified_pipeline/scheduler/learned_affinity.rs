@@ -89,6 +89,10 @@ impl LearnedAffinityScheduler {
     }
 
     /// Get affinity score for a step.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "affinity ratio doesn't need full u64 precision"
+    )]
     fn affinity(&self, step_idx: usize) -> f64 {
         if self.attempts[step_idx] == 0 {
             0.5 // Neutral prior
@@ -98,6 +102,10 @@ impl LearnedAffinityScheduler {
     }
 
     /// Get current exploration rate (decays over time).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "decay_periods won't exceed i32 range in any practical run"
+    )]
     fn current_exploration_rate(&self) -> f64 {
         let decay_periods = self.total_attempts / 1000;
         let decayed = self.exploration_rate * self.exploration_decay.powi(decay_periods as i32);

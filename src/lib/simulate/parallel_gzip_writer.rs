@@ -23,13 +23,14 @@ struct UncompressedBlock {
     data: Vec<u8>,
 }
 
-/// A compressed gzip block ready for writing.
-struct CompressedBlock {
-    serial: u64,
-    data: Vec<u8>,
+/// A compressed gzip block ready for writing, or a compression error.
+enum CompressedBlock {
+    Ok { serial: u64, data: Vec<u8> },
+    Err { serial: u64, error: String },
 }
 
 /// Compress an uncompressed block into a gzip stream.
+#[allow(clippy::needless_pass_by_value)]
 fn compress_block(
     block: UncompressedBlock,
     compressor: &mut Compressor,
@@ -46,7 +47,7 @@ fn compress_block(
 
     compressed_data.truncate(compressed_len);
 
-    Ok(CompressedBlock { serial: block.serial, data: compressed_data })
+    Ok(CompressedBlock::Ok { serial: block.serial, data: compressed_data })
 }
 
 /// Configuration for parallel gzip writer.
@@ -103,7 +104,11 @@ pub struct ParallelGzipWriter {
 
 impl ParallelGzipWriter {
     /// Create a new parallel gzip writer.
-    pub fn new<W>(writer: W, config: ParallelGzipConfig) -> io::Result<Self>
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compression level is invalid.
+    pub fn new<W>(writer: W, config: &ParallelGzipConfig) -> io::Result<Self>
     where
         W: Write + Send + 'static,
     {
@@ -128,15 +133,13 @@ impl ParallelGzipWriter {
             let handle = thread::spawn(move || {
                 let mut compressor = Compressor::new(level);
                 while let Ok(block) = rx.recv() {
-                    match compress_block(block, &mut compressor) {
-                        Ok(compressed) => {
-                            if tx.send(compressed).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Gzip compression error: {e}");
-                        }
+                    let serial = block.serial;
+                    let result = match compress_block(block, &mut compressor) {
+                        Ok(compressed) => compressed,
+                        Err(e) => CompressedBlock::Err { serial, error: e.to_string() },
+                    };
+                    if tx.send(result).is_err() {
+                        break;
                     }
                 }
             });
@@ -161,6 +164,7 @@ impl ParallelGzipWriter {
     }
 
     /// The I/O writer thread main loop.
+    #[allow(clippy::needless_pass_by_value)]
     fn io_writer_loop<W: Write>(
         mut writer: W,
         output_rx: Receiver<CompressedBlock>,
@@ -169,18 +173,35 @@ impl ParallelGzipWriter {
         let mut pending: BTreeMap<u64, CompressedBlock> = BTreeMap::new();
 
         while let Ok(block) = output_rx.recv() {
-            pending.insert(block.serial, block);
+            let serial = match &block {
+                CompressedBlock::Ok { serial, .. } | CompressedBlock::Err { serial, .. } => *serial,
+            };
+            pending.insert(serial, block);
 
             // Write all consecutive blocks
             while let Some(block) = pending.remove(&next_expected) {
-                writer.write_all(&block.data)?;
+                match block {
+                    CompressedBlock::Ok { data, .. } => writer.write_all(&data)?,
+                    CompressedBlock::Err { error, .. } => {
+                        return Err(io::Error::other(format!(
+                            "compression failed for block {next_expected}: {error}"
+                        )));
+                    }
+                }
                 next_expected += 1;
             }
         }
 
         // Write any remaining pending blocks
         for (_, block) in pending {
-            writer.write_all(&block.data)?;
+            match block {
+                CompressedBlock::Ok { data, .. } => writer.write_all(&data)?,
+                CompressedBlock::Err { serial, error } => {
+                    return Err(io::Error::other(format!(
+                        "compression failed for block {serial}: {error}"
+                    )));
+                }
+            }
         }
 
         writer.flush()?;
@@ -206,6 +227,10 @@ impl ParallelGzipWriter {
     }
 
     /// Finish writing and close all threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing or joining worker threads fails.
     pub fn finish(mut self) -> io::Result<()> {
         // Dispatch any remaining data
         self.dispatch_block()?;
@@ -261,7 +286,7 @@ mod tests {
         {
             let file = File::create(&path)?;
             let config = ParallelGzipConfig::with_threads(2);
-            let mut writer = ParallelGzipWriter::new(file, config)?;
+            let mut writer = ParallelGzipWriter::new(file, &config)?;
 
             writer.write_all(b"Hello, World!")?;
             writer.finish()?;
@@ -290,7 +315,7 @@ mod tests {
                 block_size: 16384, // 16KB blocks for more parallelism
                 ..Default::default()
             };
-            let mut writer = ParallelGzipWriter::new(file, config)?;
+            let mut writer = ParallelGzipWriter::new(file, &config)?;
 
             writer.write_all(test_data.as_bytes())?;
             writer.finish()?;
@@ -314,7 +339,7 @@ mod tests {
         {
             let file = File::create(&path)?;
             let config = ParallelGzipConfig::with_threads(1);
-            let mut writer = ParallelGzipWriter::new(file, config)?;
+            let mut writer = ParallelGzipWriter::new(file, &config)?;
 
             writer.write_all(b"Single thread test")?;
             writer.finish()?;

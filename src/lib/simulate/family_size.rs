@@ -177,6 +177,10 @@ impl FamilySizeDistribution {
     /// # Returns
     ///
     /// A family size >= `min_size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if distribution parameters are invalid (e.g., invalid log-normal, gamma, or Poisson parameters).
     pub fn sample(&self, rng: &mut impl Rng, min_size: usize) -> usize {
         let size = match self {
             Self::LogNormal { mean, stddev } => {

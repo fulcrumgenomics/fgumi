@@ -465,8 +465,7 @@ impl DuplexMetricsCollector {
                 metric.count = *count;
                 #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
                 {
-                    metric.fraction =
-                        if total > 0 { *count as f64 / total as f64 } else { 0.0 };
+                    metric.fraction = if total > 0 { *count as f64 / total as f64 } else { 0.0 };
                 }
                 metric
             })
@@ -500,10 +499,7 @@ impl DuplexMetricsCollector {
             }
             for metric in &mut metrics {
                 let cumulative_count = grid[metric.ab_size * cols + metric.ba_size];
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "metric counts never exceed 2^53"
-                )]
+                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
                 {
                     metric.fraction_gt_or_eq_size = cumulative_count as f64 / total as f64;
                 }
@@ -615,7 +611,6 @@ impl DuplexMetricsCollector {
         metrics.sort_by(|a, b| b.unique_observations.cmp(&a.unique_observations));
         metrics
     }
-
 }
 
 #[cfg(test)]

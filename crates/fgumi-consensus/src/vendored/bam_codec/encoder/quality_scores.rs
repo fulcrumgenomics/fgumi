@@ -14,7 +14,6 @@ pub(super) fn write_quality_scores<S>(
 where
     S: QualityScores,
 {
-
     if quality_scores.len() == base_count {
         for result in quality_scores.iter() {
             let n = result?;
@@ -52,7 +51,6 @@ pub(super) fn write_quality_scores_from_slice(
     base_count: usize,
     scores: &[u8],
 ) -> io::Result<()> {
-
     if scores.len() == base_count {
         // Validate entire slice first - this can be auto-vectorized by LLVM
         if scores.iter().all(|&s| s <= MAX_SCORE) {

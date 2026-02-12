@@ -96,6 +96,10 @@ impl<T> MemoryBoundedQueue<T> {
     /// Push an item with its pre-computed heap size.
     ///
     /// Returns `Err((item, heap_size))` if over memory limit or queue is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns the item and heap size if the queue is full or over its memory limit.
     pub fn push(&self, item: T, heap_size: usize) -> Result<(), (T, usize)> {
         let limit = self.limit_bytes.load(Ordering::Acquire);
         let current = self.current_bytes.load(Ordering::Acquire);
@@ -286,6 +290,10 @@ impl<T> OrderedQueue<T> {
     /// - If we DO have `next_seq`: only accept if under memory limit
     ///
     /// Returns `Err((item, heap_size))` if rejected due to backpressure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the item and heap size if rejected due to memory backpressure.
     pub fn insert(&self, serial: u64, item: T, heap_size: usize) -> Result<(), (T, usize)> {
         let mut inner = self.inner.lock();
 
@@ -536,6 +544,7 @@ mod tests {
     /// This verifies the queue properly rejects items when memory limit is reached,
     /// preventing OOM conditions in the pipeline.
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn test_backpressure_prevents_oom() {
         // Create queue with small memory limit (1KB)
         let queue: MemoryBoundedQueue<Vec<u8>> = MemoryBoundedQueue::new(16, 1024);
@@ -578,6 +587,7 @@ mod tests {
 
     /// Test that `OrderedQueue` backpressure respects memory limits.
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_ordered_queue_backpressure_memory_bound() {
         // Small limit: 500 bytes
         let queue: OrderedQueue<Vec<u8>> = OrderedQueue::new(500);

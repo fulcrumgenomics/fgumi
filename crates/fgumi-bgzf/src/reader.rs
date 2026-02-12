@@ -43,8 +43,8 @@ pub const BGZF_FOOTER_SIZE: usize = 8;
 
 /// BGZF EOF marker block (empty block signaling end of file).
 pub const BGZF_EOF: [u8; 28] = [
-    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02,
-    0x00, 0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 // ============================================================================
@@ -154,19 +154,13 @@ fn read_raw_block<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<RawBgzf
     if header[2] != 0x08 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "Invalid compression method: expected 0x08, got 0x{:02x}",
-                header[2]
-            ),
+            format!("Invalid compression method: expected 0x08, got 0x{:02x}", header[2]),
         ));
     }
 
     // Validate FEXTRA flag
     if header[3] & 0x04 == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "BGZF block missing FEXTRA flag",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "BGZF block missing FEXTRA flag"));
     }
 
     // Validate BC subfield identifier
@@ -276,13 +270,9 @@ pub fn decompress_block(
     let mut uncompressed = vec![0u8; uncompressed_size];
 
     // Decompress and validate byte count
-    let bytes_written = decompressor
-        .deflate_decompress(compressed, &mut uncompressed)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("BGZF decompression failed: {e:?}"),
-            )
+    let bytes_written =
+        decompressor.deflate_decompress(compressed, &mut uncompressed).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
         })?;
 
     if bytes_written != uncompressed_size {
@@ -344,13 +334,9 @@ pub fn decompress_block_into(
     output.resize(start + uncompressed_size, 0);
 
     // Decompress directly into the buffer and validate byte count
-    let bytes_written = decompressor
-        .deflate_decompress(compressed, &mut output[start..])
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("BGZF decompression failed: {e:?}"),
-            )
+    let bytes_written =
+        decompressor.deflate_decompress(compressed, &mut output[start..]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
         })?;
 
     if bytes_written != uncompressed_size {
@@ -425,13 +411,9 @@ pub fn decompress_block_slice_into(
     let start = output.len();
     output.resize(start + uncompressed_size, 0);
 
-    let bytes_written = decompressor
-        .deflate_decompress(compressed, &mut output[start..])
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("BGZF decompression failed: {e:?}"),
-            )
+    let bytes_written =
+        decompressor.deflate_decompress(compressed, &mut output[start..]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
         })?;
 
     if bytes_written != uncompressed_size {
@@ -471,9 +453,7 @@ mod tests {
 
     #[test]
     fn test_eof_block_detection() {
-        let block = RawBgzfBlock {
-            data: BGZF_EOF.to_vec(),
-        };
+        let block = RawBgzfBlock { data: BGZF_EOF.to_vec() };
         assert!(block.is_eof());
         assert_eq!(block.uncompressed_size(), 0);
     }
@@ -533,9 +513,7 @@ mod tests {
 
     #[test]
     fn test_decompress_eof_block() {
-        let block = RawBgzfBlock {
-            data: BGZF_EOF.to_vec(),
-        };
+        let block = RawBgzfBlock { data: BGZF_EOF.to_vec() };
         let mut decompressor = Decompressor::new();
         let result = decompress_block(&block, &mut decompressor).unwrap();
         assert!(result.is_empty());
@@ -543,9 +521,7 @@ mod tests {
 
     #[test]
     fn test_decompress_block_into_eof() {
-        let block = RawBgzfBlock {
-            data: BGZF_EOF.to_vec(),
-        };
+        let block = RawBgzfBlock { data: BGZF_EOF.to_vec() };
         let mut decompressor = Decompressor::new();
         let mut output = Vec::new();
         decompress_block_into(&block, &mut decompressor, &mut output).unwrap();
@@ -564,9 +540,7 @@ mod tests {
         let blocks = compressor.take_blocks();
         assert_eq!(blocks.len(), 1);
 
-        let block = RawBgzfBlock {
-            data: blocks[0].data.clone(),
-        };
+        let block = RawBgzfBlock { data: blocks[0].data.clone() };
         let mut decompressor = Decompressor::new();
 
         // Start with existing data in the buffer
@@ -589,9 +563,7 @@ mod tests {
         compressor.flush().unwrap();
         let blocks = compressor.take_blocks();
 
-        let block = RawBgzfBlock {
-            data: blocks[0].data.clone(),
-        };
+        let block = RawBgzfBlock { data: blocks[0].data.clone() };
         let mut decompressor = Decompressor::new();
 
         // Decompress using original function

@@ -726,7 +726,7 @@ impl BatchWeight for RawMiGroup {
 impl MemoryEstimate for RawMiGroup {
     fn estimate_heap_size(&self) -> usize {
         let mi_size = self.mi.capacity();
-        let records_size: usize = self.records.iter().map(|r| r.capacity()).sum();
+        let records_size: usize = self.records.iter().map(std::vec::Vec::capacity).sum();
         let records_vec_overhead = self.records.capacity() * std::mem::size_of::<Vec<u8>>();
         mi_size + records_size + records_vec_overhead
     }
@@ -815,6 +815,10 @@ impl RawMiGrouper {
     }
 
     /// Create a `RawMiGrouper` with record filtering and MI tag transformation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tag_name` is not exactly 2 characters.
     pub fn with_filter_and_transform<F, T>(
         tag_name: &str,
         batch_size: usize,
@@ -964,6 +968,10 @@ where
     I: Iterator<Item = Result<Vec<u8>>>,
 {
     /// Creates a new `RawMiGroupIterator`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tag_name` is not exactly 2 characters.
     pub fn new(record_iter: I, tag_name: &str) -> Self {
         assert!(tag_name.len() == 2, "Tag name must be exactly 2 characters");
         let tag_bytes = tag_name.as_bytes();
@@ -980,6 +988,10 @@ where
     }
 
     /// Creates a new `RawMiGroupIterator` with MI tag transformation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tag_name` is not exactly 2 characters.
     pub fn with_transform<F>(record_iter: I, tag_name: &str, mi_transform: F) -> Self
     where
         F: Fn(&[u8]) -> String + 'static,
@@ -1350,6 +1362,7 @@ mod tests {
     //   then: seq      (ceil(l_seq/2) bytes, 4-bit encoded)
     //   then: qual     (l_seq bytes)
     //   then: aux data
+    #[allow(clippy::cast_possible_truncation)]
     fn make_raw_bam_with_tag(tag_name: &str, tag_value: &str) -> Vec<u8> {
         let name = b"read";
         let l_read_name: u8 = (name.len() + 1) as u8; // +1 for NUL
@@ -1394,6 +1407,7 @@ mod tests {
     }
 
     /// Build a minimal raw BAM record with no aux tags.
+    #[allow(clippy::cast_possible_truncation)]
     fn make_raw_bam_without_tag() -> Vec<u8> {
         let name = b"read";
         let l_read_name: u8 = (name.len() + 1) as u8;
@@ -1632,6 +1646,7 @@ mod tests {
     }
 
     /// Build a minimal raw BAM record with two string tags.
+    #[allow(clippy::cast_possible_truncation)]
     fn make_raw_bam_with_two_tags(tag1: &str, val1: &str, tag2: &str, val2: &str) -> Vec<u8> {
         let name = b"read";
         let l_read_name: u8 = (name.len() + 1) as u8;

@@ -357,7 +357,10 @@ impl ConsensusBaseBuilder {
         // Check if the likelihood difference is large enough to skip full calculation.
         // When ln(L_winner) - ln(L_loser) > threshold, the posterior is essentially 1.
         // threshold = 23 corresponds to likelihood ratio > 10^10, giving Q > 90
-        #[expect(clippy::items_after_statements, reason = "const is logically scoped to this fast-path check")]
+        #[expect(
+            clippy::items_after_statements,
+            reason = "const is logically scoped to this fast-path check"
+        )]
         const FAST_PATH_THRESHOLD: f64 = 23.0;
 
         let likelihoods = self.likelihoods.as_array();

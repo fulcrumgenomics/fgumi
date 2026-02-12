@@ -65,6 +65,7 @@ impl UCBScheduler {
     }
 
     /// Calculate UCB score for a step.
+    #[allow(clippy::cast_precision_loss)]
     fn ucb_score(&self, step_idx: usize) -> f64 {
         let n_i = self.attempts[step_idx];
 

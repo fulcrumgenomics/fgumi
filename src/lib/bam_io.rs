@@ -107,6 +107,9 @@ impl BgzfWriterEnum {
     /// Finish writing and close the writer properly.
     /// This is especially important for multi-threaded writers to ensure
     /// all data is flushed and the EOF marker is written.
+    ///
+    /// # Errors
+    /// Returns an error if flushing or finalizing the writer fails.
     pub fn finish(self) -> io::Result<()> {
         match self {
             BgzfWriterEnum::SingleThreaded(mut w) => {
@@ -143,6 +146,10 @@ impl RawBamWriter {
     }
 
     /// Write the BAM header.
+    ///
+    /// # Errors
+    /// Returns an error if writing to the underlying writer fails.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn write_header(&mut self, header: &Header) -> io::Result<()> {
         use std::io::Write;
 
@@ -179,7 +186,11 @@ impl RawBamWriter {
     /// Write a raw BAM record.
     ///
     /// The bytes should be the raw BAM record data (without the 4-byte `block_size` prefix).
+    ///
+    /// # Errors
+    /// Returns an error if writing to the underlying writer fails.
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn write_raw_record(&mut self, record_bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
 
@@ -192,6 +203,9 @@ impl RawBamWriter {
     }
 
     /// Finish writing and close the writer.
+    ///
+    /// # Errors
+    /// Returns an error if finalizing the writer fails.
     pub fn finish(self) -> io::Result<()> {
         self.inner.finish()
     }
@@ -201,6 +215,12 @@ impl RawBamWriter {
 ///
 /// This is more efficient than `create_bam_writer` when you already have raw BAM bytes
 /// because it bypasses the noodles Record encoding path.
+///
+/// # Errors
+/// Returns an error if the file cannot be created or the header cannot be written.
+///
+/// # Panics
+/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
 pub fn create_raw_bam_writer<P: AsRef<Path>>(
     path: P,
     header: &Header,
@@ -297,6 +317,7 @@ impl IndexingBamWriter {
     }
 
     /// Write the BAM header.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn write_header(&mut self, header: &Header) -> io::Result<()> {
         // BAM magic
         self.inner.write_all(b"BAM\x01")?;
@@ -340,7 +361,11 @@ impl IndexingBamWriter {
     /// - Alignment start position
     /// - Alignment end position (calculated from CIGAR)
     /// - Mapped/unmapped status
+    ///
+    /// # Errors
+    /// Returns an error if writing the record or flushing blocks fails.
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn write_raw_record(&mut self, record_bytes: &[u8]) -> io::Result<()> {
         // Capture position BEFORE write
         let block_number = self.current_block_number;
@@ -381,6 +406,9 @@ impl IndexingBamWriter {
     ///
     /// This method encodes the record buffer to raw bytes using noodles' encoder,
     /// then writes it. Useful for the non-fast sorting path that uses decoded records.
+    ///
+    /// # Errors
+    /// Returns an error if encoding or writing the record fails.
     pub fn write_record_buf(
         &mut self,
         header: &Header,
@@ -397,6 +425,7 @@ impl IndexingBamWriter {
     }
 
     /// Process block completion notifications and resolve cached index entries.
+    #[allow(clippy::cast_possible_truncation)]
     fn flush_completed_blocks(&mut self) -> io::Result<()> {
         // Drain block info from receiver
         while let Ok(info) = self.block_info_rx.try_recv() {
@@ -455,6 +484,7 @@ impl IndexingBamWriter {
     /// Returns `Some((ref_id, start, end, is_mapped))` for mapped reads,
     /// or `None` for unmapped reads (needed for unmapped record counting).
     #[inline]
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
         // Extract fields from BAM record
         let tid = i32::from_le_bytes([bam[0], bam[1], bam[2], bam[3]]);
@@ -484,6 +514,7 @@ impl IndexingBamWriter {
     /// This is similar to `reference_length_from_cigar` but reads CIGAR ops
     /// byte-by-byte to avoid alignment requirements.
     #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn calculate_reference_length(bam: &[u8]) -> i32 {
         let l_read_name = bam[8] as usize;
         let n_cigar_op = u16::from_le_bytes([bam[12], bam[13]]) as usize;
@@ -524,6 +555,9 @@ impl IndexingBamWriter {
     }
 
     /// Finish writing, flush the BGZF stream, and return the index.
+    ///
+    /// # Errors
+    /// Returns an error if flushing, finalizing, or building the index fails.
     pub fn finish(mut self) -> io::Result<bai::Index> {
         // Flush any remaining data
         self.inner.flush()?;
@@ -576,6 +610,12 @@ impl IndexingBamWriter {
 ///
 /// # Returns
 /// An `IndexingBamWriter` that will generate a BAI index on `finish()`.
+///
+/// # Errors
+/// Returns an error if the file cannot be created or the header cannot be written.
+///
+/// # Panics
+/// Panics if `NonZero::new` fails on the thread count (should not happen).
 pub fn create_indexing_bam_writer<P: AsRef<Path>>(
     path: P,
     header: &Header,
@@ -611,6 +651,9 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
 /// # Arguments
 /// * `path` - Path for the output BAI file (typically `output.bam.bai`)
 /// * `index` - The BAI index to write
+///
+/// # Errors
+/// Returns an error if the file cannot be created or writing the index fails.
 pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()> {
     let path_ref = path.as_ref();
     let file = File::create(path_ref)
@@ -637,6 +680,9 @@ pub fn write_bai_index<P: AsRef<Path>>(path: P, index: &bai::Index) -> Result<()
 ///
 /// # Errors
 /// Returns an error if the file cannot be opened or the header cannot be read
+///
+/// # Panics
+/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
 ///
 /// # Example
 /// ```no_run
@@ -689,6 +735,9 @@ pub type RawBamReaderAuto = RawBamReader<BgzfReaderEnum>;
 ///
 /// # Errors
 /// Returns an error if the file cannot be opened or the header cannot be read
+///
+/// # Panics
+/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
 pub fn create_raw_bam_reader<P: AsRef<Path>>(
     path: P,
     threads: usize,
@@ -732,6 +781,9 @@ pub fn create_raw_bam_reader<P: AsRef<Path>>(
 ///
 /// # Errors
 /// Returns an error if the file cannot be created or the header cannot be written
+///
+/// # Panics
+/// Panics if `threads > 1` but `NonZero::new` fails (should not happen).
 ///
 /// # Example
 /// ```no_run
@@ -1310,6 +1362,7 @@ mod tests {
     /// Creates a mapped record at the given reference and position with a simple CIGAR.
     /// The read name is padded to ensure CIGAR alignment (the read name length must make
     /// the CIGAR start at a 4-byte aligned offset from the record start).
+    #[allow(clippy::cast_possible_truncation)]
     fn create_test_bam_record(ref_id: i32, pos: i32, read_name: &[u8]) -> Vec<u8> {
         // BAM record structure (without block_size prefix):
         // refID (4), pos (4), l_read_name (1), mapq (1), bin (2), n_cigar_op (2),

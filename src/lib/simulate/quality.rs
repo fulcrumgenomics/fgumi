@@ -100,6 +100,10 @@ impl PositionQualityModel {
     /// # Returns
     ///
     /// A quality score clamped to [`min_quality`, 41].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `noise_stddev` produces an invalid normal distribution.
     pub fn quality_at(&self, position: usize, rng: &mut impl Rng) -> u8 {
         let base_q = if position < self.warmup_bases {
             // Linear ramp from warmup_start to peak
@@ -185,6 +189,7 @@ impl ReadPairQualityBias {
     ///
     /// Adjusted quality score, clamped to [2, 41].
     #[must_use]
+    #[allow(clippy::cast_sign_loss)]
     pub fn apply(&self, quality: u8, is_r2: bool) -> u8 {
         if is_r2 {
             let adjusted = i16::from(quality) + i16::from(self.r2_offset);

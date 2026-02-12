@@ -12,8 +12,8 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::{Cigar as CigarBuf, QualityScores, Sequence};
 
-use fgumi_dna::{MIN_PHRED, NO_CALL_BASE};
 use crate::record_utils;
+use fgumi_dna::{MIN_PHRED, NO_CALL_BASE};
 
 /// Helper macro to get array length for any Array variant
 macro_rules! array_len {
@@ -143,7 +143,10 @@ impl SamRecordClipper {
     /// Clips a specified number of bases from the start (left side) of the alignment
     ///
     /// Returns the number of bases actually clipped
-    #[expect(clippy::too_many_lines, reason = "clipping logic with multiple modes requires handling many CIGAR edge cases")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "clipping logic with multiple modes requires handling many CIGAR edge cases"
+    )]
     pub fn clip_start_of_alignment(&self, record: &mut RecordBuf, bases_to_clip: usize) -> usize {
         if bases_to_clip == 0 {
             return 0;
@@ -313,7 +316,10 @@ impl SamRecordClipper {
     /// Clips a specified number of bases from the end (right side) of the alignment
     ///
     /// Returns the number of bases actually clipped
-    #[expect(clippy::too_many_lines, reason = "mirrors clip_start_of_alignment with symmetric end-clipping logic")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors clip_start_of_alignment with symmetric end-clipping logic"
+    )]
     pub fn clip_end_of_alignment(&self, record: &mut RecordBuf, bases_to_clip: usize) -> usize {
         if bases_to_clip == 0 {
             return 0;
@@ -783,7 +789,10 @@ impl SamRecordClipper {
     ///
     /// Given a reference length, calculates how many query bases correspond to that region
     /// starting from either the 5' end (`from_start=true`) or 3' end (`from_start=false`)
-    #[expect(clippy::unused_self, reason = "kept as a method for consistency with other clipper operations")]
+    #[expect(
+        clippy::unused_self,
+        reason = "kept as a method for consistency with other clipper operations"
+    )]
     fn calculate_query_bases_for_ref_region(
         &self,
         record: &RecordBuf,
@@ -1043,7 +1052,10 @@ impl SamRecordClipper {
     ///
     /// Returns `Result` for API compatibility, but the current implementation is
     /// infallible and always returns `Ok`.
-    #[expect(clippy::too_many_lines, reason = "CIGAR rewriting with attribute clipping requires many branches")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "CIGAR rewriting with attribute clipping requires many branches"
+    )]
     pub fn upgrade_all_clipping(&self, record: &mut RecordBuf) -> Result<(usize, usize)> {
         // Only upgrade in Hard mode
         if !matches!(self.mode, ClippingMode::Hard) {
@@ -1227,7 +1239,10 @@ pub mod cigar_utils {
 
     /// Counts the number of aligned bases in a CIGAR string
     #[must_use]
-    #[expect(clippy::redundant_closure_for_method_calls, reason = "Op::len is not a method on the trait")]
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "Op::len is not a method on the trait"
+    )]
     pub fn aligned_bases(cigar: &impl CigarTrait) -> usize {
         cigar
             .iter()
@@ -1241,7 +1256,10 @@ pub mod cigar_utils {
 
     /// Counts the number of clipped bases in a CIGAR string
     #[must_use]
-    #[expect(clippy::redundant_closure_for_method_calls, reason = "Op::len is not a method on the trait")]
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "Op::len is not a method on the trait"
+    )]
     pub fn clipped_bases(cigar: &impl CigarTrait) -> usize {
         cigar
             .iter()
@@ -1253,7 +1271,10 @@ pub mod cigar_utils {
 
     /// Counts reference-consuming operations
     #[must_use]
-    #[expect(clippy::redundant_closure_for_method_calls, reason = "Op::len is not a method on the trait")]
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "Op::len is not a method on the trait"
+    )]
     pub fn reference_length(cigar: &impl CigarTrait) -> usize {
         cigar
             .iter()

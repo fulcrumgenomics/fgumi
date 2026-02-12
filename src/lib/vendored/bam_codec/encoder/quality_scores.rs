@@ -3,6 +3,7 @@ use std::{io, iter};
 
 use super::num::write_u8;
 
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn write_quality_scores<S>(
     dst: &mut Vec<u8>,
     base_count: usize,

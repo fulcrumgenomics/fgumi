@@ -74,6 +74,10 @@ impl<R: Read> BatchedSamReader<R> {
     /// - Grows buffer proactively if unparsed data > 50% of capacity
     /// - Preserves partial records at end of buffer
     /// - Never loses data
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying reader fails.
     pub fn fill_buffer(&mut self) -> io::Result<bool> {
         let unparsed_len = self.buffer_len.saturating_sub(self.parse_pos);
 
@@ -157,6 +161,7 @@ impl<R: Read> BatchedSamReader<R> {
     }
 
     /// Grow buffer if needed based on batch size. Never shrinks.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
     fn maybe_grow(&mut self, bytes_this_batch: usize) -> bool {
         let needed = ((bytes_this_batch as f64) * GROWTH_FACTOR) as usize;
         if needed > self.buffer.len() {
@@ -438,11 +443,13 @@ mod tests {
         let second_half = &record[split_point..];
 
         // We need to simulate partial reads, so use a custom reader
+        #[allow(clippy::items_after_statements)]
         struct PartialReader {
             chunks: Vec<Vec<u8>>,
             idx: usize,
         }
 
+        #[allow(clippy::items_after_statements)]
         impl Read for PartialReader {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 if self.idx >= self.chunks.len() {

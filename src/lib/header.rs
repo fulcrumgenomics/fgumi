@@ -94,6 +94,9 @@ pub fn make_unique_program_id(header: &Header, base_id: &str) -> String {
 /// # Returns
 ///
 /// A `Map<Program>` ready to add to a header.
+/// # Errors
+///
+/// Returns an error if the program record cannot be built.
 pub fn build_program_record(
     version: &str,
     command_line: &str,
@@ -127,6 +130,9 @@ pub fn build_program_record(
 /// # Returns
 ///
 /// The modified header with the new @PG record.
+/// # Errors
+///
+/// Returns an error if the program record cannot be added to the header.
 pub fn add_pg_record(mut header: Header, version: &str, command_line: &str) -> Result<Header> {
     let previous_program = get_last_program_id(&header);
     let unique_id = make_unique_program_id(&header, "fgumi");
@@ -150,6 +156,9 @@ pub fn add_pg_record(mut header: Header, version: &str, command_line: &str) -> R
 /// # Returns
 ///
 /// The modified header builder.
+/// # Errors
+///
+/// Returns an error if the program record cannot be built.
 pub fn add_pg_to_builder(
     builder: noodles::sam::header::Builder,
     version: &str,
@@ -233,15 +242,15 @@ mod tests {
         // Verify the program has expected fields
         let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
         assert_eq!(
-            pg.other_fields().get(&tag::NAME).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::NAME).map(std::convert::AsRef::as_ref),
             Some(b"fgumi".as_slice())
         );
         assert_eq!(
-            pg.other_fields().get(&tag::VERSION).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::VERSION).map(std::convert::AsRef::as_ref),
             Some(b"1.0.0".as_slice())
         );
         assert_eq!(
-            pg.other_fields().get(&tag::COMMAND_LINE).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::COMMAND_LINE).map(std::convert::AsRef::as_ref),
             Some(b"fgumi test".as_slice())
         );
         assert!(pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).is_none());
@@ -261,7 +270,7 @@ mod tests {
         // Verify PP chaining
         let pg = programs.as_ref().get(b"fgumi.1".as_slice()).unwrap();
         assert_eq!(
-            pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"fgumi".as_slice())
         );
     }
@@ -284,7 +293,7 @@ mod tests {
         // fgumi should chain to bwa
         let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
         assert_eq!(
-            pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"bwa".as_slice())
         );
     }
@@ -300,7 +309,7 @@ mod tests {
 
         let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
         assert_eq!(
-            pg.other_fields().get(&tag::NAME).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::NAME).map(std::convert::AsRef::as_ref),
             Some(b"fgumi".as_slice())
         );
         assert!(pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).is_none());
@@ -347,7 +356,7 @@ mod tests {
         // fgumi should chain to SamBuilder
         let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
         assert_eq!(
-            pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(|s| s.as_ref()),
+            pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"SamBuilder".as_slice())
         );
 

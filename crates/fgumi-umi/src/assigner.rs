@@ -221,8 +221,8 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fgumi_dna::BitEnc;
 use crate::MoleculeId;
+use fgumi_dna::BitEnc;
 
 /// Default minimum number of unique UMIs to use N-gram/BK-tree index for candidate search.
 /// Below this threshold, linear scan is used. Based on benchmarks: index provides ~10%
@@ -295,8 +295,7 @@ impl BkTree {
         match self.root {
             Some(ref mut root) => Self::insert_into(root, encoded, index),
             None => {
-                self.root =
-                    Some(Box::new(BkNode { encoded, index, children: BTreeMap::new() }));
+                self.root = Some(Box::new(BkNode { encoded, index, children: BTreeMap::new() }));
             }
         }
     }

@@ -106,6 +106,7 @@ impl<T> ReorderBuffer<T> {
     ///
     /// Panics in debug mode if an item with the same sequence number is already buffered,
     /// or if the sequence number is before the current base.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn insert_with_size(&mut self, seq: u64, item: T, heap_size: usize) {
         debug_assert!(
             seq >= self.base_seq,
@@ -147,6 +148,10 @@ impl<T> ReorderBuffer<T> {
     ///
     /// Returns `Some((item, heap_size))` if the item with `next_seq` is buffered,
     /// otherwise returns `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal state is inconsistent (the front item was indicated as poppable but is missing).
     #[must_use]
     pub fn try_pop_next_with_size(&mut self) -> Option<(T, usize)> {
         // Check if front item is present (handles empty buffer and gaps)
@@ -162,7 +167,7 @@ impl<T> ReorderBuffer<T> {
         self.heap_bytes = self.heap_bytes.saturating_sub(size as u64);
 
         // Update can_pop for next item
-        self.can_pop = self.buffer.front().is_some_and(|x| x.is_some());
+        self.can_pop = self.buffer.front().is_some_and(Option::is_some);
 
         Some((item, size))
     }

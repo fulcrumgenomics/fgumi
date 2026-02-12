@@ -102,6 +102,7 @@ struct PrefetchingChunkReader {
 
 impl PrefetchingChunkReader {
     /// Create a new prefetching reader for a chunk file.
+    #[allow(clippy::unnecessary_wraps)]
     fn new(path: PathBuf, idx: usize) -> Result<Self> {
         // Channel for prefetched records
         let (record_tx, record_rx) = bounded(PREFETCH_BUFFER_SIZE);
@@ -117,6 +118,7 @@ impl PrefetchingChunkReader {
     }
 
     /// Reader thread function.
+    #[allow(clippy::needless_pass_by_value)]
     fn reader_thread(path: PathBuf, tx: Sender<Option<Record>>) -> Result<()> {
         let file = File::open(&path).context("Failed to open chunk file")?;
         let buf_reader = BufReader::with_capacity(MERGE_BUFFER_SIZE, file);
@@ -164,6 +166,11 @@ impl PrefetchingChunkReader {
 }
 
 /// Parallel merge implementation using prefetching readers.
+///
+/// # Errors
+///
+/// Returns an error if reading chunks, writing output, or merging fails.
+#[allow(clippy::needless_pass_by_value)]
 pub fn parallel_merge<K, F>(
     chunk_files: &[PathBuf],
     _header: &Header,
@@ -220,7 +227,7 @@ where
         }
     }
 
-    log::info!("Parallel merge complete: {} records merged", records_merged);
+    log::info!("Parallel merge complete: {records_merged} records merged");
 
     Ok(records_merged)
 }
@@ -229,6 +236,11 @@ where
 ///
 /// This version adds an output buffer that accumulates records before
 /// writing them to the output file, reducing the number of write calls.
+///
+/// # Errors
+///
+/// Returns an error if reading chunks, writing output, or merging fails.
+#[allow(clippy::needless_pass_by_value)]
 pub fn parallel_merge_buffered<K, F>(
     chunk_files: &[PathBuf],
     _header: &Header,
@@ -299,7 +311,7 @@ where
         writer.write_record(output_header, &record)?;
     }
 
-    log::info!("Buffered parallel merge complete: {} records merged", records_merged);
+    log::info!("Buffered parallel merge complete: {records_merged} records merged");
 
     Ok(records_merged)
 }

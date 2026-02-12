@@ -73,6 +73,7 @@ pub(super) fn get_array(src: &mut &[u8]) -> Result<Value, DecodeError> {
     Ok(Value::Array(array))
 }
 
+#[allow(clippy::cast_possible_wrap)]
 fn read_i8(src: &mut &[u8]) -> Result<i8, DecodeError> {
     let (n, rest) = src.split_first().ok_or(DecodeError::UnexpectedEof)?;
     *src = rest;

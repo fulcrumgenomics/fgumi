@@ -35,6 +35,7 @@ use std::sync::Arc;
 ///
 /// Optimized: Reads entire sequence bytes in one syscall, then strips newlines in memory.
 /// Fast path: If sequence fits in a single line, skip newline stripping entirely.
+#[allow(clippy::cast_possible_truncation)]
 fn read_sequence_raw(file: &mut File, record: &fai::Record) -> Result<Vec<u8>> {
     let line_bases = record.line_bases() as usize;
     let line_width = record.line_width() as usize;

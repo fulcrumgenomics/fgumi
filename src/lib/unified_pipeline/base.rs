@@ -972,6 +972,10 @@ impl BgzfBatchConfig {
 ///
 /// This is the read function for the unified pipeline when processing BAM files.
 /// Returns `Ok(true)` if blocks were read, `Ok(false)` at EOF.
+///
+/// # Errors
+///
+/// Returns an I/O error if reading from the underlying reader fails.
 pub fn read_raw_block_batch(
     reader: &mut dyn Read,
     buffer: &mut RawBlockBatch,
@@ -989,9 +993,13 @@ pub fn read_raw_block_batch(
 /// Write a batch of compressed blocks to output.
 ///
 /// This is the write function for the unified pipeline.
+///
+/// # Errors
+///
+/// Returns an I/O error if writing to the underlying writer fails.
 pub fn write_compressed_batch(
     writer: &mut dyn Write,
-    batch: CompressedBlockBatch,
+    batch: &CompressedBlockBatch,
 ) -> io::Result<()> {
     for block in &batch.blocks {
         writer.write_all(&block.data)?;
@@ -1023,6 +1031,10 @@ impl BgzfWorkerState {
     /// Decompress a batch of raw blocks into uncompressed data.
     ///
     /// Returns the concatenated uncompressed data from all blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if decompression fails.
     pub fn decompress_batch(&mut self, batch: &RawBlockBatch) -> io::Result<Vec<u8>> {
         let total_size = batch.total_uncompressed_size();
         let mut result = Vec::with_capacity(total_size);
@@ -1900,6 +1912,10 @@ pub trait PipelineLifecycle {
     fn items_written(&self) -> u64;
 
     /// Flush the output writer and finalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if flushing fails.
     fn flush_output(&self) -> io::Result<()>;
 
     /// Validate pipeline completion to detect data loss.
@@ -1915,6 +1931,10 @@ pub trait PipelineLifecycle {
     ///
     /// Returns `Ok(())` if validation passes, or `Err(PipelineValidationError)`
     /// with detailed diagnostics if any issues are detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineValidationError` if validation detects data loss or inconsistency.
     fn validate_completion(&self) -> Result<(), PipelineValidationError>;
 }
 
@@ -2007,6 +2027,7 @@ pub fn run_monitor_loop<S, F>(
 /// It handles the common cases of &str and String panic payloads, with a
 /// fallback for other types.
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn extract_panic_message(panic_info: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = panic_info.downcast_ref::<&str>() {
         (*s).to_string()
@@ -2027,7 +2048,7 @@ pub fn handle_worker_panic<S: PipelineLifecycle>(
     panic_info: Box<dyn std::any::Any + Send>,
 ) {
     let msg = extract_panic_message(panic_info);
-    state.set_error(io::Error::other(format!("Worker thread {} panicked: {}", thread_id, msg)));
+    state.set_error(io::Error::other(format!("Worker thread {thread_id} panicked: {msg}")));
 }
 
 // ============================================================================
@@ -2037,6 +2058,10 @@ pub fn handle_worker_panic<S: PipelineLifecycle>(
 /// Join all worker threads, waiting for completion.
 ///
 /// Returns an error if any thread panicked without setting an error on the state.
+///
+/// # Errors
+///
+/// Returns an I/O error if any worker thread panicked.
 pub fn join_worker_threads(handles: Vec<thread::JoinHandle<()>>) -> io::Result<()> {
     for handle in handles {
         handle.join().map_err(|_| io::Error::other("Worker thread panicked"))?;
@@ -2065,6 +2090,10 @@ pub fn join_monitor_thread(handle: Option<thread::JoinHandle<()>>) {
 /// # Returns
 /// - `Ok(items_written)` on success
 /// - `Err(error)` if an error occurred during processing
+///
+/// # Errors
+///
+/// Returns an I/O error if an error occurred during processing or output flush fails.
 pub fn finalize_pipeline<S: PipelineLifecycle>(state: &S) -> io::Result<u64> {
     // Check for errors
     if let Some(error) = state.take_error() {
@@ -2954,6 +2983,7 @@ impl PipelineStats {
     /// Record a step attempt for a specific thread (called before attempting).
     /// This tracks total attempts regardless of success/failure.
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn record_step_attempt(&self, thread_id: usize, step: PipelineStep) {
         if thread_id < MAX_THREADS {
             let step_idx = step as usize;
@@ -2980,6 +3010,7 @@ impl PipelineStats {
     }
 
     /// Get current step for all threads (for activity snapshot).
+    #[allow(clippy::cast_possible_truncation)]
     pub fn get_thread_activity(&self, num_threads: usize) -> Vec<Option<PipelineStep>> {
         (0..num_threads.min(MAX_THREADS))
             .map(|tid| {
@@ -3071,6 +3102,12 @@ impl PipelineStats {
 
     /// Format statistics as a human-readable summary.
     #[allow(clippy::similar_names)] // Intentional: xxx_ns vs xxx_ms for nanoseconds vs milliseconds
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn format_summary(&self) -> String {
         use std::fmt::Write;
 
@@ -3248,10 +3285,10 @@ impl PipelineStats {
 
             writeln!(s).unwrap();
             writeln!(s, "Batch Size (records per batch):").unwrap();
-            writeln!(s, "  Count:   {:>10}", batch_count).unwrap();
-            writeln!(s, "  Min:     {:>10}", batch_min).unwrap();
-            writeln!(s, "  Max:     {:>10}", batch_max).unwrap();
-            writeln!(s, "  Average: {:>10.1}", batch_avg).unwrap();
+            writeln!(s, "  Count:   {batch_count:>10}").unwrap();
+            writeln!(s, "  Min:     {batch_min:>10}").unwrap();
+            writeln!(s, "  Max:     {batch_max:>10}").unwrap();
+            writeln!(s, "  Average: {batch_avg:>10.1}").unwrap();
         }
 
         // NEW: Per-thread work distribution
@@ -3266,16 +3303,16 @@ impl PipelineStats {
             // Header
             write!(s, "  Thread ").unwrap();
             for name in &step_names {
-                write!(s, " {:>6}", name).unwrap();
+                write!(s, " {name:>6}").unwrap();
             }
             writeln!(s, "    Idle ms").unwrap();
 
             // Per-thread rows
             for tid in 0..num_threads.min(MAX_THREADS) {
-                write!(s, "  T{:<5} ", tid).unwrap();
+                write!(s, "  T{tid:<5} ").unwrap();
                 for step_idx in 0..NUM_STEPS {
                     let count = self.per_thread_step_counts[tid][step_idx].load(Ordering::Relaxed);
-                    write!(s, " {:>6}", count).unwrap();
+                    write!(s, " {count:>6}").unwrap();
                 }
                 let idle_ns = self.per_thread_idle_ns[tid].load(Ordering::Relaxed);
                 writeln!(s, " {:>10.1}", idle_ns as f64 / 1_000_000.0).unwrap();
@@ -3288,7 +3325,7 @@ impl PipelineStats {
                 for tid in 0..num_threads.min(MAX_THREADS) {
                     total += self.per_thread_step_counts[tid][step_idx].load(Ordering::Relaxed);
                 }
-                write!(s, " {:>6}", total).unwrap();
+                write!(s, " {total:>6}").unwrap();
             }
             let total_idle: u64 = (0..num_threads.min(MAX_THREADS))
                 .map(|tid| self.per_thread_idle_ns[tid].load(Ordering::Relaxed))
@@ -3302,13 +3339,13 @@ impl PipelineStats {
             // Header
             write!(s, "  Thread ").unwrap();
             for name in &step_names {
-                write!(s, " {:>6}", name).unwrap();
+                write!(s, " {name:>6}").unwrap();
             }
             writeln!(s, "   Total%").unwrap();
 
             // Per-thread rows with success rates
             for tid in 0..num_threads.min(MAX_THREADS) {
-                write!(s, "  T{:<5} ", tid).unwrap();
+                write!(s, "  T{tid:<5} ").unwrap();
                 let mut thread_attempts = 0u64;
                 let mut thread_successes = 0u64;
                 for step_idx in 0..NUM_STEPS {
@@ -3322,14 +3359,14 @@ impl PipelineStats {
                         write!(s, "   -  ").unwrap();
                     } else {
                         let rate = (successes as f64 / attempts as f64) * 100.0;
-                        write!(s, " {:>5.0}%", rate).unwrap();
+                        write!(s, " {rate:>5.0}%").unwrap();
                     }
                 }
                 if thread_attempts == 0 {
                     writeln!(s, "      -").unwrap();
                 } else {
                     let total_rate = (thread_successes as f64 / thread_attempts as f64) * 100.0;
-                    writeln!(s, "  {:>5.1}%", total_rate).unwrap();
+                    writeln!(s, "  {total_rate:>5.1}%").unwrap();
                 }
             }
         }
@@ -3364,10 +3401,10 @@ impl PipelineStats {
 
             if total_thread_ms > 0.0 {
                 let utilization = (work_ms / total_thread_ms) * 100.0;
-                writeln!(s, "  Work time:       {:>10.1}ms", work_ms).unwrap();
-                writeln!(s, "  Idle time:       {:>10.1}ms", idle_ms).unwrap();
-                writeln!(s, "  Utilization:     {:>10.1}%", utilization).unwrap();
-                writeln!(s, "  Contention attempts: {:>7}", total_contention).unwrap();
+                writeln!(s, "  Work time:       {work_ms:>10.1}ms").unwrap();
+                writeln!(s, "  Idle time:       {idle_ms:>10.1}ms").unwrap();
+                writeln!(s, "  Utilization:     {utilization:>10.1}%").unwrap();
+                writeln!(s, "  Contention attempts: {total_contention:>7}").unwrap();
             }
         }
 
@@ -3395,7 +3432,7 @@ impl PipelineStats {
                 } else if bytes >= 1_000 {
                     format!("{:.1} KB", bytes as f64 / 1_000.0)
                 } else {
-                    format!("{} B", bytes)
+                    format!("{bytes} B")
                 }
             };
 
@@ -3406,7 +3443,7 @@ impl PipelineStats {
                 } else if count >= 1_000 {
                     format!("{:.1}K", count as f64 / 1_000.0)
                 } else {
-                    format!("{}", count)
+                    format!("{count}")
                 }
             };
 
@@ -3586,7 +3623,7 @@ impl PipelineStats {
                             8 => "W",
                             _ => "?",
                         };
-                        write!(s, "{}", short).unwrap();
+                        write!(s, "{short}").unwrap();
                     } else {
                         write!(s, ".").unwrap();
                     }
@@ -3600,7 +3637,7 @@ impl PipelineStats {
                 samples.iter().map(|s| s.reorder_memory_bytes[1]).max().unwrap_or(0);
             let peak_r3_mb = peak_r3_bytes as f64 / 1_048_576.0;
             writeln!(s).unwrap();
-            writeln!(s, "Peak Q3 Reorder Buffer: {} items, {:.1} MB", peak_r3_items, peak_r3_mb)
+            writeln!(s, "Peak Q3 Reorder Buffer: {peak_r3_items} items, {peak_r3_mb:.1} MB")
                 .unwrap();
         }
 
@@ -3612,11 +3649,11 @@ impl PipelineStats {
             writeln!(s).unwrap();
             writeln!(s, "Memory Limiting:").unwrap();
             if group_rejects > 0 {
-                writeln!(s, "  Group rejects (memory): {:>10}", group_rejects).unwrap();
+                writeln!(s, "  Group rejects (memory): {group_rejects:>10}").unwrap();
             }
             if peak_memory > 0 {
                 let peak_mb = peak_memory as f64 / 1_048_576.0;
-                writeln!(s, "  Peak memory usage:      {:>10.1} MB", peak_mb).unwrap();
+                writeln!(s, "  Peak memory usage:      {peak_mb:>10.1} MB").unwrap();
             }
         }
 
@@ -3851,6 +3888,9 @@ pub trait OutputPipelineState: Send + Sync {
 
     // Queue 5 access (Serialize → Compress)
     fn q5_pop(&self) -> Option<(u64, SerializedBatch)>;
+    /// # Errors
+    ///
+    /// Returns the item if the queue is full.
     fn q5_push(&self, item: (u64, SerializedBatch)) -> Result<(), (u64, SerializedBatch)>;
     fn q5_is_full(&self) -> bool;
     /// Track memory released when popping from Q5.
@@ -3858,6 +3898,9 @@ pub trait OutputPipelineState: Send + Sync {
 
     // Queue 6 access (Compress → Write)
     fn q6_pop(&self) -> Option<(u64, CompressedBlockBatch)>;
+    /// # Errors
+    ///
+    /// Returns the item if the queue is full.
     fn q6_push(&self, item: (u64, CompressedBlockBatch))
     -> Result<(), (u64, CompressedBlockBatch)>;
     fn q6_is_full(&self) -> bool;
@@ -3944,6 +3987,7 @@ pub trait HasWorkerCore {
 /// - If work was done, reset backoff
 /// - If no work, mark thread as idle, sleep and record idle time (if stats enabled), then increase backoff
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 pub fn handle_worker_backoff<W: HasWorkerCore>(
     worker: &mut W,
     stats: Option<&PipelineStats>,
@@ -4060,6 +4104,7 @@ pub trait StepContext {
 ///
 /// This consolidates the duplicated worker loop logic into a single function.
 /// The `StepContext` trait provides pipeline-specific behavior.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub fn generic_worker_loop<C: StepContext>(ctx: &C, worker: &mut C::Worker) {
     let collect_stats = ctx.stats().is_some();
     let check_completion_at_end = ctx.check_completion_at_end();
@@ -4465,6 +4510,10 @@ pub trait ProcessPipelineState<G, P>: Send + Sync {
     fn process_output_is_full(&self) -> bool;
 
     /// Push processed results to output queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the item if the queue is full.
     fn process_output_push(&self, item: (u64, Vec<P>)) -> Result<(), (u64, Vec<P>)>;
 
     /// Check if an error has occurred.
@@ -4527,7 +4576,7 @@ where
             }
             Err((serial, items)) => {
                 // Re-calculate heap_size for accurate memory tracking
-                let heap_size: usize = items.iter().map(|i| i.estimate_heap_size()).sum();
+                let heap_size: usize = items.iter().map(MemoryEstimate::estimate_heap_size).sum();
                 *held = Some((serial, items, heap_size));
                 return StepResult::OutputFull;
             }
@@ -4566,7 +4615,7 @@ where
         Ok(()) => StepResult::Success,
         Err((serial, results)) => {
             // Calculate heap_size for accurate memory tracking
-            let heap_size: usize = results.iter().map(|i| i.estimate_heap_size()).sum();
+            let heap_size: usize = results.iter().map(MemoryEstimate::estimate_heap_size).sum();
             *worker.held_processed_mut() = Some((serial, results, heap_size));
             StepResult::OutputFull
         }
@@ -4589,6 +4638,10 @@ pub trait SerializePipelineState<P>: Send + Sync {
     fn serialize_output_is_full(&self) -> bool;
 
     /// Push serialized batch to output queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the item if the queue is full.
     fn serialize_output_push(
         &self,
         item: (u64, SerializedBatch),

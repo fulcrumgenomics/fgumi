@@ -3,27 +3,6 @@
 // generic code in test builds. Allow it crate-wide in test config since the actual
 // allocations are heap-based (`vec![]`), not stack arrays.
 #![cfg_attr(test, allow(clippy::large_stack_arrays))]
-// Blanket clippy pedantic allows for remaining main-crate code.
-// These will be removed incrementally as modules are extracted or fixed.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::needless_pass_by_value,
-    clippy::items_after_statements,
-    clippy::unused_self,
-    clippy::match_same_arms,
-    clippy::unnecessary_wraps,
-    clippy::too_many_lines,
-    clippy::redundant_closure_for_method_calls,
-    clippy::explicit_iter_loop,
-    clippy::struct_excessive_bools,
-    clippy::map_unwrap_or,
-    clippy::uninlined_format_args
-)]
 
 //! # fgumi - Fulcrum Genomics UMI Tools Library
 //!

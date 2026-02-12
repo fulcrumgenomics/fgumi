@@ -434,6 +434,7 @@ impl Builder {
 // Worker Functions
 // ============================================================================
 
+#[allow(clippy::needless_pass_by_value)]
 fn spawn_deflaters(
     compression_level: CompressionLevel,
     worker_count: NonZero<usize>,

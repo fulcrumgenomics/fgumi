@@ -78,6 +78,7 @@ impl ChaseBottleneckScheduler {
     /// Build priority list starting from current step, expanding outward.
     /// If direction is Forward, prefer downstream steps (toward Write).
     /// If direction is Backward, prefer upstream steps (toward Read).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn build_priorities(&mut self) {
         let current_idx = Self::step_index(self.current_step);
         let mut priorities = [PipelineStep::Read; 9];

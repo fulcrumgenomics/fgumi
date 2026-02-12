@@ -470,12 +470,11 @@ impl RecordPositionGrouper {
     /// since unmapped reads have no CIGAR to report in an MC tag.
     fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
         use crate::sort::bam_fields;
+        use crate::unified_pipeline::DecodedRecordData;
 
         if self.mc_validated {
             return Ok(());
         }
-
-        use crate::unified_pipeline::DecodedRecordData;
 
         match &decoded.data {
             DecodedRecordData::Raw(raw) => {
@@ -633,13 +632,18 @@ impl Grouper for RecordPositionGrouper {
 ///
 /// Designed to run in the parallel Process step after [`RecordPositionGrouper`]
 /// emits [`RawPositionGroup`]s.
+///
+/// # Errors
+///
+/// Returns an error if template construction from records fails.
 pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
+    use crate::unified_pipeline::DecodedRecordData;
+
     if records.is_empty() {
         return Ok(Vec::new());
     }
 
     // Check if this is raw-byte mode based on the first record
-    use crate::unified_pipeline::DecodedRecordData;
 
     let raw_byte_mode = matches!(records[0].data, DecodedRecordData::Raw(_));
 
@@ -763,6 +767,10 @@ enum FastqParseResult {
 /// ```
 ///
 /// Returns parsed records and leftover bytes for incomplete records.
+///
+/// # Errors
+///
+/// Returns an error if a record has mismatched sequence and quality lengths.
 pub fn parse_fastq_records(data: &[u8]) -> io::Result<(Vec<FastqRecord>, Vec<u8>)> {
     let mut records = Vec::new();
     let mut pos = 0;
@@ -931,6 +939,10 @@ impl FastqGrouper {
     ///
     /// **Note:** This method parses the bytes into records under the caller's lock.
     /// For better parallel scaling, use `add_records_for_stream` with pre-parsed records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream index is out of range or parsing fails.
     pub fn add_bytes_for_stream(&mut self, stream_idx: usize, data: &[u8]) -> io::Result<()> {
         log::trace!(
             "FastqGrouper::add_bytes_for_stream: stream_idx={}, num_inputs={}, data_len={}",
@@ -971,6 +983,10 @@ impl FastqGrouper {
     /// grouping (which requires sequential access) only does the grouping work.
     ///
     /// **This is the key method for fixing the t8 scaling bottleneck.**
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream index is out of range.
     pub fn add_records_for_stream(
         &mut self,
         stream_idx: usize,
@@ -1005,6 +1021,14 @@ impl FastqGrouper {
     }
 
     /// Try to emit complete templates (records from all streams with matching names).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if FASTQ files are out of sync (mismatched read names).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pending record queue is unexpectedly empty after checking non-emptiness.
     pub fn drain_complete_templates(&mut self) -> io::Result<Vec<FastqTemplate>> {
         let mut templates = Vec::new();
 
@@ -1056,6 +1080,10 @@ impl FastqGrouper {
     }
 
     /// Finish processing and return any remaining template.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is incomplete or unmatched data at EOF.
     pub fn finish(&mut self) -> io::Result<Option<FastqTemplate>> {
         // Check for any remaining complete templates
         let templates = self.drain_complete_templates()?;

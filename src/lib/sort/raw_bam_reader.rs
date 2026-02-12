@@ -59,6 +59,10 @@ impl<R: Read> RawBamRecordReader<R> {
     ///
     /// Decompresses initial BGZF blocks and verifies BAM magic.
     /// Call `skip_header()` before reading records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid BAM file.
     pub fn new(reader: R) -> io::Result<Self> {
         let reader = BufReader::with_capacity(256 * 1024, reader);
 
@@ -99,6 +103,10 @@ impl<R: Read> RawBamRecordReader<R> {
     /// Create a new raw BAM record reader from a `BufReader`.
     ///
     /// The reader should be positioned at the start of a BGZF-compressed BAM file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid BAM file.
     pub fn from_buf_reader(reader: BufReader<R>) -> io::Result<Self> {
         let mut this = Self {
             reader,
@@ -125,6 +133,11 @@ impl<R: Read> RawBamRecordReader<R> {
     ///
     /// Must be called before reading records. Returns the raw header bytes
     /// so they can be parsed if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is already skipped or the header is truncated.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn skip_header(&mut self) -> io::Result<Vec<u8>> {
         if self.header_skipped {
             return Err(io::Error::other("Header already skipped"));
@@ -183,6 +196,10 @@ impl<R: Read> RawBamRecordReader<R> {
     ///
     /// Returns `Some(record_bytes)` if a record is available, `None` at EOF.
     /// The returned bytes exclude the 4-byte `block_size` prefix (matching noodles format).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header has not been skipped or the record is truncated.
     pub fn next_record(&mut self) -> io::Result<Option<Vec<u8>>> {
         if !self.header_skipped {
             return Err(io::Error::other("Must call skip_header() first"));
@@ -312,11 +329,19 @@ pub struct BatchedRawBamReader<R: Read> {
 
 impl<R: Read> BatchedRawBamReader<R> {
     /// Create a new batched reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid BAM file.
     pub fn new(reader: R, batch_size: usize) -> io::Result<Self> {
         Ok(Self { inner: RawBamRecordReader::new(reader)?, batch_size })
     }
 
     /// Skip the BAM header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is already skipped or the header is truncated.
     pub fn skip_header(&mut self) -> io::Result<Vec<u8>> {
         self.inner.skip_header()
     }
@@ -325,6 +350,10 @@ impl<R: Read> BatchedRawBamReader<R> {
     ///
     /// Returns `None` at EOF, otherwise returns a vector of records.
     /// The vector may be smaller than `batch_size` at the end of the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a record is truncated or invalid.
     pub fn next_batch(&mut self) -> io::Result<Option<Vec<Vec<u8>>>> {
         let mut batch = Vec::with_capacity(self.batch_size);
 
@@ -346,6 +375,7 @@ mod tests {
 
     /// Build a minimal BGZF-compressed BAM with the given records.
     /// Each record is just the raw bytes (without the 4-byte `block_size` prefix).
+    #[allow(clippy::cast_possible_truncation)]
     fn build_test_bam(header_text: &str, refs: &[(&str, u32)], records: &[Vec<u8>]) -> Vec<u8> {
         let mut raw_bam = Vec::new();
 
@@ -383,6 +413,7 @@ mod tests {
     }
 
     /// Build a minimal BAM record with the given read name.
+    #[allow(clippy::cast_possible_truncation)]
     fn make_minimal_record(name: &[u8]) -> Vec<u8> {
         let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
         let total = 32 + l_read_name as usize;
@@ -422,7 +453,7 @@ mod tests {
         let result = RawBamRecordReader::new(io::Cursor::new(compressed));
         let Err(err) = result else { panic!("Expected error for invalid magic") };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("Not a BAM file"), "Unexpected error message: {}", err);
+        assert!(err.to_string().contains("Not a BAM file"), "Unexpected error message: {err}");
     }
 
     #[test]
@@ -439,8 +470,7 @@ mod tests {
         assert!(
             err.to_string().contains("File too small")
                 || err.to_string().contains("Not a BAM file"),
-            "Unexpected error message: {}",
-            err
+            "Unexpected error message: {err}"
         );
     }
 

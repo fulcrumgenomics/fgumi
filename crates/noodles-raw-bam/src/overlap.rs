@@ -1,6 +1,6 @@
 use crate::cigar::{
-    get_cigar_ops, reference_length_from_cigar, reference_length_from_raw_bam,
-    unclipped_other_end, unclipped_other_start,
+    get_cigar_ops, reference_length_from_cigar, reference_length_from_raw_bam, unclipped_other_end,
+    unclipped_other_start,
 };
 use crate::fields::{aux_data_slice, flags, mate_pos, mate_ref_id, pos, ref_id, template_length};
 use crate::tags::find_string_tag;

@@ -113,6 +113,10 @@ impl<R: Read + Send> MultiStreamReader<R> {
     /// Read the next chunk from input streams (round-robin).
     ///
     /// Returns None when all streams are exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading from any stream fails.
     pub fn read_next_chunk(&mut self) -> io::Result<Option<MultiStreamChunk>> {
         if self.readers.is_empty() {
             return Ok(None);
@@ -157,6 +161,10 @@ impl<R: Read + Send> MultiStreamReader<R> {
     /// Read all remaining chunks from all streams.
     ///
     /// This is primarily useful for testing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading from any stream fails.
     pub fn read_all_chunks(&mut self) -> io::Result<Vec<MultiStreamChunk>> {
         let mut chunks = Vec::new();
         while let Some(chunk) = self.read_next_chunk()? {
@@ -350,6 +358,14 @@ impl FastqFormat {
     /// must be processed in order (due to leftover handling).
     ///
     /// Uses reusable work buffers per stream to minimize allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if boundary finding encounters invalid data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the boundary state is not initialized for all streams in the batch.
     pub fn find_boundaries(
         state: &FastqBoundaryState,
         batch: FastqDecompressedBatch,
@@ -358,8 +374,7 @@ impl FastqFormat {
         // Streams must be pre-allocated since we take &self (not &mut self)
         assert!(
             state.stream_states.len() > max_stream,
-            "FastqBoundaryState not initialized for stream {}",
-            max_stream
+            "FastqBoundaryState not initialized for stream {max_stream}"
         );
 
         // Track which streams have chunks in this batch
@@ -385,7 +400,7 @@ impl FastqFormat {
 
             // Find complete FASTQ records
             let (data, offsets, leftover_start) =
-                find_fastq_boundaries_inplace(&stream_state.work_buffer)?;
+                find_fastq_boundaries_inplace(&stream_state.work_buffer);
 
             // Save leftover for next chunk
             stream_state.leftover = stream_state.work_buffer[leftover_start..].to_vec();
@@ -414,7 +429,7 @@ impl FastqFormat {
                 stream_state.work_buffer.extend_from_slice(&leftover);
 
                 let (data, offsets, leftover_start) =
-                    find_fastq_boundaries_inplace(&stream_state.work_buffer)?;
+                    find_fastq_boundaries_inplace(&stream_state.work_buffer);
 
                 stream_state.leftover = stream_state.work_buffer[leftover_start..].to_vec();
 
@@ -463,6 +478,9 @@ impl FastqFormat {
     /// This step is parallel - it's the key optimization for FASTQ.
     /// Given the byte offsets from `find_boundaries`, this constructs
     /// the actual record objects.
+    /// # Errors
+    ///
+    /// Returns an I/O error if parsing any record fails.
     pub fn parse_records(batch: FastqBoundaryBatch) -> io::Result<FastqParsedBatch> {
         // This is the KEY PARALLEL STEP!
         // Parse records from boundary information.
@@ -497,9 +515,9 @@ impl FastqFormat {
 /// - `leftover_start`: Index where leftover begins in the original data
 ///
 /// The caller should extract `data[leftover_start..]` for the leftover bytes.
-fn find_fastq_boundaries_inplace(data: &[u8]) -> io::Result<(Vec<u8>, Vec<usize>, usize)> {
+fn find_fastq_boundaries_inplace(data: &[u8]) -> (Vec<u8>, Vec<usize>, usize) {
     if data.is_empty() {
-        return Ok((Vec::new(), vec![0], 0));
+        return (Vec::new(), vec![0], 0);
     }
 
     let mut offsets = vec![0];
@@ -520,7 +538,7 @@ fn find_fastq_boundaries_inplace(data: &[u8]) -> io::Result<(Vec<u8>, Vec<usize>
     // Only allocate for the complete data (unavoidable - we return ownership)
     let complete_data = data[..pos].to_vec();
 
-    Ok((complete_data, offsets, pos))
+    (complete_data, offsets, pos)
 }
 
 /// Find FASTQ record boundaries in data (original version for compatibility).
@@ -530,10 +548,10 @@ fn find_fastq_boundaries_inplace(data: &[u8]) -> io::Result<(Vec<u8>, Vec<usize>
 /// - offsets: Start positions of each record (including 0)
 /// - leftover: Bytes of incomplete record at end (to prepend to next chunk)
 #[allow(dead_code)]
-fn find_fastq_boundaries(data: &[u8]) -> io::Result<(Vec<u8>, Vec<usize>, Vec<u8>)> {
-    let (complete_data, offsets, leftover_start) = find_fastq_boundaries_inplace(data)?;
+fn find_fastq_boundaries(data: &[u8]) -> (Vec<u8>, Vec<usize>, Vec<u8>) {
+    let (complete_data, offsets, leftover_start) = find_fastq_boundaries_inplace(data);
     let leftover = data[leftover_start..].to_vec();
-    Ok((complete_data, offsets, leftover))
+    (complete_data, offsets, leftover)
 }
 
 /// Find the end of a complete FASTQ record starting at the given position.
@@ -664,6 +682,7 @@ fn parse_single_fastq_record(data: &[u8]) -> io::Result<FastqRecord> {
 /// This configuration controls the unified pipeline that works for both
 /// BGZF-compressed and Gzip/Plain FASTQ inputs.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct FastqPipelineConfig {
     /// Number of worker threads
     pub num_threads: usize,
@@ -875,6 +894,10 @@ impl MultiBgzfBlockReader {
     /// Read next batch of raw BGZF blocks from all streams.
     ///
     /// Returns `Ok(None)` when all streams have reached EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading BGZF blocks fails.
     pub fn read_next_batch(&mut self) -> io::Result<Option<FastqReadBatch>> {
         if self.is_done() {
             return Ok(None);
@@ -975,6 +998,10 @@ impl<R: BufRead + Send> MultiDecompressedReader<R> {
     /// Read next batch of decompressed chunks from all streams.
     ///
     /// Returns `Ok(None)` when all streams have reached EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading from any stream fails.
     pub fn read_next_batch(&mut self) -> io::Result<Option<FastqReadBatch>> {
         log::trace!(
             "MultiDecompressedReader::read_next_batch: is_done={}, eof_flags={:?}",
@@ -1050,6 +1077,10 @@ impl<R: BufRead + Send> MultiDecompressedReader<R> {
 ///
 /// # Returns
 /// A new batch with all chunks marked as decompressed
+///
+/// # Errors
+///
+/// Returns an I/O error if BGZF decompression fails.
 pub fn decompress_fastq_batch(
     batch: FastqReadBatch,
     decompressor: &mut Decompressor,
@@ -1189,6 +1220,10 @@ impl FastqMultiStreamGrouper {
     ///
     /// # Returns
     /// All templates that are complete (have records from all streams)
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if parsing or grouping fails.
     pub fn add_batch(&mut self, batch: FastqReadBatch) -> io::Result<Vec<FastqTemplate>> {
         // Feed each chunk to the appropriate stream (parses and accumulates)
         for chunk in batch.chunks {
@@ -1210,6 +1245,10 @@ impl FastqMultiStreamGrouper {
     ///
     /// # Returns
     /// All templates that are complete (have records from all streams)
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if grouping fails.
     pub fn add_parsed_batch(
         &mut self,
         streams: Vec<FastqParsedStream>,
@@ -1231,6 +1270,10 @@ impl FastqMultiStreamGrouper {
     }
 
     /// Finish processing and return any remaining template.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the grouper fails to finalize.
     pub fn finish(&mut self) -> io::Result<Option<FastqTemplate>> {
         self.inner.finish()
     }
@@ -1252,6 +1295,10 @@ pub enum FastqReader<R: BufRead + Send> {
 
 impl<R: BufRead + Send> FastqReader<R> {
     /// Read the next batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading fails.
     pub fn read_next_batch(&mut self) -> io::Result<Option<FastqReadBatch>> {
         match self {
             FastqReader::Bgzf(r) => r.read_next_batch(),
@@ -1655,9 +1702,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             let parse_done = self.parse_done.load(Ordering::Acquire);
             if !boundaries_done || !parse_done {
                 log::trace!(
-                    "is_complete: parallel parse flags not done: boundaries_done={}, parse_done={}",
-                    boundaries_done,
-                    parse_done
+                    "is_complete: parallel parse flags not done: boundaries_done={boundaries_done}, parse_done={parse_done}"
                 );
                 return false;
             }
@@ -1674,9 +1719,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             let parsed_queue_len = self.q2_75_parsed.len();
             if boundaries_queue_len > 0 || parsed_queue_len > 0 {
                 log::trace!(
-                    "is_complete: parallel parse queues not empty: q2_5={}, q2_75={}",
-                    boundaries_queue_len,
-                    parsed_queue_len
+                    "is_complete: parallel parse queues not empty: q2_5={boundaries_queue_len}, q2_75={parsed_queue_len}"
                 );
                 return false;
             }
@@ -1730,6 +1773,10 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
     }
 
     /// Flush the output writer and finalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if writing the BGZF EOF or flushing fails.
     pub fn flush_output(&self) -> io::Result<()> {
         if let Some(mut writer) = self.output.output.lock().take() {
             // Write BGZF EOF marker before flushing
@@ -1753,6 +1800,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
     /// # Errors
     ///
     /// Returns `PipelineValidationError` with diagnostics if any issues are detected.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_completion(&self) -> Result<(), PipelineValidationError> {
         let mut non_empty_queues = Vec::new();
         let mut counter_mismatches = Vec::new();
@@ -2474,9 +2522,7 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
         if batch_opt.is_none() && read_done && all_processed && reorder_empty {
             state.boundaries_done.store(true, Ordering::Release);
             log::info!(
-                "fastq_try_step_find_boundaries: set boundaries_done=true (read={}, found={})",
-                batches_read,
-                batches_boundaries_found
+                "fastq_try_step_find_boundaries: set boundaries_done=true (read={batches_read}, found={batches_boundaries_found})"
             );
         }
 
@@ -2549,6 +2595,7 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
 /// For synchronized FASTQs, this step also creates templates and pushes them
 /// directly to Q3, bypassing the Group step entirely. This eliminates all lock
 /// contention since each worker can create templates independently.
+#[allow(clippy::too_many_lines)]
 fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
@@ -2755,7 +2802,7 @@ fn create_templates_from_streams(
         }
         n => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("Synchronized mode not supported for {} streams (max 2)", n),
+            format!("Synchronized mode not supported for {n} streams (max 2)"),
         )),
     }
 }
@@ -2769,6 +2816,7 @@ fn create_templates_from_streams(
 ///
 /// For synchronized FASTQs, this step is a no-op since templates are created
 /// directly in the Parse step. It only handles completion detection.
+#[allow(clippy::too_many_lines)]
 fn fastq_try_step_group_parsed<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
@@ -2937,9 +2985,13 @@ fn fastq_try_step_group_parsed<R: BufRead + Send, P: Send + MemoryEstimate>(
 /// This step batches templates together for efficient downstream processing.
 /// Templates are accumulated in `pending_templates` until `batch_size` is reached,
 /// then pushed to Q3 as a batch.
+#[allow(clippy::too_many_lines)]
 fn fastq_try_step_group<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
+    const MAX_PENDING_DRAIN: usize = 16;
+    const MAX_RETRIES: u32 = 10_000;
+
     if state.group_done.load(Ordering::Relaxed) || state.has_error() {
         return false;
     }
@@ -2959,7 +3011,6 @@ fn fastq_try_step_group<R: BufRead + Send, P: Send + MemoryEstimate>(
 
     // Pre-drain q2_decompressed BEFORE taking the reorder lock (lock-free operations)
     // This reduces critical section time by moving ArrayQueue ops outside the lock
-    const MAX_PENDING_DRAIN: usize = 16;
     let mut pre_drained: Vec<(u64, FastqReadBatch, usize)> = Vec::with_capacity(MAX_PENDING_DRAIN);
     while pre_drained.len() < MAX_PENDING_DRAIN {
         if let Some((serial, batch)) = state.q2_decompressed.pop() {
@@ -3101,7 +3152,6 @@ fn fastq_try_step_group<R: BufRead + Send, P: Send + MemoryEstimate>(
         // CRITICAL: Must retry until flush succeeds to avoid data loss.
         // Use blocking loop with yield to allow consumer threads to drain.
         let mut retries: u32 = 0;
-        const MAX_RETRIES: u32 = 10_000;
         while !pending.is_empty() {
             if flush_pending(&mut pending, state) {
                 continue; // Flushed one batch, try next
@@ -3625,6 +3675,11 @@ where
 ///
 /// # Returns
 /// Number of templates written, or an error.
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step or file I/O fails.
+#[allow(clippy::too_many_lines)]
 pub fn run_fastq_pipeline<P, PF, SF>(
     config: FastqPipelineConfig,
     fastq_paths: &[PathBuf],
@@ -3742,13 +3797,7 @@ where
                     let bp = s.batches_parsed.load(Ordering::Relaxed);
                     let bg = s.batches_grouped.load(Ordering::Relaxed);
                     log::trace!(
-                        "Parallel parse state: boundaries_done={}, parse_done={}, batches: read={}, boundaries={}, parsed={}, grouped={}",
-                        bd,
-                        pd,
-                        br,
-                        bf,
-                        bp,
-                        bg
+                        "Parallel parse state: boundaries_done={bd}, parse_done={pd}, batches: read={br}, boundaries={bf}, parsed={bp}, grouped={bg}"
                     );
                 }
             });
@@ -3778,7 +3827,7 @@ where
 }
 
 /// Internal: Run pipeline for BGZF inputs specifically.
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn run_fastq_pipeline_bgzf<P, PF, SF>(
     config: FastqPipelineConfig,
     reader: MultiBgzfBlockReader,
@@ -3828,6 +3877,7 @@ where
     let reader_mutex = Mutex::new(Some(reader));
 
     // Wrap everything in a struct for shared access
+    #[allow(clippy::items_after_statements)]
     struct BgzfPipelineState<P: Send> {
         batch_size: usize,
         reader: Mutex<Option<MultiBgzfBlockReader>>,
@@ -3861,6 +3911,7 @@ where
         stats: Option<Arc<PipelineStats>>,
     }
 
+    #[allow(clippy::items_after_statements)]
     impl<P: Send> BgzfPipelineState<P> {
         fn set_error(&self, e: io::Error) {
             self.error_flag.store(true, Ordering::SeqCst);
@@ -3906,6 +3957,7 @@ where
     }
 
     // Trait implementations for shared step functions
+    #[allow(clippy::items_after_statements)]
     impl<P: Send> ProcessPipelineState<FastqTemplate, P> for BgzfPipelineState<P> {
         fn process_input_pop(&self) -> Option<(u64, Vec<FastqTemplate>)> {
             self.q3_templates.pop()
@@ -3928,6 +3980,7 @@ where
         }
     }
 
+    #[allow(clippy::items_after_statements)]
     impl<P: Send> SerializePipelineState<P> for BgzfPipelineState<P> {
         fn serialize_input_pop(&self) -> Option<(u64, Vec<P>)> {
             self.q4_processed.pop()
@@ -3953,6 +4006,7 @@ where
         }
     }
 
+    #[allow(clippy::items_after_statements)]
     impl<P: Send> OutputPipelineState for BgzfPipelineState<P> {
         type Processed = P;
         fn has_error(&self) -> bool {
@@ -4007,6 +4061,7 @@ where
         }
     }
 
+    #[allow(clippy::items_after_statements)]
     impl<P: Send> WritePipelineState for BgzfPipelineState<P> {
         fn write_input_queue(&self) -> &ArrayQueue<(u64, CompressedBlockBatch)> {
             &self.q6_compressed
@@ -4079,6 +4134,7 @@ where
     let scheduler_strategy = config.scheduler_strategy;
 
     // Worker function (non-blocking with held-item pattern)
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     fn bgzf_worker<P: Send + MemoryEstimate, PF, SF>(
         state: &BgzfPipelineState<P>,
         header: &Header,
@@ -4090,6 +4146,8 @@ where
         PF: Fn(FastqTemplate) -> io::Result<P>,
         SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64>,
     {
+        const MAX_RETRIES: u32 = 10_000;
+
         loop {
             // CRITICAL: Don't exit while holding items - they would be lost!
             if state.has_error() || (state.is_complete() && !worker.has_any_held_items()) {
@@ -4289,7 +4347,6 @@ where
                         // Flush remaining pending templates.
                         // CRITICAL: Must retry until flush succeeds to avoid data loss.
                         let mut retries: u32 = 0;
-                        const MAX_RETRIES: u32 = 10_000;
                         while !pending.is_empty() {
                             if flush_pending(&mut pending, state) {
                                 continue;
@@ -4381,8 +4438,7 @@ where
                 if let Err(panic_info) = result {
                     let msg = super::base::extract_panic_message(panic_info);
                     state.set_error(io::Error::other(format!(
-                        "Worker thread {} panicked: {}",
-                        thread_id, msg
+                        "Worker thread {thread_id} panicked: {msg}"
                     )));
                 }
             })
@@ -4911,8 +4967,8 @@ mod tests {
                     let mut records_parsed = 0;
                     for batch_id in 0..batches_per_thread {
                         // Create a boundary batch for this thread/batch
-                        let name = format!("read_t{}_b{}", thread_id, batch_id);
-                        let data = format!("@{}\nACGT\n+\nIIII\n", name);
+                        let name = format!("read_t{thread_id}_b{batch_id}");
+                        let data = format!("@{name}\nACGT\n+\nIIII\n");
 
                         let boundary_batch = FastqBoundaryBatch {
                             streams: vec![FastqStreamBoundaries {
@@ -4962,7 +5018,7 @@ mod tests {
                 let grouper = Arc::clone(&grouper);
                 thread::spawn(move || {
                     for i in 0..records_per_thread {
-                        let name = format!("read_t{}_i{}", thread_id, i);
+                        let name = format!("read_t{thread_id}_i{i}");
                         let streams = vec![
                             FastqParsedStream {
                                 stream_idx: 0,
