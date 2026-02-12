@@ -61,27 +61,13 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
 
 #[must_use]
 pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
+    // Only applies to FR pairs (matching the RecordBuf-based `num_bases_extending_past_mate`)
+    if !is_fr_pair_raw(bam) {
+        return 0;
+    }
+
     let flg = flags(bam);
-
-    // Only applies to paired, mapped reads with mapped mates
-    if flg & flags::PAIRED == 0 || flg & flags::UNMAPPED != 0 || flg & flags::MATE_UNMAPPED != 0 {
-        return 0;
-    }
-
-    // Check FR pair: read and mate on same reference, opposite strands
     let is_reverse = flg & flags::REVERSE != 0;
-    let mate_is_reverse = flg & flags::MATE_REVERSE != 0;
-
-    // FR pair requires opposite strand orientations
-    if is_reverse == mate_is_reverse {
-        return 0;
-    }
-
-    let this_ref_id = ref_id(bam);
-    let m_ref_id = mate_ref_id(bam);
-    if this_ref_id != m_ref_id {
-        return 0;
-    }
 
     // Need MC tag for mate CIGAR information
     let aux = aux_data_slice(bam);
@@ -643,7 +629,7 @@ mod tests {
     #[test]
     fn test_num_bases_extending_past_mate_raw_no_mc_tag() {
         // Paired FR but no MC tag => 0
-        let rec = make_bam_bytes(
+        let rec = make_bam_bytes_with_tlen(
             0,
             100,
             flags::PAIRED | flags::MATE_REVERSE,
@@ -652,6 +638,7 @@ mod tests {
             10,
             0,
             200,
+            110, // TLEN: valid FR pair
             &[],
         );
         assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
@@ -669,7 +656,7 @@ mod tests {
         // result = 20 - 15 = 5
         let mut aux = Vec::new();
         aux.extend_from_slice(b"MCZ10M\x00");
-        let rec = make_bam_bytes(
+        let rec = make_bam_bytes_with_tlen(
             0,
             100, // 0-based pos
             flags::PAIRED | flags::MATE_REVERSE,
@@ -678,6 +665,7 @@ mod tests {
             20,
             0,
             105, // 0-based mate pos
+            20,  // TLEN: FR pair spanning 20 bases
             &aux,
         );
         assert_eq!(num_bases_extending_past_mate_raw(&rec), 5);
@@ -692,7 +680,7 @@ mod tests {
         // No trailing soft clips => trailing_sc.saturating_sub(gap) = 0
         let mut aux = Vec::new();
         aux.extend_from_slice(b"MCZ10M\x00");
-        let rec = make_bam_bytes(
+        let rec = make_bam_bytes_with_tlen(
             0,
             100,
             flags::PAIRED | flags::MATE_REVERSE,
@@ -701,6 +689,7 @@ mod tests {
             10,
             0,
             200,
+            110, // TLEN: FR pair spanning pos 100 to mate end 209
             &aux,
         );
         assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
@@ -786,7 +775,7 @@ mod tests {
         // trailing_soft_clip = 3, 3.saturating_sub(100) = 0
         let mut aux = Vec::new();
         aux.extend_from_slice(b"MCZ10M\x00");
-        let rec = make_bam_bytes(
+        let rec = make_bam_bytes_with_tlen(
             0,
             100,
             flags::PAIRED | flags::MATE_REVERSE,
@@ -795,6 +784,7 @@ mod tests {
             13,
             0,
             200,
+            110, // TLEN: valid FR pair
             &aux,
         );
         assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
@@ -838,5 +828,60 @@ mod tests {
     fn test_leading_soft_clip_from_ops_with_hard_before_soft() {
         let cigar = &[encode_op(5, 3), encode_op(4, 5), encode_op(0, 10)]; // 3H5S10M
         assert_eq!(leading_soft_clip_from_ops(cigar), 5);
+    }
+
+    // ========================================================================
+    // Regression: chimeric/split reads with non-FR orientation
+    // ========================================================================
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_non_fr_chimeric_forward() {
+        // Reproduces the MI=807 bug from SRR6109273 simplex equivalency failure.
+        // R1: flag=97 (paired, mate_reverse, first_in_pair), pos=11576620,
+        //     CIGAR=145M124S, mate_pos=11576412, TLEN=-28, MC=87S182M
+        // The reads are on opposite strands and same ref, but NOT in FR orientation
+        // (TLEN is negative => RF orientation). The old RecordBuf code checked
+        // is_fr_pair_from_tags and returned 0. The raw-byte code was missing this
+        // check and incorrectly returned 269 (entire read length), causing the
+        // consensus read to be trimmed to zero bases and dropped.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ87S182M\x00");
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            11576620,                                    // 0-based pos
+            flags::PAIRED | flags::MATE_REVERSE | 0x40, // flag=97 (0x40=first_in_pair)
+            b"rea",
+            &[encode_op(0, 145), encode_op(4, 124)], // 145M124S
+            269,                                      // seq_len = 145 + 124
+            0,                                        // same ref
+            11576412,                                 // 0-based mate pos
+            -28,                                      // TLEN
+            &aux,
+        );
+        // Not FR pair, so should return 0 (no clipping)
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
+    }
+
+    #[test]
+    fn test_num_bases_extending_past_mate_raw_non_fr_chimeric_reverse() {
+        // The mate of the above read:
+        // R2: flag=145 (paired, reverse, second_in_pair), pos=11576412,
+        //     CIGAR=87S182M, mate_pos=11576620, TLEN=28, MC=145M124S
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MCZ145M124S\x00");
+        let rec = make_bam_bytes_with_tlen(
+            0,
+            11576412,                               // 0-based pos
+            flags::PAIRED | flags::REVERSE | 0x80,  // flag=145 (0x80=second_in_pair)
+            b"rea",
+            &[encode_op(4, 87), encode_op(0, 182)], // 87S182M
+            269,                                     // seq_len = 87 + 182
+            0,                                       // same ref
+            11576620,                                // 0-based mate pos
+            28,                                      // TLEN
+            &aux,
+        );
+        // Not FR pair, so should return 0 (no clipping)
+        assert_eq!(num_bases_extending_past_mate_raw(&rec), 0);
     }
 }
