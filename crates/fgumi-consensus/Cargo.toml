@@ -13,7 +13,7 @@ approx = "0.5"
 bstr = "1.12.1"
 log = "0"
 noodles = { version = "0.104.0", features = ["bam", "sam", "core"] }
-rand = "0.9"
+rand = "0.10"
 wide = "1.1"
 fgumi-dna = { path = "../fgumi-dna" }
 fgumi-sam = { path = "../fgumi-sam" }

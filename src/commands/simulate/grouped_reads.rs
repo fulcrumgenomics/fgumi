@@ -28,7 +28,7 @@ use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReferenceSequence;
 use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;

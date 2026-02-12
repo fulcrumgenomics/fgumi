@@ -32,14 +32,14 @@ use rand::rngs::StdRng;
 pub fn create_rng(seed: Option<u64>) -> StdRng {
     match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_os_rng(),
+        None => rand::make_rng(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     #[test]
     fn test_seeded_rng_reproducible() {

@@ -7,7 +7,7 @@
 //! - Empirical (loaded from `fgumi group -f` histogram output)
 
 use anyhow::{Context, Result};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rand_distr::{Distribution, Gamma, LogNormal, Poisson};
 use std::fs::File;
 use std::io::{BufRead, BufReader};

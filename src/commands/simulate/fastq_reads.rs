@@ -11,7 +11,7 @@ use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simulate::{FastqWriter, create_rng};
 use log::info;
 use noodles::fasta;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};

@@ -14,7 +14,7 @@ rayon = "1.10"
 fgumi-dna = { path = "../fgumi-dna" }
 
 [dev-dependencies]
-rstest = "0.25"
+rstest = "0.26"
 proptest = "1"
 
 [features]
