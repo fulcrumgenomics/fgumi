@@ -1,0 +1,15 @@
+[package]
+name = "fgumi-bgzf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87.0"
+description = "BGZF block reading, decompression, and compression utilities"
+license = "MIT"
+
+[dependencies]
+libdeflater = "1.22"
+crc32fast = "1.4"
+bgzf = "0.3.0"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

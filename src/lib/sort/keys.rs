@@ -1233,7 +1233,7 @@ mod tests {
             .name("test")
             .sequence("ACGT")
             .flags(Flags::SUPPLEMENTARY)
-            .pa_tag(info)
+            .tag("pa", info.to_tag_value())
             .build();
 
         let result = PrimaryAlignmentInfo::from_record(&record);
@@ -1272,7 +1272,7 @@ mod tests {
             .reference_sequence_id(5)
             .alignment_start(5000)
             .flags(Flags::SUPPLEMENTARY)
-            .pa_tag(pa_info)
+            .tag("pa", pa_info.to_tag_value())
             .build();
 
         let header = Header::default();
