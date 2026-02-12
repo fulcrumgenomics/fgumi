@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/noodles-raw-bam"]
+resolver = "2"
+
 [package]
 name = "fgumi"
 version = "0.1.0"
@@ -59,6 +63,7 @@ wide = "1.1"
 rand_distr = "0.5"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
+noodles-raw-bam = { path = "crates/noodles-raw-bam", features = ["noodles"] }
 
 [features]
 default = []
@@ -76,6 +81,7 @@ profile-adjacency = []
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
+noodles-raw-bam = { path = "crates/noodles-raw-bam", features = ["test-utils"] }
 
 [[bench]]
 name = "core_functions"

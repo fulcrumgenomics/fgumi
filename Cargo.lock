@@ -710,6 +710,7 @@ dependencies = [
  "noodles",
  "noodles-bgzf",
  "noodles-csi",
+ "noodles-raw-bam",
  "noodles-util",
  "parking_lot",
  "proptest",
@@ -1505,6 +1506,15 @@ dependencies = [
  "memchr",
  "noodles-bgzf",
  "noodles-core",
+]
+
+[[package]]
+name = "noodles-raw-bam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "noodles",
+ "rstest",
 ]
 
 [[package]]

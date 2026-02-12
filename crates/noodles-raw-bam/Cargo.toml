@@ -1,0 +1,19 @@
+[package]
+name = "noodles-raw-bam"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87.0"
+description = "Raw byte-level operations on BAM alignment records"
+publish = false
+
+[dependencies]
+noodles = { version = "0.104.0", features = ["bam", "sam"], optional = true }
+anyhow = { version = "1.0.100", optional = true }
+
+[features]
+default = []
+noodles = ["dep:noodles", "dep:anyhow"]
+test-utils = []
+
+[dev-dependencies]
+rstest = "0"
