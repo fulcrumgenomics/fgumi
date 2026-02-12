@@ -261,7 +261,7 @@ impl Command for DuplexMetrics {
             .map(|&fraction| {
                 // Only collect duplex UMI counts for the 100% fraction to save memory
                 let collect_duplex = self.duplex_umi_counts && (fraction - 1.0_f64).abs() < 0.01;
-                DuplexMetricsCollector::new(self.min_ab_reads, self.min_ba_reads, collect_duplex)
+                DuplexMetricsCollector::new(collect_duplex)
             })
             .collect();
 
@@ -2171,7 +2171,7 @@ mod tests {
         use fgumi_lib::metrics::duplex::DuplexMetricsCollector;
 
         // Create a collector with duplex UMI counting enabled
-        let mut collector = DuplexMetricsCollector::new(1, 1, true);
+        let mut collector = DuplexMetricsCollector::new(true);
 
         // Record individual UMIs with different frequencies
         // UMI "AAA" appears in 50% of families (5 out of 10)
