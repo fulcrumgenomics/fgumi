@@ -45,11 +45,11 @@ impl fmt::Display for DecodeError {
 pub fn read_value(src: &mut &[u8], ty: Type) -> Result<Value, DecodeError> {
     match ty {
         Type::Character => read_u8(src).map(Value::Character),
-        Type::Int8 => read_u8(src).map(|n| Value::Int8(n as i8)),
+        Type::Int8 => read_i8(src).map(Value::Int8),
         Type::UInt8 => read_u8(src).map(Value::UInt8),
-        Type::Int16 => read_u16_le(src).map(|n| Value::Int16(n as i16)),
+        Type::Int16 => read_i16_le(src).map(Value::Int16),
         Type::UInt16 => read_u16_le(src).map(Value::UInt16),
-        Type::Int32 => read_u32_le(src).map(|n| Value::Int32(n as i32)),
+        Type::Int32 => read_i32_le(src).map(Value::Int32),
         Type::UInt32 => read_u32_le(src).map(Value::UInt32),
         Type::Float => read_f32_le(src).map(Value::Float),
         Type::String => read_string(src).map(Value::String),
@@ -64,16 +64,34 @@ fn read_u8(src: &mut &[u8]) -> Result<u8, DecodeError> {
     Ok(*n)
 }
 
+fn read_i8(src: &mut &[u8]) -> Result<i8, DecodeError> {
+    let (n, rest) = src.split_first().ok_or(DecodeError::UnexpectedEof)?;
+    *src = rest;
+    Ok((*n).cast_signed())
+}
+
 fn read_u16_le(src: &mut &[u8]) -> Result<u16, DecodeError> {
     let (buf, rest) = src.split_first_chunk().ok_or(DecodeError::UnexpectedEof)?;
     *src = rest;
     Ok(u16::from_le_bytes(*buf))
 }
 
+fn read_i16_le(src: &mut &[u8]) -> Result<i16, DecodeError> {
+    let (buf, rest) = src.split_first_chunk().ok_or(DecodeError::UnexpectedEof)?;
+    *src = rest;
+    Ok(i16::from_le_bytes(*buf))
+}
+
 fn read_u32_le(src: &mut &[u8]) -> Result<u32, DecodeError> {
     let (buf, rest) = src.split_first_chunk().ok_or(DecodeError::UnexpectedEof)?;
     *src = rest;
     Ok(u32::from_le_bytes(*buf))
+}
+
+fn read_i32_le(src: &mut &[u8]) -> Result<i32, DecodeError> {
+    let (buf, rest) = src.split_first_chunk().ok_or(DecodeError::UnexpectedEof)?;
+    *src = rest;
+    Ok(i32::from_le_bytes(*buf))
 }
 
 fn read_f32_le(src: &mut &[u8]) -> Result<f32, DecodeError> {
@@ -99,6 +117,7 @@ mod tests {
 
     #[test]
     fn test_read_value() -> Result<(), Box<dyn std::error::Error>> {
+        #[allow(clippy::needless_pass_by_value)]
         fn t(mut src: &[u8], ty: Type, expected: Value) -> Result<(), DecodeError> {
             let actual = read_value(&mut src, ty)?;
             assert_eq!(actual, expected);

@@ -130,6 +130,10 @@ impl ExternalSorter {
     }
 
     /// Sort a BAM file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the input, sorting, or writing the output fails.
     pub fn sort(&self, input: &Path, output: &Path) -> Result<SortStats> {
         info!("Starting sort with order: {:?}", self.sort_order);
         info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
@@ -507,7 +511,7 @@ impl ExternalSorter {
         let index_path = output.with_extension("bam.bai");
         write_bai_index(&index_path, &index)?;
         info!("Wrote BAM index: {}", index_path.display());
-        info!("Merge complete: {} records merged", records_merged);
+        info!("Merge complete: {records_merged} records merged");
 
         Ok(())
     }

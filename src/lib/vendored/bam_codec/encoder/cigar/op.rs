@@ -25,6 +25,7 @@ impl fmt::Display for EncodeError {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 pub(super) fn encode_op(op: Op) -> Result<u32, EncodeError> {
     if op.len() <= MAX_LENGTH {
         // SAFETY: `op.len() <= MAX_LENGTH <= u32::MAX`.

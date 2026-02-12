@@ -588,9 +588,7 @@ impl<'a> PairBuilder<'a> {
 
         // Add read group tag
         let rg_tag = Tag::new(b'R', b'G');
-        first_read
-            .data_mut()
-            .insert(rg_tag, BufValue::from(self.parent.read_group_id.clone()));
+        first_read.data_mut().insert(rg_tag, BufValue::from(self.parent.read_group_id.clone()));
 
         // Add custom attributes
         for (tag_str, value) in &self.attrs {
@@ -638,9 +636,7 @@ impl<'a> PairBuilder<'a> {
         }
 
         // Add read group tag
-        second_read
-            .data_mut()
-            .insert(rg_tag, BufValue::from(self.parent.read_group_id.clone()));
+        second_read.data_mut().insert(rg_tag, BufValue::from(self.parent.read_group_id.clone()));
 
         // Add custom attributes
         for (tag_str, value) in &self.attrs {
@@ -654,10 +650,12 @@ impl<'a> PairBuilder<'a> {
         if !unmapped1 && !unmapped2 && self.contig == contig2 {
             let pos1 = i32::try_from(self.start1.unwrap()).expect("start1 fits in i32");
             let pos2 = i32::try_from(self.start2.unwrap()).expect("start2 fits in i32");
-            let end1 =
-                pos1 + i32::try_from(cigar_ref_len(&cigar1)).expect("cigar1 ref len fits in i32") - 1;
-            let end2 =
-                pos2 + i32::try_from(cigar_ref_len(&cigar2)).expect("cigar2 ref len fits in i32") - 1;
+            let end1 = pos1
+                + i32::try_from(cigar_ref_len(&cigar1)).expect("cigar1 ref len fits in i32")
+                - 1;
+            let end2 = pos2
+                + i32::try_from(cigar_ref_len(&cigar2)).expect("cigar2 ref len fits in i32")
+                - 1;
 
             let (left, right) = if pos1 <= pos2 { (pos1, end2) } else { (pos2, end1) };
             let tlen = right - left + 1;
@@ -1684,10 +1682,12 @@ impl RecordPairBuilder {
         if r1_mapped && r2_mapped && self.reference_sequence_id == r2_ref_id {
             let pos1 = i32::try_from(self.r1_start.unwrap()).expect("r1_start fits in i32");
             let pos2 = i32::try_from(self.r2_start.unwrap()).expect("r2_start fits in i32");
-            let end1 =
-                pos1 + i32::try_from(cigar_ref_len(&r1_cigar)).expect("r1 cigar ref len fits in i32") - 1;
-            let end2 =
-                pos2 + i32::try_from(cigar_ref_len(&r2_cigar)).expect("r2 cigar ref len fits in i32") - 1;
+            let end1 = pos1
+                + i32::try_from(cigar_ref_len(&r1_cigar)).expect("r1 cigar ref len fits in i32")
+                - 1;
+            let end2 = pos2
+                + i32::try_from(cigar_ref_len(&r2_cigar)).expect("r2 cigar ref len fits in i32")
+                - 1;
 
             let (left, right) = if pos1 <= pos2 { (pos1, end2) } else { (pos2, end1) };
             let tlen = right - left + 1;
@@ -2504,7 +2504,11 @@ pub fn cigar_ref_len(cigar: &str) -> usize {
         .filter(|op| {
             matches!(
                 op.kind(),
-                Kind::Match | Kind::Deletion | Kind::Skip | Kind::SequenceMatch | Kind::SequenceMismatch
+                Kind::Match
+                    | Kind::Deletion
+                    | Kind::Skip
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch
             )
         })
         .map(|op| op.len())

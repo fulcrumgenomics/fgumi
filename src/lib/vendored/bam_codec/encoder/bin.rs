@@ -20,7 +20,7 @@ pub(super) fn write_bin(
 }
 
 // § 5.3 "C source code for computing bin number and overlapping bins" (2021-06-03)
-#[allow(clippy::eq_op)]
+#[allow(clippy::eq_op, clippy::cast_possible_truncation)]
 fn region_to_bin(alignment_start: Position, alignment_end: Position) -> u16 {
     let start = usize::from(alignment_start) - 1;
     let end = usize::from(alignment_end) - 1;
@@ -62,6 +62,14 @@ mod tests {
 
     #[test]
     fn test_region_to_bin() -> Result<(), noodles::core::position::TryFromIntError> {
+        // https://github.com/zaeleus/noodles/issues/229
+        const DEPTH: usize = 5;
+        const MIN_SHIFT: usize = 14;
+        const MAX_POSITION: usize = 1 << (MIN_SHIFT + 3 * DEPTH);
+        const U16_SIZE: usize = 1 << 16;
+        const MAX_BIN_ID: usize = (1 << ((DEPTH + 1) * 3)) / 7;
+        const WINDOW_SIZE: usize = 1 << MIN_SHIFT;
+
         let start = Position::try_from(8)?;
         let end = Position::try_from(13)?;
         assert_eq!(region_to_bin(start, end), 4681);
@@ -70,13 +78,6 @@ mod tests {
         let end = Position::try_from(63_245_986)?;
         assert_eq!(region_to_bin(start, end), 8541);
 
-        // https://github.com/zaeleus/noodles/issues/229
-        const DEPTH: usize = 5;
-        const MIN_SHIFT: usize = 14;
-        const MAX_POSITION: usize = 1 << (MIN_SHIFT + 3 * DEPTH);
-        const U16_SIZE: usize = 1 << 16;
-        const MAX_BIN_ID: usize = (1 << ((DEPTH + 1) * 3)) / 7;
-        const WINDOW_SIZE: usize = 1 << MIN_SHIFT;
         let start =
             Position::try_from((MAX_POSITION + 1) + (WINDOW_SIZE * (U16_SIZE - MAX_BIN_ID)))?;
         let end = start;

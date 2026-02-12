@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use fgoxide::io::DelimFile;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::Metric;
 
@@ -27,7 +27,10 @@ where
     }
 
     // If the value is a whole number, serialize without decimal point
-    #[expect(clippy::cast_precision_loss, reason = "i64::MAX boundary check, exact precision not needed")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "i64::MAX boundary check, exact precision not needed"
+    )]
     let max_safe = i64::MAX as f64;
     if value.fract() == 0.0 && value.abs() < max_safe {
         #[expect(clippy::cast_possible_truncation, reason = "guarded by abs check above")]
@@ -137,7 +140,7 @@ impl UmiCorrectionMetrics {
     /// # Errors
     ///
     /// Returns an error if the file cannot be created or written to.
-    pub fn write_metrics(metrics: &[Self], path: &PathBuf) -> Result<()> {
+    pub fn write_metrics(metrics: &[Self], path: &Path) -> Result<()> {
         DelimFile::default()
             .write_tsv(path, metrics)
             .with_context(|| format!("Failed to write UMI correction metrics: {}", path.display()))
@@ -157,7 +160,7 @@ impl UmiCorrectionMetrics {
     /// - The file cannot be read
     /// - The file format is invalid
     /// - Any values cannot be parsed
-    pub fn read_metrics(path: &PathBuf) -> Result<Vec<Self>> {
+    pub fn read_metrics(path: &Path) -> Result<Vec<Self>> {
         DelimFile::default()
             .read_tsv(path)
             .with_context(|| format!("Failed to read UMI correction metrics: {}", path.display()))

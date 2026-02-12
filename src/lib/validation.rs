@@ -183,6 +183,7 @@ pub fn optional_string_to_tag(tag: Option<&str>, name: &str) -> Result<Option<Ta
 /// let result = validate_min_max(10, Some(5), "min-reads", "max-reads");
 /// assert!(result.is_err());
 /// ```
+#[allow(clippy::needless_pass_by_value)]
 pub fn validate_min_max<T: Ord + Display>(
     min_val: T,
     max_val: Option<T>,
@@ -269,6 +270,7 @@ pub fn validate_quality_score(quality: u8, _name: &str) -> Result<()> {
 /// let result = validate_positive(0, "min-reads");
 /// assert!(result.is_err());
 /// ```
+#[allow(clippy::needless_pass_by_value)]
 pub fn validate_positive<T: Ord + Display + Default>(value: T, name: &str) -> Result<()> {
     if value <= T::default() {
         return Err(FgumiError::InvalidParameter {

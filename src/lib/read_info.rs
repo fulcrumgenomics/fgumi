@@ -101,6 +101,10 @@ impl LibraryIndex {
     ///
     /// Each unique library name gets a sequential index starting from 0.
     /// Index 0 is reserved for "unknown" library.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header contains more than 65,535 distinct libraries.
     #[must_use]
     pub fn from_header(header: &Header) -> Self {
         use ahash::AHasher;
@@ -120,7 +124,8 @@ impl LibraryIndex {
 
             // Get or create library index
             let lib_idx = *library_to_idx.entry(library.clone()).or_insert_with(|| {
-                let idx = names.len() as u16;
+                let idx: u16 =
+                    names.len().try_into().expect("too many distinct libraries for u16 index");
                 names.push(library);
                 idx
             });
@@ -218,6 +223,7 @@ impl Default for LibraryIndex {
 ///
 /// For unpaired reads or reads without MC tag, mate position uses UNKNOWN sentinels.
 #[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn compute_group_key(
     record: &sam::alignment::RecordBuf,
     library_index: &LibraryIndex,
@@ -234,8 +240,8 @@ pub fn compute_group_key(
     }
 
     // Own position
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let ref_id = record.reference_sequence_id().map_or(-1, |id| id as i32);
+    let ref_id =
+        record.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
     let pos = get_unclipped_position_for_groupkey(record);
     let strand = u8::from(flags.is_reverse_complemented());
 
@@ -266,8 +272,8 @@ pub fn compute_group_key(
 
     // Try to get mate position from MC tag
     let mate_strand = u8::from(flags.is_mate_reverse_complemented());
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let mate_ref_id = record.mate_reference_sequence_id().map_or(-1, |id| id as i32);
+    let mate_ref_id =
+        record.mate_reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
 
     // Get mate unclipped 5' position based on strand
     let mate_pos = if mate_strand == 1 {

@@ -21,6 +21,11 @@ use crate::sort::bam_fields;
 ///
 /// # Returns
 /// True if tags were reversed, false if not needed
+///
+/// # Errors
+///
+/// Currently infallible; returns `Result` for API consistency with
+/// [`reverse_per_base_tags_raw`].
 pub fn reverse_per_base_tags(record: &mut RecordBuf) -> Result<bool> {
     // Check if read is mapped to negative strand
     let flags = record.flags();
@@ -45,7 +50,7 @@ pub fn reverse_per_base_tags(record: &mut RecordBuf) -> Result<bool> {
                         .insert(tag, Value::from(String::from_utf8_lossy(&reversed).to_string()));
                 }
                 _ => {
-                    if let Some(reversed_value) = reverse_array_value(value)? {
+                    if let Some(reversed_value) = reverse_array_value(value) {
                         record.data_mut().insert(tag, reversed_value);
                     }
                 }
@@ -80,6 +85,10 @@ pub fn reverse_per_base_tags(record: &mut RecordBuf) -> Result<bool> {
 ///
 /// # Returns
 /// `Ok(true)` if tags were reversed, `Ok(false)` if not on reverse strand.
+///
+/// # Errors
+///
+/// Returns an error if the record is too short to be a valid BAM record.
 pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
     if record.len() < bam_fields::MIN_BAM_HEADER_LEN {
         bail!(
@@ -125,7 +134,7 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
 }
 
 /// Reverses an array value
-fn reverse_array_value(value: &Value) -> Result<Option<Value>> {
+fn reverse_array_value(value: &Value) -> Option<Value> {
     match value {
         Value::Array(arr) => {
             use noodles::sam::alignment::record_buf::data::field::value::Array;
@@ -168,9 +177,9 @@ fn reverse_array_value(value: &Value) -> Result<Option<Value>> {
                 }
             };
 
-            Ok(Some(reversed))
+            Some(reversed)
         }
-        _ => Ok(None),
+        _ => None,
     }
 }
 
@@ -243,7 +252,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let reversed = reverse_array_value(&input).unwrap().unwrap();
+            let reversed = reverse_array_value(&input).unwrap();
             assert_eq!(reversed, expected);
         }
     }
@@ -251,7 +260,7 @@ mod tests {
     #[test]
     fn test_reverse_array_value_non_array() {
         let value = Value::from(42i32);
-        let reversed = reverse_array_value(&value).unwrap();
+        let reversed = reverse_array_value(&value);
         assert!(reversed.is_none());
     }
 

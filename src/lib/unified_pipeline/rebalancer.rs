@@ -106,8 +106,17 @@ impl DynamicRebalancer {
     /// # Returns
     ///
     /// New memory limits for each queue (in same order as `queue_names`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stats` length does not match the number of queues.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn rebalance(&mut self, stats: &[QueueStats]) -> Vec<u64> {
         assert_eq!(stats.len(), self.current_allocations.len());
+
+        if stats.is_empty() {
+            return Vec::new();
+        }
 
         // Compute demand for each queue
         let demands: Vec<f64> = stats
@@ -234,6 +243,7 @@ pub struct InitialAllocation {
 ///
 /// Initial allocations for each queue type.
 #[must_use]
+#[allow(clippy::match_same_arms)]
 pub fn initial_allocation_for_command(
     command: &str,
     strategy: Option<&str>,
@@ -296,7 +306,10 @@ pub fn initial_allocation_for_command(
 /// Returns an error if:
 /// - The value cannot be parsed as a number
 /// - The value is below the minimum (256MB)
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn parse_memory_limit(s: &str) -> Result<u64, String> {
+    const MIN_BYTES: u64 = 256 * 1024 * 1024; // 256MB
+
     let s = s.trim().to_uppercase();
 
     let (num_str, multiplier) = if s.ends_with("GB") {
@@ -316,11 +329,9 @@ pub fn parse_memory_limit(s: &str) -> Result<u64, String> {
         (s.as_str(), 1)
     };
 
-    let num: f64 = num_str.trim().parse().map_err(|_| format!("Invalid memory value: {}", s))?;
+    let num: f64 = num_str.trim().parse().map_err(|_| format!("Invalid memory value: {s}"))?;
 
     let bytes = (num * f64::from(multiplier)) as u64;
-
-    const MIN_BYTES: u64 = 256 * 1024 * 1024; // 256MB
     if bytes < MIN_BYTES {
         return Err(format!(
             "Queue memory limit {}MB is too low (minimum: 256MB)",
@@ -336,6 +347,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn test_parse_memory_limit() {
         assert_eq!(parse_memory_limit("4GB").unwrap(), 4 * 1024 * 1024 * 1024);
         assert_eq!(parse_memory_limit("4G").unwrap(), 4 * 1024 * 1024 * 1024);
@@ -394,13 +406,12 @@ mod tests {
         let budget: u64 = 1_000_000_000;
         assert!(
             total >= budget - 10 && total <= budget + 10,
-            "Total {} should be close to budget {}",
-            total,
-            budget
+            "Total {total} should be close to budget {budget}"
         );
     }
 
     #[test]
+    #[allow(clippy::cast_possible_wrap)]
     fn test_rebalancer_gradual_change() {
         let config = RebalancerConfig {
             total_budget: 1_000_000_000,

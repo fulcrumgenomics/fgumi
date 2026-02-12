@@ -1,4 +1,8 @@
-use crate::fields::{flags, pos, l_read_name, n_cigar_op, flags::{UNMAPPED, REVERSE}};
+use crate::fields::{
+    flags,
+    flags::{REVERSE, UNMAPPED},
+    l_read_name, n_cigar_op, pos,
+};
 
 /// Extract CIGAR operations from BAM record.
 #[inline]
@@ -331,7 +335,9 @@ pub fn clip_cigar_ops_raw(
     }
 
     // Helper to encode a CIGAR op as raw u32
-    let encode_op = |op_type: u32, len: usize| -> u32 { (u32::try_from(len).expect("CIGAR op length overflows u32") << 4) | op_type };
+    let encode_op = |op_type: u32, len: usize| -> u32 {
+        (u32::try_from(len).expect("CIGAR op length overflows u32") << 4) | op_type
+    };
 
     // Count existing H+S clips at the relevant end (matching clip_*_of_read)
     let existing_clip: usize = if from_start {
@@ -1027,11 +1033,11 @@ mod tests {
         // M (0), D (2), N (3) all consume reference
         // ref_len = 10 + 3 + 5 + 2 + 8 = 28
         let cigar = &[
-            (10 << 4), // 10M
-            (3 << 4) | 2,  // 3D
-            (5 << 4),  // 5M
-            (2 << 4) | 3,  // 2N
-            (8 << 4),  // 8M
+            (10 << 4),    // 10M
+            (3 << 4) | 2, // 3D
+            (5 << 4),     // 5M
+            (2 << 4) | 3, // 2N
+            (8 << 4),     // 8M
         ];
         assert_eq!(reference_length_from_cigar(cigar), 28);
     }
@@ -1041,9 +1047,9 @@ mod tests {
         // 10M5I10M: insertions don't consume reference
         // ref_len = 10 + 10 = 20
         let cigar = &[
-            (10 << 4), // 10M
-            (5 << 4) | 1,  // 5I
-            (10 << 4), // 10M
+            (10 << 4),    // 10M
+            (5 << 4) | 1, // 5I
+            (10 << 4),    // 10M
         ];
         assert_eq!(reference_length_from_cigar(cigar), 20);
     }
@@ -1085,14 +1091,14 @@ mod tests {
     fn test_reference_length_from_raw_bam_mixed_ops() {
         // 5S10M2D3N5M3I8X2H: ref consuming = 10M+2D+3N+5M+8X = 28
         let cigar = &[
-            (5 << 4) | 4,  // 5S
-            (10 << 4), // 10M
-            (2 << 4) | 2,  // 2D
-            (3 << 4) | 3,  // 3N
-            (5 << 4),  // 5M
-            (3 << 4) | 1,  // 3I
-            (8 << 4) | 8,  // 8X (= mismatch, consumes ref)
-            (2 << 4) | 5,  // 2H
+            (5 << 4) | 4, // 5S
+            (10 << 4),    // 10M
+            (2 << 4) | 2, // 2D
+            (3 << 4) | 3, // 3N
+            (5 << 4),     // 5M
+            (3 << 4) | 1, // 3I
+            (8 << 4) | 8, // 8X (= mismatch, consumes ref)
+            (2 << 4) | 5, // 2H
         ];
         let rec = make_bam_bytes(0, 100, 0, b"rea", cigar, 31, -1, -1, &[]);
         assert_eq!(reference_length_from_raw_bam(&rec), 28);
@@ -1104,8 +1110,7 @@ mod tests {
 
     #[test]
     fn test_unclipped_5prime_from_raw_bam_unmapped() {
-        let rec =
-            make_bam_bytes(0, 100, flags::UNMAPPED, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
+        let rec = make_bam_bytes(0, 100, flags::UNMAPPED, b"rea", &[(10 << 4)], 10, -1, -1, &[]);
         assert_eq!(unclipped_5prime_from_raw_bam(&rec), 0);
     }
 
@@ -1143,11 +1148,11 @@ mod tests {
     fn test_unclipped_5prime_from_raw_bam_hard_and_soft_clip() {
         // 3H5S10M4S2H: forward → start = 101 - 3 - 5 = 93
         let cigar = &[
-            (3 << 4) | 5,  // 3H
-            (5 << 4) | 4,  // 5S
-            (10 << 4), // 10M
-            (4 << 4) | 4,  // 4S
-            (2 << 4) | 5,  // 2H
+            (3 << 4) | 5, // 3H
+            (5 << 4) | 4, // 5S
+            (10 << 4),    // 10M
+            (4 << 4) | 4, // 4S
+            (2 << 4) | 5, // 2H
         ];
         let rec = make_bam_bytes(0, 100, 0, b"rea", cigar, 15, -1, -1, &[]);
         // Forward: pos_1based=101, leading clips=3+5=8, unclipped_start = 101 - 8 = 93
@@ -1158,11 +1163,11 @@ mod tests {
     fn test_unclipped_5prime_from_raw_bam_reverse_hard_and_soft_clip() {
         // 3H5S10M4S2H: reverse → end = 101 + 10 + 4 + 2 - 1 = 116
         let cigar = &[
-            (3 << 4) | 5,  // 3H
-            (5 << 4) | 4,  // 5S
-            (10 << 4), // 10M
-            (4 << 4) | 4,  // 4S
-            (2 << 4) | 5,  // 2H
+            (3 << 4) | 5, // 3H
+            (5 << 4) | 4, // 5S
+            (10 << 4),    // 10M
+            (4 << 4) | 4, // 4S
+            (2 << 4) | 5, // 2H
         ];
         let rec = make_bam_bytes(0, 100, flags::REVERSE, b"rea", cigar, 15, -1, -1, &[]);
         // Reverse: pos_1based=101, ref_len=10, trailing_clips=4+2=6, end = 101 + 10 + 6 - 1 = 116

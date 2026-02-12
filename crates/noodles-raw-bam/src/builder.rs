@@ -1,5 +1,8 @@
 use crate::sequence::pack_sequence_into;
-use crate::tags::{append_string_tag, append_int_tag, append_float_tag, append_i16_array_tag, append_phred33_string_tag};
+use crate::tags::{
+    append_float_tag, append_i16_array_tag, append_int_tag, append_phred33_string_tag,
+    append_string_tag,
+};
 
 // ============================================================================
 // Unmapped BAM Record Builder
@@ -180,7 +183,8 @@ impl UnmappedBamRecordBuilder {
     #[inline]
     pub fn write_with_block_size(&self, output: &mut Vec<u8>) {
         debug_assert!(self.sealed, "must call build_record first");
-        let block_size = u32::try_from(self.buf.len()).expect("record too large for BAM block_size");
+        let block_size =
+            u32::try_from(self.buf.len()).expect("record too large for BAM block_size");
         output.extend_from_slice(&block_size.to_le_bytes());
         output.extend_from_slice(&self.buf);
     }
@@ -197,8 +201,8 @@ impl Default for UnmappedBamRecordBuilder {
 mod tests {
     use super::*;
     use crate::fields::*;
-    use crate::tags::*;
     use crate::sequence::*;
+    use crate::tags::*;
     use crate::testutil::*;
 
     #[test]

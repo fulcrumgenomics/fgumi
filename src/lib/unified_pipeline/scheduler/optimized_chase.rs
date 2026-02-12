@@ -144,6 +144,7 @@ impl OptimizedChaseScheduler {
     }
 
     /// Build optimized priority list.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn build_priorities(&mut self, _bp: BackpressureState) {
         let mut priorities = Vec::with_capacity(9);
         let current_idx = Self::step_index(self.current_step);

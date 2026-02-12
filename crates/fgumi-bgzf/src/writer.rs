@@ -145,8 +145,7 @@ impl InlineBgzfCompressor {
             let remaining_in_buffer = BGZF_MAX_BLOCK_SIZE - self.buffer.len();
             let to_copy = remaining_in_buffer.min(data.len() - offset);
 
-            self.buffer
-                .extend_from_slice(&data[offset..offset + to_copy]);
+            self.buffer.extend_from_slice(&data[offset..offset + to_copy]);
             offset += to_copy;
 
             // If buffer is full, compress it
@@ -230,10 +229,7 @@ impl InlineBgzfCompressor {
 
         let serial = self.next_serial;
         self.next_serial += 1;
-        self.completed_blocks.push(CompressedBlock {
-            serial,
-            data: compressed_data,
-        });
+        self.completed_blocks.push(CompressedBlock { serial, data: compressed_data });
 
         // Reset buffer for next block
         self.buffer.clear();
@@ -249,7 +245,9 @@ impl InlineBgzfCompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::{BGZF_FOOTER_SIZE as READER_FOOTER_SIZE, BGZF_HEADER_SIZE as READER_HEADER_SIZE, BGZF_EOF};
+    use crate::reader::{
+        BGZF_EOF, BGZF_FOOTER_SIZE as READER_FOOTER_SIZE, BGZF_HEADER_SIZE as READER_HEADER_SIZE,
+    };
 
     #[test]
     fn test_bgzf_constants() {

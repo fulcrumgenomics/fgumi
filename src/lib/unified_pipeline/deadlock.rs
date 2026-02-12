@@ -456,7 +456,7 @@ fn handle_deadlock(
             let old_stable = deadlock_state.stable_memory_limit.load(Ordering::Relaxed);
             if new_stable > old_stable {
                 deadlock_state.stable_memory_limit.store(new_stable, Ordering::Relaxed);
-                log::warn!("  Stable limit updated: {} -> {} bytes", old_stable, new_stable);
+                log::warn!("  Stable limit updated: {old_stable} -> {new_stable} bytes");
             }
         }
 
@@ -474,7 +474,7 @@ fn handle_deadlock(
             log::warn!("  Recovery: Unbinding limits (unlimited)");
             0
         } else {
-            log::warn!("  Recovery: {} -> {} bytes (2x)", current, new_limit);
+            log::warn!("  Recovery: {current} -> {new_limit} bytes (2x)");
             new_limit
         };
 
@@ -510,7 +510,7 @@ fn try_restore_limits(deadlock_state: &DeadlockState, now: u64) {
         // Unbounded - try to restore to 8x original or stable, whichever is higher
         let target = (original.saturating_mul(8)).max(stable);
         if target > 0 {
-            log::info!("  Restoring: unlimited -> {} bytes", target);
+            log::info!("  Restoring: unlimited -> {target} bytes");
             deadlock_state.current_memory_limit.store(target, Ordering::SeqCst);
             deadlock_state.last_recovery_time.store(now, Ordering::Relaxed);
             deadlock_state.deadlock_at_current_limit.store(false, Ordering::Relaxed);
@@ -526,7 +526,7 @@ fn try_restore_limits(deadlock_state: &DeadlockState, now: u64) {
     // Halve the limit (but not below original or stable)
     let new_limit = (current / 2).max(original).max(stable);
     if new_limit < current {
-        log::info!("  Restoring: {} -> {} bytes (halving)", current, new_limit);
+        log::info!("  Restoring: {current} -> {new_limit} bytes (halving)");
         deadlock_state.current_memory_limit.store(new_limit, Ordering::SeqCst);
         deadlock_state.last_recovery_time.store(now, Ordering::Relaxed);
         deadlock_state.deadlock_at_current_limit.store(false, Ordering::Relaxed);
@@ -534,6 +534,7 @@ fn try_restore_limits(deadlock_state: &DeadlockState, now: u64) {
 }
 
 /// Log detailed queue state for diagnostics.
+#[allow(clippy::cast_precision_loss)]
 fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
     let now = now_secs();
 
@@ -807,7 +808,7 @@ mod tests {
         if let DeadlockAction::Recovered(new_limit) = action {
             assert_eq!(new_limit, original_limit * 2);
         } else {
-            panic!("Expected Recovered action, got {:?}", action);
+            panic!("Expected Recovered action, got {action:?}");
         }
     }
 
@@ -846,7 +847,7 @@ mod tests {
         if let DeadlockAction::Recovered(new_limit) = action {
             assert_eq!(new_limit, 0);
         } else {
-            panic!("Expected Recovered action, got {:?}", action);
+            panic!("Expected Recovered action, got {action:?}");
         }
     }
 

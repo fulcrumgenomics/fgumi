@@ -91,6 +91,7 @@ impl ReadAheadReader {
     }
 
     /// Reader thread function - reads records in batches.
+    #[allow(clippy::needless_pass_by_value)]
     fn reader_thread(reader: &mut BamReaderAuto, tx: Sender<Vec<Record>>, batch_size: usize) {
         let mut record = Record::default();
         let mut batch = Vec::with_capacity(batch_size);
@@ -228,6 +229,7 @@ impl RawReadAheadReader {
     }
 
     /// Reader thread function - reads raw records in batches.
+    #[allow(clippy::needless_pass_by_value)]
     fn reader_thread(reader: &mut RawBamReaderAuto, tx: Sender<Vec<RawRecord>>, batch_size: usize) {
         let mut record = RawRecord::new();
         let mut batch = Vec::with_capacity(batch_size);

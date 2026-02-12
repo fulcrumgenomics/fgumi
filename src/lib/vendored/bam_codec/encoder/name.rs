@@ -8,7 +8,7 @@ const MAX_LENGTH: usize = 254;
 pub(super) const MISSING: &[u8] = b"*";
 
 pub(super) fn write_length(dst: &mut Vec<u8>, name: Option<&BStr>) -> io::Result<()> {
-    let mut len = name.map(|s| s.len()).unwrap_or(MISSING.len());
+    let mut len = name.map_or(MISSING.len(), |s| s.len());
 
     // + NUL terminator
     len += mem::size_of::<u8>();
@@ -75,7 +75,7 @@ mod tests {
     fn test_write_name() -> io::Result<()> {
         fn t(buf: &mut Vec<u8>, name: Option<&[u8]>, expected: &[u8]) -> io::Result<()> {
             buf.clear();
-            write_name(buf, name.map(|buf| buf.as_bstr()))?;
+            write_name(buf, name.map(bstr::ByteSlice::as_bstr))?;
             assert_eq!(buf, expected);
             Ok(())
         }

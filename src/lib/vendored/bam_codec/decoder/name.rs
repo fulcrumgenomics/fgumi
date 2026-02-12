@@ -96,6 +96,7 @@ mod tests {
 
     #[test]
     fn test_read_name() -> Result<(), Box<dyn std::error::Error>> {
+        #[allow(clippy::needless_pass_by_value)]
         fn t(mut src: &[u8], expected: Option<BString>) -> Result<(), DecodeError> {
             let mut actual = None;
             let l_read_name = NonZero::try_from(src.len()).unwrap();

@@ -46,6 +46,8 @@ mod tests {
             Ok(())
         }
 
+        use super::array::tests::T;
+
         let mut buf = Vec::new();
 
         t(&mut buf, &Value::Character(b'n'), b"n")?;
@@ -61,14 +63,12 @@ mod tests {
 
         t(&mut buf, &Value::Hex(b"CAFE".as_bstr()), &[b'C', b'A', b'F', b'E', 0x00])?;
 
-        use super::array::tests::T;
-
         t(
             &mut buf,
             &Value::Array(Array::UInt8(Box::new(T::new(&[0])))),
             &[
                 b'C', // subtype = UInt8
-                0x01, 0x00, 0x00, 0x00, // count = 2
+                0x01, 0x00, 0x00, 0x00, // count = 1
                 0x00, // values[0] = 0
             ],
         )?;

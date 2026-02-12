@@ -204,11 +204,19 @@ pub trait RawSortKey: Ord + Clone + Send + Sync + Sized {
     /// Serialize the key to a writer for temp file storage.
     ///
     /// Format should be compact and enable fast deserialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the writer fails.
     fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()>;
 
     /// Deserialize a key from a reader.
     ///
     /// Must be the inverse of `write_to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading from the reader fails or data is invalid.
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self>;
 }
 
@@ -227,6 +235,7 @@ pub struct SortContext {
 impl SortContext {
     /// Create a sort context from a BAM header.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn from_header(header: &Header) -> Self {
         Self { nref: header.reference_sequences().len() as u32 }
     }
@@ -264,8 +273,7 @@ impl SortOrder {
     #[must_use]
     pub fn header_go_tag(&self) -> Option<&'static str> {
         match self {
-            Self::Coordinate => None,
-            Self::Queryname => None,
+            Self::Coordinate | Self::Queryname => None,
             Self::TemplateCoordinate => Some("query"),
         }
     }
@@ -274,8 +282,7 @@ impl SortOrder {
     #[must_use]
     pub fn header_ss_tag(&self) -> Option<&'static str> {
         match self {
-            Self::Coordinate => None,
-            Self::Queryname => None,
+            Self::Coordinate | Self::Queryname => None,
             Self::TemplateCoordinate => Some("template-coordinate"),
         }
     }
@@ -294,6 +301,10 @@ pub trait SortKey: Ord + Clone + Send + Sync {
     fn build_context(header: &Header) -> Self::Context;
 
     /// Extract a sort key from a BAM record using pre-built context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key extraction fails due to missing or invalid fields.
     fn from_record(record: &RecordBuf, header: &Header, ctx: &Self::Context) -> Result<Self>;
 }
 
@@ -351,7 +362,7 @@ impl SortKey for CoordinateKey {
             return Ok(Self::unmapped());
         }
 
-        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         let tid = record.reference_sequence_id().map_or(-1, |id| id as i32);
 
         #[allow(clippy::cast_possible_wrap)]
@@ -395,6 +406,7 @@ impl RawCoordinateKey {
     /// * `nref` - Number of reference sequences (for unmapped handling)
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_sign_loss)]
     pub fn new(tid: i32, pos: i32, reverse: bool, nref: u32) -> Self {
         // Map unmapped (tid=-1) to nref for proper sorting (after all mapped)
         let tid = if tid < 0 { nref } else { tid as u32 };
@@ -665,7 +677,9 @@ impl RawSortKey for RawQuerynameKey {
     #[inline]
     fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         // Format: [name_len: u16][name: bytes][flags: u16]
-        let name_len = self.name.len() as u16;
+        let name_len = u16::try_from(self.name.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "queryname too long for u16")
+        })?;
         writer.write_all(&name_len.to_le_bytes())?;
         writer.write_all(&self.name)?;
         writer.write_all(&self.flags.to_le_bytes())
@@ -863,7 +877,7 @@ impl SortKey for TemplateCoordinateKey {
         let is_reverse = flags.is_reverse_complemented();
 
         // Get reference ID
-        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         let tid = record.reference_sequence_id().map_or(-1, |id| id as i32);
 
         // Calculate unclipped 5' position for this read
@@ -871,7 +885,7 @@ impl SortKey for TemplateCoordinateKey {
         let this_pos = unclipped_five_prime_position(record).unwrap_or(0) as i64;
 
         // Get mate information
-        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         let mate_tid = record.mate_reference_sequence_id().map_or(i32::MAX, |id| id as i32);
 
         let mate_reverse = flags.is_mate_reverse_complemented();
@@ -881,16 +895,22 @@ impl SortKey for TemplateCoordinateKey {
         #[allow(clippy::cast_possible_wrap)]
         let mate_pos: i64 = if mate_reverse {
             // Reverse strand - 5' is at the end
-            mate_unclipped_end(record).map(|p| p as i64).unwrap_or_else(|| {
-                // Fallback to raw mate position if MC tag missing
-                record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64)
-            })
+            mate_unclipped_end(record).map_or_else(
+                || {
+                    // Fallback to raw mate position if MC tag missing
+                    record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64)
+                },
+                |p| p as i64,
+            )
         } else {
             // Forward strand - 5' is at the start
-            mate_unclipped_start(record).map(|p| p as i64).unwrap_or_else(|| {
-                // Fallback to raw mate position if MC tag missing
-                record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64)
-            })
+            mate_unclipped_start(record).map_or_else(
+                || {
+                    // Fallback to raw mate position if MC tag missing
+                    record.mate_alignment_start().map_or(0, |p| usize::from(p) as i64)
+                },
+                |p| p as i64,
+            )
         };
 
         // Determine which read is "earlier" (lower position)
@@ -1683,8 +1703,8 @@ mod tests {
         let f2161 = queryname_flag_order(2161); // R1 SUPPLEMENTARY
 
         // Correct order: R1 PRIMARY < R1 SUPP < R2 PRIMARY
-        assert!(f113 < f2161, "R1 PRIMARY (113) should be < R1 SUPP (2161): {} vs {}", f113, f2161);
-        assert!(f2161 < f177, "R1 SUPP (2161) should be < R2 PRIMARY (177): {} vs {}", f2161, f177);
+        assert!(f113 < f2161, "R1 PRIMARY (113) should be < R1 SUPP (2161): {f113} vs {f2161}");
+        assert!(f2161 < f177, "R1 SUPP (2161) should be < R2 PRIMARY (177): {f2161} vs {f177}");
     }
 
     /// Test edge case: both R1 and R2 flags set (unusual but possible).

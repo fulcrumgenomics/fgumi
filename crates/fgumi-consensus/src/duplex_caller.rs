@@ -202,15 +202,15 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::caller::ConsensusOutput;
-use crate::simple_umi::consensus_umis;
-use crate::{ReadType, SourceRead};
 use crate::caller::{ConsensusCaller, ConsensusCallingStats, RejectionReason};
 use crate::phred::MAX_PHRED;
 use crate::phred::{MIN_PHRED, PhredScore};
-use noodles_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
+use crate::simple_umi::consensus_umis;
 use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
+use crate::{ReadType, SourceRead};
+use noodles_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
 
 /// Duplex consensus read - matches fgbio's `DuplexConsensusRead`
 ///
@@ -267,16 +267,13 @@ impl DuplexConsensusRead {
             .collect()
     }
 
-    /// Returns the maximum combined depth across all positions
+    /// Returns the (min, max) combined depth across all positions.
     #[must_use]
-    pub fn max_depth(&self) -> u16 {
-        self.combined_depths().into_iter().max().unwrap_or(0)
-    }
-
-    /// Returns the minimum combined depth across all positions
-    #[must_use]
-    pub fn min_depth(&self) -> u16 {
-        self.combined_depths().into_iter().min().unwrap_or(0)
+    pub fn depth_range(&self) -> (u16, u16) {
+        let depths = self.combined_depths();
+        let min = depths.iter().copied().min().unwrap_or(0);
+        let max = depths.iter().copied().max().unwrap_or(0);
+        (min, max)
     }
 }
 
@@ -342,8 +339,14 @@ impl DuplexConsensusCaller {
     /// # Panics
     ///
     /// Panics if `min_reads` is empty (though this is checked and returns an error first).
-    #[expect(clippy::too_many_arguments, reason = "constructor needs all configuration parameters from CLI options")]
-    #[expect(clippy::needless_pass_by_value, reason = "changing to &[usize] would require updating many call sites across the codebase")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor needs all configuration parameters from CLI options"
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "changing to &[usize] would require updating many call sites across the codebase"
+    )]
     pub fn new(
         read_name_prefix: String,
         read_group_id: String,
@@ -450,7 +453,10 @@ impl DuplexConsensusCaller {
 
     /// Test helper: accepts `Vec<RecordBuf>`, encodes to raw bytes, and delegates to `consensus_reads`.
     #[cfg(test)]
-    #[expect(clippy::needless_pass_by_value, reason = "test helper takes ownership for convenience")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "test helper takes ownership for convenience"
+    )]
     pub(crate) fn consensus_reads_from_sam_records(
         &mut self,
         records: Vec<noodles::sam::alignment::RecordBuf>,
@@ -580,7 +586,10 @@ impl DuplexConsensusCaller {
     ///
     /// IMPORTANT: This function requires that all reads have MI tags with /A or /B suffixes.
     /// The duplex command MUST be used with reads grouped using the "paired" strategy.
-    #[expect(clippy::type_complexity, reason = "tuple return type is clearer than a one-off struct for strand partitioning")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "tuple return type is clearer than a one-off struct for strand partitioning"
+    )]
     fn partition_records_by_strand(
         records: Vec<Vec<u8>>,
     ) -> Result<(Option<String>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
@@ -644,7 +653,10 @@ impl DuplexConsensusCaller {
     /// NOTE: This function is used only in tests. Production code uses
     /// [`partition_reads_by_strand_simple`] which is more efficient.
     #[cfg(test)]
-    #[expect(clippy::type_complexity, reason = "tuple return type is clearer than a one-off struct for test grouping")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "tuple return type is clearer than a one-off struct for test grouping"
+    )]
     fn group_by_mi_and_strand(
         reads: Vec<RecordBuf>,
     ) -> Result<AHashMap<String, (Vec<RecordBuf>, Vec<RecordBuf>)>> {
@@ -811,7 +823,10 @@ impl DuplexConsensusCaller {
     /// * `ab` - Optional AB strand single-strand consensus
     /// * `ba` - Optional BA strand single-strand consensus
     /// * `source_reads` - Optional source reads for error calculation
-    #[expect(clippy::too_many_lines, reason = "duplex consensus building has many sequential steps that are clearest in one function")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "duplex consensus building has many sequential steps that are clearest in one function"
+    )]
     pub(crate) fn duplex_consensus(
         ab: Option<&VanillaConsensusRead>,
         ba: Option<&VanillaConsensusRead>,
@@ -972,9 +987,18 @@ impl DuplexConsensusCaller {
     /// * `first_of_pair` - Whether this is first of pair (for RX orientation)
     /// * `cell_tag` - Optional cell barcode tag (e.g., CB)
     /// * `cell_barcode` - Optional cell barcode value to add to record
-    #[expect(clippy::too_many_arguments, reason = "duplex record construction requires many parameters from the calling context")]
-    #[expect(clippy::too_many_lines, reason = "BAM record construction has many sequential tag-writing steps")]
-    #[expect(clippy::unnecessary_wraps, reason = "Result return type kept for API consistency with other consensus record builders")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "duplex record construction requires many parameters from the calling context"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "BAM record construction has many sequential tag-writing steps"
+    )]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "Result return type kept for API consistency with other consensus record builders"
+    )]
     pub(crate) fn duplex_read_into(
         builder: &mut UnmappedBamRecordBuilder,
         output: &mut ConsensusOutput,
@@ -1499,17 +1523,15 @@ impl DuplexConsensusCaller {
             // Must truncate to len (minimum of both consensuses) to match fgbio
             let a_qualities_tag = Tag::from([b'a', b'q']);
             let a_quals_slice = &qual_a.as_ref()[..len];
-            duplex.data_mut().insert(
-                a_qualities_tag,
-                crate::tags::qualities_to_tag_value(a_quals_slice),
-            );
+            duplex
+                .data_mut()
+                .insert(a_qualities_tag, crate::tags::qualities_to_tag_value(a_quals_slice));
 
             let b_qualities_tag = Tag::from([b'b', b'q']);
             let b_quals_slice = &qual_b.as_ref()[..len];
-            duplex.data_mut().insert(
-                b_qualities_tag,
-                crate::tags::qualities_to_tag_value(b_quals_slice),
-            );
+            duplex
+                .data_mut()
+                .insert(b_qualities_tag, crate::tags::qualities_to_tag_value(b_quals_slice));
         }
 
         // Always remove cd/ce from duplex output - fgbio doesn't output these for duplex consensus
@@ -1565,8 +1587,14 @@ impl DuplexConsensusCaller {
 
     /// Processes a single UMI group to generate duplex consensus
     #[expect(clippy::too_many_arguments, reason = "group processing requires many parameters")]
-    #[expect(clippy::too_many_lines, reason = "duplex group processing has many sequential steps including strand separation, SS calling, duplex calling, and output")]
-    #[expect(clippy::needless_pass_by_value, reason = "owned values consumed by downstream consensus pipeline")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "duplex group processing has many sequential steps including strand separation, SS calling, duplex calling, and output"
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "owned values consumed by downstream consensus pipeline"
+    )]
     fn process_group(
         base_mi: String,
         a_records: Vec<Vec<u8>>,
@@ -2094,8 +2122,8 @@ impl ConsensusCaller for DuplexConsensusCaller {
 mod tests {
     use super::*;
     use fgumi_sam::builder::RecordBuilder;
-    use noodles_raw_bam::ParsedBamRecord;
     use noodles::sam::alignment::record_buf::data::field::Value;
+    use noodles_raw_bam::ParsedBamRecord;
 
     fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
         let header = noodles::sam::Header::default();
@@ -4306,8 +4334,7 @@ mod tests {
         };
 
         // Combined depths: [8, 7, 6, 7]
-        assert_eq!(duplex.max_depth(), 8);
-        assert_eq!(duplex.min_depth(), 6);
+        assert_eq!(duplex.depth_range(), (6, 8));
     }
 
     #[test]

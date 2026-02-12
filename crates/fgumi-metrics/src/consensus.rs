@@ -308,14 +308,46 @@ impl ConsensusMetrics {
 
         // Core metrics matching fgbio's output
         let core = [
-            ("raw_reads_considered", self.total_input_reads.to_string(), "Total raw reads considered from input file"),
-            ("raw_reads_rejected", self.filtered_reads.to_string(), "Total number of raw reads rejected before consensus calling"),
-            ("raw_reads_used", raw_reads_used.to_string(), "Total count of raw reads used in consensus reads"),
-            ("frac_raw_reads_used", format_float(frac_used), "Fraction of raw reads used in consensus reads"),
-            ("raw_reads_rejected_for_insufficient_support", self.rejected_insufficient_support.to_string(), "Insufficient reads to generate a consensus"),
-            ("raw_reads_rejected_for_minority_alignment", self.rejected_minority_alignment.to_string(), "Read has a different, and minority, set of indels"),
-            ("raw_reads_rejected_for_orphan_consensus", self.rejected_orphan_consensus.to_string(), "Only one of R1 or R2 consensus generated"),
-            ("raw_reads_rejected_for_zero_bases_post_trimming", self.rejected_zero_bases_post_trimming.to_string(), "Read or mate had zero bases post trimming"),
+            (
+                "raw_reads_considered",
+                self.total_input_reads.to_string(),
+                "Total raw reads considered from input file",
+            ),
+            (
+                "raw_reads_rejected",
+                self.filtered_reads.to_string(),
+                "Total number of raw reads rejected before consensus calling",
+            ),
+            (
+                "raw_reads_used",
+                raw_reads_used.to_string(),
+                "Total count of raw reads used in consensus reads",
+            ),
+            (
+                "frac_raw_reads_used",
+                format_float(frac_used),
+                "Fraction of raw reads used in consensus reads",
+            ),
+            (
+                "raw_reads_rejected_for_insufficient_support",
+                self.rejected_insufficient_support.to_string(),
+                "Insufficient reads to generate a consensus",
+            ),
+            (
+                "raw_reads_rejected_for_minority_alignment",
+                self.rejected_minority_alignment.to_string(),
+                "Read has a different, and minority, set of indels",
+            ),
+            (
+                "raw_reads_rejected_for_orphan_consensus",
+                self.rejected_orphan_consensus.to_string(),
+                "Only one of R1 or R2 consensus generated",
+            ),
+            (
+                "raw_reads_rejected_for_zero_bases_post_trimming",
+                self.rejected_zero_bases_post_trimming.to_string(),
+                "Read or mate had zero bases post trimming",
+            ),
         ];
         for (key, value, description) in core {
             metrics.push(ConsensusKvMetric::new(key, value, description));
@@ -337,20 +369,76 @@ impl ConsensusMetrics {
     /// Appends fgumi-specific rejection metrics with non-zero counts.
     fn push_optional_rejections(&self, metrics: &mut Vec<ConsensusKvMetric>) {
         let optional = [
-            ("raw_reads_rejected_for_insufficient_strand_support", self.rejected_insufficient_strand_support, "Insufficient strand support for consensus"),
-            ("raw_reads_rejected_for_low_base_quality", self.rejected_low_base_quality, "Low base quality"),
-            ("raw_reads_rejected_for_excessive_n_bases", self.rejected_excessive_n_bases, "Excessive N bases in read"),
-            ("raw_reads_rejected_for_no_valid_alignment", self.rejected_no_valid_alignment, "No valid alignment found"),
-            ("raw_reads_rejected_for_low_mapping_quality", self.rejected_low_mapping_quality, "Low mapping quality"),
-            ("raw_reads_rejected_for_n_bases_in_umi", self.rejected_n_bases_in_umi, "N bases in UMI sequence"),
-            ("raw_reads_rejected_for_missing_umi", self.rejected_missing_umi, "Read lacks required UMI tag"),
-            ("raw_reads_rejected_for_not_passing_filter", self.rejected_not_passing_filter, "Read did not pass vendor filter"),
-            ("raw_reads_rejected_for_low_mean_quality", self.rejected_low_mean_quality, "Low mean base quality"),
-            ("raw_reads_rejected_for_insufficient_min_depth", self.rejected_insufficient_min_depth, "Insufficient minimum read depth"),
-            ("raw_reads_rejected_for_excessive_error_rate", self.rejected_excessive_error_rate, "Excessive error rate"),
-            ("raw_reads_rejected_for_umi_too_short", self.rejected_umi_too_short, "UMI sequence too short"),
-            ("raw_reads_rejected_for_single_strand_only", self.rejected_same_strand_only, "Only generating one strand of duplex consensus"),
-            ("raw_reads_rejected_for_duplicate_umi", self.rejected_duplicate_umi, "Duplicate UMI detected"),
+            (
+                "raw_reads_rejected_for_insufficient_strand_support",
+                self.rejected_insufficient_strand_support,
+                "Insufficient strand support for consensus",
+            ),
+            (
+                "raw_reads_rejected_for_low_base_quality",
+                self.rejected_low_base_quality,
+                "Low base quality",
+            ),
+            (
+                "raw_reads_rejected_for_excessive_n_bases",
+                self.rejected_excessive_n_bases,
+                "Excessive N bases in read",
+            ),
+            (
+                "raw_reads_rejected_for_no_valid_alignment",
+                self.rejected_no_valid_alignment,
+                "No valid alignment found",
+            ),
+            (
+                "raw_reads_rejected_for_low_mapping_quality",
+                self.rejected_low_mapping_quality,
+                "Low mapping quality",
+            ),
+            (
+                "raw_reads_rejected_for_n_bases_in_umi",
+                self.rejected_n_bases_in_umi,
+                "N bases in UMI sequence",
+            ),
+            (
+                "raw_reads_rejected_for_missing_umi",
+                self.rejected_missing_umi,
+                "Read lacks required UMI tag",
+            ),
+            (
+                "raw_reads_rejected_for_not_passing_filter",
+                self.rejected_not_passing_filter,
+                "Read did not pass vendor filter",
+            ),
+            (
+                "raw_reads_rejected_for_low_mean_quality",
+                self.rejected_low_mean_quality,
+                "Low mean base quality",
+            ),
+            (
+                "raw_reads_rejected_for_insufficient_min_depth",
+                self.rejected_insufficient_min_depth,
+                "Insufficient minimum read depth",
+            ),
+            (
+                "raw_reads_rejected_for_excessive_error_rate",
+                self.rejected_excessive_error_rate,
+                "Excessive error rate",
+            ),
+            (
+                "raw_reads_rejected_for_umi_too_short",
+                self.rejected_umi_too_short,
+                "UMI sequence too short",
+            ),
+            (
+                "raw_reads_rejected_for_single_strand_only",
+                self.rejected_same_strand_only,
+                "Only generating one strand of duplex consensus",
+            ),
+            (
+                "raw_reads_rejected_for_duplicate_umi",
+                self.rejected_duplicate_umi,
+                "Duplicate UMI detected",
+            ),
         ];
         for (key, count, description) in optional {
             if count > 0 {

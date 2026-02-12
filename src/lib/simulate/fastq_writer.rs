@@ -89,7 +89,7 @@ impl FastqWriter {
             Ok(Self { inner: FastqWriterInner::SingleThreaded(gz) })
         } else {
             let config = ParallelGzipConfig::with_threads(threads);
-            let writer = ParallelGzipWriter::new(file, config)
+            let writer = ParallelGzipWriter::new(file, &config)
                 .with_context(|| "Failed to create parallel gzip writer")?;
             Ok(Self { inner: FastqWriterInner::MultiThreaded(writer) })
         }

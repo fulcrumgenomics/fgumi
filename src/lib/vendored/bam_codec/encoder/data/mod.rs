@@ -10,6 +10,7 @@ use noodles::sam::alignment::record_buf::data::field::Value as RecordBufValue;
 use self::field::write_field;
 use super::num::{write_f32_le, write_i16_le, write_u32_le};
 
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn write_data<D>(dst: &mut Vec<u8>, data: D) -> io::Result<()>
 where
     D: Data,
@@ -58,6 +59,7 @@ pub(super) fn write_data_fast(
 /// Try to write a common tag using the fast path.
 /// Returns true if handled, false if caller should use generic path.
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn try_write_common_tag(dst: &mut Vec<u8>, tag: Tag, value: &RecordBufValue) -> bool {
     let tag_bytes = tag.as_ref();
 
@@ -134,10 +136,11 @@ fn try_write_common_tag(dst: &mut Vec<u8>, tag: Tag, value: &RecordBufValue) -> 
             {
                 // Write header: tag + 'B' + 's' + count
                 dst.extend([tag_bytes[0], tag_bytes[1], b'B', b's']);
+                debug_assert!(u32::try_from(values.len()).is_ok(), "Int16 array too large for BAM");
                 write_u32_le(dst, values.len() as u32);
 
                 // Write each i16 value in little-endian format
-                for &v in values.iter() {
+                for &v in values {
                     write_i16_le(dst, v);
                 }
 

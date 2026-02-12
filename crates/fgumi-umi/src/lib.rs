@@ -93,10 +93,7 @@ impl MoleculeId {
     /// efficient Vec-based grouping instead of `HashMap`.
     #[inline]
     #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "molecule IDs never exceed usize::MAX / 2"
-    )]
+    #[expect(clippy::cast_possible_truncation, reason = "molecule IDs never exceed usize::MAX / 2")]
     pub fn to_vec_index(&self) -> Option<usize> {
         match self {
             MoleculeId::None => None,

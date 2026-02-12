@@ -1,3 +1,4 @@
+#[allow(clippy::cast_sign_loss)]
 pub(super) fn write_i8(dst: &mut Vec<u8>, n: i8) {
     write_u8(dst, n as u8);
 }

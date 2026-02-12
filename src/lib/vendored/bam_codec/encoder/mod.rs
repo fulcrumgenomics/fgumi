@@ -52,6 +52,7 @@ pub enum EncodeError {
 
 impl error::Error for EncodeError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        #[allow(clippy::match_same_arms)]
         match self {
             Self::InvalidReferenceSequenceId(e) => Some(e),
             Self::InvalidAlignmentStart(e) => Some(e),

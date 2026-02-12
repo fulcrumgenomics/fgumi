@@ -166,6 +166,10 @@ impl BoundaryState {
     ///
     /// A `BoundaryBatch` containing the complete records and their offsets.
     /// Any incomplete record at the end is saved as leftover for the next call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the BAM header is malformed.
     pub fn find_boundaries(&mut self, decompressed: &[u8]) -> io::Result<BoundaryBatch> {
         // Step 1: Combine leftover with new data into reusable work_buffer
         // This avoids allocating a new Vec on every call
@@ -246,6 +250,10 @@ impl BoundaryState {
     ///
     /// This validates that any remaining bytes form complete records.
     /// If there are incomplete bytes at EOF, an error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if there are incomplete BAM records at EOF.
     pub fn finish(&mut self) -> io::Result<Option<BoundaryBatch>> {
         if self.leftover.is_empty() {
             return Ok(None);
@@ -307,6 +315,10 @@ impl Default for BoundaryState {
 /// # Returns
 ///
 /// A vector of decoded `DecodedRecord` instances (record + pre-computed `GroupKey`).
+///
+/// # Errors
+///
+/// Returns an I/O error if any BAM record is malformed.
 pub fn decode_records(
     batch: &BoundaryBatch,
     group_key_config: &GroupKeyConfig,
@@ -817,6 +829,10 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
     }
 
     /// Flush the output writer and finalize.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if flushing the output writer fails.
     pub fn flush_output(&self) -> io::Result<()> {
         if let Some(mut writer) = self.output.output.lock().take() {
             writer.flush()?;
@@ -1309,11 +1325,19 @@ pub trait Grouper: Send {
     /// for fast comparison (position, name hash, library, etc.).
     ///
     /// Returns completed groups (may be empty if more records are needed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if grouping logic encounters invalid data.
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>>;
 
     /// Signal that no more input will arrive (EOF).
     ///
     /// Returns any remaining partial group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if finalizing the grouper fails.
     fn finish(&mut self) -> io::Result<Option<Self::Group>>;
 
     /// Returns true if the grouper has a partial group.
@@ -1350,11 +1374,19 @@ impl<G: Send> GroupState<G> {
     }
 
     /// Process decoded records and return completed groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if grouping fails.
     pub fn process(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<G>> {
         self.grouper.add_records(records)
     }
 
     /// Signal EOF and get any remaining group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the grouper fails to finalize.
     pub fn finish(&mut self) -> io::Result<Option<G>> {
         if self.finished {
             return Ok(None);
@@ -1835,10 +1867,13 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
 ///
 /// Uses the held-item pattern to prevent deadlock. If the output queue is full,
 /// the batch is stored in `worker.held_boundaries` and the function returns immediately.
+#[allow(clippy::too_many_lines)]
 fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     state: &BamPipelineState<G, P>,
     worker: &mut WorkerState<P>,
 ) -> (bool, bool) {
+    const MAX_BATCHES_PER_LOCK: usize = 8;
+
     // =========================================================================
     // Priority 1: Try to advance any held boundary batch first
     // =========================================================================
@@ -1877,9 +1912,6 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     };
 
     // Process multiple batches per lock acquisition to reduce contention
-    // Max batches per acquisition (tune for balance between throughput and latency)
-    const MAX_BATCHES_PER_LOCK: usize = 8;
-
     for _ in 0..MAX_BATCHES_PER_LOCK {
         // Check if output queue still has space
         if state.q2b_boundaries.is_full() {
@@ -2137,10 +2169,15 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
 /// Batching mode depends on configuration:
 /// - `target_templates_per_batch > 0`: Weight-based batching using `BatchWeight::batch_weight()`
 /// - `target_templates_per_batch == 0`: Count-based batching using `batch_size`
+#[allow(clippy::too_many_lines)]
 fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + MemoryEstimate>(
     state: &BamPipelineState<G, P>,
     group_state: &Mutex<GroupState<G>>,
 ) -> (bool, bool) {
+    const MAX_RETRIES: u32 = 10_000;
+    const MAX_BATCHES_PER_LOCK: usize = 8;
+    const MAX_PENDING_DRAIN: usize = 16;
+
     // Try to acquire exclusive access to group state
     let Some(mut guard) = group_state.try_lock() else {
         if let Some(stats) = state.stats() {
@@ -2247,7 +2284,6 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
     if guard.is_finished() && !state.group_done.load(Ordering::SeqCst) {
         // CRITICAL: Must retry until flush succeeds to avoid data loss
         let mut retries = 0;
-        const MAX_RETRIES: u32 = 10_000;
         loop {
             if flush_all(&mut guard, state).is_some() {
                 state.group_done.store(true, Ordering::SeqCst);
@@ -2256,8 +2292,7 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
             retries += 1;
             if retries > MAX_RETRIES {
                 state.set_error(std::io::Error::other(format!(
-                    "Failed to flush final groups after {} retries",
-                    MAX_RETRIES
+                    "Failed to flush final groups after {MAX_RETRIES} retries"
                 )));
                 return (false, false);
             }
@@ -2266,8 +2301,6 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
     }
 
     // Process multiple record batches per lock acquisition to reduce contention
-    const MAX_BATCHES_PER_LOCK: usize = 8;
-    const MAX_PENDING_DRAIN: usize = 16;
     let mut did_work = false;
 
     // Reusable buffer for pre-draining (allocated once per try_step_group call)
@@ -2429,7 +2462,6 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
                 // CRITICAL: Must retry until flush succeeds to avoid data loss
                 {
                     let mut retries = 0;
-                    const MAX_RETRIES: u32 = 10_000;
                     loop {
                         if flush_all(&mut guard, state).is_some() {
                             state.group_done.store(true, Ordering::SeqCst);
@@ -2438,8 +2470,7 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
                         retries += 1;
                         if retries > MAX_RETRIES {
                             state.set_error(std::io::Error::other(format!(
-                                "Failed to flush final groups after {} retries",
-                                MAX_RETRIES
+                                "Failed to flush final groups after {MAX_RETRIES} retries"
                             )));
                             return (false, false);
                         }
@@ -2451,7 +2482,6 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
             Ok(None) => {
                 // CRITICAL: Must retry until flush succeeds to avoid data loss
                 let mut retries = 0;
-                const MAX_RETRIES: u32 = 10_000;
                 loop {
                     if flush_all(&mut guard, state).is_some() {
                         state.group_done.store(true, Ordering::SeqCst);
@@ -2460,8 +2490,7 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
                     retries += 1;
                     if retries > MAX_RETRIES {
                         state.set_error(std::io::Error::other(format!(
-                            "Failed to flush final groups after {} retries",
-                            MAX_RETRIES
+                            "Failed to flush final groups after {MAX_RETRIES} retries"
                         )));
                         return (false, false);
                     }
@@ -2500,6 +2529,8 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
     fns: &PipelineFunctions<G, P>,
     worker: &mut WorkerState<P>,
 ) -> bool {
+    const MAX_BATCHES: usize = 8;
+
     // =========================================================================
     // Priority 1: Try to advance any held processed batch first
     // =========================================================================
@@ -2531,7 +2562,6 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
     // Always drain multiple batches when work is available for better throughput.
     // Q5 memory backpressure above prevents unbounded growth.
     // =========================================================================
-    const MAX_BATCHES: usize = 8;
     let mut did_work = false;
 
     for _ in 0..MAX_BATCHES {
@@ -2950,6 +2980,7 @@ impl SingleThreadedBuffers {
 /// This avoids the overhead of thread spawning, queues, and atomic
 /// operations when only one thread is requested. Significantly faster
 /// for small inputs or when parallelization overhead exceeds the benefit.
+#[allow(clippy::needless_pass_by_value)]
 fn run_bam_pipeline_single_threaded<G, P>(
     config: &PipelineConfig,
     mut input: Box<dyn Read + Send>,
@@ -3101,6 +3132,11 @@ where
 /// # Returns
 ///
 /// Number of groups processed, or an error.
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step fails.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub fn run_bam_pipeline<G, P>(
     config: PipelineConfig,
     input: Box<dyn Read + Send>,
@@ -3326,6 +3362,11 @@ thread_local! {
 ///
 /// Appends serialized BAM bytes to the provided buffer and returns the record count.
 /// This variant is more efficient when the caller wants to reuse a buffer.
+///
+/// # Errors
+///
+/// Returns an I/O error if record encoding fails.
+#[allow(clippy::cast_possible_truncation)]
 pub fn serialize_bam_records_into(
     records: &[RecordBuf],
     header: &Header,
@@ -3374,6 +3415,10 @@ pub fn serialize_bam_records_into(
 /// This is a convenience wrapper around `serialize_bam_records_into` that allocates
 /// a new buffer. Use `serialize_bam_records_into` for better performance when
 /// buffer reuse is possible.
+///
+/// # Errors
+///
+/// Returns an I/O error if record encoding fails.
 pub fn serialize_bam_records(
     records: &[RecordBuf],
     header: &Header,
@@ -3387,6 +3432,10 @@ pub fn serialize_bam_records(
 ///
 /// This produces raw BAM record bytes (`block_size` prefix + record data),
 /// suitable for BGZF compression in the pipeline. Uses thread-local buffer.
+///
+/// # Errors
+///
+/// Returns an I/O error if record encoding fails.
 pub fn serialize_bam_record(record: &RecordBuf, header: &Header) -> io::Result<SerializedBatch> {
     let mut data = Vec::with_capacity(256);
     let record_count = serialize_bam_record_into(record, header, &mut data)?;
@@ -3399,6 +3448,11 @@ pub fn serialize_bam_record(record: &RecordBuf, header: &Header) -> io::Result<S
 /// suitable for BGZF compression in the pipeline. Uses thread-local buffer for encoding.
 ///
 /// Returns the number of records serialized (always 1 for a single record).
+///
+/// # Errors
+///
+/// Returns an I/O error if record encoding fails.
+#[allow(clippy::cast_possible_truncation)]
 pub fn serialize_bam_record_into(
     record: &RecordBuf,
     header: &Header,
@@ -3427,6 +3481,11 @@ pub fn serialize_bam_record_into(
 /// BGZF blocks as the buffer fills.
 ///
 /// Returns the number of records serialized.
+///
+/// # Errors
+///
+/// Returns an I/O error if record encoding or compression fails.
+#[allow(clippy::cast_possible_truncation)]
 pub fn serialize_bam_records_to_compressor(
     records: &[RecordBuf],
     header: &Header,
@@ -3542,6 +3601,10 @@ impl BamPipelineConfig {
 /// # Returns
 ///
 /// Number of groups processed, or an error.
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step or file I/O fails.
 pub fn run_bam_pipeline_with_grouper<G, P, GrouperFn, ProcessFn, SerializeFn>(
     config: BamPipelineConfig,
     input_path: &Path,
@@ -3668,6 +3731,10 @@ where
 /// # Returns
 ///
 /// Number of groups processed, or an error.
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step or file I/O fails.
 pub fn run_bam_pipeline_with_header<G, P, GrouperFn, ProcessFn, SerializeFn>(
     config: BamPipelineConfig,
     input_path: &Path,
@@ -3799,7 +3866,11 @@ where
 /// # Returns
 ///
 /// Number of groups processed, or an error.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step or file I/O fails.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn run_bam_pipeline_from_reader<G, P, R, GrouperFn, ProcessFn, SerializeFn>(
     config: BamPipelineConfig,
     input: R,

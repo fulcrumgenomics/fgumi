@@ -9,8 +9,8 @@ use noodles::sam::alignment::record::Sequence as SequenceTrait;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::{QualityScores, RecordBuf, Sequence};
 
-use crate::tags::{per_base, per_read};
 use crate::phred::{MIN_PHRED, NO_CALL_BASE};
+use crate::tags::{per_base, per_read};
 use fgumi_metrics::rejection::RejectionReason;
 
 /// Filter thresholds for consensus reads
@@ -386,7 +386,10 @@ fn extract_int_tag(data: &noodles::sam::alignment::record_buf::Data, tag_str: &s
         Value::Int16(v) => Some(i32::from(*v)),
         Value::UInt16(v) => Some(i32::from(*v)),
         Value::Int32(v) => Some(*v),
-        #[expect(clippy::cast_possible_wrap, reason = "BAM tag values in practice never exceed i32::MAX")]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "BAM tag values in practice never exceed i32::MAX"
+        )]
         Value::UInt32(v) => Some(*v as i32),
         _ => None,
     }
@@ -773,7 +776,10 @@ pub fn mean_base_quality(record: &RecordBuf) -> f64 {
         .filter(|&(base, _)| base != NO_CALL_BASE)
         .fold((0u64, 0usize), |(sum, count), (_, qual)| (sum + u64::from(qual), count + 1));
 
-    #[expect(clippy::cast_precision_loss, reason = "precision loss is acceptable for quality averaging")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for quality averaging"
+    )]
     if count == 0 { 0.0 } else { sum as f64 / count as f64 }
 }
 
@@ -798,7 +804,10 @@ pub fn compute_read_stats(record: &RecordBuf) -> (usize, f64) {
             }
         });
 
-    #[expect(clippy::cast_precision_loss, reason = "precision loss is acceptable for quality averaging")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for quality averaging"
+    )]
     let mean_qual = if non_n_count == 0 { 0.0 } else { qual_sum as f64 / non_n_count as f64 };
     (n_count, mean_qual)
 }
@@ -982,7 +991,11 @@ pub fn filter_duplex_read_raw(
     };
 
     // Check AB strand (max depth, min error) against AB thresholds
-    #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation, reason = "depth values are non-negative and fit in usize on all supported platforms")]
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "depth values are non-negative and fit in usize on all supported platforms"
+    )]
     if (max_depth as usize) < ab_thresholds.min_reads {
         return Ok(FilterResult::InsufficientReads);
     }
@@ -991,7 +1004,11 @@ pub fn filter_duplex_read_raw(
     }
 
     // Check BA strand (min depth, max error) against BA thresholds
-    #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation, reason = "depth values are non-negative and fit in usize on all supported platforms")]
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "depth values are non-negative and fit in usize on all supported platforms"
+    )]
     if (min_depth as usize) < ba_thresholds.min_reads {
         return Ok(FilterResult::InsufficientReads);
     }
@@ -1028,7 +1045,10 @@ pub fn compute_read_stats_raw(bam: &[u8]) -> (usize, f64) {
         }
     }
 
-    #[expect(clippy::cast_precision_loss, reason = "precision loss is acceptable for quality averaging")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for quality averaging"
+    )]
     let mean_qual = if non_n_count == 0 { 0.0 } else { qual_sum as f64 / non_n_count as f64 };
     (n_count, mean_qual)
 }
@@ -1042,7 +1062,10 @@ fn find_string_or_uint8_array(aux_data: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> 
     } else {
         let arr = bam_fields::find_array_tag(aux_data, &tag)?;
         if matches!(arr.elem_type, b'C' | b'c') {
-            #[expect(clippy::cast_possible_truncation, reason = "UInt8 array elements are guaranteed to fit in u8")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "UInt8 array elements are guaranteed to fit in u8"
+            )]
             Some((0..arr.count).map(|i| bam_fields::array_tag_element_u16(&arr, i) as u8).collect())
         } else {
             None
@@ -1058,7 +1081,10 @@ fn find_string_or_uint8_array(aux_data: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> 
 /// # Errors
 ///
 /// Returns an error if the record is too short or the aux data cannot be parsed.
-#[expect(clippy::similar_names, reason = "threshold variable names mirror the consensus tag names they check")]
+#[expect(
+    clippy::similar_names,
+    reason = "threshold variable names mirror the consensus tag names they check"
+)]
 pub fn mask_bases_raw(
     record: &mut [u8],
     thresholds: &FilterThresholds,
@@ -1107,7 +1133,10 @@ pub fn mask_bases_raw(
 /// # Errors
 ///
 /// Returns an error if the record is too short or the aux data cannot be parsed.
-#[expect(clippy::similar_names, reason = "threshold variable names mirror the duplex strand tag names")]
+#[expect(
+    clippy::similar_names,
+    reason = "threshold variable names mirror the duplex strand tag names"
+)]
 pub fn mask_duplex_bases_raw(
     record: &mut [u8],
     cc_thresholds: &FilterThresholds,

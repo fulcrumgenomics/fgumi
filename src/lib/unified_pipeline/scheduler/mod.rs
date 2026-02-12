@@ -188,6 +188,7 @@ pub enum Direction {
 
 /// Backpressure state from queue depths and memory pressure.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct BackpressureState {
     /// True when output queue exceeds high-water mark.
     pub output_high: bool,
@@ -450,8 +451,7 @@ mod tests {
             assert_eq!(
                 scheduler.exclusive_step_owned(),
                 expected_ownership,
-                "Thread {} ownership mismatch",
-                thread_id
+                "Thread {thread_id} ownership mismatch"
             );
         }
     }
@@ -508,12 +508,11 @@ mod tests {
             assert_eq!(
                 t6.exclusive_step_owned(),
                 Some(PipelineStep::Group),
-                "{:?} T6 should own Group",
-                strategy
+                "{strategy:?} T6 should own Group"
             );
 
             let t3 = create_scheduler(strategy, 3, 8);
-            assert_eq!(t3.exclusive_step_owned(), None, "{:?} T3 should own nothing", strategy);
+            assert_eq!(t3.exclusive_step_owned(), None, "{strategy:?} T3 should own nothing");
         }
     }
 

@@ -4,22 +4,20 @@
 //! reads from the same source molecule (same UMI/MI tag) and calls a consensus
 //! sequence using a likelihood-based model.
 
-use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use crate::base_builder::ConsensusBaseBuilder;
-use crate::caller::{
-    ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
-};
-use crate::simple_umi::consensus_umis;
-use fgumi_dna::dna::reverse_complement;
+use crate::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason};
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
 };
-use noodles_raw_bam::{UnmappedBamRecordBuilder, flags};
+use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
+use fgumi_dna::dna::reverse_complement;
+use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 #[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
+use noodles_raw_bam::{UnmappedBamRecordBuilder, flags};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -195,7 +193,10 @@ impl VanillaConsensusRead {
 
     /// Returns the error rate (total errors / total depth)
     #[must_use]
-    #[expect(clippy::cast_precision_loss, reason = "u32 values from u16 sums are small enough for f32 precision")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "u32 values from u16 sums are small enough for f32 precision"
+    )]
     pub fn error_rate(&self) -> f32 {
         let total_depth: u32 = self.depths.iter().map(|&d| u32::from(d)).sum();
         if total_depth == 0 {
@@ -861,8 +862,14 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Sub-groups reads by read type (fragment, R1, R2)
-    #[expect(clippy::type_complexity, reason = "tuple return type is clearer than a one-off struct for internal grouping")]
-    #[expect(clippy::unused_self, reason = "method signature kept for consistency with other caller trait methods")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "tuple return type is clearer than a one-off struct for internal grouping"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "method signature kept for consistency with other caller trait methods"
+    )]
     fn subgroup_reads(&self, reads: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
         use noodles_raw_bam as bam_fields;
 
@@ -1187,7 +1194,10 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Builds a consensus record as raw BAM bytes and writes it into a `ConsensusOutput`.
-    #[expect(clippy::too_many_arguments, reason = "consensus record building requires many parameters from the calling context")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "consensus record building requires many parameters from the calling context"
+    )]
     fn build_consensus_record_into(
         &mut self,
         output: &mut ConsensusOutput,
@@ -1353,15 +1363,15 @@ pub(crate) enum ReadType {
 )]
 mod tests {
     use super::*;
+    use bstr::BString;
     use fgumi_sam::builder::{RecordBuilder, RecordPairBuilder};
     use fgumi_sam::record_utils;
-    use noodles_raw_bam::ParsedBamRecord;
-    use bstr::BString;
     use noodles::core::Position;
     use noodles::sam::alignment::record::Flags as NoodlesFlags;
     use noodles::sam::alignment::record::cigar::op::Op;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence, data::field::Value};
+    use noodles_raw_bam::ParsedBamRecord;
 
     /// Build a SAM header with a dummy reference sequence so that records
     /// with `reference_sequence_id(0)` or `mate_reference_sequence_id(0)` can be encoded.

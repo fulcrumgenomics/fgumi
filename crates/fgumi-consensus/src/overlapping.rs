@@ -267,7 +267,10 @@ impl OverlappingBasesConsensusCaller {
     }
 
     /// Process disagreeing bases
-    #[expect(clippy::too_many_arguments, reason = "disagreement processing requires all base/quality parameters from both reads")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "disagreement processing requires all base/quality parameters from both reads"
+    )]
     fn process_disagreement(
         &mut self,
         r1_offset: usize,
@@ -402,7 +405,12 @@ struct ReadAndRefPosIterator {
     end_read_pos: i32,
 }
 
-#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "position arithmetic requires casts between BAM integer types"
+)]
 impl ReadAndRefPosIterator {
     /// Create iterator for aligned positions overlapping with mate (noodles `RecordBuf`)
     fn new_with_mate(record: &RecordBuf, mate: &RecordBuf) -> Result<Self> {
@@ -566,7 +574,10 @@ impl ReadAndRefPosIterator {
     }
 }
 
-#[expect(clippy::cast_sign_loss, reason = "position arithmetic requires casts between BAM integer types")]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "position arithmetic requires casts between BAM integer types"
+)]
 impl Iterator for ReadAndRefPosIterator {
     type Item = ReadPosition;
 
@@ -757,9 +768,13 @@ impl OverlappingBasesConsensusCaller {
         }
 
         // Verify both have alignment positions and ends
-        let Some(r1_start) = noodles_raw_bam::alignment_start_from_raw(r1) else { return Ok(false) };
+        let Some(r1_start) = noodles_raw_bam::alignment_start_from_raw(r1) else {
+            return Ok(false);
+        };
         let Some(r1_end) = noodles_raw_bam::alignment_end_from_raw(r1) else { return Ok(false) };
-        let Some(r2_start) = noodles_raw_bam::alignment_start_from_raw(r2) else { return Ok(false) };
+        let Some(r2_start) = noodles_raw_bam::alignment_start_from_raw(r2) else {
+            return Ok(false);
+        };
         let Some(r2_end) = noodles_raw_bam::alignment_end_from_raw(r2) else { return Ok(false) };
 
         // Create merge iterator that yields positions where both reads have aligned bases
@@ -2179,8 +2194,7 @@ mod tests {
 
         // r1: 100-107, r2: 104-111, overlap: 104-107
         let raw_iter = ReadMateAndRefPosIterator::new_raw(
-            &r1_raw, &r2_raw,
-            100, 107, // r1 start/end
+            &r1_raw, &r2_raw, 100, 107, // r1 start/end
             104, 111, // r2 start/end
         );
         let raw_positions: Vec<_> = raw_iter.collect();

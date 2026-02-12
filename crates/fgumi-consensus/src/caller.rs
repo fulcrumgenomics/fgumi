@@ -350,7 +350,10 @@ impl Default for ConsensusOptionsBase {
 ///
 /// Returns 0.0 if total depth is zero.
 #[must_use]
-#[expect(clippy::cast_precision_loss, reason = "u32 values from u16 sums are small enough for f32 precision")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "u32 values from u16 sums are small enough for f32 precision"
+)]
 pub fn calculate_error_rate(depths: &[u16], errors: &[u16]) -> f32 {
     let total_depth: u32 = depths.iter().map(|&d| u32::from(d)).sum();
     if total_depth == 0 {

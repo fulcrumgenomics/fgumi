@@ -13,11 +13,11 @@
 //! - **Consensus filtering**: Quality-based filtering and masking of consensus reads
 //! - **Consensus tags**: SAM tags for tracking consensus metrics
 
-pub mod phred;
 pub mod base_builder;
 pub mod caller;
 pub mod filter;
 pub mod overlapping;
+pub mod phred;
 pub mod sequence;
 pub mod simple_umi;
 pub mod tags;

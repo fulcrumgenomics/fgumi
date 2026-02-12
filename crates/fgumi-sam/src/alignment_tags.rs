@@ -7,19 +7,6 @@
 //! - **UQ**: Phred likelihood of the segment (sum of mismatch qualities)
 //! - **MD**: Mismatched and deleted reference bases
 
-// These lints are suppressed because the code operates on BAM integer fields
-// where value ranges are well-understood and the casts are safe.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::missing_errors_doc,
-    clippy::too_many_lines,
-    clippy::redundant_closure_for_method_calls,
-    clippy::explicit_iter_loop,
-    clippy::match_same_arms,
-    clippy::uninlined_format_args
-)]
 
 use anyhow::{Context, Result};
 use noodles::core::Position;
@@ -60,6 +47,12 @@ pub fn uq_tag() -> Tag {
 ///
 /// # Returns
 /// True if tags were regenerated, false if read is unmapped (tags are nulled)
+///
+/// # Errors
+///
+/// Returns an error if the reference sequence ID is missing or not found in the header,
+/// the alignment start is missing, or the reference bases cannot be fetched.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn regenerate_alignment_tags(
     record: &mut RecordBuf,
     header: &Header,
@@ -87,12 +80,12 @@ pub fn regenerate_alignment_tags(
 
     // Calculate total reference span from CIGAR and fetch entire alignment span once
     // This is a key optimization - instead of fetching per CIGAR operation, we fetch once
-    // Note: Skip (N in CIGAR) is NOT included - it doesn't affect NM/MD/UQ calculation
+    // Skip (N) is included because it advances the reference position
     let ref_span: usize = cigar
         .iter()
-        .filter_map(|op| op.ok())
+        .filter_map(Result::ok)
         .map(|op| match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => op.len(),
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion | Kind::Skip => op.len(),
             _ => 0,
         })
         .sum();
@@ -131,7 +124,7 @@ pub fn regenerate_alignment_tags(
                 let ref_bases = &all_ref_bases[ref_offset..ref_offset + len];
 
                 // Compare each base
-                for &ref_base in ref_bases.iter() {
+                for &ref_base in ref_bases {
                     let seq_base = seq
                         .as_ref()
                         .get(seq_pos)
@@ -207,10 +200,12 @@ pub fn regenerate_alignment_tags(
                 // Soft clip: advance sequence position only
                 seq_pos += len;
             }
-            Kind::HardClip | Kind::Pad | Kind::Skip => {
-                // These don't consume sequence or reference for tag calculation
-                // Note: Skip (N in CIGAR) represents spliced alignments - the skipped
-                // reference region doesn't affect NM/MD/UQ calculation
+            Kind::Skip => {
+                // Skip (N) advances reference position but doesn't affect NM/MD/UQ
+                ref_offset += len;
+            }
+            Kind::HardClip | Kind::Pad => {
+                // These don't consume sequence or reference
             }
         }
     }
@@ -220,7 +215,7 @@ pub fn regenerate_alignment_tags(
 
     // Update tags
     record.data_mut().insert(nm_tag(), Value::from(nm as i32));
-    record.data_mut().insert(uq_tag(), Value::from(uq as i32));
+    record.data_mut().insert(uq_tag(), Value::from(uq.min(i32::MAX as u32) as i32));
     record.data_mut().insert(md_tag(), Value::from(md_string));
 
     Ok(true)
@@ -238,6 +233,18 @@ use noodles_raw_bam;
 /// recalculated based on the alignment and reference.
 ///
 /// Returns `Ok(true)` if tags were regenerated, `Ok(false)` for unmapped reads.
+///
+/// # Errors
+///
+/// Returns an error if the record is too short, the reference sequence ID is not found
+/// in the header, the alignment start is invalid, or the CIGAR operations reference
+/// beyond the available sequence or reference data.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 pub fn regenerate_alignment_tags_raw(
     record: &mut Vec<u8>,
     header: &Header,
@@ -273,7 +280,7 @@ pub fn regenerate_alignment_tags_raw(
 
     let alignment_start_0based = noodles_raw_bam::pos(record);
     if alignment_start_0based < 0 {
-        anyhow::bail!("Invalid alignment start position: {}", alignment_start_0based);
+        anyhow::bail!("Invalid alignment start position: {alignment_start_0based}");
     }
     let ref_start = Position::new((alignment_start_0based + 1) as usize)
         .context("Invalid alignment start position")?;
@@ -288,7 +295,7 @@ pub fn regenerate_alignment_tags_raw(
             let op_type = op & 0xF;
             let op_len = (op >> 4) as usize;
             match op_type {
-                0 | 2 | 7 | 8 => op_len, // M, D, =, X
+                0 | 2 | 3 | 7 | 8 => op_len, // M, D, N, =, X
                 _ => 0,
             }
         })
@@ -394,9 +401,11 @@ pub fn regenerate_alignment_tags_raw(
                 }
                 seq_pos += op_len;
             }
-            5 | 6 | 3 => {
-                // H (5), P (6), N (3) — no sequence or ref consumed for tag calc
+            3 => {
+                // N — skip (spliced alignment), advances reference but not NM/MD/UQ
+                ref_offset += op_len;
             }
+            // H (5), P (6), and others — no sequence or ref consumed for tag calc
             _ => {}
         }
     }
@@ -454,12 +463,7 @@ mod tests {
     }
 
     impl ReferenceProvider for MockReference {
-        fn fetch(
-            &self,
-            chrom: &str,
-            start: Position,
-            end: Position,
-        ) -> Result<Vec<u8>> {
+        fn fetch(&self, chrom: &str, start: Position, end: Position) -> Result<Vec<u8>> {
             let sequence = self
                 .sequences
                 .get(chrom)
@@ -500,9 +504,11 @@ mod tests {
             .build()
     }
 
-    /// Encode a RecordBuf to raw BAM bytes for testing raw tag regeneration.
+    /// Encode a `RecordBuf` to raw BAM bytes for testing raw tag regeneration.
+    #[allow(clippy::cast_sign_loss)]
     fn encode_record_buf_to_raw(header: &Header, record: &RecordBuf) -> Result<Vec<u8>> {
-        use std::io::Cursor;
+        use noodles::sam::alignment::io::Write as AlignmentWrite;
+        use std::io::{Cursor, Read};
 
         // Write a complete BAM file in memory
         let mut bam_data = Vec::new();
@@ -513,14 +519,18 @@ mod tests {
             writer.get_mut().try_finish()?;
         }
 
-        // Read it back to extract raw record bytes
+        // Read back: skip the header, then read the raw record bytes
         let mut reader = noodles::bam::io::Reader::new(Cursor::new(&bam_data));
         let _header = reader.read_header()?;
 
-        let mut bam_record = noodles::bam::Record::default();
-        reader.read_record(&mut bam_record)?;
+        // Each BAM record is prefixed with block_size:i32
+        let mut size_buf = [0u8; 4];
+        reader.get_mut().read_exact(&mut size_buf)?;
+        let block_size = i32::from_le_bytes(size_buf) as usize;
+        let mut record_bytes = vec![0u8; block_size];
+        reader.get_mut().read_exact(&mut record_bytes)?;
 
-        Ok(bam_record.as_ref().to_vec())
+        Ok(record_bytes)
     }
 
     #[test]
@@ -808,14 +818,18 @@ mod tests {
         let header = create_test_header();
 
         // CIGAR with Skip operation (N): 2M2N2M (spliced alignment)
+        // Ref: ACGTACGTACGTACGT
+        // Read: AC|GT aligned as 2M at pos 1-2, skip 2 ref bases, 2M at pos 5-6
+        // Pos 1-2: AC vs AC (match), Pos 5-6: GT vs AC (2 mismatches)
         let mut record = create_mapped_record("ACGT", &[30, 30, 30, 30], "2M2N2M", 1);
 
         regenerate_alignment_tags(&mut record, &header, &reference)?;
 
-        // Skip ignored: NM=0, UQ=0, MD=4
-        assert_eq!(record.data().get(&nm_tag()), Some(&Value::from(0)));
-        assert_eq!(record.data().get(&uq_tag()), Some(&Value::from(0)));
-        assert_eq!(record.data().get(&md_tag()), Some(&Value::from("4".to_string())));
+        // Skip advances ref but doesn't contribute to NM/MD/UQ directly;
+        // the bases after the skip align to different ref positions.
+        assert_eq!(record.data().get(&nm_tag()), Some(&Value::from(2)));
+        assert_eq!(record.data().get(&uq_tag()), Some(&Value::from(60)));
+        assert_eq!(record.data().get(&md_tag()), Some(&Value::from("2A0C0".to_string())));
 
         Ok(())
     }
@@ -941,8 +955,7 @@ mod tests {
         regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
 
         // Read tags back from raw bytes
-        let aux_off =
-            noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux_off = noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
         let nm = noodles_raw_bam::find_int_tag(aux, b"NM");
@@ -970,8 +983,7 @@ mod tests {
         let mut raw = encode_record_buf_to_raw(&header, &record_buf)?;
         regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
 
-        let aux_off =
-            noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux_off = noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
         let nm = noodles_raw_bam::find_int_tag(aux, b"NM");

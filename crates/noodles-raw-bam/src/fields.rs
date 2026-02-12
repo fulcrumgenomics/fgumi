@@ -527,7 +527,7 @@ mod tests {
             200,                            // pos
             flags::PAIRED | flags::REVERSE, // flags
             b"rea",                         // name
-            &[(10 << 4) | 0],              // 10M cigar
+            &[(10 << 4) | 0],               // 10M cigar
             10,                             // seq_len
             5,                              // mate_tid
             300,                            // mate_pos

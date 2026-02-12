@@ -26,8 +26,7 @@ impl DecodeError {
     pub fn tag(&self) -> Option<Tag> {
         match self {
             Self::InvalidTag(_) => None,
-            Self::InvalidType(tag, _) => Some(*tag),
-            Self::InvalidValue(tag, _) => Some(*tag),
+            Self::InvalidType(tag, _) | Self::InvalidValue(tag, _) => Some(*tag),
         }
     }
 }

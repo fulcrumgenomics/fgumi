@@ -57,6 +57,7 @@ pub enum DecodeError {
 
 impl error::Error for DecodeError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        #[allow(clippy::match_same_arms)]
         match self {
             Self::InvalidReferenceSequenceId(e) => Some(e),
             Self::InvalidAlignmentStart(e) => Some(e),

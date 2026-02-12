@@ -81,6 +81,10 @@ impl StrandBiasModel {
     /// # Returns
     ///
     /// A value in [0, 1] representing the fraction of reads on the A strand.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `alpha` or `beta` are invalid Beta distribution parameters.
     pub fn sample_a_fraction(&self, rng: &mut impl Rng) -> f64 {
         let dist = Beta::new(self.alpha, self.beta).expect("Invalid beta parameters");
         dist.sample(rng)
@@ -96,6 +100,7 @@ impl StrandBiasModel {
     /// # Returns
     ///
     /// A tuple of (`a_count`, `b_count`) where `a_count` + `b_count` == total.
+    #[allow(clippy::cast_sign_loss)]
     pub fn split_reads(&self, total: usize, rng: &mut impl Rng) -> (usize, usize) {
         if total == 0 {
             return (0, 0);
@@ -122,6 +127,7 @@ impl StrandBiasModel {
     /// # Returns
     ///
     /// A tuple of (`a_count`, `b_count`) where `a_count` + `b_count` == total.
+    #[allow(clippy::cast_sign_loss)]
     pub fn split_reads_with_minimum(
         &self,
         total: usize,

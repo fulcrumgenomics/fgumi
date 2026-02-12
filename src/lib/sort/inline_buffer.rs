@@ -37,6 +37,7 @@ impl PackedCoordKey {
     /// * `nref` - Number of reference sequences (for unmapped handling)
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_sign_loss)]
     pub fn new(tid: i32, pos: i32, reverse: bool, nref: u32) -> Self {
         // Map unmapped (tid=-1) to nref for proper sorting (after all mapped)
         let tid = if tid < 0 { nref } else { tid as u32 };
@@ -163,10 +164,14 @@ impl RecordBuffer {
     /// Push a record for coordinate sorting.
     ///
     /// Extracts the sort key inline from raw BAM bytes (zero-copy).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the record length exceeds `u32::MAX`.
     #[inline]
     pub fn push_coordinate(&mut self, record: &[u8]) {
         let offset = self.data.len() as u64;
-        let len = record.len() as u32;
+        let len = u32::try_from(record.len()).expect("record length exceeds u32::MAX");
 
         // Extract sort key from raw BAM bytes
         let sort_key = extract_coordinate_key_inline(record, self.nref);
@@ -208,6 +213,7 @@ impl RecordBuffer {
     /// Get record bytes by reference.
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn get_record(&self, r: &RecordRef) -> &[u8] {
         let start = r.offset as usize + HEADER_SIZE;
         let end = start + r.len as usize;
@@ -328,7 +334,7 @@ pub struct TemplateKey {
 
 impl TemplateKey {
     /// Create a new template key from extracted fields.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::cast_sign_loss)]
     #[must_use]
     pub fn new(
         tid1: i32,
@@ -627,10 +633,14 @@ impl TemplateRecordBuffer {
     }
 
     /// Push a record with a pre-computed template key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the record length exceeds `u32::MAX`.
     #[inline]
     pub fn push(&mut self, record: &[u8], key: TemplateKey) {
         let offset = self.data.len() as u64;
-        let record_len = record.len() as u32;
+        let record_len = u32::try_from(record.len()).expect("record length exceeds u32::MAX");
 
         // Write inline header using manual byte operations (avoids alignment issues)
         let header = TemplateInlineHeader { key, record_len, padding: 0 };
@@ -663,6 +673,7 @@ impl TemplateRecordBuffer {
     /// Get record bytes by reference.
     #[inline]
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn get_record(&self, r: &TemplateRecordRef) -> &[u8] {
         let start = r.offset as usize + TEMPLATE_HEADER_SIZE;
         let end = start + r.len as usize;
@@ -773,21 +784,21 @@ pub fn radix_sort_record_refs(refs: &mut [RecordRef]) {
 
         // Count occurrences of each byte value
         let mut counts = [0usize; 256];
-        for r in src_slice.iter() {
+        for r in src_slice {
             let byte = ((r.sort_key >> (byte_idx * 8)) & 0xFF) as usize;
             counts[byte] += 1;
         }
 
         // Convert to cumulative offsets
         let mut total = 0;
-        for count in counts.iter_mut() {
+        for count in &mut counts {
             let c = *count;
             *count = total;
             total += c;
         }
 
         // Scatter elements to destination (stable - preserves order within buckets)
-        for r in src_slice.iter() {
+        for r in src_slice {
             let byte = ((r.sort_key >> (byte_idx * 8)) & 0xFF) as usize;
             let dest_idx = counts[byte];
             counts[byte] += 1;
@@ -853,19 +864,19 @@ pub fn parallel_radix_sort_record_refs(refs: &mut [RecordRef]) {
 fn merge_sorted_chunks(refs: &mut [RecordRef], chunk_ranges: &[std::ops::Range<usize>]) {
     use crate::sort::radix::{heap_make, heap_sift_down};
 
-    if chunk_ranges.len() <= 1 {
-        return;
-    }
-
-    let n = refs.len();
-    let mut result: Vec<RecordRef> = Vec::with_capacity(n);
-
     // Heap entry: (sort_key, chunk_idx, position_in_chunk)
     struct HeapEntry {
         key: u64,
         chunk_idx: usize,
         pos: usize,
     }
+
+    if chunk_ranges.len() <= 1 {
+        return;
+    }
+
+    let n = refs.len();
+    let mut result: Vec<RecordRef> = Vec::with_capacity(n);
 
     // Initialize heap with first element from each chunk
     let mut heap: Vec<HeapEntry> = Vec::with_capacity(chunk_ranges.len());
@@ -1004,14 +1015,14 @@ fn radix_sort_template_field<F>(
 
         // Count occurrences of each byte value
         let mut counts = [0usize; 256];
-        for r in src_slice.iter() {
+        for r in src_slice {
             let byte = ((get_field(r) >> (byte_idx * 8)) & 0xFF) as usize;
             counts[byte] += 1;
         }
 
         // Convert to cumulative offsets
         let mut total = 0;
-        for count in counts.iter_mut() {
+        for count in &mut counts {
             let c = *count;
             *count = total;
             total += c;
@@ -1083,18 +1094,18 @@ fn merge_sorted_template_chunks(
 ) {
     use crate::sort::radix::{heap_make, heap_sift_down};
 
+    struct HeapEntry {
+        key: TemplateKey,
+        chunk_idx: usize,
+        pos: usize,
+    }
+
     if chunk_ranges.len() <= 1 {
         return;
     }
 
     let n = refs.len();
     let mut result: Vec<TemplateRecordRef> = Vec::with_capacity(n);
-
-    struct HeapEntry {
-        key: TemplateKey,
-        chunk_idx: usize,
-        pos: usize,
-    }
 
     let mut heap: Vec<HeapEntry> = Vec::with_capacity(chunk_ranges.len());
     for (chunk_idx, range) in chunk_ranges.iter().enumerate() {
@@ -1226,6 +1237,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_radix_sort_large() {
         // Test with larger array to trigger radix sort (> RADIX_THRESHOLD)
         let mut refs: Vec<RecordRef> = (0..1000)
@@ -1241,7 +1253,7 @@ mod tests {
 
         // Verify sorted
         for (i, r) in refs.iter().enumerate() {
-            assert_eq!(r.sort_key, i as u64, "Expected sort_key {} at index {}", i, i);
+            assert_eq!(r.sort_key, i as u64, "Expected sort_key {i} at index {i}");
         }
     }
 
@@ -1261,6 +1273,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_radix_sort_all_same_keys() {
         // All same keys should maintain original order (stability)
         let mut refs: Vec<RecordRef> = (0..100)
@@ -1272,11 +1285,12 @@ mod tests {
         // Verify all keys are 42 and order is preserved
         for (i, r) in refs.iter().enumerate() {
             assert_eq!(r.sort_key, 42);
-            assert_eq!(r.offset, i as u64 * 100, "Stability violated at index {}", i);
+            assert_eq!(r.offset, i as u64 * 100, "Stability violated at index {i}");
         }
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_radix_sort_all_zero_keys() {
         let mut refs: Vec<RecordRef> = (0..50)
             .map(|i| RecordRef { sort_key: 0, offset: i as u64 * 100, len: 10, padding: 0 })
@@ -1308,6 +1322,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_parallel_radix_sort() {
         // Test parallel sort with enough elements to trigger parallelism
         let mut refs: Vec<RecordRef> = (0..50_000)
@@ -1323,11 +1338,12 @@ mod tests {
 
         // Verify sorted
         for (i, r) in refs.iter().enumerate() {
-            assert_eq!(r.sort_key, i as u64, "Expected sort_key {} at index {}", i, i);
+            assert_eq!(r.sort_key, i as u64, "Expected sort_key {i} at index {i}");
         }
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_parallel_radix_sort_stability() {
         // Test that parallel sort maintains stability for equal keys
         let mut refs: Vec<RecordRef> = (0..20_000)
@@ -1343,15 +1359,16 @@ mod tests {
 
         // Verify sorted and stable within groups
         for i in 1..refs.len() {
-            assert!(refs[i - 1].sort_key <= refs[i].sort_key, "Not sorted at index {}", i);
+            assert!(refs[i - 1].sort_key <= refs[i].sort_key, "Not sorted at index {i}");
             // Within same key group, offsets should be in order
             if refs[i - 1].sort_key == refs[i].sort_key {
-                assert!(refs[i - 1].offset < refs[i].offset, "Stability violated at index {}", i);
+                assert!(refs[i - 1].offset < refs[i].offset, "Stability violated at index {i}");
             }
         }
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_radix_sort_template_refs_stability() {
         // Test that template radix sort is stable for equal keys
         // Create refs with identical TemplateKey but different offsets to track order
@@ -1381,6 +1398,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn test_parallel_radix_sort_template_refs_stability() {
         // Test that parallel template sort maintains stability for equal keys
         // Use groups of records with same key to verify stability within groups
@@ -1415,7 +1433,7 @@ mod tests {
         for i in 1..refs.len() {
             let prev_key = &refs[i - 1].key;
             let curr_key = &refs[i].key;
-            assert!(prev_key <= curr_key, "Not sorted at index {}", i);
+            assert!(prev_key <= curr_key, "Not sorted at index {i}");
             // Within same key group, offsets should be in order (stability)
             if prev_key == curr_key {
                 assert!(
@@ -1477,9 +1495,7 @@ mod tests {
             if let Some(prev) = prev_seq_byte {
                 assert!(
                     prev < seq_byte,
-                    "TemplateRecordBuffer::sort() stability violated: {} should be < {}",
-                    prev,
-                    seq_byte
+                    "TemplateRecordBuffer::sort() stability violated: {prev} should be < {seq_byte}"
                 );
             }
             prev_seq_byte = Some(seq_byte);

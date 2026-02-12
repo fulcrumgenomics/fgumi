@@ -58,12 +58,15 @@ pub struct LibraryLookup {
 impl LibraryLookup {
     /// Build lookup from BAM header.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn from_header(header: &Header) -> Self {
         // Collect all unique library names from read groups
         let mut libraries: Vec<String> = header
             .read_groups()
             .iter()
-            .filter_map(|(_, rg)| rg.other_fields().get(&rg_tag::LIBRARY).map(|lb| lb.to_string()))
+            .filter_map(|(_, rg)| {
+                rg.other_fields().get(&rg_tag::LIBRARY).map(std::string::ToString::to_string)
+            })
             .collect();
 
         // Sort alphabetically and deduplicate
@@ -86,7 +89,7 @@ impl LibraryLookup {
                 let lib = rg
                     .other_fields()
                     .get(&rg_tag::LIBRARY)
-                    .map(|lb| lb.to_string())
+                    .map(std::string::ToString::to_string)
                     .unwrap_or_default();
                 let ordinal = *lib_to_ordinal.get(&lib).unwrap_or(&0);
                 (id.to_vec(), ordinal)
@@ -250,6 +253,14 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
     /// - `compression_level` 0 = uncompressed (fastest, uses most disk).
     /// - `compression_level` > 0 = BGZF compression at specified level.
     /// - `threads` > 1 enables multi-threaded compression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output file cannot be created.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `threads` is greater than 1 but `NonZero::new` receives zero.
     pub fn create(path: &Path, compression_level: u32, threads: usize) -> Result<Self> {
         let file = std::fs::File::create(path)?;
         let buf = BufWriter::with_capacity(256 * 1024, file);
@@ -281,7 +292,12 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
     }
 
     /// Write a keyed record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the underlying writer fails.
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn write_record(&mut self, key: &K, record: &[u8]) -> Result<()> {
         key.write_to(&mut self.writer)?;
         self.writer.write_all(&(record.len() as u32).to_le_bytes())?;
@@ -290,6 +306,10 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
     }
 
     /// Finish writing and flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the writer fails.
     pub fn finish(self) -> Result<()> {
         self.writer.finish()
     }
@@ -307,6 +327,10 @@ pub struct GenericKeyedChunkReader<K: RawSortKey + 'static> {
 impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     /// Open a keyed chunk file for reading with background prefetching.
     /// Auto-detects BGZF/gzip compression via magic bytes (0x1f 0x8b).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened.
     pub fn open(path: &Path) -> Result<Self> {
         let (tx, rx) = bounded(MERGE_PREFETCH_SIZE);
         let path = path.to_path_buf();
@@ -350,6 +374,7 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     }
 
     /// Read records from a reader and send them through the channel.
+    #[allow(clippy::needless_pass_by_value)]
     fn read_records<R: Read>(mut reader: R, tx: crossbeam_channel::Sender<Option<(K, Vec<u8>)>>) {
         loop {
             // Read key using the trait method
@@ -361,7 +386,7 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error reading keyed chunk key: {}", e);
+                    log::error!("Error reading keyed chunk key: {e}");
                     let _ = tx.send(None);
                     break;
                 }
@@ -520,6 +545,12 @@ impl RawExternalSorter {
         temp_path: &Path,
         consolidation_count: &mut usize,
     ) -> Result<()> {
+        struct HeapEntry<K> {
+            key: K,
+            record: Vec<u8>,
+            reader_idx: usize,
+        }
+
         if self.max_temp_files == 0 || chunk_files.len() < self.max_temp_files {
             return Ok(());
         }
@@ -557,12 +588,6 @@ impl RawExternalSorter {
         )?;
 
         // Initialize heap with first record from each reader
-        struct HeapEntry<K> {
-            key: K,
-            record: Vec<u8>,
-            reader_idx: usize,
-        }
-
         let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(readers.len());
         for (reader_idx, reader) in readers.iter_mut().enumerate() {
             if let Some((key, record)) = reader.next_record() {
@@ -627,6 +652,10 @@ impl RawExternalSorter {
     }
 
     /// Sort a BAM file using raw-bytes approach.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, sorting, or writing the BAM file fails.
     pub fn sort(&self, input: &Path, output: &Path) -> Result<RawSortStats> {
         info!("Starting raw-bytes sort with order: {:?}", self.sort_order);
         info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
@@ -675,6 +704,7 @@ impl RawExternalSorter {
     ///
     /// Uses `RecordBuffer` which stores records in a single contiguous allocation
     /// with pre-computed sort keys, eliminating per-record heap allocations.
+    #[allow(clippy::cast_possible_truncation)]
     fn sort_coordinate_optimized(
         &self,
         reader: crate::bam_io::RawBamReaderAuto,
@@ -816,6 +846,7 @@ impl RawExternalSorter {
     /// Similar to `sort_coordinate_optimized` but uses `IndexingBamWriter` to
     /// build the BAI index incrementally during write. Uses single-threaded
     /// compression for accurate virtual position tracking.
+    #[allow(clippy::cast_possible_truncation)]
     fn sort_coordinate_with_index(
         &self,
         reader: crate::bam_io::RawBamReaderAuto,
@@ -1234,13 +1265,6 @@ impl RawExternalSorter {
         header: &Header,
         output: &Path,
     ) -> Result<u64> {
-        let num_disk = chunk_files.len();
-        let has_memory = !memory_keyed.is_empty();
-        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
-
-        // Create output header with sort order tags
-        let output_header = self.create_output_header(header);
-
         /// Source for keyed chunks during merge.
         enum KeyedChunkSource {
             /// Disk-based chunk with prefetching reader.
@@ -1268,6 +1292,23 @@ impl RawExternalSorter {
             }
         }
 
+        /// Heap entry for keyed merge - stores pre-computed key for O(1) comparison.
+        struct KeyedHeapEntry {
+            key: TemplateKey,
+            record: Vec<u8>,
+            chunk_idx: usize,
+        }
+
+        // Output buffer to reduce write syscalls - stores raw bytes directly
+        const OUTPUT_BUFFER_SIZE: usize = 2048;
+
+        let num_disk = chunk_files.len();
+        let has_memory = !memory_keyed.is_empty();
+        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
+
+        // Create output header with sort order tags
+        let output_header = self.create_output_header(header);
+
         // Create unified chunk sources
         let mut sources: Vec<KeyedChunkSource> = Vec::with_capacity(num_disk + 1);
 
@@ -1280,13 +1321,6 @@ impl RawExternalSorter {
         // Add in-memory keyed chunk
         if has_memory {
             sources.push(KeyedChunkSource::Memory { records: memory_keyed, idx: 0 });
-        }
-
-        /// Heap entry for keyed merge - stores pre-computed key for O(1) comparison.
-        struct KeyedHeapEntry {
-            key: TemplateKey,
-            record: Vec<u8>,
-            chunk_idx: usize,
         }
 
         // Initialize heap with first record from each chunk
@@ -1322,9 +1356,6 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
-
-        // Output buffer to reduce write syscalls - stores raw bytes directly
-        const OUTPUT_BUFFER_SIZE: usize = 2048;
         let mut output_buffer: Vec<Vec<u8>> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
 
         // Merge loop using fixed-array heap with O(1) comparisons
@@ -1368,7 +1399,7 @@ impl RawExternalSorter {
 
         writer.finish()?;
 
-        info!("Merge complete: {} records merged", records_merged);
+        info!("Merge complete: {records_merged} records merged");
         Ok(records_merged)
     }
 
@@ -1384,13 +1415,6 @@ impl RawExternalSorter {
         header: &Header,
         output: &Path,
     ) -> Result<u64> {
-        let num_disk = chunk_files.len();
-        let has_memory = !memory_keyed.is_empty();
-        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
-
-        // Create output header with sort order tags
-        let output_header = self.create_output_header(header);
-
         /// Source for keyed chunks during merge.
         enum GenericKeyedChunkSource<K: RawSortKey + Default + 'static> {
             /// Disk-based chunk with prefetching reader.
@@ -1417,6 +1441,23 @@ impl RawExternalSorter {
             }
         }
 
+        /// Heap entry for keyed merge - stores pre-computed key for O(1) comparison.
+        struct GenericKeyedHeapEntry<K> {
+            key: K,
+            record: Vec<u8>,
+            chunk_idx: usize,
+        }
+
+        // Output buffer to reduce write syscalls
+        const OUTPUT_BUFFER_SIZE: usize = 2048;
+
+        let num_disk = chunk_files.len();
+        let has_memory = !memory_keyed.is_empty();
+        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
+
+        // Create output header with sort order tags
+        let output_header = self.create_output_header(header);
+
         // Create unified chunk sources
         let mut sources: Vec<GenericKeyedChunkSource<K>> = Vec::with_capacity(num_disk + 1);
 
@@ -1428,13 +1469,6 @@ impl RawExternalSorter {
         // Add in-memory keyed chunk
         if has_memory {
             sources.push(GenericKeyedChunkSource::Memory { records: memory_keyed, idx: 0 });
-        }
-
-        /// Heap entry for keyed merge - stores pre-computed key for O(1) comparison.
-        struct GenericKeyedHeapEntry<K> {
-            key: K,
-            record: Vec<u8>,
-            chunk_idx: usize,
         }
 
         // Initialize heap with first record from each chunk
@@ -1469,9 +1503,6 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
-
-        // Output buffer to reduce write syscalls
-        const OUTPUT_BUFFER_SIZE: usize = 2048;
         let mut output_buffer: Vec<Vec<u8>> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
 
         // Merge loop using fixed-array heap with key comparisons
@@ -1515,7 +1546,7 @@ impl RawExternalSorter {
 
         writer.finish()?;
 
-        info!("Merge complete: {} records merged", records_merged);
+        info!("Merge complete: {records_merged} records merged");
         Ok(records_merged)
     }
 
@@ -1531,12 +1562,6 @@ impl RawExternalSorter {
         output: &Path,
     ) -> Result<noodles::bam::bai::Index> {
         use crate::bam_io::create_indexing_bam_writer;
-
-        let num_disk = chunk_files.len();
-        let has_memory = !memory_keyed.is_empty();
-        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
-
-        let output_header = self.create_output_header(header);
 
         // Source for keyed chunks during merge
         enum KeyedSource<K: RawSortKey + Default + 'static> {
@@ -1561,6 +1586,19 @@ impl RawExternalSorter {
             }
         }
 
+        // Heap entry for merge
+        struct HeapEntry<K> {
+            key: K,
+            record: Vec<u8>,
+            chunk_idx: usize,
+        }
+
+        let num_disk = chunk_files.len();
+        let has_memory = !memory_keyed.is_empty();
+        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
+
+        let output_header = self.create_output_header(header);
+
         // Create chunk sources
         let mut sources: Vec<KeyedSource<K>> = Vec::with_capacity(num_disk + 1);
         for path in chunk_files {
@@ -1568,13 +1606,6 @@ impl RawExternalSorter {
         }
         if has_memory {
             sources.push(KeyedSource::Memory { records: memory_keyed, idx: 0 });
-        }
-
-        // Heap entry for merge
-        struct HeapEntry<K> {
-            key: K,
-            record: Vec<u8>,
-            chunk_idx: usize,
         }
 
         // Initialize heap
@@ -1637,7 +1668,7 @@ impl RawExternalSorter {
         }
 
         let index = writer.finish()?;
-        info!("Merge complete: {} records merged", records_merged);
+        info!("Merge complete: {records_merged} records merged");
         Ok(index)
     }
 
@@ -1761,8 +1792,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
         if is_paired && !mate_unmapped {
             // Unmapped read with mapped mate - use mate's position as primary key
             let mate_unclipped = find_mc_tag_in_record(bam_bytes)
-                .map(|mc| mate_unclipped_5prime(mate_pos, mate_reverse, mc))
-                .unwrap_or(mate_pos);
+                .map_or(mate_pos, |mc| mate_unclipped_5prime(mate_pos, mate_reverse, mc));
 
             return TemplateKey::new(
                 mate_tid,
@@ -1790,8 +1820,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
     // Calculate mate's unclipped 5' position
     let mate_unclipped = if is_paired && !mate_unmapped {
         find_mc_tag_in_record(bam_bytes)
-            .map(|mc| mate_unclipped_5prime(mate_pos, mate_reverse, mc))
-            .unwrap_or(mate_pos)
+            .map_or(mate_pos, |mc| mate_unclipped_5prime(mate_pos, mate_reverse, mc))
     } else {
         mate_pos
     };

@@ -76,6 +76,10 @@ impl InsertSizeModel {
     /// # Returns
     ///
     /// An insert size clamped to [min, max].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mean and stddev produce invalid log-normal parameters.
     pub fn sample(&self, rng: &mut impl Rng) -> usize {
         // Convert mean/stddev to log-normal parameters
         // For log-normal: E[X] = exp(mu + sigma^2/2), Var[X] = (exp(sigma^2) - 1) * exp(2*mu + sigma^2)

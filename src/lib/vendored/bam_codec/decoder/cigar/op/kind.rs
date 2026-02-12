@@ -19,6 +19,7 @@ impl fmt::Display for DecodeError {
     }
 }
 
+#[expect(clippy::cast_possible_truncation, reason = "n is masked to 0..=15")]
 pub(super) fn decode_kind(n: u32) -> Result<Kind, DecodeError> {
     match n & 0x0f {
         0 => Ok(Kind::Match),

@@ -76,6 +76,7 @@ impl EpsilonGreedyScheduler {
     }
 
     /// Get success rate for a step.
+    #[allow(clippy::cast_precision_loss)]
     fn success_rate(&self, step_idx: usize) -> f64 {
         if self.attempts[step_idx] == 0 {
             0.5 // Neutral prior for unexplored steps

@@ -1,4 +1,4 @@
-use crate::fields::{l_seq, seq_offset, qual_offset};
+use crate::fields::{l_seq, qual_offset, seq_offset};
 
 /// BAM 4-bit base encoding -> ASCII lookup table.
 ///
