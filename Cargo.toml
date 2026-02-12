@@ -46,7 +46,7 @@ libdeflater = "1.22"
 serde = { version = "1.0.228", features = ["derive"] }
 itertools = "0.14.0"
 indexmap = "2"
-rand = "0.9"
+rand = "0.10"
 csv = "1.1"
 memchr = "2"
 murmur3 = "0.5"
@@ -60,7 +60,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 noodles-csi = "0.53.0"
 bgzf = "0.3.0"
 wide = "1.1"
-rand_distr = "0.5"
+rand_distr = "0.6"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
 noodles-raw-bam = { path = "crates/noodles-raw-bam", features = ["noodles"] }
