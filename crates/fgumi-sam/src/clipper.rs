@@ -1067,7 +1067,6 @@ impl SamRecordClipper {
         let mut leading_hard = 0;
         let mut leading_soft = 0;
         let mut trailing_soft = 0;
-        let mut _trailing_hard = 0;
 
         // Count leading clips
         for op in &ops {
@@ -1081,10 +1080,10 @@ impl SamRecordClipper {
             }
         }
 
-        // Count trailing clips (from the end)
+        // Count trailing soft clips (from the end)
         for op in ops.iter().rev() {
             match op.kind() {
-                Kind::HardClip => _trailing_hard += op.len(),
+                Kind::HardClip => {}
                 Kind::SoftClip => {
                     trailing_soft += op.len();
                     break;
