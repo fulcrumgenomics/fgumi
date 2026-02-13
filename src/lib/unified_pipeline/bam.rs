@@ -111,7 +111,7 @@ impl BoundaryState {
         }
 
         // Check magic
-        if &data[0..4] != b"BAM\x01" {
+        if &data[0..4] != bam_fields::BAM_MAGIC {
             // Not a valid BAM file, but let's not error here
             // Just return 0 so records start immediately
             return Some(0);

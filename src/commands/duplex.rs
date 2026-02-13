@@ -16,15 +16,13 @@ use fgumi_lib::bam_io::{
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
-    ThreadingOptions,
+    ThreadingOptions, build_pipeline_config,
 };
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
 };
 use crossbeam_queue::SegQueue;
-use fgumi_lib::consensus_caller::{
-    ConsensusCaller, ConsensusCallingStats, ConsensusOutput, make_prefix_from_header,
-};
+use fgumi_lib::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 use fgumi_lib::duplex_consensus_caller::DuplexConsensusCaller;
 use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
 use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
@@ -37,7 +35,7 @@ use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::sort::bam_fields;
 use fgumi_lib::umi::extract_mi_base;
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use fgumi_lib::validation::{optional_string_to_tag, validate_file_exists};
 use fgumi_lib::vendored::RawRecord;
@@ -297,11 +295,7 @@ impl Command for Duplex {
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Use library name from header if no prefix is specified (like fgbio)
-        let read_name_prefix = self
-            .read_group
-            .read_name_prefix
-            .clone()
-            .unwrap_or_else(|| make_prefix_from_header(&header));
+        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
         // Parse cell_tag if provided
         let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
@@ -533,21 +527,12 @@ impl Duplex {
         )?;
 
         // Configure pipeline
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
-        }
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedDuplexMetrics>> = Arc::new(SegQueue::new());

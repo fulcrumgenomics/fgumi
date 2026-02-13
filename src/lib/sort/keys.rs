@@ -31,6 +31,7 @@ use crate::read_info::LibraryIndex;
 use crate::sam::record_utils::{
     mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
 };
+use crate::sort::bam_fields;
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use std::io::{Read, Write};
 
@@ -457,15 +458,9 @@ impl RawSortKey for RawCoordinateKey {
 
     #[inline]
     fn extract(bam: &[u8], ctx: &SortContext) -> Self {
-        // BAM format offsets (all little-endian):
-        // 0-3: tid (i32)
-        // 4-7: pos (i32)
-        // 14-15: flags (u16)
-
-        let tid = i32::from_le_bytes([bam[0], bam[1], bam[2], bam[3]]);
-        let pos = i32::from_le_bytes([bam[4], bam[5], bam[6], bam[7]]);
-        let flags = u16::from_le_bytes([bam[14], bam[15]]);
-        let reverse = (flags & 0x10) != 0;
+        let tid = bam_fields::ref_id(bam);
+        let pos = bam_fields::pos(bam);
+        let reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
 
         // Create key based on tid (samtools behavior):
         // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set

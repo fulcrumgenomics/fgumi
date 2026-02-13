@@ -56,8 +56,7 @@ use fgumi_lib::metrics::correct::UmiCorrectionMetrics;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::template::{TemplateBatch, TemplateIterator};
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
+    Grouper, MemoryEstimate, run_bam_pipeline_from_reader, serialize_bam_records_into,
 };
 use fgumi_lib::validation::validate_file_exists;
 use log::{info, warn};
@@ -75,7 +74,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions,
+    ThreadingOptions, build_pipeline_config,
 };
 
 /// Result of matching an observed UMI to an expected UMI.
@@ -876,21 +875,12 @@ impl CorrectUmis {
         track_rejects: bool,
     ) -> Result<u64> {
         // Configure pipeline - correct is ReaderHeavy (70% in decompression)
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
-        }
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
 
         // Enable raw-byte mode (correct uses TemplateGrouper, no cell tag needed)
         {

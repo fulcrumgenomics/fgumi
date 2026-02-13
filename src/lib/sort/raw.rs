@@ -1742,7 +1742,8 @@ impl RawExternalSorter {
 /// heap allocations for the read name by using a hash instead.
 #[must_use]
 pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup) -> TemplateKey {
-    use crate::sort::bam_fields::{
+    use crate::sort::bam_fields;
+    use bam_fields::{
         find_mc_tag_in_record, find_mi_tag_in_record, flags, get_cigar_ops, mate_unclipped_5prime,
         unclipped_5prime,
     };
@@ -1754,12 +1755,12 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
     let library = lib_lookup.get_ordinal(bam_bytes);
 
     // Extract fields from raw bytes
-    let tid = i32::from_le_bytes([bam_bytes[0], bam_bytes[1], bam_bytes[2], bam_bytes[3]]);
-    let pos = i32::from_le_bytes([bam_bytes[4], bam_bytes[5], bam_bytes[6], bam_bytes[7]]);
-    let l_read_name = bam_bytes[8] as usize;
-    let flag = u16::from_le_bytes([bam_bytes[14], bam_bytes[15]]);
-    let mate_tid = i32::from_le_bytes([bam_bytes[20], bam_bytes[21], bam_bytes[22], bam_bytes[23]]);
-    let mate_pos = i32::from_le_bytes([bam_bytes[24], bam_bytes[25], bam_bytes[26], bam_bytes[27]]);
+    let tid = bam_fields::ref_id(bam_bytes);
+    let pos = bam_fields::pos(bam_bytes);
+    let l_read_name = bam_fields::l_read_name(bam_bytes) as usize;
+    let flag = bam_fields::flags(bam_bytes);
+    let mate_tid = bam_fields::mate_ref_id(bam_bytes);
+    let mate_pos = bam_fields::mate_pos(bam_bytes);
 
     // Extract flags
     let is_unmapped = (flag & flags::UNMAPPED) != 0;

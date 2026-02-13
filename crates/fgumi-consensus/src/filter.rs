@@ -1024,10 +1024,10 @@ pub fn filter_duplex_read_raw(
 /// Returns (`no_call_count`, `mean_base_quality`).
 ///
 /// # Panics
-/// Panics if the record is shorter than `MIN_BAM_HEADER_LEN` (36 bytes).
+/// Panics if the record is shorter than `MIN_BAM_RECORD_LEN` (36 bytes).
 #[must_use]
 pub fn compute_read_stats_raw(bam: &[u8]) -> (usize, f64) {
-    assert!(bam.len() >= bam_fields::MIN_BAM_HEADER_LEN, "BAM record too short");
+    assert!(bam.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(bam);
     let qual_off = bam_fields::qual_offset(bam);
     let len = bam_fields::l_seq(bam) as usize;
@@ -1090,7 +1090,7 @@ pub fn mask_bases_raw(
     thresholds: &FilterThresholds,
     min_base_quality: Option<u8>,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_HEADER_LEN, "BAM record too short");
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
     let len = bam_fields::l_seq(record) as usize;
@@ -1145,7 +1145,7 @@ pub fn mask_duplex_bases_raw(
     min_base_quality: Option<u8>,
     require_ss_agreement: bool,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_HEADER_LEN, "BAM record too short");
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
     let len = bam_fields::l_seq(record) as usize;

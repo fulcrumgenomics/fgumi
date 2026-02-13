@@ -253,11 +253,11 @@ pub fn regenerate_alignment_tags_raw(
     header: &Header,
     reference: &impl ReferenceProvider,
 ) -> Result<bool> {
-    if record.len() < noodles_raw_bam::MIN_BAM_HEADER_LEN {
+    if record.len() < noodles_raw_bam::MIN_BAM_RECORD_LEN {
         anyhow::bail!(
             "BAM record too short ({} bytes, minimum {})",
             record.len(),
-            noodles_raw_bam::MIN_BAM_HEADER_LEN
+            noodles_raw_bam::MIN_BAM_RECORD_LEN
         );
     }
     let flg = noodles_raw_bam::flags(record);
@@ -934,7 +934,7 @@ mod tests {
         let (_fasta, reference) = create_test_reference()?;
         let header = create_test_header();
 
-        // Record shorter than MIN_BAM_HEADER_LEN (36 bytes)
+        // Record shorter than MIN_BAM_RECORD_LEN (36 bytes)
         let mut too_short = vec![0u8; 10];
         let result = regenerate_alignment_tags_raw(&mut too_short, &header, &reference);
         assert!(result.is_err());

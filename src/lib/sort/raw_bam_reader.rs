@@ -32,8 +32,7 @@ use std::io::{self, BufReader, Read};
 /// Number of BGZF blocks to read per batch.
 const BLOCKS_PER_BATCH: usize = 64;
 
-/// BAM magic bytes (appears in decompressed data, not raw file).
-const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
+use noodles_raw_bam::BAM_MAGIC;
 
 /// A raw BAM record reader that reads directly from BGZF blocks.
 ///
@@ -380,7 +379,7 @@ mod tests {
         let mut raw_bam = Vec::new();
 
         // Magic
-        raw_bam.extend_from_slice(b"BAM\x01");
+        raw_bam.extend_from_slice(BAM_MAGIC);
 
         // Header text
         let text_bytes = header_text.as_bytes();

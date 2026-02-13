@@ -20,8 +20,7 @@ use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::reference::ReferenceReader;
 use fgumi_lib::template::{TemplateBatch, TemplateIterator};
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
+    Grouper, MemoryEstimate, run_bam_pipeline_from_reader, serialize_bam_records_into,
 };
 use fgumi_lib::validation::validate_file_exists;
 use log::info;
@@ -38,6 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::command::Command;
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+    build_pipeline_config,
 };
 
 /// Clips reads in a BAM file to remove overlaps
@@ -682,21 +682,12 @@ impl Clip {
         reference: Arc<ReferenceReader>,
     ) -> Result<u64> {
         // Configure pipeline - clip is writer-heavy workload
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
-        }
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
+        let pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedClipMetrics>> = Arc::new(SegQueue::new());
