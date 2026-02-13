@@ -27,5 +27,5 @@ pub use fgumi_sam::record_utils::{
     is_fr_pair_from_tags, leading_clipping, leading_soft_clipping, mate_unclipped_end,
     mate_unclipped_start, num_bases_extending_past_mate, parse_cigar_string, read_pos_at_ref_pos,
     reference_length, trailing_clipping, trailing_soft_clipping, unclipped_end,
-    unclipped_five_prime_position, unclipped_start,
+    unclipped_five_prime_position, unclipped_start, unclipped_three_prime_position,
 };

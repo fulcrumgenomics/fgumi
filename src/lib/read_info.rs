@@ -21,6 +21,7 @@ use bstr::ByteSlice;
 
 use crate::sam::record_utils::{
     mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
+    unclipped_three_prime_position,
 };
 use crate::template::Template;
 use crate::unified_pipeline::GroupKey;
@@ -228,6 +229,7 @@ pub fn compute_group_key(
     record: &sam::alignment::RecordBuf,
     library_index: &LibraryIndex,
     cell_tag: Option<Tag>,
+    single_end_three_prime: bool,
 ) -> GroupKey {
     // Extract name hash
     let name_hash = LibraryIndex::hash_name(record.name().map(AsRef::as_ref));
@@ -267,6 +269,23 @@ pub fn compute_group_key(
     // Check if paired and has mate info
     let is_paired = flags.is_segmented();
     if !is_paired {
+        if single_end_three_prime {
+            // For single-end reads, use both 5' and 3' positions to distinguish
+            // reads of different lengths at the same start position.
+            let pos_3prime = get_unclipped_three_prime_position_for_groupkey(record);
+            // Use paired constructor with 5' and 3' positions (same ref, same strand)
+            return GroupKey::paired(
+                ref_id,
+                pos,
+                strand,
+                ref_id,
+                pos_3prime,
+                strand,
+                library_idx,
+                cell_hash,
+                name_hash,
+            );
+        }
         return GroupKey::single(ref_id, pos, strand, library_idx, cell_hash, name_hash);
     }
 
@@ -314,6 +333,19 @@ fn get_unclipped_position_for_groupkey(record: &sam::alignment::RecordBuf) -> i3
         return 0;
     }
     unclipped_five_prime_position(record).map_or(i32::MAX, |pos| pos as i32)
+}
+
+/// Get unclipped 3' position for `GroupKey` computation.
+///
+/// Returns 0 for unmapped reads. Returns `i32::MAX` for malformed mapped reads
+/// (those missing alignment data) to avoid incorrectly grouping them at position 0.
+/// Used for single-end read grouping where both 5' and 3' positions matter.
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn get_unclipped_three_prime_position_for_groupkey(record: &sam::alignment::RecordBuf) -> i32 {
+    if record.flags().is_unmapped() {
+        return 0;
+    }
+    unclipped_three_prime_position(record).map_or(i32::MAX, |pos| pos as i32)
 }
 
 /// Information about read positions needed for grouping and ordering.
