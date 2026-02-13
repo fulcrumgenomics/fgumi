@@ -45,8 +45,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fgumi_lib::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer,
-    create_optional_bam_writer,
+    create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer,
 };
 use fgumi_lib::bitenc::BitEnc;
 use fgumi_lib::dna::reverse_complement_str;
@@ -54,18 +53,16 @@ use fgumi_lib::grouper::TemplateGrouper;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::metrics::correct::UmiCorrectionMetrics;
 use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::template::{TemplateBatch, TemplateIterator};
+use fgumi_lib::sort::bam_fields;
+use fgumi_lib::template::TemplateBatch;
 use fgumi_lib::unified_pipeline::{
     BamPipelineConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
 };
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::vendored::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
-use noodles::sam::alignment::io::Write as SamWrite;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
-use noodles::sam::{self, Header};
+use noodles::sam::Header;
 use std::io;
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -300,13 +297,9 @@ struct TemplateCorrection {
 
 /// Result from processing a batch of templates through UMI correction.
 struct CorrectProcessedBatch {
-    /// Records to write (kept records with corrected UMIs).
-    kept_records: Vec<RecordBuf>,
-    /// Rejected records (if tracking rejects).
-    rejected_records: Vec<RecordBuf>,
-    /// Raw-byte kept records (raw-byte mode).
+    /// Kept records with corrected UMIs (raw bytes).
     kept_raw_records: Vec<Vec<u8>>,
-    /// Raw-byte rejected records (raw-byte mode).
+    /// Rejected records (raw bytes, if tracking rejects).
     rejected_raw_records: Vec<Vec<u8>>,
     /// Number of templates processed.
     templates_count: u64,
@@ -322,15 +315,6 @@ struct CorrectProcessedBatch {
 
 impl MemoryEstimate for CorrectProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        let recordbuf_size: usize = self
-            .kept_records
-            .iter()
-            .chain(self.rejected_records.iter())
-            .map(MemoryEstimate::estimate_heap_size)
-            .sum();
-        let recordbuf_vec_overhead = (self.kept_records.capacity()
-            + self.rejected_records.capacity())
-            * std::mem::size_of::<RecordBuf>();
         let raw_size: usize = self
             .kept_raw_records
             .iter()
@@ -340,7 +324,7 @@ impl MemoryEstimate for CorrectProcessedBatch {
         let raw_vec_overhead = (self.kept_raw_records.capacity()
             + self.rejected_raw_records.capacity())
             * std::mem::size_of::<Vec<u8>>();
-        recordbuf_size + recordbuf_vec_overhead + raw_size + raw_vec_overhead
+        raw_size + raw_vec_overhead
     }
 }
 
@@ -357,9 +341,7 @@ struct CollectedCorrectMetrics {
     mismatched: u64,
     /// Per-UMI match counts (for metrics file).
     umi_matches: AHashMap<String, UmiCorrectionMetrics>,
-    /// Rejected records (if tracking).
-    rejects: Vec<RecordBuf>,
-    /// Rejected raw records (if tracking, for raw-byte mode).
+    /// Rejected raw records (if tracking).
     raw_rejects: Vec<Vec<u8>>,
 }
 
@@ -479,6 +461,9 @@ impl CorrectUmis {
     ///
     /// Returns an error if any validation check fails.
     fn validate(&self) -> Result<()> {
+        if self.umi_tag.len() != 2 || !self.umi_tag.is_ascii() {
+            bail!("--umi-tag must be exactly 2 ASCII characters (e.g. 'RX').");
+        }
         if self.umis.is_empty() && self.umi_files.is_empty() {
             bail!("At least one UMI or UMI file must be provided.");
         }
@@ -557,72 +542,6 @@ impl CorrectUmis {
             }
             warn!("###################################################################");
         }
-    }
-
-    /// Extracts and validates that all records in a template have the same UMI.
-    ///
-    /// Returns:
-    /// - `Some(umi)` if all records have the same UMI
-    /// - `None` if no records have a UMI (all missing)
-    ///
-    /// # Panics
-    ///
-    /// Panics if:
-    /// - Records have different UMIs
-    /// - Some records have UMIs and others don't
-    /// - UMI tag has non-string value
-    fn extract_and_validate_template_umi(records: &[RecordBuf], umi_tag: Tag) -> Option<String> {
-        if records.is_empty() {
-            return None;
-        }
-
-        // Extract UMI from first record
-        let first_umi = records[0].data().get(&umi_tag).map(|v| {
-            if let sam::alignment::record_buf::data::field::Value::String(s) = v {
-                String::from_utf8_lossy(s).to_string()
-            } else {
-                panic!(
-                    "UMI tag {:?} has non-string value in record {:?}",
-                    umi_tag,
-                    records[0].name()
-                );
-            }
-        });
-
-        // Validate all other records have the same UMI
-        for record in &records[1..] {
-            let current_umi = record.data().get(&umi_tag).map(|v| {
-                if let sam::alignment::record_buf::data::field::Value::String(s) = v {
-                    String::from_utf8_lossy(s).to_string()
-                } else {
-                    panic!(
-                        "UMI tag {:?} has non-string value in record {:?}",
-                        umi_tag,
-                        record.name()
-                    );
-                }
-            });
-
-            match (&first_umi, &current_umi) {
-                (Some(first), Some(current)) if first != current => {
-                    panic!(
-                        "Template {:?} has mismatched UMIs: first={:?}, current={:?}",
-                        records[0].name(),
-                        first,
-                        current
-                    );
-                }
-                (Some(_), None) | (None, Some(_)) => {
-                    panic!(
-                        "Template {:?} has inconsistent UMI presence across records",
-                        records[0].name()
-                    );
-                }
-                _ => {} // Both None or both Some with matching values
-            }
-        }
-
-        first_umi
     }
 
     /// Compute UMI correction for a template (called once per template).
@@ -719,44 +638,11 @@ impl CorrectUmis {
         }
     }
 
-    /// Apply a computed correction to a record.
-    fn apply_correction_to_record(
-        mut record: RecordBuf,
-        correction: &TemplateCorrection,
-        umi_tag: Tag,
-        dont_store_original_umis: bool,
-    ) -> RecordBuf {
-        if correction.needs_correction {
-            // Store original UMI if there were actual mismatches
-            if !dont_store_original_umis && correction.has_mismatches {
-                record.data_mut().insert(
-                    Tag::ORIGINAL_UMI_BARCODE_SEQUENCE,
-                    sam::alignment::record_buf::data::field::Value::String(
-                        correction.original_umi.clone().into(),
-                    ),
-                );
-            }
-
-            // Write corrected UMI
-            if let Some(ref corrected) = correction.corrected_umi {
-                record.data_mut().insert(
-                    umi_tag,
-                    sam::alignment::record_buf::data::field::Value::String(
-                        corrected.clone().into(),
-                    ),
-                );
-            }
-        }
-        record
-    }
-
     /// Extract and validate UMI from raw-byte records in a template.
     fn extract_and_validate_template_umi_raw(
         raw_records: &[Vec<u8>],
         umi_tag: [u8; 2],
     ) -> Option<String> {
-        use fgumi_lib::sort::bam_fields;
-
         if raw_records.is_empty() {
             return None;
         }
@@ -811,8 +697,6 @@ impl CorrectUmis {
         umi_tag: [u8; 2],
         dont_store_original_umis: bool,
     ) {
-        use fgumi_lib::sort::bam_fields;
-
         if correction.needs_correction {
             // Write corrected UMI first (in-place update avoids scanning past OX)
             if let Some(ref corrected) = correction.corrected_umi {
@@ -913,7 +797,7 @@ impl CorrectUmis {
         const BATCH_SIZE: usize = 1000; // Templates per batch
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
-        let umi_tag = Tag::new(self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]);
+        let umi_tag_bytes: [u8; 2] = [self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]];
         let revcomp = self.revcomp;
         let cache_size = self.cache_size;
         let dont_store_original_umis = self.dont_store_original_umis;
@@ -948,8 +832,6 @@ impl CorrectUmis {
                     *cache_ref = Some(LruCache::new(NonZero::new(cache_size).unwrap()));
                 }
 
-                let mut kept_records = Vec::new();
-                let mut rejected_records = Vec::new();
                 let mut kept_raw_records = Vec::new();
                 let mut rejected_raw_records: Vec<Vec<u8>> = Vec::new();
                 let mut missing_umis = 0u64;
@@ -959,24 +841,77 @@ impl CorrectUmis {
                 let templates_count = batch.len() as u64;
                 // Count ALL input records for progress tracking (not just kept/rejected)
                 let mut total_input_records = 0u64;
-                let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
 
                 for template in batch {
                     // Count input records BEFORE processing
                     total_input_records += template.read_count() as u64;
 
-                    if template.is_raw_byte_mode() {
-                        // Raw-byte mode - take ownership to avoid deep clone
-                        let raw_records = template.into_raw_records().unwrap_or_default();
-                        let umi_opt = Self::extract_and_validate_template_umi_raw(
-                            &raw_records,
-                            umi_tag_bytes,
-                        );
+                    let raw_records = template.into_raw_records().unwrap_or_default();
+                    let umi_opt =
+                        Self::extract_and_validate_template_umi_raw(&raw_records, umi_tag_bytes);
 
-                        match umi_opt {
-                            None => {
-                                let num_records = raw_records.len() as u64;
-                                missing_umis += num_records;
+                    match umi_opt {
+                        None => {
+                            let num_records = raw_records.len() as u64;
+                            missing_umis += num_records;
+                            let entry = umi_matches_map
+                                .entry(unmatched_umi_for_process.clone())
+                                .or_insert_with(|| {
+                                    UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
+                                });
+                            entry.total_matches += num_records;
+                            if track_rejects {
+                                rejected_raw_records.extend(raw_records);
+                            }
+                        }
+                        Some(umi) => {
+                            let correction = Self::compute_template_correction(
+                                &umi,
+                                umi_length,
+                                revcomp,
+                                max_mismatches,
+                                min_distance_diff,
+                                &encoded_umi_set,
+                                &mut cache_ref,
+                            );
+                            let num_records = raw_records.len() as u64;
+
+                            if correction.matched {
+                                for m in &correction.matches {
+                                    if m.matched {
+                                        let entry =
+                                            umi_matches_map.entry(m.umi.clone()).or_insert_with(
+                                                || UmiCorrectionMetrics::new(m.umi.clone()),
+                                            );
+                                        entry.total_matches += num_records;
+                                        match m.mismatches {
+                                            0 => entry.perfect_matches += num_records,
+                                            1 => entry.one_mismatch_matches += num_records,
+                                            2 => entry.two_mismatch_matches += num_records,
+                                            _ => entry.other_matches += num_records,
+                                        }
+                                    }
+                                }
+
+                                for mut raw in raw_records {
+                                    Self::apply_correction_to_raw(
+                                        &mut raw,
+                                        &correction,
+                                        umi_tag_bytes,
+                                        dont_store_original_umis,
+                                    );
+                                    kept_raw_records.push(raw);
+                                }
+                            } else {
+                                match correction.rejection_reason {
+                                    RejectionReason::WrongLength => {
+                                        wrong_length += num_records;
+                                    }
+                                    RejectionReason::Mismatched => {
+                                        mismatched += num_records;
+                                    }
+                                    RejectionReason::None => {}
+                                }
                                 let entry = umi_matches_map
                                     .entry(unmatched_umi_for_process.clone())
                                     .or_insert_with(|| {
@@ -985,150 +920,6 @@ impl CorrectUmis {
                                 entry.total_matches += num_records;
                                 if track_rejects {
                                     rejected_raw_records.extend(raw_records);
-                                }
-                            }
-                            Some(umi) => {
-                                let correction = Self::compute_template_correction(
-                                    &umi,
-                                    umi_length,
-                                    revcomp,
-                                    max_mismatches,
-                                    min_distance_diff,
-                                    &encoded_umi_set,
-                                    &mut cache_ref,
-                                );
-                                let num_records = raw_records.len() as u64;
-
-                                if correction.matched {
-                                    for m in &correction.matches {
-                                        if m.matched {
-                                            let entry = umi_matches_map
-                                                .entry(m.umi.clone())
-                                                .or_insert_with(|| {
-                                                    UmiCorrectionMetrics::new(m.umi.clone())
-                                                });
-                                            entry.total_matches += num_records;
-                                            match m.mismatches {
-                                                0 => entry.perfect_matches += num_records,
-                                                1 => entry.one_mismatch_matches += num_records,
-                                                2 => entry.two_mismatch_matches += num_records,
-                                                _ => entry.other_matches += num_records,
-                                            }
-                                        }
-                                    }
-
-                                    for mut raw in raw_records {
-                                        Self::apply_correction_to_raw(
-                                            &mut raw,
-                                            &correction,
-                                            umi_tag_bytes,
-                                            dont_store_original_umis,
-                                        );
-                                        kept_raw_records.push(raw);
-                                    }
-                                } else {
-                                    match correction.rejection_reason {
-                                        RejectionReason::WrongLength => {
-                                            wrong_length += num_records;
-                                        }
-                                        RejectionReason::Mismatched => {
-                                            mismatched += num_records;
-                                        }
-                                        RejectionReason::None => {}
-                                    }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
-                                    if track_rejects {
-                                        rejected_raw_records.extend(raw_records);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // RecordBuf mode
-                        let records: Vec<RecordBuf> = template.into_records();
-                        let umi_opt = Self::extract_and_validate_template_umi(&records, umi_tag);
-
-                        match umi_opt {
-                            None => {
-                                let num_records = records.len() as u64;
-                                missing_umis += num_records;
-                                let entry = umi_matches_map
-                                    .entry(unmatched_umi_for_process.clone())
-                                    .or_insert_with(|| {
-                                        UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
-                                    });
-                                entry.total_matches += num_records;
-                                if track_rejects {
-                                    rejected_records.extend(records);
-                                }
-                            }
-                            Some(umi) => {
-                                let correction = Self::compute_template_correction(
-                                    &umi,
-                                    umi_length,
-                                    revcomp,
-                                    max_mismatches,
-                                    min_distance_diff,
-                                    &encoded_umi_set,
-                                    &mut cache_ref,
-                                );
-                                let num_records = records.len() as u64;
-
-                                if correction.matched {
-                                    for m in &correction.matches {
-                                        if m.matched {
-                                            let entry = umi_matches_map
-                                                .entry(m.umi.clone())
-                                                .or_insert_with(|| {
-                                                    UmiCorrectionMetrics::new(m.umi.clone())
-                                                });
-                                            entry.total_matches += num_records;
-                                            match m.mismatches {
-                                                0 => entry.perfect_matches += num_records,
-                                                1 => entry.one_mismatch_matches += num_records,
-                                                2 => entry.two_mismatch_matches += num_records,
-                                                _ => entry.other_matches += num_records,
-                                            }
-                                        }
-                                    }
-
-                                    for record in records {
-                                        let corrected = Self::apply_correction_to_record(
-                                            record,
-                                            &correction,
-                                            umi_tag,
-                                            dont_store_original_umis,
-                                        );
-                                        kept_records.push(corrected);
-                                    }
-                                } else {
-                                    match correction.rejection_reason {
-                                        RejectionReason::WrongLength => {
-                                            wrong_length += num_records;
-                                        }
-                                        RejectionReason::Mismatched => {
-                                            mismatched += num_records;
-                                        }
-                                        RejectionReason::None => {}
-                                    }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
-                                    if track_rejects {
-                                        rejected_records.extend(records);
-                                    }
                                 }
                             }
                         }
@@ -1142,8 +933,6 @@ impl CorrectUmis {
                 }
 
                 Ok(CorrectProcessedBatch {
-                    kept_records,
-                    rejected_records,
                     kept_raw_records,
                     rejected_raw_records,
                     templates_count,
@@ -1157,7 +946,7 @@ impl CorrectUmis {
 
         // Serialize function: convert records to bytes and collect metrics
         let serialize_fn = move |processed: CorrectProcessedBatch,
-                                 header: &Header,
+                                 _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
             // Push metrics to lock-free queue
@@ -1167,23 +956,15 @@ impl CorrectUmis {
                 wrong_length: processed.wrong_length,
                 mismatched: processed.mismatched,
                 umi_matches: processed.umi_matches,
-                rejects: processed.rejected_records,
                 raw_rejects: processed.rejected_raw_records,
             });
 
-            // Serialize kept records: raw-byte path or RecordBuf path
-            let mut kept_count = 0u64;
-            if !processed.kept_raw_records.is_empty() {
-                for raw in &processed.kept_raw_records {
-                    let block_size = raw.len() as u32;
-                    output.extend_from_slice(&block_size.to_le_bytes());
-                    output.extend_from_slice(raw);
-                    kept_count += 1;
-                }
-            }
-            if !processed.kept_records.is_empty() {
-                kept_count += processed.kept_records.len() as u64;
-                serialize_bam_records_into(&processed.kept_records, header, output)?;
+            // Serialize kept records as raw bytes
+            let kept_count = processed.kept_raw_records.len() as u64;
+            for raw in &processed.kept_raw_records {
+                let block_size = raw.len() as u32;
+                output.extend_from_slice(&block_size.to_le_bytes());
+                output.extend_from_slice(raw);
             }
             // Return KEPT record count (not input count, to avoid double-counting)
             Ok(kept_count)
@@ -1210,7 +991,6 @@ impl CorrectUmis {
         let mut total_wrong_length = 0u64;
         let mut total_mismatched = 0u64;
         let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-        let mut all_rejects: Vec<RecordBuf> = Vec::new();
         let mut all_raw_rejects: Vec<Vec<u8>> = Vec::new();
 
         while let Some(metrics) = collected_metrics.pop() {
@@ -1231,46 +1011,27 @@ impl CorrectUmis {
             }
 
             if track_rejects {
-                all_rejects.extend(metrics.rejects);
                 all_raw_rejects.extend(metrics.raw_rejects);
             }
         }
 
-        // Write rejects file if requested
-        let has_rejects = !all_rejects.is_empty() || !all_raw_rejects.is_empty();
-        if track_rejects && has_rejects {
-            if let Some(rejects_path) = &self.rejects_opts.rejects {
-                let writer_threads = self.threading.num_threads();
-                let mut rejects_writer = create_optional_bam_writer(
-                    Some(rejects_path),
-                    &header_for_rejects,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?
-                .expect("rejects path is Some");
+        // Write rejects file if requested (always create the file for consistency with
+        // single-threaded path, even if no records were rejected)
+        if let Some(rejects_path) = &self.rejects_opts.rejects {
+            let writer_threads = self.threading.num_threads();
+            let mut rejects_writer = create_raw_bam_writer(
+                rejects_path,
+                &header_for_rejects,
+                writer_threads,
+                self.compression.compression_level,
+            )?;
 
-                // Ensure we never mix RecordBuf and raw rejects in the same run
-                debug_assert!(
-                    all_rejects.is_empty() || all_raw_rejects.is_empty(),
-                    "mixed RecordBuf and raw-byte rejects in same run"
-                );
-
-                // Write RecordBuf rejects
-                for record in &all_rejects {
-                    rejects_writer.write_alignment_record(&header_for_rejects, record)?;
-                }
-                // Write raw-byte rejects
-                for raw in &all_raw_rejects {
-                    use std::io::Write;
-                    let block_size = raw.len() as u32;
-                    rejects_writer.get_mut().write_all(&block_size.to_le_bytes())?;
-                    rejects_writer.get_mut().write_all(raw)?;
-                }
-
-                rejects_writer.finish(&header_for_rejects)?;
-                let total_reject_records = all_rejects.len() + all_raw_rejects.len();
-                info!("Wrote {total_reject_records} rejected records to rejects file");
+            for raw in &all_raw_rejects {
+                rejects_writer.write_raw_record(raw)?;
             }
+
+            rejects_writer.finish()?;
+            info!("Wrote {} rejected records to rejects file", all_raw_rejects.len());
         }
 
         // Ensure ALL UMI rows are present (even with zero counts) - matches fgbio behavior
@@ -1333,20 +1094,22 @@ impl CorrectUmis {
     ) -> Result<u64> {
         info!("Using single-threaded mode with template-level UMI correction");
 
-        // Open input BAM reader and create template iterator
-        let (mut bam_reader, _) = create_bam_reader(&self.io.input, 1)?;
-        let record_iter = bam_reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-        let template_iter = TemplateIterator::new(record_iter);
+        // Open raw BAM reader
+        let (mut reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
 
         // Open output writer (single-threaded)
         let mut writer =
-            create_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
-        let mut reject_writer = create_optional_bam_writer(
-            self.rejects_opts.rejects.as_ref(),
-            &header,
-            1,
-            self.compression.compression_level,
-        )?;
+            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
+        let mut reject_writer = if let Some(rejects_path) = &self.rejects_opts.rejects {
+            Some(create_raw_bam_writer(
+                rejects_path,
+                &header,
+                1,
+                self.compression.compression_level,
+            )?)
+        } else {
+            None
+        };
 
         // LRU cache (single thread, no thread_local needed)
         let mut cache: Option<LruCache<Vec<u8>, UmiMatch>> = if self.cache_size > 0 {
@@ -1372,102 +1135,126 @@ impl CorrectUmis {
         let mut mismatched = 0u64;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        let umi_tag = Tag::new(self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]);
+        let umi_tag_bytes: [u8; 2] = [self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]];
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
         let revcomp = self.revcomp;
         let dont_store_original_umis = self.dont_store_original_umis;
 
-        // Process templates
-        for template_result in template_iter {
-            let template = template_result?;
-            let records: Vec<RecordBuf> = template.into_records();
-            let num_records = records.len() as u64;
-            total_records += num_records;
-            total_templates += 1;
+        // Process templates using inline name-based grouping
+        let mut name_buf: Vec<Vec<u8>> = Vec::new();
+        let mut current_name: Vec<u8> = Vec::new();
+        let mut raw_record = RawRecord::new();
 
-            // Template-level UMI correction
-            let umi_opt = Self::extract_and_validate_template_umi(&records, umi_tag);
+        loop {
+            let bytes_read = reader.read_record(&mut raw_record)?;
+            let at_eof = bytes_read == 0;
 
-            match umi_opt {
-                None => {
-                    // No UMI in any record - reject all records
-                    missing_umis += num_records;
-                    umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches += num_records;
-                    if track_rejects {
-                        if let Some(ref mut rw) = reject_writer {
-                            for record in records {
-                                rw.write_alignment_record(&header, &record)?;
-                            }
-                        }
-                    }
-                }
-                Some(umi) => {
-                    // Correct UMI once for the template
-                    let correction = Self::compute_template_correction(
-                        &umi,
-                        umi_length,
-                        revcomp,
-                        max_mismatches,
-                        min_distance_diff,
-                        &encoded_umi_set,
-                        &mut cache,
-                    );
+            // Flush the current template if the name changes or we hit EOF
+            let flush = if at_eof {
+                !name_buf.is_empty()
+            } else {
+                let name = bam_fields::read_name(raw_record.as_ref());
+                !name_buf.is_empty() && current_name.as_slice() != name
+            };
 
-                    if correction.matched {
-                        // Update metrics for matched UMIs (count per-read, not per-template)
-                        for m in &correction.matches {
-                            if m.matched {
-                                let entry = umi_metrics.get_mut(&m.umi).unwrap();
-                                entry.total_matches += num_records;
-                                match m.mismatches {
-                                    0 => entry.perfect_matches += num_records,
-                                    1 => entry.one_mismatch_matches += num_records,
-                                    2 => entry.two_mismatch_matches += num_records,
-                                    _ => entry.other_matches += num_records,
-                                }
-                            }
-                        }
+            if flush {
+                let num_records = name_buf.len() as u64;
+                total_records += num_records;
+                total_templates += 1;
 
-                        // Apply correction to all records in template and write
-                        for record in records {
-                            let corrected = Self::apply_correction_to_record(
-                                record,
-                                &correction,
-                                umi_tag,
-                                dont_store_original_umis,
-                            );
-                            writer.write_alignment_record(&header, &corrected)?;
-                        }
-                    } else {
-                        // Rejection - update counters based on reason
-                        match correction.rejection_reason {
-                            RejectionReason::WrongLength => wrong_length += num_records,
-                            RejectionReason::Mismatched => mismatched += num_records,
-                            RejectionReason::None => {}
-                        }
+                // Template-level UMI correction
+                let umi_opt = Self::extract_and_validate_template_umi_raw(&name_buf, umi_tag_bytes);
+
+                match umi_opt {
+                    None => {
+                        missing_umis += num_records;
                         umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches += num_records;
-
                         if track_rejects {
                             if let Some(ref mut rw) = reject_writer {
-                                for record in records {
-                                    rw.write_alignment_record(&header, &record)?;
+                                for raw in &name_buf {
+                                    rw.write_raw_record(raw)?;
+                                }
+                            }
+                        }
+                    }
+                    Some(umi) => {
+                        let correction = Self::compute_template_correction(
+                            &umi,
+                            umi_length,
+                            revcomp,
+                            max_mismatches,
+                            min_distance_diff,
+                            &encoded_umi_set,
+                            &mut cache,
+                        );
+
+                        if correction.matched {
+                            for m in &correction.matches {
+                                if m.matched {
+                                    let entry = umi_metrics.get_mut(&m.umi).unwrap();
+                                    entry.total_matches += num_records;
+                                    match m.mismatches {
+                                        0 => entry.perfect_matches += num_records,
+                                        1 => entry.one_mismatch_matches += num_records,
+                                        2 => entry.two_mismatch_matches += num_records,
+                                        _ => entry.other_matches += num_records,
+                                    }
+                                }
+                            }
+
+                            for mut raw in name_buf.drain(..) {
+                                Self::apply_correction_to_raw(
+                                    &mut raw,
+                                    &correction,
+                                    umi_tag_bytes,
+                                    dont_store_original_umis,
+                                );
+                                writer.write_raw_record(&raw)?;
+                            }
+                        } else {
+                            match correction.rejection_reason {
+                                RejectionReason::WrongLength => wrong_length += num_records,
+                                RejectionReason::Mismatched => mismatched += num_records,
+                                RejectionReason::None => {}
+                            }
+                            umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches +=
+                                num_records;
+
+                            if track_rejects {
+                                if let Some(ref mut rw) = reject_writer {
+                                    for raw in &name_buf {
+                                        rw.write_raw_record(raw)?;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                progress.log_if_needed(num_records);
+                name_buf.clear();
             }
 
-            progress.log_if_needed(num_records);
+            if at_eof {
+                break;
+            }
+
+            // Start new template group if needed
+            if name_buf.is_empty() {
+                current_name.clear();
+                current_name.extend_from_slice(bam_fields::read_name(raw_record.as_ref()));
+            }
+
+            name_buf.push(std::mem::replace(&mut raw_record, RawRecord::new()).into_inner());
         }
 
         progress.log_final();
 
         // Finish writers
-        writer.finish(&header)?;
-        if let Some(ref mut rw) = reject_writer {
-            rw.finish(&header)?;
+        writer.finish()?;
+        if let Some(rw) = reject_writer {
+            rw.finish()?;
         }
 
         // Finalize and write metrics
@@ -1906,16 +1693,17 @@ mod tests {
     /// Returns an error if BAM file creation or writing fails.
     fn create_test_bam(records: Vec<(&str, Option<&str>)>) -> Result<NamedTempFile> {
         use fgumi_lib::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::io::Write as SamWrite;
         use noodles::sam::header::record::value::map::Map;
 
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path().to_path_buf();
 
         // Create a minimal BAM with header
-        let header = sam::Header::builder()
+        let header = noodles::sam::Header::builder()
             .add_reference_sequence(
                 "chr1",
-                Map::<sam::header::record::value::map::ReferenceSequence>::new(
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
                     std::num::NonZero::new(1000).unwrap(),
                 ),
             )
@@ -2301,20 +2089,17 @@ mod tests {
         corrector.execute("test")?;
 
         // Read output and check OX tag
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&output)?;
-        let header = reader.read_header()?;
+        let (mut reader, _header) = create_raw_bam_reader(&output, 1)?;
+        let mut raw = RawRecord::new();
+        while reader.read_record(&mut raw)? > 0 {
+            let name =
+                std::str::from_utf8(bam_fields::read_name(raw.as_ref())).unwrap().to_string();
+            let aux = bam_fields::aux_data_slice(raw.as_ref());
 
-        for result in reader.records() {
-            let record = result?;
-            let record_buf = RecordBuf::try_from_alignment_record(&header, &record)?;
-            let name = record_buf.name().map(std::string::ToString::to_string).unwrap_or_default();
-
-            let ox_tag = Tag::ORIGINAL_UMI_BARCODE_SEQUENCE;
             if name == "exact" {
-                assert!(record_buf.data().get(&ox_tag).is_none());
+                assert!(bam_fields::find_string_tag(aux, b"OX").is_none());
             } else if name == "correctable" {
-                let ox_value = record_buf.data().get(&ox_tag);
-                assert!(ox_value.is_some());
+                assert!(bam_fields::find_string_tag(aux, b"OX").is_some());
             }
         }
 
@@ -2340,13 +2125,11 @@ mod tests {
         };
         corrector2.execute("test")?;
 
-        let mut reader2 = noodles::bam::io::reader::Builder.build_from_path(&output2)?;
-        let header2 = reader2.read_header()?;
-
-        for result in reader2.records() {
-            let record = result?;
-            let record_buf = RecordBuf::try_from_alignment_record(&header2, &record)?;
-            assert!(record_buf.data().get(&Tag::ORIGINAL_UMI_BARCODE_SEQUENCE).is_none());
+        let (mut reader2, _header2) = create_raw_bam_reader(&output2, 1)?;
+        let mut raw2 = RawRecord::new();
+        while reader2.read_record(&mut raw2)? > 0 {
+            let aux = bam_fields::aux_data_slice(raw2.as_ref());
+            assert!(bam_fields::find_string_tag(aux, b"OX").is_none());
         }
 
         Ok(())
@@ -2382,22 +2165,18 @@ mod tests {
         corrector.execute("test")?;
 
         // Read output and verify
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&paths.output)?;
-        let header = reader.read_header()?;
-
-        for result in reader.records() {
-            let record = result?;
-            let record_buf = RecordBuf::try_from_alignment_record(&header, &record)?;
-            let name = record_buf.name().map(std::string::ToString::to_string).unwrap_or_default();
+        let (mut reader, _header) = create_raw_bam_reader(&paths.output, 1)?;
+        let mut raw = RawRecord::new();
+        while reader.read_record(&mut raw)? > 0 {
+            let name =
+                std::str::from_utf8(bam_fields::read_name(raw.as_ref())).unwrap().to_string();
+            let aux = bam_fields::aux_data_slice(raw.as_ref());
 
             if name == "correctable" {
-                let ox_tag = Tag::ORIGINAL_UMI_BARCODE_SEQUENCE;
-                let ox_value = record_buf.data().get(&ox_tag);
+                let ox_value = bam_fields::find_string_tag(aux, b"OX");
                 assert!(ox_value.is_some());
                 // Original should be "TCTTTT" (revcomp of "AAAAGA")
-                if let Some(sam::alignment::record_buf::data::field::Value::String(s)) = ox_value {
-                    assert_eq!(s.to_string(), "TCTTTT");
-                }
+                assert_eq!(ox_value.unwrap(), b"TCTTTT");
             }
         }
 
@@ -2863,51 +2642,76 @@ mod tests {
     // Tests for template-level UMI correction functions
     // ============================================================================
 
-    /// Helper to create a `RecordBuf` with a name and optional RX tag
-    fn create_record_with_umi(name: &str, umi: Option<&str>) -> RecordBuf {
-        use fgumi_lib::sam::builder::RecordBuilder;
-
-        let mut builder = RecordBuilder::new().name(name).sequence("ACGT").qualities(&[40u8; 4]); // 'I' is Phred+33 = 40
-
-        if let Some(umi_seq) = umi {
-            builder = builder.tag("RX", umi_seq);
+    /// Helper to create a raw BAM record with a name and optional RX tag.
+    fn create_raw_record_with_umi(name: &str, umi: Option<&str>) -> Vec<u8> {
+        let mut record = Vec::new();
+        // ref_id = -1 (unmapped)
+        record.extend_from_slice(&(-1i32).to_le_bytes());
+        // pos = -1
+        record.extend_from_slice(&(-1i32).to_le_bytes());
+        // l_read_name (null-terminated)
+        record.push((name.len() + 1) as u8);
+        // mapq = 0
+        record.push(0);
+        // bin = 0
+        record.extend_from_slice(&0u16.to_le_bytes());
+        // n_cigar_op = 0
+        record.extend_from_slice(&0u16.to_le_bytes());
+        // flag = 4 (unmapped)
+        record.extend_from_slice(&4u16.to_le_bytes());
+        // l_seq = 4
+        record.extend_from_slice(&4u32.to_le_bytes());
+        // next_ref_id = -1
+        record.extend_from_slice(&(-1i32).to_le_bytes());
+        // next_pos = -1
+        record.extend_from_slice(&(-1i32).to_le_bytes());
+        // tlen = 0
+        record.extend_from_slice(&0i32.to_le_bytes());
+        // read_name (null-terminated)
+        record.extend_from_slice(name.as_bytes());
+        record.push(0);
+        // cigar: none
+        // seq: ACGT packed (A=1,C=2,G=4,T=8) -> 0x12, 0x48
+        record.extend_from_slice(&[0x12, 0x48]);
+        // qual
+        record.extend_from_slice(&[40, 40, 40, 40]);
+        // aux: RX:Z:value\0 if provided
+        if let Some(umi_val) = umi {
+            record.extend_from_slice(b"RXZ");
+            record.extend_from_slice(umi_val.as_bytes());
+            record.push(0);
         }
-
-        builder.build()
+        record
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_empty() {
-        let records: Vec<RecordBuf> = vec![];
-        let umi_tag = Tag::new(b'R', b'X');
-        let result = CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        let records: Vec<Vec<u8>> = vec![];
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_single_record_with_umi() {
-        let records = vec![create_record_with_umi("read1", Some("AAAAAA"))];
-        let umi_tag = Tag::new(b'R', b'X');
-        let result = CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        let records = vec![create_raw_record_with_umi("read1", Some("AAAAAA"))];
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
         assert_eq!(result, Some("AAAAAA".to_string()));
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_single_record_without_umi() {
-        let records = vec![create_record_with_umi("read1", None)];
-        let umi_tag = Tag::new(b'R', b'X');
-        let result = CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        let records = vec![create_raw_record_with_umi("read1", None)];
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_paired_matching() {
         let records = vec![
-            create_record_with_umi("read1", Some("AAAAAA")),
-            create_record_with_umi("read1", Some("AAAAAA")),
+            create_raw_record_with_umi("read1", Some("AAAAAA")),
+            create_raw_record_with_umi("read1", Some("AAAAAA")),
         ];
-        let umi_tag = Tag::new(b'R', b'X');
-        let result = CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
         assert_eq!(result, Some("AAAAAA".to_string()));
     }
 
@@ -2915,30 +2719,29 @@ mod tests {
     #[should_panic(expected = "mismatched UMIs")]
     fn test_extract_and_validate_template_umi_paired_mismatched() {
         let records = vec![
-            create_record_with_umi("read1", Some("AAAAAA")),
-            create_record_with_umi("read1", Some("CCCCCC")),
+            create_raw_record_with_umi("read1", Some("AAAAAA")),
+            create_raw_record_with_umi("read1", Some("CCCCCC")),
         ];
-        let umi_tag = Tag::new(b'R', b'X');
-        CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
     }
 
     #[test]
     #[should_panic(expected = "inconsistent UMI presence")]
     fn test_extract_and_validate_template_umi_inconsistent_presence() {
         let records = vec![
-            create_record_with_umi("read1", Some("AAAAAA")),
-            create_record_with_umi("read1", None),
+            create_raw_record_with_umi("read1", Some("AAAAAA")),
+            create_raw_record_with_umi("read1", None),
         ];
-        let umi_tag = Tag::new(b'R', b'X');
-        CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_paired_no_umi() {
-        let records =
-            vec![create_record_with_umi("read1", None), create_record_with_umi("read1", None)];
-        let umi_tag = Tag::new(b'R', b'X');
-        let result = CorrectUmis::extract_and_validate_template_umi(&records, umi_tag);
+        let records = vec![
+            create_raw_record_with_umi("read1", None),
+            create_raw_record_with_umi("read1", None),
+        ];
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&records, *b"RX");
         assert!(result.is_none());
     }
 
@@ -3038,109 +2841,6 @@ mod tests {
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA-CCCCCC".to_string()));
         assert!(!correction.needs_correction);
-    }
-
-    #[test]
-    fn test_apply_correction_to_record_no_correction_needed() {
-        let record = create_record_with_umi("read1", Some("AAAAAA"));
-        let correction = TemplateCorrection {
-            matched: true,
-            corrected_umi: Some("AAAAAA".to_string()),
-            original_umi: "AAAAAA".to_string(),
-            needs_correction: false,
-            has_mismatches: false,
-            matches: vec![],
-            rejection_reason: RejectionReason::None,
-        };
-
-        let result = CorrectUmis::apply_correction_to_record(
-            record,
-            &correction,
-            Tag::new(b'R', b'X'),
-            false,
-        );
-
-        // UMI should remain unchanged
-        let rx_tag = Tag::new(b'R', b'X');
-        let umi = result.data().get(&rx_tag);
-        assert!(umi.is_some());
-    }
-
-    #[test]
-    fn test_apply_correction_to_record_with_correction() {
-        let record = create_record_with_umi("read1", Some("AAAAAT"));
-        let correction = TemplateCorrection {
-            matched: true,
-            corrected_umi: Some("AAAAAA".to_string()),
-            original_umi: "AAAAAT".to_string(),
-            needs_correction: true,
-            has_mismatches: true,
-            matches: vec![],
-            rejection_reason: RejectionReason::None,
-        };
-
-        let result = CorrectUmis::apply_correction_to_record(
-            record,
-            &correction,
-            Tag::new(b'R', b'X'),
-            false,
-        );
-
-        // Check RX tag was updated
-        let rx_tag = Tag::new(b'R', b'X');
-        if let Some(sam::alignment::record_buf::data::field::Value::String(s)) =
-            result.data().get(&rx_tag)
-        {
-            assert_eq!(String::from_utf8_lossy(s), "AAAAAA");
-        } else {
-            panic!("RX tag not found or wrong type");
-        }
-
-        // Check OX tag was added
-        let ox_tag = Tag::ORIGINAL_UMI_BARCODE_SEQUENCE;
-        if let Some(sam::alignment::record_buf::data::field::Value::String(s)) =
-            result.data().get(&ox_tag)
-        {
-            assert_eq!(String::from_utf8_lossy(s), "AAAAAT");
-        } else {
-            panic!("OX tag not found or wrong type");
-        }
-    }
-
-    #[test]
-    fn test_apply_correction_to_record_dont_store_original() {
-        let record = create_record_with_umi("read1", Some("AAAAAT"));
-        let correction = TemplateCorrection {
-            matched: true,
-            corrected_umi: Some("AAAAAA".to_string()),
-            original_umi: "AAAAAT".to_string(),
-            needs_correction: true,
-            has_mismatches: true,
-            matches: vec![],
-            rejection_reason: RejectionReason::None,
-        };
-
-        // dont_store_original_umis = true
-        let result = CorrectUmis::apply_correction_to_record(
-            record,
-            &correction,
-            Tag::new(b'R', b'X'),
-            true,
-        );
-
-        // Check RX tag was updated
-        let rx_tag = Tag::new(b'R', b'X');
-        if let Some(sam::alignment::record_buf::data::field::Value::String(s)) =
-            result.data().get(&rx_tag)
-        {
-            assert_eq!(String::from_utf8_lossy(s), "AAAAAA");
-        } else {
-            panic!("RX tag not found or wrong type");
-        }
-
-        // OX tag should NOT be added
-        let ox_tag = Tag::ORIGINAL_UMI_BARCODE_SEQUENCE;
-        assert!(result.data().get(&ox_tag).is_none());
     }
 
     // ============================================================================
