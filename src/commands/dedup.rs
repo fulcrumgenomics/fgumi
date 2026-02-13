@@ -39,8 +39,8 @@ use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_positio
 use fgumi_lib::template::{MoleculeId, Template};
 use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
-    run_bam_pipeline_from_reader, serialize_bam_records_into,
+    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    serialize_bam_records_into,
 };
 use fgumi_lib::validation::{string_to_tag, validate_file_exists, validate_tag};
 use log::info;
@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+    build_pipeline_config,
 };
 use fgumi_lib::sort::PA_TAG;
 use fgumi_lib::sort::bam_fields;
@@ -284,8 +285,8 @@ fn filter_template_raw(
 ) -> bool {
     use fgumi_lib::sort::bam_fields;
 
-    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_HEADER_LEN);
-    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_HEADER_LEN);
+    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
 
     metrics.total_templates += 1;
 
@@ -1160,21 +1161,12 @@ impl Command for MarkDuplicates {
 
         // Configure pipeline
         let num_threads = self.threading.num_threads();
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
-        }
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 

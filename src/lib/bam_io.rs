@@ -128,6 +128,78 @@ impl BgzfWriterEnum {
 /// Type alias for a BAM writer that supports both single and multi-threaded BGZF
 pub type BamWriter = noodles::bam::io::Writer<BgzfWriterEnum>;
 
+/// Create a [`BgzfReaderEnum`] from a file, selecting single- or multi-threaded based on `threads`.
+fn make_bgzf_reader(file: File, threads: usize) -> BgzfReaderEnum {
+    if threads > 1 {
+        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
+        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, file))
+    } else {
+        BgzfReaderEnum::SingleThreaded(BgzfReader::new(file))
+    }
+}
+
+/// Create a [`BgzfWriterEnum`] from a file, selecting single- or multi-threaded based on `threads`.
+#[allow(clippy::cast_possible_truncation)]
+fn make_bgzf_writer(output_file: File, threads: usize, compression_level: u32) -> BgzfWriterEnum {
+    if threads > 1 {
+        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
+        let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
+
+        if let Ok(cl) = CompressionLevel::new(compression_level as u8) {
+            builder = builder.set_compression_level(cl);
+        }
+
+        BgzfWriterEnum::MultiThreaded(builder.build_from_writer(output_file))
+    } else {
+        let level = noodles_bgzf::io::writer::CompressionLevel::new(compression_level as u8)
+            .unwrap_or_default();
+        let writer = noodles_bgzf::io::writer::Builder::default()
+            .set_compression_level(level)
+            .build_from_writer(output_file);
+        BgzfWriterEnum::SingleThreaded(writer)
+    }
+}
+
+/// Write a BAM header (magic, SAM text, reference sequences) to any writer.
+///
+/// Shared implementation used by both [`RawBamWriter`] and [`IndexingBamWriter`].
+///
+/// Note: we use a manual implementation rather than delegating to
+/// `noodles::bam::io::Writer::write_header` because the noodles encoder
+/// produces subtly different output that causes read-back failures with
+/// some writer backends (e.g. `MultithreadedWriter`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
+    // BAM magic
+    writer.write_all(noodles_raw_bam::BAM_MAGIC)?;
+
+    // Header text (SAM header serialized using noodles)
+    let mut sam_writer = noodles::sam::io::Writer::new(Vec::new());
+    sam_writer.write_header(header)?;
+    let header_bytes = sam_writer.into_inner();
+    let l_text = header_bytes.len() as i32;
+    writer.write_all(&l_text.to_le_bytes())?;
+    writer.write_all(&header_bytes)?;
+
+    // Reference sequences
+    let n_ref = header.reference_sequences().len() as i32;
+    writer.write_all(&n_ref.to_le_bytes())?;
+
+    for (name, map) in header.reference_sequences() {
+        // l_name: length of name + null terminator
+        let l_name = (name.len() + 1) as u32;
+        writer.write_all(&l_name.to_le_bytes())?;
+        writer.write_all(name)?;
+        writer.write_all(&[0u8])?; // null terminator
+
+        // l_ref: reference length
+        let l_ref = map.length().get() as i32;
+        writer.write_all(&l_ref.to_le_bytes())?;
+    }
+
+    Ok(())
+}
+
 /// Raw BAM writer for writing raw record bytes directly.
 ///
 /// This bypasses the noodles Record encoding path for maximum performance
@@ -149,38 +221,8 @@ impl RawBamWriter {
     ///
     /// # Errors
     /// Returns an error if writing to the underlying writer fails.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn write_header(&mut self, header: &Header) -> io::Result<()> {
-        use std::io::Write;
-
-        // BAM magic
-        self.inner.write_all(b"BAM\x01")?;
-
-        // Header text (SAM header serialized using noodles)
-        let mut sam_writer = noodles::sam::io::Writer::new(Vec::new());
-        sam_writer.write_header(header)?;
-        let header_bytes = sam_writer.into_inner();
-        let l_text = header_bytes.len() as i32;
-        self.inner.write_all(&l_text.to_le_bytes())?;
-        self.inner.write_all(&header_bytes)?;
-
-        // Reference sequences
-        let n_ref = header.reference_sequences().len() as i32;
-        self.inner.write_all(&n_ref.to_le_bytes())?;
-
-        for (name, map) in header.reference_sequences() {
-            // l_name: length of name + null terminator
-            let l_name = (name.len() + 1) as u32;
-            self.inner.write_all(&l_name.to_le_bytes())?;
-            self.inner.write_all(name)?;
-            self.inner.write_all(&[0u8])?; // null terminator
-
-            // l_ref: reference length
-            let l_ref = map.length().get() as i32;
-            self.inner.write_all(&l_ref.to_le_bytes())?;
-        }
-
-        Ok(())
+        write_bam_header(&mut self.inner, header)
     }
 
     /// Write a raw BAM record.
@@ -231,19 +273,7 @@ pub fn create_raw_bam_writer<P: AsRef<Path>>(
     let output_file = File::create(path_ref)
         .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
 
-    let bgzf_writer = if threads > 1 {
-        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
-
-        #[allow(clippy::cast_possible_truncation)]
-        if let Ok(cl) = CompressionLevel::new(compression_level as u8) {
-            builder = builder.set_compression_level(cl);
-        }
-
-        BgzfWriterEnum::MultiThreaded(builder.build_from_writer(output_file))
-    } else {
-        BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file))
-    };
+    let bgzf_writer = make_bgzf_writer(output_file, threads, compression_level);
 
     let mut writer = RawBamWriter::new(bgzf_writer);
     writer
@@ -317,32 +347,8 @@ impl IndexingBamWriter {
     }
 
     /// Write the BAM header.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn write_header(&mut self, header: &Header) -> io::Result<()> {
-        // BAM magic
-        self.inner.write_all(b"BAM\x01")?;
-
-        // Header text (SAM header serialized using noodles)
-        let mut sam_writer = noodles::sam::io::Writer::new(Vec::new());
-        sam_writer.write_header(header)?;
-        let header_bytes = sam_writer.into_inner();
-        let l_text = header_bytes.len() as i32;
-        self.inner.write_all(&l_text.to_le_bytes())?;
-        self.inner.write_all(&header_bytes)?;
-
-        // Reference sequences
-        let n_ref = header.reference_sequences().len() as i32;
-        self.inner.write_all(&n_ref.to_le_bytes())?;
-
-        for (name, map) in header.reference_sequences() {
-            let l_name = (name.len() + 1) as u32;
-            self.inner.write_all(&l_name.to_le_bytes())?;
-            self.inner.write_all(name)?;
-            self.inner.write_all(&[0u8])?;
-
-            let l_ref = map.length().get() as i32;
-            self.inner.write_all(&l_ref.to_le_bytes())?;
-        }
+        write_bam_header(&mut self.inner, header)?;
 
         // Flush header to ensure it's in its own block(s)
         self.inner.flush()?;
@@ -487,11 +493,11 @@ impl IndexingBamWriter {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
         // Extract fields from BAM record
-        let tid = i32::from_le_bytes([bam[0], bam[1], bam[2], bam[3]]);
-        let pos = i32::from_le_bytes([bam[4], bam[5], bam[6], bam[7]]);
-        let flags = u16::from_le_bytes([bam[14], bam[15]]);
+        let tid = noodles_raw_bam::ref_id(bam);
+        let pos = noodles_raw_bam::pos(bam);
+        let flags = noodles_raw_bam::flags(bam);
 
-        let is_unmapped = (flags & 0x4) != 0;
+        let is_unmapped = (flags & noodles_raw_bam::flags::UNMAPPED) != 0;
 
         // Unmapped reads: return None (indexer handles them specially)
         if tid < 0 || is_unmapped {
@@ -703,12 +709,7 @@ pub fn create_bam_reader<P: AsRef<Path>>(
     let file = File::open(path_ref)
         .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-    let bgzf_reader = if threads > 1 {
-        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, file))
-    } else {
-        BgzfReaderEnum::SingleThreaded(BgzfReader::new(file))
-    };
+    let bgzf_reader = make_bgzf_reader(file, threads);
 
     let mut reader = noodles::bam::io::Reader::from(bgzf_reader);
     let header = reader
@@ -746,12 +747,7 @@ pub fn create_raw_bam_reader<P: AsRef<Path>>(
     let file = File::open(path_ref)
         .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-    let bgzf_reader = if threads > 1 {
-        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, file))
-    } else {
-        BgzfReaderEnum::SingleThreaded(BgzfReader::new(file))
-    };
+    let bgzf_reader = make_bgzf_reader(file, threads);
 
     // Use noodles to read the header, then extract the BGZF reader
     let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);
@@ -807,23 +803,7 @@ pub fn create_bam_writer<P: AsRef<Path>>(
     let output_file = File::create(path_ref)
         .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
 
-    let bgzf_writer = if threads > 1 {
-        // Use multi-threaded BGZF writer with compression level
-        let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
-
-        #[allow(clippy::cast_possible_truncation)]
-        if let Ok(cl) = CompressionLevel::new(compression_level as u8) {
-            builder = builder.set_compression_level(cl);
-        }
-
-        BgzfWriterEnum::MultiThreaded(builder.build_from_writer(output_file))
-    } else {
-        // Use single-threaded BGZF writer
-        // Note: Single-threaded writer doesn't support compression level configuration
-        // via builder pattern in the same way - would need noodles update
-        BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file))
-    };
+    let bgzf_writer = make_bgzf_writer(output_file, threads, compression_level);
 
     let mut writer = noodles::bam::io::Writer::from(bgzf_writer);
     writer

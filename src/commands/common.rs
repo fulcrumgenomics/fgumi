@@ -9,7 +9,7 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use clap::Args;
 use fgumi_lib::bam_io::is_stdin_path;
-use fgumi_lib::unified_pipeline::SchedulerStrategy;
+use fgumi_lib::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use fgumi_lib::validation::validate_file_exists;
 use noodles::sam::Header;
 
@@ -192,6 +192,16 @@ pub struct ReadGroupOptions {
     /// Read group ID for consensus reads
     #[arg(short = 'R', long = "read-group-id", default_value = "A")]
     pub read_group_id: String,
+}
+
+impl ReadGroupOptions {
+    /// Returns the configured read name prefix, or derives one from the header.
+    #[must_use]
+    pub fn prefix_or_from_header(&self, header: &noodles::sam::Header) -> String {
+        self.read_name_prefix
+            .clone()
+            .unwrap_or_else(|| fgumi_lib::consensus_caller::make_prefix_from_header(header))
+    }
 }
 
 impl Default for ReadGroupOptions {
@@ -701,6 +711,34 @@ pub fn parse_memory_size(size_str: &str) -> anyhow::Result<u64> {
             )
         }
     }
+}
+
+/// Builds a [`BamPipelineConfig`] from the common CLI option structs.
+///
+/// This consolidates the pipeline configuration boilerplate that is repeated
+/// across all multi-threaded commands: auto-tuning, scheduler strategy,
+/// stats collection, deadlock settings, and queue memory limits.
+///
+/// After calling this, commands can further customize the returned config
+/// (e.g. setting `group_key_config` for raw-byte mode).
+pub fn build_pipeline_config(
+    scheduler_opts: &SchedulerOptions,
+    compression: &CompressionOptions,
+    queue_memory: &QueueMemoryOptions,
+    num_threads: usize,
+) -> anyhow::Result<BamPipelineConfig> {
+    let mut config = BamPipelineConfig::auto_tuned(num_threads, compression.compression_level);
+    config.pipeline.scheduler_strategy = scheduler_opts.strategy();
+    if scheduler_opts.collect_stats() {
+        config.pipeline = config.pipeline.with_stats(true);
+    }
+    config.pipeline.deadlock_timeout_secs = scheduler_opts.deadlock_timeout_secs();
+    config.pipeline.deadlock_recover_enabled = scheduler_opts.deadlock_recover_enabled();
+
+    let queue_memory_limit_bytes = queue_memory.calculate_memory_limit(num_threads)?;
+    config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
+    queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
+    Ok(config)
 }
 
 #[cfg(test)]

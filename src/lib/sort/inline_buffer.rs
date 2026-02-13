@@ -9,6 +9,7 @@
 //! - Sort by index array, not by moving actual record data
 //! - ~24 bytes overhead per record vs ~110 bytes
 
+use crate::sort::bam_fields;
 use crate::sort::keys::{RawSortKey, SortContext};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
@@ -280,15 +281,9 @@ impl RecordBuffer {
 #[inline]
 #[must_use]
 pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
-    // BAM format offsets (all little-endian):
-    // 0-3: tid (i32)
-    // 4-7: pos (i32)
-    // 14-15: flags (u16)
-
-    let tid = i32::from_le_bytes([bam[0], bam[1], bam[2], bam[3]]);
-    let pos = i32::from_le_bytes([bam[4], bam[5], bam[6], bam[7]]);
-    let flags = u16::from_le_bytes([bam[14], bam[15]]);
-    let reverse = (flags & 0x10) != 0;
+    let tid = bam_fields::ref_id(bam);
+    let pos = bam_fields::pos(bam);
+    let reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
 
     // Pack key based on tid (samtools behavior):
     // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set

@@ -22,10 +22,13 @@
 //! 32+     var   read_name (l_read_name bytes, null-terminated)
 //! ```
 
+/// BAM file magic bytes (`BAM\1`).
+pub const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
+
 /// Minimum length of a valid BAM record (the 32-byte fixed header).
 /// All read-primitive functions that access fixed-offset fields (`flags`, `mapq`,
 /// `ref_id`, `pos`, etc.) require at least this many bytes.
-pub const MIN_BAM_HEADER_LEN: usize = 32;
+pub const MIN_BAM_RECORD_LEN: usize = 32;
 
 /// BAM flag bits.
 pub mod flags {
@@ -252,19 +255,20 @@ pub fn qual_offset(bam: &[u8]) -> usize {
 #[inline]
 #[must_use]
 pub fn extract_coordinate_fields(bam_bytes: &[u8]) -> (i32, i32, bool, &[u8]) {
-    // Read fixed fields at known offsets
-    let tid = i32::from_le_bytes([bam_bytes[0], bam_bytes[1], bam_bytes[2], bam_bytes[3]]);
-    let pos = i32::from_le_bytes([bam_bytes[4], bam_bytes[5], bam_bytes[6], bam_bytes[7]]);
-    let l_read_name = bam_bytes[8] as usize;
-    let flag = u16::from_le_bytes([bam_bytes[14], bam_bytes[15]]);
+    debug_assert!(
+        bam_bytes.len() >= MIN_BAM_RECORD_LEN,
+        "BAM record too short ({} < {MIN_BAM_RECORD_LEN})",
+        bam_bytes.len()
+    );
 
+    let tid = ref_id(bam_bytes);
+    let p = pos(bam_bytes);
+    let flag = flags(bam_bytes);
     let reverse = (flag & flags::REVERSE) != 0;
     let unmapped = (flag & flags::UNMAPPED) != 0;
+    let name = read_name(bam_bytes);
 
-    // Read name starts at byte 32, exclude null terminator
-    let name = if l_read_name > 1 { &bam_bytes[32..32 + l_read_name - 1] } else { &[] };
-
-    if unmapped { (i32::MAX, i32::MAX, false, name) } else { (tid, pos, reverse, name) }
+    if unmapped { (i32::MAX, i32::MAX, false, name) } else { (tid, p, reverse, name) }
 }
 
 /// Packed boolean flags for [`TemplateCoordFields`].
@@ -356,32 +360,33 @@ pub struct TemplateCoordFields<'a> {
 #[inline]
 #[must_use]
 pub fn extract_template_coordinate_fields(bam_bytes: &[u8]) -> TemplateCoordFields<'_> {
-    let tid = i32::from_le_bytes([bam_bytes[0], bam_bytes[1], bam_bytes[2], bam_bytes[3]]);
-    let pos = i32::from_le_bytes([bam_bytes[4], bam_bytes[5], bam_bytes[6], bam_bytes[7]]);
-    let l_read_name = bam_bytes[8] as usize;
-    let n_cigar_op = u16::from_le_bytes([bam_bytes[12], bam_bytes[13]]) as usize;
-    let flag = u16::from_le_bytes([bam_bytes[14], bam_bytes[15]]);
-    let l_seq =
-        u32::from_le_bytes([bam_bytes[16], bam_bytes[17], bam_bytes[18], bam_bytes[19]]) as usize;
-    let mate_tid = i32::from_le_bytes([bam_bytes[20], bam_bytes[21], bam_bytes[22], bam_bytes[23]]);
-    let mate_pos = i32::from_le_bytes([bam_bytes[24], bam_bytes[25], bam_bytes[26], bam_bytes[27]]);
+    debug_assert!(
+        bam_bytes.len() >= MIN_BAM_RECORD_LEN,
+        "BAM record too short ({} < {MIN_BAM_RECORD_LEN})",
+        bam_bytes.len()
+    );
 
-    // Read name starts at byte 32, exclude null terminator
-    let name = if l_read_name > 1 { &bam_bytes[32..32 + l_read_name - 1] } else { &[] };
-
-    // Extract flags
+    let tid = ref_id(bam_bytes);
+    let p = pos(bam_bytes);
+    let l_rn = l_read_name(bam_bytes) as usize;
+    let n_co = n_cigar_op(bam_bytes) as usize;
+    let flag = flags(bam_bytes);
+    let l_s = l_seq(bam_bytes) as usize;
+    let m_tid = mate_ref_id(bam_bytes);
+    let m_pos = mate_pos(bam_bytes);
+    let name = read_name(bam_bytes);
     let tc_flags = TemplateCoordFlags::from_flag(flag);
 
     TemplateCoordFields {
         tid,
-        pos,
-        mate_tid,
-        mate_pos,
+        pos: p,
+        mate_tid: m_tid,
+        mate_pos: m_pos,
         flags: tc_flags,
         name,
-        l_read_name,
-        n_cigar_op,
-        l_seq,
+        l_read_name: l_rn,
+        n_cigar_op: n_co,
+        l_seq: l_s,
     }
 }
 

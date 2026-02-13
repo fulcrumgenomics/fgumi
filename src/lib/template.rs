@@ -659,11 +659,11 @@ impl Template {
 
         // Guard against truncated records
         for (i, r) in raw_records.iter().enumerate() {
-            if r.len() < bam_fields::MIN_BAM_HEADER_LEN {
+            if r.len() < bam_fields::MIN_BAM_RECORD_LEN {
                 bail!(
                     "Raw BAM record {i} too short to parse ({} < {})",
                     r.len(),
-                    bam_fields::MIN_BAM_HEADER_LEN
+                    bam_fields::MIN_BAM_RECORD_LEN
                 );
             }
             let l_rn = r[8] as usize;

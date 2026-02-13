@@ -90,11 +90,11 @@ pub fn reverse_per_base_tags(record: &mut RecordBuf) -> Result<bool> {
 ///
 /// Returns an error if the record is too short to be a valid BAM record.
 pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
-    if record.len() < bam_fields::MIN_BAM_HEADER_LEN {
+    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
         bail!(
             "BAM record too short ({} bytes, minimum {})",
             record.len(),
-            bam_fields::MIN_BAM_HEADER_LEN
+            bam_fields::MIN_BAM_RECORD_LEN
         );
     }
     let flg = bam_fields::flags(record);
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_reverse_per_base_tags_raw_short_record() {
-        // A record shorter than MIN_BAM_HEADER_LEN (32 bytes) should return an error
+        // A record shorter than MIN_BAM_RECORD_LEN (32 bytes) should return an error
         let mut short_record = vec![0u8; 16];
         let result = reverse_per_base_tags_raw(&mut short_record);
         assert!(result.is_err());

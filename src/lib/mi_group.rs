@@ -1964,9 +1964,9 @@ mod tests {
             "MI",
             10,
             |bam: &[u8]| {
-                // Check flag field at offset 14..16
-                let flag = u16::from_le_bytes([bam[14], bam[15]]);
-                flag & 0x100 == 0 // keep if NOT secondary
+                // Check flag field
+                let flag = noodles_raw_bam::flags(bam);
+                flag & noodles_raw_bam::flags::SECONDARY == 0 // keep if NOT secondary
             },
             |raw: &[u8]| {
                 let s = String::from_utf8_lossy(raw);

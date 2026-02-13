@@ -627,6 +627,50 @@ impl Grouper for RecordPositionGrouper {
 
 /// Build [`Template`]s from raw decoded records.
 ///
+/// Groups decoded records by `name_hash` and builds a [`Template`] from each group.
+///
+/// This is a generic helper: `extract` pulls the per-record payload out of each
+/// [`DecodedRecord`], and `build` converts a batch of payloads into a [`Template`].
+fn group_by_name_and_build<T>(
+    records: Vec<DecodedRecord>,
+    extract: impl Fn(DecodedRecord) -> io::Result<T>,
+    build: impl Fn(Vec<T>) -> anyhow::Result<Template>,
+) -> io::Result<Vec<Template>> {
+    let mut templates = Vec::new();
+    let mut current_name_hash: Option<u64> = None;
+    let mut current_items: Vec<T> = Vec::new();
+
+    for decoded in records {
+        let name_hash = decoded.key.name_hash;
+        let item = extract(decoded)?;
+
+        match current_name_hash {
+            Some(h) if h == name_hash => {
+                current_items.push(item);
+            }
+            Some(_) => {
+                let template = build(std::mem::take(&mut current_items))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                templates.push(template);
+                current_name_hash = Some(name_hash);
+                current_items.push(item);
+            }
+            None => {
+                current_name_hash = Some(name_hash);
+                current_items.push(item);
+            }
+        }
+    }
+
+    if !current_items.is_empty() {
+        let template =
+            build(current_items).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        templates.push(template);
+    }
+
+    Ok(templates)
+}
+
 /// Groups records by `name_hash` (QNAME) and builds a [`Template`] from each group.
 /// Records must be grouped by QNAME (guaranteed by template-coordinate sort order).
 ///
@@ -643,93 +687,33 @@ pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<V
         return Ok(Vec::new());
     }
 
-    // Check if this is raw-byte mode based on the first record
-
     let raw_byte_mode = matches!(records[0].data, DecodedRecordData::Raw(_));
 
     if raw_byte_mode {
-        return build_templates_from_raw_records(records);
+        group_by_name_and_build(
+            records,
+            |d| match d.data {
+                DecodedRecordData::Raw(v) => Ok(v),
+                DecodedRecordData::Parsed(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected raw-byte record but found parsed record",
+                )),
+            },
+            Template::from_raw_records,
+        )
+    } else {
+        group_by_name_and_build(
+            records,
+            |d| match d.data {
+                DecodedRecordData::Parsed(r) => Ok(r),
+                DecodedRecordData::Raw(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected parsed record but found raw-byte record",
+                )),
+            },
+            Template::from_records,
+        )
     }
-
-    let mut templates = Vec::new();
-    let mut current_name_hash: Option<u64> = None;
-    let mut current_records: Vec<RecordBuf> = Vec::new();
-
-    for decoded in records {
-        let name_hash = decoded.key.name_hash;
-        let record = match decoded.data {
-            DecodedRecordData::Parsed(r) => r,
-            DecodedRecordData::Raw(_) => unreachable!("checked above"),
-        };
-
-        match current_name_hash {
-            Some(h) if h == name_hash => {
-                current_records.push(record);
-            }
-            Some(_) => {
-                let template = Template::from_records(std::mem::take(&mut current_records))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                templates.push(template);
-                current_name_hash = Some(name_hash);
-                current_records.push(record);
-            }
-            None => {
-                current_name_hash = Some(name_hash);
-                current_records.push(record);
-            }
-        }
-    }
-
-    // Flush last template
-    if !current_records.is_empty() {
-        let template = Template::from_records(current_records)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        templates.push(template);
-    }
-
-    Ok(templates)
-}
-
-/// Build templates from raw-byte mode decoded records.
-fn build_templates_from_raw_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
-    use crate::unified_pipeline::DecodedRecordData;
-
-    let mut templates = Vec::new();
-    let mut current_name_hash: Option<u64> = None;
-    let mut current_raw: Vec<Vec<u8>> = Vec::new();
-
-    for decoded in records {
-        let name_hash = decoded.key.name_hash;
-        let raw = match decoded.data {
-            DecodedRecordData::Raw(v) => v,
-            DecodedRecordData::Parsed(_) => unreachable!("raw-byte mode checked by caller"),
-        };
-
-        match current_name_hash {
-            Some(h) if h == name_hash => {
-                current_raw.push(raw);
-            }
-            Some(_) => {
-                let template = Template::from_raw_records(std::mem::take(&mut current_raw))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                templates.push(template);
-                current_name_hash = Some(name_hash);
-                current_raw.push(raw);
-            }
-            None => {
-                current_name_hash = Some(name_hash);
-                current_raw.push(raw);
-            }
-        }
-    }
-
-    if !current_raw.is_empty() {
-        let template = Template::from_raw_records(current_raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        templates.push(template);
-    }
-
-    Ok(templates)
 }
 
 // ============================================================================
@@ -1724,6 +1708,69 @@ mod tests {
 
         let templates = build_templates_from_records(records).unwrap();
         assert_eq!(templates.len(), 3);
+    }
+
+    #[test]
+    fn test_build_templates_from_raw_bytes() {
+        use crate::sort::bam_fields;
+        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+
+        let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
+        let raw = bam_fields::make_bam_bytes(
+            0,                                                            // tid
+            100,                                                          // pos
+            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT, // flags
+            b"read1",                                                     // name
+            &[bam_fields::encode_op(0, 4)],                               // 4M cigar
+            4,                                                            // seq_len
+            0,                                                            // mate_tid
+            200,                                                          // mate_pos
+            &[],                                                          // aux
+        );
+        let decoded = DecodedRecord::from_raw_bytes(raw, key);
+
+        let templates = build_templates_from_records(vec![decoded]).unwrap();
+        assert_eq!(templates.len(), 1);
+    }
+
+    #[test]
+    fn test_build_templates_from_raw_bytes_paired() {
+        use crate::sort::bam_fields;
+        use crate::unified_pipeline::{DecodedRecord, GroupKey};
+
+        let key1 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+        let key2 = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
+
+        let r1 = bam_fields::make_bam_bytes(
+            0,
+            100,
+            bam_fields::flags::PAIRED | bam_fields::flags::FIRST_SEGMENT,
+            b"read1",
+            &[bam_fields::encode_op(0, 4)],
+            4,
+            0,
+            200,
+            &[],
+        );
+        let r2 = bam_fields::make_bam_bytes(
+            0,
+            200,
+            bam_fields::flags::PAIRED
+                | bam_fields::flags::LAST_SEGMENT
+                | bam_fields::flags::REVERSE,
+            b"read1",
+            &[bam_fields::encode_op(0, 4)],
+            4,
+            0,
+            100,
+            &[],
+        );
+
+        let records =
+            vec![DecodedRecord::from_raw_bytes(r1, key1), DecodedRecord::from_raw_bytes(r2, key2)];
+
+        let templates = build_templates_from_records(records).unwrap();
+        assert_eq!(templates.len(), 1);
     }
 
     // ========================================================================

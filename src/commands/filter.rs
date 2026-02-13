@@ -29,7 +29,7 @@ use fgumi_lib::sort::bam_fields;
 use fgumi_lib::tag_reversal::reverse_per_base_tags_raw;
 use fgumi_lib::template::{TemplateBatch, TemplateIterator};
 use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use fgumi_lib::validation::validate_file_exists;
 use fgumi_lib::vendored::raw_bam_record::RawRecord;
@@ -44,6 +44,7 @@ use std::time::Instant;
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+    build_pipeline_config,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -526,25 +527,16 @@ impl Filter {
         track_rejects: bool,
     ) -> Result<u64> {
         // Configure pipeline - filter is Balanced workload
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
-        }
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
 
         // Enable raw-byte mode: skip noodles decode
         let library_index = LibraryIndex::from_header(&header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Create filter configuration
         let config = Arc::new(FilterConfig::new(
@@ -678,25 +670,16 @@ impl Filter {
         track_rejects: bool,
     ) -> Result<u64> {
         // Configure pipeline - filter is Balanced workload
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
-        if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
-        }
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
 
         // Enable raw-byte mode: skip noodles decode
         let library_index = LibraryIndex::from_header(&header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
-
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
 
         // Create filter configuration
         let config = Arc::new(FilterConfig::new(
@@ -1028,6 +1011,31 @@ impl Filter {
         Ok((masked_count as u64, pass))
     }
 
+    /// Check mean quality and no-call fraction/count on a raw BAM record.
+    ///
+    /// Returns `true` if the record passes the quality and no-call thresholds.
+    fn check_no_call_and_quality(
+        bam: &[u8],
+        min_mean_qual: Option<f64>,
+        max_no_call_frac: f64,
+    ) -> bool {
+        let (no_calls, mean_qual) = compute_read_stats_raw(bam);
+        if let Some(min_qual) = min_mean_qual {
+            if mean_qual < min_qual {
+                return false;
+            }
+        }
+        let seq_len = bam_fields::l_seq(bam) as usize;
+        if max_no_call_frac >= 1.0 {
+            // Count mode: threshold is an absolute base count
+            (no_calls as f64) <= max_no_call_frac
+        } else {
+            // Fraction mode
+            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
+            no_call_frac <= max_no_call_frac
+        }
+    }
+
     /// Checks read-level filters on a raw simplex consensus record.
     ///
     /// Returns `true` if the record passes all filters (depth, error rate, mean quality,
@@ -1043,21 +1051,7 @@ impl Filter {
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
-        let (no_calls, mean_qual) = compute_read_stats_raw(bam);
-        if let Some(min_qual) = min_mean_qual {
-            if mean_qual < min_qual {
-                return Ok(false);
-            }
-        }
-        let seq_len = bam_fields::l_seq(bam) as usize;
-        if max_no_call_frac >= 1.0 {
-            // Count mode: threshold is an absolute base count
-            Ok((no_calls as f64) <= max_no_call_frac)
-        } else {
-            // Fraction mode
-            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
-            Ok(no_call_frac <= max_no_call_frac)
-        }
+        Ok(Self::check_no_call_and_quality(bam, min_mean_qual, max_no_call_frac))
     }
 
     /// Checks read-level filters on a raw duplex consensus record.
@@ -1078,21 +1072,7 @@ impl Filter {
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
-        let (no_calls, mean_qual) = compute_read_stats_raw(bam);
-        if let Some(min_qual) = min_mean_qual {
-            if mean_qual < min_qual {
-                return Ok(false);
-            }
-        }
-        let seq_len = bam_fields::l_seq(bam) as usize;
-        if max_no_call_frac >= 1.0 {
-            // Count mode: threshold is an absolute base count
-            Ok((no_calls as f64) <= max_no_call_frac)
-        } else {
-            // Fraction mode
-            let no_call_frac = if seq_len > 0 { no_calls as f64 / seq_len as f64 } else { 0.0 };
-            Ok(no_call_frac <= max_no_call_frac)
-        }
+        Ok(Self::check_no_call_and_quality(bam, min_mean_qual, max_no_call_frac))
     }
 
     /// Validates that parameter vectors have 1-3 values and are in valid ranges

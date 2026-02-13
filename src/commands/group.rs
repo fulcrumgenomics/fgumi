@@ -5,6 +5,7 @@
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
+    build_pipeline_config,
 };
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
@@ -26,9 +27,7 @@ use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_positio
 use fgumi_lib::template::{MoleculeId, Template};
 use fgumi_lib::umi::{UmiValidation, validate_umi};
 use fgumi_lib::unified_pipeline::DecodedRecord;
-use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, GroupKeyConfig, Grouper, run_bam_pipeline_from_reader,
-};
+use fgumi_lib::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 #[cfg(feature = "memory-debug")]
 use fgumi_lib::unified_pipeline::MemoryEstimate;
@@ -234,8 +233,8 @@ fn filter_template_raw(
 ) -> bool {
     use fgumi_lib::sort::bam_fields;
 
-    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_HEADER_LEN);
-    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_HEADER_LEN);
+    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
 
     let num_primary_reads = raw_r1.is_some() as u64 + raw_r2.is_some() as u64;
     metrics.total_templates += num_primary_reads;
@@ -941,26 +940,17 @@ impl Command for GroupReadsByUmi {
 
         // Configure 7-step pipeline
         let num_threads = self.threading.num_threads();
-        // Use auto-tuned config for better performance with varying thread counts
-        let mut pipeline_config =
-            BamPipelineConfig::auto_tuned(num_threads, self.compression.compression_level);
-        pipeline_config.pipeline.scheduler_strategy = self.scheduler_opts.strategy();
+        let mut pipeline_config = build_pipeline_config(
+            &self.scheduler_opts,
+            &self.compression,
+            &self.queue_memory,
+            num_threads,
+        )?;
 
-        // Configure stats collection - use shared stats if available, otherwise enable regular stats
+        // Override stats: use shared stats if available (memory-debug feature)
         if let Some(stats) = shared_stats.as_ref() {
             pipeline_config.pipeline = pipeline_config.pipeline.with_shared_stats(stats.clone());
-        } else if self.scheduler_opts.collect_stats() {
-            pipeline_config.pipeline = pipeline_config.pipeline.with_stats(true);
         }
-
-        pipeline_config.pipeline.deadlock_timeout_secs =
-            self.scheduler_opts.deadlock_timeout_secs();
-        pipeline_config.pipeline.deadlock_recover_enabled =
-            self.scheduler_opts.deadlock_recover_enabled();
-        // Calculate and apply queue memory limit
-        let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
-        pipeline_config.pipeline.queue_memory_limit = queue_memory_limit_bytes;
-        self.queue_memory.log_memory_config(num_threads, queue_memory_limit_bytes);
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         // Template-based batching is enabled by default in auto_tuned() with target=500 templates.
         // This provides consistent batch sizes across datasets with varying templates-per-group ratios.
@@ -2042,7 +2032,7 @@ impl GroupReadsByUmi {
                         "UMI found that had shorter length than expected ({min_length} < {min_len})"
                     );
                 }
-                Ok(umis.into_iter().map(|u| u[..min_length].to_string()).collect())
+                Ok(umis.into_iter().map(|u| u[..min_len].to_string()).collect())
             }
         }
     }
@@ -4812,7 +4802,7 @@ mod tests {
     fn test_group_filter_template_raw_truncated_record_treated_as_missing() {
         // Construct a template that bypasses from_raw_records validation
         // by directly building with a truncated raw record.
-        // The filter should treat records shorter than MIN_BAM_HEADER_LEN as missing.
+        // The filter should treat records shorter than MIN_BAM_RECORD_LEN as missing.
         let short_rec = [0u8; 16]; // Less than 32 bytes
         let valid_rec = make_raw_bam_for_group(
             b"rea",
@@ -4824,10 +4814,10 @@ mod tests {
         );
         // Build a template where raw_records[0] is too short — testing defense-in-depth
         // We can't use from_raw_records (it validates), so test the constant is correct
-        assert_eq!(fgumi_lib::sort::bam_fields::MIN_BAM_HEADER_LEN, 32);
+        assert_eq!(fgumi_lib::sort::bam_fields::MIN_BAM_RECORD_LEN, 32);
         // Verify the valid record passes and the short one would be caught by from_raw_records
-        assert!(valid_rec.len() >= fgumi_lib::sort::bam_fields::MIN_BAM_HEADER_LEN);
-        assert!(short_rec.len() < fgumi_lib::sort::bam_fields::MIN_BAM_HEADER_LEN);
+        assert!(valid_rec.len() >= fgumi_lib::sort::bam_fields::MIN_BAM_RECORD_LEN);
+        assert!(short_rec.len() < fgumi_lib::sort::bam_fields::MIN_BAM_RECORD_LEN);
     }
 
     #[test]
