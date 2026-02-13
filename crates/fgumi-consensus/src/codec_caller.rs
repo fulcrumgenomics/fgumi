@@ -769,7 +769,7 @@ impl CodecConsensusCaller {
 
         // Phase 6: Build output from raw bytes
         // Collect raw record refs from filtered reads only (r1_infos/r2_infos)
-        // to avoid deriving tags from rejected reads (secondary/unmapped/FR mismatch)
+        // for tags derived from consensus source reads (cell barcode, etc.)
         let all_paired_raws: Vec<&[u8]> = r1_infos
             .iter()
             .chain(r2_infos.iter())
@@ -784,6 +784,7 @@ impl CodecConsensusCaller {
             &ss_for_bc,
             umi.as_deref(),
             &all_paired_raws,
+            records,
         )?;
 
         self.stats.consensus_reads_generated += 1;
@@ -1195,6 +1196,10 @@ impl CodecConsensusCaller {
         clippy::unnecessary_wraps,
         reason = "Result return type kept for API consistency with other callers"
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all_records needed separately from source_raws for UMI consensus"
+    )]
     fn build_output_record_into(
         &mut self,
         output: &mut ConsensusOutput,
@@ -1203,6 +1208,7 @@ impl CodecConsensusCaller {
         ss_b: &SingleStrandConsensus,
         umi: Option<&str>,
         source_raws: &[&[u8]],
+        all_records: &[Vec<u8>],
     ) -> Result<()> {
         // Generate read name - use ':' delimiter to match fgbio format
         self.consensus_counter += 1;
@@ -1310,8 +1316,11 @@ impl CodecConsensusCaller {
             }
         }
 
-        // RX tag (UmiBases) - extract from all source reads and build consensus
-        let umis: Vec<String> = source_raws
+        // RX tag (UmiBases) - extract from ALL records in the MI group and build consensus.
+        // This must use all_records (not just filtered source_raws) to match fgbio, which
+        // includes reads excluded from sequence consensus (unmapped, non-FR, etc.) when
+        // building the UMI consensus. Their UMI bases help resolve N's at ambiguous positions.
+        let umis: Vec<String> = all_records
             .iter()
             .filter_map(|raw| {
                 bam_fields::find_string_tag_in_record(raw, b"RX")
