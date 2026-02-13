@@ -59,7 +59,7 @@
 //! - `fastq`: FASTQ pipeline with multi-stream grouping and parallel Parse
 //! - `scheduler`: Thread scheduling strategies
 //! - `deadlock`: Deadlock detection and recovery
-//! - `queue`: Memory-bounded queue implementations
+//! - `queue`: Queue implementations
 //! - `rebalancer`: Dynamic memory rebalancing
 //!
 //! # Parallel Ordered Batch Processing Pattern
