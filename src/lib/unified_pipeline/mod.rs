@@ -59,7 +59,7 @@
 //! - `fastq`: FASTQ pipeline with multi-stream grouping and parallel Parse
 //! - `scheduler`: Thread scheduling strategies
 //! - `deadlock`: Deadlock detection and recovery
-//! - `queue`: Memory-bounded queue implementations
+//! - `queue`: Queue implementations
 //! - `rebalancer`: Dynamic memory rebalancing
 //!
 //! # Parallel Ordered Batch Processing Pattern
@@ -97,7 +97,7 @@ pub use bam::*;
 pub use fastq::*;
 
 // Re-export queue types
-pub use queue::{MemoryBoundedQueue, OrderedQueue, QueueStats};
+pub use queue::{OrderedQueue, QueueStats};
 
 // Re-export rebalancer types
 pub use rebalancer::{
