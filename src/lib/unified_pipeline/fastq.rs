@@ -1130,8 +1130,7 @@ impl<R: BufRead + Send> MultiRecordCountReader<R> {
 
 /// Read exactly `n` complete FASTQ records from a buffered reader.
 ///
-/// Uses `BufRead::read_until` (which delegates to `memchr` internally) for
-/// SIMD-accelerated newline scanning. Each FASTQ record
+/// Uses `BufRead::read_until` for line-by-line reading. Each FASTQ record
 /// consists of exactly 4 lines (name, sequence, plus, quality).
 ///
 /// Returns `(data, offsets, at_eof)` where:
