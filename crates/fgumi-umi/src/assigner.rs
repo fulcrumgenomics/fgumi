@@ -1644,9 +1644,9 @@ impl PairedUmiAssigner {
         &self.higher_prefix
     }
 
-    /// Split paired UMI into two parts
+    /// Split paired UMI into two parts.
     ///
-    /// Splits a paired UMI like "ACGT-TGCA" into its two components.
+    /// Splits a paired UMI like "ACGT-TGCA" into its two components (left and right halves).
     ///
     /// # Arguments
     ///
@@ -1654,12 +1654,28 @@ impl PairedUmiAssigner {
     ///
     /// # Returns
     ///
-    /// Result containing tuple of (first part, second part) as string slices
+    /// Result containing tuple of (left half, right half) as string slices
     ///
     /// # Errors
     ///
     /// Returns error if UMI doesn't contain exactly one '-'
-    fn split(umi: &str) -> Result<(&str, &str)> {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fgumi_lib::assigner::PairedUmiAssigner;
+    ///
+    /// let (left, right) = PairedUmiAssigner::split("ACGT-TGCA").unwrap();
+    /// assert_eq!(left, "ACGT");
+    /// assert_eq!(right, "TGCA");
+    ///
+    /// // Invalid: multiple dashes
+    /// assert!(PairedUmiAssigner::split("A-B-C").is_err());
+    ///
+    /// // Invalid: no dash
+    /// assert!(PairedUmiAssigner::split("ACGTTGCA").is_err());
+    /// ```
+    pub fn split(umi: &str) -> Result<(&str, &str)> {
         // Use byte operations for faster lookup since UMIs are ASCII
         let bytes = umi.as_bytes();
         if let Some(pos) = bytes.iter().position(|&b| b == b'-') {
