@@ -154,12 +154,17 @@ fn run_passthrough_pipeline_with_config(
     Ok((count, output_records))
 }
 
-/// Extract sorted record names from a list of records.
-fn sorted_record_names(records: &[RecordBuf]) -> Vec<Option<String>> {
-    let mut names: Vec<_> = records
+/// Extract record names from a list of records, preserving order.
+fn record_names(records: &[RecordBuf]) -> Vec<Option<String>> {
+    records
         .iter()
         .map(|r| r.name().map(|n| String::from_utf8_lossy(n.as_ref()).to_string()))
-        .collect();
+        .collect()
+}
+
+/// Extract sorted record names from a list of records.
+fn sorted_record_names(records: &[RecordBuf]) -> Vec<Option<String>> {
+    let mut names = record_names(records);
     names.sort();
     names
 }
@@ -257,15 +262,12 @@ fn test_bam_pipeline_multithreaded_determinism() {
         let (_, output_records) = run_passthrough_pipeline(&input_bam, &output_bam, num_threads)
             .unwrap_or_else(|e| panic!("Run {run} failed: {e}"));
 
-        let names = sorted_record_names(&output_records);
+        let names = record_names(&output_records);
         all_names.push(names);
     }
 
     for i in 1..all_names.len() {
-        assert_eq!(
-            all_names[0], all_names[i],
-            "Run 0 and run {i} produced different sorted output"
-        );
+        assert_eq!(all_names[0], all_names[i], "Run 0 and run {i} produced different output order");
     }
 }
 
@@ -1072,7 +1074,7 @@ mod stress_tests {
         let consumer = std::thread::spawn(move || {
             let mut count = 0;
             while count < num_items {
-                if let Some(_) = consumer_queue.try_pop_next() {
+                if consumer_queue.try_pop_next().is_some() {
                     count += 1;
                 } else {
                     std::thread::yield_now();
