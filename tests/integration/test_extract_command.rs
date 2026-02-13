@@ -896,3 +896,72 @@ fn test_variable_length_reads_bgzf() {
     let records = read_bam_records(&output);
     assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
 }
+
+/// Regression test: verify that user-configurable options (--read-group-id,
+/// --umi-tag, --annotate-read-names) are correctly propagated in multi-threaded mode.
+#[test]
+fn test_extract_multithreaded_custom_options() {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+
+    let tmp = TempDir::new().unwrap();
+    let r1 = create_gzip_fastq(&tmp, "r1.fq.gz", &[("read1", "ACGTATTTTTTT", "IIIIIIIIIIII")]);
+    let r2 = create_gzip_fastq(&tmp, "r2.fq.gz", &[("read1", "TGCATAAAAAAA", "IIIIIIIIIIII")]);
+    let output = tmp.path().join("output.bam");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--threads",
+            "4",
+            "--compression-level",
+            "1",
+            "--read-group-id",
+            "MyRG",
+            "--umi-tag",
+            "ZU",
+            "--annotate-read-names",
+        ])
+        .status()
+        .expect("Failed to execute extract command");
+
+    assert!(status.success(), "Multi-threaded extract with custom options failed");
+
+    let records = read_bam_records(&output);
+    assert_eq!(records.len(), 2);
+
+    for record in &records {
+        // Verify custom read group ID
+        let rg = record.data().get(&Tag::from(*b"RG")).expect("RG tag should be present");
+        match rg {
+            Value::String(s) => {
+                let rg_str = String::from_utf8_lossy(s);
+                assert_eq!(rg_str, "MyRG", "Read group should be MyRG, not the default 'A'");
+            }
+            _ => panic!("RG tag should be a string"),
+        }
+
+        // Verify UMI stored under custom tag ZU (not default RX)
+        assert!(record.data().get(&Tag::from(*b"ZU")).is_some(), "UMI should be under ZU tag");
+        assert!(
+            record.data().get(&Tag::from(*b"RX")).is_none(),
+            "RX tag should not be present when --umi-tag ZU is used"
+        );
+
+        // Verify read name annotation (should contain '+' with UMI appended)
+        let name = std::str::from_utf8(record.name().unwrap().as_ref()).unwrap();
+        assert!(name.contains('+'), "Read name should be annotated with UMI: {name}");
+    }
+}
