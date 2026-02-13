@@ -9,19 +9,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::bam_io::create_bam_reader;
+use fgumi_lib::bam_io::create_raw_bam_reader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
-use fgumi_lib::template::TemplateIterator;
+use fgumi_lib::sort::bam_fields;
 use fgumi_lib::umi::extract_mi_base;
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::vendored::RawRecord;
 use log::info;
 use murmur3::murmur3_32;
-use noodles::sam::alignment::record::Cigar;
-use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -56,8 +54,6 @@ struct TemplateInfo {
     ref_name: Option<String>,
     position: Option<i32>,
     end_position: Option<i32>,
-    #[allow(dead_code)] // Part of struct for completeness, may be used in future
-    is_reverse: bool,
     /// Hash fraction for deterministic downsampling (computed once per template)
     hash_fraction: f64,
     /// Grouping key matching fgbio's `ReadInfo`: (ref1, start1, strand1, ref2, start2, strand2)
@@ -79,40 +75,30 @@ struct ReadInfoKey {
     strand2: bool,
 }
 
-/// Computes the unclipped 5' position for a read, matching fgbio's positionOf.
+/// CIGAR operation type for soft clip (BAM encoding: lower 4 bits of encoded op).
+const CIGAR_SOFT_CLIP: u32 = 4;
+
+/// Computes the unclipped 5' position for a raw BAM record, matching fgbio's positionOf.
 ///
 /// For forward strand reads: unclippedStart = alignmentStart - leading soft clips
 /// For reverse strand reads: unclippedEnd = alignmentEnd + trailing soft clips
-fn unclipped_five_prime_position(record: &RecordBuf) -> Option<i32> {
-    let is_reverse = record.flags().is_reverse_complemented();
-    let cigar = record.cigar();
+fn unclipped_five_prime_position_raw(bam: &[u8]) -> Option<i32> {
+    let is_reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
+    let cigar_ops = bam_fields::get_cigar_ops(bam);
 
     if is_reverse {
-        // For reverse strand, 5' is at the end
-        // unclippedEnd = alignmentEnd + trailing soft clips
-        let alignment_end = record.alignment_end().map(|p| usize::from(p) as i32)?;
-
-        // Count trailing soft clips (last element if it's S)
-        let trailing_clips: i32 = cigar
-            .iter()
-            .filter_map(std::result::Result::ok)
+        let alignment_end = bam_fields::alignment_end_from_raw(bam).map(|p| p as i32)?;
+        let trailing_clips = cigar_ops
             .last()
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map_or(0, |op| op.len() as i32);
-
+            .filter(|&&op| (op & 0xf) == CIGAR_SOFT_CLIP)
+            .map_or(0, |&op| (op >> 4) as i32);
         Some(alignment_end + trailing_clips)
     } else {
-        // For forward strand, 5' is at the start
-        // unclippedStart = alignmentStart - leading soft clips
-        let alignment_start = record.alignment_start().map(|p| usize::from(p) as i32)?;
-
-        // Count leading soft clips (first element if it's S)
-        let leading_clips: i32 = cigar
-            .iter()
-            .find_map(std::result::Result::ok)
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map_or(0, |op| op.len() as i32);
-
+        let alignment_start = bam_fields::alignment_start_from_raw(bam).map(|p| p as i32)?;
+        let leading_clips = cigar_ops
+            .first()
+            .filter(|&&op| (op & 0xf) == CIGAR_SOFT_CLIP)
+            .map_or(0, |&op| (op >> 4) as i32);
         Some(alignment_start - leading_clips)
     }
 }
@@ -374,23 +360,14 @@ impl Command for DuplexMetrics {
 }
 
 impl DuplexMetrics {
-    /// Converts a two-character tag string to a noodles Tag object.
-    ///
-    /// # Arguments
-    ///
-    /// * `tag_name` - Two-character tag name (e.g., "RX", "MI", "CB")
-    ///
-    /// # Returns
-    ///
-    /// A noodles Tag object
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag name is not exactly 2 characters
-    fn tag_from_string(tag_name: &str) -> noodles::sam::alignment::record::data::field::Tag {
-        assert_eq!(tag_name.len(), 2, "Tag name must be exactly 2 characters");
+    /// Converts a two-character tag string to a byte array for raw BAM tag lookups.
+    fn tag_to_bytes(tag_name: &str) -> [u8; 2] {
         let bytes = tag_name.as_bytes();
-        noodles::sam::alignment::record::data::field::Tag::from([bytes[0], bytes[1]])
+        assert!(
+            bytes.len() == 2 && bytes.is_ascii(),
+            "SAM tag must be exactly 2 ASCII characters: '{tag_name}'"
+        );
+        [bytes[0], bytes[1]]
     }
 
     /// Validates that the input BAM is not a consensus BAM.
@@ -398,37 +375,43 @@ impl DuplexMetrics {
     /// Consensus BAMs (output from simplex/duplex callers) should not be used with this tool.
     /// This checks the first valid R1 record and errors if it contains consensus tags.
     fn validate_not_consensus_bam(&self) -> Result<()> {
-        use fgumi_lib::consensus_tags::is_consensus;
+        let (mut reader, _header) = create_raw_bam_reader(&self.input, 1)?;
+        let mut raw_record = RawRecord::new();
 
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
+        loop {
+            let bytes_read =
+                reader.read_record(&mut raw_record).context("Failed to read BAM record")?;
+            if bytes_read == 0 {
+                break;
+            }
 
-        // Look at the first valid R1 record
-        for result in reader.record_bufs(&header) {
-            let record = result?;
+            let bam = raw_record.as_ref();
+            let flg = bam_fields::flags(bam);
 
             // Only check R1 records that are paired, mapped, and primary
-            let flags = record.flags();
-            if !flags.is_segmented()
-                || !flags.is_first_segment()
-                || flags.is_secondary()
-                || flags.is_supplementary()
-                || flags.is_unmapped()
+            if (flg & bam_fields::flags::PAIRED) == 0
+                || (flg & bam_fields::flags::FIRST_SEGMENT) == 0
+                || (flg & bam_fields::flags::SECONDARY) != 0
+                || (flg & bam_fields::flags::SUPPLEMENTARY) != 0
+                || (flg & bam_fields::flags::UNMAPPED) != 0
             {
                 continue;
             }
 
-            // Check if this is a consensus read
-            if is_consensus(&record) {
+            // Check if this is a consensus read (has cD tag, or both aD and bD tags)
+            let aux = bam_fields::aux_data_slice(bam);
+            let is_consensus = bam_fields::find_tag_type(aux, b"cD").is_some()
+                || (bam_fields::find_tag_type(aux, b"aD").is_some()
+                    && bam_fields::find_tag_type(aux, b"bD").is_some());
+
+            if is_consensus {
+                let name = String::from_utf8_lossy(bam_fields::read_name(bam));
                 anyhow::bail!(
                     "Input BAM file ({}) appears to contain consensus sequences. \
                     duplex-metrics cannot run on consensus BAMs, and instead requires \
                     the UMI-grouped BAM generated by group which is run prior to consensus calling.\n\
-                    First R1 record '{}' has consensus SAM tags present.",
+                    First R1 record '{name}' has consensus SAM tags present.",
                     self.input.display(),
-                    record.name().map_or_else(
-                        || "<unnamed>".to_string(),
-                        |n| String::from_utf8_lossy(n.as_ref()).to_string()
-                    )
                 );
             }
 
@@ -564,10 +547,10 @@ impl DuplexMetrics {
         collectors: &mut [DuplexMetricsCollector],
         umi_consensus_caller: &mut SimpleUmiConsensusCaller,
     ) -> Result<(usize, Vec<usize>)> {
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
+        let (mut reader, header) = create_raw_bam_reader(&self.input, 1)?;
 
-        let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-        let template_iter = TemplateIterator::new(record_iter);
+        let mi_tag = Self::tag_to_bytes(&self.mi_tag);
+        let umi_tag = Self::tag_to_bytes(&self.umi_tag);
 
         // Streaming approach: process groups as they arrive (assumes consecutive ReadInfo grouping)
         // This matches fgbio's takeNextGroup behavior
@@ -577,174 +560,65 @@ impl DuplexMetrics {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
         let mut fraction_template_counts: Vec<usize> = vec![0; fractions.len()];
 
-        for template in template_iter {
-            let template = template?;
-            if template.records.len() < 2 {
-                continue;
-            }
+        // Buffer for grouping consecutive records by read name (template)
+        let mut name_buf: Vec<Vec<u8>> = Vec::new();
+        let mut current_name: Vec<u8> = Vec::new();
+        let mut raw_record = RawRecord::new();
 
-            // Find R1 and R2 that pass fgbio's filtering criteria
-            let r1 = template.records.iter().find(|r| {
-                let f = r.flags();
-                f.is_segmented()
-                    && !f.is_unmapped()
-                    && !f.is_mate_unmapped()
-                    && f.is_first_segment()
-                    && !f.is_secondary()
-                    && !f.is_supplementary()
-            });
-            let r2 = template.records.iter().find(|r| {
-                let f = r.flags();
-                f.is_segmented()
-                    && !f.is_unmapped()
-                    && !f.is_mate_unmapped()
-                    && f.is_last_segment()
-                    && !f.is_secondary()
-                    && !f.is_supplementary()
-            });
+        loop {
+            let bytes_read =
+                reader.read_record(&mut raw_record).context("Failed to read BAM record")?;
+            let at_eof = bytes_read == 0;
 
-            let (r1, r2) = match (r1, r2) {
-                (Some(r1), Some(r2)) => (r1, r2),
-                _ => continue,
-            };
-
-            let record = r1; // Use R1 as the primary record for tags
-
-            // Get read name
-            let read_name = record
-                .name()
-                .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
-                .unwrap_or_default();
-
-            // Get MI tag (molecular identifier)
-            let mi_tag = Self::tag_from_string(&self.mi_tag);
-            let mi =
-                if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-                    record.data().get(&mi_tag)
-                {
-                    String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
-                } else {
-                    continue;
-                };
-
-            // Get UMI tag (raw UMI)
-            let umi_tag = Self::tag_from_string(&self.umi_tag);
-            let rx =
-                if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-                    record.data().get(&umi_tag)
-                {
-                    String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
-                } else {
-                    continue;
-                };
-
-            // Get reference position and calculate insert coordinates
-            let ref_name = if let Some(ref_id) = record.reference_sequence_id() {
-                header.reference_sequences().get_index(ref_id).map(|(name, _)| name.to_string())
+            // Flush the current name group when the name changes or at EOF
+            let flush = if at_eof {
+                !name_buf.is_empty()
             } else {
-                None
+                let name = bam_fields::read_name(raw_record.as_ref());
+                !name_buf.is_empty() && current_name.as_slice() != name
             };
 
-            // Calculate insert coordinates and ReadInfo key (matching fgbio)
-            // r1 and r2 were already found above
-            let (position, end_position, read_info_key) = {
-                let r1_ref = r1.reference_sequence_id();
-                let r2_ref = r2.reference_sequence_id();
+            if flush {
+                if let Some((template_info, read_info_key)) =
+                    Self::extract_template_info(&name_buf, &header, mi_tag, umi_tag)?
+                {
+                    if Self::overlaps_intervals(&template_info, intervals) {
+                        template_count += 1;
+                        progress.log_if_needed(2);
 
-                if r1_ref == r2_ref && r1_ref.is_some() {
-                    // Get unclipped 5' positions (matching fgbio's positionOf)
-                    let r1_5prime = unclipped_five_prime_position(r1);
-                    let r2_5prime = unclipped_five_prime_position(r2);
-                    let r1_strand = r1.flags().is_reverse_complemented();
-                    let r2_strand = r2.flags().is_reverse_complemented();
+                        if current_key.as_ref() != Some(&read_info_key) && !current_group.is_empty()
+                        {
+                            Self::process_coordinate_group(
+                                &current_group,
+                                fractions,
+                                collectors,
+                                umi_consensus_caller,
+                                &mut fraction_template_counts,
+                                self,
+                            );
+                            current_group.clear();
+                        }
 
-                    if let (Some(s1), Some(s2)) = (r1_5prime, r2_5prime) {
-                        // For insert coordinates, use alignment positions
-                        let r1_start = r1.alignment_start().map(|p| usize::from(p) as i32);
-                        let r2_start = r2.alignment_start().map(|p| usize::from(p) as i32);
-                        let r1_end = r1.alignment_end().map(|p| usize::from(p) as i32);
-                        let r2_end = r2.alignment_end().map(|p| usize::from(p) as i32);
-
-                        let (pos, end) = match (r1_start, r2_start, r1_end, r2_end) {
-                            (Some(rs1), Some(rs2), Some(re1), Some(re2)) => {
-                                (rs1.min(rs2), re1.max(re2))
-                            }
-                            (Some(rs1), Some(rs2), _, _) => (rs1.min(rs2), rs1.max(rs2)),
-                            _ => continue,
-                        };
-
-                        // Build ReadInfo key: order by (ref, 5' position) so earlier read is first
-                        // This matches fgbio's ReadInfo ordering
-                        let key = if (r1_ref, s1) <= (r2_ref, s2) {
-                            ReadInfoKey {
-                                ref_index1: r1_ref,
-                                start1: s1,
-                                strand1: r1_strand,
-                                ref_index2: r2_ref,
-                                start2: s2,
-                                strand2: r2_strand,
-                            }
-                        } else {
-                            ReadInfoKey {
-                                ref_index1: r2_ref,
-                                start1: s2,
-                                strand1: r2_strand,
-                                ref_index2: r1_ref,
-                                start2: s1,
-                                strand2: r1_strand,
-                            }
-                        };
-
-                        (pos, end, key)
-                    } else {
-                        continue;
+                        current_group.push(template_info);
+                        current_key = Some(read_info_key);
                     }
-                } else {
-                    continue;
                 }
-            };
-
-            // Compute hash once for this template
-            let hash_fraction = Self::compute_hash_fraction(&read_name);
-
-            let template_info = TemplateInfo {
-                read_name,
-                mi,
-                rx,
-                ref_name,
-                position: Some(position),
-                end_position: Some(end_position),
-                is_reverse: false,
-                hash_fraction,
-                read_info_key: read_info_key.clone(),
-            };
-
-            // Check interval overlap
-            if !Self::overlaps_intervals(&template_info, intervals) {
-                continue;
+                name_buf.clear();
             }
 
-            template_count += 1;
-            progress.log_if_needed(2); // Each template has R1 and R2
-
-            // Streaming: when ReadInfo key changes, process the accumulated group
-            if current_key.as_ref() != Some(&read_info_key) && !current_group.is_empty() {
-                Self::process_coordinate_group(
-                    &current_group,
-                    fractions,
-                    collectors,
-                    umi_consensus_caller,
-                    &mut fraction_template_counts,
-                    self,
-                );
-                current_group.clear();
+            if at_eof {
+                break;
             }
 
-            current_group.push(template_info);
-            current_key = Some(read_info_key);
+            // Add current record to the name group
+            if name_buf.is_empty() {
+                current_name.clear();
+                current_name.extend_from_slice(bam_fields::read_name(raw_record.as_ref()));
+            }
+            name_buf.push(raw_record.as_ref().to_vec());
         }
 
-        // Process the final group
+        // Process the final coordinate group
         if !current_group.is_empty() {
             Self::process_coordinate_group(
                 &current_group,
@@ -758,6 +632,139 @@ impl DuplexMetrics {
 
         progress.log_final();
         Ok((template_count, fraction_template_counts))
+    }
+
+    /// Extracts template information from a group of raw BAM records with the same name.
+    ///
+    /// Finds the primary R1 and R2 records, extracts MI/UMI tags, computes positions,
+    /// and builds the `ReadInfoKey` for coordinate grouping.
+    ///
+    /// Returns `None` if the template should be skipped (fewer than 2 records, missing
+    /// R1/R2, unmapped, different references, or missing required tags).
+    fn extract_template_info(
+        records: &[Vec<u8>],
+        header: &noodles::sam::Header,
+        mi_tag: [u8; 2],
+        umi_tag: [u8; 2],
+    ) -> Result<Option<(TemplateInfo, ReadInfoKey)>> {
+        if records.len() < 2 {
+            return Ok(None);
+        }
+
+        // Find R1: paired, mapped, mate mapped, first segment, primary
+        let r1 = records.iter().find(|bam| {
+            let f = bam_fields::flags(bam);
+            (f & bam_fields::flags::PAIRED) != 0
+                && (f & bam_fields::flags::UNMAPPED) == 0
+                && (f & bam_fields::flags::MATE_UNMAPPED) == 0
+                && (f & bam_fields::flags::FIRST_SEGMENT) != 0
+                && (f & bam_fields::flags::SECONDARY) == 0
+                && (f & bam_fields::flags::SUPPLEMENTARY) == 0
+        });
+
+        // Find R2: paired, mapped, mate mapped, last segment, primary
+        let r2 = records.iter().find(|bam| {
+            let f = bam_fields::flags(bam);
+            (f & bam_fields::flags::PAIRED) != 0
+                && (f & bam_fields::flags::UNMAPPED) == 0
+                && (f & bam_fields::flags::MATE_UNMAPPED) == 0
+                && (f & bam_fields::flags::LAST_SEGMENT) != 0
+                && (f & bam_fields::flags::SECONDARY) == 0
+                && (f & bam_fields::flags::SUPPLEMENTARY) == 0
+        });
+
+        let (r1, r2) = match (r1, r2) {
+            (Some(r1), Some(r2)) => (r1.as_slice(), r2.as_slice()),
+            _ => return Ok(None),
+        };
+
+        // Extract fields from R1 (primary record for tags)
+        let read_name = String::from_utf8_lossy(bam_fields::read_name(r1)).to_string();
+
+        let r1_aux = bam_fields::aux_data_slice(r1);
+        let mi = match bam_fields::find_string_tag(r1_aux, &mi_tag) {
+            Some(b) => std::str::from_utf8(b).context("MI tag is not valid UTF-8")?.to_string(),
+            None => return Ok(None),
+        };
+
+        let rx = match bam_fields::find_string_tag(r1_aux, &umi_tag) {
+            Some(b) => std::str::from_utf8(b).context("UMI tag is not valid UTF-8")?.to_string(),
+            None => return Ok(None),
+        };
+
+        // Reference info
+        let r1_ref_id = bam_fields::ref_id(r1);
+        let r2_ref_id = bam_fields::ref_id(r2);
+        let r1_ref = if r1_ref_id >= 0 { Some(r1_ref_id as usize) } else { None };
+        let r2_ref = if r2_ref_id >= 0 { Some(r2_ref_id as usize) } else { None };
+
+        if r1_ref != r2_ref || r1_ref.is_none() {
+            return Ok(None);
+        }
+
+        let ref_name = header
+            .reference_sequences()
+            .get_index(r1_ref_id as usize)
+            .map(|(name, _)| name.to_string());
+
+        // Get unclipped 5' positions (matching fgbio's positionOf)
+        let r1_5prime = unclipped_five_prime_position_raw(r1);
+        let r2_5prime = unclipped_five_prime_position_raw(r2);
+        let r1_strand = (bam_fields::flags(r1) & bam_fields::flags::REVERSE) != 0;
+        let r2_strand = (bam_fields::flags(r2) & bam_fields::flags::REVERSE) != 0;
+
+        let (s1, s2) = match (r1_5prime, r2_5prime) {
+            (Some(s1), Some(s2)) => (s1, s2),
+            _ => return Ok(None),
+        };
+
+        // Calculate insert coordinates from alignment positions
+        let r1_start = bam_fields::alignment_start_from_raw(r1).map(|p| p as i32);
+        let r2_start = bam_fields::alignment_start_from_raw(r2).map(|p| p as i32);
+        let r1_end = bam_fields::alignment_end_from_raw(r1).map(|p| p as i32);
+        let r2_end = bam_fields::alignment_end_from_raw(r2).map(|p| p as i32);
+
+        let (position, end_position) = match (r1_start, r2_start, r1_end, r2_end) {
+            (Some(rs1), Some(rs2), Some(re1), Some(re2)) => (rs1.min(rs2), re1.max(re2)),
+            (Some(rs1), Some(rs2), _, _) => (rs1.min(rs2), rs1.max(rs2)),
+            _ => return Ok(None),
+        };
+
+        // Build ReadInfoKey: order by (ref, 5' position) so earlier read is first
+        let read_info_key = if (r1_ref, s1) <= (r2_ref, s2) {
+            ReadInfoKey {
+                ref_index1: r1_ref,
+                start1: s1,
+                strand1: r1_strand,
+                ref_index2: r2_ref,
+                start2: s2,
+                strand2: r2_strand,
+            }
+        } else {
+            ReadInfoKey {
+                ref_index1: r2_ref,
+                start1: s2,
+                strand1: r2_strand,
+                ref_index2: r1_ref,
+                start2: s1,
+                strand2: r1_strand,
+            }
+        };
+
+        let hash_fraction = Self::compute_hash_fraction(&read_name);
+
+        let template_info = TemplateInfo {
+            read_name,
+            mi,
+            rx,
+            ref_name,
+            position: Some(position),
+            end_position: Some(end_position),
+            hash_fraction,
+            read_info_key: read_info_key.clone(),
+        };
+
+        Ok(Some((template_info, read_info_key)))
     }
 
     /// Processes a single coordinate group for all downsampling fractions.
@@ -888,9 +895,8 @@ impl DuplexMetrics {
         let hash = murmur3_32(&mut std::io::Cursor::new(read_name.as_bytes()), 42).unwrap_or(0);
 
         // Scala implementation uses Int (i32), takes absolute value, then normalizes
-        // Convert u32 to i32 first to match Scala's behavior
-        let hash_i32 = hash as i32;
-        let positive_hash = hash_i32.abs() as f64;
+        // Use unsigned_abs() to avoid panic on i32::MIN
+        let positive_hash = (hash as i32).unsigned_abs() as f64;
         positive_hash / i32::MAX as f64
     }
 
@@ -2457,7 +2463,6 @@ mod tests {
             ref_name: Some("chr1".to_string()),
             position: Some(1000),
             end_position: Some(1100),
-            is_reverse: false,
             hash_fraction: 0.5,
             read_info_key: ReadInfoKey {
                 ref_index1: Some(0),
@@ -2487,7 +2492,6 @@ mod tests {
             ref_name: None,
             position: None,
             end_position: None,
-            is_reverse: false,
             hash_fraction: 0.5,
             read_info_key: ReadInfoKey {
                 ref_index1: None,
