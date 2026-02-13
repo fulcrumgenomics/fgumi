@@ -85,6 +85,8 @@ compare = []
 simulate = []
 # Enable profiling output for adjacency UMI assigner
 profile-adjacency = []
+# Enable slow stress tests for concurrency testing
+stress-tests = []
 
 [dev-dependencies]
 rstest = "0"
