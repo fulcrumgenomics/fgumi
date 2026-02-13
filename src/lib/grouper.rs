@@ -10,6 +10,7 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
+use crate::metrics::paired_half_match::HalfMatchCollector;
 use crate::sort::bam_fields;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
@@ -367,6 +368,8 @@ pub struct ProcessedPositionGroup {
     pub filter_metrics: FilterMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
+    /// Half-match metrics for paired UMI strategies (optional).
+    pub half_match_metrics: Option<HalfMatchCollector>,
 }
 
 // ============================================================================

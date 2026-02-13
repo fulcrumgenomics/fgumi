@@ -22,6 +22,7 @@ pub use fgumi_metrics::consensus;
 pub use fgumi_metrics::correct;
 pub use fgumi_metrics::duplex;
 pub use fgumi_metrics::group;
+pub mod paired_half_match;
 pub use fgumi_metrics::writer;
 
 // Re-export commonly used types
@@ -33,4 +34,5 @@ pub use duplex::{
     FamilySizeMetric, UmiMetric,
 };
 pub use group::{FamilySizeMetrics, UmiGroupingMetrics};
+pub use paired_half_match::{HalfMatchCollector, PairedHalfMatchMetric};
 pub use writer::write_metrics;
