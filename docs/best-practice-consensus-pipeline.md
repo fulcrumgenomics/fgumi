@@ -121,7 +121,8 @@ For fixed/known UMI sets, correct sequencing errors before alignment:
 fgumi correct \
   --input unmapped.bam \
   --output corrected.bam \
-  --includelist known_umis.txt
+  --umi-files known_umis.txt \
+  --min-distance 1
 ```
 
 ### Step 1.2: Alignment
@@ -339,6 +340,8 @@ C-->D["fgumi dedup"];
 fgumi extract \
   --inputs r1.fq.gz r2.fq.gz \
   --read-structures 8M+T 8M+T \
+  --sample "sample_name" \
+  --library "library_name" \
   --output unmapped.bam
 
 # Step 2: Align reads (fgumi zipper adds required `pa` tag)

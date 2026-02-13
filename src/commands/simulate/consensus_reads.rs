@@ -140,11 +140,7 @@ impl Command for ConsensusReads {
         let mut header_builder = Header::builder();
 
         // Add @PG record
-        header_builder = fgumi_lib::header::add_pg_to_builder(
-            header_builder,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        header_builder = crate::commands::common::add_pg_to_builder(header_builder, command_line)?;
 
         let header = header_builder.build();
 

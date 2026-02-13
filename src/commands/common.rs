@@ -11,6 +11,24 @@ use clap::Args;
 use fgumi_lib::bam_io::is_stdin_path;
 use fgumi_lib::unified_pipeline::SchedulerStrategy;
 use fgumi_lib::validation::validate_file_exists;
+use noodles::sam::Header;
+
+/// Add a @PG record to an existing header, using the current fgumi version.
+///
+/// Wraps [`fgumi_lib::header::add_pg_record`] with the binary's version string.
+pub fn add_pg_record(header: Header, command_line: &str) -> anyhow::Result<Header> {
+    fgumi_lib::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
+}
+
+/// Add a @PG record to a header builder, using the current fgumi version.
+///
+/// Wraps [`fgumi_lib::header::add_pg_to_builder`] with the binary's version string.
+pub fn add_pg_to_builder(
+    builder: noodles::sam::header::Builder,
+    command_line: &str,
+) -> anyhow::Result<noodles::sam::header::Builder> {
+    fgumi_lib::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+}
 
 /// Common input/output options for commands that read a BAM and write a BAM.
 #[derive(Debug, Clone, Args)]

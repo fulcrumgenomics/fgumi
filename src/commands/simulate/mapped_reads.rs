@@ -165,11 +165,7 @@ impl Command for MappedReads {
         header = header.add_reference_sequence(BString::from(&*ref_name), ref_seq);
 
         // Add @PG record
-        header = fgumi_lib::header::add_pg_to_builder(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        header = crate::commands::common::add_pg_to_builder(header, command_line)?;
 
         let header = header.build();
 

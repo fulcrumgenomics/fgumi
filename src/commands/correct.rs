@@ -208,7 +208,7 @@ pub struct CorrectUmis {
     pub rejects_opts: RejectsOptions,
 
     /// Optional output path for metrics TSV file.
-    #[arg(short = 'm', long)]
+    #[arg(short = 'M', long)]
     pub metrics: Option<PathBuf>,
 
     /// Maximum number of mismatches allowed.
@@ -431,11 +431,7 @@ impl Command for CorrectUmis {
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         // Add @PG record with PP chaining to input's last program
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Dispatch based on thread count:
         // - Some(threads) -> 7-step pipeline

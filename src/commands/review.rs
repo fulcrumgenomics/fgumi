@@ -597,11 +597,7 @@ impl Review {
         let header = reader.read_header()?;
 
         // Add @PG record with PP chaining
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Create output BAM
         let consensus_out_path = self.output.with_extension("consensus.bam");
@@ -672,11 +668,7 @@ impl Review {
         let header = reader.read_header()?;
 
         // Add @PG record with PP chaining
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         let grouped_out_path = self.output.with_extension("grouped.bam");
         let mut writer = bam::io::writer::Builder.build_from_path(&grouped_out_path)?;

@@ -108,19 +108,22 @@ codegen-units = 1
 inherits = "release"
 debug = "line-tables-only"
 
-# Config for 'cargo dist'
+# Config for 'dist'
 [workspace.metadata.dist]
-cargo-dist-version = "0.4.3"
-ci = ["github"]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.3"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
 installers = ["shell", "powershell"]
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    
-]
-# Necessary to be able to modify the release workflow
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Skip checking whether the specified configuration files are up to date
 allow-dirty = ["ci"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
 
 
 # The profile that 'cargo dist' will build with

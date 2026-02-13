@@ -52,7 +52,7 @@ Build with features: `cargo build --release --features compare,simulate`
 
 **Core UMI Processing:**
 - `umi/` - UMI assignment strategies: identity, edit-distance, adjacency, paired
-- `consensus/` - Consensus callers: simplex, duplex, codec, vanilla
+- `consensus/` - Consensus callers: simplex, duplex, codec
 - `grouper.rs` - Read grouping by UMI
 
 **I/O:**

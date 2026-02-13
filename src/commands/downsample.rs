@@ -138,11 +138,7 @@ impl Command for Downsample {
         info!("Header validation passed (template-coordinate order confirmed)");
 
         // Add @PG record with PP chaining to input's last program
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Create output BAM writer (single-threaded, downsample doesn't have threads parameter)
         let mut writer =

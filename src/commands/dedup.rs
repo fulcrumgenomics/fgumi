@@ -1037,7 +1037,7 @@ pub struct MarkDuplicates {
     #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
     pub assign_tag: String,
 
-    /// The tag containing the cell barcode (for single-cell data)
+    /// SAM tag containing the cell barcode
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: String,
 
@@ -1115,18 +1115,15 @@ impl Command for MarkDuplicates {
         if !is_template_coordinate_sorted(&header) {
             bail!(
                 "Input BAM must be template-coordinate sorted.\n\n\
-                To sort your BAM file, run:\n  \
-                samtools sort --template-coordinate input.bam -o sorted.bam"
+                To prepare your BAM file, run:\n  \
+                fgumi zipper -u unmapped.bam -r reference.fa -o merged.bam\n  \
+                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
             );
         }
         info!("Template-coordinate sorted");
 
         // Add @PG record
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Prepare tags
         if self.raw_tag.len() != 2 {

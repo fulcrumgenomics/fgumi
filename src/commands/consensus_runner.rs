@@ -92,7 +92,6 @@ pub fn create_unmapped_consensus_header(
     input_header: &Header,
     read_group_id: &str,
     comment_prefix: &str,
-    version: &str,
     command_line: &str,
 ) -> Result<Header> {
     let mut output_header = Header::builder();
@@ -115,7 +114,7 @@ pub fn create_unmapped_consensus_header(
     ));
 
     // Add @PG record
-    output_header = fgumi_lib::header::add_pg_to_builder(output_header, version, command_line)?;
+    output_header = crate::commands::common::add_pg_to_builder(output_header, command_line)?;
 
     Ok(output_header.build())
 }
@@ -199,7 +198,6 @@ impl ConsensusExecutionContext {
         config: ConsensusConfig,
         read_group_id: &str,
         comment_prefix: &str,
-        version: &str,
         command_line: &str,
         read_name_prefix_override: Option<String>,
     ) -> Result<Self> {
@@ -209,13 +207,8 @@ impl ConsensusExecutionContext {
         let (_reader, header) = create_bam_reader(&config.input, 1)?;
 
         // Create output header for unmapped consensus reads
-        let output_header = create_unmapped_consensus_header(
-            &header,
-            read_group_id,
-            comment_prefix,
-            version,
-            command_line,
-        )?;
+        let output_header =
+            create_unmapped_consensus_header(&header, read_group_id, comment_prefix, command_line)?;
 
         // Determine read name prefix
         let read_name_prefix =

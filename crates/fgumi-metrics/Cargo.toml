@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.87.0"
 description = "Structured metric types and TSV writer for fgumi operations"
+repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [dependencies]
