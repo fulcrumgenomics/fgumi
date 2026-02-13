@@ -9,5 +9,8 @@ license = "MIT"
 
 [dependencies]
 
+[dev-dependencies]
+rstest = "0"
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
