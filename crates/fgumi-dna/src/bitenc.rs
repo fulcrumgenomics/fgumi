@@ -122,6 +122,32 @@ impl BitEnc {
         differs.count_ones()
     }
 
+    /// Get the 2-bit encoded base at the given position.
+    ///
+    /// Returns a value in 0..4 representing A, C, G, T respectively.
+    #[inline]
+    #[must_use]
+    pub fn base_at(&self, pos: usize) -> u8 {
+        debug_assert!(pos < self.len as usize, "Position out of bounds");
+        #[allow(clippy::cast_possible_truncation)] // masked to 2 bits
+        let base = ((self.bits >> (pos * 2)) & 0b11) as u8;
+        base
+    }
+
+    /// Return a copy of this sequence with a different base at the given position.
+    ///
+    /// `base` must be in 0..4 (A=0, C=1, G=2, T=3).
+    #[inline]
+    #[must_use]
+    pub fn with_base_at(&self, pos: usize, base: u8) -> Self {
+        debug_assert!(pos < self.len as usize, "Position out of bounds");
+        debug_assert!(base < 4, "Invalid base value");
+        let bit_pos = pos * 2;
+        let mask = !(0b11u64 << bit_pos);
+        let new_bits = (self.bits & mask) | (u64::from(base) << bit_pos);
+        Self { bits: new_bits, len: self.len }
+    }
+
     /// Extract bits for bases `[start_base, start_base + len)` as a u32.
     ///
     /// Each base is 2 bits, so this can extract up to 16 bases into a u32.
@@ -230,6 +256,37 @@ mod tests {
         let multi = BitEnc::from_umi_str("AC-GT-TG").unwrap();
         assert_eq!(multi.len(), 6);
         assert_eq!(multi, BitEnc::from_bytes(b"ACGTTG").unwrap());
+    }
+
+    #[rstest::rstest]
+    #[case(0, 0)] // A
+    #[case(1, 1)] // C
+    #[case(2, 2)] // G
+    #[case(3, 3)] // T
+    fn test_base_at(#[case] pos: usize, #[case] expected: u8) {
+        let enc = BitEnc::from_bytes(b"ACGT").unwrap();
+        assert_eq!(enc.base_at(pos), expected);
+    }
+
+    #[test]
+    fn test_with_base_at() {
+        let enc = BitEnc::from_bytes(b"AAAA").unwrap();
+
+        // Change position 1 to C
+        let modified = enc.with_base_at(1, 1);
+        assert_eq!(modified, BitEnc::from_bytes(b"ACAA").unwrap());
+
+        // Change position 3 to T
+        let modified2 = enc.with_base_at(3, 3);
+        assert_eq!(modified2, BitEnc::from_bytes(b"AAAT").unwrap());
+
+        // Round-trip: replacing a base with its current value is idempotent
+        let enc2 = BitEnc::from_bytes(b"ACGT").unwrap();
+        for pos in 0..4 {
+            let base = enc2.base_at(pos);
+            let restored = enc2.with_base_at(pos, base);
+            assert_eq!(restored, enc2);
+        }
     }
 
     #[test]

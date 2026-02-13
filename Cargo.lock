@@ -721,6 +721,9 @@ dependencies = [
 [[package]]
 name = "fgumi-dna"
 version = "0.1.0"
+dependencies = [
+ "rstest",
+]
 
 [[package]]
 name = "fgumi-metrics"
