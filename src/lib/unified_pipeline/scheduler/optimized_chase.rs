@@ -15,7 +15,7 @@
 //!    step, temporarily avoid it to let the specialized thread work.
 
 use super::{BackpressureState, Direction, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Optimized chase-bottleneck scheduler.
 pub struct OptimizedChaseScheduler {
@@ -38,6 +38,8 @@ pub struct OptimizedChaseScheduler {
     is_exclusive_specialist: bool,
     /// The exclusive step this thread specializes in (if any).
     exclusive_specialty: Option<PipelineStep>,
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl OptimizedChaseScheduler {
@@ -83,7 +85,7 @@ impl OptimizedChaseScheduler {
 
     /// Create a new optimized chase scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let (current_step, is_exclusive_specialist, exclusive_specialty) =
             Self::determine_role(thread_id, num_threads);
 
@@ -97,6 +99,7 @@ impl OptimizedChaseScheduler {
             exclusive_backoff: 0,
             is_exclusive_specialist,
             exclusive_specialty,
+            active_steps,
         }
     }
 
@@ -248,7 +251,8 @@ impl Scheduler for OptimizedChaseScheduler {
         }
 
         self.build_priorities(bp);
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, was_contention: bool) {
@@ -315,6 +319,10 @@ impl Scheduler for OptimizedChaseScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -323,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_thread_0_is_reader_specialist() {
-        let scheduler = OptimizedChaseScheduler::new(0, 8);
+        let scheduler = OptimizedChaseScheduler::new(0, 8, ActiveSteps::all());
         assert_eq!(scheduler.current_step, PipelineStep::Read);
         assert!(scheduler.is_exclusive_specialist);
         assert_eq!(scheduler.exclusive_specialty, Some(PipelineStep::Read));
@@ -331,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_thread_7_is_writer_specialist() {
-        let scheduler = OptimizedChaseScheduler::new(7, 8);
+        let scheduler = OptimizedChaseScheduler::new(7, 8, ActiveSteps::all());
         assert_eq!(scheduler.current_step, PipelineStep::Write);
         assert!(scheduler.is_exclusive_specialist);
         assert_eq!(scheduler.exclusive_specialty, Some(PipelineStep::Write));
@@ -339,21 +347,21 @@ mod tests {
 
     #[test]
     fn test_thread_1_is_boundary_specialist() {
-        let scheduler = OptimizedChaseScheduler::new(1, 8);
+        let scheduler = OptimizedChaseScheduler::new(1, 8, ActiveSteps::all());
         assert_eq!(scheduler.current_step, PipelineStep::FindBoundaries);
         assert!(scheduler.is_exclusive_specialist);
     }
 
     #[test]
     fn test_thread_6_is_group_specialist() {
-        let scheduler = OptimizedChaseScheduler::new(6, 8);
+        let scheduler = OptimizedChaseScheduler::new(6, 8, ActiveSteps::all());
         assert_eq!(scheduler.current_step, PipelineStep::Group);
         assert!(scheduler.is_exclusive_specialist);
     }
 
     #[test]
     fn test_middle_threads_start_on_bottleneck() {
-        let scheduler = OptimizedChaseScheduler::new(2, 8);
+        let scheduler = OptimizedChaseScheduler::new(2, 8, ActiveSteps::all());
         assert!(
             scheduler.current_step == PipelineStep::Compress
                 || scheduler.current_step == PipelineStep::Serialize
@@ -363,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_bottleneck_steps_in_priorities() {
-        let mut scheduler = OptimizedChaseScheduler::new(3, 8);
+        let mut scheduler = OptimizedChaseScheduler::new(3, 8, ActiveSteps::all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
 
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_exclusive_backoff_after_contention() {
-        let mut scheduler = OptimizedChaseScheduler::new(3, 8); // Non-specialist
+        let mut scheduler = OptimizedChaseScheduler::new(3, 8, ActiveSteps::all()); // Non-specialist
         scheduler.current_step = PipelineStep::Group;
 
         // Fail with contention on exclusive step
@@ -388,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_specialist_no_backoff() {
-        let mut scheduler = OptimizedChaseScheduler::new(0, 8); // Reader specialist
+        let mut scheduler = OptimizedChaseScheduler::new(0, 8, ActiveSteps::all()); // Reader specialist
 
         // Fail with contention on Read
         scheduler.record_outcome(PipelineStep::Read, false, true);
@@ -399,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_bottleneck_stickiness() {
-        let mut scheduler = OptimizedChaseScheduler::new(3, 8);
+        let mut scheduler = OptimizedChaseScheduler::new(3, 8, ActiveSteps::all());
         scheduler.current_step = PipelineStep::Compress;
 
         // First failure: stay sticky
@@ -421,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_wrap_to_parallel_steps() {
-        let mut scheduler = OptimizedChaseScheduler::new(3, 8);
+        let mut scheduler = OptimizedChaseScheduler::new(3, 8, ActiveSteps::all());
         scheduler.current_step = PipelineStep::Write;
         scheduler.direction = Direction::Forward;
         scheduler.bottleneck_streak = 10; // Past threshold
@@ -434,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_priorities_returns_all_steps() {
-        let mut scheduler = OptimizedChaseScheduler::new(3, 8);
+        let mut scheduler = OptimizedChaseScheduler::new(3, 8, ActiveSteps::all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities.len(), 9);

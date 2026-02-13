@@ -11,7 +11,7 @@
 //! 5. Always return all steps to try in priority order
 
 use super::{BackpressureState, Direction, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Chase-bottleneck scheduler with dynamic step selection.
 pub struct ChaseBottleneckScheduler {
@@ -26,6 +26,8 @@ pub struct ChaseBottleneckScheduler {
     direction: Direction,
     /// Priority buffer for returning all steps in adaptive order.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl ChaseBottleneckScheduler {
@@ -44,7 +46,7 @@ impl ChaseBottleneckScheduler {
 
     /// Create a new chase-bottleneck scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let current_step = Self::initial_step(thread_id, num_threads);
         Self {
             thread_id,
@@ -52,6 +54,7 @@ impl ChaseBottleneckScheduler {
             current_step,
             direction: Direction::Forward,
             priority_buffer: Self::STEPS, // Will be reordered in get_priorities
+            active_steps,
         }
     }
 
@@ -175,7 +178,8 @@ impl Scheduler for ChaseBottleneckScheduler {
 
         // Build priority list with current step first, expanding in preferred direction
         self.build_priorities();
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -213,34 +217,42 @@ impl Scheduler for ChaseBottleneckScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_initial_step_reader() {
-        let scheduler = ChaseBottleneckScheduler::new(0, 8);
+        let scheduler = ChaseBottleneckScheduler::new(0, 8, all());
         assert_eq!(scheduler.current_step, PipelineStep::Read);
     }
 
     #[test]
     fn test_initial_step_writer() {
-        let scheduler = ChaseBottleneckScheduler::new(7, 8);
+        let scheduler = ChaseBottleneckScheduler::new(7, 8, all());
         assert_eq!(scheduler.current_step, PipelineStep::Write);
     }
 
     #[test]
     fn test_initial_step_middle() {
-        let scheduler = ChaseBottleneckScheduler::new(2, 8);
+        let scheduler = ChaseBottleneckScheduler::new(2, 8, all());
         // Thread 2 (index 1 in middle threads) should start at Decode
         assert_eq!(scheduler.current_step, PipelineStep::Decode);
     }
 
     #[test]
     fn test_get_priorities_returns_all_steps() {
-        let mut scheduler = ChaseBottleneckScheduler::new(3, 8);
+        let mut scheduler = ChaseBottleneckScheduler::new(3, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities.len(), 9);
@@ -248,14 +260,14 @@ mod tests {
 
     #[test]
     fn test_sticky_on_success() {
-        let mut scheduler = ChaseBottleneckScheduler::new(3, 8);
+        let mut scheduler = ChaseBottleneckScheduler::new(3, 8, all());
         scheduler.record_outcome(PipelineStep::Compress, true, false);
         assert_eq!(scheduler.current_step, PipelineStep::Compress);
     }
 
     #[test]
     fn test_move_on_failure_forward() {
-        let mut scheduler = ChaseBottleneckScheduler::new(3, 8);
+        let mut scheduler = ChaseBottleneckScheduler::new(3, 8, all());
         scheduler.current_step = PipelineStep::Process;
         scheduler.direction = Direction::Forward;
         scheduler.record_outcome(PipelineStep::Process, false, false);
@@ -264,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_move_on_failure_backward() {
-        let mut scheduler = ChaseBottleneckScheduler::new(3, 8);
+        let mut scheduler = ChaseBottleneckScheduler::new(3, 8, all());
         scheduler.current_step = PipelineStep::Process;
         scheduler.direction = Direction::Backward;
         scheduler.record_outcome(PipelineStep::Process, false, false);
@@ -273,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_output_high_sets_forward() {
-        let mut scheduler = ChaseBottleneckScheduler::new(3, 8);
+        let mut scheduler = ChaseBottleneckScheduler::new(3, 8, all());
         scheduler.direction = Direction::Backward;
         let bp = BackpressureState {
             output_high: true,
@@ -288,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_input_low_sets_backward() {
-        let mut scheduler = ChaseBottleneckScheduler::new(3, 8);
+        let mut scheduler = ChaseBottleneckScheduler::new(3, 8, all());
         scheduler.direction = Direction::Forward;
         let bp = BackpressureState {
             output_high: false,

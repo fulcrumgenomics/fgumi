@@ -8,7 +8,7 @@
 //! `n_i` is attempts for step i, and c is the exploration constant.
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// UCB scheduler with configurable exploration constant.
 pub struct UCBScheduler {
@@ -26,6 +26,8 @@ pub struct UCBScheduler {
     exploration_c: f64,
     /// Priority buffer.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl UCBScheduler {
@@ -47,7 +49,7 @@ impl UCBScheduler {
 
     /// Create a new UCB scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         Self {
             thread_id,
             num_threads,
@@ -56,6 +58,7 @@ impl UCBScheduler {
             successes: [0; 9],
             exploration_c: Self::DEFAULT_EXPLORATION_C,
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -98,7 +101,8 @@ impl Scheduler for UCBScheduler {
             self.priority_buffer[priority] = Self::STEPS[*step_idx];
         }
 
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -117,15 +121,23 @@ impl Scheduler for UCBScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_unexplored_steps_prioritized() {
-        let mut scheduler = UCBScheduler::new(0, 8);
+        let mut scheduler = UCBScheduler::new(0, 8, all());
 
         // Try one step many times
         for _ in 0..100 {
@@ -143,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_high_success_rate_preferred() {
-        let mut scheduler = UCBScheduler::new(0, 8);
+        let mut scheduler = UCBScheduler::new(0, 8, all());
 
         // Give Read high success rate
         for _ in 0..100 {
@@ -162,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_exploration_decreases_with_attempts() {
-        let mut scheduler = UCBScheduler::new(0, 8);
+        let mut scheduler = UCBScheduler::new(0, 8, all());
         scheduler.total_attempts = 1000;
 
         // Step with few attempts has higher exploration bonus

@@ -6,7 +6,7 @@
 
 use clap::ValueEnum;
 
-use super::base::PipelineStep;
+use super::base::{ActiveSteps, PipelineStep};
 
 #[doc(hidden)]
 pub mod backpressure_proportional;
@@ -242,14 +242,22 @@ pub trait Scheduler: Send {
     /// Get the number of threads in the pipeline.
     fn num_threads(&self) -> usize;
 
+    /// Get the active steps for this pipeline.
+    fn active_steps(&self) -> &ActiveSteps;
+
     /// Returns the exclusive step this thread owns, if any.
     ///
-    /// Thread assignment for `num_threads >= 4`:
-    /// - T0: `Read`
-    /// - T1: `FindBoundaries`
-    /// - T\[N-2\]: `Group`
-    /// - T\[N-1\]: `Write`
+    /// Maps thread IDs to active exclusive steps from both ends:
+    /// - T0 → first active exclusive step
+    /// - T\[N-1\] → last active exclusive step
+    /// - T1 → second exclusive step (from front)
+    /// - T\[N-2\] → second-to-last exclusive step (from back)
     /// - Others: None (parallel-only workers)
+    ///
+    /// This preserves backward compatibility: with all 4 exclusive steps
+    /// (`Read`, `FindBoundaries`, `Group`, `Write`) and 8 threads, the mapping is
+    /// T0→Read, T1→FindBoundaries, T6→Group, T7→Write — same as the
+    /// original hardcoded mapping.
     ///
     /// For `num_threads < 4`: Returns `None` for all threads (relaxed ownership).
     fn exclusive_step_owned(&self) -> Option<PipelineStep> {
@@ -257,16 +265,44 @@ pub trait Scheduler: Send {
         let thread_id = self.thread_id();
 
         if num_threads < 4 {
-            None
-        } else {
-            match thread_id {
-                0 => Some(PipelineStep::Read),
-                1 => Some(PipelineStep::FindBoundaries),
-                t if t == num_threads - 2 => Some(PipelineStep::Group),
-                t if t == num_threads - 1 => Some(PipelineStep::Write),
-                _ => None,
-            }
+            return None;
         }
+
+        let exclusive = self.active_steps().exclusive_steps();
+        if exclusive.is_empty() {
+            return None;
+        }
+
+        // T0 → first exclusive step
+        if thread_id == 0 {
+            return Some(exclusive[0]);
+        }
+
+        // TN-1 → last exclusive step (if more than one)
+        if thread_id == num_threads - 1 && exclusive.len() > 1 {
+            return Some(*exclusive.last().unwrap());
+        }
+
+        // Interior exclusive steps: assign from both ends
+        let num_interior = exclusive.len().saturating_sub(2);
+        if num_interior == 0 {
+            return None;
+        }
+
+        // Front half: T1→exclusive[1], T2→exclusive[2], ...
+        let front_count = num_interior.div_ceil(2);
+        if thread_id >= 1 && thread_id <= front_count {
+            return Some(exclusive[thread_id]);
+        }
+
+        // Back half: TN-2→exclusive[len-2], TN-3→exclusive[len-3], ...
+        let back_count = num_interior - front_count;
+        let back_thread_offset = num_threads - 1 - thread_id;
+        if back_thread_offset >= 1 && back_thread_offset <= back_count {
+            return Some(exclusive[exclusive.len() - 1 - back_thread_offset]);
+        }
+
+        None
     }
 
     /// Returns true if this thread should attempt the given step.
@@ -324,45 +360,48 @@ pub fn create_scheduler(
     strategy: SchedulerStrategy,
     thread_id: usize,
     num_threads: usize,
+    active_steps: ActiveSteps,
 ) -> Box<dyn Scheduler> {
     match strategy {
         SchedulerStrategy::FixedPriority => {
-            Box::new(FixedPriorityScheduler::new(thread_id, num_threads))
+            Box::new(FixedPriorityScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::ChaseBottleneck => {
-            Box::new(ChaseBottleneckScheduler::new(thread_id, num_threads))
+            Box::new(ChaseBottleneckScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::ThompsonSampling => {
-            Box::new(ThompsonSamplingScheduler::new(thread_id, num_threads))
+            Box::new(ThompsonSamplingScheduler::new(thread_id, num_threads, active_steps))
         }
-        SchedulerStrategy::UCB => Box::new(UCBScheduler::new(thread_id, num_threads)),
+        SchedulerStrategy::UCB => Box::new(UCBScheduler::new(thread_id, num_threads, active_steps)),
         SchedulerStrategy::EpsilonGreedy => {
-            Box::new(EpsilonGreedyScheduler::new(thread_id, num_threads))
+            Box::new(EpsilonGreedyScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::ThompsonWithPriors => {
-            Box::new(ThompsonWithPriorsScheduler::new(thread_id, num_threads))
+            Box::new(ThompsonWithPriorsScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::HybridAdaptive => {
-            Box::new(HybridAdaptiveScheduler::new(thread_id, num_threads))
+            Box::new(HybridAdaptiveScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::BackpressureProportional => {
-            Box::new(BackpressureProportionalScheduler::new(thread_id, num_threads))
+            Box::new(BackpressureProportionalScheduler::new(thread_id, num_threads, active_steps))
         }
-        SchedulerStrategy::TwoPhase => Box::new(TwoPhaseScheduler::new(thread_id, num_threads)),
+        SchedulerStrategy::TwoPhase => {
+            Box::new(TwoPhaseScheduler::new(thread_id, num_threads, active_steps))
+        }
         SchedulerStrategy::StickyWorkStealing => {
-            Box::new(StickyWorkStealingScheduler::new(thread_id, num_threads))
+            Box::new(StickyWorkStealingScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::LearnedAffinity => {
-            Box::new(LearnedAffinityScheduler::new(thread_id, num_threads))
+            Box::new(LearnedAffinityScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::OptimizedChase => {
-            Box::new(OptimizedChaseScheduler::new(thread_id, num_threads))
+            Box::new(OptimizedChaseScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::BalancedChase => {
-            Box::new(BalancedChaseScheduler::new(thread_id, num_threads))
+            Box::new(BalancedChaseScheduler::new(thread_id, num_threads, active_steps))
         }
         SchedulerStrategy::BalancedChaseDrain => {
-            Box::new(BalancedChaseDrainScheduler::new(thread_id, num_threads))
+            Box::new(BalancedChaseDrainScheduler::new(thread_id, num_threads, active_steps))
         }
     }
 }
@@ -370,17 +409,10 @@ pub fn create_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_create_fixed_priority_scheduler() {
-        let scheduler = create_scheduler(SchedulerStrategy::FixedPriority, 0, 8);
-        assert_eq!(scheduler.thread_id(), 0);
-    }
-
-    #[test]
-    fn test_create_chase_bottleneck_scheduler() {
-        let scheduler = create_scheduler(SchedulerStrategy::ChaseBottleneck, 0, 8);
-        assert_eq!(scheduler.thread_id(), 0);
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
     }
 
     #[test]
@@ -388,36 +420,31 @@ mod tests {
         assert_eq!(SchedulerStrategy::default(), SchedulerStrategy::BalancedChaseDrain);
     }
 
-    #[test]
-    fn test_create_all_schedulers() {
-        let strategies = [
-            SchedulerStrategy::FixedPriority,
-            SchedulerStrategy::ChaseBottleneck,
-            SchedulerStrategy::ThompsonSampling,
-            SchedulerStrategy::UCB,
-            SchedulerStrategy::EpsilonGreedy,
-            SchedulerStrategy::ThompsonWithPriors,
-            SchedulerStrategy::HybridAdaptive,
-            SchedulerStrategy::BackpressureProportional,
-            SchedulerStrategy::TwoPhase,
-            SchedulerStrategy::StickyWorkStealing,
-            SchedulerStrategy::LearnedAffinity,
-            SchedulerStrategy::OptimizedChase,
-            SchedulerStrategy::BalancedChase,
-            SchedulerStrategy::BalancedChaseDrain,
-        ];
-
-        for strategy in strategies {
-            let scheduler = create_scheduler(strategy, 0, 8);
-            assert_eq!(scheduler.thread_id(), 0);
-        }
+    #[rstest]
+    #[case::fixed_priority(SchedulerStrategy::FixedPriority)]
+    #[case::chase_bottleneck(SchedulerStrategy::ChaseBottleneck)]
+    #[case::thompson_sampling(SchedulerStrategy::ThompsonSampling)]
+    #[case::ucb(SchedulerStrategy::UCB)]
+    #[case::epsilon_greedy(SchedulerStrategy::EpsilonGreedy)]
+    #[case::thompson_with_priors(SchedulerStrategy::ThompsonWithPriors)]
+    #[case::hybrid_adaptive(SchedulerStrategy::HybridAdaptive)]
+    #[case::backpressure_proportional(SchedulerStrategy::BackpressureProportional)]
+    #[case::two_phase(SchedulerStrategy::TwoPhase)]
+    #[case::sticky_work_stealing(SchedulerStrategy::StickyWorkStealing)]
+    #[case::learned_affinity(SchedulerStrategy::LearnedAffinity)]
+    #[case::optimized_chase(SchedulerStrategy::OptimizedChase)]
+    #[case::balanced_chase(SchedulerStrategy::BalancedChase)]
+    #[case::balanced_chase_drain(SchedulerStrategy::BalancedChaseDrain)]
+    fn test_create_scheduler(#[case] strategy: SchedulerStrategy) {
+        let scheduler = create_scheduler(strategy, 0, 8, all());
+        assert_eq!(scheduler.thread_id(), 0);
     }
 
     #[test]
     fn test_exclusive_step_ownership_small_thread_counts() {
         // 2 threads: relaxed ownership (all can attempt all)
-        let s0 = create_scheduler(SchedulerStrategy::BalancedChase, 0, 2);
-        let s1 = create_scheduler(SchedulerStrategy::BalancedChase, 1, 2);
+        let s0 = create_scheduler(SchedulerStrategy::BalancedChase, 0, 2, all());
+        let s1 = create_scheduler(SchedulerStrategy::BalancedChase, 1, 2, all());
 
         assert!(s0.exclusive_step_owned().is_none());
         assert!(s1.exclusive_step_owned().is_none());
@@ -425,9 +452,9 @@ mod tests {
         assert!(s1.should_attempt_step(PipelineStep::Group));
 
         // 3 threads: also relaxed
-        let s0 = create_scheduler(SchedulerStrategy::BalancedChase, 0, 3);
-        let s1 = create_scheduler(SchedulerStrategy::BalancedChase, 1, 3);
-        let s2 = create_scheduler(SchedulerStrategy::BalancedChase, 2, 3);
+        let s0 = create_scheduler(SchedulerStrategy::BalancedChase, 0, 3, all());
+        let s1 = create_scheduler(SchedulerStrategy::BalancedChase, 1, 3, all());
+        let s2 = create_scheduler(SchedulerStrategy::BalancedChase, 2, 3, all());
 
         assert!(s0.should_attempt_step(PipelineStep::FindBoundaries));
         assert!(s1.should_attempt_step(PipelineStep::Group));
@@ -438,7 +465,7 @@ mod tests {
     fn test_exclusive_step_ownership_eight_threads() {
         // 8 threads: strict ownership
         for thread_id in 0..8 {
-            let scheduler = create_scheduler(SchedulerStrategy::BalancedChase, thread_id, 8);
+            let scheduler = create_scheduler(SchedulerStrategy::BalancedChase, thread_id, 8, all());
 
             let expected_ownership = match thread_id {
                 0 => Some(PipelineStep::Read),
@@ -458,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_should_attempt_step_parallel_always_allowed() {
-        let scheduler = create_scheduler(SchedulerStrategy::BalancedChase, 3, 8);
+        let scheduler = create_scheduler(SchedulerStrategy::BalancedChase, 3, 8, all());
 
         // Parallel steps: all threads can attempt
         assert!(scheduler.should_attempt_step(PipelineStep::Decompress));
@@ -471,14 +498,14 @@ mod tests {
     #[test]
     fn test_should_attempt_step_exclusive_only_owner() {
         // T3 (middle worker) should not attempt any exclusive steps
-        let t3 = create_scheduler(SchedulerStrategy::BalancedChase, 3, 8);
+        let t3 = create_scheduler(SchedulerStrategy::BalancedChase, 3, 8, all());
         assert!(!t3.should_attempt_step(PipelineStep::Read));
         assert!(!t3.should_attempt_step(PipelineStep::FindBoundaries));
         assert!(!t3.should_attempt_step(PipelineStep::Group));
         assert!(!t3.should_attempt_step(PipelineStep::Write));
 
         // T6 (Group owner) should only attempt Group among exclusive steps
-        let t6 = create_scheduler(SchedulerStrategy::BalancedChase, 6, 8);
+        let t6 = create_scheduler(SchedulerStrategy::BalancedChase, 6, 8, all());
         assert!(!t6.should_attempt_step(PipelineStep::Read));
         assert!(!t6.should_attempt_step(PipelineStep::FindBoundaries));
         assert!(t6.should_attempt_step(PipelineStep::Group)); // Owner!
@@ -501,17 +528,18 @@ mod tests {
             SchedulerStrategy::TwoPhase,
             SchedulerStrategy::StickyWorkStealing,
             SchedulerStrategy::LearnedAffinity,
+            SchedulerStrategy::BalancedChaseDrain,
         ];
 
         for strategy in strategies {
-            let t6 = create_scheduler(strategy, 6, 8);
+            let t6 = create_scheduler(strategy, 6, 8, all());
             assert_eq!(
                 t6.exclusive_step_owned(),
                 Some(PipelineStep::Group),
                 "{strategy:?} T6 should own Group"
             );
 
-            let t3 = create_scheduler(strategy, 3, 8);
+            let t3 = create_scheduler(strategy, 3, 8, all());
             assert_eq!(t3.exclusive_step_owned(), None, "{strategy:?} T3 should own nothing");
         }
     }
@@ -520,10 +548,10 @@ mod tests {
     fn test_four_thread_edge_case() {
         // 4 threads: minimal strict ownership
         // T0 = Read, T1 = FindBoundaries, T2 = Group (N-2), T3 = Write (N-1)
-        let t0 = create_scheduler(SchedulerStrategy::BalancedChase, 0, 4);
-        let t1 = create_scheduler(SchedulerStrategy::BalancedChase, 1, 4);
-        let t2 = create_scheduler(SchedulerStrategy::BalancedChase, 2, 4);
-        let t3 = create_scheduler(SchedulerStrategy::BalancedChase, 3, 4);
+        let t0 = create_scheduler(SchedulerStrategy::BalancedChase, 0, 4, all());
+        let t1 = create_scheduler(SchedulerStrategy::BalancedChase, 1, 4, all());
+        let t2 = create_scheduler(SchedulerStrategy::BalancedChase, 2, 4, all());
+        let t3 = create_scheduler(SchedulerStrategy::BalancedChase, 3, 4, all());
 
         assert_eq!(t0.exclusive_step_owned(), Some(PipelineStep::Read));
         assert_eq!(t1.exclusive_step_owned(), Some(PipelineStep::FindBoundaries));

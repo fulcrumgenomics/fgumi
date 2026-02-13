@@ -687,3 +687,212 @@ fn test_parallel_parse_determinism() {
         }
     }
 }
+
+// ============================================================================
+// Unified Pipeline Path Tests
+// ============================================================================
+
+/// Test BGZF+sync: multithreaded output matches single-threaded content.
+///
+/// This verifies the new BGZF+synchronized code path (which didn't exist before
+/// the unified pipeline) produces correct output by comparing against the
+/// single-threaded fast-path result.
+#[test]
+fn test_bgzf_sync_multithreaded_matches_single_threaded() {
+    let tmp = TempDir::new().unwrap();
+
+    let records_r1 = vec![
+        ("read1", "ACGTACGTAAAA", "IIIIIIIIIIII"),
+        ("read2", "TTTTTCGTACGT", "IIIIIIIIIIII"),
+        ("read3", "CCCCGGGGAAAA", "IIIIIIIIIIII"),
+    ];
+    let records_r2 = vec![
+        ("read1", "GGGGCGTACCCC", "IIIIIIIIIIII"),
+        ("read2", "AAAAACGTAAAA", "IIIIIIIIIIII"),
+        ("read3", "TTTTCCCCGGGG", "IIIIIIIIIIII"),
+    ];
+
+    let r1 = create_bgzf_fastq(&tmp, "r1.fq.bgz", &records_r1);
+    let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &records_r2);
+
+    // Run single-threaded (fast-path)
+    let output_st = tmp.path().join("output_st.bam");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output_st.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--threads",
+            "1",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to execute single-threaded extract");
+    assert!(status.success(), "Single-threaded extract failed");
+
+    // Run multithreaded (BGZF+sync through unified pipeline)
+    let output_threaded = tmp.path().join("output_mt.bam");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output_threaded.to_str().unwrap(),
+            "--read-structures",
+            "5M+T",
+            "5M+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--threads",
+            "4",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to execute multithreaded extract");
+    assert!(status.success(), "Multithreaded extract failed");
+
+    // Compare record content (not just count)
+    let st_records = read_bam_records(&output_st);
+    let mt_records = read_bam_records(&output_threaded);
+
+    assert_eq!(st_records.len(), mt_records.len(), "Record count mismatch");
+
+    for (i, (st, mt)) in st_records.iter().zip(mt_records.iter()).enumerate() {
+        assert_eq!(
+            st.sequence().as_ref(),
+            mt.sequence().as_ref(),
+            "Record {i}: sequence differs between single-threaded and multithreaded"
+        );
+        assert_eq!(
+            st.quality_scores().as_ref(),
+            mt.quality_scores().as_ref(),
+            "Record {i}: quality differs between single-threaded and multithreaded"
+        );
+    }
+}
+
+/// Test variable-length reads through the `RecordCount` reader.
+///
+/// The O(N^2) regression was caused by variable-length reads creating consistent
+/// record count mismatches between R1 and R2 in the old byte-chunk reader.
+/// The `RecordCount` reader fixes this by reading a fixed number of records.
+#[test]
+fn test_variable_length_reads_gzip() {
+    let tmp = TempDir::new().unwrap();
+
+    // Create reads with significantly different lengths between R1 and R2
+    let records_r1 = vec![
+        ("read1", "ACGTAAA", "IIIIIII"),                           // 7bp
+        ("read2", "TTTTTCCCCCCCCCC", "IIIIIIIIIIIIIII"),           // 15bp
+        ("read3", "CCCCG", "IIIII"),                               // 5bp
+        ("read4", "GGGGAAAAAATTTTTTCCCC", "IIIIIIIIIIIIIIIIIIII"), // 20bp
+    ];
+    let records_r2 = vec![
+        ("read1", "GGGGCGTACCCCCCCCCCCC", "IIIIIIIIIIIIIIIIIIII"), // 20bp
+        ("read2", "AAAAA", "IIIII"),                               // 5bp
+        ("read3", "TTTTCCCCGGGGAAAA", "IIIIIIIIIIIIIIII"),         // 16bp
+        ("read4", "ACGTAC", "IIIIII"),                             // 6bp
+    ];
+
+    let r1 = create_gzip_fastq(&tmp, "r1.fq.gz", &records_r1);
+    let r2 = create_gzip_fastq(&tmp, "r2.fq.gz", &records_r2);
+    let output = tmp.path().join("output.bam");
+
+    // Run multithreaded (exercises RecordCount reader for gzip+sync)
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "+T",
+            "+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--threads",
+            "4",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to execute extract command");
+
+    assert!(status.success(), "Extract with variable-length reads failed");
+
+    let records = read_bam_records(&output);
+    assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
+}
+
+/// Test variable-length reads with BGZF compression.
+///
+/// Exercises the BGZF+synchronized path with reads of different lengths.
+#[test]
+fn test_variable_length_reads_bgzf() {
+    let tmp = TempDir::new().unwrap();
+
+    let records_r1 = vec![
+        ("read1", "ACGTAAA", "IIIIIII"),
+        ("read2", "TTTTTCCCCCCCCCC", "IIIIIIIIIIIIIII"),
+        ("read3", "CCCCG", "IIIII"),
+        ("read4", "GGGGAAAAAATTTTTTCCCC", "IIIIIIIIIIIIIIIIIIII"),
+    ];
+    let records_r2 = vec![
+        ("read1", "GGGGCGTACCCCCCCCCCCC", "IIIIIIIIIIIIIIIIIIII"),
+        ("read2", "AAAAA", "IIIII"),
+        ("read3", "TTTTCCCCGGGGAAAA", "IIIIIIIIIIIIIIII"),
+        ("read4", "ACGTAC", "IIIIII"),
+    ];
+
+    let r1 = create_bgzf_fastq(&tmp, "r1.fq.bgz", &records_r1);
+    let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &records_r2);
+    let output = tmp.path().join("output.bam");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "extract",
+            "--inputs",
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--read-structures",
+            "+T",
+            "+T",
+            "--sample",
+            "test_sample",
+            "--library",
+            "test_library",
+            "--threads",
+            "4",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to execute extract command");
+
+    assert!(status.success(), "BGZF extract with variable-length reads failed");
+
+    let records = read_bam_records(&output);
+    assert_eq!(records.len(), 8, "Should have 8 records (4 pairs × 2 reads)");
+}

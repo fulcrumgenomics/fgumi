@@ -7,7 +7,7 @@
 use super::chase_bottleneck::ChaseBottleneckScheduler;
 use super::fixed_priority::FixedPriorityScheduler;
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Operating mode for the hybrid scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,8 @@ pub struct HybridAdaptiveScheduler {
     consecutive_successes: usize,
     /// Threshold to switch modes.
     switch_threshold: usize,
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl HybridAdaptiveScheduler {
@@ -44,16 +46,17 @@ impl HybridAdaptiveScheduler {
 
     /// Create a new hybrid adaptive scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         Self {
             thread_id,
             num_threads,
-            fixed: FixedPriorityScheduler::new(thread_id, num_threads),
-            chase: ChaseBottleneckScheduler::new(thread_id, num_threads),
+            fixed: FixedPriorityScheduler::new(thread_id, num_threads, active_steps.clone()),
+            chase: ChaseBottleneckScheduler::new(thread_id, num_threads, active_steps.clone()),
             mode: Mode::Fixed,
             consecutive_failures: 0,
             consecutive_successes: 0,
             switch_threshold: Self::DEFAULT_THRESHOLD,
+            active_steps,
         }
     }
 }
@@ -102,6 +105,10 @@ impl Scheduler for HybridAdaptiveScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -110,13 +117,13 @@ mod tests {
 
     #[test]
     fn test_starts_in_fixed_mode() {
-        let scheduler = HybridAdaptiveScheduler::new(0, 8);
+        let scheduler = HybridAdaptiveScheduler::new(0, 8, ActiveSteps::all());
         assert_eq!(scheduler.mode, Mode::Fixed);
     }
 
     #[test]
     fn test_switch_to_chase_after_failures() {
-        let mut scheduler = HybridAdaptiveScheduler::new(0, 8);
+        let mut scheduler = HybridAdaptiveScheduler::new(0, 8, ActiveSteps::all());
 
         // Record failures to trigger switch
         for _ in 0..5 {
@@ -128,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_return_to_fixed_after_successes() {
-        let mut scheduler = HybridAdaptiveScheduler::new(0, 8);
+        let mut scheduler = HybridAdaptiveScheduler::new(0, 8, ActiveSteps::all());
         scheduler.mode = Mode::Chase;
 
         // Record successes to trigger return
@@ -141,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_consecutive_counter_reset() {
-        let mut scheduler = HybridAdaptiveScheduler::new(0, 8);
+        let mut scheduler = HybridAdaptiveScheduler::new(0, 8, ActiveSteps::all());
 
         // Build up failures
         for _ in 0..3 {

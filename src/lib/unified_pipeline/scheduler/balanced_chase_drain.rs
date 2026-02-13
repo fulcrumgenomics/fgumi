@@ -12,7 +12,7 @@
 //! the output queue drops below the high-water mark (`output_high` = false).
 
 use super::{BackpressureState, Direction, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Balanced chase scheduler with drain mode for output backpressure.
 pub struct BalancedChaseDrainScheduler {
@@ -35,6 +35,8 @@ pub struct BalancedChaseDrainScheduler {
     /// Memory drain mode - when true, prioritize Process over Group.
     /// Activated when Group fails due to memory pressure, deactivated when `memory_high` clears.
     memory_drain_mode: bool,
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl BalancedChaseDrainScheduler {
@@ -53,7 +55,7 @@ impl BalancedChaseDrainScheduler {
 
     /// Create a new balanced chase drain scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let (current_step, exclusive_role) = Self::determine_role(thread_id, num_threads);
 
         Self {
@@ -65,6 +67,7 @@ impl BalancedChaseDrainScheduler {
             exclusive_role,
             drain_mode: false,
             memory_drain_mode: false,
+            active_steps,
         }
     }
 
@@ -220,7 +223,8 @@ impl Scheduler for BalancedChaseDrainScheduler {
         }
 
         self.build_priorities(bp);
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -276,15 +280,23 @@ impl Scheduler for BalancedChaseDrainScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_reader_starts_on_compress() {
-        let scheduler = BalancedChaseDrainScheduler::new(0, 8);
+        let scheduler = BalancedChaseDrainScheduler::new(0, 8, all());
         assert_eq!(scheduler.current_step, PipelineStep::Compress);
         assert_eq!(scheduler.exclusive_role, Some(PipelineStep::Read));
         assert!(!scheduler.drain_mode);
@@ -292,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_serialize_failure_triggers_drain_mode() {
-        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8);
+        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8, all());
 
         // Simulate Serialize failure
         scheduler.record_outcome(PipelineStep::Serialize, false, false);
@@ -303,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_drain_mode_exits_when_backpressure_clears() {
-        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8);
+        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8, all());
 
         // Enter drain mode
         scheduler.drain_mode = true;
@@ -327,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_drain_mode_prioritizes_compress() {
-        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8);
+        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8, all());
 
         // Enter drain mode
         scheduler.drain_mode = true;
@@ -351,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_normal_mode_serializes_first() {
-        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8);
+        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8, all());
 
         // Not in drain mode
         assert!(!scheduler.drain_mode);
@@ -368,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_memory_high_prioritizes_process() {
-        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8);
+        let mut scheduler = BalancedChaseDrainScheduler::new(3, 8, all());
 
         // Memory high - should prioritize Process to drain q4_groups
         let bp = BackpressureState {

@@ -12,7 +12,7 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Atomic counter for unique seeds across threads.
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +33,8 @@ pub struct EpsilonGreedyScheduler {
     rng: SmallRng,
     /// Priority buffer.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl EpsilonGreedyScheduler {
@@ -54,7 +56,7 @@ impl EpsilonGreedyScheduler {
 
     /// Create a new Epsilon-Greedy scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let seed = SEED_COUNTER
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(thread_id as u64)
@@ -67,6 +69,7 @@ impl EpsilonGreedyScheduler {
             successes: [0; 9],
             rng: SmallRng::seed_from_u64(seed),
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -105,7 +108,8 @@ impl Scheduler for EpsilonGreedyScheduler {
             }
         }
 
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -123,21 +127,29 @@ impl Scheduler for EpsilonGreedyScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_default_epsilon() {
-        let scheduler = EpsilonGreedyScheduler::new(0, 8);
+        let scheduler = EpsilonGreedyScheduler::new(0, 8, all());
         assert!((scheduler.epsilon - 0.1).abs() < 0.001);
     }
 
     #[test]
     fn test_success_rate_calculation() {
-        let mut scheduler = EpsilonGreedyScheduler::new(0, 8);
+        let mut scheduler = EpsilonGreedyScheduler::new(0, 8, all());
         scheduler.attempts[0] = 10;
         scheduler.successes[0] = 7;
 
@@ -147,14 +159,14 @@ mod tests {
 
     #[test]
     fn test_unexplored_neutral_prior() {
-        let scheduler = EpsilonGreedyScheduler::new(0, 8);
+        let scheduler = EpsilonGreedyScheduler::new(0, 8, all());
         let rate = scheduler.success_rate(0);
         assert!((rate - 0.5).abs() < 0.001);
     }
 
     #[test]
     fn test_priorities_returns_all_steps() {
-        let mut scheduler = EpsilonGreedyScheduler::new(0, 8);
+        let mut scheduler = EpsilonGreedyScheduler::new(0, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities.len(), 9);

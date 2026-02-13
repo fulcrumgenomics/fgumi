@@ -10,7 +10,7 @@
 use super::chase_bottleneck::ChaseBottleneckScheduler;
 use super::fixed_priority::FixedPriorityScheduler;
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Pipeline phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,8 @@ pub struct TwoPhaseScheduler {
     items_processed: u64,
     /// Threshold to exit startup phase.
     startup_threshold: u64,
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl TwoPhaseScheduler {
@@ -47,15 +49,16 @@ impl TwoPhaseScheduler {
 
     /// Create a new two-phase scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         Self {
             thread_id,
             num_threads,
-            fixed: FixedPriorityScheduler::new(thread_id, num_threads),
-            chase: ChaseBottleneckScheduler::new(thread_id, num_threads),
+            fixed: FixedPriorityScheduler::new(thread_id, num_threads, active_steps.clone()),
+            chase: ChaseBottleneckScheduler::new(thread_id, num_threads, active_steps.clone()),
             phase: Phase::Startup,
             items_processed: 0,
             startup_threshold: Self::DEFAULT_STARTUP_THRESHOLD,
+            active_steps,
         }
     }
 }
@@ -109,6 +112,10 @@ impl Scheduler for TwoPhaseScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -117,13 +124,13 @@ mod tests {
 
     #[test]
     fn test_starts_in_startup_phase() {
-        let scheduler = TwoPhaseScheduler::new(0, 8);
+        let scheduler = TwoPhaseScheduler::new(0, 8, ActiveSteps::all());
         assert_eq!(scheduler.phase, Phase::Startup);
     }
 
     #[test]
     fn test_transition_to_steady_state() {
-        let mut scheduler = TwoPhaseScheduler::new(0, 8);
+        let mut scheduler = TwoPhaseScheduler::new(0, 8, ActiveSteps::all());
         let bp = BackpressureState::default();
 
         // Process enough items to exit startup
@@ -137,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_transition_to_drain() {
-        let mut scheduler = TwoPhaseScheduler::new(0, 8);
+        let mut scheduler = TwoPhaseScheduler::new(0, 8, ActiveSteps::all());
         scheduler.phase = Phase::SteadyState;
 
         let bp = BackpressureState {

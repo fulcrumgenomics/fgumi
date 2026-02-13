@@ -22,14 +22,14 @@ use crate::progress::ProgressTracker;
 use crate::reorder_buffer::ReorderBuffer;
 
 use super::base::{
-    BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch, GroupKeyConfig,
-    HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed, HasHeldSerialized,
-    HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues, OutputPipelineState,
-    PROGRESS_LOG_INTERVAL, PipelineConfig, PipelineLifecycle, PipelineStats, PipelineStep,
-    PipelineValidationError, ProcessPipelineState, QueueSample, RawBlockBatch, ReorderBufferState,
-    SerializePipelineState, SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon,
-    WritePipelineState, finalize_pipeline, generic_worker_loop, handle_worker_panic,
-    join_monitor_thread, join_worker_threads, shared_try_step_compress,
+    ActiveSteps, BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch,
+    GroupKeyConfig, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
+    HasHeldSerialized, HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues,
+    OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineConfig, PipelineLifecycle, PipelineStats,
+    PipelineStep, PipelineValidationError, ProcessPipelineState, QueueSample, RawBlockBatch,
+    ReorderBufferState, SerializePipelineState, SerializedBatch, StepContext, WorkerCoreState,
+    WorkerStateCommon, WritePipelineState, finalize_pipeline, generic_worker_loop,
+    handle_worker_panic, join_monitor_thread, join_worker_threads, shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -1506,6 +1506,7 @@ impl<P: Send> WorkerState<P> {
                 thread_id,
                 num_threads,
                 scheduler_strategy,
+                ActiveSteps::all(),
             ),
             decompressor: libdeflater::Decompressor::new(),
             decompression_buffer: Vec::with_capacity(DECOMPRESSION_BUFFER_CAPACITY),
