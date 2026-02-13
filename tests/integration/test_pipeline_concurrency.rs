@@ -1266,12 +1266,17 @@ mod stress_tests {
 
         // 1000 families with 1 record each
         let input_records = create_large_test_bam(&input_bam, &header, 1000, 1);
+        let expected_len = input_records.len();
 
-        let result = run_passthrough_pipeline(&input_bam, &output_bam, 4);
-        assert!(result.is_ok(), "Pipeline failed: {result:?}");
-        let (count, output_records) = result.unwrap();
-        assert_eq!(count as usize, input_records.len());
-        assert_eq!(output_records.len(), input_records.len());
+        let input_clone = input_bam.clone();
+        let output_clone = output_bam.clone();
+        let result = run_with_timeout(Duration::from_secs(30), move || {
+            run_passthrough_pipeline(&input_clone, &output_clone, 4)
+        });
+        assert!(result.is_ok(), "Pipeline timed out with many tiny families");
+        let (count, output_records) = result.unwrap().expect("Pipeline failed");
+        assert_eq!(count as usize, expected_len);
+        assert_eq!(output_records.len(), expected_len);
     }
 
     /// Stress: records with long sequences.
@@ -1301,21 +1306,27 @@ mod stress_tests {
             .map(|(umi, depth, name, seq)| (umi.as_str(), *depth, name.as_str(), seq.as_str()))
             .collect();
         let input_records = create_test_bam_with_families(&input_bam, &header, &family_refs);
+        let expected_len = input_records.len();
+        let input_seqs: Vec<_> =
+            input_records.iter().map(|r| r.sequence().as_ref().to_vec()).collect();
 
-        let result = run_passthrough_pipeline(&input_bam, &output_bam, 4);
-        assert!(result.is_ok(), "Pipeline failed with large records: {result:?}");
-        let (count, output_records) = result.unwrap();
-        assert_eq!(count as usize, input_records.len());
-        assert_eq!(output_records.len(), input_records.len());
+        let input_clone = input_bam.clone();
+        let output_clone = output_bam.clone();
+        let result = run_with_timeout(Duration::from_secs(30), move || {
+            run_passthrough_pipeline(&input_clone, &output_clone, 4)
+        });
+        assert!(result.is_ok(), "Pipeline timed out with large records");
+        let (count, output_records) = result.unwrap().expect("Pipeline failed with large records");
+        assert_eq!(count as usize, expected_len);
+        assert_eq!(output_records.len(), expected_len);
 
         // Verify sequences are preserved
-        let mut input_seqs: Vec<_> =
-            input_records.iter().map(|r| r.sequence().as_ref().to_vec()).collect();
+        let mut sorted_input_seqs = input_seqs;
+        sorted_input_seqs.sort();
         let mut output_seqs: Vec<_> =
             output_records.iter().map(|r| r.sequence().as_ref().to_vec()).collect();
-        input_seqs.sort();
         output_seqs.sort();
-        assert_eq!(input_seqs, output_seqs, "Sequences not preserved for large records");
+        assert_eq!(sorted_input_seqs, output_seqs, "Sequences not preserved for large records");
     }
 
     // ---------- 4.5 Infrastructure Interaction Stress ----------
