@@ -75,8 +75,7 @@ SORT ORDERS:
                       Use for `fgumi zipper`, template-level operations.
 
   template-coordinate Template-level position sort for UMI grouping.
-                      Use for `fgumi group` input. Equivalent to:
-                        samtools sort --template-coordinate
+                      Use for `fgumi group`, `fgumi dedup`, and `fgumi downsample` input.
 
 PERFORMANCE:
 

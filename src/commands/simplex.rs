@@ -206,7 +206,7 @@ pub struct Simplex {
     #[arg(short = 'S', long = "sort-order")]
     pub sort_order: Option<String>,
 
-    /// Tag containing cellular barcodes
+    /// SAM tag containing the cell barcode
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: Option<String>,
 
@@ -258,7 +258,6 @@ impl Command for Simplex {
             &header,
             &self.read_group.read_group_id,
             "Read group",
-            crate::version::VERSION.as_str(),
             command_line,
         )?;
 

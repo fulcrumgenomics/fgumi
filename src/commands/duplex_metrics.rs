@@ -4,7 +4,7 @@
 //! - Full downsampling at 20 levels (5%, 10%, ..., 100%)
 //! - UMI consensus calling within coordinate+strand families
 //! - Ideal duplex fraction calculation using proper binomial CDF
-//! - Optional interval filtering (BED format) to restrict analysis to specific regions
+//! - Optional interval filtering (BED or Picard interval list format) to restrict analysis to specific regions
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -192,8 +192,8 @@ pub struct DuplexMetrics {
     #[arg(long = "duplex-umi-counts", default_value = "false")]
     pub duplex_umi_counts: bool,
 
-    /// Optional intervals file (BED format) to restrict analysis
-    #[arg(short = 'L', long = "intervals")]
+    /// Optional intervals file to restrict analysis (BED or Picard interval list format)
+    #[arg(short = 'l', long = "intervals")]
     pub intervals: Option<PathBuf>,
 
     /// Optional sample name or description for PDF plot titles
@@ -207,10 +207,6 @@ pub struct DuplexMetrics {
     /// SAM tag containing the molecular identifier (assigned by `group`)
     #[arg(long = "mi-tag", default_value = "MI")]
     pub mi_tag: String,
-
-    /// Optional SAM tag for cell barcode (for single-cell data)
-    #[arg(long = "cell-tag")]
-    pub cell_tag: Option<String>,
 }
 
 impl Command for DuplexMetrics {
@@ -439,26 +435,17 @@ impl DuplexMetrics {
         Ok(())
     }
 
-    /// Parses an intervals file in BED format.
+    /// Parses an intervals file in BED or Picard interval list format.
     ///
-    /// Reads a BED-formatted file containing genomic intervals and parses each line
-    /// into an `Interval` struct with chromosome, start, and end coordinates.
-    /// Skips empty lines and comment lines starting with '#'.
+    /// Auto-detects the format: if any line starts with `@`, the file is treated as a
+    /// Picard interval list (1-based closed coordinates with a SAM header); otherwise
+    /// it is treated as BED (0-based half-open coordinates).
     ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the BED file
-    ///
-    /// # Returns
-    ///
-    /// A vector of `Interval` objects.
+    /// Intervals are stored internally using BED conventions (0-based half-open).
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - File cannot be opened or read
-    /// - Lines have fewer than 3 fields
-    /// - Start or end positions cannot be parsed as integers
+    /// Returns an error if the file cannot be read or lines cannot be parsed.
     fn parse_intervals(path: &PathBuf) -> Result<Vec<Interval>> {
         use std::fs::File;
         use std::io::{BufRead, BufReader};
@@ -466,6 +453,7 @@ impl DuplexMetrics {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut intervals = Vec::new();
+        let mut is_interval_list = false;
 
         for line in reader.lines() {
             let line = line?;
@@ -476,21 +464,43 @@ impl DuplexMetrics {
                 continue;
             }
 
-            // Parse BED format: chr start end [name] [score] [strand]
-            let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() < 3 {
-                anyhow::bail!("Invalid BED line (needs at least 3 fields): {line}");
+            // Skip SAM header lines (interval list format)
+            if line.starts_with('@') {
+                is_interval_list = true;
+                continue;
             }
 
-            let ref_name = fields[0].to_string();
-            let start: i32 = fields[1]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid start position: {}", fields[1]))?;
-            let end: i32 = fields[2]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid end position: {}", fields[2]))?;
+            let mut fields = line.splitn(4, '\t');
+            let ref_name = fields.next().unwrap(); // guaranteed non-empty (line isn't empty)
+            let start_str = fields.next();
+            let end_str = fields.next();
 
-            intervals.push(Interval { ref_name, start, end });
+            let (Some(start_str), Some(end_str)) = (start_str, end_str) else {
+                let fmt = if is_interval_list { "interval list" } else { "BED" };
+                anyhow::bail!("Invalid {fmt} line (needs at least 3 fields): {line}");
+            };
+
+            if is_interval_list {
+                // Picard interval list: chr start end strand name (1-based, closed)
+                let start: i32 = start_str
+                    .parse::<i32>()
+                    .map_err(|_| anyhow::anyhow!("Invalid start position: {start_str}"))?
+                    - 1; // Convert 1-based to 0-based
+                let end: i32 = end_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid end position: {end_str}"))?;
+                // end stays the same: 1-based closed end == 0-based half-open end
+                intervals.push(Interval { ref_name: ref_name.to_string(), start, end });
+            } else {
+                // BED format: chr start end [name] [score] [strand] (0-based, half-open)
+                let start: i32 = start_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid start position: {start_str}"))?;
+                let end: i32 = end_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid end position: {end_str}"))?;
+                intervals.push(Interval { ref_name: ref_name.to_string(), start, end });
+            }
         }
 
         Ok(intervals)
@@ -520,10 +530,12 @@ impl DuplexMetrics {
         if let (Some(ref_name), Some(start), Some(end)) =
             (&template.ref_name, template.position, template.end_position)
         {
-            // Check if the insert [start, end] overlaps with any interval
+            // Intervals are 0-based half-open; template positions are 1-based inclusive.
+            // In 0-based half-open the template is [start-1, end), so the overlap
+            // test is: (start-1) < interval.end && interval.start < end
+            // which simplifies to: start <= interval.end && interval.start < end
             intervals.iter().any(|interval| {
-                // Two intervals overlap if: start1 <= end2 && start2 <= end1
-                interval.ref_name == *ref_name && start <= interval.end && interval.start <= end
+                interval.ref_name == *ref_name && start <= interval.end && interval.start < end
             })
         } else {
             false // Unmapped reads or reads without proper coordinates don't overlap any interval
@@ -1312,7 +1324,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -1378,7 +1389,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -1467,7 +1477,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -1594,7 +1603,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -1749,7 +1757,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -1875,7 +1882,6 @@ mod tests {
                 description: None,
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
-                cell_tag: None,
             };
 
             cmd.execute("test")?;
@@ -1905,7 +1911,6 @@ mod tests {
                 description: None,
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
-                cell_tag: None,
             };
 
             cmd.execute("test")?;
@@ -1935,7 +1940,6 @@ mod tests {
                 description: None,
                 umi_tag: "RX".to_string(),
                 mi_tag: "MI".to_string(),
-                cell_tag: None,
             };
 
             cmd.execute("test")?;
@@ -2072,7 +2076,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -2136,7 +2139,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         cmd.execute("test")?;
@@ -2341,7 +2343,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         // This should fail with an error about consensus BAM
@@ -2368,7 +2369,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         assert_eq!(metrics.min_ab_reads, 1);
@@ -2390,7 +2390,6 @@ mod tests {
             description: Some("Test Sample".to_string()),
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         assert_eq!(metrics.min_ab_reads, 3);
@@ -2411,7 +2410,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         // The validation happens in execute(), check during command construction would be ideal
@@ -2502,6 +2500,206 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_intervals_bed_format() -> Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("intervals.bed");
+        std::fs::write(&path, "# comment line\nchr1\t100\t200\nchr2\t300\t400\n")?;
+        let intervals = DuplexMetrics::parse_intervals(&path)?;
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].ref_name, "chr1");
+        assert_eq!(intervals[0].start, 100);
+        assert_eq!(intervals[0].end, 200);
+        assert_eq!(intervals[1].ref_name, "chr2");
+        assert_eq!(intervals[1].start, 300);
+        assert_eq!(intervals[1].end, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_intervals_interval_list_format() -> Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("intervals.interval_list");
+        // Picard interval list: SAM header then 1-based closed coordinates
+        std::fs::write(
+            &path,
+            "@HD\tVN:1.6\tSO:coordinate\n\
+             @SQ\tSN:chr1\tLN:10000\n\
+             @SQ\tSN:chr2\tLN:10000\n\
+             chr1\t101\t200\t+\tinterval1\n\
+             chr2\t301\t400\t+\tinterval2\n",
+        )?;
+        let intervals = DuplexMetrics::parse_intervals(&path)?;
+        assert_eq!(intervals.len(), 2);
+        // 1-based closed [101, 200] converts to 0-based half-open [100, 200]
+        assert_eq!(intervals[0].ref_name, "chr1");
+        assert_eq!(intervals[0].start, 100);
+        assert_eq!(intervals[0].end, 200);
+        // 1-based closed [301, 400] converts to 0-based half-open [300, 400]
+        assert_eq!(intervals[1].ref_name, "chr2");
+        assert_eq!(intervals[1].start, 300);
+        assert_eq!(intervals[1].end, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn test_only_count_inserts_overlapping_interval_list() -> Result<()> {
+        let mut records = Vec::new();
+
+        // Family 1 at chr1:1000-1100
+        let (r1, r2) = build_test_pair("q1", 0, 1000, 1100, 60, 60, "AAA-GGG", "1/A", true, false);
+        records.push(r1);
+        records.push(r2);
+
+        // Family 2 at chr1:2000-2100 (2 reads)
+        for i in 1..=2 {
+            let (r1, r2) = build_test_pair(
+                &format!("q{}", i + 1),
+                0,
+                2000,
+                2100,
+                60,
+                60,
+                "GGG-AAA",
+                "2/A",
+                true,
+                false,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+
+        // Family 3 at chr1:3000-3100 (3 reads)
+        for i in 1..=3 {
+            let (r1, r2) = build_test_pair(
+                &format!("q{}", i + 3),
+                0,
+                3000,
+                3100,
+                60,
+                60,
+                "ACT-TTA",
+                "3/A",
+                true,
+                false,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+
+        // Family 4 at chr2:4000-4100 (4 reads)
+        for i in 1..=4 {
+            let (r1, r2) = build_test_pair(
+                &format!("q{}", i + 6),
+                1,
+                4000,
+                4100,
+                60,
+                60,
+                "TTA-ACT",
+                "4/A",
+                true,
+                false,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+
+        // Family 5 at chr2:5000-5100 (5 reads)
+        for i in 1..=5 {
+            let (r1, r2) = build_test_pair(
+                &format!("q{}", i + 10),
+                1,
+                5000,
+                5100,
+                60,
+                60,
+                "CGA-GGT",
+                "5/A",
+                true,
+                false,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+
+        // Family 6 at chr2:6000-6100 (6 reads)
+        for i in 1..=6 {
+            let (r1, r2) = build_test_pair(
+                &format!("q{}", i + 15),
+                1,
+                6000,
+                6100,
+                60,
+                60,
+                "GGT-CGA",
+                "6/A",
+                true,
+                false,
+            );
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_test_bam(records)?;
+
+        // Create intervals file in Picard interval list format
+        // Same regions as the BED test: chr1:900-1001, chr1:3150-3500, chr2:5050-6050
+        // BED 0-based half-open -> interval list 1-based closed:
+        //   chr1:900-1001 -> chr1:901-1001
+        //   chr1:3150-3500 -> chr1:3151-3500
+        //   chr2:5050-6050 -> chr2:5051-6050
+        let intervals_dir = TempDir::new()?;
+        let intervals_path = intervals_dir.path().join("intervals.interval_list");
+        std::fs::write(
+            &intervals_path,
+            "@HD\tVN:1.6\tSO:coordinate\n\
+             @SQ\tSN:chr1\tLN:100000\n\
+             @SQ\tSN:chr2\tLN:100000\n\
+             chr1\t901\t1001\t+\tinterval1\n\
+             chr1\t3151\t3500\t+\tinterval2\n\
+             chr2\t5051\t6050\t+\tinterval3\n",
+        )?;
+
+        let output_dir = TempDir::new()?;
+        let output = output_dir.path().join("output");
+
+        let cmd = DuplexMetrics {
+            input: input.path().to_path_buf(),
+            output: output.clone(),
+            min_ab_reads: 1,
+            min_ba_reads: 1,
+            duplex_umi_counts: false,
+            intervals: Some(intervals_path),
+            description: None,
+            umi_tag: "RX".to_string(),
+            mi_tag: "MI".to_string(),
+        };
+
+        cmd.execute("test")?;
+
+        // Should capture families 1, 3, 5, 6 based on intervals (same as BED test)
+        let duplex_family_path = format!("{}.duplex_family_sizes.txt", output.display());
+        let duplex_metrics: Vec<DuplexFamilySizeMetric> =
+            DelimFile::default().read_tsv(&duplex_family_path)?;
+
+        let size_1_count =
+            duplex_metrics.iter().find(|m| m.ab_size == 1 && m.ba_size == 0).map_or(0, |m| m.count);
+        let size_3_count =
+            duplex_metrics.iter().find(|m| m.ab_size == 3 && m.ba_size == 0).map_or(0, |m| m.count);
+        let size_5_count =
+            duplex_metrics.iter().find(|m| m.ab_size == 5 && m.ba_size == 0).map_or(0, |m| m.count);
+        let size_6_count =
+            duplex_metrics.iter().find(|m| m.ab_size == 6 && m.ba_size == 0).map_or(0, |m| m.count);
+
+        assert_eq!(size_1_count, 1, "Should have 1 family of size 1");
+        assert_eq!(size_3_count, 1, "Should have 1 family of size 3");
+        assert_eq!(size_5_count, 1, "Should have 1 family of size 5");
+        assert_eq!(size_6_count, 1, "Should have 1 family of size 6");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_handle_empty_umi_components() -> Result<()> {
         let mut records = Vec::new();
 
@@ -2552,7 +2750,6 @@ mod tests {
             description: None,
             umi_tag: "RX".to_string(),
             mi_tag: "MI".to_string(),
-            cell_tag: None,
         };
 
         // Should complete without panicking or errors

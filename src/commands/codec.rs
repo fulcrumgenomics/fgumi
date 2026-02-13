@@ -218,8 +218,8 @@ pub struct Codec {
     #[arg(short = 'X', long = "max-duplex-disagreements")]
     pub max_duplex_disagreements: Option<usize>,
 
-    /// Cell barcode tag name (e.g., "CB"). Optional - only specify if filtering by cell.
-    #[arg(short = 'c', long = "cell-tag")]
+    /// SAM tag containing the cell barcode
+    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: Option<String>,
 
     /// Output sort order (Unsorted, Queryname, Coordinate, Unknown)
@@ -274,7 +274,6 @@ impl Command for Codec {
             &header,
             &self.read_group.read_group_id,
             "Read group",
-            crate::version::VERSION.as_str(),
             command_line,
         )?;
 

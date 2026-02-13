@@ -88,7 +88,7 @@ MODES:
 
   grouping:
     For comparing grouped BAM files where MI assignment order may differ.
-    Both files MUST be in the same order (e.g., query-name sorted with `samtools sort -n`).
+    Both files MUST be in the same order (e.g., query-name sorted with `fgumi sort --order queryname`).
     Validates that:
     1. Read names and R1/R2 flags match between files
     2. Reads with the same MI in file 1 have the same MI in file 2 (and vice versa)

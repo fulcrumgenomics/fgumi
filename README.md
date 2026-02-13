@@ -31,7 +31,7 @@ fgumi provides comprehensive functionality for:
 - **UMI extraction** from FASTQ files
 - **Read grouping** by UMI with multiple assignment strategies
 - **UMI-aware deduplication** for marking/removing PCR duplicates
-- **Consensus calling** (simplex, duplex, and vanilla)
+- **Consensus calling** (simplex, duplex, and CODEC)
 - **Quality filtering** of consensus reads
 - **Read clipping** for overlapping pairs
 - **Metrics collection** for QC and analysis
@@ -109,7 +109,7 @@ Enable with: `cargo build --release --features <feature>`
 | `correct` | Correct UMIs based on sequence similarity | `fgbio CorrectUmis` |
 | `zipper` | Restore original FASTQ from unaligned BAM | `fgbio ZipperBams`, `picard MergeBamAlignment` |
 | `fastq` | Convert BAM to FASTQ format | `samtools fastq` |
-| `sort` | Sort BAM by coordinate/queryname/template | `samtools sort` |
+| `sort` | Sort BAM by coordinate/queryname/template | — |
 | `group` | Group reads by UMI | `fgbio GroupReadsByUmi` |
 | `dedup` | Mark/remove UMI-aware duplicates | `gatk UmiAwareMarkDuplicatesWithMateCigar`, `umi-tools dedup` |
 | `simplex` | Call single-strand consensus reads | `fgbio CallMolecularConsensusReads` |
@@ -137,7 +137,9 @@ fgumi <command> --help
 fgumi extract \
   --inputs R1.fastq.gz R2.fastq.gz \
   --read-structures +T +M \
-  --output unaligned.bam
+  --output unaligned.bam \
+  --sample MySample \
+  --library MyLibrary
 ```
 
 2. **(Optional) Correct UMIs** for fixed UMI sets:
@@ -145,7 +147,8 @@ fgumi extract \
 fgumi correct \
   --input unaligned.bam \
   --output corrected.bam \
-  --includelist umis.txt
+  --umi-files umis.txt \
+  --min-distance 1
 ```
 
 3. **Align and sort** reads using fgumi fastq + zipper + sort pipeline:
@@ -186,8 +189,8 @@ fgumi codec \
 6. **(Optional) Collect duplex metrics**:
 ```bash
 fgumi duplex-metrics \
-  --input duplex.bam \
-  --output metrics.txt
+  --input grouped.bam \
+  --output metrics
 ```
 
 7. **Filter** consensus reads:
@@ -195,7 +198,8 @@ fgumi duplex-metrics \
 fgumi filter \
   --input consensus.bam \
   --output filtered.bam \
-  --ref ref.fa
+  --ref ref.fa \
+  --min-reads 1,1,1
 ```
 
 ## Performance Options

@@ -60,7 +60,7 @@ In order to correctly clip reads by template and update mate information, the in
 queryname sorted or query grouped. If your input BAM is not in an appropriate order the sort can be
 done in streaming fashion with, for example:
 
-  samtools sort -n -u in.bam | fgumi clip -i /dev/stdin ...
+  fgumi sort -i in.bam --order queryname | fgumi clip -i /dev/stdin ...
 
 The output sort order may be specified with --sort-order. If not given, then the output will be in the same
 order as input.
@@ -84,7 +84,7 @@ pub struct Clip {
     pub io: BamIoOptions,
 
     /// Reference FASTA file (required for tag regeneration)
-    #[arg(short = 'r', long = "reference", required = true)]
+    #[arg(short = 'r', long = "reference", alias = "ref", required = true)]
     pub reference: PathBuf,
 
     /// Clipping mode: soft, soft-with-mask, or hard
@@ -100,8 +100,11 @@ pub struct Clip {
     pub clip_overlapping_reads: bool,
 
     /// Clip reads that extend past their mate's start position
-    /// Note: In Scala fgbio this parameter is called `clipBasesPastMate`
-    #[arg(long = "clip-extending-past-mate", default_value = "false")]
+    #[arg(
+        long = "clip-bases-past-mate",
+        alias = "clip-extending-past-mate",
+        default_value = "false"
+    )]
     pub clip_extending_past_mate: bool,
 
     /// Note: NM/UQ/MD tags are always regenerated after clipping (matching fgbio behavior)
@@ -251,11 +254,7 @@ impl Command for Clip {
             let header = self.update_header_sort_order(header)?;
 
             // Add @PG record with PP chaining to input's last program
-            let header = fgumi_lib::header::add_pg_record(
-                header,
-                crate::version::VERSION.as_str(),
-                command_line,
-            )?;
+            let header = crate::commands::common::add_pg_record(header, command_line)?;
 
             self.execute_threads_mode(reader, threads, header, reference)?
         } else {
@@ -329,11 +328,7 @@ impl Clip {
         }
 
         // Add @PG record with PP chaining to input's last program
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Create output BAM writer with multi-threaded BGZF compression
         let writer_threads = self.threading.num_threads();

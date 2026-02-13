@@ -109,7 +109,7 @@ Named tag sets like "Consensus" are automatically expanded to their constituent 
 By default, input is read from stdin and output is written to stdout, allowing for streaming
 workflows like:
 
-  fgumi zipper -u unmapped.bam -r reference.fa | samtools sort -@ $(nproc) -o output.bam
+  bwa mem -t 8 -p -K 150000000 -Y ref.fa reads.fq | fgumi zipper -u unmapped.bam -r ref.fa | fgumi sort -i /dev/stdin -o output.bam --order template-coordinate
 "#
 )]
 #[command(verbatim_doc_comment)]
@@ -802,11 +802,7 @@ impl Command for Zipper {
         let output_header = build_output_header(&unmapped_header, &mapped_header, &dict_path)?;
 
         // Add @PG record with PP chaining
-        let output_header = fgumi_lib::header::add_pg_record(
-            output_header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let output_header = crate::commands::common::add_pg_record(output_header, command_line)?;
 
         let tag_info = TagInfo::new(
             self.tags_to_remove.clone(),

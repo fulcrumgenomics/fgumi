@@ -185,7 +185,7 @@ pub struct Duplex {
     #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
 
-    /// Cellular barcode tag for filtering (e.g., CB for 10X)
+    /// SAM tag containing the cell barcode
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: Option<String>,
 
@@ -294,11 +294,7 @@ impl Command for Duplex {
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         // Add @PG record with PP chaining to input's last program
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Use library name from header if no prefix is specified (like fgbio)
         let read_name_prefix = self
@@ -533,7 +529,6 @@ impl Duplex {
             &input_header,
             &self.read_group.read_group_id,
             "Read group",
-            crate::version::VERSION.as_str(),
             command_line,
         )?;
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.87.0"
 description = "Consensus calling algorithms for fgumi: simplex, duplex, and CODEC"
+repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [dependencies]

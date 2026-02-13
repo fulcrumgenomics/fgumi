@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.87.0"
 description = "UMI assignment strategies and utilities for fgumi"
+repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [dependencies]

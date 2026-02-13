@@ -91,7 +91,7 @@ values two and three differ, the more stringent value comes earlier.
 In order to correctly filter reads in or out by template, the input BAM must be either queryname sorted or
 query grouped. If your BAM is not already in an appropriate order, this can be done in streaming fashion with:
 
-  samtools sort -n -u in.bam | fgumi filter -i /dev/stdin ...
+  fgumi sort -i in.bam --order queryname | fgumi filter -i /dev/stdin ...
 
 The output sort order may be specified with --sort-order. If not given, then the output will be in the same
 order as input.
@@ -140,7 +140,10 @@ pub struct Filter {
     #[arg(short = 'q', long = "min-mean-base-quality")]
     pub min_mean_base_quality: Option<f64>,
 
-    /// Maximum number of no-calls (N bases) allowed in a read
+    /// Maximum no-calls (N bases) allowed in a read.
+    ///
+    /// If < 1.0, treated as a fraction of read length (e.g. 0.2 = 20% Ns allowed).
+    /// If >= 1.0, treated as an absolute base count (must be integer, e.g. 5 = max 5 Ns).
     #[arg(short = 'n', long = "max-no-call-fraction", default_value = "0.2")]
     pub max_no_call_fraction: f64,
 
@@ -282,11 +285,7 @@ impl Command for Filter {
             let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
             // Add @PG record with PP chaining to input's last program
-            let header = fgumi_lib::header::add_pg_record(
-                header,
-                crate::version::VERSION.as_str(),
-                command_line,
-            )?;
+            let header = crate::commands::common::add_pg_record(header, command_line)?;
 
             let track_rejects = self.rejects.is_some();
 
@@ -329,11 +328,7 @@ impl Filter {
         let (_, header) = create_bam_reader(&self.io.input, reader_threads)?;
 
         // Add @PG record with PP chaining to input's last program
-        let header = fgumi_lib::header::add_pg_record(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Create output BAM with multi-threaded BGZF writer (raw byte writer)
         let writer_threads = self.threading.num_threads();

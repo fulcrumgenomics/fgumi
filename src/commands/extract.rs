@@ -397,8 +397,8 @@ pub(crate) struct Extract {
     #[arg(long, short = 'q')]
     umi_qual_tag: Option<String>,
 
-    /// Tag in which to store the cellular barcodes
-    #[arg(long, short = 'c', default_value = "CB")]
+    /// SAM tag containing the cell barcode
+    #[arg(long = "cell-tag", short = 'c', default_value = "CB")]
     cell_tag: String,
 
     /// Tag in which to store the cellular barcode qualities
@@ -626,11 +626,7 @@ impl Extract {
         header = header.add_read_group(self.read_group_id.clone(), rg.build()?);
 
         // Add @PG record
-        header = fgumi_lib::header::add_pg_to_builder(
-            header,
-            crate::version::VERSION.as_str(),
-            command_line,
-        )?;
+        header = crate::commands::common::add_pg_to_builder(header, command_line)?;
 
         Ok(header.build())
     }
