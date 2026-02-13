@@ -789,6 +789,12 @@ pub struct GroupReadsByUmi {
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
 
+    /// Use the 3' position when grouping single-end reads.
+    /// When enabled, single-end reads of different lengths at the same 5' position
+    /// will be placed in separate groups (since their 3' positions differ).
+    #[arg(long = "single-end-three-prime")]
+    pub single_end_three_prime: bool,
+
     /// Enable comprehensive memory debugging (reports every 1 second)
     #[cfg(feature = "memory-debug")]
     #[arg(long)]
@@ -976,7 +982,14 @@ impl Command for GroupReadsByUmi {
 
         // Enable raw-byte mode: skip noodles decode/encode for ~30% CPU savings
         let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        let mut group_key_config = if self.single_end_three_prime {
+            // Raw-byte mode doesn't support 3' position computation; fall back to noodles decode
+            GroupKeyConfig::new(library_index, cell_tag)
+        } else {
+            GroupKeyConfig::new_raw(library_index, cell_tag)
+        };
+        group_key_config.single_end_three_prime = self.single_end_three_prime;
+        pipeline_config.group_key_config = Some(group_key_config);
 
         // Short-circuit support for memory bisection debugging.
         // Set FGUMI_SHORT_CIRCUIT=process|serialize|compress to skip downstream steps.
@@ -1486,7 +1499,12 @@ impl GroupReadsByUmi {
             let record = record_result?;
 
             // Compute GroupKey for this record
-            let key = compute_group_key(&record, &library_index, Some(cell_tag));
+            let key = compute_group_key(
+                &record,
+                &library_index,
+                Some(cell_tag),
+                self.single_end_three_prime,
+            );
             let decoded = DecodedRecord::new(record, key);
 
             // Feed to RecordPositionGrouper - may emit completed groups
@@ -1513,8 +1531,10 @@ impl GroupReadsByUmi {
             progress.log_if_needed(1);
         }
 
-        // Finish grouper - emit final group
-        if let Some(final_group) = grouper.finish()? {
+        // Finish grouper - emit final groups
+        // The grouper may have multiple remaining groups when templates at EOF have different
+        // position keys (e.g., single-end reads with --single-end-three-prime enabled).
+        while let Some(final_group) = grouper.finish()? {
             Self::process_and_write_position_group(
                 final_group,
                 filter_config,
@@ -2154,6 +2174,7 @@ mod tests {
                 queue_memory_per_thread: true,
                 queue_memory_limit_mb: None,
             },
+            single_end_three_prime: false,
             #[cfg(feature = "memory-debug")]
             debug_memory: false,
             #[cfg(feature = "memory-debug")]
@@ -4861,5 +4882,168 @@ mod tests {
         let mut metrics = FilterMetrics::new();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
         assert!(!filter_template_raw(&template, &config, &mut metrics));
+    }
+
+    // ========================================================================
+    // Tests for --single-end-three-prime feature
+    // ========================================================================
+
+    /// Default read length when CIGAR is empty or doesn't consume any query bases.
+    const DEFAULT_TEST_READ_LENGTH: usize = 100;
+
+    /// Calculate the read length from a CIGAR string by summing operations that consume the query.
+    /// Operations that consume query: M, I, S, =, X
+    /// Operations that don't consume query: D, N, H, P
+    fn cigar_read_length(cigar: &str) -> usize {
+        let mut read_len = 0usize;
+        let mut num_str = String::new();
+
+        for c in cigar.chars() {
+            if c.is_ascii_digit() {
+                num_str.push(c);
+            } else {
+                let len: usize = num_str.parse().unwrap_or(0);
+                num_str.clear();
+                // Operations that consume the query sequence
+                if matches!(c, 'M' | 'I' | 'S' | '=' | 'X') {
+                    read_len += len;
+                }
+            }
+        }
+        if read_len == 0 { DEFAULT_TEST_READ_LENGTH } else { read_len }
+    }
+
+    /// Build a test read with custom CIGAR string
+    #[allow(clippy::cast_sign_loss)]
+    fn build_test_read_with_cigar(
+        name: &str,
+        ref_id: usize,
+        pos: i32,
+        mapq: u8,
+        flags: u16,
+        umi: &str,
+        cigar: &str,
+    ) -> sam::alignment::RecordBuf {
+        use fgumi_lib::sam::builder::RecordBuilder;
+
+        // Generate sequence based on CIGAR read length
+        let read_len = cigar_read_length(cigar);
+        let seq: String = "ACGT".chars().cycle().take(read_len).collect();
+
+        let mut builder = RecordBuilder::new()
+            .name(name)
+            .sequence(&seq)
+            .reference_sequence_id(ref_id)
+            .alignment_start(pos as usize)
+            .mapping_quality(mapq)
+            .cigar(cigar)
+            .tag("RX", umi);
+
+        // Set flags based on raw u16
+        let sam_flags = sam::alignment::record::Flags::from(flags);
+        if sam_flags.is_reverse_complemented() {
+            builder = builder.reverse_complement(true);
+        }
+        if sam_flags.is_unmapped() {
+            builder = builder.unmapped(true);
+        }
+
+        builder.build()
+    }
+
+    #[test]
+    fn test_cigar_read_length_simple() {
+        assert_eq!(cigar_read_length("100M"), 100);
+        assert_eq!(cigar_read_length("10S90M"), 100);
+        assert_eq!(cigar_read_length("90M10S"), 100);
+        assert_eq!(cigar_read_length("5S90M5S"), 100);
+    }
+
+    #[test]
+    fn test_cigar_read_length_with_deletions() {
+        assert_eq!(cigar_read_length("50M10D50M"), 100);
+        assert_eq!(cigar_read_length("10M5D10M"), 20);
+    }
+
+    #[test]
+    fn test_cigar_read_length_with_insertions() {
+        assert_eq!(cigar_read_length("50M10I40M"), 100);
+        assert_eq!(cigar_read_length("10M5I10M"), 25);
+    }
+
+    #[test]
+    fn test_cigar_read_length_complex() {
+        assert_eq!(cigar_read_length("5S10M5I20M10D30M5S"), 75);
+    }
+
+    #[test]
+    fn test_cigar_read_length_empty_returns_default() {
+        assert_eq!(cigar_read_length(""), DEFAULT_TEST_READ_LENGTH);
+    }
+
+    #[test]
+    fn test_single_end_different_lengths_separate_groups() -> Result<()> {
+        // With --single-end-three-prime, single-end reads of different lengths
+        // at the same position should be in separate groups
+        let mut records = Vec::new();
+
+        // Two single-end reads at same 5' position but different lengths (different 3')
+        let r1 = build_test_read_with_cigar("read_a", 0, 100, 60, 0, "AAAAAA", "50M");
+        let r2 = build_test_read_with_cigar("read_b", 0, 100, 60, 0, "AAAAAA", "100M");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            single_end_three_prime: true,
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have both records");
+
+        // With different 3' positions, they should be in separate groups
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 2, "Different read lengths should produce separate groups");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_end_different_lengths_same_group_by_default() -> Result<()> {
+        // Without --single-end-three-prime, single-end reads of different lengths
+        // at the same position should be in the same group (default behavior)
+        let mut records = Vec::new();
+
+        // Two single-end reads at same 5' position but different lengths
+        let r1 = build_test_read_with_cigar("read_a", 0, 100, 60, 0, "AAAAAA", "50M");
+        let r2 = build_test_read_with_cigar("read_b", 0, 100, 60, 0, "AAAAAA", "100M");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            single_end_three_prime: false,
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have both records");
+
+        // Without the flag, same 5' position + same UMI = same group
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "Same position should be in same group by default");
+
+        Ok(())
     }
 }

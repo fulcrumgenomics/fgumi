@@ -402,6 +402,7 @@ pub fn decode_records(
                 &record,
                 &group_key_config.library_index,
                 group_key_config.cell_tag,
+                group_key_config.single_end_three_prime,
             );
             records.push(DecodedRecord::new(record, key));
         }
@@ -3082,8 +3083,10 @@ where
         }
     }
 
-    // Finish grouper - process any remaining partial group
-    if let Some(final_group) = grouper.finish()? {
+    // Finish grouper - process any remaining partial groups
+    // The grouper may have multiple remaining groups when templates at EOF have different
+    // position keys (e.g., single-end reads with --single-end-three-prime enabled).
+    while let Some(final_group) = grouper.finish()? {
         // Step 6: Process
         let processed = (fns.process_fn)(final_group)?;
 

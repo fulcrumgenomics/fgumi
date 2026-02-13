@@ -1532,6 +1532,8 @@ pub struct GroupKeyConfig {
     pub cell_tag: Option<Tag>,
     /// When true, skip noodles decode and work with raw BAM bytes.
     pub raw_byte_mode: bool,
+    /// Whether to use 3' position for single-end read grouping.
+    pub single_end_three_prime: bool,
 }
 
 impl GroupKeyConfig {
@@ -1542,6 +1544,7 @@ impl GroupKeyConfig {
             library_index: Arc::new(library_index),
             cell_tag: Some(cell_tag),
             raw_byte_mode: false,
+            single_end_three_prime: false,
         }
     }
 
@@ -1552,13 +1555,19 @@ impl GroupKeyConfig {
             library_index: Arc::new(library_index),
             cell_tag: Some(cell_tag),
             raw_byte_mode: true,
+            single_end_three_prime: false,
         }
     }
 
     /// Create a `GroupKeyConfig` for raw-byte mode without cell barcode extraction.
     #[must_use]
     pub fn new_raw_no_cell(library_index: LibraryIndex) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag: None, raw_byte_mode: true }
+        Self {
+            library_index: Arc::new(library_index),
+            cell_tag: None,
+            raw_byte_mode: true,
+            single_end_three_prime: false,
+        }
     }
 }
 
@@ -1568,6 +1577,7 @@ impl Default for GroupKeyConfig {
             library_index: Arc::new(LibraryIndex::default()),
             cell_tag: Some(Tag::from([b'C', b'B'])), // Default cell barcode tag
             raw_byte_mode: false,
+            single_end_three_prime: false,
         }
     }
 }
