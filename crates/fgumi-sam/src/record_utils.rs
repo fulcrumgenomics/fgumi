@@ -536,6 +536,25 @@ pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<usize> {
     }
 }
 
+/// Gets the unclipped 3' position of a read.
+///
+/// For forward strand reads, returns the unclipped end position.
+/// For reverse strand reads, returns the unclipped start position.
+/// This is the opposite of `unclipped_five_prime_position`.
+///
+/// Returns `None` for unmapped reads.
+#[must_use]
+pub fn unclipped_three_prime_position(record: &RecordBuf) -> Option<usize> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    if record.flags().is_reverse_complemented() {
+        unclipped_start(record)
+    } else {
+        unclipped_end(record)
+    }
+}
+
 /// Counts reference-consuming operations from a CIGAR.
 #[expect(
     clippy::redundant_closure_for_method_calls,
@@ -1467,12 +1486,73 @@ mod tests {
     }
 
     #[test]
+    fn test_unclipped_three_prime_forward_strand() {
+        // Forward strand: 3' is at unclipped_end
+        // 5S45M10H at position 10 → unclipped_end = 64
+        let read = create_cigar_test_read("fwd", 10, "5S45M10H");
+        assert_eq!(unclipped_three_prime_position(&read), Some(64));
+    }
+
+    #[test]
+    fn test_unclipped_three_prime_reverse_strand() {
+        // Reverse strand: 3' is at unclipped_start
+        // 5S45M10H at position 10 → unclipped_start = 5
+        let read = RecordBuilder::new()
+            .name("rev")
+            .sequence(&"A".repeat(60))
+            .reference_sequence_id(0)
+            .alignment_start(10)
+            .cigar("5S45M10H")
+            .flags(Flags::REVERSE_COMPLEMENTED)
+            .build();
+        assert_eq!(unclipped_three_prime_position(&read), Some(5));
+    }
+
+    #[test]
+    fn test_unclipped_three_prime_unmapped_returns_none() {
+        let read =
+            RecordBuilder::new().name("unmapped").sequence("ACGT").flags(Flags::UNMAPPED).build();
+        assert_eq!(unclipped_three_prime_position(&read), None);
+    }
+
+    #[test]
+    fn test_five_and_three_prime_are_opposites() {
+        // For forward strand: 5' = unclipped_start, 3' = unclipped_end
+        let forward = create_cigar_test_read("fwd", 10, "5S45M10H");
+        assert_eq!(unclipped_five_prime_position(&forward), Some(5));
+        assert_eq!(unclipped_three_prime_position(&forward), Some(64));
+
+        // For reverse strand: 5' = unclipped_end, 3' = unclipped_start
+        let reverse = RecordBuilder::new()
+            .name("rev")
+            .sequence(&"A".repeat(60))
+            .reference_sequence_id(0)
+            .alignment_start(10)
+            .cigar("5S45M10H")
+            .flags(Flags::REVERSE_COMPLEMENTED)
+            .build();
+        assert_eq!(unclipped_five_prime_position(&reverse), Some(64));
+        assert_eq!(unclipped_three_prime_position(&reverse), Some(5));
+
+        // Verify they are indeed opposites
+        assert_eq!(
+            unclipped_five_prime_position(&forward),
+            unclipped_three_prime_position(&reverse)
+        );
+        assert_eq!(
+            unclipped_three_prime_position(&forward),
+            unclipped_five_prime_position(&reverse)
+        );
+    }
+
+    #[test]
     fn test_unclipped_positions_unmapped_returns_none() {
         let read =
             RecordBuilder::new().name("unmapped").sequence("ACGT").flags(Flags::UNMAPPED).build();
         assert_eq!(unclipped_start(&read), None);
         assert_eq!(unclipped_end(&read), None);
         assert_eq!(unclipped_five_prime_position(&read), None);
+        assert_eq!(unclipped_three_prime_position(&read), None);
     }
 
     #[test]
