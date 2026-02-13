@@ -1,14 +1,30 @@
-//! FASTQ 7-step pipeline with multi-stream grouping.
+//! Unified FASTQ pipeline with configurable active steps.
 //!
 //! This module implements the FASTQ-specific pipeline for the `extract` command,
 //! which reads from multiple synchronized FASTQ streams (R1, R2, I1, I2) and
 //! groups reads by template name.
+//!
+//! A single unified pipeline handles both gzip and BGZF inputs. The set of active
+//! pipeline steps is configured via [`ActiveSteps`] based on input type and mode:
+//!
+//! - **Gzip + synchronized** (e.g. `extract`): Read → Decode → Process → Serialize →
+//!   Compress → Write. Uses [`MultiRecordCountReader`] to produce pre-bounded batches,
+//!   skipping Decompress, `FindBoundaries`, and Group entirely.
+//! - **BGZF + synchronized**: Read → Decompress → `FindBoundaries` → Decode → Process →
+//!   Serialize → Compress → Write. Decompress handles BGZF blocks, `FindBoundaries`
+//!   locates record boundaries, Decode creates templates directly (bypassing Group).
+//! - **Non-synchronized** (gzip or BGZF): Includes Group step for template grouping.
+//!   Optionally includes `FindBoundaries` + Decode when `use_parallel_parse` is enabled.
+//!
+//! Inactive steps are excluded from scheduling — the conditionals are outside the
+//! worker loop, not inside. Queues for skipped steps are allocated at minimum
+//! capacity and never accessed.
 
 use crossbeam_queue::ArrayQueue;
 use noodles::sam::Header;
 use parking_lot::Mutex;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,14 +40,13 @@ use crate::reorder_buffer::ReorderBuffer;
 use libdeflater::Decompressor;
 
 use super::base::{
-    CompressedBlockBatch, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
-    HasHeldSerialized, HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues,
-    OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineLifecycle, PipelineStats, PipelineStep,
+    ActiveSteps, CompressedBlockBatch, HasCompressor, HasHeldBoundaries, HasHeldCompressed,
+    HasHeldProcessed, HasHeldSerialized, HasWorkerCore, MemoryEstimate, MonitorableState,
+    OutputPipelineQueues, OutputPipelineState, PipelineLifecycle, PipelineStats, PipelineStep,
     PipelineValidationError, ProcessPipelineState, ReorderBufferState, SerializePipelineState,
     SerializedBatch, StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState,
     finalize_pipeline, generic_worker_loop, handle_worker_panic, join_monitor_thread,
-    join_worker_threads, run_monitor_loop, shared_try_step_compress, shared_try_step_process,
-    shared_try_step_serialize, shared_try_step_write_new,
+    join_worker_threads, run_monitor_loop, shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -42,137 +57,6 @@ use super::scheduler::{BackpressureState, SchedulerStrategy};
 //
 // This module provides infrastructure for reading from multiple synchronized
 // FASTQ input streams (R1, R2, I1, I2, etc.) in the unified pipeline.
-
-/// Chunk of decompressed data from a specific input stream.
-#[derive(Debug)]
-pub struct MultiStreamChunk {
-    /// Stream index this chunk came from (0=R1, 1=R2, etc.).
-    pub stream_idx: usize,
-    /// Decompressed data.
-    pub data: Vec<u8>,
-    /// Serial number for ordering.
-    pub serial: u64,
-}
-
-/// Coordinates reading from multiple synchronized input streams.
-///
-/// Accepts already-opened readers (which may be decompressed or not).
-/// The caller is responsible for opening the readers with appropriate
-/// decompression (e.g., using fgoxide or gzp).
-pub struct MultiStreamReader<R: Read + Send> {
-    /// Readers for each input file.
-    readers: Vec<R>,
-    /// Next serial number.
-    next_serial: u64,
-    /// Current stream index for round-robin reading.
-    current_stream: usize,
-    /// EOF flags for each stream.
-    eof: Vec<bool>,
-    /// Chunk size for reading.
-    chunk_size: usize,
-}
-
-impl<R: Read + Send> MultiStreamReader<R> {
-    /// Default chunk size (64KB).
-    pub const DEFAULT_CHUNK_SIZE: usize = 65536;
-
-    /// Create a new multi-stream reader from already-opened readers.
-    ///
-    /// The readers should already be configured for decompression if needed.
-    #[must_use]
-    pub fn new(readers: Vec<R>) -> Self {
-        let num_streams = readers.len();
-        Self {
-            readers,
-            next_serial: 0,
-            current_stream: 0,
-            eof: vec![false; num_streams],
-            chunk_size: Self::DEFAULT_CHUNK_SIZE,
-        }
-    }
-
-    /// Create with a custom chunk size.
-    #[must_use]
-    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.chunk_size = chunk_size;
-        self
-    }
-
-    /// Returns the number of input streams.
-    #[must_use]
-    pub fn num_streams(&self) -> usize {
-        self.readers.len()
-    }
-
-    /// Check if all streams are at EOF.
-    #[must_use]
-    pub fn is_eof(&self) -> bool {
-        self.eof.iter().all(|&e| e)
-    }
-
-    /// Read the next chunk from input streams (round-robin).
-    ///
-    /// Returns None when all streams are exhausted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if reading from any stream fails.
-    pub fn read_next_chunk(&mut self) -> io::Result<Option<MultiStreamChunk>> {
-        if self.readers.is_empty() {
-            return Ok(None);
-        }
-
-        // Find next stream that's not at EOF
-        let start = self.current_stream;
-        loop {
-            if !self.eof[self.current_stream] {
-                break;
-            }
-            self.current_stream = (self.current_stream + 1) % self.readers.len();
-            if self.current_stream == start {
-                // All streams at EOF
-                return Ok(None);
-            }
-        }
-
-        let stream_idx = self.current_stream;
-        let reader = &mut self.readers[stream_idx];
-
-        let mut buf = vec![0u8; self.chunk_size];
-        let n = reader.read(&mut buf)?;
-
-        if n == 0 {
-            self.eof[stream_idx] = true;
-            // Try next stream
-            self.current_stream = (self.current_stream + 1) % self.readers.len();
-            return self.read_next_chunk();
-        }
-
-        buf.truncate(n);
-        let serial = self.next_serial;
-        self.next_serial += 1;
-
-        // Move to next stream for round-robin
-        self.current_stream = (self.current_stream + 1) % self.readers.len();
-
-        Ok(Some(MultiStreamChunk { stream_idx, data: buf, serial }))
-    }
-
-    /// Read all remaining chunks from all streams.
-    ///
-    /// This is primarily useful for testing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if reading from any stream fails.
-    pub fn read_all_chunks(&mut self) -> io::Result<Vec<MultiStreamChunk>> {
-        let mut chunks = Vec::new();
-        while let Some(chunk) = self.read_next_chunk()? {
-            chunks.push(chunk);
-        }
-        Ok(chunks)
-    }
-}
 
 // ============================================================================
 // FASTQ Multi-Stream Types for Unified 7-Step Pipeline
@@ -541,19 +425,6 @@ fn find_fastq_boundaries_inplace(data: &[u8]) -> (Vec<u8>, Vec<usize>, usize) {
     (complete_data, offsets, pos)
 }
 
-/// Find FASTQ record boundaries in data (original version for compatibility).
-///
-/// Returns (`complete_data`, offsets, leftover).
-/// - `complete_data`: Bytes containing only complete records
-/// - offsets: Start positions of each record (including 0)
-/// - leftover: Bytes of incomplete record at end (to prepend to next chunk)
-#[allow(dead_code)]
-fn find_fastq_boundaries(data: &[u8]) -> (Vec<u8>, Vec<usize>, Vec<u8>) {
-    let (complete_data, offsets, leftover_start) = find_fastq_boundaries_inplace(data);
-    let leftover = data[leftover_start..].to_vec();
-    (complete_data, offsets, leftover)
-}
-
 /// Find the end of a complete FASTQ record starting at the given position.
 ///
 /// Returns the number of bytes consumed (position after the last newline),
@@ -571,26 +442,15 @@ fn find_fastq_record_end(data: &[u8]) -> Option<usize> {
         return None;
     }
 
+    // Find 4 newlines using SIMD-accelerated memchr
     let mut pos = 0;
-    let mut lines_found = 0;
-
-    // Find 4 complete lines
-    while lines_found < 4 && pos < data.len() {
-        // Find end of this line
-        while pos < data.len() && data[pos] != b'\n' {
-            pos += 1;
+    for _ in 0..4 {
+        match memchr::memchr(b'\n', &data[pos..]) {
+            Some(nl) => pos += nl + 1,
+            None => return None,
         }
-
-        if pos >= data.len() {
-            // No newline found - incomplete
-            return None;
-        }
-
-        pos += 1; // Skip the newline
-        lines_found += 1;
     }
-
-    if lines_found == 4 { Some(pos) } else { None }
+    Some(pos)
 }
 
 /// Parse FASTQ records from boundary data.
@@ -831,6 +691,54 @@ impl FastqPipelineConfig {
         }
         self
     }
+
+    /// Compute the active pipeline steps based on input type and mode.
+    ///
+    /// - Gzip+synchronized: Read, Decode, Process, Serialize, Compress, Write
+    /// - BGZF+synchronized: Read, Decompress, `FindBoundaries`, Decode, Process,
+    ///   Serialize, Compress, Write
+    /// - BGZF (not synchronized): depends on `use_parallel_parse`
+    #[must_use]
+    pub fn active_steps(&self) -> ActiveSteps {
+        // Synchronized mode requires parallel parse; enforce the invariant here
+        // so callers that construct config with pub fields directly get correct steps.
+        let use_parallel_parse = self.use_parallel_parse || self.synchronized;
+
+        let mut steps = vec![PipelineStep::Read];
+
+        // RecordCount reader (gzip+synchronized) bypasses q1_raw entirely,
+        // so Decompress is not needed. All other paths need it.
+        let is_record_count = !self.inputs_are_bgzf && self.synchronized;
+        if !is_record_count {
+            steps.push(PipelineStep::Decompress);
+        }
+
+        // `FindBoundaries` scans decompressed data for record boundaries.
+        // Only needed for BGZF when parallel parse or synchronized mode is active.
+        if self.inputs_are_bgzf && use_parallel_parse {
+            steps.push(PipelineStep::FindBoundaries);
+        }
+
+        // Decode (Parse) parses FASTQ records from boundary data.
+        // Only active when parallel parse is enabled (or forced by synchronized mode).
+        if use_parallel_parse {
+            steps.push(PipelineStep::Decode);
+        }
+
+        // Group collects parsed records into templates.
+        // Skipped in synchronized mode (Decode creates templates directly).
+        if !self.synchronized {
+            steps.push(PipelineStep::Group);
+        }
+
+        steps.extend([
+            PipelineStep::Process,
+            PipelineStep::Serialize,
+            PipelineStep::Compress,
+            PipelineStep::Write,
+        ]);
+        ActiveSteps::new(&steps)
+    }
 }
 
 // ============================================================================
@@ -1059,6 +967,235 @@ impl<R: BufRead + Send> MultiDecompressedReader<R> {
     pub fn set_chunk_size(&mut self, size: usize) {
         self.chunk_size = size.max(4096);
     }
+}
+
+// ============================================================================
+// MultiRecordCountReader - Record-count-based reader for gzip FASTQs
+// ============================================================================
+
+/// Default number of FASTQ records per stream per batch.
+/// ~200 records × ~300 bytes ≈ 60KB, comparable to the 64KB chunk size.
+const DEFAULT_RECORDS_PER_BATCH: usize = 200;
+
+/// Reads a fixed number of complete FASTQ records from each stream per batch.
+///
+/// Unlike `MultiDecompressedReader` which reads fixed byte-size chunks,
+/// this reader guarantees equal record counts across all streams in each batch.
+/// This eliminates the O(N²) regression caused by `find_boundaries()` having to
+/// re-scan growing leftover buffers when R1/R2 records have different lengths.
+///
+/// Produces `FastqBoundaryBatch` directly, skipping the `Decompress` and
+/// `FindBoundaries` steps entirely.
+pub struct MultiRecordCountReader<R: BufRead + Send> {
+    /// Readers for each input stream.
+    readers: Vec<R>,
+    /// Next serial number for batches.
+    next_serial: u64,
+    /// EOF flags for each stream.
+    eof_flags: Vec<bool>,
+    /// Number of FASTQ records to read per stream per batch.
+    records_per_batch: usize,
+}
+
+impl<R: BufRead + Send> MultiRecordCountReader<R> {
+    /// Create a new record-count reader from pre-opened decompressed readers.
+    #[must_use]
+    pub fn new(readers: Vec<R>) -> Self {
+        let num_streams = readers.len();
+        Self {
+            readers,
+            next_serial: 0,
+            eof_flags: vec![false; num_streams],
+            records_per_batch: DEFAULT_RECORDS_PER_BATCH,
+        }
+    }
+
+    /// Get the number of input streams.
+    #[must_use]
+    pub fn num_streams(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Check if all streams have reached EOF.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.eof_flags.iter().all(|&eof| eof)
+    }
+
+    /// Set the number of records per batch.
+    pub fn set_records_per_batch(&mut self, n: usize) {
+        self.records_per_batch = n.max(1);
+    }
+
+    /// Read the next batch of FASTQ records from all streams.
+    ///
+    /// Reads exactly `records_per_batch` complete FASTQ records from each
+    /// non-EOF stream. At EOF, aligns to the minimum record count across
+    /// streams so templates can be formed.
+    ///
+    /// Returns `Ok(None)` when all streams have reached EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading from any stream fails.
+    pub fn read_next_batch(&mut self) -> io::Result<Option<FastqBoundaryBatch>> {
+        if self.is_done() {
+            return Ok(None);
+        }
+
+        #[allow(clippy::type_complexity)]
+        let mut stream_results: Vec<Option<(Vec<u8>, Vec<usize>, bool)>> =
+            Vec::with_capacity(self.readers.len());
+
+        for (stream_idx, reader) in self.readers.iter_mut().enumerate() {
+            if self.eof_flags[stream_idx] {
+                stream_results.push(None);
+                continue;
+            }
+
+            let (data, offsets, at_eof) = read_n_fastq_records(reader, self.records_per_batch)?;
+
+            if at_eof {
+                self.eof_flags[stream_idx] = true;
+            }
+
+            if offsets.len() <= 1 {
+                // No complete records read (empty or EOF)
+                stream_results.push(None);
+            } else {
+                stream_results.push(Some((data, offsets, at_eof)));
+            }
+        }
+
+        // Find min record count across active streams for alignment at EOF
+        let min_records = stream_results
+            .iter()
+            .filter_map(|r| r.as_ref().map(|(_, offsets, _)| offsets.len() - 1))
+            .min();
+
+        let Some(min_records) = min_records else {
+            // All streams exhausted
+            return Ok(None);
+        };
+
+        // If any stream is exhausted while others still have data, stop to avoid
+        // producing batches with missing streams (which would drop mates).
+        if stream_results.iter().any(Option::is_none) {
+            for flag in &mut self.eof_flags {
+                *flag = true;
+            }
+            return Ok(None);
+        }
+
+        if min_records == 0 {
+            return Ok(None);
+        }
+
+        // Build FastqBoundaryBatch, truncating to min_records at EOF boundaries
+        let mut streams = Vec::with_capacity(self.readers.len());
+        for (stream_idx, result) in stream_results.into_iter().enumerate() {
+            let Some((data, offsets, _at_eof)) = result else {
+                continue;
+            };
+
+            let record_count = offsets.len() - 1;
+            let (final_data, final_offsets) = if record_count > min_records {
+                // Truncate to min_records. Excess records are permanently discarded
+                // (reader already advanced). This only occurs at EOF, where excess
+                // records have no mate and cannot form valid templates.
+                let truncated_offsets: Vec<usize> = offsets[..=min_records].to_vec();
+                let truncated_data = data[..offsets[min_records]].to_vec();
+                (truncated_data, truncated_offsets)
+            } else {
+                (data, offsets)
+            };
+
+            streams.push(FastqStreamBoundaries {
+                stream_idx,
+                data: final_data,
+                offsets: final_offsets,
+            });
+        }
+
+        if streams.is_empty() {
+            return Ok(None);
+        }
+
+        let serial = self.next_serial;
+        self.next_serial += 1;
+
+        Ok(Some(FastqBoundaryBatch { streams, serial }))
+    }
+}
+
+/// Read exactly `n` complete FASTQ records from a buffered reader.
+///
+/// Uses `BufRead::read_until` (which delegates to `memchr` internally) for
+/// SIMD-accelerated newline scanning. Each FASTQ record
+/// consists of exactly 4 lines (name, sequence, plus, quality).
+///
+/// Returns `(data, offsets, at_eof)` where:
+/// - `data`: concatenated bytes of all complete records
+/// - `offsets`: byte offset of each record start (includes 0, so len = records + 1)
+/// - `at_eof`: true if the reader reached EOF
+fn read_n_fastq_records<R: BufRead>(
+    reader: &mut R,
+    n: usize,
+) -> io::Result<(Vec<u8>, Vec<usize>, bool)> {
+    // Pre-allocate: ~300 bytes per record is typical
+    let mut data = Vec::with_capacity(n * 300);
+    let mut offsets = Vec::with_capacity(n + 1);
+    offsets.push(0);
+    let mut at_eof = false;
+
+    for _ in 0..n {
+        let record_start = data.len();
+
+        // Read 4 lines per FASTQ record
+        let mut lines_read = 0;
+        for _ in 0..4 {
+            let before = data.len();
+            let bytes_read = reader.read_until(b'\n', &mut data)?;
+            if bytes_read == 0 {
+                // EOF mid-record: truncate back to record start
+                data.truncate(record_start);
+                at_eof = true;
+                break;
+            }
+            lines_read += 1;
+
+            // If the line doesn't end with \n (EOF without trailing newline),
+            // add one for consistency
+            if data[data.len() - 1] != b'\n' {
+                data.push(b'\n');
+                at_eof = true;
+            }
+
+            // Validate first line starts with '@' (name line)
+            if lines_read == 1 && data[before] != b'@' {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Expected FASTQ record to start with '@', got '{}'",
+                        data[before] as char
+                    ),
+                ));
+            }
+        }
+
+        if lines_read < 4 {
+            // Incomplete record at EOF
+            break;
+        }
+
+        offsets.push(data.len());
+
+        if at_eof {
+            break;
+        }
+    }
+
+    Ok((data, offsets, at_eof))
 }
 
 // ============================================================================
@@ -1291,18 +1428,40 @@ pub enum FastqReader<R: BufRead + Send> {
     Bgzf(MultiBgzfBlockReader),
     /// Gzip/Plain inputs - reads already-decompressed chunks
     Decompressed(MultiDecompressedReader<R>),
+    /// Record-count-based reader - produces `FastqBoundaryBatch` directly.
+    /// Used for gzip/plain inputs to skip `Decompress` + `FindBoundaries` steps.
+    RecordCount(MultiRecordCountReader<R>),
 }
 
 impl<R: BufRead + Send> FastqReader<R> {
-    /// Read the next batch.
+    /// Read the next batch (for Bgzf and Decompressed variants).
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if reading fails.
+    /// Returns an I/O error if reading fails or if called on a `RecordCount` reader.
     pub fn read_next_batch(&mut self) -> io::Result<Option<FastqReadBatch>> {
         match self {
             FastqReader::Bgzf(r) => r.read_next_batch(),
             FastqReader::Decompressed(r) => r.read_next_batch(),
+            FastqReader::RecordCount(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RecordCount reader does not produce FastqReadBatch; use read_next_boundary_batch()",
+            )),
+        }
+    }
+
+    /// Read the next boundary batch (for `RecordCount` variant only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading fails or if called on a non-RecordCount reader.
+    pub fn read_next_boundary_batch(&mut self) -> io::Result<Option<FastqBoundaryBatch>> {
+        match self {
+            FastqReader::RecordCount(r) => r.read_next_batch(),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_next_boundary_batch() only works with RecordCount reader",
+            )),
         }
     }
 
@@ -1312,6 +1471,7 @@ impl<R: BufRead + Send> FastqReader<R> {
         match self {
             FastqReader::Bgzf(r) => r.is_done(),
             FastqReader::Decompressed(r) => r.is_done(),
+            FastqReader::RecordCount(r) => r.is_done(),
         }
     }
 
@@ -1321,7 +1481,14 @@ impl<R: BufRead + Send> FastqReader<R> {
         match self {
             FastqReader::Bgzf(r) => r.num_streams(),
             FastqReader::Decompressed(r) => r.num_streams(),
+            FastqReader::RecordCount(r) => r.num_streams(),
         }
+    }
+
+    /// Returns true if this is a record-count reader.
+    #[must_use]
+    pub fn is_record_count(&self) -> bool {
+        matches!(self, FastqReader::RecordCount(_))
     }
 }
 
@@ -1370,6 +1537,7 @@ impl<P: Send> FastqWorkerState<P> {
         thread_id: usize,
         num_threads: usize,
         scheduler_strategy: SchedulerStrategy,
+        active_steps: ActiveSteps,
     ) -> Self {
         Self {
             core: WorkerCoreState::new(
@@ -1377,6 +1545,7 @@ impl<P: Send> FastqWorkerState<P> {
                 thread_id,
                 num_threads,
                 scheduler_strategy,
+                active_steps,
             ),
             decompressor: Decompressor::new(),
             held_raw: None,
@@ -1480,6 +1649,8 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
     // ========== Step 1: Read ==========
     /// The reader (BGZF or Decompressed).
     pub reader: Mutex<Option<FastqReader<R>>>,
+    /// Whether the reader is a `RecordCount` reader (produces `FastqBoundaryBatch` directly).
+    pub reader_is_record_count: bool,
     /// Flag indicating EOF has been reached.
     pub read_done: AtomicBool,
     /// Count of batches successfully read and pushed to q1.
@@ -1568,6 +1739,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
         let cap = config.queue_capacity;
         let batch_size = config.batch_size;
         let num_streams = reader.num_streams();
+        let is_record_count = reader.is_record_count();
         let stats = if config.collect_stats {
             config.shared_stats.clone().or_else(|| Some(Arc::new(PipelineStats::new())))
         } else {
@@ -1583,6 +1755,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
         Self {
             config,
             reader: Mutex::new(Some(reader)),
+            reader_is_record_count: is_record_count,
             read_done: AtomicBool::new(false),
             batches_read: AtomicU64::new(0),
             q1_raw: ArrayQueue::new(cap),
@@ -2220,78 +2393,66 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> WritePipel
 // ========== Step Functions ==========
 
 /// Try to read the next batch (Step 1).
+///
+/// For `RecordCount` readers (gzip+synchronized), reads complete FASTQ records and
+/// pushes `FastqBoundaryBatch` directly to `q2_5_boundaries`, skipping Decompress
+/// and `FindBoundaries` steps entirely.
+///
+/// For `Bgzf` and `Decompressed` readers, reads raw/decompressed chunks to `q1_raw`.
 fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
     state: &FastqPipelineState<R, P>,
     worker: &mut FastqWorkerState<P>,
 ) -> bool {
+    // Check reader type once: RecordCount path skips q1_raw entirely
+    if state.reader_is_record_count {
+        return fastq_try_step_read_record_count(state, worker);
+    }
+
     // =========================================================================
+    // Standard path (Bgzf / Decompressed): read raw batches to q1_raw
+    // =========================================================================
+
     // Priority 1: Try to advance any held item first
-    // =========================================================================
     if let Some((serial, held)) = worker.held_raw.take() {
         match state.q1_raw.push((serial, held)) {
             Ok(()) => {
-                // Successfully advanced held item, continue to read more
                 state.deadlock_state.record_q1_push();
             }
             Err((serial, held)) => {
-                // Still can't push - put it back and signal output full
                 worker.held_raw = Some((serial, held));
                 return false;
             }
         }
     }
 
-    // =========================================================================
     // Priority 2: Check for completion/error
-    // =========================================================================
     if state.read_done.load(Ordering::Relaxed) {
-        log::trace!("fastq_try_step_read: read_done=true, returning false");
         return false;
     }
     if state.has_error() {
-        log::trace!("fastq_try_step_read: has_error=true, returning false");
         return false;
     }
 
-    // =========================================================================
-    // Priority 3: Check if output queue has space (soft check)
-    // =========================================================================
+    // Priority 3: Check if output queue has space
     if state.q1_raw.is_full() {
-        log::trace!("fastq_try_step_read: q1_raw is full, returning false");
         return false;
     }
 
-    // =========================================================================
-    // Priority 4: Try to acquire exclusive reader lock
-    // =========================================================================
+    // Priority 4: Acquire exclusive reader lock
     let Some(mut guard) = state.reader.try_lock() else {
-        // Record contention for diagnostics
         if let Some(stats) = state.stats() {
             stats.record_contention(PipelineStep::Read);
         }
-        log::trace!("fastq_try_step_read: couldn't acquire reader lock, returning false");
         return false;
     };
     let Some(ref mut reader) = *guard else {
-        log::trace!("fastq_try_step_read: reader is None, returning false");
         return false;
     };
-    log::trace!("fastq_try_step_read: acquired reader lock, calling read_next_batch");
 
-    // =========================================================================
     // Priority 5: Read next batch
-    // =========================================================================
     match reader.read_next_batch() {
         Ok(Some(batch)) => {
             let serial = batch.serial;
-            log::trace!(
-                "fastq_try_step_read: got batch serial={}, chunks={}",
-                serial,
-                batch.chunks.len()
-            );
-            // =========================================================================
-            // Priority 6: Try to push result (non-blocking)
-            // =========================================================================
             match state.q1_raw.push((serial, batch)) {
                 Ok(()) => {
                     state.batches_read.fetch_add(1, Ordering::Release);
@@ -2299,9 +2460,6 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
                     true
                 }
                 Err((serial, batch)) => {
-                    // Output full - hold the result for next attempt
-                    // CRITICAL: Still count as read since the reader has consumed this batch
-                    // (matches BGZF path behavior - batches_read counts all consumed batches)
                     worker.held_raw = Some((serial, batch));
                     state.batches_read.fetch_add(1, Ordering::Release);
                     false
@@ -2309,8 +2467,87 @@ fn fastq_try_step_read<R: BufRead + Send, P: Send + MemoryEstimate>(
             }
         }
         Ok(None) => {
-            log::trace!("fastq_try_step_read: got None, setting read_done=true");
             state.read_done.store(true, Ordering::SeqCst);
+            false
+        }
+        Err(e) => {
+            state.set_error(e);
+            false
+        }
+    }
+}
+
+/// Read step for `RecordCount` readers: produces `FastqBoundaryBatch` directly
+/// to `q2_5_boundaries`, bypassing Decompress and `FindBoundaries`.
+fn fastq_try_step_read_record_count<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    worker: &mut FastqWorkerState<P>,
+) -> bool {
+    // Priority 1: Try to advance held boundary batch
+    if let Some((serial, held)) = worker.held_boundaries.take() {
+        let heap_size = held.estimate_heap_size();
+        match state.q2_5_boundaries.push((serial, held)) {
+            Ok(()) => {
+                state.q2_5_boundaries_heap_bytes.fetch_add(heap_size as u64, Ordering::Relaxed);
+                state.deadlock_state.record_q2_5_push();
+            }
+            Err((serial, held)) => {
+                worker.held_boundaries = Some((serial, held));
+                return false;
+            }
+        }
+    }
+
+    // Priority 2: Check for completion/error
+    if state.read_done.load(Ordering::Relaxed) {
+        return false;
+    }
+    if state.has_error() {
+        return false;
+    }
+
+    // Priority 3: Check if output queue has space
+    if state.q2_5_boundaries.is_full() {
+        return false;
+    }
+
+    // Priority 4: Acquire exclusive reader lock
+    let Some(mut guard) = state.reader.try_lock() else {
+        if let Some(stats) = state.stats() {
+            stats.record_contention(PipelineStep::Read);
+        }
+        return false;
+    };
+    let Some(ref mut reader) = *guard else {
+        return false;
+    };
+
+    // Priority 5: Read next boundary batch
+    match reader.read_next_boundary_batch() {
+        Ok(Some(batch)) => {
+            let serial = batch.serial;
+            let heap_size = batch.estimate_heap_size();
+            match state.q2_5_boundaries.push((serial, batch)) {
+                Ok(()) => {
+                    state.q2_5_boundaries_heap_bytes.fetch_add(heap_size as u64, Ordering::Relaxed);
+                    state.deadlock_state.record_q2_5_push();
+                    state.batches_read.fetch_add(1, Ordering::Release);
+                    // RecordCount reader produces boundaries directly (Read + FindBoundaries combined)
+                    state.batches_boundaries_found.fetch_add(1, Ordering::Release);
+                    true
+                }
+                Err((serial, batch)) => {
+                    worker.held_boundaries = Some((serial, batch));
+                    state.batches_read.fetch_add(1, Ordering::Release);
+                    state.batches_boundaries_found.fetch_add(1, Ordering::Release);
+                    false
+                }
+            }
+        }
+        Ok(None) => {
+            // EOF: set read_done and boundaries_done (skip Decompress + FindBoundaries)
+            state.read_done.store(true, Ordering::SeqCst);
+            state.boundaries_done.store(true, Ordering::SeqCst);
             false
         }
         Err(e) => {
@@ -2628,7 +2865,15 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
 
         if boundaries_done && all_parsed && state.q2_5_boundaries.is_empty() {
             state.parse_done.store(true, Ordering::Release);
-            log::trace!("fastq_try_step_parse: set parse_done=true");
+            // In synchronized mode, Group is skipped — set group_done alongside parse_done
+            if state.config.synchronized {
+                state.group_done.store(true, Ordering::Release);
+                log::trace!(
+                    "fastq_try_step_parse: set parse_done=true, group_done=true (synchronized)"
+                );
+            } else {
+                log::trace!("fastq_try_step_parse: set parse_done=true");
+            }
         } else if let Some(stats) = state.stats() {
             // Record Q2.5 as extension of Q2
             stats.record_queue_empty(2);
@@ -3681,7 +3926,7 @@ where
 /// Returns an I/O error if any pipeline step or file I/O fails.
 #[allow(clippy::too_many_lines)]
 pub fn run_fastq_pipeline<P, PF, SF>(
-    config: FastqPipelineConfig,
+    mut config: FastqPipelineConfig,
     fastq_paths: &[PathBuf],
     decompressed_readers: Option<Vec<Box<dyn BufRead + Send>>>,
     header: &Header,
@@ -3696,6 +3941,13 @@ where
 {
     log::debug!("run_fastq_pipeline: starting, num_threads={}", config.num_threads);
 
+    // Synchronized mode requires parallel parse: Decode creates templates directly,
+    // and FindBoundaries is needed for BGZF inputs. This is a safety net for callers
+    // that set config fields directly; active_steps() also enforces this invariant.
+    if config.synchronized {
+        config.use_parallel_parse = true;
+    }
+
     // Write BAM header first
     log::debug!("run_fastq_pipeline: writing BAM header");
     write_bam_header(&mut output, header)?;
@@ -3703,27 +3955,29 @@ where
 
     // Create reader based on input type
     log::debug!(
-        "run_fastq_pipeline: creating reader, decompressed_readers.is_some()={}",
-        decompressed_readers.is_some()
+        "run_fastq_pipeline: creating reader, decompressed_readers.is_some()={}, inputs_are_bgzf={}, synchronized={}",
+        decompressed_readers.is_some(),
+        config.inputs_are_bgzf,
+        config.synchronized,
     );
     let reader: FastqReader<Box<dyn BufRead + Send>> = if let Some(readers) = decompressed_readers {
-        // Gzip/Plain path
-        log::debug!("run_fastq_pipeline: using Gzip/Plain path, {} readers", readers.len());
-        FastqReader::Decompressed(MultiDecompressedReader::new(readers))
+        if config.synchronized {
+            // Gzip+synchronized: use record-count reader (skips Decompress + FindBoundaries)
+            log::debug!(
+                "run_fastq_pipeline: using RecordCount path (synchronized), {} readers",
+                readers.len()
+            );
+            FastqReader::RecordCount(MultiRecordCountReader::new(readers))
+        } else {
+            // Gzip/Plain path: byte-chunk reader
+            log::debug!("run_fastq_pipeline: using Decompressed path, {} readers", readers.len());
+            FastqReader::Decompressed(MultiDecompressedReader::new(readers))
+        }
     } else {
-        // BGZF path
+        // BGZF path: block-level reader (unified through same pipeline)
         log::debug!("run_fastq_pipeline: using BGZF path");
         let bgzf_reader = MultiBgzfBlockReader::new(fastq_paths)?;
-        // Wrap in a way that works with the type system
-        // We need to use a different approach since MultiBgzfBlockReader doesn't use R
-        return run_fastq_pipeline_bgzf(
-            config,
-            bgzf_reader,
-            header,
-            output,
-            process_fn,
-            serialize_fn,
-        );
+        FastqReader::Bgzf(bgzf_reader)
     };
 
     // Create state
@@ -3741,6 +3995,7 @@ where
     let num_threads = config.num_threads;
     let compression_level = config.compression_level;
     let scheduler_strategy = config.scheduler_strategy;
+    let active_steps = config.active_steps();
 
     // Spawn workers
     log::debug!("run_fastq_pipeline: spawning {num_threads} worker threads");
@@ -3750,6 +4005,7 @@ where
             let process_fn = Arc::clone(&process_fn);
             let serialize_fn = Arc::clone(&serialize_fn);
             let header = Arc::clone(&header);
+            let active_steps = active_steps.clone();
 
             thread::spawn(move || {
                 // Wrap worker logic in catch_unwind to handle panics gracefully
@@ -3760,6 +4016,7 @@ where
                         thread_id,
                         num_threads,
                         scheduler_strategy,
+                        active_steps,
                     );
                     log::debug!("Worker thread {thread_id} created worker state");
                     let ctx = FastqStepContext {
@@ -3826,647 +4083,6 @@ where
     finalize_pipeline(&*state)
 }
 
-/// Internal: Run pipeline for BGZF inputs specifically.
-#[allow(clippy::similar_names, clippy::too_many_lines, clippy::needless_pass_by_value)]
-fn run_fastq_pipeline_bgzf<P, PF, SF>(
-    config: FastqPipelineConfig,
-    reader: MultiBgzfBlockReader,
-    header: &Header,
-    output: Box<dyn Write + Send>,
-    process_fn: PF,
-    serialize_fn: SF,
-) -> io::Result<u64>
-where
-    P: Send + MemoryEstimate + 'static,
-    PF: Fn(FastqTemplate) -> io::Result<P> + Send + Sync + 'static,
-    SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
-{
-    // For BGZF, we wrap the reader in our enum
-    // But MultiBgzfBlockReader doesn't use the R parameter, so we need a workaround
-    // Create a simple wrapper type that implements the needed interface
-
-    // Actually, let's just inline the pipeline here for BGZF
-    // This avoids the type system complexity
-
-    let num_streams = reader.num_streams();
-    let cap = config.queue_capacity;
-    let batch_size = config.batch_size;
-
-    // Create queues and state manually
-    let q1_raw: ArrayQueue<(u64, FastqReadBatch)> = ArrayQueue::new(cap);
-    let q2_decompressed: ArrayQueue<(u64, FastqReadBatch)> = ArrayQueue::new(cap);
-    let q2_reorder = Mutex::new(ReorderBuffer::new());
-    // Note: The BGZF path does not use parallel parse, so the synchronized
-    // bypass optimization is not available here. The grouper is always used.
-    let grouper = Mutex::new(FastqMultiStreamGrouper::new(num_streams));
-    let group_done = AtomicBool::new(false);
-    let next_template_serial = AtomicU64::new(0);
-    let pending_templates = Mutex::new(Vec::with_capacity(batch_size));
-    let q3_templates: ArrayQueue<(u64, Vec<FastqTemplate>)> = ArrayQueue::new(cap);
-    let q4_processed: ArrayQueue<(u64, Vec<P>)> = ArrayQueue::new(cap);
-    let q5_serialized: ArrayQueue<(u64, SerializedBatch)> = ArrayQueue::new(cap);
-    let q6_compressed: ArrayQueue<(u64, CompressedBlockBatch)> = ArrayQueue::new(cap);
-    let q6_reorder: Mutex<ReorderBuffer<CompressedBlockBatch>> = Mutex::new(ReorderBuffer::new());
-    let output_mutex = Mutex::new(Some(output));
-    let read_done = AtomicBool::new(false);
-    let batches_read = AtomicU64::new(0);
-    let batches_grouped = AtomicU64::new(0);
-    let error_flag = AtomicBool::new(false);
-    let error_storage: Mutex<Option<io::Error>> = Mutex::new(None);
-    let templates_written = AtomicU64::new(0);
-    let reader_mutex = Mutex::new(Some(reader));
-
-    // Wrap everything in a struct for shared access
-    #[allow(clippy::items_after_statements)]
-    struct BgzfPipelineState<P: Send> {
-        batch_size: usize,
-        reader: Mutex<Option<MultiBgzfBlockReader>>,
-        read_done: AtomicBool,
-        batches_read: AtomicU64,
-        q1_raw: ArrayQueue<(u64, FastqReadBatch)>,
-        q2_decompressed: ArrayQueue<(u64, FastqReadBatch)>,
-        q2_reorder: Mutex<ReorderBuffer<FastqReadBatch>>,
-        /// Atomic state for Q2 reorder buffer.
-        q2_reorder_state: ReorderBufferState,
-        grouper: Mutex<FastqMultiStreamGrouper>,
-        batches_grouped: AtomicU64,
-        group_done: AtomicBool,
-        next_template_serial: AtomicU64,
-        /// Total number of individual templates pushed to Q3 (for debugging).
-        total_templates_pushed: AtomicU64,
-        /// Total number of individual records serialized (for debugging).
-        #[allow(dead_code)]
-        total_records_serialized: AtomicU64,
-        pending_templates: Mutex<Vec<FastqTemplate>>,
-        q3_templates: ArrayQueue<(u64, Vec<FastqTemplate>)>,
-        q4_processed: ArrayQueue<(u64, Vec<P>)>,
-        q5_serialized: ArrayQueue<(u64, SerializedBatch)>,
-        q6_compressed: ArrayQueue<(u64, CompressedBlockBatch)>,
-        q6_reorder: Mutex<ReorderBuffer<CompressedBlockBatch>>,
-        output: Mutex<Option<Box<dyn Write + Send>>>,
-        error_flag: AtomicBool,
-        error: Mutex<Option<io::Error>>,
-        templates_written: AtomicU64,
-        progress: ProgressTracker,
-        stats: Option<Arc<PipelineStats>>,
-    }
-
-    #[allow(clippy::items_after_statements)]
-    impl<P: Send> BgzfPipelineState<P> {
-        fn set_error(&self, e: io::Error) {
-            self.error_flag.store(true, Ordering::SeqCst);
-            let mut guard = self.error.lock();
-            if guard.is_none() {
-                *guard = Some(e);
-            }
-        }
-
-        fn has_error(&self) -> bool {
-            self.error_flag.load(Ordering::Relaxed)
-        }
-
-        fn is_complete(&self) -> bool {
-            // Check flags - both read and group must be done
-            if !self.read_done.load(Ordering::Acquire) || !self.group_done.load(Ordering::Acquire) {
-                return false;
-            }
-
-            // Check all ArrayQueues are empty (lock-free checks)
-            if !self.q1_raw.is_empty()
-                || !self.q2_decompressed.is_empty()
-                || !self.q3_templates.is_empty()
-                || !self.q4_processed.is_empty()
-                || !self.q5_serialized.is_empty()
-                || !self.q6_compressed.is_empty()
-            {
-                return false;
-            }
-
-            // Check reorder buffers and pending templates (requires locks)
-            let q2_empty = self.q2_reorder.lock().is_empty();
-            let q6_empty = self.q6_reorder.lock().is_empty();
-            let pending_empty = self.pending_templates.lock().is_empty();
-
-            q2_empty && q6_empty && pending_empty
-        }
-
-        /// Check if Decompress step can proceed with pushing a batch to Q2.
-        fn can_decompress_proceed(&self, serial: u64) -> bool {
-            self.q2_reorder_state.can_proceed(serial)
-        }
-    }
-
-    // Trait implementations for shared step functions
-    #[allow(clippy::items_after_statements)]
-    impl<P: Send> ProcessPipelineState<FastqTemplate, P> for BgzfPipelineState<P> {
-        fn process_input_pop(&self) -> Option<(u64, Vec<FastqTemplate>)> {
-            self.q3_templates.pop()
-        }
-        fn process_output_is_full(&self) -> bool {
-            self.q4_processed.is_full()
-        }
-        fn process_output_push(&self, item: (u64, Vec<P>)) -> Result<(), (u64, Vec<P>)> {
-            self.q4_processed.push(item)
-        }
-        fn has_error(&self) -> bool {
-            self.error_flag.load(Ordering::Relaxed)
-        }
-        fn set_error(&self, e: io::Error) {
-            self.error_flag.store(true, Ordering::SeqCst);
-            let mut guard = self.error.lock();
-            if guard.is_none() {
-                *guard = Some(e);
-            }
-        }
-    }
-
-    #[allow(clippy::items_after_statements)]
-    impl<P: Send> SerializePipelineState<P> for BgzfPipelineState<P> {
-        fn serialize_input_pop(&self) -> Option<(u64, Vec<P>)> {
-            self.q4_processed.pop()
-        }
-        fn serialize_output_is_full(&self) -> bool {
-            self.q5_serialized.is_full()
-        }
-        fn serialize_output_push(
-            &self,
-            item: (u64, SerializedBatch),
-        ) -> Result<(), (u64, SerializedBatch)> {
-            self.q5_serialized.push(item)
-        }
-        fn has_error(&self) -> bool {
-            self.error_flag.load(Ordering::Relaxed)
-        }
-        fn set_error(&self, e: io::Error) {
-            self.error_flag.store(true, Ordering::SeqCst);
-            let mut guard = self.error.lock();
-            if guard.is_none() {
-                *guard = Some(e);
-            }
-        }
-    }
-
-    #[allow(clippy::items_after_statements)]
-    impl<P: Send> OutputPipelineState for BgzfPipelineState<P> {
-        type Processed = P;
-        fn has_error(&self) -> bool {
-            self.error_flag.load(Ordering::Relaxed)
-        }
-        fn set_error(&self, e: io::Error) {
-            self.error_flag.store(true, Ordering::SeqCst);
-            let mut guard = self.error.lock();
-            if guard.is_none() {
-                *guard = Some(e);
-            }
-        }
-        fn q5_pop(&self) -> Option<(u64, SerializedBatch)> {
-            self.q5_serialized.pop()
-        }
-        fn q5_push(&self, item: (u64, SerializedBatch)) -> Result<(), (u64, SerializedBatch)> {
-            self.q5_serialized.push(item)
-        }
-        fn q5_is_full(&self) -> bool {
-            self.q5_serialized.is_full()
-        }
-        fn q6_pop(&self) -> Option<(u64, CompressedBlockBatch)> {
-            self.q6_compressed.pop()
-        }
-        // Note: BGZF path does not track compressed queue heap bytes (no add/remove tracking).
-        // This is intentional — the BGZF pipeline is simpler and doesn't need memory-debug visibility.
-        fn q6_push(
-            &self,
-            item: (u64, CompressedBlockBatch),
-        ) -> Result<(), (u64, CompressedBlockBatch)> {
-            self.q6_compressed.push(item)
-        }
-        fn q6_is_full(&self) -> bool {
-            self.q6_compressed.is_full()
-        }
-        fn q6_reorder_insert(&self, serial: u64, batch: CompressedBlockBatch) {
-            self.q6_reorder.lock().insert(serial, batch);
-        }
-        fn q6_reorder_try_pop_next(&self) -> Option<CompressedBlockBatch> {
-            self.q6_reorder.lock().try_pop_next()
-        }
-        fn output_try_lock(
-            &self,
-        ) -> Option<parking_lot::MutexGuard<'_, Option<Box<dyn Write + Send>>>> {
-            self.output.try_lock()
-        }
-        fn increment_written(&self) -> u64 {
-            self.templates_written.fetch_add(1, Ordering::Release)
-        }
-        fn stats(&self) -> Option<&PipelineStats> {
-            self.stats.as_deref()
-        }
-    }
-
-    #[allow(clippy::items_after_statements)]
-    impl<P: Send> WritePipelineState for BgzfPipelineState<P> {
-        fn write_input_queue(&self) -> &ArrayQueue<(u64, CompressedBlockBatch)> {
-            &self.q6_compressed
-        }
-        fn write_reorder_buffer(&self) -> &Mutex<ReorderBuffer<CompressedBlockBatch>> {
-            &self.q6_reorder
-        }
-        fn write_output(&self) -> &Mutex<Option<Box<dyn Write + Send>>> {
-            &self.output
-        }
-        fn has_error(&self) -> bool {
-            self.error_flag.load(Ordering::Relaxed)
-        }
-        fn set_error(&self, e: io::Error) {
-            self.error_flag.store(true, Ordering::SeqCst);
-            let mut guard = self.error.lock();
-            if guard.is_none() {
-                *guard = Some(e);
-            }
-        }
-        fn record_written(&self, count: u64) {
-            self.templates_written.fetch_add(count, Ordering::Relaxed);
-            self.progress.log_if_needed(count);
-        }
-        fn stats(&self) -> Option<&PipelineStats> {
-            self.stats.as_deref()
-        }
-    }
-
-    let stats = if config.collect_stats {
-        config.shared_stats.clone().or_else(|| Some(Arc::new(PipelineStats::new())))
-    } else {
-        None
-    };
-
-    let state = Arc::new(BgzfPipelineState::<P> {
-        batch_size,
-        reader: reader_mutex,
-        read_done,
-        batches_read,
-        q1_raw,
-        q2_decompressed,
-        q2_reorder,
-        q2_reorder_state: ReorderBufferState::new(config.queue_memory_limit),
-        grouper,
-        batches_grouped,
-        group_done,
-        next_template_serial,
-        total_templates_pushed: AtomicU64::new(0),
-        total_records_serialized: AtomicU64::new(0),
-        pending_templates,
-        q3_templates,
-        q4_processed,
-        q5_serialized,
-        q6_compressed,
-        q6_reorder,
-        output: output_mutex,
-        error_flag,
-        error: error_storage,
-        templates_written,
-        progress: ProgressTracker::new("Processed records").with_interval(PROGRESS_LOG_INTERVAL),
-        stats,
-    });
-
-    let process_fn = Arc::new(process_fn);
-    let serialize_fn = Arc::new(serialize_fn);
-    let header = Arc::new(header.clone());
-    let num_threads = config.num_threads;
-    let compression_level = config.compression_level;
-    let scheduler_strategy = config.scheduler_strategy;
-
-    // Worker function (non-blocking with held-item pattern)
-    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
-    fn bgzf_worker<P: Send + MemoryEstimate, PF, SF>(
-        state: &BgzfPipelineState<P>,
-        header: &Header,
-        process_fn: &PF,
-        serialize_fn: &SF,
-        worker: &mut FastqWorkerState<P>,
-        is_reader: bool,
-    ) where
-        PF: Fn(FastqTemplate) -> io::Result<P>,
-        SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64>,
-    {
-        const MAX_RETRIES: u32 = 10_000;
-
-        loop {
-            // CRITICAL: Don't exit while holding items - they would be lost!
-            if state.has_error() || (state.is_complete() && !worker.has_any_held_items()) {
-                break;
-            }
-
-            let mut did_work = false;
-
-            // =========================================================================
-            // Step 1: Read (reader thread only) - with held pattern
-            // =========================================================================
-            if is_reader {
-                // Priority 1: Try to advance any held raw batch first
-                if let Some((serial, held)) = worker.held_raw.take() {
-                    match state.q1_raw.push((serial, held)) {
-                        Ok(()) => did_work = true,
-                        Err(returned) => {
-                            worker.held_raw = Some(returned);
-                        }
-                    }
-                }
-
-                // Priority 2: Read new batch if not holding and not done
-                if worker.held_raw.is_none() && !state.read_done.load(Ordering::Relaxed) {
-                    if let Some(mut guard) = state.reader.try_lock() {
-                        if let Some(ref mut reader) = *guard {
-                            if !state.q1_raw.is_full() {
-                                match reader.read_next_batch() {
-                                    Ok(Some(batch)) => {
-                                        let serial = batch.serial;
-                                        match state.q1_raw.push((serial, batch)) {
-                                            Ok(()) => {
-                                                state.batches_read.fetch_add(1, Ordering::Release);
-                                                did_work = true;
-                                            }
-                                            Err(returned) => {
-                                                // Hold for next iteration
-                                                worker.held_raw = Some(returned);
-                                                state.batches_read.fetch_add(1, Ordering::Release);
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        state.read_done.store(true, Ordering::SeqCst);
-                                    }
-                                    Err(e) => {
-                                        state.set_error(e);
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(ref stats) = state.stats {
-                        stats.record_contention(PipelineStep::Read);
-                    }
-                }
-            }
-
-            // =========================================================================
-            // Step 2: Decompress - with held pattern and memory backpressure
-            // =========================================================================
-            // Priority 1: Try to advance any held decompressed batch first
-            if let Some((serial, held, heap_size)) = worker.held_decompressed.take() {
-                // Re-reserve memory for this held batch
-                state.q2_reorder_state.add_heap_bytes(heap_size as u64);
-
-                // Check memory-based backpressure before trying to push
-                if state.can_decompress_proceed(serial) {
-                    match state.q2_decompressed.push((serial, held)) {
-                        Ok(()) => did_work = true,
-                        Err((serial, held)) => {
-                            state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
-                            worker.held_decompressed = Some((serial, held, heap_size));
-                        }
-                    }
-                } else {
-                    state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
-                    worker.held_decompressed = Some((serial, held, heap_size));
-                }
-            }
-
-            // Priority 2: Decompress new batch if not holding
-            if worker.held_decompressed.is_none() && !state.q2_decompressed.is_full() {
-                if let Some((serial, batch)) = state.q1_raw.pop() {
-                    match decompress_fastq_batch(batch, &mut worker.decompressor) {
-                        Ok(decompressed) => {
-                            let heap_size = decompressed.estimate_heap_size();
-                            state.q2_reorder_state.add_heap_bytes(heap_size as u64);
-
-                            if state.can_decompress_proceed(serial) {
-                                match state.q2_decompressed.push((serial, decompressed)) {
-                                    Ok(()) => did_work = true,
-                                    Err((serial, decompressed)) => {
-                                        state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
-                                        worker.held_decompressed =
-                                            Some((serial, decompressed, heap_size));
-                                    }
-                                }
-                            } else {
-                                state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
-                                worker.held_decompressed = Some((serial, decompressed, heap_size));
-                            }
-                        }
-                        Err(e) => {
-                            state.set_error(e);
-                        }
-                    }
-                }
-            }
-
-            // =========================================================================
-            // Step 3: Group (exclusive) with batching - unchanged (already non-blocking)
-            // =========================================================================
-            if !state.group_done.load(Ordering::Relaxed) {
-                if let Some(mut grouper_guard) = state.grouper.try_lock() {
-                    let mut pending = state.pending_templates.lock();
-                    let mut reorder = state.q2_reorder.lock();
-
-                    // Move to reorder buffer (with heap_size tracking)
-                    while let Some((serial, batch)) = state.q2_decompressed.pop() {
-                        let heap_size = batch.estimate_heap_size();
-                        reorder.insert_with_size(serial, batch, heap_size);
-                    }
-
-                    // Helper to flush pending templates as a batch. Returns true if flushed.
-                    // NOTE: No memory tracking - matches BAM's pattern where memory is tracked
-                    // BEFORE the Group step (Q2 reorder), not after.
-                    let flush_pending = |pending: &mut Vec<FastqTemplate>,
-                                         state: &BgzfPipelineState<P>|
-                     -> bool {
-                        if pending.is_empty() {
-                            return true;
-                        }
-                        if state.q3_templates.is_full() {
-                            return false;
-                        }
-                        let batch: Vec<FastqTemplate> = std::mem::take(pending);
-                        let count = batch.len() as u64;
-                        let serial = state.next_template_serial.fetch_add(1, Ordering::Release);
-                        match state.q3_templates.push((serial, batch)) {
-                            Ok(()) => {
-                                state.total_templates_pushed.fetch_add(count, Ordering::Release);
-                                true
-                            }
-                            Err(returned) => {
-                                pending.extend(returned.1);
-                                state.next_template_serial.fetch_sub(1, Ordering::Release);
-                                false
-                            }
-                        }
-                    };
-
-                    // Try to flush any pending templates from previous iterations
-                    if !pending.is_empty() && flush_pending(&mut pending, state) {
-                        did_work = true;
-                    }
-
-                    // Drain in order
-                    while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
-                        // Update next_seq atomic for backpressure tracking
-                        state.q2_reorder_state.update_next_seq(reorder.next_seq());
-                        // Release the memory tracked for this batch
-                        state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
-
-                        match grouper_guard.add_batch(batch) {
-                            Ok(templates) => {
-                                pending.extend(templates);
-                                let mut flush_failed = false;
-                                while pending.len() >= state.batch_size {
-                                    if !flush_pending(&mut pending, state) {
-                                        flush_failed = true;
-                                        break;
-                                    }
-                                }
-                                state.batches_grouped.fetch_add(1, Ordering::Release);
-                                did_work = true;
-                                if flush_failed {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                state.set_error(e);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Check completion
-                    let read_done = state.read_done.load(Ordering::Acquire);
-                    let batches_read = state.batches_read.load(Ordering::Acquire);
-                    let batches_grouped = state.batches_grouped.load(Ordering::Acquire);
-                    if read_done && batches_grouped == batches_read {
-                        match grouper_guard.finish() {
-                            Ok(Some(template)) => pending.push(template),
-                            Ok(None) => {}
-                            Err(e) => state.set_error(e),
-                        }
-                        // Flush remaining pending templates.
-                        // CRITICAL: Must retry until flush succeeds to avoid data loss.
-                        let mut retries: u32 = 0;
-                        while !pending.is_empty() {
-                            if flush_pending(&mut pending, state) {
-                                continue;
-                            }
-                            retries += 1;
-                            if retries > MAX_RETRIES {
-                                state.set_error(io::Error::other(format!(
-                                    "Failed to flush {} final templates after {} retries",
-                                    pending.len(),
-                                    MAX_RETRIES
-                                )));
-                                break;
-                            }
-                            std::thread::yield_now();
-                        }
-                        if pending.is_empty() {
-                            state.group_done.store(true, Ordering::SeqCst);
-                        }
-                    }
-                } else if let Some(ref stats) = state.stats {
-                    stats.record_contention(PipelineStep::Group);
-                }
-            }
-
-            // =========================================================================
-            // Step 4: Process - use shared step function
-            // =========================================================================
-            if shared_try_step_process(state, worker, process_fn).is_success() {
-                did_work = true;
-            }
-
-            // =========================================================================
-            // Step 5: Serialize - use shared step function
-            // =========================================================================
-            if shared_try_step_serialize(state, worker, |p, buf| serialize_fn(p, header, buf))
-                .is_success()
-            {
-                did_work = true;
-            }
-
-            // =========================================================================
-            // Step 6: Compress - use shared step function
-            // =========================================================================
-            if shared_try_step_compress(state, worker).is_success() {
-                did_work = true;
-            }
-
-            // =========================================================================
-            // Step 7: Write - use shared step function
-            // =========================================================================
-            if shared_try_step_write_new(state).is_success() {
-                did_work = true;
-            }
-
-            if !did_work {
-                std::thread::yield_now();
-            }
-        }
-    }
-
-    // Spawn workers
-    let handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let state = Arc::clone(&state);
-            let process_fn = Arc::clone(&process_fn);
-            let serialize_fn = Arc::clone(&serialize_fn);
-            let header = Arc::clone(&header);
-
-            thread::spawn(move || {
-                // Wrap worker logic in catch_unwind to handle panics gracefully
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut worker = FastqWorkerState::new(
-                        compression_level,
-                        thread_id,
-                        num_threads,
-                        scheduler_strategy,
-                    );
-                    bgzf_worker(
-                        &state,
-                        &header,
-                        &*process_fn,
-                        &*serialize_fn,
-                        &mut worker,
-                        thread_id == 0,
-                    );
-                }));
-
-                // If a panic occurred, set the error flag so other threads exit
-                if let Err(panic_info) = result {
-                    let msg = super::base::extract_panic_message(panic_info);
-                    state.set_error(io::Error::other(format!(
-                        "Worker thread {thread_id} panicked: {msg}"
-                    )));
-                }
-            })
-        })
-        .collect();
-
-    // Wait for completion
-    join_worker_threads(handles)?;
-
-    // Check for errors
-    if let Some(error) = state.error.lock().take() {
-        return Err(error);
-    }
-
-    // Flush output and write EOF block
-    if let Some(ref mut writer) = *state.output.lock() {
-        writer.write_all(&BGZF_EOF)?;
-        writer.flush()?;
-    }
-
-    // Log pipeline statistics if enabled
-    if let Some(ref stats) = state.stats {
-        stats.log_summary();
-    }
-
-    Ok(state.templates_written.load(Ordering::Relaxed))
-}
-
 /// Write BAM header to output.
 fn write_bam_header(writer: &mut dyn Write, header: &Header) -> io::Result<()> {
     use noodles::bam;
@@ -4487,6 +4103,8 @@ mod tests {
     use super::*;
     use crate::bgzf_reader::RawBgzfBlock;
     use crate::bgzf_writer::CompressedBlock;
+    use PipelineStep::*;
+    use rstest::rstest;
     use std::io::Cursor;
 
     #[test]
@@ -4629,95 +4247,6 @@ mod tests {
 
         // Should read 0 blocks (EOF blocks are skipped by read_raw_blocks)
         assert_eq!(blocks.len(), 0);
-    }
-
-    // ========================================================================
-    // MultiStreamReader Tests
-    // ========================================================================
-
-    #[test]
-    fn test_multi_stream_reader_single_stream() {
-        let data = b"Hello World";
-        let reader = Cursor::new(data.to_vec());
-        let mut msr = MultiStreamReader::new(vec![reader]).with_chunk_size(5);
-
-        let chunks = msr.read_all_chunks().unwrap();
-
-        // Should have 3 chunks: "Hello", " Worl", "d"
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].stream_idx, 0);
-        assert_eq!(chunks[0].data, b"Hello");
-        assert_eq!(chunks[1].data, b" Worl");
-        assert_eq!(chunks[2].data, b"d");
-
-        // Verify serial numbers
-        for (i, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.serial, i as u64);
-        }
-
-        assert!(msr.is_eof());
-    }
-
-    #[test]
-    fn test_multi_stream_reader_two_streams() {
-        let r1 = Cursor::new(b"AAAA".to_vec());
-        let r2 = Cursor::new(b"BBBB".to_vec());
-        let mut msr = MultiStreamReader::new(vec![r1, r2]).with_chunk_size(2);
-
-        let chunks = msr.read_all_chunks().unwrap();
-
-        // Round-robin: R1(AA), R2(BB), R1(AA), R2(BB)
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].stream_idx, 0);
-        assert_eq!(chunks[0].data, b"AA");
-        assert_eq!(chunks[1].stream_idx, 1);
-        assert_eq!(chunks[1].data, b"BB");
-        assert_eq!(chunks[2].stream_idx, 0);
-        assert_eq!(chunks[2].data, b"AA");
-        assert_eq!(chunks[3].stream_idx, 1);
-        assert_eq!(chunks[3].data, b"BB");
-
-        assert!(msr.is_eof());
-    }
-
-    #[test]
-    fn test_multi_stream_reader_unequal_lengths() {
-        let r1 = Cursor::new(b"AAAAAA".to_vec()); // 6 bytes
-        let r2 = Cursor::new(b"BB".to_vec()); // 2 bytes
-        let mut msr = MultiStreamReader::new(vec![r1, r2]).with_chunk_size(2);
-
-        let chunks = msr.read_all_chunks().unwrap();
-
-        // Round-robin until R2 is empty, then just R1
-        // R1(AA), R2(BB), R1(AA), R1(AA)
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].stream_idx, 0); // AA
-        assert_eq!(chunks[1].stream_idx, 1); // BB
-        assert_eq!(chunks[2].stream_idx, 0); // AA
-        assert_eq!(chunks[3].stream_idx, 0); // AA (R2 is now EOF)
-
-        assert!(msr.is_eof());
-    }
-
-    #[test]
-    fn test_multi_stream_reader_empty_streams() {
-        let r1: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let r2: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let mut msr = MultiStreamReader::new(vec![r1, r2]);
-
-        let result = msr.read_next_chunk().unwrap();
-        assert!(result.is_none());
-        assert!(msr.is_eof());
-    }
-
-    #[test]
-    fn test_multi_stream_reader_no_streams() {
-        let readers: Vec<Cursor<Vec<u8>>> = vec![];
-        let mut msr = MultiStreamReader::new(readers);
-
-        let result = msr.read_next_chunk().unwrap();
-        assert!(result.is_none());
-        assert_eq!(msr.num_streams(), 0);
     }
 
     /// Test that demonstrates data loss when using `let _ = queue.push()` pattern.
@@ -5538,5 +5067,213 @@ mod tests {
             templates[0].records[1].sequence, b"CCCC",
             "records[1] must be R2 (stream 1) data, not R1"
         );
+    }
+
+    // ========================================================================
+    // MultiRecordCountReader tests
+    // ========================================================================
+
+    fn make_fastq_records(records: &[(&str, &str)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (name, seq) in records {
+            data.extend_from_slice(format!("@{name}\n").as_bytes());
+            data.extend_from_slice(seq.as_bytes());
+            data.push(b'\n');
+            data.extend_from_slice(b"+\n");
+            // Quality = same length as sequence, all 'I'
+            data.extend(std::iter::repeat_n(b'I', seq.len()));
+            data.push(b'\n');
+        }
+        data
+    }
+
+    #[test]
+    fn test_read_n_fastq_records_basic() {
+        let data = make_fastq_records(&[("r1", "ACGT"), ("r2", "TGCA"), ("r3", "AAAA")]);
+        let mut cursor = Cursor::new(data);
+
+        let (buf, offsets, at_eof) = read_n_fastq_records(&mut cursor, 2).unwrap();
+
+        assert_eq!(offsets.len(), 3); // 2 records + initial 0
+        assert!(!at_eof);
+        // First record starts at 0
+        assert_eq!(offsets[0], 0);
+        // Each record: "@rN\nACGT\n+\nIIII\n" = 4+4+2+4+1 = 15 bytes each
+        assert!(offsets[1] > 0);
+        assert!(offsets[2] > offsets[1]);
+        // Verify first record starts with @
+        assert_eq!(buf[0], b'@');
+    }
+
+    #[test]
+    fn test_read_n_fastq_records_at_eof() {
+        let data = make_fastq_records(&[("r1", "ACGT")]);
+        let mut cursor = Cursor::new(data);
+
+        let (_, offsets, at_eof) = read_n_fastq_records(&mut cursor, 5).unwrap();
+
+        // Only 1 record available, requested 5
+        assert_eq!(offsets.len(), 2); // 1 record
+        assert!(at_eof);
+    }
+
+    #[test]
+    fn test_read_n_fastq_records_empty_input() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+
+        let (_, offsets, at_eof) = read_n_fastq_records(&mut cursor, 5).unwrap();
+
+        assert_eq!(offsets.len(), 1); // Just the initial 0
+        assert!(at_eof);
+    }
+
+    #[test]
+    fn test_multi_record_count_reader_variable_length() {
+        // R1 has short reads, R2 has long reads (the regression scenario)
+        let r1_data = make_fastq_records(&[("r1_a", "AC"), ("r1_b", "TG"), ("r1_c", "AA")]);
+        let r2_data = make_fastq_records(&[
+            ("r2_a", "ACGTACGTACGT"),
+            ("r2_b", "TGCATGCATGCA"),
+            ("r2_c", "AAAACCCCGGGG"),
+        ]);
+
+        let r1 = Cursor::new(r1_data);
+        let r2 = Cursor::new(r2_data);
+
+        let mut reader = MultiRecordCountReader::new(vec![r1, r2]);
+        reader.set_records_per_batch(2);
+
+        let batch = reader.read_next_batch().unwrap().unwrap();
+
+        assert_eq!(batch.streams.len(), 2);
+        // Both streams should have exactly 2 records
+        let r1_records = batch.streams[0].offsets.len() - 1;
+        let r2_records = batch.streams[1].offsets.len() - 1;
+        assert_eq!(r1_records, 2, "R1 should have 2 records");
+        assert_eq!(r2_records, 2, "R2 should have 2 records");
+    }
+
+    #[test]
+    fn test_multi_record_count_reader_eof_alignment() {
+        // R1 has 3 records, R2 has 2 records
+        let r1_data = make_fastq_records(&[("r1_a", "ACGT"), ("r1_b", "TGCA"), ("r1_c", "AAAA")]);
+        let r2_data = make_fastq_records(&[("r2_a", "ACGT"), ("r2_b", "TGCA")]);
+
+        let r1 = Cursor::new(r1_data);
+        let r2 = Cursor::new(r2_data);
+
+        let mut reader = MultiRecordCountReader::new(vec![r1, r2]);
+        reader.set_records_per_batch(5); // Request more than available
+
+        let batch = reader.read_next_batch().unwrap().unwrap();
+
+        assert_eq!(batch.streams.len(), 2);
+        // At EOF, should align to minimum (2 records)
+        let r1_records = batch.streams[0].offsets.len() - 1;
+        let r2_records = batch.streams[1].offsets.len() - 1;
+        assert_eq!(r1_records, r2_records, "Record counts should be aligned at EOF");
+        assert_eq!(r2_records, 2, "Should have min(3, 2) = 2 records");
+    }
+
+    #[test]
+    fn test_multi_record_count_reader_single_stream() {
+        let data = make_fastq_records(&[("r1", "ACGT"), ("r2", "TGCA")]);
+        let cursor = Cursor::new(data);
+
+        let mut reader = MultiRecordCountReader::new(vec![cursor]);
+        reader.set_records_per_batch(1);
+
+        let batch1 = reader.read_next_batch().unwrap().unwrap();
+        assert_eq!(batch1.streams.len(), 1);
+        assert_eq!(batch1.streams[0].offsets.len() - 1, 1);
+        assert_eq!(batch1.serial, 0);
+
+        let batch2 = reader.read_next_batch().unwrap().unwrap();
+        assert_eq!(batch2.streams[0].offsets.len() - 1, 1);
+        assert_eq!(batch2.serial, 1);
+
+        // Third read should be None (EOF)
+        assert!(reader.read_next_batch().unwrap().is_none());
+        assert!(reader.is_done());
+    }
+
+    #[test]
+    fn test_multi_record_count_reader_empty_input() {
+        let cursor = Cursor::new(Vec::<u8>::new());
+        let mut reader = MultiRecordCountReader::new(vec![cursor]);
+
+        assert!(reader.read_next_batch().unwrap().is_none());
+        assert!(reader.is_done());
+    }
+
+    #[test]
+    fn test_multi_record_count_reader_produces_valid_boundaries() {
+        let data = make_fastq_records(&[("read1", "ACGTACGT"), ("read2", "TGCATGCA")]);
+        let cursor = Cursor::new(data);
+
+        let mut reader = MultiRecordCountReader::new(vec![cursor]);
+        reader.set_records_per_batch(2);
+
+        let batch = reader.read_next_batch().unwrap().unwrap();
+        let stream = &batch.streams[0];
+
+        // Verify offsets point to valid record boundaries
+        for i in 0..stream.offsets.len() - 1 {
+            let start = stream.offsets[i];
+            let end = if i + 1 < stream.offsets.len() {
+                stream.offsets[i + 1]
+            } else {
+                stream.data.len()
+            };
+            // Each record should start with '@'
+            assert_eq!(stream.data[start], b'@', "Record {i} should start with '@'");
+            // Each record should end with '\n'
+            assert_eq!(stream.data[end - 1], b'\n', "Record {i} should end with newline");
+        }
+    }
+
+    // ========================================================================
+    // ActiveSteps Configuration Tests
+    // ========================================================================
+
+    #[rstest]
+    // Gzip+sync: active_steps() enforces synchronized → use_parallel_parse
+    #[case::gzip_synchronized(false, true, false,
+        &[Read, Decode, Process, Serialize, Compress, Write],
+        &[Decompress, FindBoundaries, Group])]
+    // BGZF+sync: Decompress+FindBoundaries+Decode active, Group skipped
+    #[case::bgzf_synchronized(true, true, false,
+        &[Read, Decompress, FindBoundaries, Decode, Process, Serialize, Compress, Write],
+        &[Group])]
+    // BGZF+non-sync+ppp=false: no FindBoundaries/Decode
+    #[case::bgzf_non_synchronized(true, false, false,
+        &[Read, Decompress, Group, Process, Serialize, Compress, Write],
+        &[FindBoundaries, Decode])]
+    // Gzip+non-sync+ppp=false: no FindBoundaries/Decode
+    #[case::gzip_non_synchronized(false, false, false,
+        &[Read, Decompress, Group, Process, Serialize, Compress, Write],
+        &[FindBoundaries, Decode])]
+    // BGZF+non-sync+ppp=true: all 9 steps
+    #[case::all_steps_with_parallel_parse(true, false, true,
+        &[Read, Decompress, FindBoundaries, Decode, Group, Process, Serialize, Compress, Write],
+        &[])]
+    fn test_active_steps(
+        #[case] inputs_are_bgzf: bool,
+        #[case] synchronized: bool,
+        #[case] use_parallel_parse: bool,
+        #[case] expected_active: &[PipelineStep],
+        #[case] expected_inactive: &[PipelineStep],
+    ) {
+        let mut config = FastqPipelineConfig::new(4, inputs_are_bgzf, 1);
+        if synchronized {
+            config = config.with_synchronized(true);
+        }
+        config.use_parallel_parse = use_parallel_parse;
+        let steps = config.active_steps();
+
+        assert_eq!(steps.steps(), expected_active);
+        for &step in expected_inactive {
+            assert!(!steps.is_active(step));
+        }
     }
 }

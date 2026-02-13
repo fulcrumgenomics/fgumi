@@ -12,7 +12,7 @@ use rand_distr::{Beta, Distribution};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Atomic counter for unique seeds across threads.
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +31,8 @@ pub struct ThompsonSamplingScheduler {
     rng: SmallRng,
     /// Priority buffer for returning step order.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl ThompsonSamplingScheduler {
@@ -49,7 +51,7 @@ impl ThompsonSamplingScheduler {
 
     /// Create a new Thompson Sampling scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         // Use a unique seed for each scheduler instance
         let seed = SEED_COUNTER
             .fetch_add(1, Ordering::Relaxed)
@@ -62,6 +64,7 @@ impl ThompsonSamplingScheduler {
             betas: [1.0; 9],
             rng: SmallRng::seed_from_u64(seed),
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -100,7 +103,8 @@ impl Scheduler for ThompsonSamplingScheduler {
             self.priority_buffer[priority] = Self::STEPS[*step_idx];
         }
 
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -119,22 +123,30 @@ impl Scheduler for ThompsonSamplingScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_initial_uniform_prior() {
-        let scheduler = ThompsonSamplingScheduler::new(0, 8);
+        let scheduler = ThompsonSamplingScheduler::new(0, 8, all());
         assert!((scheduler.alphas[0] - 1.0).abs() < f64::EPSILON);
         assert!((scheduler.betas[0] - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_update_on_success() {
-        let mut scheduler = ThompsonSamplingScheduler::new(0, 8);
+        let mut scheduler = ThompsonSamplingScheduler::new(0, 8, all());
         scheduler.record_outcome(PipelineStep::Read, true, false);
         assert!((scheduler.alphas[0] - 2.0).abs() < f64::EPSILON);
         assert!((scheduler.betas[0] - 1.0).abs() < f64::EPSILON);
@@ -142,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_update_on_failure() {
-        let mut scheduler = ThompsonSamplingScheduler::new(0, 8);
+        let mut scheduler = ThompsonSamplingScheduler::new(0, 8, all());
         scheduler.record_outcome(PipelineStep::Read, false, false);
         assert!((scheduler.alphas[0] - 1.0).abs() < f64::EPSILON);
         assert!((scheduler.betas[0] - 2.0).abs() < f64::EPSILON);
@@ -150,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_get_priorities_returns_all_steps() {
-        let mut scheduler = ThompsonSamplingScheduler::new(0, 8);
+        let mut scheduler = ThompsonSamplingScheduler::new(0, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities.len(), 9);
@@ -158,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_learned_preference() {
-        let mut scheduler = ThompsonSamplingScheduler::new(0, 8);
+        let mut scheduler = ThompsonSamplingScheduler::new(0, 8, all());
         // Heavily reward Read step
         for _ in 0..100 {
             scheduler.record_outcome(PipelineStep::Read, true, false);

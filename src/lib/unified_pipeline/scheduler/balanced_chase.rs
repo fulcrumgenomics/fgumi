@@ -12,7 +12,7 @@
 //! - Minimize idle time by keeping everyone busy on the real bottleneck
 
 use super::{BackpressureState, Direction, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Balanced chase scheduler focused on even work distribution.
 pub struct BalancedChaseScheduler {
@@ -29,6 +29,8 @@ pub struct BalancedChaseScheduler {
     priority_buffer: [PipelineStep; 9],
     /// Which exclusive step this thread is responsible for (if any).
     exclusive_role: Option<PipelineStep>,
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl BalancedChaseScheduler {
@@ -47,7 +49,7 @@ impl BalancedChaseScheduler {
 
     /// Create a new balanced chase scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let (current_step, exclusive_role) = Self::determine_role(thread_id, num_threads);
 
         Self {
@@ -57,6 +59,7 @@ impl BalancedChaseScheduler {
             direction: Direction::Forward,
             priority_buffer: Self::STEPS,
             exclusive_role,
+            active_steps,
         }
     }
 
@@ -168,7 +171,8 @@ impl Scheduler for BalancedChaseScheduler {
         }
 
         self.build_priorities(bp);
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -214,29 +218,37 @@ impl Scheduler for BalancedChaseScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_reader_starts_on_compress() {
-        let scheduler = BalancedChaseScheduler::new(0, 8);
+        let scheduler = BalancedChaseScheduler::new(0, 8, all());
         assert_eq!(scheduler.current_step, PipelineStep::Compress);
         assert_eq!(scheduler.exclusive_role, Some(PipelineStep::Read));
     }
 
     #[test]
     fn test_writer_starts_on_compress() {
-        let scheduler = BalancedChaseScheduler::new(7, 8);
+        let scheduler = BalancedChaseScheduler::new(7, 8, all());
         assert_eq!(scheduler.current_step, PipelineStep::Compress);
         assert_eq!(scheduler.exclusive_role, Some(PipelineStep::Write));
     }
 
     #[test]
     fn test_exclusive_role_first_in_priorities() {
-        let mut scheduler = BalancedChaseScheduler::new(0, 8);
+        let mut scheduler = BalancedChaseScheduler::new(0, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
 
@@ -250,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_pivot_to_compress_after_exclusive() {
-        let mut scheduler = BalancedChaseScheduler::new(0, 8);
+        let mut scheduler = BalancedChaseScheduler::new(0, 8, all());
 
         // Complete Read successfully
         scheduler.record_outcome(PipelineStep::Read, true, false);
@@ -261,13 +273,13 @@ mod tests {
 
     #[test]
     fn test_middle_thread_no_exclusive_role() {
-        let scheduler = BalancedChaseScheduler::new(3, 8);
+        let scheduler = BalancedChaseScheduler::new(3, 8, all());
         assert!(scheduler.exclusive_role.is_none());
     }
 
     #[test]
     fn test_bottleneck_always_in_top_priorities() {
-        let mut scheduler = BalancedChaseScheduler::new(3, 8);
+        let mut scheduler = BalancedChaseScheduler::new(3, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
 

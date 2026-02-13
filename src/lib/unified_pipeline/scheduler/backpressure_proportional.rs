@@ -5,7 +5,7 @@
 //! When input starves, upstream steps get higher priority.
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Backpressure-proportional scheduler with EMA smoothing.
 pub struct BackpressureProportionalScheduler {
@@ -19,6 +19,8 @@ pub struct BackpressureProportionalScheduler {
     alpha: f64,
     /// Priority buffer.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl BackpressureProportionalScheduler {
@@ -44,7 +46,7 @@ impl BackpressureProportionalScheduler {
 
     /// Create a new backpressure-proportional scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         // Initialize with balanced weights
         let weights = [0.5; 9];
 
@@ -54,6 +56,7 @@ impl BackpressureProportionalScheduler {
             weights,
             alpha: Self::DEFAULT_ALPHA,
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -96,7 +99,8 @@ impl Scheduler for BackpressureProportionalScheduler {
             self.priority_buffer[priority] = Self::STEPS[*step_idx];
         }
 
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, _step: PipelineStep, _success: bool, _was_contention: bool) {
@@ -110,6 +114,10 @@ impl Scheduler for BackpressureProportionalScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -118,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_initial_balanced_weights() {
-        let scheduler = BackpressureProportionalScheduler::new(0, 8);
+        let scheduler = BackpressureProportionalScheduler::new(0, 8, ActiveSteps::all());
         for weight in scheduler.weights {
             assert!((weight - 0.5).abs() < 0.001);
         }
@@ -126,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_output_high_increases_downstream() {
-        let mut scheduler = BackpressureProportionalScheduler::new(0, 8);
+        let mut scheduler = BackpressureProportionalScheduler::new(0, 8, ActiveSteps::all());
         let bp = BackpressureState {
             output_high: true,
             input_low: false,
@@ -146,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_input_low_increases_upstream() {
-        let mut scheduler = BackpressureProportionalScheduler::new(0, 8);
+        let mut scheduler = BackpressureProportionalScheduler::new(0, 8, ActiveSteps::all());
         let bp = BackpressureState {
             output_high: false,
             input_low: true,

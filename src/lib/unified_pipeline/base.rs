@@ -1114,6 +1114,10 @@ impl PipelineStep {
     }
 
     /// Convert from step index to `PipelineStep`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is greater than 8.
     #[must_use]
     pub const fn from_index(idx: usize) -> PipelineStep {
         match idx {
@@ -1125,7 +1129,24 @@ impl PipelineStep {
             5 => PipelineStep::Process,
             6 => PipelineStep::Serialize,
             7 => PipelineStep::Compress,
-            _ => PipelineStep::Write,
+            8 => PipelineStep::Write,
+            _ => panic!("PipelineStep::from_index: invalid index (must be 0..=8)"),
+        }
+    }
+
+    /// Get the 0-based index of this step (Read=0, ..., Write=8).
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        match self {
+            PipelineStep::Read => 0,
+            PipelineStep::Decompress => 1,
+            PipelineStep::FindBoundaries => 2,
+            PipelineStep::Decode => 3,
+            PipelineStep::Group => 4,
+            PipelineStep::Process => 5,
+            PipelineStep::Serialize => 6,
+            PipelineStep::Compress => 7,
+            PipelineStep::Write => 8,
         }
     }
 
@@ -1143,6 +1164,93 @@ impl PipelineStep {
             PipelineStep::Compress => "Co",
             PipelineStep::Write => "Wr",
         }
+    }
+}
+
+// ============================================================================
+// ActiveSteps - Configurable set of active pipeline steps
+// ============================================================================
+
+/// Tracks which pipeline steps are active for a given pipeline configuration.
+///
+/// Some steps may be skipped depending on input type and mode:
+/// - Gzip+synchronized: skips `Decompress`, `FindBoundaries`, `Group`
+/// - BGZF+synchronized: skips `Group`
+/// - BAM (all active): all 9 steps
+#[derive(Debug, Clone)]
+pub struct ActiveSteps {
+    /// Active steps in pipeline order.
+    steps: Vec<PipelineStep>,
+    /// Fast lookup: `active[step.index()]` is true iff step is active.
+    active: [bool; 9],
+}
+
+impl ActiveSteps {
+    /// Create from a list of active steps (must be in pipeline order, unique).
+    ///
+    /// # Panics
+    ///
+    /// Panics if steps are not in ascending pipeline order or contain duplicates.
+    #[must_use]
+    pub fn new(steps: &[PipelineStep]) -> Self {
+        assert!(
+            steps.windows(2).all(|w| w[0].index() < w[1].index()),
+            "ActiveSteps must be unique and in pipeline order"
+        );
+        let mut active = [false; 9];
+        for &step in steps {
+            active[step.index()] = true;
+        }
+        Self { steps: steps.to_vec(), active }
+    }
+
+    /// All 9 steps active (BAM pipeline, default).
+    #[must_use]
+    pub fn all() -> Self {
+        Self::new(&PipelineStep::all())
+    }
+
+    /// Check if a step is active.
+    #[must_use]
+    pub fn is_active(&self, step: PipelineStep) -> bool {
+        self.active[step.index()]
+    }
+
+    /// Get the active steps in pipeline order.
+    #[must_use]
+    pub fn steps(&self) -> &[PipelineStep] {
+        &self.steps
+    }
+
+    /// Get only the active exclusive steps in pipeline order.
+    #[must_use]
+    pub fn exclusive_steps(&self) -> Vec<PipelineStep> {
+        self.steps.iter().copied().filter(PipelineStep::is_exclusive).collect()
+    }
+
+    /// Number of active steps.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Returns true if no steps are active.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Filter a priority buffer in-place, keeping only active steps.
+    /// Returns the number of active steps remaining.
+    pub fn filter_in_place(&self, buffer: &mut [PipelineStep; 9]) -> usize {
+        let mut write = 0;
+        for read in 0..9 {
+            if self.active[buffer[read].index()] {
+                buffer[write] = buffer[read];
+                write += 1;
+            }
+        }
+        write
     }
 }
 
@@ -1761,16 +1869,18 @@ impl WorkerCoreState {
     /// * `thread_id` - Thread index (0-based)
     /// * `num_threads` - Total number of worker threads
     /// * `scheduler_strategy` - Strategy for step scheduling
+    /// * `active_steps` - Which pipeline steps are active
     #[must_use]
     pub fn new(
         compression_level: u32,
         thread_id: usize,
         num_threads: usize,
         scheduler_strategy: SchedulerStrategy,
+        active_steps: ActiveSteps,
     ) -> Self {
         Self {
             compressor: InlineBgzfCompressor::new(compression_level),
-            scheduler: create_scheduler(scheduler_strategy, thread_id, num_threads),
+            scheduler: create_scheduler(scheduler_strategy, thread_id, num_threads, active_steps),
             serialization_buffer: Vec::with_capacity(SERIALIZATION_BUFFER_CAPACITY),
             backoff_us: MIN_BACKOFF_US,
         }
@@ -5490,14 +5600,15 @@ mod tests {
     #[test]
     fn test_worker_core_state_initial_values() {
         use super::super::scheduler::SchedulerStrategy;
-        let state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default());
+        let state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default(), ActiveSteps::all());
         assert_eq!(state.backoff_us, MIN_BACKOFF_US);
     }
 
     #[test]
     fn test_worker_core_state_reset_backoff() {
         use super::super::scheduler::SchedulerStrategy;
-        let mut state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default());
+        let mut state =
+            WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default(), ActiveSteps::all());
         state.increase_backoff();
         assert!(state.backoff_us > MIN_BACKOFF_US);
         state.reset_backoff();
@@ -5507,7 +5618,8 @@ mod tests {
     #[test]
     fn test_worker_core_state_increase_backoff() {
         use super::super::scheduler::SchedulerStrategy;
-        let mut state = WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default());
+        let mut state =
+            WorkerCoreState::new(6, 0, 4, SchedulerStrategy::default(), ActiveSteps::all());
         assert_eq!(state.backoff_us, MIN_BACKOFF_US); // 10
         state.increase_backoff();
         assert_eq!(state.backoff_us, MIN_BACKOFF_US * 2); // 20

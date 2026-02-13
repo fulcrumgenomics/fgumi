@@ -7,7 +7,6 @@
 //! - **UQ**: Phred likelihood of the segment (sum of mismatch qualities)
 //! - **MD**: Mismatched and deleted reference bases
 
-
 use anyhow::{Context, Result};
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -85,7 +84,11 @@ pub fn regenerate_alignment_tags(
         .iter()
         .filter_map(Result::ok)
         .map(|op| match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion | Kind::Skip => op.len(),
+            Kind::Match
+            | Kind::SequenceMatch
+            | Kind::SequenceMismatch
+            | Kind::Deletion
+            | Kind::Skip => op.len(),
             _ => 0,
         })
         .sum();

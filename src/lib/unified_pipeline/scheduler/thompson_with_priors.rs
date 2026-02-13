@@ -11,7 +11,7 @@ use rand::rngs::SmallRng;
 use rand_distr::{Beta, Distribution};
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Atomic counter for unique seeds across threads.
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +30,8 @@ pub struct ThompsonWithPriorsScheduler {
     rng: SmallRng,
     /// Priority buffer.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl ThompsonWithPriorsScheduler {
@@ -55,7 +57,7 @@ impl ThompsonWithPriorsScheduler {
 
     /// Create a new Thompson Sampling scheduler with thread-specific priors.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let mut alphas = [Self::BASE_PRIOR; 9];
         let betas = [Self::BASE_PRIOR; 9];
 
@@ -94,6 +96,7 @@ impl ThompsonWithPriorsScheduler {
             betas,
             rng: SmallRng::seed_from_u64(seed),
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -128,7 +131,8 @@ impl Scheduler for ThompsonWithPriorsScheduler {
             self.priority_buffer[priority] = Self::STEPS[*step_idx];
         }
 
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -147,6 +151,10 @@ impl Scheduler for ThompsonWithPriorsScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -155,27 +163,27 @@ mod tests {
 
     #[test]
     fn test_reader_thread_prior() {
-        let scheduler = ThompsonWithPriorsScheduler::new(0, 8);
+        let scheduler = ThompsonWithPriorsScheduler::new(0, 8, ActiveSteps::all());
         assert!(scheduler.alphas[0] > 10.0); // Read has strong prior
         assert!(scheduler.alphas[8] < 5.0); // Write has weak prior
     }
 
     #[test]
     fn test_writer_thread_prior() {
-        let scheduler = ThompsonWithPriorsScheduler::new(7, 8);
+        let scheduler = ThompsonWithPriorsScheduler::new(7, 8, ActiveSteps::all());
         assert!(scheduler.alphas[8] > 10.0); // Write has strong prior
         assert!(scheduler.alphas[0] < 5.0); // Read has weak prior
     }
 
     #[test]
     fn test_boundary_thread_prior() {
-        let scheduler = ThompsonWithPriorsScheduler::new(1, 8);
+        let scheduler = ThompsonWithPriorsScheduler::new(1, 8, ActiveSteps::all());
         assert!(scheduler.alphas[2] > 10.0); // FindBoundaries has strong prior
     }
 
     #[test]
     fn test_group_thread_prior() {
-        let scheduler = ThompsonWithPriorsScheduler::new(6, 8); // N-2 = 6
+        let scheduler = ThompsonWithPriorsScheduler::new(6, 8, ActiveSteps::all()); // N-2 = 6
         assert!(scheduler.alphas[4] > 10.0); // Group has strong prior
     }
 }

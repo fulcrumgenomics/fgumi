@@ -5,7 +5,7 @@
 //! then from any step. After success elsewhere, gradually returns home.
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Sticky work-stealing scheduler.
 pub struct StickyWorkStealingScheduler {
@@ -23,6 +23,8 @@ pub struct StickyWorkStealingScheduler {
     home_return_threshold: usize,
     /// Priority buffer.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl StickyWorkStealingScheduler {
@@ -44,7 +46,7 @@ impl StickyWorkStealingScheduler {
 
     /// Create a new sticky work-stealing scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let home_step = Self::determine_home_step(thread_id, num_threads);
 
         Self {
@@ -55,6 +57,7 @@ impl StickyWorkStealingScheduler {
             away_counter: 0,
             home_return_threshold: Self::DEFAULT_HOME_RETURN_THRESHOLD,
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -136,7 +139,8 @@ impl Scheduler for StickyWorkStealingScheduler {
         }
 
         self.build_priorities();
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -157,6 +161,10 @@ impl Scheduler for StickyWorkStealingScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -165,26 +173,26 @@ mod tests {
 
     #[test]
     fn test_reader_home_step() {
-        let scheduler = StickyWorkStealingScheduler::new(0, 8);
+        let scheduler = StickyWorkStealingScheduler::new(0, 8, ActiveSteps::all());
         assert_eq!(scheduler.home_step, PipelineStep::Read);
     }
 
     #[test]
     fn test_writer_home_step() {
-        let scheduler = StickyWorkStealingScheduler::new(7, 8);
+        let scheduler = StickyWorkStealingScheduler::new(7, 8, ActiveSteps::all());
         assert_eq!(scheduler.home_step, PipelineStep::Write);
     }
 
     #[test]
     fn test_sticky_on_success() {
-        let mut scheduler = StickyWorkStealingScheduler::new(3, 8);
+        let mut scheduler = StickyWorkStealingScheduler::new(3, 8, ActiveSteps::all());
         scheduler.record_outcome(PipelineStep::Compress, true, false);
         assert_eq!(scheduler.current_step, PipelineStep::Compress);
     }
 
     #[test]
     fn test_return_home_after_threshold() {
-        let mut scheduler = StickyWorkStealingScheduler::new(0, 8);
+        let mut scheduler = StickyWorkStealingScheduler::new(0, 8, ActiveSteps::all());
         scheduler.current_step = PipelineStep::Write; // Away from home
 
         // Accumulate away counter

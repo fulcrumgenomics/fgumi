@@ -12,7 +12,7 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Atomic counter for unique seeds across threads.
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +39,8 @@ pub struct LearnedAffinityScheduler {
     rng: SmallRng,
     /// Priority buffer.
     priority_buffer: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
 }
 
 impl LearnedAffinityScheduler {
@@ -64,7 +66,7 @@ impl LearnedAffinityScheduler {
 
     /// Create a new learned affinity scheduler.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let seed = SEED_COUNTER
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(thread_id as u64)
@@ -80,6 +82,7 @@ impl LearnedAffinityScheduler {
             total_attempts: 0,
             rng: SmallRng::seed_from_u64(seed),
             priority_buffer: Self::STEPS,
+            active_steps,
         }
     }
 
@@ -134,7 +137,8 @@ impl Scheduler for LearnedAffinityScheduler {
             }
         }
 
-        &self.priority_buffer
+        let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
+        &self.priority_buffer[..n]
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
@@ -153,6 +157,10 @@ impl Scheduler for LearnedAffinityScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
@@ -161,13 +169,13 @@ mod tests {
 
     #[test]
     fn test_initial_exploration_rate() {
-        let scheduler = LearnedAffinityScheduler::new(0, 8);
+        let scheduler = LearnedAffinityScheduler::new(0, 8, ActiveSteps::all());
         assert!((scheduler.exploration_rate - 0.3).abs() < 0.001);
     }
 
     #[test]
     fn test_exploration_decay() {
-        let mut scheduler = LearnedAffinityScheduler::new(0, 8);
+        let mut scheduler = LearnedAffinityScheduler::new(0, 8, ActiveSteps::all());
         let initial_rate = scheduler.current_exploration_rate();
 
         // Simulate 2000 attempts
@@ -180,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_affinity_learning() {
-        let mut scheduler = LearnedAffinityScheduler::new(0, 8);
+        let mut scheduler = LearnedAffinityScheduler::new(0, 8, ActiveSteps::all());
 
         // Build high affinity for Read
         for _ in 0..100 {
@@ -197,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_minimum_exploration_rate() {
-        let mut scheduler = LearnedAffinityScheduler::new(0, 8);
+        let mut scheduler = LearnedAffinityScheduler::new(0, 8, ActiveSteps::all());
         scheduler.total_attempts = 1_000_000; // Many attempts
 
         let rate = scheduler.current_exploration_rate();

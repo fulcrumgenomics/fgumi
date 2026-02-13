@@ -4,7 +4,7 @@
 //! Includes backpressure override for output queue pressure.
 
 use super::{BackpressureState, Scheduler};
-use crate::unified_pipeline::base::PipelineStep;
+use crate::unified_pipeline::base::{ActiveSteps, PipelineStep};
 
 /// Fixed-priority scheduler with per-thread role-based priorities.
 pub struct FixedPriorityScheduler {
@@ -19,12 +19,18 @@ pub struct FixedPriorityScheduler {
     backpressure_drain: [PipelineStep; 9],
     /// Backpressure priority (fill input).
     backpressure_fill: [PipelineStep; 9],
+    /// Active steps in the pipeline.
+    active_steps: ActiveSteps,
+    /// Scratch buffer for filtering active priorities.
+    active_priorities: [PipelineStep; 9],
+    /// Number of active priorities in the scratch buffer.
+    num_active: usize,
 }
 
 impl FixedPriorityScheduler {
     /// Create a new fixed-priority scheduler for the given thread.
     #[must_use]
-    pub fn new(thread_id: usize, num_threads: usize) -> Self {
+    pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         use PipelineStep::{
             Compress, Decode, Decompress, FindBoundaries, Group, Process, Read, Serialize, Write,
         };
@@ -71,19 +77,31 @@ impl FixedPriorityScheduler {
             p
         };
 
-        Self { thread_id, num_threads, priorities, backpressure_drain, backpressure_fill }
+        Self {
+            thread_id,
+            num_threads,
+            priorities,
+            backpressure_drain,
+            backpressure_fill,
+            active_steps,
+            active_priorities: [PipelineStep::Read; 9],
+            num_active: 9,
+        }
     }
 }
 
 impl Scheduler for FixedPriorityScheduler {
     fn get_priorities(&mut self, bp: BackpressureState) -> &[PipelineStep] {
-        if bp.output_high {
+        let source = if bp.output_high {
             &self.backpressure_drain
         } else if bp.input_low && !bp.read_done {
             &self.backpressure_fill
         } else {
             &self.priorities
-        }
+        };
+        self.active_priorities = *source;
+        self.num_active = self.active_steps.filter_in_place(&mut self.active_priorities);
+        &self.active_priorities[..self.num_active]
     }
 
     fn record_outcome(&mut self, _step: PipelineStep, _success: bool, _was_contention: bool) {
@@ -97,15 +115,23 @@ impl Scheduler for FixedPriorityScheduler {
     fn num_threads(&self) -> usize {
         self.num_threads
     }
+
+    fn active_steps(&self) -> &ActiveSteps {
+        &self.active_steps
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn all() -> ActiveSteps {
+        ActiveSteps::all()
+    }
+
     #[test]
     fn test_reader_priorities() {
-        let mut scheduler = FixedPriorityScheduler::new(0, 8);
+        let mut scheduler = FixedPriorityScheduler::new(0, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities[0], PipelineStep::Read);
@@ -113,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_writer_priorities() {
-        let mut scheduler = FixedPriorityScheduler::new(7, 8);
+        let mut scheduler = FixedPriorityScheduler::new(7, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities[0], PipelineStep::Write);
@@ -121,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_boundary_specialist_early() {
-        let mut scheduler = FixedPriorityScheduler::new(1, 8);
+        let mut scheduler = FixedPriorityScheduler::new(1, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities[0], PipelineStep::FindBoundaries);
@@ -129,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_boundary_specialist_late() {
-        let mut scheduler = FixedPriorityScheduler::new(6, 8);
+        let mut scheduler = FixedPriorityScheduler::new(6, 8, all());
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
         assert_eq!(priorities[0], PipelineStep::Group);
@@ -137,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_drain() {
-        let mut scheduler = FixedPriorityScheduler::new(2, 8);
+        let mut scheduler = FixedPriorityScheduler::new(2, 8, all());
         let bp = BackpressureState {
             output_high: true,
             input_low: false,
@@ -151,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_fill() {
-        let mut scheduler = FixedPriorityScheduler::new(2, 8);
+        let mut scheduler = FixedPriorityScheduler::new(2, 8, all());
         let bp = BackpressureState {
             output_high: false,
             input_low: true,
@@ -165,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_fill_not_when_read_done() {
-        let mut scheduler = FixedPriorityScheduler::new(2, 8);
+        let mut scheduler = FixedPriorityScheduler::new(2, 8, all());
         let bp = BackpressureState {
             output_high: false,
             input_low: true,
@@ -180,8 +206,8 @@ mod tests {
 
     #[test]
     fn test_two_threads() {
-        let mut s0 = FixedPriorityScheduler::new(0, 2);
-        let mut s1 = FixedPriorityScheduler::new(1, 2);
+        let mut s0 = FixedPriorityScheduler::new(0, 2, all());
+        let mut s1 = FixedPriorityScheduler::new(1, 2, all());
         let bp = BackpressureState::default();
 
         assert_eq!(s0.get_priorities(bp)[0], PipelineStep::Read);
