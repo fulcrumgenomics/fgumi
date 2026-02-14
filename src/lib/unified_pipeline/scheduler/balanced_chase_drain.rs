@@ -37,6 +37,10 @@ pub struct BalancedChaseDrainScheduler {
     memory_drain_mode: bool,
     /// Active steps in the pipeline.
     active_steps: ActiveSteps,
+    /// Whether this thread prefers Compress over Serialize in normal mode.
+    /// Set for half the non-exclusive threads when `num_threads >= 8`.
+    /// Provides soft cache affinity without OS-level thread pinning.
+    compress_preferred: bool,
 }
 
 impl BalancedChaseDrainScheduler {
@@ -57,6 +61,8 @@ impl BalancedChaseDrainScheduler {
     #[must_use]
     pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
         let (current_step, exclusive_role) = Self::determine_role(thread_id, num_threads);
+        let compress_preferred =
+            Self::is_compress_preferred(thread_id, num_threads, exclusive_role);
 
         Self {
             thread_id,
@@ -68,7 +74,25 @@ impl BalancedChaseDrainScheduler {
             drain_mode: false,
             memory_drain_mode: false,
             active_steps,
+            compress_preferred,
         }
+    }
+
+    /// Whether this thread should prefer Compress over Serialize in normal mode.
+    /// For 8+ threads, non-exclusive even-indexed middle threads prefer Compress.
+    fn is_compress_preferred(
+        thread_id: usize,
+        num_threads: usize,
+        exclusive_role: Option<PipelineStep>,
+    ) -> bool {
+        if num_threads < 8 {
+            return false;
+        }
+        if exclusive_role.is_some() {
+            return false;
+        }
+        // Even-indexed middle threads prefer Compress
+        thread_id.is_multiple_of(2)
     }
 
     /// Determine thread role - same as balanced-chase.
@@ -160,12 +184,23 @@ impl BalancedChaseDrainScheduler {
                 priorities.push(Serialize);
             }
         } else {
-            // Normal mode: Serialize then Compress
-            if !priorities.contains(&Serialize) {
-                priorities.push(Serialize);
-            }
-            if !priorities.contains(&Compress) {
-                priorities.push(Compress);
+            // Normal mode: order depends on thread affinity
+            if self.compress_preferred {
+                // Compress-preferred threads: Compress then Serialize
+                if !priorities.contains(&Compress) {
+                    priorities.push(Compress);
+                }
+                if !priorities.contains(&Serialize) {
+                    priorities.push(Serialize);
+                }
+            } else {
+                // Default: Serialize then Compress
+                if !priorities.contains(&Serialize) {
+                    priorities.push(Serialize);
+                }
+                if !priorities.contains(&Compress) {
+                    priorities.push(Compress);
+                }
             }
 
             // Current step (if not already added)
@@ -288,6 +323,8 @@ impl Scheduler for BalancedChaseDrainScheduler {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn all() -> ActiveSteps {
@@ -363,19 +400,106 @@ mod tests {
 
     #[test]
     fn test_normal_mode_serializes_first() {
+        // Thread 3 of 8 is odd-indexed middle thread, so NOT compress_preferred
         let mut scheduler = BalancedChaseDrainScheduler::new(3, 8, all());
 
         // Not in drain mode
         assert!(!scheduler.drain_mode);
+        assert!(!scheduler.compress_preferred);
 
         let bp = BackpressureState::default();
         let priorities = scheduler.get_priorities(bp);
 
-        // Serialize should be before Compress in normal mode
+        // Serialize should be before Compress in normal mode for non-preferred threads
         let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
         let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
 
         assert!(serialize_pos.unwrap() < compress_pos.unwrap());
+    }
+
+    #[rstest]
+    #[case(0, 4)]
+    #[case(1, 4)]
+    #[case(2, 4)]
+    #[case(3, 4)]
+    #[case(0, 2)]
+    #[case(1, 2)]
+    fn test_compress_preferred_below_8_threads(
+        #[case] thread_id: usize,
+        #[case] num_threads: usize,
+    ) {
+        let (_, exclusive_role) =
+            BalancedChaseDrainScheduler::determine_role(thread_id, num_threads);
+        assert!(
+            !BalancedChaseDrainScheduler::is_compress_preferred(
+                thread_id,
+                num_threads,
+                exclusive_role
+            ),
+            "thread {thread_id} of {num_threads} should not be compress-preferred"
+        );
+    }
+
+    #[test]
+    fn test_compress_preferred_at_8_threads() {
+        // At 8 threads: T0=Read, T1=FindBoundaries, T6=Group, T7=Write (exclusive)
+        // Middle threads: T2, T3, T4, T5
+        // Even-indexed middle: T2, T4 should be compress-preferred
+        for (tid, expected) in [
+            (0, false), // Read
+            (1, false), // FindBoundaries
+            (2, true),  // even middle
+            (3, false), // odd middle
+            (4, true),  // even middle
+            (5, false), // odd middle
+            (6, false), // Group
+            (7, false), // Write
+        ] {
+            let (_, exclusive_role) = BalancedChaseDrainScheduler::determine_role(tid, 8);
+            assert_eq!(
+                BalancedChaseDrainScheduler::is_compress_preferred(tid, 8, exclusive_role),
+                expected,
+                "thread {tid} of 8"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compress_preferred_priorities() {
+        // Thread 2 of 8 is compress-preferred
+        let mut scheduler = BalancedChaseDrainScheduler::new(2, 8, all());
+        assert!(scheduler.compress_preferred);
+
+        let bp = BackpressureState::default();
+        let priorities = scheduler.get_priorities(bp);
+
+        // Compress should be before Serialize for compress-preferred threads
+        let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
+        let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
+        assert!(
+            compress_pos.unwrap() < serialize_pos.unwrap(),
+            "Compress-preferred thread should try Compress before Serialize"
+        );
+    }
+
+    #[test]
+    fn test_compress_preferred_drain_mode() {
+        // In drain mode, Compress is already first regardless of preference
+        let mut scheduler = BalancedChaseDrainScheduler::new(2, 8, all());
+        scheduler.drain_mode = true;
+
+        let bp = BackpressureState {
+            output_high: true,
+            input_low: false,
+            read_done: false,
+            memory_high: false,
+            memory_drained: true,
+        };
+        let priorities = scheduler.get_priorities(bp);
+
+        let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
+        let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
+        assert!(compress_pos.unwrap() < serialize_pos.unwrap());
     }
 
     #[test]
