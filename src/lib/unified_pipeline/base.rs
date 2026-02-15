@@ -1859,6 +1859,10 @@ pub struct WorkerCoreState {
     pub serialization_buffer: Vec<u8>,
     /// Current backoff duration in microseconds (for adaptive backoff).
     pub backoff_us: u64,
+    /// Recycled serialization buffers to avoid repeated allocation.
+    /// Populated by Compress step after consuming `SerializedBatch` data.
+    /// Kept small (max 2) to limit memory overhead.
+    pub recycled_buffers: Vec<Vec<u8>>,
 }
 
 impl WorkerCoreState {
@@ -1883,6 +1887,7 @@ impl WorkerCoreState {
             scheduler: create_scheduler(scheduler_strategy, thread_id, num_threads, active_steps),
             serialization_buffer: Vec::with_capacity(SERIALIZATION_BUFFER_CAPACITY),
             backoff_us: MIN_BACKOFF_US,
+            recycled_buffers: Vec::with_capacity(2),
         }
     }
 
@@ -1923,11 +1928,43 @@ impl WorkerCoreState {
             std::thread::sleep(std::time::Duration::from_micros(actual_us));
         }
     }
+
+    /// Take a recycled buffer or allocate a new one with the given capacity.
+    #[inline]
+    pub fn take_or_alloc_buffer(&mut self, capacity: usize) -> Vec<u8> {
+        if let Some(mut buf) = self.recycled_buffers.pop() {
+            buf.clear();
+            // After clear(), len=0, so reserve(capacity) guarantees
+            // buf.capacity() >= capacity.
+            buf.reserve(capacity);
+            buf
+        } else {
+            Vec::with_capacity(capacity)
+        }
+    }
+
+    /// Return a buffer for recycling. Keeps at most 2 buffers to limit memory.
+    #[inline]
+    pub fn recycle_buffer(&mut self, buf: Vec<u8>) {
+        if self.recycled_buffers.len() < 2 {
+            self.recycled_buffers.push(buf);
+        }
+    }
 }
 
 impl HasCompressor for WorkerCoreState {
     fn compressor_mut(&mut self) -> &mut InlineBgzfCompressor {
         &mut self.compressor
+    }
+}
+
+impl HasRecycledBuffers for WorkerCoreState {
+    fn take_or_alloc_buffer(&mut self, capacity: usize) -> Vec<u8> {
+        self.take_or_alloc_buffer(capacity)
+    }
+
+    fn recycle_buffer(&mut self, buf: Vec<u8>) {
+        self.recycle_buffer(buf);
     }
 }
 
@@ -2594,8 +2631,13 @@ impl PipelineConfig {
         // High water mark: trigger write when output is above 4x threads
         let output_high_water = (num_threads * 4).max(32);
 
-        // Larger batches for more threads (amortize syscall overhead)
-        let blocks_per_read_batch = if num_threads >= 8 { 32 } else { 16 };
+        // Scale BAM block batch size with thread count to reduce queue ops
+        let blocks_per_read_batch = match num_threads {
+            1..=3 => 16,
+            4..=7 => 32,
+            8..=15 => 48,
+            _ => 64,
+        };
 
         Self {
             num_threads,
@@ -4050,6 +4092,19 @@ pub trait HasCompressor {
     fn compressor_mut(&mut self) -> &mut InlineBgzfCompressor;
 }
 
+/// Trait for worker states that support buffer recycling.
+///
+/// Used by the Serialize and Compress steps to reuse `Vec<u8>` buffers
+/// instead of allocating fresh ones each batch. The Compress step recycles
+/// consumed `SerializedBatch` data buffers, and the Serialize step pops
+/// recycled buffers instead of calling `Vec::with_capacity`.
+pub trait HasRecycledBuffers {
+    /// Take a recycled buffer or allocate a new one with the given capacity.
+    fn take_or_alloc_buffer(&mut self, capacity: usize) -> Vec<u8>;
+    /// Return a buffer for recycling. Keeps at most 2 buffers.
+    fn recycle_buffer(&mut self, buf: Vec<u8>);
+}
+
 /// Trait for worker states that may hold items between iterations.
 ///
 /// When a worker tries to push to a full queue, it "holds" the item and returns
@@ -4435,7 +4490,7 @@ pub trait HasHeldBoundaries<B> {
 pub fn shared_try_step_compress<S, W>(state: &S, worker: &mut W) -> StepResult
 where
     S: OutputPipelineState,
-    W: HasCompressor + HasHeldCompressed,
+    W: HasCompressor + HasHeldCompressed + HasRecycledBuffers,
 {
     // =========================================================================
     // Priority 1: Try to advance any held compressed batch
@@ -4480,25 +4535,33 @@ where
     // =========================================================================
     // Priority 4: Compress the data
     // =========================================================================
-    let compressor = worker.compressor_mut();
+    let SerializedBatch { data, record_count } = serialized;
 
-    if let Err(e) = compressor.write_all(&serialized.data) {
-        state.set_error(e);
-        return StepResult::InputEmpty;
-    }
-    if let Err(e) = compressor.flush() {
-        state.set_error(e);
-        return StepResult::InputEmpty;
-    }
+    // Scope the compressor borrow so we can recycle the buffer afterwards
+    let blocks = {
+        let compressor = worker.compressor_mut();
 
-    // Take the compressed blocks, preserving the record count
-    let blocks = compressor.take_blocks();
+        if let Err(e) = compressor.write_all(&data) {
+            state.set_error(e);
+            return StepResult::InputEmpty;
+        }
+        if let Err(e) = compressor.flush() {
+            state.set_error(e);
+            return StepResult::InputEmpty;
+        }
+
+        // Take the compressed blocks, preserving the record count
+        compressor.take_blocks()
+    };
+
+    // Recycle the serialized data buffer for reuse in Serialize step
+    worker.recycle_buffer(data);
 
     // Record compressed bytes for throughput metrics
     let compressed_bytes: u64 = blocks.iter().map(|b| b.data.len() as u64).sum();
     state.record_compressed_bytes_out(compressed_bytes);
 
-    let batch = CompressedBlockBatch { blocks, record_count: serialized.record_count };
+    let batch = CompressedBlockBatch { blocks, record_count };
 
     // =========================================================================
     // Priority 5: Try to push result
@@ -4800,7 +4863,7 @@ pub fn shared_try_step_serialize<S, W, P, F>(
 ) -> StepResult
 where
     S: SerializePipelineState<P>,
-    W: HasHeldSerialized,
+    W: HasHeldSerialized + HasRecycledBuffers,
     F: FnMut(P, &mut Vec<u8>) -> io::Result<u64>,
 {
     // Priority 1: Advance held item
@@ -4836,24 +4899,29 @@ where
     let capacity = worker.serialization_buffer_capacity();
 
     // Priority 5: Serialize directly into buffer (no intermediate allocation)
-    let buffer = worker.serialization_buffer_mut();
-    buffer.clear();
-    let mut total_records: u64 = 0;
+    let total_records = {
+        let buffer = worker.serialization_buffer_mut();
+        buffer.clear();
+        let mut total_records: u64 = 0;
 
-    for item in batch {
-        match serialize_fn(item, buffer) {
-            Ok(record_count) => {
-                total_records += record_count;
-            }
-            Err(e) => {
-                state.set_error(e);
-                return StepResult::InputEmpty;
+        for item in batch {
+            match serialize_fn(item, buffer) {
+                Ok(record_count) => {
+                    total_records += record_count;
+                }
+                Err(e) => {
+                    state.set_error(e);
+                    return StepResult::InputEmpty;
+                }
             }
         }
-    }
+        total_records
+    };
 
-    // Swap buffer (avoid allocation) - use worker's configured capacity
-    let data = std::mem::replace(buffer, Vec::with_capacity(capacity));
+    // Swap buffer - try recycled buffer first, fall back to fresh allocation
+    let replacement = worker.take_or_alloc_buffer(capacity);
+    let buffer = worker.serialization_buffer_mut();
+    let data = std::mem::replace(buffer, replacement);
     state.record_serialized_bytes(data.len() as u64);
     state.record_serialized_records(total_records);
 
@@ -4903,18 +4971,35 @@ pub trait WritePipelineState: Send + Sync {
 
 /// Shared Write step - drains queue to reorder buffer, writes in order.
 ///
+/// Uses a two-phase approach to reduce contention:
+/// - **Phase 1**: Drain Q7 into the reorder buffer (only needs reorder lock).
+///   Any thread can do this, reducing the frequency of output lock contention.
+/// - **Phase 2**: Write ready batches to output (needs output lock).
+///   Re-drains under both locks to catch items arriving between phases.
+///
 /// Returns `Success` if any data was written, `InputEmpty` otherwise.
-/// This step is exclusive - uses `try_lock` to avoid blocking.
 pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult {
     if state.has_error() {
         return StepResult::InputEmpty;
     }
 
-    // Try to acquire output lock (non-blocking)
+    // Phase 1: Drain Q7 into reorder buffer (only needs reorder lock)
+    {
+        let mut reorder = state.write_reorder_buffer().lock();
+        let queue = state.write_input_queue();
+        while let Some((serial, batch)) = queue.pop() {
+            reorder.insert(serial, batch);
+        }
+    }
+    // Reorder lock released here
+
+    // Phase 2: Write ready batches (needs output lock)
     let Some(mut output_guard) = state.write_output().try_lock() else {
         if let Some(stats) = state.stats() {
             stats.record_contention(PipelineStep::Write);
         }
+        // Q7 drain already happened (phase 1), so contention here
+        // only means another thread is writing, not that Q7 is blocked
         return StepResult::InputEmpty;
     };
 
@@ -4927,12 +5012,12 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
         let mut reorder = state.write_reorder_buffer().lock();
         let queue = state.write_input_queue();
 
-        // Drain queue into reorder buffer
+        // Drain any additional items that arrived since phase 1
         while let Some((serial, batch)) = queue.pop() {
             reorder.insert(serial, batch);
         }
 
-        // Write in-order batches
+        // Write all ready batches in sequence order
         while let Some(batch) = reorder.try_pop_next() {
             for block in &batch.blocks {
                 if let Err(e) = output.write_all(&block.data) {
@@ -5506,8 +5591,8 @@ mod tests {
         assert_eq!(config.num_threads, 8);
         // queue_capacity = (8*16).clamp(64, 256) = 128
         assert_eq!(config.queue_capacity, 128);
-        // blocks_per_read_batch = 32 for >= 8 threads
-        assert_eq!(config.blocks_per_read_batch, 32);
+        // blocks_per_read_batch = 48 for 8..=15 threads
+        assert_eq!(config.blocks_per_read_batch, 48);
     }
 
     #[test]

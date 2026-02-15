@@ -24,12 +24,13 @@ use crate::reorder_buffer::ReorderBuffer;
 use super::base::{
     ActiveSteps, BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch,
     GroupKeyConfig, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
-    HasHeldSerialized, HasWorkerCore, MemoryEstimate, MonitorableState, OutputPipelineQueues,
-    OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineConfig, PipelineLifecycle, PipelineStats,
-    PipelineStep, PipelineValidationError, ProcessPipelineState, QueueSample, RawBlockBatch,
-    ReorderBufferState, SerializePipelineState, SerializedBatch, StepContext, WorkerCoreState,
-    WorkerStateCommon, WritePipelineState, finalize_pipeline, generic_worker_loop,
-    handle_worker_panic, join_monitor_thread, join_worker_threads, shared_try_step_compress,
+    HasHeldSerialized, HasRecycledBuffers, HasWorkerCore, MemoryEstimate, MonitorableState,
+    OutputPipelineQueues, OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineConfig,
+    PipelineLifecycle, PipelineStats, PipelineStep, PipelineValidationError, ProcessPipelineState,
+    QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState, SerializedBatch,
+    StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState, finalize_pipeline,
+    generic_worker_loop, handle_worker_panic, join_monitor_thread, join_worker_threads,
+    shared_try_step_compress,
 };
 use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
@@ -1044,6 +1045,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> MonitorableState
             read_done: self.read_done.load(Ordering::Relaxed),
             group_done: self.group_done.load(Ordering::Relaxed),
             draining: self.output.draining.load(Ordering::Relaxed),
+            extra_state: None,
         }
     }
 }
@@ -1551,6 +1553,16 @@ impl<P: Send> WorkerState<P> {
 impl<P: Send> HasCompressor for WorkerState<P> {
     fn compressor_mut(&mut self) -> &mut InlineBgzfCompressor {
         &mut self.core.compressor
+    }
+}
+
+impl<P: Send> HasRecycledBuffers for WorkerState<P> {
+    fn take_or_alloc_buffer(&mut self, capacity: usize) -> Vec<u8> {
+        self.core.take_or_alloc_buffer(capacity)
+    }
+
+    fn recycle_buffer(&mut self, buf: Vec<u8>) {
+        self.core.recycle_buffer(buf);
     }
 }
 

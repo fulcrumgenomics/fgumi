@@ -948,8 +948,7 @@ impl Extract {
                 .with_stats(self.scheduler_opts.collect_stats())
                 .with_scheduler_strategy(self.scheduler_opts.strategy())
                 .with_deadlock_timeout(self.scheduler_opts.deadlock_timeout_secs())
-                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled())
-                .with_synchronized(true); // Extract always uses synchronized FASTQs
+                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled());
 
         // Calculate and apply queue memory limit
         let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;

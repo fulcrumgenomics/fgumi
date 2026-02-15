@@ -387,6 +387,8 @@ pub struct QueueSnapshot {
     pub read_done: bool,
     pub group_done: bool,
     pub draining: bool,
+    /// Extra diagnostic info for FASTQ pipeline deadlock debugging.
+    pub extra_state: Option<String>,
 }
 
 /// Check for deadlock and attempt recovery if configured.
@@ -613,6 +615,9 @@ fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
         snapshot.group_done,
         snapshot.draining,
     );
+    if let Some(ref extra) = snapshot.extra_state {
+        log::warn!("  Extra: {extra}");
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +716,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         let action = check_deadlock_and_restore(&state, &snapshot);
@@ -738,6 +744,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         let action = check_deadlock_and_restore(&state, &snapshot);
@@ -767,6 +774,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         let action = check_deadlock_and_restore(&state, &snapshot);
@@ -800,6 +808,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         let action = check_deadlock_and_restore(&state, &snapshot);
@@ -839,6 +848,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         let action = check_deadlock_and_restore(&state, &snapshot);
@@ -878,6 +888,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         check_deadlock_and_restore(&state, &snapshot);
@@ -911,6 +922,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         let action = check_deadlock_and_restore(&state, &snapshot);
@@ -1043,6 +1055,7 @@ mod tests {
             read_done: false,
             group_done: false,
             draining: false,
+            extra_state: None,
         };
 
         check_deadlock_and_restore(&state, &snapshot);

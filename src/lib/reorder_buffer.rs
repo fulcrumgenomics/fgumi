@@ -206,6 +206,16 @@ impl<T> ReorderBuffer<T> {
         self.count
     }
 
+    /// Get the internal buffer length (number of slots including gaps).
+    ///
+    /// This reflects the actual memory footprint of the `VecDeque`, which grows
+    /// when items arrive out of order (gaps are filled with `None`). Use this
+    /// to limit memory growth when items may arrive with large serial gaps.
+    #[must_use]
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Get the next expected sequence number.
     #[must_use]
     pub fn next_seq(&self) -> u64 {
