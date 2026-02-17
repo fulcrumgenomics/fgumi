@@ -56,16 +56,6 @@ impl OptimizedChaseScheduler {
         PipelineStep::Write,
     ];
 
-    /// Parallel steps that any thread can help with.
-    #[allow(dead_code)]
-    const PARALLEL_STEPS: [PipelineStep; 5] = [
-        PipelineStep::Decompress,
-        PipelineStep::Decode,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-    ];
-
     /// Exclusive steps that only one thread can execute at a time.
     const EXCLUSIVE_STEPS: [PipelineStep; 4] = [
         PipelineStep::Read,

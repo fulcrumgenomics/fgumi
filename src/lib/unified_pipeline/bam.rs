@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::bam_io::is_stdout_path;
 use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::progress::ProgressTracker;
@@ -3721,6 +3722,58 @@ impl BamPipelineConfig {
     }
 }
 
+/// Writer wrapper that appends the BGZF EOF marker on drop, but only on success.
+///
+/// Drop order ensures correctness: when wrapping as `BufWriter<EofWriter<W>>`,
+/// `BufWriter` flushes buffered data first, then `EofWriter` appends the EOF block.
+///
+/// The EOF block is only written if `arm()` has been called (via the shared
+/// `armed` flag). This prevents a failed pipeline from producing a seemingly
+/// complete BAM file that masks truncated output.
+struct EofWriter<W: Write> {
+    inner: Option<W>,
+    armed: Arc<AtomicBool>,
+}
+
+impl<W: Write> EofWriter<W> {
+    fn new(inner: W) -> (Self, Arc<AtomicBool>) {
+        let armed = Arc::new(AtomicBool::new(false));
+        (Self { inner: Some(inner), armed: Arc::clone(&armed) }, armed)
+    }
+}
+
+impl<W: Write> Write for EofWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.as_mut().expect("write after finish").write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.as_mut().expect("flush after finish").flush()
+    }
+}
+
+impl<W: Write> Drop for EofWriter<W> {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::Acquire) {
+            if let Some(mut w) = self.inner.take() {
+                let _ = w.write_all(&BGZF_EOF);
+                let _ = w.flush();
+            }
+        }
+    }
+}
+
+/// Open an output writer for pipeline use, supporting stdout via "-" or "/dev/stdout".
+fn open_pipeline_output(output_path: &Path) -> io::Result<Box<dyn Write + Send>> {
+    if is_stdout_path(output_path) {
+        Ok(Box::new(std::io::stdout()))
+    } else {
+        let file = File::create(output_path)
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
+        Ok(Box::new(file))
+    }
+}
+
 /// Run a BAM file through the pipeline with a grouper factory.
 ///
 /// This is a convenience function that handles BAM header I/O and
@@ -3772,22 +3825,21 @@ where
         })?
     };
 
-    // Create output BAM and write header
-    let output_file = File::create(output_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
+    // Create output writer (supports stdout via "-" or "/dev/stdout")
+    let output_writer = open_pipeline_output(output_path)?;
 
     // Write BAM header using BGZF compression
-    let mut header_writer = bam::io::Writer::new(output_file);
+    let mut header_writer = bam::io::Writer::new(output_writer);
     header_writer
         .write_header(&header)
         .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
 
-    // Finish the BGZF writer and get the underlying file handle for the pipeline.
+    // Finish the BGZF writer and get the underlying writer for the pipeline.
     // We need to:
     // 1. Get the BGZF writer from the BAM writer
     // 2. Flush/finish the BGZF stream (writes any pending data)
-    // 3. Get the underlying file handle
-    // This ensures the pipeline writes raw BGZF blocks directly to the file,
+    // 3. Get the underlying writer
+    // This ensures the pipeline writes raw BGZF blocks directly to the output,
     // not through another BGZF compression layer.
     let mut bgzf_writer = header_writer.into_inner();
     bgzf_writer
@@ -3801,8 +3853,10 @@ where
         .map_err(|e| io::Error::new(e.kind(), format!("Failed to re-open input: {e}")))?;
     let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
-    // Wrap output in BufWriter to reduce syscalls
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+    // Wrap output in EofWriter then BufWriter.
+    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
+    let (eof_writer, eof_armed) = EofWriter::new(output);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
 
     // Build GroupKeyConfig from header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
@@ -3822,7 +3876,7 @@ where
         serialize_fn(p, &header_clone, buf)
     });
 
-    // Run the pipeline
+    // Run the pipeline — only arm EOF on success
     let result = run_bam_pipeline(
         config.pipeline,
         Box::new(input),
@@ -3832,22 +3886,9 @@ where
         group_key_config,
         None,
     );
-
-    // After pipeline completes, write BGZF EOF block to finalize the BAM file
     if result.is_ok() {
-        use std::io::Write as _;
-
-        // Append EOF block to output file
-        let mut output_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(output_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open output for EOF: {e}")))?;
-
-        output_file
-            .write_all(&BGZF_EOF)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to write BGZF EOF: {e}")))?;
+        eof_armed.store(true, Ordering::Release);
     }
-
     result
 }
 
@@ -3904,21 +3945,20 @@ where
         })?
     };
 
-    // Create output BAM and write the custom output header
-    let output_file = File::create(output_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
+    // Create output writer (supports stdout via "-" or "/dev/stdout")
+    let output_writer = open_pipeline_output(output_path)?;
 
     // Write BAM header using BGZF compression
-    let mut header_writer = bam::io::Writer::new(output_file);
+    let mut header_writer = bam::io::Writer::new(output_writer);
     header_writer
         .write_header(&output_header)
         .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
 
-    // Finish the BGZF writer and get the underlying file handle for the pipeline.
+    // Finish the BGZF writer and get the underlying writer for the pipeline.
     // We need to:
     // 1. Get the BGZF writer from the BAM writer
-    // 2. Flush/finish the BGZF stream (writes any pending data + EOF)
-    // 3. Get the underlying file handle
+    // 2. Flush/finish the BGZF stream (writes any pending data)
+    // 3. Get the underlying writer
     let mut bgzf_writer = header_writer.into_inner();
     bgzf_writer
         .try_finish()
@@ -3931,8 +3971,10 @@ where
         .map_err(|e| io::Error::new(e.kind(), format!("Failed to re-open input: {e}")))?;
     let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
-    // Wrap output in BufWriter to reduce syscalls
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+    // Wrap output in EofWriter then BufWriter.
+    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
+    let (eof_writer, eof_armed) = EofWriter::new(output);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
 
     // Build GroupKeyConfig from input header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
@@ -3951,7 +3993,7 @@ where
         serialize_fn(p, &output_header, buf)
     });
 
-    // Run the pipeline
+    // Run the pipeline — only arm EOF on success
     let result = run_bam_pipeline(
         config.pipeline,
         Box::new(input),
@@ -3961,22 +4003,9 @@ where
         group_key_config,
         None,
     );
-
-    // After pipeline completes, write BGZF EOF block to finalize the BAM file
     if result.is_ok() {
-        use std::io::Write as _;
-
-        // Append EOF block to output file
-        let mut output_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(output_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open output for EOF: {e}")))?;
-
-        output_file
-            .write_all(&BGZF_EOF)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to write BGZF EOF: {e}")))?;
+        eof_armed.store(true, Ordering::Release);
     }
-
     result
 }
 
@@ -4036,25 +4065,26 @@ where
     // Use output_header if provided, otherwise clone input_header
     let output_header = output_header.unwrap_or_else(|| input_header.clone());
 
-    // Create output BAM and write the output header
-    let output_file = File::create(output_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
+    // Create output writer (supports stdout via "-" or "/dev/stdout")
+    let output_writer = open_pipeline_output(output_path)?;
 
     // Write BAM header using BGZF compression
-    let mut header_writer = bam::io::Writer::new(output_file);
+    let mut header_writer = bam::io::Writer::new(output_writer);
     header_writer
         .write_header(&output_header)
         .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
 
-    // Finish the BGZF writer and get the underlying file handle for the pipeline.
+    // Finish the BGZF writer and get the underlying writer for the pipeline.
     let mut bgzf_writer = header_writer.into_inner();
     bgzf_writer
         .try_finish()
         .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
     let output = bgzf_writer.into_inner();
 
-    // Wrap output in BufWriter to reduce syscalls
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+    // Wrap output in EofWriter then BufWriter.
+    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
+    let (eof_writer, eof_armed) = EofWriter::new(output);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
 
     // Build GroupKeyConfig from input header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
@@ -4072,13 +4102,9 @@ where
         serialize_fn(p, &output_header, buf)
     });
 
-    // Run the pipeline with the already-opened reader.
-    // NOTE: The input stream starts at position 0 (including header bytes), so the pipeline
-    // must still skip the header. We don't set header_already_read since the bytes are present.
-    let pipeline_config = config.pipeline;
-
+    // Run the pipeline — only arm EOF on success
     let result = run_bam_pipeline(
-        pipeline_config,
+        config.pipeline,
         Box::new(input),
         Box::new(output),
         grouper,
@@ -4086,22 +4112,9 @@ where
         group_key_config,
         None,
     );
-
-    // After pipeline completes, write BGZF EOF block to finalize the BAM file
     if result.is_ok() {
-        use std::io::Write as _;
-
-        // Append EOF block to output file
-        let mut output_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(output_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open output for EOF: {e}")))?;
-
-        output_file
-            .write_all(&BGZF_EOF)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to write BGZF EOF: {e}")))?;
+        eof_armed.store(true, Ordering::Release);
     }
-
     result
 }
 
@@ -4150,10 +4163,9 @@ where
     let output_header = output_header.unwrap_or_else(|| input_header.clone());
 
     // Create primary output BAM and write the output header
-    let output_file = File::create(output_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
+    let output_writer = open_pipeline_output(output_path)?;
 
-    let mut header_writer = bam::io::Writer::new(output_file);
+    let mut header_writer = bam::io::Writer::new(output_writer);
     header_writer
         .write_header(&output_header)
         .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
@@ -4163,7 +4175,11 @@ where
         .try_finish()
         .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
     let output = bgzf_writer.into_inner();
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+
+    // Wrap output in EofWriter then BufWriter.
+    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
+    let (eof_writer, eof_armed) = EofWriter::new(output);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
 
     // Create secondary output (reject BAM) with its own BGZF compression
     let secondary_writer = crate::bam_io::create_raw_bam_writer(
@@ -4201,18 +4217,9 @@ where
         Some(secondary_writer),
     );
 
-    // After pipeline completes, write BGZF EOF block to finalize the primary BAM file
+    // Only arm EOF on success — failed pipeline leaves truncated BAM as error signal
     if result.is_ok() {
-        use std::io::Write as _;
-
-        let mut output_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(output_path)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open output for EOF: {e}")))?;
-
-        output_file
-            .write_all(&BGZF_EOF)
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to write BGZF EOF: {e}")))?;
+        eof_armed.store(true, Ordering::Release);
     }
 
     result
@@ -4222,6 +4229,30 @@ where
 mod tests {
     use super::*;
     use crate::read_info::LibraryIndex;
+
+    #[test]
+    fn test_eof_writer_writes_eof_when_armed() {
+        let mut buf = Vec::new();
+        {
+            let (mut writer, armed) = EofWriter::new(&mut buf);
+            writer.write_all(b"hello").unwrap();
+            armed.store(true, Ordering::Release);
+        }
+        assert!(buf.starts_with(b"hello"));
+        assert!(buf.ends_with(&BGZF_EOF));
+    }
+
+    #[test]
+    fn test_eof_writer_skips_eof_when_not_armed() {
+        let mut buf = Vec::new();
+        {
+            let (mut writer, _armed) = EofWriter::new(&mut buf);
+            writer.write_all(b"hello").unwrap();
+            // Don't arm — simulates pipeline error
+        }
+        assert_eq!(&buf, b"hello");
+        assert!(!buf.ends_with(&BGZF_EOF));
+    }
 
     /// Create a minimal `BamPipelineState` for testing memory backpressure.
     fn create_test_state(memory_limit: u64) -> BamPipelineState<(), ()> {

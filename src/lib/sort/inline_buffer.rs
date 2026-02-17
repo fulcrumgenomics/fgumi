@@ -469,10 +469,10 @@ impl RawSortKey for TemplateKey {
     const SERIALIZED_SIZE: Option<usize> = Some(32);
 
     fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
-        // Template key extraction requires LibraryLookup which is in raw.rs
-        // This method should not be called directly - use extract_template_key_inline() in raw.rs
-        // For generic pipeline, we pass the key extraction function as a parameter
-        unimplemented!(
+        // TemplateKey extraction requires LibraryLookup context not available through the
+        // RawSortKey trait interface.  All callers use extract_template_key_inline() in raw.rs
+        // instead.  This arm exists only to satisfy the trait obligation.
+        unreachable!(
             "TemplateKey::extract() should not be called directly. \
              Use extract_template_key_inline() with LibraryLookup instead."
         )
@@ -1149,7 +1149,6 @@ fn merge_sorted_template_chunks(
 }
 
 /// Binary insertion sort for small arrays of `TemplateRecordRef`.
-#[allow(dead_code)]
 fn insertion_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     for i in 1..refs.len() {
         let key = &refs[i].key;

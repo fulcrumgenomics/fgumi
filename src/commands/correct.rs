@@ -1736,29 +1736,6 @@ mod tests {
         EncodedUmiSet::new(&strings)
     }
 
-    /// Helper to create a `CorrectUmis` with specified input/output paths
-    #[allow(dead_code)]
-    fn create_corrector_with_paths(input: PathBuf, output: PathBuf) -> CorrectUmis {
-        CorrectUmis {
-            io: BamIoOptions { input, output },
-            rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
-            umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
-            umi_files: vec![],
-            umi_tag: "RX".to_string(),
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        }
-    }
-
     #[test]
     fn test_find_best_match_perfect() {
         let umi_set = get_encoded_umi_set();

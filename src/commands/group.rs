@@ -1,5 +1,3 @@
-// This file will contain the complete group.rs with all integration tests implemented
-// We'll build it section by section
 //! Groups reads by UMI to identify reads from the same original molecule.
 
 use crate::commands::command::Command;
@@ -75,30 +73,11 @@ pub struct TagFamilySizeMetric {
 
 // UmiGroupingMetrics is now imported from fgumi_lib::metrics
 
-/// Result of processing a position group, used for parallel processing
-#[allow(dead_code)]
-struct PositionGroupResult {
-    /// Family size counts for this position group
-    family_sizes: AHashMap<usize, u64>,
-    /// Templates grouped by MI and sorted, ready for writing
-    sorted_templates: Vec<Template>,
-}
-
 /// Collected metrics from `serialize_fn`, aggregated after pipeline completion.
 #[derive(Default, Debug)]
 struct CollectedMetrics {
     family_sizes: AHashMap<usize, u64>,
     filter_metrics: FilterMetrics,
-}
-
-impl CollectedMetrics {
-    #[allow(dead_code)]
-    fn merge(&mut self, other: &CollectedMetrics) {
-        for (size, count) in &other.family_sizes {
-            *self.family_sizes.entry(*size).or_insert(0) += count;
-        }
-        self.filter_metrics.merge(&other.filter_metrics);
-    }
 }
 
 /// Configuration for template filtering during group processing.
@@ -799,6 +778,57 @@ pub struct GroupReadsByUmi {
     pub memory_report_interval: u64,
 }
 
+/// Build [`UmiGroupingMetrics`] from filter metrics and family size counts.
+///
+/// Shared by both the pipeline and single-threaded execution paths.
+fn build_grouping_metrics(
+    filter_metrics: &FilterMetrics,
+    family_size_counter: &AHashMap<usize, u64>,
+) -> UmiGroupingMetrics {
+    let mut metrics = UmiGroupingMetrics::new();
+    metrics.total_records = filter_metrics.total_templates;
+    metrics.accepted_records = filter_metrics.accepted_templates;
+    metrics.discarded_non_pf = filter_metrics.discarded_non_pf;
+    metrics.discarded_poor_alignment = filter_metrics.discarded_poor_alignment;
+    metrics.discarded_ns_in_umi = filter_metrics.discarded_ns_in_umi;
+    metrics.discarded_umi_too_short = filter_metrics.discarded_umi_too_short;
+
+    metrics.total_families = family_size_counter.values().sum::<u64>();
+    metrics.unique_molecule_ids = metrics.total_families;
+
+    if metrics.unique_molecule_ids > 0 {
+        metrics.avg_reads_per_molecule =
+            metrics.accepted_records as f64 / metrics.unique_molecule_ids as f64;
+    }
+
+    if !family_size_counter.is_empty() {
+        let mut sizes: Vec<(usize, u64)> =
+            family_size_counter.iter().map(|(&size, &count)| (size, count)).collect();
+        sizes.sort_by_key(|(size, _)| *size);
+
+        let total_families = metrics.total_families;
+        let mut cumulative = 0u64;
+        let median_target = total_families / 2;
+
+        for (size, count) in &sizes {
+            cumulative += count;
+            if cumulative >= median_target {
+                metrics.median_reads_per_molecule = *size as u64;
+                break;
+            }
+        }
+
+        if let Some((min_size, _)) = sizes.first() {
+            metrics.min_reads_per_molecule = *min_size as u64;
+        }
+        if let Some((max_size, _)) = sizes.last() {
+            metrics.max_reads_per_molecule = *max_size as u64;
+        }
+    }
+
+    metrics
+}
+
 impl Command for GroupReadsByUmi {
     /// Execute the tool using the 7-step unified pipeline.
     #[allow(clippy::too_many_lines)]
@@ -1107,13 +1137,14 @@ impl Command for GroupReadsByUmi {
 
                 // Assign UMI groups using the unified _impl function
                 let mut templates = filtered_templates;
-                if let Err(_e) = assign_umi_groups_impl(
+                if let Err(e) = assign_umi_groups_impl(
                     &mut templates,
                     assigner.as_ref(),
                     raw_tag,
                     assign_tag_bytes,
                     filter_config.min_umi_length,
                 ) {
+                    log::warn!("UMI assignment failed, returning empty group: {e}");
                     #[cfg(feature = "memory-debug")]
                     if debug_memory_flag {
                         if let Some(stats) = stats_for_tracking.as_ref() {
@@ -1339,53 +1370,7 @@ impl Command for GroupReadsByUmi {
             total_filter_metrics.merge(&m.filter_metrics);
         }
 
-        // Build final metrics
-        let mut metrics = UmiGroupingMetrics::new();
-        metrics.total_records = total_filter_metrics.total_templates;
-        metrics.accepted_records = total_filter_metrics.accepted_templates;
-        metrics.discarded_non_pf = total_filter_metrics.discarded_non_pf;
-        metrics.discarded_poor_alignment = total_filter_metrics.discarded_poor_alignment;
-        metrics.discarded_ns_in_umi = total_filter_metrics.discarded_ns_in_umi;
-        metrics.discarded_umi_too_short = total_filter_metrics.discarded_umi_too_short;
-
-        // Calculate metrics from family size counter
-        metrics.total_families = family_size_counter.values().sum::<u64>();
-        metrics.unique_molecule_ids = metrics.total_families;
-
-        // Calculate average reads per molecule
-        if metrics.unique_molecule_ids > 0 {
-            metrics.avg_reads_per_molecule =
-                metrics.accepted_records as f64 / metrics.unique_molecule_ids as f64;
-        }
-
-        // Calculate median family size
-        if !family_size_counter.is_empty() {
-            let mut sizes: Vec<(usize, u64)> =
-                family_size_counter.iter().map(|(&size, &count)| (size, count)).collect();
-            sizes.sort_by_key(|(size, _)| *size);
-
-            let total_families = metrics.total_families;
-            let mut cumulative = 0u64;
-            let median_target = total_families / 2;
-
-            for (size, count) in &sizes {
-                cumulative += count;
-                if cumulative >= median_target {
-                    metrics.median_reads_per_molecule = *size as u64;
-                    break;
-                }
-            }
-
-            // Find min and max family sizes
-            if let Some((min_size, _)) = sizes.first() {
-                metrics.min_reads_per_molecule = *min_size as u64;
-            }
-            if let Some((max_size, _)) = sizes.last() {
-                metrics.max_reads_per_molecule = *max_size as u64;
-            }
-        }
-
-        // Log summary using enhanced logging (includes discard reasons)
+        let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
         log_umi_grouping_summary(&metrics);
 
         // Write family size histogram
@@ -1518,53 +1503,7 @@ impl GroupReadsByUmi {
         writer.into_inner().finish().context("Failed to finish output BAM")?;
         info!("Wrote output to {}", self.io.output.display());
 
-        // Build final metrics (same logic as pipeline mode)
-        let mut metrics = UmiGroupingMetrics::new();
-        metrics.total_records = total_filter_metrics.total_templates;
-        metrics.accepted_records = total_filter_metrics.accepted_templates;
-        metrics.discarded_non_pf = total_filter_metrics.discarded_non_pf;
-        metrics.discarded_poor_alignment = total_filter_metrics.discarded_poor_alignment;
-        metrics.discarded_ns_in_umi = total_filter_metrics.discarded_ns_in_umi;
-        metrics.discarded_umi_too_short = total_filter_metrics.discarded_umi_too_short;
-
-        // Calculate metrics from family size counter
-        metrics.total_families = family_size_counter.values().sum::<u64>();
-        metrics.unique_molecule_ids = metrics.total_families;
-
-        // Calculate average reads per molecule
-        if metrics.unique_molecule_ids > 0 {
-            metrics.avg_reads_per_molecule =
-                metrics.accepted_records as f64 / metrics.unique_molecule_ids as f64;
-        }
-
-        // Calculate median family size
-        if !family_size_counter.is_empty() {
-            let mut sizes: Vec<(usize, u64)> =
-                family_size_counter.iter().map(|(&size, &count)| (size, count)).collect();
-            sizes.sort_by_key(|(size, _)| *size);
-
-            let total_families = metrics.total_families;
-            let mut cumulative = 0u64;
-            let median_target = total_families / 2;
-
-            for (size, count) in &sizes {
-                cumulative += count;
-                if cumulative >= median_target {
-                    metrics.median_reads_per_molecule = *size as u64;
-                    break;
-                }
-            }
-
-            // Find min and max family sizes
-            if let Some((min_size, _)) = sizes.first() {
-                metrics.min_reads_per_molecule = *min_size as u64;
-            }
-            if let Some((max_size, _)) = sizes.last() {
-                metrics.max_reads_per_molecule = *max_size as u64;
-            }
-        }
-
-        // Log summary using enhanced logging
+        let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
         log_umi_grouping_summary(&metrics);
 
         // Write family size histogram
@@ -1696,345 +1635,6 @@ impl GroupReadsByUmi {
         }
 
         Ok(())
-    }
-}
-
-#[allow(dead_code)]
-impl GroupReadsByUmi {
-    /// Get the unclipped 5' position of a read
-    /// For positive strand: unclipped start
-    /// For negative strand: unclipped end
-    fn get_unclipped_position(record: &sam::alignment::RecordBuf) -> Result<i32> {
-        if record.flags().is_unmapped() {
-            return Ok(0);
-        }
-
-        let alignment_start = record
-            .alignment_start()
-            .ok_or_else(|| anyhow::anyhow!("Mapped read missing alignment start"))?;
-
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let alignment_start_i32 = usize::from(alignment_start) as i32;
-
-        if record.flags().is_reverse_complemented() {
-            // Negative strand: calculate unclipped end
-            // unclipped_end = alignment_start + alignment_span + soft_clipped_bases_at_end
-            let cigar = record.cigar();
-
-            // Calculate alignment span (M/D/N/=/X operations)
-            let alignment_span: i32 = cigar
-                .as_ref()
-                .iter()
-                .filter(|op| {
-                    matches!(
-                        op.kind(),
-                        noodles::sam::alignment::record::cigar::op::Kind::Match
-                            | noodles::sam::alignment::record::cigar::op::Kind::Deletion
-                            | noodles::sam::alignment::record::cigar::op::Kind::Skip
-                            | noodles::sam::alignment::record::cigar::op::Kind::SequenceMatch
-                            | noodles::sam::alignment::record::cigar::op::Kind::SequenceMismatch
-                    )
-                })
-                .map(|op| i32::try_from(op.len()).unwrap())
-                .sum();
-
-            // Get trailing soft clips
-            let trailing_soft_clips: i32 = cigar
-                .as_ref()
-                .iter()
-                .rev()
-                .take_while(|op| {
-                    matches!(op.kind(), noodles::sam::alignment::record::cigar::op::Kind::SoftClip)
-                })
-                .map(|op| i32::try_from(op.len()).unwrap())
-                .sum();
-
-            Ok(alignment_start_i32 + alignment_span + trailing_soft_clips)
-        } else {
-            // Positive strand: calculate unclipped start
-            // unclipped_start = alignment_start - soft_clipped_bases_at_start
-            let cigar = record.cigar();
-
-            // Get leading soft clips
-            let leading_soft_clips: i32 = cigar
-                .as_ref()
-                .iter()
-                .take_while(|op| {
-                    matches!(op.kind(), noodles::sam::alignment::record::cigar::op::Kind::SoftClip)
-                })
-                .map(|op| i32::try_from(op.len()).unwrap())
-                .sum();
-
-            Ok(alignment_start_i32 - leading_soft_clips)
-        }
-    }
-
-    /// Process a position group without writing - returns result for parallel processing
-    fn process_position_group(
-        &self,
-        group: &mut Vec<Template>,
-        assigner: &dyn UmiAssigner,
-    ) -> Result<PositionGroupResult> {
-        if group.is_empty() {
-            return Ok(PositionGroupResult {
-                family_sizes: AHashMap::new(),
-                sorted_templates: Vec::new(),
-            });
-        }
-
-        // Assign UMI groups
-        self.assign_umi_groups(group, assigner)?;
-
-        // Group by molecule ID using Vec-based indexing
-        let max_idx = group.iter().filter_map(|t| t.mi.to_vec_index()).max().unwrap_or(0);
-
-        let mut by_mi: Vec<Vec<Template>> = vec![Vec::new(); max_idx + 1];
-        for template in group.drain(..) {
-            if let Some(idx) = template.mi.to_vec_index() {
-                by_mi[idx].push(template);
-            }
-        }
-
-        // Count family sizes
-        let mut family_sizes: AHashMap<usize, u64> = AHashMap::new();
-        for group_templates in &by_mi {
-            if !group_templates.is_empty() {
-                *family_sizes.entry(group_templates.len()).or_insert(0) += 1;
-            }
-        }
-
-        // Collect sorted templates (Vec indices are already in sorted order)
-        let mut sorted_templates = Vec::new();
-        for mut group_templates in by_mi {
-            if group_templates.is_empty() {
-                continue;
-            }
-            group_templates.sort_by(|a, b| a.name.cmp(&b.name));
-            sorted_templates.extend(group_templates);
-        }
-
-        Ok(PositionGroupResult { family_sizes, sorted_templates })
-    }
-
-    /// Assign UMI groups to templates at the same position
-    ///
-    /// When `split_templates_by_pair_orientation` is true, templates are first split
-    /// into subgroups by (R1 positive strand, R2 positive strand) before UMI assignment.
-    /// This matches fgbio's behavior where F1R2 pairs are not grouped with F2R1 pairs
-    /// for non-paired strategies (e.g., Edit, Adjacency, Identity).
-    fn assign_umi_groups(
-        &self,
-        templates: &mut [Template],
-        assigner: &dyn UmiAssigner,
-    ) -> Result<()> {
-        // Split templates by pair orientation if required by the assigner
-        // This matches fgbio's behavior in GroupReadsByUmi.assignUmiGroups
-        if assigner.split_templates_by_pair_orientation() {
-            // Group by (R1 positive strand, R2 positive strand)
-            // Templates with different pair orientations should NOT be grouped together
-            let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
-
-            for (idx, template) in templates.iter().enumerate() {
-                let orientation = Self::get_pair_orientation(template);
-                subgroups.entry(orientation).or_default().push(idx);
-            }
-
-            // Process each subgroup separately
-            // Each subgroup gets its own set of MI assignments
-            for indices in subgroups.values() {
-                self.assign_umi_groups_for_indices(templates, indices, assigner)?;
-            }
-        } else {
-            // No splitting - process all templates together (for Paired strategy)
-            let all_indices: Vec<usize> = (0..templates.len()).collect();
-            self.assign_umi_groups_for_indices(templates, &all_indices, assigner)?;
-        }
-
-        Ok(())
-    }
-
-    /// Get the pair orientation for a template: (R1 positive strand, R2 positive strand)
-    /// Returns (true, true) for unpaired/single-end reads
-    fn get_pair_orientation(template: &Template) -> (bool, bool) {
-        let r1_positive = template.r1().is_none_or(|r| !r.flags().is_reverse_complemented());
-        let r2_positive = template.r2().is_none_or(|r| !r.flags().is_reverse_complemented());
-        (r1_positive, r2_positive)
-    }
-
-    /// Assign UMI groups to a specific subset of templates (identified by indices)
-    ///
-    /// This sets the `Template.mi` field with the `MoleculeId` enum. The actual BAM MI tag
-    /// is set later during serialization, when we have the global offset.
-    fn assign_umi_groups_for_indices(
-        &self,
-        templates: &mut [Template],
-        indices: &[usize],
-        assigner: &dyn UmiAssigner,
-    ) -> Result<()> {
-        if indices.is_empty() {
-            return Ok(());
-        }
-
-        // Extract UMIs from the specified templates - pre-allocate capacity
-        let mut umis = Vec::with_capacity(indices.len());
-        let raw_tag: [u8; 2] = {
-            let bytes = self.raw_tag.as_bytes();
-            [bytes[0], bytes[1]]
-        };
-
-        for &idx in indices {
-            let template = &templates[idx];
-            let umi_str = if let Some(r1) = &template.r1() {
-                if let Some(DataValue::String(umi_bytes)) = r1.data().get(&raw_tag) {
-                    String::from_utf8_lossy(umi_bytes).into_owned()
-                } else {
-                    bail!("UMI tag is not a string");
-                }
-            } else if let Some(r2) = &template.r2() {
-                if let Some(DataValue::String(umi_bytes)) = r2.data().get(&raw_tag) {
-                    String::from_utf8_lossy(umi_bytes).into_owned()
-                } else {
-                    bail!("UMI tag is not a string");
-                }
-            } else {
-                bail!("Template has no reads");
-            };
-
-            // Determine which read is earlier based on GENOMIC POSITION for paired UMI strategies
-            let is_r1_earlier = if let (Some(r1), Some(r2)) = (&template.r1(), &template.r2()) {
-                Self::is_r1_genomically_earlier(r1, r2)?
-            } else {
-                true
-            };
-
-            let processed_umi = Self::umi_for_read(&umi_str, is_r1_earlier, assigner)?;
-            umis.push(processed_umi);
-        }
-
-        // Truncate UMIs if needed
-        let truncated_umis = self.truncate_umis(umis)?;
-
-        // Assign UMI groups - returns Vec<MoleculeId> indexed by input position
-        let assignments = assigner.assign(&truncated_umis);
-
-        // Store MoleculeId enum in Template.mi field
-        // The actual MI tag string is set during serialization with global offset
-        for (i, &idx) in indices.iter().enumerate() {
-            let template = &mut templates[idx];
-            template.mi = assignments[i];
-        }
-
-        Ok(())
-    }
-
-    /// Determine if R1 is genomically earlier than R2
-    /// This uses the actual genomic coordinates, not just the read pair flags
-    fn is_r1_genomically_earlier(
-        r1: &sam::alignment::RecordBuf,
-        r2: &sam::alignment::RecordBuf,
-    ) -> Result<bool> {
-        let ref1 = r1.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap());
-        let ref2 = r2.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap());
-
-        // If on different chromosomes, compare chromosome IDs
-        if ref1 != ref2 {
-            return Ok(ref1 < ref2);
-        }
-
-        // Same chromosome: compare unclipped 5' positions
-        let pos1 = Self::get_unclipped_position(r1)?;
-        let pos2 = Self::get_unclipped_position(r2)?;
-
-        if pos1 != pos2 {
-            return Ok(pos1 < pos2);
-        }
-
-        // Same position: compare strands (positive strand sorts before negative)
-        let strand1 = u8::from(r1.flags().is_reverse_complemented());
-        let strand2 = u8::from(r2.flags().is_reverse_complemented());
-
-        Ok(strand1 < strand2)
-    }
-
-    /// Get the MI tag from a template
-    fn get_mi_tag(&self, template: &Template) -> Result<String> {
-        use sam::alignment::record::data::field::Tag;
-        let assign_tag_bytes: [u8; 2] = {
-            let bytes = self.assign_tag.as_bytes();
-            [bytes[0], bytes[1]]
-        };
-        let assign_tag = Tag::from(assign_tag_bytes);
-
-        let r1 = template.r1();
-        let r2 = template.r2();
-        let record = if let Some(rec) = r1 { rec } else { r2.unwrap() };
-
-        if let Some(data) = record.data().get(&assign_tag) {
-            if let DataValue::String(mi) = data {
-                Ok(String::from_utf8_lossy(mi).to_string())
-            } else {
-                bail!("MI tag is not a string");
-            }
-        } else {
-            bail!("Missing MI tag");
-        }
-    }
-
-    /// Extract UMI for a read, handling paired UMI strategies
-    fn umi_for_read(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> Result<String> {
-        // For paired UMI strategies, we need to add prefixes to indicate which read is earlier
-        if assigner.split_templates_by_pair_orientation() {
-            // For non-paired strategies, just return the UMI
-            Ok(umi.to_uppercase())
-        } else {
-            // For paired strategies, parse and prefix the UMI
-            let parts: Vec<&str> = umi.split('-').collect();
-            if parts.len() != 2 {
-                bail!(
-                    "Paired strategy used but UMI did not contain 2 segments delimited by '-': {umi}"
-                );
-            }
-
-            let Some(paired) = assigner.as_any().downcast_ref::<PairedUmiAssigner>() else {
-                bail!("Expected PairedUmiAssigner")
-            };
-
-            let result = if is_r1_earlier {
-                format!(
-                    "{}:{}-{}:{}",
-                    paired.lower_read_umi_prefix(),
-                    parts[0],
-                    paired.higher_read_umi_prefix(),
-                    parts[1]
-                )
-            } else {
-                format!(
-                    "{}:{}-{}:{}",
-                    paired.higher_read_umi_prefix(),
-                    parts[0],
-                    paired.lower_read_umi_prefix(),
-                    parts[1]
-                )
-            };
-
-            Ok(result)
-        }
-    }
-
-    /// Truncate UMIs to minimum length if specified
-    fn truncate_umis(&self, umis: Vec<String>) -> Result<Vec<String>> {
-        match self.min_umi_length {
-            None => Ok(umis),
-            Some(min_len) => {
-                let min_length = umis.iter().map(std::string::String::len).min().unwrap_or(0);
-                if min_length < min_len {
-                    bail!(
-                        "UMI found that had shorter length than expected ({min_length} < {min_len})"
-                    );
-                }
-                Ok(umis.into_iter().map(|u| u[..min_len].to_string()).collect())
-            }
-        }
     }
 
     /// Write family size histogram
@@ -2363,15 +1963,13 @@ mod tests {
         let assigner: Box<dyn UmiAssigner> = Box::new(PairedUmiAssigner::new(1));
 
         let umi1 = "AAA-TTT";
-        let result1 =
-            GroupReadsByUmi::umi_for_read(umi1, true, assigner.as_ref()).expect("Should succeed");
+        let result1 = umi_for_read_impl(umi1, true, assigner.as_ref()).expect("Should succeed");
 
         assert!(result1.contains("AAA"));
         assert!(result1.contains("TTT"));
         assert!(result1.contains('-'));
 
-        let result2 =
-            GroupReadsByUmi::umi_for_read(umi1, false, assigner.as_ref()).expect("Should succeed");
+        let result2 = umi_for_read_impl(umi1, false, assigner.as_ref()).expect("Should succeed");
 
         assert_ne!(result1, result2, "Prefixes should differ based on which read is earlier");
     }
@@ -2380,11 +1978,11 @@ mod tests {
     fn test_umi_for_read_handles_absent_umi_ends() {
         let assigner: Box<dyn UmiAssigner> = Box::new(PairedUmiAssigner::new(1));
 
-        let result_left = GroupReadsByUmi::umi_for_read("-TTT", true, assigner.as_ref())
+        let result_left = umi_for_read_impl("-TTT", true, assigner.as_ref())
             .expect("Should handle absent left UMI");
         assert!(result_left.contains('-') && result_left.contains("TTT"));
 
-        let result_right = GroupReadsByUmi::umi_for_read("AAA-", true, assigner.as_ref())
+        let result_right = umi_for_read_impl("AAA-", true, assigner.as_ref())
             .expect("Should handle absent right UMI");
         assert!(result_right.contains("AAA") && result_right.contains('-'));
     }
@@ -2393,8 +1991,8 @@ mod tests {
     fn test_umi_for_read_uppercase_for_non_paired() {
         let assigner: Box<dyn UmiAssigner> = Box::new(IdentityUmiAssigner::new());
 
-        let result = GroupReadsByUmi::umi_for_read("acgtacgt", true, assigner.as_ref())
-            .expect("Should succeed");
+        let result =
+            umi_for_read_impl("acgtacgt", true, assigner.as_ref()).expect("Should succeed");
 
         assert_eq!(result, "ACGTACGT");
     }
@@ -2405,7 +2003,8 @@ mod tests {
             GroupReadsByUmi { min_umi_length: Some(5), ..test_group_cmd(Strategy::Identity, 0) };
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string(), "AAAAAAA".to_string()];
-        let truncated = tool.truncate_umis(umis).expect("Should truncate successfully");
+        let truncated =
+            truncate_umis_impl(umis, tool.min_umi_length).expect("Should truncate successfully");
 
         assert_eq!(truncated.len(), 3);
         assert!(truncated.iter().all(|u| u.len() == 5));
@@ -2417,7 +2016,7 @@ mod tests {
 
         let umis = vec!["AAAAAA".to_string(), "AAAAA".to_string()];
         let original = umis.clone();
-        let result = tool.truncate_umis(umis).expect("Should succeed");
+        let result = truncate_umis_impl(umis, tool.min_umi_length).expect("Should succeed");
 
         assert_eq!(result, original);
     }
@@ -2428,7 +2027,7 @@ mod tests {
             GroupReadsByUmi { min_umi_length: Some(6), ..test_group_cmd(Strategy::Identity, 0) };
 
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
-        let result = tool.truncate_umis(umis);
+        let result = truncate_umis_impl(umis, tool.min_umi_length);
         assert!(result.is_err());
     }
 
@@ -3880,10 +3479,8 @@ mod tests {
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
-        // Should handle gracefully (either error or filter out)
-        let result = cmd.execute("test");
-        // The command should either succeed with filtered reads or fail gracefully
-        assert!(result.is_ok() || result.is_err());
+        // Should complete without panic — either succeeds or returns a structured error
+        let _result = cmd.execute("test");
 
         Ok(())
     }
@@ -4266,7 +3863,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = GroupReadsByUmi::get_pair_orientation(&template);
+        let orientation = get_pair_orientation_impl(&template);
         assert_eq!(orientation, (true, false), "F1R2 should have orientation (true, false)");
 
         Ok(())
@@ -4279,7 +3876,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = GroupReadsByUmi::get_pair_orientation(&template);
+        let orientation = get_pair_orientation_impl(&template);
         assert_eq!(orientation, (false, true), "F2R1 should have orientation (false, true)");
 
         Ok(())
@@ -4293,7 +3890,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = GroupReadsByUmi::get_pair_orientation(&template);
+        let orientation = get_pair_orientation_impl(&template);
         assert_eq!(
             orientation,
             (true, true),
@@ -4310,7 +3907,7 @@ mod tests {
 
         let template = Template::from_records(vec![r1, r2])?;
 
-        let orientation = GroupReadsByUmi::get_pair_orientation(&template);
+        let orientation = get_pair_orientation_impl(&template);
         assert_eq!(
             orientation,
             (false, false),

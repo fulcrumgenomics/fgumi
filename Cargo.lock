@@ -682,7 +682,6 @@ dependencies = [
  "rayon",
  "read-structure",
  "rstest",
- "scoped_threadpool",
  "seq_io",
  "serde",
  "statrs",

@@ -79,12 +79,14 @@ impl BufRead for BgzfReaderEnum {
 /// Type alias for a BAM reader that supports both single and multi-threaded BGZF.
 pub type BamReaderAuto = noodles::bam::io::Reader<BgzfReaderEnum>;
 
-/// Enum wrapping single-threaded and multi-threaded BGZF writers
+/// Enum wrapping single-threaded and multi-threaded BGZF writers.
+///
+/// Uses `Box<dyn Write + Send>` to support both file and stdout output.
 pub enum BgzfWriterEnum {
     /// Single-threaded BGZF writer
-    SingleThreaded(BgzfWriter<File>),
+    SingleThreaded(BgzfWriter<Box<dyn Write + Send>>),
     /// Multi-threaded BGZF writer
-    MultiThreaded(MultithreadedWriter<File>),
+    MultiThreaded(MultithreadedWriter<Box<dyn Write + Send>>),
 }
 
 impl Write for BgzfWriterEnum {
@@ -138,9 +140,14 @@ fn make_bgzf_reader(file: File, threads: usize) -> BgzfReaderEnum {
     }
 }
 
-/// Create a [`BgzfWriterEnum`] from a file, selecting single- or multi-threaded based on `threads`.
+/// Create a [`BgzfWriterEnum`] from a writer, selecting single- or multi-threaded based on
+/// `threads`.
 #[allow(clippy::cast_possible_truncation)]
-fn make_bgzf_writer(output_file: File, threads: usize, compression_level: u32) -> BgzfWriterEnum {
+fn make_bgzf_writer(
+    output: Box<dyn Write + Send>,
+    threads: usize,
+    compression_level: u32,
+) -> BgzfWriterEnum {
     if threads > 1 {
         let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
         let mut builder = MultithreadedWriterBuilder::default().set_worker_count(worker_count);
@@ -149,13 +156,13 @@ fn make_bgzf_writer(output_file: File, threads: usize, compression_level: u32) -
             builder = builder.set_compression_level(cl);
         }
 
-        BgzfWriterEnum::MultiThreaded(builder.build_from_writer(output_file))
+        BgzfWriterEnum::MultiThreaded(builder.build_from_writer(output))
     } else {
         let level = noodles_bgzf::io::writer::CompressionLevel::new(compression_level as u8)
             .unwrap_or_default();
         let writer = noodles_bgzf::io::writer::Builder::default()
             .set_compression_level(level)
-            .build_from_writer(output_file);
+            .build_from_writer(output);
         BgzfWriterEnum::SingleThreaded(writer)
     }
 }
@@ -283,10 +290,9 @@ pub fn create_raw_bam_writer<P: AsRef<Path>>(
     compression_level: u32,
 ) -> Result<RawBamWriter> {
     let path_ref = path.as_ref();
-    let output_file = File::create(path_ref)
-        .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
+    let output = open_output_writer(path_ref)?;
 
-    let bgzf_writer = make_bgzf_writer(output_file, threads, compression_level);
+    let bgzf_writer = make_bgzf_writer(output, threads, compression_level);
 
     let mut writer = RawBamWriter::new(bgzf_writer);
     writer
@@ -642,6 +648,11 @@ pub fn create_indexing_bam_writer<P: AsRef<Path>>(
     threads: usize,
 ) -> Result<IndexingBamWriter> {
     let path_ref = path.as_ref();
+    if is_stdout_path(path_ref) {
+        anyhow::bail!(
+            "Cannot create an indexing BAM writer for stdout (indexing requires a seekable file)"
+        );
+    }
     let output_file = File::create(path_ref)
         .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
 
@@ -813,10 +824,9 @@ pub fn create_bam_writer<P: AsRef<Path>>(
     compression_level: u32,
 ) -> Result<BamWriter> {
     let path_ref = path.as_ref();
-    let output_file = File::create(path_ref)
-        .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
+    let output = open_output_writer(path_ref)?;
 
-    let bgzf_writer = make_bgzf_writer(output_file, threads, compression_level);
+    let bgzf_writer = make_bgzf_writer(output, threads, compression_level);
 
     let mut writer = noodles::bam::io::Writer::from(bgzf_writer);
     writer
@@ -881,6 +891,36 @@ pub fn create_optional_bam_writer<P: AsRef<Path>>(
 pub fn is_stdin_path<P: AsRef<Path>>(path: P) -> bool {
     let path_str = path.as_ref().to_string_lossy();
     path_str == "-" || path_str == "/dev/stdin"
+}
+
+/// Check if a path refers to stdout.
+///
+/// Returns true if the path is "-" or "/dev/stdout".
+///
+/// # Example
+/// ```
+/// use fgumi_lib::bam_io::is_stdout_path;
+/// use std::path::Path;
+///
+/// assert!(is_stdout_path(Path::new("-")));
+/// assert!(is_stdout_path(Path::new("/dev/stdout")));
+/// assert!(!is_stdout_path(Path::new("output.bam")));
+/// ```
+pub fn is_stdout_path<P: AsRef<Path>>(path: P) -> bool {
+    let path_str = path.as_ref().to_string_lossy();
+    path_str == "-" || path_str == "/dev/stdout"
+}
+
+/// Open an output writer for a path, supporting stdout via "-" or "/dev/stdout".
+fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
+    let path_ref = path.as_ref();
+    if is_stdout_path(path_ref) {
+        Ok(Box::new(std::io::stdout()))
+    } else {
+        let file = File::create(path_ref)
+            .with_context(|| format!("Failed to create output BAM: {}", path_ref.display()))?;
+        Ok(Box::new(file))
+    }
 }
 
 /// A reader that buffers all bytes read through it.
@@ -1166,7 +1206,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_flush_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file = File::create(temp_file.path())?;
+        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let mut writer = BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file));
 
         // Write some data and flush
@@ -1180,7 +1220,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_flush_multithreaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file = File::create(temp_file.path())?;
+        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
@@ -1200,7 +1240,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_finish_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file = File::create(temp_file.path())?;
+        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let mut writer = BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file));
 
         // Write some data
@@ -1216,7 +1256,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_finish_multithreaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file = File::create(temp_file.path())?;
+        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
@@ -1238,7 +1278,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_write_single_threaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file = File::create(temp_file.path())?;
+        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let mut writer = BgzfWriterEnum::SingleThreaded(BgzfWriter::new(output_file));
 
         // Test writing via the Write trait
@@ -1251,7 +1291,7 @@ mod tests {
     #[test]
     fn test_bgzf_writer_write_multithreaded() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let output_file = File::create(temp_file.path())?;
+        let output_file: Box<dyn Write + Send> = Box::new(File::create(temp_file.path())?);
         let worker_count = NonZero::new(2).expect("2 is non-zero");
         let compression_level = CompressionLevel::new(6).expect("valid compression level");
         let mut writer = BgzfWriterEnum::MultiThreaded(MultithreadedWriter::with_worker_count(
@@ -1539,5 +1579,27 @@ mod tests {
         // Verify file is non-empty (contains header + data + EOF)
         assert!(temp.path().metadata()?.len() > 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_is_stdout_path() {
+        assert!(is_stdout_path("-"));
+        assert!(is_stdout_path("/dev/stdout"));
+        assert!(is_stdout_path(Path::new("-")));
+        assert!(is_stdout_path(Path::new("/dev/stdout")));
+
+        assert!(!is_stdout_path("output.bam"));
+        assert!(!is_stdout_path("/path/to/file.bam"));
+        assert!(!is_stdout_path(""));
+        assert!(!is_stdout_path("/dev/null"));
+    }
+
+    #[test]
+    fn test_indexing_writer_rejects_stdout() {
+        let header = Header::default();
+        let result = create_indexing_bam_writer("-", &header, 6, 2);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("stdout"));
     }
 }

@@ -109,6 +109,21 @@ At a minimum, all of the functions and data structures that are a part of the pr
 You are encouraged to include [examples](https://doc.rust-lang.org/rust-by-example/testing/doc_testing.html) in the function documentation, as these are also run as test cases.
 
 
+#### Feature Flags for Development
+
+Several Cargo features exist for development and debugging purposes. These are **not** included in the default feature set and must be enabled explicitly.
+
+| Feature | Purpose | Usage |
+|---------|---------|-------|
+| `memory-debug` | Enables comprehensive memory debugging infrastructure: a monitor thread, hot-path atomic counters, and additional CLI arguments for memory tracking. Requires `libmimalloc-sys` and `sysinfo` dependencies. | `cargo build --features memory-debug` |
+| `dhat-heap` | Enables heap profiling via the `dhat` crate. Replaces the default `mimalloc` allocator with `dhat::Alloc`. | `cargo build --features dhat-heap` |
+| `profile-adjacency` | Enables profiling output for the adjacency UMI assigner. | `cargo build --features profile-adjacency` |
+| `stress-tests` | Enables slow stress tests for concurrency testing. | `cargo nextest run --features stress-tests` |
+| `compare` | Enables the `compare` subcommand for BAM and metrics developer tools. | `cargo build --features compare` |
+| `simulate` | Enables the `simulate` command for generating synthetic test data. | `cargo build --features simulate` |
+
+None of these features are included in release builds or `cargo dist` artifacts.
+
 #### Testing
 
 In general, every addition of (non-trivial) code to the project must be accompanied by unit tests that, at a minimum, exercise all the "happy paths" (i.e., non-error cases) through the code.
