@@ -176,7 +176,8 @@ pub struct FastqDecompressedChunk {
 
 impl MemoryEstimate for FastqDecompressedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.chunks.iter().map(|c| c.data.capacity()).sum()
+        self.chunks.iter().map(|c| c.data.capacity()).sum::<usize>()
+            + self.chunks.capacity() * std::mem::size_of::<FastqDecompressedChunk>()
     }
 }
 
@@ -207,7 +208,8 @@ impl MemoryEstimate for FastqBoundaryBatch {
         self.streams
             .iter()
             .map(|s| s.data.capacity() + s.offsets.capacity() * std::mem::size_of::<usize>())
-            .sum()
+            .sum::<usize>()
+            + self.streams.capacity() * std::mem::size_of::<FastqStreamBoundaries>()
     }
 }
 
@@ -239,8 +241,10 @@ impl MemoryEstimate for FastqParsedBatch {
                     .iter()
                     .map(|r| r.name.capacity() + r.sequence.capacity() + r.quality.capacity())
                     .sum::<usize>()
+                    + stream.records.capacity() * std::mem::size_of::<FastqRecord>()
             })
-            .sum()
+            .sum::<usize>()
+            + self.streams.capacity() * std::mem::size_of::<FastqParsedStream>()
     }
 }
 
@@ -2167,7 +2171,8 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
                 Ok(()) => {
                     #[cfg(feature = "memory-debug")]
                     {
-                        // TODO: compute heap size if needed for memory-debug
+                        // Heap size tracking for pushed templates is not yet implemented;
+                        // queue memory is tracked through estimates only for now.
                         let q4_heap: u64 = 0;
                         state.output.groups_heap_bytes.fetch_add(q4_heap, Ordering::AcqRel);
                     }
@@ -2480,7 +2485,11 @@ where
     // =========================================================================
     // Priority 6: Try to push result (non-blocking)
     // =========================================================================
-    let batch = SerializedBatch { data: combined_data, record_count: total_record_count };
+    let batch = SerializedBatch {
+        data: combined_data,
+        record_count: total_record_count,
+        secondary_data: None,
+    };
     let heap_size = batch.estimate_heap_size();
     match state.output.serialized.push((serial, batch)) {
         Ok(()) => {
@@ -3938,5 +3947,78 @@ mod tests {
             &[Read, Decompress, FindBoundaries, Decode, Process, Serialize, Compress, Write]
         );
         assert!(!steps.is_active(Group));
+    }
+
+    #[test]
+    fn test_fastq_decompressed_batch_memory_estimate() {
+        let mut data = Vec::with_capacity(2048);
+        data.extend_from_slice(&[0u8; 100]);
+        let mut chunks = Vec::with_capacity(4);
+        chunks.push(FastqDecompressedChunk { stream_idx: 0, data });
+
+        let batch = FastqDecompressedBatch { chunks, serial: 0 };
+        let estimate = batch.estimate_heap_size();
+
+        // Should use data capacity (2048) not len (100)
+        assert!(estimate >= 2048, "estimate {estimate} should be >= 2048 (data capacity)");
+        // Should include Vec<FastqDecompressedChunk> overhead
+        let vec_overhead = 4 * std::mem::size_of::<FastqDecompressedChunk>();
+        assert!(
+            estimate >= 2048 + vec_overhead,
+            "estimate {estimate} should include chunk Vec overhead"
+        );
+    }
+
+    #[test]
+    fn test_fastq_boundary_batch_memory_estimate() {
+        let mut data = Vec::with_capacity(1024);
+        data.extend_from_slice(&[0u8; 100]);
+        let mut offsets = Vec::with_capacity(16);
+        offsets.push(0usize);
+
+        let mut streams = Vec::with_capacity(4);
+        streams.push(FastqStreamBoundaries { stream_idx: 0, data, offsets });
+
+        let batch = FastqBoundaryBatch { streams, serial: 0 };
+        let estimate = batch.estimate_heap_size();
+
+        let expected_min = 1024
+            + 16 * std::mem::size_of::<usize>()
+            + 4 * std::mem::size_of::<FastqStreamBoundaries>();
+        assert!(
+            estimate >= expected_min,
+            "estimate {estimate} should be >= {expected_min} (capacities + overhead)"
+        );
+    }
+
+    #[test]
+    fn test_fastq_parsed_batch_memory_estimate() {
+        use crate::grouper::FastqRecord;
+
+        let mut name = Vec::with_capacity(64);
+        name.extend_from_slice(b"read1");
+        let mut seq = Vec::with_capacity(256);
+        seq.extend_from_slice(b"ACGT");
+        let mut qual = Vec::with_capacity(256);
+        qual.extend_from_slice(b"IIII");
+
+        let record = FastqRecord { name, sequence: seq, quality: qual };
+        let mut records = Vec::with_capacity(8);
+        records.push(record);
+
+        let mut streams = Vec::with_capacity(4);
+        streams.push(FastqParsedStream { stream_idx: 0, records });
+
+        let batch = FastqParsedBatch { streams, serial: 0 };
+        let estimate = batch.estimate_heap_size();
+
+        let record_data = 64 + 256 + 256; // capacities of name, seq, qual
+        let records_overhead = 8 * std::mem::size_of::<FastqRecord>();
+        let streams_overhead = 4 * std::mem::size_of::<FastqParsedStream>();
+        let expected_min = record_data + records_overhead + streams_overhead;
+        assert!(
+            estimate >= expected_min,
+            "estimate {estimate} should be >= {expected_min} (capacities + overhead)"
+        );
     }
 }

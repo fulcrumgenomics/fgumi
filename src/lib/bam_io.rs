@@ -244,6 +244,19 @@ impl RawBamWriter {
         self.inner.write_all(record_bytes)
     }
 
+    /// Write pre-formatted BAM record bytes directly to the BGZF stream.
+    ///
+    /// Unlike `write_raw_record`, this does NOT add a length prefix — the data
+    /// must already contain properly formatted BAM records (4-byte LE size + record bytes).
+    /// Used by the pipeline for bulk secondary output.
+    ///
+    /// # Errors
+    /// Returns an error if writing to the underlying writer fails.
+    pub fn write_raw_bytes(&mut self, data: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        self.inner.write_all(data)
+    }
+
     /// Finish writing and close the writer.
     ///
     /// # Errors
@@ -1503,6 +1516,28 @@ mod tests {
         let index = writer.finish()?;
         assert!(!index.reference_sequences().is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_raw_bytes() -> Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        let header = noodles::sam::Header::default();
+        let mut writer = create_raw_bam_writer(temp.path(), &header, 1, 1)?;
+
+        // Write pre-formatted BAM record bytes (4-byte LE length + record)
+        let record_bytes = vec![1, 2, 3, 4, 5];
+        let mut formatted = Vec::new();
+        #[allow(clippy::cast_possible_truncation)]
+        let len = record_bytes.len() as u32;
+        formatted.extend_from_slice(&len.to_le_bytes());
+        formatted.extend_from_slice(&record_bytes);
+
+        writer.write_raw_bytes(&formatted)?;
+        writer.finish()?;
+
+        // Verify file is non-empty (contains header + data + EOF)
+        assert!(temp.path().metadata()?.len() > 0);
         Ok(())
     }
 }

@@ -186,6 +186,7 @@ impl BatchWeight for ProcessedDedupGroup {
 impl MemoryEstimate for ProcessedDedupGroup {
     fn estimate_heap_size(&self) -> usize {
         self.templates.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
+            + self.templates.capacity() * std::mem::size_of::<Template>()
             + self.family_sizes.capacity() * std::mem::size_of::<(usize, u64)>()
             + std::mem::size_of::<DedupMetrics>()
     }
@@ -2804,5 +2805,27 @@ mod tests {
         let flags_with_dup = bam_fields::flags(&rec);
         bam_fields::set_flags(&mut rec, flags_with_dup & !bam_fields::flags::DUPLICATE);
         assert_eq!(bam_fields::flags(&rec) & bam_fields::flags::DUPLICATE, 0);
+    }
+
+    #[test]
+    fn test_processed_dedup_group_memory_estimate() {
+        let template = create_test_template("test", &[30, 30, 30, 30]);
+        let mut templates = Vec::with_capacity(10);
+        templates.push(template);
+
+        let batch = ProcessedDedupGroup {
+            templates,
+            family_sizes: AHashMap::new(),
+            dedup_metrics: DedupMetrics::default(),
+            input_record_count: 1,
+        };
+
+        let estimate = batch.estimate_heap_size();
+        // Should include Vec<Template> overhead for capacity * size_of::<Template>()
+        let vec_overhead = 10 * std::mem::size_of::<Template>();
+        assert!(
+            estimate >= vec_overhead,
+            "estimate {estimate} should include Vec<Template> overhead {vec_overhead}"
+        );
     }
 }

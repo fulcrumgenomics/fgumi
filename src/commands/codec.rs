@@ -60,7 +60,9 @@ struct CodecProcessedBatch {
 
 impl MemoryEstimate for CodecProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.consensus_output.data.len() + self.rejects.iter().map(Vec::len).sum::<usize>()
+        self.consensus_output.data.capacity()
+            + self.rejects.iter().map(Vec::capacity).sum::<usize>()
+            + self.rejects.capacity() * std::mem::size_of::<Vec<u8>>()
     }
 }
 
@@ -1184,5 +1186,24 @@ mod tests {
         assert!(output_path.exists());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_codec_processed_batch_memory_estimate() {
+        let mut data = Vec::with_capacity(1024);
+        data.extend_from_slice(&[0u8; 100]);
+        let mut reject = Vec::with_capacity(512);
+        reject.extend_from_slice(&[0u8; 50]);
+
+        let batch = CodecProcessedBatch {
+            consensus_output: ConsensusOutput { data, count: 1 },
+            rejects: vec![reject],
+            groups_count: 1,
+            stats: CodecConsensusStats::default(),
+        };
+
+        let estimate = batch.estimate_heap_size();
+        assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
+        assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
     }
 }
