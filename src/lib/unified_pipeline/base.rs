@@ -238,8 +238,8 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
         stats.update_system_rss(rss);
     }
 
-    // TODO: Queue memory integration deferred - requires pipeline reference to read actual queues
-    // For now, queue memory is tracked through estimates only
+    // Queue memory integration deferred — reading actual queue sizes requires a pipeline
+    // reference that is not available here.  Queue memory is tracked through estimates only.
 
     let breakdown = stats.get_memory_breakdown();
 
@@ -890,19 +890,22 @@ pub struct CompressedBlockBatch {
     pub blocks: Vec<CompressedBlock>,
     /// Number of records/templates in this batch (for progress logging).
     pub record_count: u64,
+    /// Optional secondary data passed through without compression.
+    /// Used for dual-output pipelines (e.g., rejected records).
+    pub secondary_data: Option<Vec<u8>>,
 }
 
 impl CompressedBlockBatch {
     /// Create a new empty batch.
     #[must_use]
     pub fn new() -> Self {
-        Self { blocks: Vec::new(), record_count: 0 }
+        Self { blocks: Vec::new(), record_count: 0, secondary_data: None }
     }
 
     /// Create a batch with pre-allocated capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { blocks: Vec::with_capacity(capacity), record_count: 0 }
+        Self { blocks: Vec::with_capacity(capacity), record_count: 0, secondary_data: None }
     }
 
     /// Number of blocks in this batch.
@@ -927,6 +930,7 @@ impl CompressedBlockBatch {
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.record_count = 0;
+        self.secondary_data = None;
     }
 }
 
@@ -935,6 +939,7 @@ impl MemoryEstimate for CompressedBlockBatch {
         // Vec overhead + sum of block data sizes
         self.blocks.iter().map(|b| b.data.capacity()).sum::<usize>()
             + self.blocks.capacity() * std::mem::size_of::<CompressedBlock>()
+            + self.secondary_data.as_ref().map_or(0, Vec::capacity)
     }
 }
 
@@ -1504,7 +1509,8 @@ impl MemoryEstimate for RecordBuf {
 
 impl MemoryEstimate for Vec<RecordBuf> {
     fn estimate_heap_size(&self) -> usize {
-        self.iter().map(MemoryEstimate::estimate_heap_size).sum()
+        self.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
+            + self.capacity() * std::mem::size_of::<RecordBuf>()
     }
 }
 
@@ -1617,13 +1623,16 @@ pub struct SerializedBatch {
     pub data: Vec<u8>,
     /// Number of records/templates in this batch (for progress logging).
     pub record_count: u64,
+    /// Optional secondary output data (e.g., rejected records).
+    /// Passed through compression unchanged and written to a secondary output file.
+    pub secondary_data: Option<Vec<u8>>,
 }
 
 impl SerializedBatch {
     /// Create a new empty batch.
     #[must_use]
     pub fn new() -> Self {
-        Self { data: Vec::new(), record_count: 0 }
+        Self { data: Vec::new(), record_count: 0, secondary_data: None }
     }
 
     /// Returns true if the batch contains no data.
@@ -1636,12 +1645,13 @@ impl SerializedBatch {
     pub fn clear(&mut self) {
         self.data.clear();
         self.record_count = 0;
+        self.secondary_data = None;
     }
 }
 
 impl MemoryEstimate for SerializedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.data.capacity()
+        self.data.capacity() + self.secondary_data.as_ref().map_or(0, Vec::capacity)
     }
 }
 
@@ -1688,6 +1698,8 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     // ========== Output ==========
     /// Output file, mutex-protected for exclusive access.
     pub output: Mutex<Option<Box<dyn Write + Send>>>,
+    /// Optional secondary output writer for dual-output pipelines (e.g., reject BAM).
+    pub secondary_output: Option<Mutex<Option<crate::bam_io::RawBamWriter>>>,
 
     // ========== Completion and Error Tracking ==========
     /// Flag indicating an error occurred.
@@ -1732,6 +1744,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
             compressed_heap_bytes: AtomicU64::new(0),
             write_reorder: Mutex::new(ReorderBuffer::new()),
             output: Mutex::new(Some(output)),
+            secondary_output: None,
             error_flag: AtomicBool::new(false),
             error: Mutex::new(None),
             items_written: AtomicU64::new(0),
@@ -1739,6 +1752,13 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
             progress: ProgressTracker::new(progress_name).with_interval(PROGRESS_LOG_INTERVAL),
             stats,
         }
+    }
+
+    /// Set a secondary output writer for dual-output pipelines.
+    ///
+    /// Must be called before the pipeline is started.
+    pub fn set_secondary_output(&mut self, writer: crate::bam_io::RawBamWriter) {
+        self.secondary_output = Some(Mutex::new(Some(writer)));
     }
 
     // ========== Error Handling ==========
@@ -1857,6 +1877,9 @@ pub struct WorkerCoreState {
     /// Reusable buffer for serialization.
     /// Swapped out each batch to avoid per-batch allocation.
     pub serialization_buffer: Vec<u8>,
+    /// Reusable buffer for secondary serialization (e.g., reject output).
+    /// Only allocated when a secondary serialize function is used.
+    pub secondary_serialization_buffer: Vec<u8>,
     /// Current backoff duration in microseconds (for adaptive backoff).
     pub backoff_us: u64,
     /// Recycled serialization buffers to avoid repeated allocation.
@@ -1886,6 +1909,7 @@ impl WorkerCoreState {
             compressor: InlineBgzfCompressor::new(compression_level),
             scheduler: create_scheduler(scheduler_strategy, thread_id, num_threads, active_steps),
             serialization_buffer: Vec::with_capacity(SERIALIZATION_BUFFER_CAPACITY),
+            secondary_serialization_buffer: Vec::new(),
             backoff_us: MIN_BACKOFF_US,
             recycled_buffers: Vec::with_capacity(2),
         }
@@ -4535,7 +4559,7 @@ where
     // =========================================================================
     // Priority 4: Compress the data
     // =========================================================================
-    let SerializedBatch { data, record_count } = serialized;
+    let SerializedBatch { data, record_count, secondary_data } = serialized;
 
     // Scope the compressor borrow so we can recycle the buffer afterwards
     let blocks = {
@@ -4561,7 +4585,7 @@ where
     let compressed_bytes: u64 = blocks.iter().map(|b| b.data.len() as u64).sum();
     state.record_compressed_bytes_out(compressed_bytes);
 
-    let batch = CompressedBlockBatch { blocks, record_count };
+    let batch = CompressedBlockBatch { blocks, record_count, secondary_data };
 
     // =========================================================================
     // Priority 5: Try to push result
@@ -4925,7 +4949,7 @@ where
     state.record_serialized_bytes(data.len() as u64);
     state.record_serialized_records(total_records);
 
-    let result_batch = SerializedBatch { data, record_count: total_records };
+    let result_batch = SerializedBatch { data, record_count: total_records, secondary_data: None };
 
     // Priority 6: Push result
     match state.serialize_output_push((serial, result_batch)) {
@@ -5512,9 +5536,11 @@ mod tests {
     fn test_compressed_block_batch_clear() {
         let mut batch = CompressedBlockBatch::new();
         batch.record_count = 42;
+        batch.secondary_data = Some(vec![1, 2, 3]);
         batch.clear();
         assert!(batch.is_empty());
         assert_eq!(batch.record_count, 0);
+        assert!(batch.secondary_data.is_none());
     }
 
     #[test]
@@ -5544,9 +5570,11 @@ mod tests {
         let mut batch = SerializedBatch::new();
         batch.data.extend_from_slice(&[1, 2, 3]);
         batch.record_count = 10;
+        batch.secondary_data = Some(vec![4, 5, 6]);
         batch.clear();
         assert!(batch.is_empty());
         assert_eq!(batch.record_count, 0);
+        assert!(batch.secondary_data.is_none());
     }
 
     // ========================================================================
@@ -5819,5 +5847,60 @@ mod tests {
         let mut batch = DecompressedBatch::new();
         batch.data.reserve(2048);
         assert!(batch.estimate_heap_size() >= 2048);
+    }
+
+    #[test]
+    fn test_memory_estimate_vec_record_buf() {
+        use crate::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::record_buf::RecordBuf;
+
+        let record = RecordBuilder::new().sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let mut records: Vec<RecordBuf> = Vec::with_capacity(10);
+        records.push(record);
+
+        let estimate = records.estimate_heap_size();
+        // Should include Vec overhead for capacity * size_of::<RecordBuf>()
+        let vec_overhead = 10 * std::mem::size_of::<RecordBuf>();
+        assert!(
+            estimate >= vec_overhead,
+            "estimate {estimate} should include Vec<RecordBuf> overhead {vec_overhead}"
+        );
+    }
+
+    #[test]
+    fn test_serialized_batch_memory_estimate_with_secondary() {
+        let batch = SerializedBatch {
+            data: vec![0u8; 100],
+            record_count: 5,
+            secondary_data: Some(vec![0u8; 50]),
+        };
+        let estimate = batch.estimate_heap_size();
+        assert!(
+            estimate >= 150,
+            "Should include both primary ({}) and secondary data, got {estimate}",
+            batch.data.capacity()
+        );
+    }
+
+    #[test]
+    fn test_serialized_batch_memory_estimate_without_secondary() {
+        let batch = SerializedBatch { data: vec![0u8; 100], record_count: 5, secondary_data: None };
+        let estimate = batch.estimate_heap_size();
+        assert!(estimate >= 100);
+        assert!(estimate < 150, "Should not include phantom secondary data, got {estimate}");
+    }
+
+    #[test]
+    fn test_compressed_block_batch_memory_with_secondary() {
+        let batch = CompressedBlockBatch {
+            blocks: vec![],
+            record_count: 0,
+            secondary_data: Some(vec![0u8; 200]),
+        };
+        assert!(
+            batch.estimate_heap_size() >= 200,
+            "Should include secondary data, got {}",
+            batch.estimate_heap_size()
+        );
     }
 }

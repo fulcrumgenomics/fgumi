@@ -1573,6 +1573,8 @@ impl MemoryEstimate for TemplateBatch {
 #[must_use]
 pub fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
     // Name: Option<BString> which is a Vec<u8>
+    // NB: noodles API returns &BStr, so we can only measure len(), not capacity().
+    // Same constraint applies to sequence and quality_scores below.
     let name_size = record.name().map_or(0, |n| n.len());
 
     // Sequence: noodles stores bases as unpacked ASCII (1 byte per base in Vec<u8>)

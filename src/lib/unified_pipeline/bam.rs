@@ -1429,6 +1429,11 @@ pub struct PipelineFunctions<G: Send, P: Send> {
     /// Appends serialized BAM bytes to the buffer and returns the record count.
     /// This enables buffer reuse in single-threaded mode to avoid allocations.
     pub serialize_fn: Box<dyn Fn(P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync>,
+
+    /// Optional secondary serialization (e.g., rejected records).
+    /// Called with a borrow of P BEFORE the primary `serialize_fn` consumes it.
+    pub secondary_serialize_fn:
+        Option<Box<dyn Fn(&P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync>>,
 }
 
 impl<G: Send, P: Send> PipelineFunctions<G, P> {
@@ -1438,7 +1443,21 @@ impl<G: Send, P: Send> PipelineFunctions<G, P> {
         ProcessFn: Fn(G) -> io::Result<P> + Send + Sync + 'static,
         SerializeFn: Fn(P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
     {
-        Self { process_fn: Box::new(process_fn), serialize_fn: Box::new(serialize_fn) }
+        Self {
+            process_fn: Box::new(process_fn),
+            serialize_fn: Box::new(serialize_fn),
+            secondary_serialize_fn: None,
+        }
+    }
+
+    /// Attach a secondary serialize function for dual-output pipelines.
+    #[must_use]
+    pub fn with_secondary_serialize<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
+    {
+        self.secondary_serialize_fn = Some(Box::new(f));
+        self
     }
 }
 
@@ -2690,12 +2709,21 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     // =========================================================================
     // Priority 4: Serialize all items
     // =========================================================================
-    // Prepare worker's serialization buffer
+    // Prepare worker's serialization buffers
     worker.core.serialization_buffer.clear();
+    worker.core.secondary_serialization_buffer.clear();
 
     // Serialize all items into worker's buffer
     let mut total_record_count: u64 = 0;
     for item in batch {
+        // Secondary serialize (borrows item) — must run before primary consumes it
+        if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+            if let Err(e) = (secondary_fn)(&item, &mut worker.core.secondary_serialization_buffer) {
+                state.set_error(e);
+                return false;
+            }
+        }
+        // Primary serialize (consumes item)
         match (fns.serialize_fn)(item, &mut worker.core.serialization_buffer) {
             Ok(record_count) => {
                 total_record_count += record_count;
@@ -2713,6 +2741,16 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
         Vec::with_capacity(SERIALIZATION_BUFFER_CAPACITY),
     );
 
+    // Build secondary data if any was serialized
+    let secondary_data = if worker.core.secondary_serialization_buffer.is_empty() {
+        None
+    } else {
+        Some(std::mem::replace(
+            &mut worker.core.secondary_serialization_buffer,
+            Vec::with_capacity(SERIALIZATION_BUFFER_CAPACITY),
+        ))
+    };
+
     // Record serialized bytes for throughput metrics
     if let Some(stats) = state.stats() {
         stats.serialized_bytes.fetch_add(combined_data.len() as u64, Ordering::Relaxed);
@@ -2721,7 +2759,8 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     // =========================================================================
     // Priority 5: Try to push result (non-blocking)
     // =========================================================================
-    let batch = SerializedBatch { data: combined_data, record_count: total_record_count };
+    let batch =
+        SerializedBatch { data: combined_data, record_count: total_record_count, secondary_data };
     let heap_size = batch.estimate_heap_size();
     match state.output.serialized.push((serial, batch)) {
         Ok(()) => {
@@ -2792,6 +2831,21 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
                     return (false, false); // Error, not contention
                 }
                 batch_bytes += block.data.len() as u64;
+            }
+
+            // Write secondary data (e.g., rejects) in the same serial order
+            if let Some(ref secondary_data) = batch.secondary_data {
+                if !secondary_data.is_empty() {
+                    if let Some(ref secondary_mutex) = state.output.secondary_output {
+                        let mut sw_guard = secondary_mutex.lock();
+                        if let Some(ref mut sw) = *sw_guard {
+                            if let Err(e) = sw.write_raw_bytes(secondary_data) {
+                                state.set_error(e);
+                                return (false, false);
+                            }
+                        }
+                    }
+                }
             }
 
             // Record bytes written for throughput metrics
@@ -2974,6 +3028,9 @@ struct SingleThreadedBuffers {
     /// Buffer for serialized BAM record data.
     /// Cleared and reused each group to avoid allocation.
     serialized: Vec<u8>,
+    /// Buffer for secondary serialized data (e.g., rejected records).
+    /// Only used when a secondary serialize function is set.
+    secondary: Vec<u8>,
 }
 
 impl SingleThreadedBuffers {
@@ -2984,6 +3041,7 @@ impl SingleThreadedBuffers {
             decompressed: Vec::with_capacity(256 * 1024),
             // Typical group serializes to ~64KB
             serialized: Vec::with_capacity(64 * 1024),
+            secondary: Vec::new(),
         }
     }
 }
@@ -3001,6 +3059,7 @@ fn run_bam_pipeline_single_threaded<G, P>(
     mut grouper: Box<dyn Grouper<Group = G> + Send>,
     fns: PipelineFunctions<G, P>,
     group_key_config: GroupKeyConfig,
+    mut secondary_writer: Option<crate::bam_io::RawBamWriter>,
 ) -> io::Result<u64>
 where
     G: Send + 'static,
@@ -3060,7 +3119,13 @@ where
                 // Step 6: Process
                 let processed = (fns.process_fn)(group)?;
 
-                // Step 7: Serialize (reuse buffer)
+                // Step 7a: Secondary serialize (borrows processed)
+                buffers.secondary.clear();
+                if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+                    (secondary_fn)(&processed, &mut buffers.secondary)?;
+                }
+
+                // Step 7b: Primary serialize (consumes processed, reuse buffer)
                 buffers.serialized.clear();
                 let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
 
@@ -3070,6 +3135,13 @@ where
 
                 // Step 9: Write any completed blocks to output
                 compressor.write_blocks_to(output.as_mut())?;
+
+                // Write secondary data
+                if !buffers.secondary.is_empty() {
+                    if let Some(ref mut sw) = secondary_writer {
+                        sw.write_raw_bytes(&buffers.secondary)?;
+                    }
+                }
 
                 progress.log_if_needed(record_count);
             }
@@ -3084,11 +3156,24 @@ where
 
             for group in groups {
                 let processed = (fns.process_fn)(group)?;
+
+                buffers.secondary.clear();
+                if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+                    (secondary_fn)(&processed, &mut buffers.secondary)?;
+                }
+
                 buffers.serialized.clear();
                 let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
                 compressor.write_all(&buffers.serialized)?;
                 compressor.maybe_compress()?;
                 compressor.write_blocks_to(output.as_mut())?;
+
+                if !buffers.secondary.is_empty() {
+                    if let Some(ref mut sw) = secondary_writer {
+                        sw.write_raw_bytes(&buffers.secondary)?;
+                    }
+                }
+
                 progress.log_if_needed(record_count);
             }
         }
@@ -3099,7 +3184,13 @@ where
         // Step 6: Process
         let processed = (fns.process_fn)(final_group)?;
 
-        // Step 7: Serialize (reuse buffer)
+        // Step 7a: Secondary serialize (borrows processed)
+        buffers.secondary.clear();
+        if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
+            (secondary_fn)(&processed, &mut buffers.secondary)?;
+        }
+
+        // Step 7b: Primary serialize (consumes processed, reuse buffer)
         buffers.serialized.clear();
         let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
 
@@ -3110,6 +3201,13 @@ where
         // Step 9: Write any completed blocks to output
         compressor.write_blocks_to(output.as_mut())?;
 
+        // Write secondary data
+        if !buffers.secondary.is_empty() {
+            if let Some(ref mut sw) = secondary_writer {
+                sw.write_raw_bytes(&buffers.secondary)?;
+            }
+        }
+
         progress.log_if_needed(record_count);
     }
 
@@ -3119,6 +3217,13 @@ where
 
     // Flush output
     output.flush()?;
+
+    // Finalize secondary output writer
+    if let Some(writer) = secondary_writer {
+        writer.finish().map_err(|e| {
+            io::Error::new(e.kind(), format!("Failed to finalize secondary output: {e}"))
+        })?;
+    }
 
     Ok(progress.count())
 }
@@ -3157,6 +3262,7 @@ pub fn run_bam_pipeline<G, P>(
     grouper: Box<dyn Grouper<Group = G> + Send>,
     fns: PipelineFunctions<G, P>,
     group_key_config: GroupKeyConfig,
+    secondary_writer: Option<crate::bam_io::RawBamWriter>,
 ) -> io::Result<u64>
 where
     G: Send + BatchWeight + MemoryEstimate + 'static,
@@ -3177,10 +3283,15 @@ where
             grouper,
             fns,
             group_key_config,
+            secondary_writer,
         );
     }
 
-    let state = Arc::new(BamPipelineState::<G, P>::new(config, input, output, group_key_config));
+    let mut state = BamPipelineState::<G, P>::new(config, input, output, group_key_config);
+    if let Some(sw) = secondary_writer {
+        state.output.set_secondary_output(sw);
+    }
+    let state = Arc::new(state);
 
     // Set num_threads for stats display
     if let Some(stats) = state.stats() {
@@ -3353,7 +3464,25 @@ where
     join_monitor_thread(monitor_handle);
 
     // Finalize: check errors, flush output, log stats
-    finalize_pipeline(&*state)
+    let result = finalize_pipeline(&*state);
+
+    // Finalize secondary output writer (if present)
+    if let Some(ref secondary_mutex) = state.output.secondary_output {
+        let mut guard = secondary_mutex.lock();
+        if let Some(writer) = guard.take() {
+            if let Err(e) = writer.finish().map_err(|e| {
+                io::Error::new(e.kind(), format!("Failed to finalize secondary output: {e}"))
+            }) {
+                if result.is_err() {
+                    log::error!("Secondary output finalization also failed: {e}");
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    result
 }
 
 // ============================================================================
@@ -3438,7 +3567,7 @@ pub fn serialize_bam_records(
 ) -> io::Result<SerializedBatch> {
     let mut data = Vec::with_capacity(records.len() * 256);
     let record_count = serialize_bam_records_into(records, header, &mut data)?;
-    Ok(SerializedBatch { data, record_count })
+    Ok(SerializedBatch { data, record_count, secondary_data: None })
 }
 
 /// Serialize a single BAM record to bytes.
@@ -3452,7 +3581,7 @@ pub fn serialize_bam_records(
 pub fn serialize_bam_record(record: &RecordBuf, header: &Header) -> io::Result<SerializedBatch> {
     let mut data = Vec::with_capacity(256);
     let record_count = serialize_bam_record_into(record, header, &mut data)?;
-    Ok(SerializedBatch { data, record_count })
+    Ok(SerializedBatch { data, record_count, secondary_data: None })
 }
 
 /// Serialize a single BAM record to bytes, appending to the provided buffer.
@@ -3701,6 +3830,7 @@ where
         grouper,
         fns,
         group_key_config,
+        None,
     );
 
     // After pipeline completes, write BGZF EOF block to finalize the BAM file
@@ -3829,6 +3959,7 @@ where
         grouper,
         fns,
         group_key_config,
+        None,
     );
 
     // After pipeline completes, write BGZF EOF block to finalize the BAM file
@@ -3953,6 +4084,7 @@ where
         grouper,
         fns,
         group_key_config,
+        None,
     );
 
     // After pipeline completes, write BGZF EOF block to finalize the BAM file
@@ -3960,6 +4092,119 @@ where
         use std::io::Write as _;
 
         // Append EOF block to output file
+        let mut output_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(output_path)
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to open output for EOF: {e}")))?;
+
+        output_file
+            .write_all(&BGZF_EOF)
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to write BGZF EOF: {e}")))?;
+    }
+
+    result
+}
+
+/// Run a BAM pipeline from an already-opened reader, with a secondary output file.
+///
+/// This variant routes rejected/secondary records through the pipeline's ordering
+/// infrastructure so both primary and secondary output files maintain input order.
+///
+/// The secondary serialize function is called with a borrow of the processed batch
+/// BEFORE the primary serialize function consumes it.
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step or file I/O fails.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+pub fn run_bam_pipeline_from_reader_with_secondary<
+    G,
+    P,
+    R,
+    GrouperFn,
+    ProcessFn,
+    SerializeFn,
+    SecondaryFn,
+>(
+    config: BamPipelineConfig,
+    input: R,
+    input_header: Header,
+    output_path: &Path,
+    output_header: Option<Header>,
+    secondary_output_path: &Path,
+    grouper_fn: GrouperFn,
+    process_fn: ProcessFn,
+    serialize_fn: SerializeFn,
+    secondary_serialize_fn: SecondaryFn,
+) -> io::Result<u64>
+where
+    G: Send + BatchWeight + MemoryEstimate + 'static,
+    P: Send + MemoryEstimate + 'static,
+    R: Read + Send + 'static,
+    GrouperFn: FnOnce(&Header) -> Box<dyn Grouper<Group = G> + Send>,
+    ProcessFn: Fn(G) -> io::Result<P> + Send + Sync + 'static,
+    SerializeFn: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
+    SecondaryFn: Fn(&P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
+{
+    // Use output_header if provided, otherwise clone input_header
+    let output_header = output_header.unwrap_or_else(|| input_header.clone());
+
+    // Create primary output BAM and write the output header
+    let output_file = File::create(output_path)
+        .map_err(|e| io::Error::new(e.kind(), format!("Failed to create output: {e}")))?;
+
+    let mut header_writer = bam::io::Writer::new(output_file);
+    header_writer
+        .write_header(&output_header)
+        .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
+
+    let mut bgzf_writer = header_writer.into_inner();
+    bgzf_writer
+        .try_finish()
+        .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
+    let output = bgzf_writer.into_inner();
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+
+    // Create secondary output (reject BAM) with its own BGZF compression
+    let secondary_writer = crate::bam_io::create_raw_bam_writer(
+        secondary_output_path,
+        &output_header,
+        1, // single-threaded BGZF for secondary
+        config.compression_level,
+    )
+    .map_err(|e| io::Error::other(format!("Failed to create secondary output: {e}")))?;
+
+    // Build GroupKeyConfig
+    let group_key_config = config.group_key_config.unwrap_or_else(|| {
+        use noodles::sam::alignment::record::data::field::Tag;
+        let library_index = LibraryIndex::from_header(&input_header);
+        let cell_tag = Tag::from([b'C', b'B']);
+        GroupKeyConfig::new(library_index, cell_tag)
+    });
+
+    let grouper = grouper_fn(&input_header);
+
+    let fns = PipelineFunctions::new(process_fn, move |p: P, buf: &mut Vec<u8>| {
+        serialize_fn(p, &output_header, buf)
+    })
+    .with_secondary_serialize(secondary_serialize_fn);
+
+    let pipeline_config = config.pipeline;
+
+    let result = run_bam_pipeline(
+        pipeline_config,
+        Box::new(input),
+        Box::new(output),
+        grouper,
+        fns,
+        group_key_config,
+        Some(secondary_writer),
+    );
+
+    // After pipeline completes, write BGZF EOF block to finalize the primary BAM file
+    if result.is_ok() {
+        use std::io::Write as _;
+
         let mut output_file = std::fs::OpenOptions::new()
             .append(true)
             .open(output_path)
@@ -4257,7 +4502,8 @@ mod tests {
         // Add item to write_reorder buffer
         {
             let mut write_reorder = state.output.write_reorder.lock();
-            let batch = CompressedBlockBatch { blocks: vec![], record_count: 0 };
+            let batch =
+                CompressedBlockBatch { blocks: vec![], record_count: 0, secondary_data: None };
             write_reorder.insert(0, batch);
         }
 
@@ -4265,5 +4511,27 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.non_empty_queues.iter().any(|s| s.contains("write_reorder")));
+    }
+
+    #[test]
+    fn test_pipeline_functions_secondary_serialize() {
+        let fns = PipelineFunctions::<Vec<u8>, Vec<u8>>::new(Ok, |data, buf| {
+            buf.extend_from_slice(&data);
+            Ok(1)
+        });
+        assert!(fns.secondary_serialize_fn.is_none());
+
+        let fns = fns.with_secondary_serialize(|data: &Vec<u8>, buf: &mut Vec<u8>| {
+            buf.extend_from_slice(data);
+            Ok(1)
+        });
+        assert!(fns.secondary_serialize_fn.is_some());
+
+        // Verify the secondary serialize function works
+        let test_data = vec![1u8, 2, 3, 4];
+        let mut buf = Vec::new();
+        let count = (fns.secondary_serialize_fn.as_ref().unwrap())(&test_data, &mut buf).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(buf, vec![1, 2, 3, 4]);
     }
 }

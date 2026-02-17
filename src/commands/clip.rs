@@ -175,7 +175,8 @@ struct ClipProcessedBatch {
 
 impl MemoryEstimate for ClipProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        self.clipped_records.iter().map(MemoryEstimate::estimate_heap_size).sum()
+        self.clipped_records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
+            + self.clipped_records.capacity() * std::mem::size_of::<RecordBuf>()
     }
 }
 
@@ -2461,5 +2462,30 @@ mod tests {
         assert_eq!(output_records.len(), 2, "Should have 2 records");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_clip_processed_batch_memory_estimate() {
+        use fgumi_lib::sam::builder::RecordBuilder;
+        use noodles::sam::alignment::record_buf::RecordBuf;
+
+        let record = RecordBuilder::new().sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let mut records = Vec::with_capacity(10);
+        records.push(record);
+
+        let batch = ClipProcessedBatch {
+            clipped_records: records,
+            templates_count: 1,
+            overlap_clipped_count: 0,
+            extend_clipped_count: 0,
+        };
+
+        let estimate = batch.estimate_heap_size();
+        // Should include Vec overhead for capacity * size_of::<RecordBuf>()
+        let vec_overhead = 10 * std::mem::size_of::<RecordBuf>();
+        assert!(
+            estimate >= vec_overhead,
+            "estimate {estimate} should include Vec<RecordBuf> overhead {vec_overhead}"
+        );
     }
 }

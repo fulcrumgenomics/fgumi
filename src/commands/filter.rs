@@ -13,26 +13,23 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fgumi_lib::alignment_tags::regenerate_alignment_tags_raw;
-use fgumi_lib::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer,
-};
+use fgumi_lib::bam_io::create_bam_reader_for_pipeline;
 use fgumi_lib::consensus_filter::{
     FilterConfig, FilterResult, compute_read_stats_raw, filter_duplex_read_raw, filter_read_raw,
     is_duplex_consensus_raw, mask_bases_raw, mask_duplex_bases_raw, template_passes_raw,
 };
 use fgumi_lib::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::reference::ReferenceReader;
 use fgumi_lib::sort::bam_fields;
 use fgumi_lib::tag_reversal::reverse_per_base_tags_raw;
-use fgumi_lib::template::{TemplateBatch, TemplateIterator};
+use fgumi_lib::template::TemplateBatch;
 use fgumi_lib::unified_pipeline::{
-    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    BamPipelineConfig, BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
+    run_bam_pipeline_from_reader, run_bam_pipeline_from_reader_with_secondary,
 };
 use fgumi_lib::validation::validate_file_exists;
-use fgumi_lib::vendored::raw_bam_record::RawRecord;
 use log::info;
 use noodles::sam::Header;
 use std::io;
@@ -152,10 +149,6 @@ pub struct Filter {
     #[arg(short = 'R', long = "reverse-per-base-tags", default_value = "false")]
     pub reverse_per_base_tags: bool,
 
-    /// Sort order for output BAM
-    #[arg(short = 'S', long = "sort-order")]
-    pub sort_order: Option<String>,
-
     /// Threading options for parallel processing
     #[command(flatten)]
     pub threading: ThreadingOptions,
@@ -210,10 +203,11 @@ struct FilterProcessedBatchRaw {
 impl MemoryEstimate for FilterProcessedBatchRaw {
     fn estimate_heap_size(&self) -> usize {
         let vec_overhead = std::mem::size_of::<Vec<u8>>();
-        let kept: usize = self.kept_records.iter().map(|v| v.capacity() + vec_overhead).sum();
-        let rejected: usize =
-            self.rejected_records.iter().map(|v| v.capacity() + vec_overhead).sum();
-        kept + rejected
+        let kept_outer = self.kept_records.capacity() * vec_overhead;
+        let kept_inner: usize = self.kept_records.iter().map(|v| v.capacity()).sum();
+        let rejected_outer = self.rejected_records.capacity() * vec_overhead;
+        let rejected_inner: usize = self.rejected_records.iter().map(|v| v.capacity()).sum();
+        kept_outer + kept_inner + rejected_outer + rejected_inner
     }
 }
 
@@ -243,8 +237,28 @@ struct CollectedFilterMetrics {
     failed_records: u64,
     /// Total bases masked.
     total_bases_masked: u64,
-    /// Rejected records (if tracking).
-    rejects: Vec<Vec<u8>>,
+}
+
+/// Shared state for a filter pipeline run, built by `setup_pipeline`.
+struct FilterPipelineSetup {
+    pipeline_config: BamPipelineConfig,
+    config: Arc<FilterConfig>,
+    reference: Option<Arc<ReferenceReader>>,
+    collected_metrics: Arc<SegQueue<CollectedFilterMetrics>>,
+    progress_counter: Arc<AtomicU64>,
+}
+
+/// Captures needed by the process closure, extracted from `Filter` and `FilterPipelineSetup`.
+struct FilterProcessCaptures {
+    config: Arc<FilterConfig>,
+    reference: Option<Arc<ReferenceReader>>,
+    min_base_quality: Option<u8>,
+    should_reverse_tags: bool,
+    min_mean_base_quality: Option<f64>,
+    max_no_call_fraction: f64,
+    require_single_strand_agreement: bool,
+    progress: Arc<AtomicU64>,
+    header: Header,
 }
 
 impl Command for Filter {
@@ -274,30 +288,20 @@ impl Command for Filter {
         }
         info!("Max no-call fraction: {}", self.max_no_call_fraction);
 
-        // ========================================================================
-        // CRITICAL: Check --threads mode BEFORE creating any file handles
-        // ========================================================================
-        // Route to 7-step unified pipeline when --threads is specified.
-        // Use single-threaded fast path when --threads is not provided.
-        // This must be checked first to avoid creating file handles that the pipeline
-        // will need to manage itself.
-        let total_reads = if let Some(threads) = self.threading.threads {
-            // Open input using streaming-capable reader for pipeline use
-            let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        // Open input using streaming-capable reader for pipeline use
+        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
-            // Add @PG record with PP chaining to input's last program
-            let header = crate::commands::common::add_pg_record(header, command_line)?;
+        // Add @PG record with PP chaining to input's last program
+        let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-            let track_rejects = self.rejects.is_some();
+        let track_rejects = self.rejects.is_some();
+        let threads = self.threading.threads.unwrap_or(1);
 
-            // Route to appropriate 7-step pipeline mode
-            if self.filter_by_template {
-                self.execute_threads_mode_template(threads, reader, header, track_rejects)?
-            } else {
-                self.execute_threads_mode_single_read(threads, reader, header, track_rejects)?
-            }
+        // Route to appropriate 7-step pipeline mode
+        let total_reads = if self.filter_by_template {
+            self.execute_threads_mode_template(threads, reader, header, track_rejects)?
         } else {
-            self.execute_single_threaded(command_line)?
+            self.execute_threads_mode_single_read(threads, reader, header, track_rejects)?
         };
 
         timer.log_completion(total_reads);
@@ -306,227 +310,13 @@ impl Command for Filter {
 }
 
 impl Filter {
-    /// Execute in single-threaded mode.
-    ///
-    /// Returns the total number of reads processed.
-    fn execute_single_threaded(&self, command_line: &str) -> Result<u64> {
-        // ========================================================================
-        // Single-threaded mode: use simple sequential implementation
-        // ========================================================================
-
-        // Create filter configuration
-        let config = FilterConfig::new(
-            &self.min_reads,
-            &self.max_read_error_rate,
-            &self.max_base_error_rate,
-            self.min_base_quality,
-            self.min_mean_base_quality,
-            self.max_no_call_fraction,
-        );
-
-        // Read header from input BAM (we need it before branching to set up writers)
-        let reader_threads = self.threading.num_threads();
-        let (_, header) = create_bam_reader(&self.io.input, reader_threads)?;
-
-        // Add @PG record with PP chaining to input's last program
-        let header = crate::commands::common::add_pg_record(header, command_line)?;
-
-        // Create output BAM with multi-threaded BGZF writer (raw byte writer)
-        let writer_threads = self.threading.num_threads();
-        let mut writer = create_raw_bam_writer(
-            &self.io.output,
-            &header,
-            writer_threads,
-            self.compression.compression_level,
-        )?;
-
-        // Create optional rejects writer
-        let mut rejects_writer = match self.rejects.as_ref() {
-            Some(path) => Some(create_raw_bam_writer(
-                path,
-                &header,
-                writer_threads,
-                self.compression.compression_level,
-            )?),
-            None => None,
-        };
-
-        // Create reference reader for tag regeneration (always enabled, matching fgbio behavior)
-        info!("Loading reference genome into memory...");
-        let ref_load_start = Instant::now();
-        let reference_reader = Some(ReferenceReader::new(&self.reference)?);
-        let ref_load_elapsed = ref_load_start.elapsed();
-        info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
-
-        // Process reads
-        let mut total_reads: u64 = 0;
-        let mut passed_reads: u64 = 0;
-        let mut failed_reads: u64 = 0;
-        let mut total_bases_masked: u64 = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        info!("Processing consensus reads...");
-
-        if self.filter_by_template {
-            // Template-aware filtering using streaming TemplateIterator
-            // TODO: Use raw-byte template grouper to avoid RecordBuf decode/re-encode overhead
-            info!("Using template-aware filtering (streaming)");
-
-            let (mut reader, _) = create_bam_reader(&self.io.input, reader_threads)?;
-            let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-            let template_iter = TemplateIterator::new(record_iter);
-            let mut total_templates = 0u64;
-
-            for template_result in template_iter {
-                let template = template_result?;
-                // Convert template records to raw bytes
-                let mut template_records: Vec<Vec<u8>> = template
-                    .records
-                    .iter()
-                    .map(|r| {
-                        let mut buf = Vec::new();
-                        fgumi_lib::vendored::bam_codec::encode_record_buf(&mut buf, &header, r)?;
-                        Ok(buf)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                total_reads += template_records.len() as u64;
-                total_templates += 1;
-
-                let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
-
-                for (idx, record) in template_records.iter_mut().enumerate() {
-                    let (masked, pass) = Self::process_record_raw(
-                        record,
-                        &config,
-                        reference_reader.as_ref(),
-                        &header,
-                        self.reverse_per_base_tags,
-                        self.min_base_quality,
-                        self.require_single_strand_agreement,
-                        self.min_mean_base_quality,
-                        self.max_no_call_fraction,
-                    )?;
-                    total_bases_masked += masked;
-                    pass_map.insert(idx, pass);
-                }
-
-                let template_pass = template_passes_raw(&template_records, &pass_map);
-
-                for (idx, record) in template_records.iter().enumerate() {
-                    let flags = bam_fields::flags(record);
-                    let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
-                        && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
-
-                    if is_primary {
-                        if template_pass {
-                            writer.write_raw_record(record)?;
-                            passed_reads += 1;
-                        } else {
-                            if let Some(ref mut rw) = rejects_writer {
-                                rw.write_raw_record(record)?;
-                            }
-                            failed_reads += 1;
-                        }
-                    } else {
-                        let record_pass = pass_map.get(&idx).copied().unwrap_or(false);
-                        if template_pass && record_pass {
-                            writer.write_raw_record(record)?;
-                            passed_reads += 1;
-                        } else {
-                            if let Some(ref mut rw) = rejects_writer {
-                                rw.write_raw_record(record)?;
-                            }
-                            failed_reads += 1;
-                        }
-                    }
-                }
-
-                if total_templates.is_multiple_of(100_000) {
-                    info!("Processed {total_templates} templates");
-                }
-            }
-        } else {
-            // Single-read filtering: process reads independently using raw bytes
-            info!("Using single-read filtering");
-
-            let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, reader_threads)?;
-            let mut raw_record = RawRecord::new();
-
-            while raw_reader.read_record(&mut raw_record)? > 0 {
-                let mut record = raw_record.as_ref().to_vec();
-                total_reads += 1;
-
-                let (masked, pass) = Self::process_record_raw(
-                    &mut record,
-                    &config,
-                    reference_reader.as_ref(),
-                    &header,
-                    self.reverse_per_base_tags,
-                    self.min_base_quality,
-                    self.require_single_strand_agreement,
-                    self.min_mean_base_quality,
-                    self.max_no_call_fraction,
-                )?;
-                total_bases_masked += masked;
-
-                if pass {
-                    writer.write_raw_record(&record)?;
-                    passed_reads += 1;
-                } else {
-                    if let Some(ref mut rw) = rejects_writer {
-                        rw.write_raw_record(&record)?;
-                    }
-                    failed_reads += 1;
-                }
-
-                progress.log_if_needed(1);
-            }
-        }
-
-        progress.log_final();
-        info!("Filtering complete");
-        info!("Total reads: {total_reads}");
-        info!("Passed reads: {passed_reads}");
-        info!("Failed reads: {failed_reads}");
-        info!("Total bases masked: {total_bases_masked}");
-
-        // Write statistics file if requested
-        if let Some(stats_path) = &self.stats {
-            self.write_statistics(
-                stats_path,
-                total_reads as usize,
-                passed_reads as usize,
-                failed_reads as usize,
-                total_bases_masked as usize,
-            )?;
-        }
-
-        // Flush and finish the writers
-        writer.finish()?;
-        if let Some(rw) = rejects_writer {
-            rw.finish()?;
-        }
-
-        Ok(total_reads)
-    }
-
     // ========================================================================
     // 7-Step Unified Pipeline Implementation
     // ========================================================================
 
-    /// Execute using the 7-step unified pipeline (single-read mode, raw bytes).
-    ///
-    /// Each record is filtered independently without template awareness.
-    /// This mode is used when `--filter-by-template` is false.
-    #[allow(clippy::too_many_lines)]
-    fn execute_threads_mode_single_read(
-        &self,
-        num_threads: usize,
-        reader: Box<dyn std::io::Read + Send>,
-        header: Header,
-        track_rejects: bool,
-    ) -> Result<u64> {
-        // Configure pipeline - filter is Balanced workload
+    /// Build the shared pipeline configuration, filter config, reference, metrics
+    /// queue, and progress counter used by both pipeline modes.
+    fn setup_pipeline(&self, num_threads: usize, header: &Header) -> Result<FilterPipelineSetup> {
         let mut pipeline_config = build_pipeline_config(
             &self.scheduler_opts,
             &self.compression,
@@ -534,11 +324,9 @@ impl Filter {
             num_threads,
         )?;
 
-        // Enable raw-byte mode: skip noodles decode
-        let library_index = LibraryIndex::from_header(&header);
+        let library_index = LibraryIndex::from_header(header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
 
-        // Create filter configuration
         let config = Arc::new(FilterConfig::new(
             &self.min_reads,
             &self.max_read_error_rate,
@@ -548,38 +336,153 @@ impl Filter {
             self.max_no_call_fraction,
         ));
 
-        // Load reference for tag regeneration (always enabled, matching fgbio behavior)
         info!("Loading reference genome into memory...");
         let ref_load_start = Instant::now();
         let reference: Option<Arc<ReferenceReader>> =
             Some(Arc::new(ReferenceReader::new(&self.reference)?));
-        let ref_load_elapsed = ref_load_start.elapsed();
-        info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
+        info!("Reference loaded in {:.1}s", ref_load_start.elapsed().as_secs_f64());
 
-        // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedFilterMetrics>> = Arc::new(SegQueue::new());
-        let collected_for_serialize = Arc::clone(&collected_metrics);
-
-        // Configuration for closures
-        let config_for_process = Arc::clone(&config);
-        let min_base_quality = self.min_base_quality;
-        let should_reverse_tags = self.reverse_per_base_tags;
-        let min_mean_base_quality = self.min_mean_base_quality;
-        let max_no_call_fraction = self.max_no_call_fraction;
-        let require_single_strand_agreement = self.require_single_strand_agreement;
-        let reference_for_process = reference;
-
-        // Progress tracking
         let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_for_process = Arc::clone(&progress_counter);
 
-        // Grouper: process individual raw-byte records
+        Ok(FilterPipelineSetup {
+            pipeline_config,
+            config,
+            reference,
+            collected_metrics,
+            progress_counter,
+        })
+    }
+
+    /// Build the process closure captures from self and setup.
+    fn process_captures(
+        &self,
+        setup: &FilterPipelineSetup,
+        header: &Header,
+    ) -> FilterProcessCaptures {
+        FilterProcessCaptures {
+            config: Arc::clone(&setup.config),
+            reference: setup.reference.clone(),
+            min_base_quality: self.min_base_quality,
+            should_reverse_tags: self.reverse_per_base_tags,
+            min_mean_base_quality: self.min_mean_base_quality,
+            max_no_call_fraction: self.max_no_call_fraction,
+            require_single_strand_agreement: self.require_single_strand_agreement,
+            progress: Arc::clone(&setup.progress_counter),
+            header: header.clone(),
+        }
+    }
+
+    /// Run the filter pipeline with the given grouper and process function.
+    ///
+    /// This is the common pipeline executor shared by single-read and template modes.
+    /// It builds the serialize function, runs the pipeline (with optional secondary
+    /// output for rejects), and aggregates metrics.
+    fn run_filter_pipeline<G, GrouperFn, ProcessFn>(
+        &self,
+        setup: FilterPipelineSetup,
+        reader: Box<dyn std::io::Read + Send>,
+        header: Header,
+        grouper_fn: GrouperFn,
+        process_fn: ProcessFn,
+    ) -> Result<u64>
+    where
+        G: Send + BatchWeight + MemoryEstimate + 'static,
+        GrouperFn: FnOnce(&Header) -> Box<dyn Grouper<Group = G> + Send>,
+        ProcessFn: Fn(G) -> io::Result<FilterProcessedBatchRaw> + Send + Sync + 'static,
+    {
+        let collected_for_serialize = Arc::clone(&setup.collected_metrics);
+
+        // Primary serialize: write kept records
+        let serialize_fn = move |processed: FilterProcessedBatchRaw,
+                                 _header: &Header,
+                                 output: &mut Vec<u8>|
+              -> io::Result<u64> {
+            collected_for_serialize.push(CollectedFilterMetrics {
+                total_records: processed.records_count,
+                passed_records: processed.passed_count,
+                failed_records: processed.records_count - processed.passed_count,
+                total_bases_masked: processed.bases_masked,
+            });
+
+            serialize_raw_records(&processed.kept_records, output)
+        };
+
+        if let Some(rejects_path) = &self.rejects {
+            // Secondary serialize: write rejected records
+            let secondary_serialize_fn =
+                |batch: &FilterProcessedBatchRaw, buf: &mut Vec<u8>| -> io::Result<u64> {
+                    serialize_raw_records(&batch.rejected_records, buf)
+                };
+
+            run_bam_pipeline_from_reader_with_secondary(
+                setup.pipeline_config,
+                reader,
+                header,
+                &self.io.output,
+                None,
+                rejects_path,
+                grouper_fn,
+                process_fn,
+                serialize_fn,
+                secondary_serialize_fn,
+            )?;
+        } else {
+            run_bam_pipeline_from_reader(
+                setup.pipeline_config,
+                reader,
+                header,
+                &self.io.output,
+                None,
+                grouper_fn,
+                process_fn,
+                serialize_fn,
+            )?;
+        }
+
+        // Aggregate metrics
+        let mut total_reads = 0u64;
+        let mut passed_reads = 0u64;
+        let mut failed_reads = 0u64;
+        let mut total_bases_masked = 0u64;
+
+        while let Some(metrics) = setup.collected_metrics.pop() {
+            total_reads += metrics.total_records;
+            passed_reads += metrics.passed_records;
+            failed_reads += metrics.failed_records;
+            total_bases_masked += metrics.total_bases_masked;
+        }
+
+        if let Some(stats_path) = &self.stats {
+            self.write_filter_stats(stats_path, total_reads, passed_reads, failed_reads)?;
+        }
+
+        info!("Processed {total_reads} reads; kept {passed_reads} and rejected {failed_reads}");
+        if self.rejects.is_some() && failed_reads > 0 {
+            info!("Wrote {failed_reads} rejected records to rejects file");
+        }
+        info!("Total bases masked: {total_bases_masked}");
+
+        Ok(total_reads)
+    }
+
+    /// Execute using the 7-step unified pipeline (single-read mode, raw bytes).
+    ///
+    /// Each record is filtered independently without template awareness.
+    fn execute_threads_mode_single_read(
+        &self,
+        num_threads: usize,
+        reader: Box<dyn std::io::Read + Send>,
+        header: Header,
+        track_rejects: bool,
+    ) -> Result<u64> {
+        let setup = self.setup_pipeline(num_threads, &header)?;
+        let ctx = self.process_captures(&setup, &header);
+
         let grouper_fn = move |_header: &Header| {
             Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = Vec<u8>> + Send>
         };
 
-        // Process function: filter each raw record
-        let header_for_process = header.clone();
         let process_fn = move |mut record: Vec<u8>| -> io::Result<FilterProcessedBatchRaw> {
             let mut kept_records = Vec::new();
             let mut rejected_records = Vec::new();
@@ -587,14 +490,14 @@ impl Filter {
 
             let (bases_masked, pass) = Self::process_record_raw(
                 &mut record,
-                &config_for_process,
-                reference_for_process.as_deref(),
-                &header_for_process,
-                should_reverse_tags,
-                min_base_quality,
-                require_single_strand_agreement,
-                min_mean_base_quality,
-                max_no_call_fraction,
+                &ctx.config,
+                ctx.reference.as_deref(),
+                &ctx.header,
+                ctx.should_reverse_tags,
+                ctx.min_base_quality,
+                ctx.require_single_strand_agreement,
+                ctx.min_mean_base_quality,
+                ctx.max_no_call_fraction,
             )
             .map_err(io::Error::other)?;
 
@@ -605,8 +508,7 @@ impl Filter {
                 rejected_records.push(record);
             }
 
-            // Progress logging
-            let count = progress_for_process.fetch_add(1, Ordering::Relaxed);
+            let count = ctx.progress.fetch_add(1, Ordering::Relaxed);
             if (count + 1).is_multiple_of(1_000_000) {
                 info!("Processed {} records", count + 1);
             }
@@ -620,48 +522,12 @@ impl Filter {
             })
         };
 
-        // Serialize function: raw bytes directly (bypasses bam_codec)
-        let serialize_fn = move |processed: FilterProcessedBatchRaw,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Push metrics to lock-free queue
-            collected_for_serialize.push(CollectedFilterMetrics {
-                total_records: processed.records_count,
-                passed_records: processed.passed_count,
-                failed_records: processed.records_count - processed.passed_count,
-                total_bases_masked: processed.bases_masked,
-                rejects: processed.rejected_records,
-            });
-
-            // Serialize kept records directly as raw BAM bytes
-            serialize_raw_records(&processed.kept_records, output)
-        };
-
-        // Clone header before pipeline (needed for post-pipeline aggregation)
-        let header_for_metrics = header.clone();
-
-        // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let _records_written = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None, // Use input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        )?;
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        self.aggregate_and_finalize_metrics(collected_metrics, track_rejects, &header_for_metrics)
+        self.run_filter_pipeline(setup, reader, header, grouper_fn, process_fn)
     }
 
     /// Execute using the 7-step unified pipeline (template-aware mode).
     ///
     /// All primary reads in a template must pass for the template to pass.
-    /// This mode is used when `--filter-by-template` is true (the default).
-    #[allow(clippy::too_many_lines)]
     fn execute_threads_mode_template(
         &self,
         num_threads: usize,
@@ -669,66 +535,19 @@ impl Filter {
         header: Header,
         track_rejects: bool,
     ) -> Result<u64> {
-        // Configure pipeline - filter is Balanced workload
-        let mut pipeline_config = build_pipeline_config(
-            &self.scheduler_opts,
-            &self.compression,
-            &self.queue_memory,
-            num_threads,
-        )?;
+        let setup = self.setup_pipeline(num_threads, &header)?;
+        let ctx = self.process_captures(&setup, &header);
 
-        // Enable raw-byte mode: skip noodles decode
-        let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
-
-        // Create filter configuration
-        let config = Arc::new(FilterConfig::new(
-            &self.min_reads,
-            &self.max_read_error_rate,
-            &self.max_base_error_rate,
-            self.min_base_quality,
-            self.min_mean_base_quality,
-            self.max_no_call_fraction,
-        ));
-
-        // Load reference for tag regeneration (always enabled, matching fgbio behavior)
-        info!("Loading reference genome into memory...");
-        let ref_load_start = Instant::now();
-        let reference: Option<Arc<ReferenceReader>> =
-            Some(Arc::new(ReferenceReader::new(&self.reference)?));
-        let ref_load_elapsed = ref_load_start.elapsed();
-        info!("Reference loaded in {:.1}s", ref_load_elapsed.as_secs_f64());
-
-        // Lock-free metrics collection
-        let collected_metrics: Arc<SegQueue<CollectedFilterMetrics>> = Arc::new(SegQueue::new());
-        let collected_for_serialize = Arc::clone(&collected_metrics);
-
-        // Configuration for closures
         #[cfg(test)]
         const BATCH_SIZE: usize = 50;
         #[cfg(not(test))]
         const BATCH_SIZE: usize = 1000;
 
-        let config_for_process = Arc::clone(&config);
-        let min_base_quality = self.min_base_quality;
-        let should_reverse_tags = self.reverse_per_base_tags;
-        let min_mean_base_quality = self.min_mean_base_quality;
-        let max_no_call_fraction = self.max_no_call_fraction;
-        let require_single_strand_agreement = self.require_single_strand_agreement;
-        let reference_for_process = reference;
-
-        // Progress tracking
-        let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_for_process = Arc::clone(&progress_counter);
-
-        // Grouper: batch templates by QNAME
         let grouper_fn = move |_header: &Header| {
             Box::new(TemplateGrouper::new(BATCH_SIZE))
                 as Box<dyn Grouper<Group = TemplateBatch> + Send>
         };
 
-        // Process function: filter each template batch
-        let header_for_process = header.clone();
         let process_fn = move |batch: TemplateBatch| -> io::Result<FilterProcessedBatchRaw> {
             let mut kept_records: Vec<Vec<u8>> = Vec::new();
             let mut rejected_records: Vec<Vec<u8>> = Vec::new();
@@ -742,30 +561,27 @@ impl Filter {
                     .ok_or_else(|| io::Error::other("template has no raw records"))?;
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
 
-                // Process each record in the template
                 for (idx, record) in template_records.iter_mut().enumerate() {
                     total_records += 1;
 
                     let (masked, pass) = Self::process_record_raw(
                         record,
-                        &config_for_process,
-                        reference_for_process.as_deref(),
-                        &header_for_process,
-                        should_reverse_tags,
-                        min_base_quality,
-                        require_single_strand_agreement,
-                        min_mean_base_quality,
-                        max_no_call_fraction,
+                        &ctx.config,
+                        ctx.reference.as_deref(),
+                        &ctx.header,
+                        ctx.should_reverse_tags,
+                        ctx.min_base_quality,
+                        ctx.require_single_strand_agreement,
+                        ctx.min_mean_base_quality,
+                        ctx.max_no_call_fraction,
                     )
                     .map_err(io::Error::other)?;
                     bases_masked += masked;
                     pass_map.insert(idx, pass);
                 }
 
-                // Check if template passes (all primary reads must pass)
                 let template_pass = template_passes_raw(&template_records, &pass_map);
 
-                // Collect kept/rejected records
                 for (idx, record) in template_records.into_iter().enumerate() {
                     let flags = bam_fields::flags(&record);
                     let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
@@ -779,7 +595,6 @@ impl Filter {
                             rejected_records.push(record);
                         }
                     } else {
-                        // Supplementary/secondary: only write if template passes AND individual record passes
                         let record_pass = pass_map.get(&idx).copied().unwrap_or(false);
                         if template_pass && record_pass {
                             passed_count += 1;
@@ -791,8 +606,7 @@ impl Filter {
                 }
             }
 
-            // Progress logging
-            let count = progress_for_process.fetch_add(total_records, Ordering::Relaxed);
+            let count = ctx.progress.fetch_add(total_records, Ordering::Relaxed);
             if (count + total_records) / 1_000_000 > count / 1_000_000 {
                 info!("Processed {} records", count + total_records);
             }
@@ -806,108 +620,7 @@ impl Filter {
             })
         };
 
-        // Serialize function: convert records to bytes and collect metrics
-        let serialize_fn = move |processed: FilterProcessedBatchRaw,
-                                 _header: &Header,
-                                 output: &mut Vec<u8>|
-              -> io::Result<u64> {
-            // Push metrics to lock-free queue
-            collected_for_serialize.push(CollectedFilterMetrics {
-                total_records: processed.records_count,
-                passed_records: processed.passed_count,
-                failed_records: processed.records_count - processed.passed_count,
-                total_bases_masked: processed.bases_masked,
-                rejects: processed.rejected_records,
-            });
-
-            // Serialize kept records as raw bytes
-            serialize_raw_records(&processed.kept_records, output)
-        };
-
-        // Clone header before pipeline (needed for post-pipeline aggregation)
-        let header_for_metrics = header.clone();
-
-        // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let _records_written = run_bam_pipeline_from_reader(
-            pipeline_config,
-            reader,
-            header,
-            &self.io.output,
-            None, // Use input header for output
-            grouper_fn,
-            process_fn,
-            serialize_fn,
-        )?;
-
-        // ========== Post-pipeline: Aggregate metrics ==========
-        self.aggregate_and_finalize_metrics(collected_metrics, track_rejects, &header_for_metrics)
-    }
-
-    /// Aggregate metrics from the pipeline and finalize output.
-    ///
-    /// Returns the total number of reads processed.
-    fn aggregate_and_finalize_metrics(
-        &self,
-        collected_metrics: Arc<SegQueue<CollectedFilterMetrics>>,
-        track_rejects: bool,
-        header: &Header,
-    ) -> Result<u64> {
-        let mut total_reads = 0u64;
-        let mut passed_reads = 0u64;
-        let mut failed_reads = 0u64;
-        let mut total_bases_masked = 0u64;
-        let mut total_rejects_written = 0u64;
-
-        // Create rejects writer up front so we can stream rejects incrementally
-        let mut rejects_writer = if track_rejects {
-            self.rejects
-                .as_ref()
-                .map(|rejects_path| {
-                    let writer_threads = self.threading.num_threads();
-                    create_raw_bam_writer(
-                        rejects_path,
-                        header,
-                        writer_threads,
-                        self.compression.compression_level,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-
-        while let Some(metrics) = collected_metrics.pop() {
-            total_reads += metrics.total_records;
-            passed_reads += metrics.passed_records;
-            failed_reads += metrics.failed_records;
-            total_bases_masked += metrics.total_bases_masked;
-
-            if let Some(ref mut rw) = rejects_writer {
-                for record in &metrics.rejects {
-                    rw.write_raw_record(record)?;
-                    total_rejects_written += 1;
-                }
-            }
-        }
-
-        // Finalize rejects writer
-        if let Some(rw) = rejects_writer {
-            rw.finish()?;
-            if total_rejects_written > 0 {
-                info!("Wrote {total_rejects_written} rejected records to rejects file");
-            }
-        }
-
-        // Write stats file if requested
-        if let Some(stats_path) = &self.stats {
-            self.write_filter_stats(stats_path, total_reads, passed_reads, failed_reads)?;
-        }
-
-        // Log summary
-        info!("Processed {total_reads} reads; kept {passed_reads} and rejected {failed_reads}");
-        info!("Total bases masked: {total_bases_masked}");
-
-        Ok(total_reads)
+        self.run_filter_pipeline(setup, reader, header, grouper_fn, process_fn)
     }
 
     /// Write filtering statistics to a file.
@@ -1171,100 +884,6 @@ impl Filter {
 
         Ok(())
     }
-
-    /// Writes filtering statistics to a TSV file.
-    ///
-    /// Creates a human-readable statistics file containing filtering parameters,
-    /// read counts, pass/fail rates, and total bases masked during filtering.
-    ///
-    /// # Arguments
-    ///
-    /// * `stats_path` - Path where the statistics file should be written
-    /// * `total_reads` - Total number of reads processed
-    /// * `passed_reads` - Number of reads that passed filtering
-    /// * `failed_reads` - Number of reads that failed filtering
-    /// * `total_bases_masked` - Total number of bases masked across all reads
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be created or written to.
-    fn write_statistics(
-        &self,
-        stats_path: &PathBuf,
-        total_reads: usize,
-        passed_reads: usize,
-        failed_reads: usize,
-        total_bases_masked: usize,
-    ) -> Result<()> {
-        use std::io::Write;
-
-        let mut file = std::fs::File::create(stats_path)?;
-
-        writeln!(file, "# Filter Statistics")?;
-        writeln!(file, "#")?;
-        writeln!(file, "# Input: {}", self.io.input.display())?;
-        writeln!(file, "# Output: {}", self.io.output.display())?;
-        writeln!(file, "#")?;
-        writeln!(file, "# Filtering Parameters:")?;
-        writeln!(file, "#   Min reads: {:?}", self.min_reads)?;
-        writeln!(file, "#   Max read error rate: {:?}", self.max_read_error_rate)?;
-        writeln!(file, "#   Max base error rate: {:?}", self.max_base_error_rate)?;
-        if let Some(q) = self.min_base_quality {
-            writeln!(file, "#   Min base quality: {q}")?;
-        }
-        if let Some(q) = self.min_mean_base_quality {
-            writeln!(file, "#   Min mean base quality: {q}")?;
-        }
-        writeln!(file, "#   Max no-call fraction: {}", self.max_no_call_fraction)?;
-        writeln!(file, "#   Filter by template: {}", self.filter_by_template)?;
-        writeln!(file, "#")?;
-        writeln!(file)?;
-
-        writeln!(file, "METRIC\tVALUE")?;
-        writeln!(file, "total_reads\t{total_reads}")?;
-        writeln!(file, "passed_reads\t{passed_reads}")?;
-        writeln!(file, "failed_reads\t{failed_reads}")?;
-        writeln!(
-            file,
-            "pass_rate\t{:.4}",
-            if total_reads > 0 { passed_reads as f64 / total_reads as f64 } else { 0.0 }
-        )?;
-        writeln!(
-            file,
-            "fail_rate\t{:.4}",
-            if total_reads > 0 { failed_reads as f64 / total_reads as f64 } else { 0.0 }
-        )?;
-        writeln!(file, "total_bases_masked\t{total_bases_masked}")?;
-
-        info!("Statistics written to {}", stats_path.display());
-
-        Ok(())
-    }
-
-    /// Gets the threshold for a specific consensus level (duplex/AB/BA)
-    ///
-    /// If only 1 value provided: applies to all levels
-    /// If 2 values provided: [duplex, single-strand]
-    /// If 3 values provided: [duplex, AB, BA]
-    #[allow(dead_code)]
-    fn get_threshold<T: Copy>(values: &[T], index: usize) -> T {
-        match values.len() {
-            1 => values[0],
-            2 => {
-                if index == 0 {
-                    values[0] // duplex
-                } else {
-                    values[1] // AB or BA
-                }
-            }
-            3 => values[index],
-            _ => unreachable!("Validation should catch this"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1287,7 +906,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.2,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1336,27 +955,6 @@ mod tests {
     }
 
     #[test]
-    fn test_threshold_selection() {
-        // Test with 1 value
-        let values = vec![10];
-        assert_eq!(Filter::get_threshold(&values, 0), 10);
-        assert_eq!(Filter::get_threshold(&values, 1), 10);
-        assert_eq!(Filter::get_threshold(&values, 2), 10);
-
-        // Test with 2 values
-        let values = vec![5, 10];
-        assert_eq!(Filter::get_threshold(&values, 0), 5); // duplex
-        assert_eq!(Filter::get_threshold(&values, 1), 10); // AB
-        assert_eq!(Filter::get_threshold(&values, 2), 10); // BA
-
-        // Test with 3 values
-        let values = vec![5, 10, 15];
-        assert_eq!(Filter::get_threshold(&values, 0), 5); // duplex
-        assert_eq!(Filter::get_threshold(&values, 1), 10); // AB
-        assert_eq!(Filter::get_threshold(&values, 2), 15); // BA
-    }
-
-    #[test]
     fn test_default_filter_parameters() {
         let filter = Filter {
             io: BamIoOptions {
@@ -1371,7 +969,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1402,7 +1000,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::new(8),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1431,7 +1029,6 @@ mod tests {
             min_mean_base_quality: Some(20.0),
             max_no_call_fraction: 0.05,
             reverse_per_base_tags: true,
-            sort_order: Some("coordinate".to_string()),
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1463,7 +1060,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1492,7 +1089,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1842,33 +1439,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_threshold_single_value() {
-        // Single value should apply to all levels
-        let values = vec![10];
-        assert_eq!(Filter::get_threshold(&values, 0), 10);
-        assert_eq!(Filter::get_threshold(&values, 1), 10);
-        assert_eq!(Filter::get_threshold(&values, 2), 10);
-    }
-
-    #[test]
-    fn test_get_threshold_two_values() {
-        // Two values: first for duplex, second for both AB and BA
-        let values = vec![5, 10];
-        assert_eq!(Filter::get_threshold(&values, 0), 5); // Duplex
-        assert_eq!(Filter::get_threshold(&values, 1), 10); // AB
-        assert_eq!(Filter::get_threshold(&values, 2), 10); // BA
-    }
-
-    #[test]
-    fn test_get_threshold_three_values() {
-        // Three values: duplex, AB, BA
-        let values = vec![5, 10, 15];
-        assert_eq!(Filter::get_threshold(&values, 0), 5); // Duplex
-        assert_eq!(Filter::get_threshold(&values, 1), 10); // AB
-        assert_eq!(Filter::get_threshold(&values, 2), 15); // BA
-    }
-
-    #[test]
     fn test_validate_max_no_call_fraction_integer() {
         // When max_no_call_fraction >= 1.0, it should be an integer
         let filter = Filter {
@@ -1884,7 +1454,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 5.5, // >= 1.0 but not an integer
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1919,7 +1489,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 5.0, // >= 1.0 and IS an integer
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1952,7 +1522,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -1982,7 +1552,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2012,7 +1582,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::new(8),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2041,7 +1611,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2070,7 +1640,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: false,
@@ -2082,64 +1652,6 @@ mod tests {
         };
 
         assert!(!filter.filter_by_template);
-    }
-
-    #[test]
-    fn test_filter_with_sort_order_coordinate() {
-        let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
-            reference: PathBuf::from("ref.fa"),
-            min_reads: vec![3],
-            max_read_error_rate: vec![0.1],
-            max_base_error_rate: vec![0.2],
-            min_base_quality: Some(13),
-            min_mean_base_quality: None,
-            max_no_call_fraction: 0.1,
-            reverse_per_base_tags: true,
-            sort_order: Some("coordinate".to_string()),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            filter_by_template: true,
-            rejects: None,
-            stats: None,
-            require_single_strand_agreement: false,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        assert_eq!(filter.sort_order, Some("coordinate".to_string()));
-    }
-
-    #[test]
-    fn test_filter_with_sort_order_queryname() {
-        let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
-            reference: PathBuf::from("ref.fa"),
-            min_reads: vec![3],
-            max_read_error_rate: vec![0.1],
-            max_base_error_rate: vec![0.2],
-            min_base_quality: Some(13),
-            min_mean_base_quality: None,
-            max_no_call_fraction: 0.1,
-            reverse_per_base_tags: true,
-            sort_order: Some("queryname".to_string()),
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            filter_by_template: true,
-            rejects: None,
-            stats: None,
-            require_single_strand_agreement: false,
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        assert_eq!(filter.sort_order, Some("queryname".to_string()));
     }
 
     #[test]
@@ -2157,7 +1669,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2186,7 +1698,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2215,7 +1727,7 @@ mod tests {
             min_mean_base_quality: Some(25.0),
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2244,7 +1756,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.01,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2275,7 +1787,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2306,7 +1818,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2336,7 +1848,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2368,7 +1880,6 @@ mod tests {
             min_mean_base_quality: Some(20.0),
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: Some("coordinate".to_string()),
             threading: ThreadingOptions::new(4),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2382,7 +1893,6 @@ mod tests {
         assert!(filter.rejects.is_some());
         assert!(filter.stats.is_some());
         assert!(filter.require_single_strand_agreement);
-        assert!(filter.sort_order.is_some());
         assert!(filter.min_mean_base_quality.is_some());
     }
 
@@ -2401,7 +1911,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.0,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2430,7 +1940,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.1,
             reverse_per_base_tags: true,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2533,7 +2043,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.2,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::new(threads),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2653,7 +2163,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.2, // 20% max Ns allowed
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2806,7 +2316,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.2,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2878,7 +2388,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.2, // Max 20% Ns allowed
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -2944,7 +2454,7 @@ mod tests {
             min_mean_base_quality: Some(20.0), // Filter reads with mean quality < 20
             max_no_call_fraction: 1.0,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3067,7 +2577,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3135,7 +2645,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: false, // Independent filtering
@@ -3201,7 +2711,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3271,7 +2781,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3294,7 +2804,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::new(4),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3357,7 +2867,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 1.0,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3411,7 +2921,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 1.0,
             reverse_per_base_tags: true, // Enable tag reversal
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3468,7 +2978,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::new(4), // Multi-threaded
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3534,7 +3044,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3557,7 +3067,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::new(4),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3638,7 +3148,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: true, // Also test reverse tags in this mode
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: false, // Non-template mode
@@ -3747,7 +3257,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3862,7 +3372,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::new(4),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3898,7 +3408,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3929,7 +3439,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -3984,7 +3494,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: true, // Test reverse tags in parallel mode
-            sort_order: None,
+
             threading: ThreadingOptions::new(4),
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -4044,7 +3554,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading: ThreadingOptions::new(4), // Multi-threaded
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
@@ -4069,11 +3579,11 @@ mod tests {
     /// Parameterized test for all threading modes.
     ///
     /// Tests:
-    /// - `None`: Single-threaded fast path, no pipeline
+    /// - `None`: Pipeline with default (1 thread)
     /// - `Some(1)`: Pipeline with 1 thread
     /// - `Some(2)`: Pipeline with 2 threads
     #[rstest]
-    #[case::fast_path(ThreadingOptions::none())]
+    #[case::default(ThreadingOptions::none())]
     #[case::pipeline_1(ThreadingOptions::new(1))]
     #[case::pipeline_2(ThreadingOptions::new(2))]
     fn test_threading_modes(#[case] threading: ThreadingOptions) -> Result<()> {
@@ -4107,7 +3617,7 @@ mod tests {
             min_mean_base_quality: None,
             max_no_call_fraction: 0.5,
             reverse_per_base_tags: false,
-            sort_order: None,
+
             threading,
             compression: CompressionOptions { compression_level: 1 },
             filter_by_template: true,
