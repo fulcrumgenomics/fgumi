@@ -50,7 +50,7 @@ use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use anyhow::{Context, Result};
 use clap::Parser;
-use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer};
+use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer, is_stdin_path, is_stdout_path};
 use fgumi_lib::batched_sam_reader::BatchedSamReader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
@@ -784,7 +784,7 @@ impl Command for Zipper {
         // For stdin, use BatchedSamReader that starts at 64MB and grows based on observed usage.
         // This handles bwa mem's bursty output pattern (450-750MB SAM text per batch).
         // The -K parameter (bwa_chunk_size) is used for batch tracking.
-        let mapped_reader: Box<dyn BufRead + Send> = if self.input.to_str() == Some("-") {
+        let mapped_reader: Box<dyn BufRead + Send> = if is_stdin_path(&self.input) {
             info!("Reading SAM from stdin with adaptive buffer (bwa -K {})", self.bwa_chunk_size);
             Box::new(BatchedSamReader::new(std::io::stdin(), self.bwa_chunk_size))
         } else {
@@ -867,7 +867,7 @@ impl Command for Zipper {
             )?
         } else {
             // Single-threaded: simple sequential processing
-            let output_writer: Box<dyn Write> = if self.output.to_str() == Some("-") {
+            let output_writer: Box<dyn Write> = if is_stdout_path(&self.output) {
                 Box::new(std::io::stdout().lock())
             } else {
                 Box::new(

@@ -228,6 +228,28 @@ pub fn create_umi_family_with_errors(
     records
 }
 
+/// Create a reference FASTA + FAI that matches the test header (chr1, 10000bp).
+///
+/// Writes `ref.fa` and `ref.fa.fai` into the given directory.
+/// Returns the path to `ref.fa`.
+pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::io::Write;
+
+    let ref_path = dir.join("ref.fa");
+    let fai_path = dir.join("ref.fa.fai");
+
+    let ref_seq = "ACGTACGT".repeat(1250); // 10000 bases
+    let mut fasta = std::fs::File::create(&ref_path).unwrap();
+    writeln!(fasta, ">chr1").unwrap();
+    writeln!(fasta, "{ref_seq}").unwrap();
+    fasta.flush().unwrap();
+
+    let fai_content = "chr1\t10000\t6\t10000\t10001\n".to_string();
+    std::fs::write(&fai_path, fai_content).unwrap();
+
+    ref_path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -49,22 +49,13 @@ impl Interval {
 /// Read name and template information for downsampling
 #[derive(Clone)]
 struct TemplateInfo {
-    #[allow(dead_code)] // Part of struct for completeness, may be used in future
-    read_name: String,
     mi: String,
     rx: String,
     ref_name: Option<String>,
     position: Option<i32>,
     end_position: Option<i32>,
-    #[allow(dead_code)] // Part of struct for completeness, may be used in future
-    is_reverse: bool,
     /// Hash fraction for deterministic downsampling (computed once per template)
     hash_fraction: f64,
-    /// Grouping key matching fgbio's `ReadInfo`: (ref1, start1, strand1, ref2, start2, strand2)
-    /// Positions are ordered so the earlier-mapping read comes first
-    #[allow(dead_code)]
-    // Stored for debugging/future use, streaming uses local variable for grouping
-    read_info_key: ReadInfoKey,
 }
 
 /// Grouping key matching fgbio's `ReadInfo` structure
@@ -720,15 +711,12 @@ impl DuplexMetrics {
             let hash_fraction = Self::compute_hash_fraction(&read_name);
 
             let template_info = TemplateInfo {
-                read_name,
                 mi,
                 rx,
                 ref_name,
                 position: Some(position),
                 end_position: Some(end_position),
-                is_reverse: false,
                 hash_fraction,
-                read_info_key: read_info_key.clone(),
             };
 
             // Check interval overlap
@@ -2449,22 +2437,12 @@ mod tests {
     fn test_interval_overlap_logic() {
         // Test no intervals - should always return true
         let template = TemplateInfo {
-            read_name: "read1".to_string(),
             mi: "1/A".to_string(),
             rx: "AAA-TTT".to_string(),
             ref_name: Some("chr1".to_string()),
             position: Some(1000),
             end_position: Some(1100),
-            is_reverse: false,
             hash_fraction: 0.5,
-            read_info_key: ReadInfoKey {
-                ref_index1: Some(0),
-                start1: 1000,
-                strand1: false,
-                ref_index2: Some(0),
-                start2: 1100,
-                strand2: false,
-            },
         };
 
         assert!(DuplexMetrics::overlaps_intervals(&template, &[]));
@@ -2479,22 +2457,12 @@ mod tests {
 
         // Test unmapped template
         let unmapped = TemplateInfo {
-            read_name: "read2".to_string(),
             mi: "2/A".to_string(),
             rx: "AAA-TTT".to_string(),
             ref_name: None,
             position: None,
             end_position: None,
-            is_reverse: false,
             hash_fraction: 0.5,
-            read_info_key: ReadInfoKey {
-                ref_index1: None,
-                start1: 0,
-                strand1: false,
-                ref_index2: None,
-                start2: 0,
-                strand2: false,
-            },
         };
         assert!(!DuplexMetrics::overlaps_intervals(&unmapped, &intervals));
     }

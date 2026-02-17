@@ -45,7 +45,6 @@ const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 /// Estimated bytes per BAM record for memory accounting.
 /// This should be conservative to prevent OOM but not so high that we spill unnecessarily.
 /// Actual `RecordBuf` + Key overhead is ~800-1200 bytes for typical BAM records.
-#[allow(dead_code)]
 const ESTIMATED_RECORD_SIZE: usize = 800;
 
 /// Buffer size for reading temp files during merge.

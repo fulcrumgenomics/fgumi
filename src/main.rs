@@ -56,6 +56,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Parser, Debug)]
 #[command(styles = STYLES)]
 struct Args {
+    /// Enable verbose (debug-level) logging. Equivalent to setting `RUST_LOG=debug`.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[clap(subcommand)]
     subcommand: Subcommand,
 }
@@ -120,8 +123,6 @@ fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-
     // Capture full command line BEFORE clap parsing for @PG records
     let command_line = std::env::args().collect::<Vec<_>>().join(" ");
 
@@ -144,6 +145,9 @@ fn main() -> Result<()> {
             e.exit();
         }
     };
+
+    let default_level = if args.verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
 
     info!("Running fgumi version {}", version::VERSION.as_str());
     args.subcommand.execute(&command_line)

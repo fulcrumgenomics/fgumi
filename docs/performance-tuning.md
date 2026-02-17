@@ -165,6 +165,58 @@ fgumi filter \
 - Minimal memory footprint
 - Fast compression for quick turnaround
 
+## Verbose Logging
+
+Use `--verbose` (or `-v`) to enable debug-level logging for any command:
+
+```bash
+fgumi group --verbose --input reads.bam --output grouped.bam
+```
+
+This is equivalent to setting `RUST_LOG=debug`. If `RUST_LOG` is explicitly set, it takes precedence over `--verbose`.
+
+## Advanced Pipeline Options
+
+The following options are available on all multi-threaded pipeline commands. They are hidden from the default help text but can be useful for debugging and performance analysis.
+
+### Pipeline Statistics
+
+```bash
+fgumi group --pipeline-stats --input reads.bam --output grouped.bam
+```
+
+Prints detailed per-step timing, throughput, contention metrics, and per-thread work distribution at completion.
+
+### Scheduler Strategy
+
+```bash
+fgumi group --scheduler balanced-chase-drain --input reads.bam --output grouped.bam
+```
+
+Controls which scheduling strategy threads use for work assignment. The default (`balanced-chase-drain`) is recommended for most workloads. Available strategies:
+
+| Strategy | Description |
+|----------|-------------|
+| `balanced-chase-drain` | Default. Balanced work distribution with output drain mode. |
+| `fixed-priority` | Static thread roles (reader, writer, workers). Simple baseline. |
+| `chase-bottleneck` | Threads dynamically follow work through the pipeline. |
+
+Other experimental strategies are available (`thompson-sampling`, `ucb`, `epsilon-greedy`, etc.) but are not recommended for production use.
+
+### Deadlock Detection
+
+```bash
+# Adjust timeout (default: 10 seconds, 0 to disable)
+fgumi group --deadlock-timeout 30 --input reads.bam --output grouped.bam
+
+# Enable automatic recovery (default: detection only)
+fgumi group --deadlock-recover --input reads.bam --output grouped.bam
+```
+
+The pipeline monitors for progress stalls. When no queue operations succeed for the timeout duration, diagnostic information is logged (queue depths, memory usage, per-queue timestamps).
+
+With `--deadlock-recover`, the pipeline progressively doubles queue memory limits (2x, 4x, up to 8x) to resolve backpressure deadlocks, then restores original limits after 30 seconds of sustained progress.
+
 ## Performance Monitoring
 
 ### Memory Usage
@@ -193,6 +245,14 @@ fgumi filter \
 1. Increase `--threads` if CPU usage is low
 2. Increase `--queue-memory` if I/O bound
 3. Reduce `--compression-level` if CPU bound
+
+### Pipeline Appears Stuck
+If a command hangs without producing output:
+1. Check if a deadlock warning appears in the log (default timeout: 10 seconds)
+2. Run with `--verbose` to see detailed pipeline activity
+3. Run with `--pipeline-stats` to see per-step metrics at completion
+4. Try `--deadlock-recover` to allow automatic recovery from backpressure deadlocks
+5. Reduce `--threads` — fewer threads means simpler scheduling and less contention
 
 ### System Memory Warnings
 ```text

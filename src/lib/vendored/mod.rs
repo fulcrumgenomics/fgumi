@@ -5,7 +5,7 @@
 //! - noodles-bam PR for BAM codec optimizations
 //! - noodles-bam PR for `Record::as_ref()` (raw bytes access)
 //!
-//! TODO: Remove this module once the upstream PRs are merged and released.
+//! This module should be removed once the upstream PRs are merged and released.
 
 pub mod bam_codec;
 pub mod bgzf_multithreaded;

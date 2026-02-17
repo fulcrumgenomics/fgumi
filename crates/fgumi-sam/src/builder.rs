@@ -1710,7 +1710,8 @@ impl RecordPairBuilder {
 /// - `cD`: Maximum depth (coverage)
 /// - `cM`: Minimum depth (coverage)
 /// - `cE`: Error rate
-/// - Per-base arrays for detailed metrics
+/// - `cd`: Per-base depth array
+/// - `ce`: Per-base error count array
 ///
 /// For duplex consensus reads, additional strand-specific tags are supported:
 /// - `aD`: A-strand (AB) depth
@@ -1851,15 +1852,15 @@ impl ConsensusTagsBuilder {
         // Guard against conflicting tag sources
         debug_assert!(
             !(self.depth_max.is_some() && self.per_base_depths.is_some()),
-            "depth_max and per_base_depths both set cD tag; use one or the other"
+            "depth_max (cD) and per_base_depths (cd) are mutually exclusive; use one or the other"
         );
         debug_assert!(
             !(self.error_rate.is_some() && self.per_base_errors.is_some()),
-            "error_rate and per_base_errors both set cE tag; use one or the other"
+            "error_rate (cE) and per_base_errors (ce) are mutually exclusive; use one or the other"
         );
         debug_assert!(
             !(self.error_count.is_some() && self.per_base_errors.is_some()),
-            "error_count and per_base_errors both set cE tag; use one or the other"
+            "error_count (cE) and per_base_errors (ce) are mutually exclusive; use one or the other"
         );
 
         let mut tags = Vec::new();
@@ -1878,10 +1879,10 @@ impl ConsensusTagsBuilder {
             tags.push((Tag::from([b'c', b'E']), to_smallest_signed_int(count)));
         }
         if let Some(depths) = self.per_base_depths {
-            tags.push((Tag::from([b'c', b'D']), BufValue::from(depths)));
+            tags.push((Tag::from([b'c', b'd']), BufValue::from(depths)));
         }
         if let Some(errors) = self.per_base_errors {
-            tags.push((Tag::from([b'c', b'E']), BufValue::from(errors)));
+            tags.push((Tag::from([b'c', b'e']), BufValue::from(errors)));
         }
 
         // Duplex consensus tags
@@ -2210,6 +2211,8 @@ mod tests {
             .build();
 
         assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].0, Tag::from([b'c', b'd']));
+        assert_eq!(tags[1].0, Tag::from([b'c', b'e']));
     }
 
     // ========================================================================
