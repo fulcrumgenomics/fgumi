@@ -923,13 +923,10 @@ impl VanillaUmiConsensusCaller {
         // Sub-group by read type
         let (fragment_reads, r1_reads, r2_reads) = self.subgroup_reads(reads);
 
-        let original_r1_count = r1_reads.len();
-        let original_r2_count = r2_reads.len();
-
         let mut output = ConsensusOutput::default();
 
         // Process fragment subgroup
-        let fragment_ok =
+        let (fragment_ok, _, _) =
             self.process_subgroup(&mut output, umi, ReadType::Fragment, fragment_reads)?;
         if fragment_ok {
             self.stats.record_consensus();
@@ -937,10 +934,10 @@ impl VanillaUmiConsensusCaller {
 
         // Process R1/R2 subgroups
         let mut r1r2_output = ConsensusOutput::default();
-        let r1_reads_clone = if self.track_rejects { r1_reads.clone() } else { Vec::new() };
-        let r2_reads_clone = if self.track_rejects { r2_reads.clone() } else { Vec::new() };
-        let r1_ok = self.process_subgroup(&mut r1r2_output, umi, ReadType::R1, r1_reads)?;
-        let r2_ok = self.process_subgroup(&mut r1r2_output, umi, ReadType::R2, r2_reads)?;
+        let (r1_ok, r1_surviving_count, r1_surviving_reads) =
+            self.process_subgroup(&mut r1r2_output, umi, ReadType::R1, r1_reads)?;
+        let (r2_ok, r2_surviving_count, r2_surviving_reads) =
+            self.process_subgroup(&mut r1r2_output, umi, ReadType::R2, r2_reads)?;
 
         match (r1_ok, r2_ok) {
             (true, true) => {
@@ -949,15 +946,17 @@ impl VanillaUmiConsensusCaller {
                 output.extend(&r1r2_output);
             }
             (true, false) => {
-                self.stats.record_rejection(RejectionReason::OrphanConsensus, original_r1_count);
+                self.stats
+                    .record_rejection(RejectionReason::OrphanConsensus, r1_surviving_count);
                 if self.track_rejects {
-                    self.rejected_reads.extend(r1_reads_clone);
+                    self.rejected_reads.extend(r1_surviving_reads);
                 }
             }
             (false, true) => {
-                self.stats.record_rejection(RejectionReason::OrphanConsensus, original_r2_count);
+                self.stats
+                    .record_rejection(RejectionReason::OrphanConsensus, r2_surviving_count);
                 if self.track_rejects {
-                    self.rejected_reads.extend(r2_reads_clone);
+                    self.rejected_reads.extend(r2_surviving_reads);
                 }
             }
             (false, false) => {}
@@ -967,18 +966,23 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Processes a single subgroup (Fragment, R1, or R2) and writes the consensus record
-    /// into the output buffer if successful. Returns `true` if a consensus was produced.
+    /// into the output buffer if successful.
+    ///
+    /// Returns a tuple of:
+    /// - `bool` — whether a consensus was produced
+    /// - `usize` — count of reads that survived all internal filtering (not rejected)
+    /// - `Vec<Vec<u8>>` — the surviving raw reads (only populated when `self.track_rejects`)
     fn process_subgroup(
         &mut self,
         output: &mut ConsensusOutput,
         umi: &str,
         read_type: ReadType,
         group_reads: Vec<Vec<u8>>,
-    ) -> Result<bool> {
+    ) -> Result<(bool, usize, Vec<Vec<u8>>)> {
         use noodles_raw_bam as bam_fields;
 
         if group_reads.is_empty() {
-            return Ok(false);
+            return Ok((false, 0, Vec::new()));
         }
 
         if group_reads.len() < self.options.min_reads {
@@ -986,7 +990,7 @@ impl VanillaUmiConsensusCaller {
             if self.track_rejects {
                 self.rejected_reads.extend(group_reads);
             }
-            return Ok(false);
+            return Ok((false, 0, Vec::new()));
         }
 
         // Calculate mate overlap clips from raw bytes
@@ -1030,7 +1034,7 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok(false);
+            return Ok((false, 0, Vec::new()));
         }
 
         // Filter by alignment
@@ -1055,8 +1059,16 @@ impl VanillaUmiConsensusCaller {
                     }
                 }
             }
-            return Ok(false);
+            return Ok((false, 0, Vec::new()));
         }
+
+        // Capture surviving count and reads before building consensus
+        let surviving_count = filtered_source_reads.len();
+        let surviving_reads = if self.track_rejects {
+            filtered_source_reads.iter().map(|sr| group_reads[sr.original_idx].clone()).collect()
+        } else {
+            Vec::new()
+        };
 
         // Build consensus from source reads
         let (bases, quals, depths, errors) =
@@ -1079,7 +1091,7 @@ impl VanillaUmiConsensusCaller {
             &errors,
         );
 
-        Ok(true)
+        Ok((true, surviving_count, surviving_reads))
     }
 
     /// Creates consensus from `SourceReads` (which already have transformed bases/quals).
@@ -4058,6 +4070,291 @@ mod tests {
         assert_eq!(
             stats.consensus_reads, 4,
             "Consensus reads should be 4 (2 pairs), not double-counted"
+        );
+    }
+
+    /// Test that orphan consensus rejection does not double-count reads that were already
+    /// individually rejected inside `process_subgroup` (e.g. as MinorityAlignment).
+    ///
+    /// Scenario: R1 succeeds with internal rejections, R2 fails entirely.
+    /// - 3 read pairs. R1: 2 reads with 50M (majority), 1 with 25M25I (minority alignment).
+    /// - R2: all bases low quality → ZeroLengthAfterTrimming for all 3.
+    /// - R1 builds consensus from 2 surviving reads, 1 rejected as MinorityAlignment.
+    /// - R2 fails completely, triggering orphan handler.
+    /// - OrphanConsensus should count 2 (surviving R1 reads), not 3 (original R1 count).
+    /// - filtered_reads must not exceed total_reads.
+    #[test]
+    fn test_orphan_consensus_no_double_count_r1_succeeds_r2_fails() {
+        let seq_50 = "A".repeat(50);
+        let good_quals = vec![30u8; 50];
+        let bad_quals = vec![2u8; 50]; // Below default min_input_base_quality (10)
+
+        // Build 3 R1 reads: 2 with 50M, 1 with 25M25I (minority alignment)
+        let r1_a = RecordBuilder::new()
+            .name("read_a")
+            .sequence(&seq_50)
+            .qualities(&good_quals)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(1000)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r1_b = RecordBuilder::new()
+            .name("read_b")
+            .sequence(&seq_50)
+            .qualities(&good_quals)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(1000)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r1_c = RecordBuilder::new()
+            .name("read_c")
+            .sequence(&seq_50)
+            .qualities(&good_quals)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("25M25I")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(1000)
+            .tag("MI", "UMI1")
+            .build();
+
+        // Build 3 R2 reads: all with low quality → ZeroLengthAfterTrimming
+        let r2_a = RecordBuilder::new()
+            .name("read_a")
+            .sequence(&seq_50)
+            .qualities(&bad_quals)
+            .first_segment(false) // R2
+            .reference_sequence_id(0)
+            .alignment_start(1000)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r2_b = RecordBuilder::new()
+            .name("read_b")
+            .sequence(&seq_50)
+            .qualities(&bad_quals)
+            .first_segment(false)
+            .reference_sequence_id(0)
+            .alignment_start(1000)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r2_c = RecordBuilder::new()
+            .name("read_c")
+            .sequence(&seq_50)
+            .qualities(&bad_quals)
+            .first_segment(false)
+            .reference_sequence_id(0)
+            .alignment_start(1000)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .tag("MI", "UMI1")
+            .build();
+
+        let options = VanillaUmiConsensusOptions {
+            tag: "MI".to_string(),
+            min_reads: 2,
+            ..VanillaUmiConsensusOptions::default()
+        };
+
+        let mut caller =
+            VanillaUmiConsensusCaller::new("test".to_string(), "A".to_string(), options);
+
+        let output =
+            consensus_reads_from_records(&mut caller, vec![r1_a, r1_b, r1_c, r2_a, r2_b, r2_c])
+                .unwrap();
+
+        // No consensus should be produced (R1 built one but it's orphaned)
+        assert_eq!(output.count, 0, "Orphan R1 consensus should be discarded");
+
+        let stats = caller.statistics();
+
+        // 6 input reads total
+        assert_eq!(stats.total_reads, 6, "Should count all 6 input reads");
+
+        // filtered_reads must not exceed total_reads (the bug would cause 7 > 6)
+        assert!(
+            stats.filtered_reads <= stats.total_reads,
+            "filtered_reads ({}) must not exceed total_reads ({})",
+            stats.filtered_reads,
+            stats.total_reads,
+        );
+
+        // Verify the specific rejection counts:
+        // - 1 MinorityAlignment (r1_c)
+        // - 3 ZeroLengthAfterTrimming (all R2 reads)
+        // - 2 OrphanConsensus (surviving R1 reads, NOT 3)
+        let rejections = &stats.rejection_reasons;
+        assert_eq!(
+            rejections.get(&RejectionReason::MinorityAlignment).copied().unwrap_or(0),
+            1,
+            "Should have 1 MinorityAlignment rejection"
+        );
+        assert_eq!(
+            rejections.get(&RejectionReason::ZeroLengthAfterTrimming).copied().unwrap_or(0),
+            3,
+            "Should have 3 ZeroLengthAfterTrimming rejections"
+        );
+        assert_eq!(
+            rejections.get(&RejectionReason::OrphanConsensus).copied().unwrap_or(0),
+            2,
+            "OrphanConsensus should count 2 surviving R1 reads, not 3 original"
+        );
+    }
+
+    /// Symmetric test: R1 fails entirely, R2 succeeds with internal rejections.
+    ///
+    /// Scenario: R2 succeeds with internal rejections, R1 fails entirely.
+    /// - 3 read pairs. R2: 2 reads with 50M (majority), 1 with 25M25I (minority alignment).
+    /// - R1: all bases low quality → ZeroLengthAfterTrimming for all 3.
+    /// - R2 builds consensus from 2 surviving reads, 1 rejected as MinorityAlignment.
+    /// - R1 fails completely, triggering orphan handler.
+    /// - OrphanConsensus should count 2 (surviving R2 reads), not 3 (original R2 count).
+    #[test]
+    fn test_orphan_consensus_no_double_count_r1_fails_r2_succeeds() {
+        let seq_50 = "A".repeat(50);
+        let good_quals = vec![30u8; 50];
+        let bad_quals = vec![2u8; 50];
+
+        // Build 3 R1 reads: all with low quality → ZeroLengthAfterTrimming
+        let r1_a = RecordBuilder::new()
+            .name("read_a")
+            .sequence(&seq_50)
+            .qualities(&bad_quals)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(1000)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r1_b = RecordBuilder::new()
+            .name("read_b")
+            .sequence(&seq_50)
+            .qualities(&bad_quals)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(1000)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r1_c = RecordBuilder::new()
+            .name("read_c")
+            .sequence(&seq_50)
+            .qualities(&bad_quals)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(1000)
+            .tag("MI", "UMI1")
+            .build();
+
+        // Build 3 R2 reads: 2 with 50M, 1 with 25M25I (minority alignment)
+        let r2_a = RecordBuilder::new()
+            .name("read_a")
+            .sequence(&seq_50)
+            .qualities(&good_quals)
+            .first_segment(false)
+            .reference_sequence_id(0)
+            .alignment_start(1000)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r2_b = RecordBuilder::new()
+            .name("read_b")
+            .sequence(&seq_50)
+            .qualities(&good_quals)
+            .first_segment(false)
+            .reference_sequence_id(0)
+            .alignment_start(1000)
+            .cigar("50M")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .tag("MI", "UMI1")
+            .build();
+
+        let r2_c = RecordBuilder::new()
+            .name("read_c")
+            .sequence(&seq_50)
+            .qualities(&good_quals)
+            .first_segment(false)
+            .reference_sequence_id(0)
+            .alignment_start(1000)
+            .cigar("25M25I")
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .tag("MI", "UMI1")
+            .build();
+
+        let options = VanillaUmiConsensusOptions {
+            tag: "MI".to_string(),
+            min_reads: 2,
+            ..VanillaUmiConsensusOptions::default()
+        };
+
+        let mut caller =
+            VanillaUmiConsensusCaller::new("test".to_string(), "A".to_string(), options);
+
+        let output =
+            consensus_reads_from_records(&mut caller, vec![r1_a, r1_b, r1_c, r2_a, r2_b, r2_c])
+                .unwrap();
+
+        assert_eq!(output.count, 0, "Orphan R2 consensus should be discarded");
+
+        let stats = caller.statistics();
+
+        assert_eq!(stats.total_reads, 6, "Should count all 6 input reads");
+
+        assert!(
+            stats.filtered_reads <= stats.total_reads,
+            "filtered_reads ({}) must not exceed total_reads ({})",
+            stats.filtered_reads,
+            stats.total_reads,
+        );
+
+        let rejections = &stats.rejection_reasons;
+        assert_eq!(
+            rejections.get(&RejectionReason::MinorityAlignment).copied().unwrap_or(0),
+            1,
+            "Should have 1 MinorityAlignment rejection"
+        );
+        assert_eq!(
+            rejections.get(&RejectionReason::ZeroLengthAfterTrimming).copied().unwrap_or(0),
+            3,
+            "Should have 3 ZeroLengthAfterTrimming rejections"
+        );
+        assert_eq!(
+            rejections.get(&RejectionReason::OrphanConsensus).copied().unwrap_or(0),
+            2,
+            "OrphanConsensus should count 2 surviving R2 reads, not 3 original"
         );
     }
 }
