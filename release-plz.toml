@@ -5,7 +5,25 @@ changelog_config = "cliff.toml"
 dependencies_update = true
 # labels for the release PR
 pr_labels = ["release"]
-# disable GitHub releases - this is handled by cargo-dist
-git_release_enable = false
-# disable running `cargo-semver-checks`
+# create GitHub releases for each published crate
+git_release_enable = true
+# disable running `cargo-semver-checks` until after the first release
 semver_check = false
+# increase timeout to allow crates.io index propagation between dependent crates
+publish_timeout = "10m"
+
+# TODO: remove after first publish completes for all crates.
+# release-plz publishes alphabetically, not topologically. These crates have
+# dev-dependencies on not-yet-published crates, so skip them until their
+# dependencies are on crates.io.
+[[package]]
+name = "fgumi-metrics"
+publish = false
+
+[[package]]
+name = "fgumi-consensus"
+publish = false
+
+[[package]]
+name = "fgumi"
+publish = false
