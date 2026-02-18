@@ -1,10 +1,11 @@
 [package]
-name = "noodles-raw-bam"
+name = "fgumi-raw-bam"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.87.0"
 description = "Raw byte-level operations on BAM alignment records"
-publish = false
+repository = "https://github.com/fulcrumgenomics/fgumi"
+license = "MIT"
 
 [dependencies]
 noodles = { version = "0.104.0", features = ["bam", "sam"], optional = true }

@@ -659,6 +659,7 @@ dependencies = [
  "fgumi-consensus",
  "fgumi-dna",
  "fgumi-metrics",
+ "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-umi",
  "flate2",
@@ -674,7 +675,6 @@ dependencies = [
  "noodles",
  "noodles-bgzf",
  "noodles-csi",
- "noodles-raw-bam",
  "parking_lot",
  "proptest",
  "rand 0.10.0",
@@ -710,10 +710,10 @@ dependencies = [
  "bstr 1.12.1",
  "fgumi-dna",
  "fgumi-metrics",
+ "fgumi-raw-bam",
  "fgumi-sam",
  "log",
  "noodles",
- "noodles-raw-bam",
  "rand 0.10.0",
  "wide 1.1.1",
 ]
@@ -735,15 +735,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-raw-bam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "noodles",
+ "rstest",
+]
+
+[[package]]
 name = "fgumi-sam"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bstr 1.12.1",
  "fgumi-dna",
+ "fgumi-raw-bam",
  "log",
  "noodles",
- "noodles-raw-bam",
  "tempfile",
 ]
 
@@ -1483,15 +1492,6 @@ dependencies = [
  "memchr",
  "noodles-bgzf",
  "noodles-core",
-]
-
-[[package]]
-name = "noodles-raw-bam"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "noodles",
- "rstest",
 ]
 
 [[package]]

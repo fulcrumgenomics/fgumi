@@ -12,7 +12,7 @@ ahash = "0.8"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1.10"
-fgumi-dna = { path = "../fgumi-dna" }
+fgumi-dna = { version = "0.1.0", path = "../fgumi-dna" }
 
 [dev-dependencies]
 rstest = "0.26"

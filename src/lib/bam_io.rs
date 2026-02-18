@@ -178,7 +178,7 @@ fn make_bgzf_writer(
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
     // BAM magic
-    writer.write_all(noodles_raw_bam::BAM_MAGIC)?;
+    writer.write_all(fgumi_raw_bam::BAM_MAGIC)?;
 
     // Header text (SAM header serialized using noodles)
     let mut sam_writer = noodles::sam::io::Writer::new(Vec::new());
@@ -512,11 +512,11 @@ impl IndexingBamWriter {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
         // Extract fields from BAM record
-        let tid = noodles_raw_bam::ref_id(bam);
-        let pos = noodles_raw_bam::pos(bam);
-        let flags = noodles_raw_bam::flags(bam);
+        let tid = fgumi_raw_bam::ref_id(bam);
+        let pos = fgumi_raw_bam::pos(bam);
+        let flags = fgumi_raw_bam::flags(bam);
 
-        let is_unmapped = (flags & noodles_raw_bam::flags::UNMAPPED) != 0;
+        let is_unmapped = (flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
 
         // Unmapped reads: return None (indexer handles them specially)
         if tid < 0 || is_unmapped {

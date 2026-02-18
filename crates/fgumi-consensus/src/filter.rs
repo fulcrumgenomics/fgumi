@@ -904,7 +904,7 @@ pub fn is_duplex_consensus(record: &RecordBuf) -> bool {
 // Raw-byte equivalents (operate on &[u8] / &mut Vec<u8>)
 // ============================================================================
 
-use noodles_raw_bam as bam_fields;
+use fgumi_raw_bam as bam_fields;
 
 /// Detects if a raw BAM record is a duplex consensus.
 ///

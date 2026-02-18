@@ -16,13 +16,13 @@ log = "0"
 noodles = { version = "0.104.0", features = ["bam", "sam", "core"] }
 rand = "0.10"
 wide = "1.1"
-fgumi-dna = { path = "../fgumi-dna" }
-fgumi-sam = { path = "../fgumi-sam" }
-fgumi-metrics = { path = "../fgumi-metrics" }
-noodles-raw-bam = { path = "../noodles-raw-bam", features = ["noodles"] }
+fgumi-dna = { version = "0.1.0", path = "../fgumi-dna" }
+fgumi-sam = { version = "0.1.0", path = "../fgumi-sam" }
+fgumi-metrics = { version = "0.1.0", path = "../fgumi-metrics" }
+fgumi-raw-bam = { version = "0.1.0", path = "../fgumi-raw-bam", features = ["noodles"] }
 
 [dev-dependencies]
-noodles-raw-bam = { path = "../noodles-raw-bam", features = ["test-utils"] }
+fgumi-raw-bam = { version = "0.1.0", path = "../fgumi-raw-bam", features = ["test-utils"] }
 
 [features]
 default = ["simplex", "duplex", "codec"]

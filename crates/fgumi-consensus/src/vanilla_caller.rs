@@ -17,7 +17,7 @@ use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 #[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
-use noodles_raw_bam::{UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{UnmappedBamRecordBuilder, flags};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -613,7 +613,7 @@ impl VanillaUmiConsensusCaller {
 
     /// Filters reads to remove secondary/supplementary alignments.
     fn filter_reads(&mut self, reads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|raw| {
             let flg = bam_fields::flags(raw);
@@ -737,7 +737,7 @@ impl VanillaUmiConsensusCaller {
         original_idx: usize,
         mate_overlap_clip: usize,
     ) -> Option<SourceRead> {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         let flg = bam_fields::flags(raw);
         let is_negative_strand = flg & flags::REVERSE != 0;
@@ -871,7 +871,7 @@ impl VanillaUmiConsensusCaller {
         reason = "method signature kept for consistency with other caller trait methods"
     )]
     fn subgroup_reads(&self, reads: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         let mut fragment_reads = Vec::new();
         let mut r1_reads = Vec::new();
@@ -979,7 +979,7 @@ impl VanillaUmiConsensusCaller {
         read_type: ReadType,
         group_reads: Vec<Vec<u8>>,
     ) -> Result<(bool, usize, Vec<Vec<u8>>)> {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         if group_reads.is_empty() {
             return Ok((false, 0, Vec::new()));
@@ -1221,7 +1221,7 @@ impl VanillaUmiConsensusCaller {
         depths: &[u16],
         errors: &[u16],
     ) {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         let read_name = format!("{}:{}", self.read_name_prefix, umi);
 
@@ -1298,7 +1298,7 @@ impl VanillaUmiConsensusCaller {
 
 impl ConsensusCaller for VanillaUmiConsensusCaller {
     fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         if records.is_empty() {
             return Ok(ConsensusOutput::default());
@@ -1383,7 +1383,7 @@ mod tests {
     use noodles::sam::alignment::record::cigar::op::Op;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence, data::field::Value};
-    use noodles_raw_bam::ParsedBamRecord;
+    use fgumi_raw_bam::ParsedBamRecord;
 
     /// Build a SAM header with a dummy reference sequence so that records
     /// with `reference_sequence_id(0)` or `mate_reference_sequence_id(0)` can be encoded.
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_downsampling() {
-        use noodles_raw_bam as bam_fields;
+        use fgumi_raw_bam as bam_fields;
 
         // Test that downsampling with a seed produces deterministic results
         let seed = 42u64;

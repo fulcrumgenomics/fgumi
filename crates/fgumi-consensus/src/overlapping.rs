@@ -10,7 +10,7 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER};
-use noodles_raw_bam;
+use fgumi_raw_bam;
 
 /// Check if a base is a no-call (N, n, or .)
 /// Matches htsjdk's SequenceUtil.isNoCall behavior
@@ -474,12 +474,12 @@ impl ReadAndRefPosIterator {
     ) -> Self {
         let rec_start_i32 = rec_start as i32;
         let rec_end_i32 = rec_end as i32;
-        let rec_len = noodles_raw_bam::l_seq(bam) as i32;
+        let rec_len = fgumi_raw_bam::l_seq(bam) as i32;
 
         let min_ref_pos = rec_start_i32.max(mate_start as i32);
         let max_ref_pos = rec_end_i32.min(mate_end as i32);
 
-        let raw_ops = noodles_raw_bam::get_cigar_ops(bam);
+        let raw_ops = fgumi_raw_bam::get_cigar_ops(bam);
         let cigar_ops: Vec<(u8, usize)> =
             raw_ops.iter().map(|&op| ((op & 0xF) as u8, (op >> 4) as usize)).collect();
 
@@ -756,26 +756,26 @@ impl OverlappingBasesConsensusCaller {
     /// Returns an error if raw BAM field extraction or CIGAR parsing fails.
     pub fn call_raw(&mut self, r1: &mut [u8], r2: &mut [u8]) -> Result<bool> {
         // Only process paired reads where both are mapped
-        if noodles_raw_bam::flags(r1) & noodles_raw_bam::flags::UNMAPPED != 0
-            || noodles_raw_bam::flags(r2) & noodles_raw_bam::flags::UNMAPPED != 0
+        if fgumi_raw_bam::flags(r1) & fgumi_raw_bam::flags::UNMAPPED != 0
+            || fgumi_raw_bam::flags(r2) & fgumi_raw_bam::flags::UNMAPPED != 0
         {
             return Ok(false);
         }
 
         // Must be on the same reference sequence
-        if noodles_raw_bam::ref_id(r1) != noodles_raw_bam::ref_id(r2) {
+        if fgumi_raw_bam::ref_id(r1) != fgumi_raw_bam::ref_id(r2) {
             return Ok(false);
         }
 
         // Verify both have alignment positions and ends
-        let Some(r1_start) = noodles_raw_bam::alignment_start_from_raw(r1) else {
+        let Some(r1_start) = fgumi_raw_bam::alignment_start_from_raw(r1) else {
             return Ok(false);
         };
-        let Some(r1_end) = noodles_raw_bam::alignment_end_from_raw(r1) else { return Ok(false) };
-        let Some(r2_start) = noodles_raw_bam::alignment_start_from_raw(r2) else {
+        let Some(r1_end) = fgumi_raw_bam::alignment_end_from_raw(r1) else { return Ok(false) };
+        let Some(r2_start) = fgumi_raw_bam::alignment_start_from_raw(r2) else {
             return Ok(false);
         };
-        let Some(r2_end) = noodles_raw_bam::alignment_end_from_raw(r2) else { return Ok(false) };
+        let Some(r2_end) = fgumi_raw_bam::alignment_end_from_raw(r2) else { return Ok(false) };
 
         // Create merge iterator that yields positions where both reads have aligned bases
         let overlap_iter =
@@ -788,10 +788,10 @@ impl OverlappingBasesConsensusCaller {
         }
 
         // Extract sequences and qualities for modification
-        let mut r1_seq = noodles_raw_bam::extract_sequence(r1);
-        let mut r2_seq = noodles_raw_bam::extract_sequence(r2);
-        let mut r1_quals: Vec<u8> = noodles_raw_bam::quality_scores_slice(r1).to_vec();
-        let mut r2_quals: Vec<u8> = noodles_raw_bam::quality_scores_slice(r2).to_vec();
+        let mut r1_seq = fgumi_raw_bam::extract_sequence(r1);
+        let mut r2_seq = fgumi_raw_bam::extract_sequence(r2);
+        let mut r1_quals: Vec<u8> = fgumi_raw_bam::quality_scores_slice(r1).to_vec();
+        let mut r2_quals: Vec<u8> = fgumi_raw_bam::quality_scores_slice(r2).to_vec();
         let mut modified = false;
 
         for pos in overlapping_positions {
@@ -839,16 +839,16 @@ impl OverlappingBasesConsensusCaller {
 
         // Write back modified sequences and qualities into the raw BAM records
         if modified {
-            let r1_seq_off = noodles_raw_bam::seq_offset(r1);
-            let r2_seq_off = noodles_raw_bam::seq_offset(r2);
+            let r1_seq_off = fgumi_raw_bam::seq_offset(r1);
+            let r2_seq_off = fgumi_raw_bam::seq_offset(r2);
             for (i, &base) in r1_seq.iter().enumerate() {
-                noodles_raw_bam::set_base(r1, r1_seq_off, i, base);
+                fgumi_raw_bam::set_base(r1, r1_seq_off, i, base);
             }
             for (i, &base) in r2_seq.iter().enumerate() {
-                noodles_raw_bam::set_base(r2, r2_seq_off, i, base);
+                fgumi_raw_bam::set_base(r2, r2_seq_off, i, base);
             }
-            let r1_qual_off = noodles_raw_bam::qual_offset(r1);
-            let r2_qual_off = noodles_raw_bam::qual_offset(r2);
+            let r1_qual_off = fgumi_raw_bam::qual_offset(r1);
+            let r2_qual_off = fgumi_raw_bam::qual_offset(r2);
             r1[r1_qual_off..r1_qual_off + r1_quals.len()].copy_from_slice(&r1_quals);
             r2[r2_qual_off..r2_qual_off + r2_quals.len()].copy_from_slice(&r2_quals);
         }
@@ -874,12 +874,12 @@ pub fn apply_overlapping_consensus_raw(
     let mut read_pairs: AHashMap<Vec<u8>, (Option<usize>, Option<usize>)> = AHashMap::new();
 
     for (idx, record) in records.iter().enumerate() {
-        let name = noodles_raw_bam::read_name(record).to_vec();
-        let flg = noodles_raw_bam::flags(record);
+        let name = fgumi_raw_bam::read_name(record).to_vec();
+        let flg = fgumi_raw_bam::flags(record);
 
-        if flg & noodles_raw_bam::flags::FIRST_SEGMENT != 0 {
+        if flg & fgumi_raw_bam::flags::FIRST_SEGMENT != 0 {
             read_pairs.entry(name).or_insert((None, None)).0 = Some(idx);
-        } else if flg & noodles_raw_bam::flags::LAST_SEGMENT != 0 {
+        } else if flg & fgumi_raw_bam::flags::LAST_SEGMENT != 0 {
             read_pairs.entry(name).or_insert((None, None)).1 = Some(idx);
         }
     }
@@ -1523,8 +1523,8 @@ mod tests {
         assert!(result);
 
         // Check that qualities were summed (30 + 20 = 50)
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 50);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 50);
     }
 
     #[test]
@@ -1542,8 +1542,8 @@ mod tests {
         assert!(result);
 
         // Max quality used (max(30, 20) = 30)
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 30);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 30);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 30);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 30);
     }
 
     #[test]
@@ -1561,8 +1561,8 @@ mod tests {
         assert!(result);
 
         // Qualities unchanged
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 30);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 20);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 30);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 20);
     }
 
     #[test]
@@ -1580,12 +1580,12 @@ mod tests {
         assert!(result);
 
         // Higher quality base (A from r1) chosen, qual = 30 - 20 = 10
-        let r1_seq = noodles_raw_bam::extract_sequence(&r1);
-        let r2_seq = noodles_raw_bam::extract_sequence(&r2);
+        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
+        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
         assert_eq!(r1_seq[0], b'A');
         assert_eq!(r2_seq[0], b'A');
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 10);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 10);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 10);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 10);
     }
 
     #[test]
@@ -1603,12 +1603,12 @@ mod tests {
         assert!(result);
 
         // Both bases masked to N with quality 2
-        let r1_seq = noodles_raw_bam::extract_sequence(&r1);
-        let r2_seq = noodles_raw_bam::extract_sequence(&r2);
+        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
+        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
         assert_eq!(r1_seq[0], b'N');
         assert_eq!(r2_seq[0], b'N');
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
     }
 
     #[test]
@@ -1626,12 +1626,12 @@ mod tests {
         assert!(result);
 
         // Only lower quality base (r2) masked
-        let r1_seq = noodles_raw_bam::extract_sequence(&r1);
-        let r2_seq = noodles_raw_bam::extract_sequence(&r2);
+        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
+        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
         assert_eq!(r1_seq[0], b'A'); // Unchanged
         assert_eq!(r2_seq[0], b'N'); // Masked
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 30); // Unchanged
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 2); // Masked
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 30); // Unchanged
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2); // Masked
     }
 
     #[test]
@@ -1649,8 +1649,8 @@ mod tests {
         assert!(result);
 
         // Only lower quality base (r1) masked
-        let r1_seq = noodles_raw_bam::extract_sequence(&r1);
-        let r2_seq = noodles_raw_bam::extract_sequence(&r2);
+        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
+        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
         assert_eq!(r1_seq[0], b'N'); // Masked
         assert_eq!(r2_seq[0], b'G'); // Unchanged
     }
@@ -1670,12 +1670,12 @@ mod tests {
         assert!(result);
 
         // Both masked when qualities are equal
-        let r1_seq = noodles_raw_bam::extract_sequence(&r1);
-        let r2_seq = noodles_raw_bam::extract_sequence(&r2);
+        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
+        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
         assert_eq!(r1_seq[0], b'N');
         assert_eq!(r2_seq[0], b'N');
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
     }
 
     #[test]
@@ -1693,12 +1693,12 @@ mod tests {
         assert!(result);
 
         // Both masked when qualities are equal
-        let r1_seq = noodles_raw_bam::extract_sequence(&r1);
-        let r2_seq = noodles_raw_bam::extract_sequence(&r2);
+        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
+        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
         assert_eq!(r1_seq[0], b'N');
         assert_eq!(r2_seq[0], b'N');
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
     }
 
     #[test]
@@ -1728,7 +1728,7 @@ mod tests {
         let cigar = [cigar_op(4, 0)]; // 4M
         let mut r1 = make_raw_bam(
             b"rea",
-            noodles_raw_bam::flags::UNMAPPED,
+            fgumi_raw_bam::flags::UNMAPPED,
             0,
             99,
             &cigar,
@@ -1772,7 +1772,7 @@ mod tests {
         assert!(result);
 
         // Quality capped at 93
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 93);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 93);
     }
 
     #[test]
@@ -1833,8 +1833,8 @@ mod tests {
         assert_eq!(caller.stats().bases_agreeing, 2); // GT == GT
 
         // Check quality sums at overlapping positions
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[2], 50); // 30 + 20
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[3], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[2], 50); // 30 + 20
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[3], 50);
     }
 
     #[test]
@@ -1856,10 +1856,10 @@ mod tests {
         assert_eq!(caller.stats().bases_agreeing, 4); // ACGT == ACGT
 
         // Check quality sums at overlapping positions
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[2], 50); // 30 + 20
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[3], 50);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[4], 50);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[5], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[2], 50); // 30 + 20
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[3], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[4], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[5], 50);
     }
 
     #[test]
@@ -1911,8 +1911,8 @@ mod tests {
         assert!(result);
 
         // Quality difference is 1, but minimum is 2
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
     }
 
     /// Verify that `call_raw` produces the same results as `call` for agreement.
@@ -1939,8 +1939,8 @@ mod tests {
         caller_raw.call_raw(&mut raw_r1, &mut raw_r2).unwrap();
 
         // Compare results
-        assert_eq!(rb_r1.quality_scores().as_ref(), noodles_raw_bam::quality_scores_slice(&raw_r1));
-        assert_eq!(rb_r2.quality_scores().as_ref(), noodles_raw_bam::quality_scores_slice(&raw_r2));
+        assert_eq!(rb_r1.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r1));
+        assert_eq!(rb_r2.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r2));
         assert_eq!(caller_buf.stats().overlapping_bases, caller_raw.stats().overlapping_bases);
         assert_eq!(caller_buf.stats().bases_agreeing, caller_raw.stats().bases_agreeing);
         assert_eq!(caller_buf.stats().bases_corrected, caller_raw.stats().bases_corrected);
@@ -1972,14 +1972,14 @@ mod tests {
         // Compare sequences
         let buf_r1_seq: Vec<u8> = rb_r1.sequence().as_ref().to_vec();
         let buf_r2_seq: Vec<u8> = rb_r2.sequence().as_ref().to_vec();
-        let raw_r1_seq = noodles_raw_bam::extract_sequence(&raw_r1);
-        let raw_r2_seq = noodles_raw_bam::extract_sequence(&raw_r2);
+        let raw_r1_seq = fgumi_raw_bam::extract_sequence(&raw_r1);
+        let raw_r2_seq = fgumi_raw_bam::extract_sequence(&raw_r2);
         assert_eq!(buf_r1_seq, raw_r1_seq);
         assert_eq!(buf_r2_seq, raw_r2_seq);
 
         // Compare qualities
-        assert_eq!(rb_r1.quality_scores().as_ref(), noodles_raw_bam::quality_scores_slice(&raw_r1));
-        assert_eq!(rb_r2.quality_scores().as_ref(), noodles_raw_bam::quality_scores_slice(&raw_r2));
+        assert_eq!(rb_r1.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r1));
+        assert_eq!(rb_r2.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r2));
 
         // Compare stats
         assert_eq!(caller_buf.stats().overlapping_bases, caller_raw.stats().overlapping_bases);
@@ -2000,18 +2000,18 @@ mod tests {
 
         // R1 (first segment): flag = PAIRED | FIRST_SEGMENT
         let cigar = [cigar_op(4, 0)]; // 4M
-        let r1_flag = noodles_raw_bam::flags::PAIRED | noodles_raw_bam::flags::FIRST_SEGMENT;
+        let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
         let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
         // R2 (last segment): flag = PAIRED | LAST_SEGMENT
-        let r2_flag = noodles_raw_bam::flags::PAIRED | noodles_raw_bam::flags::LAST_SEGMENT;
+        let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
         let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
         let mut records = vec![r1, r2];
         apply_overlapping_consensus_raw(&mut records, &mut caller).unwrap();
 
         // Check that qualities were summed (30 + 20 = 50)
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&records[0])[0], 50);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&records[1])[0], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[0])[0], 50);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[1])[0], 50);
         assert!(caller.stats().overlapping_bases > 0);
     }
 
@@ -2024,18 +2024,18 @@ mod tests {
 
         // Only FIRST_SEGMENT, no matching LAST_SEGMENT for this name
         let cigar = [cigar_op(4, 0)]; // 4M
-        let r1_flag = noodles_raw_bam::flags::PAIRED | noodles_raw_bam::flags::FIRST_SEGMENT;
+        let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
         let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
         // Different name so no pairing occurs
-        let r2_flag = noodles_raw_bam::flags::PAIRED | noodles_raw_bam::flags::LAST_SEGMENT;
+        let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
         let r2 = make_raw_bam(b"reb", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
         let mut records = vec![r1, r2];
         apply_overlapping_consensus_raw(&mut records, &mut caller).unwrap();
 
         // Qualities unchanged because no matching pair
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&records[0])[0], 30);
-        assert_eq!(noodles_raw_bam::quality_scores_slice(&records[1])[0], 20);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[0])[0], 30);
+        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[1])[0], 20);
         assert_eq!(caller.stats().overlapping_bases, 0);
     }
 
@@ -2048,9 +2048,9 @@ mod tests {
         );
 
         let cigar = [cigar_op(4, 0)]; // 4M
-        let r2_flag = noodles_raw_bam::flags::PAIRED | noodles_raw_bam::flags::LAST_SEGMENT;
+        let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
         let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
-        let r1_flag = noodles_raw_bam::flags::PAIRED | noodles_raw_bam::flags::FIRST_SEGMENT;
+        let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
         let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
 
         // R2 at index 0, R1 at index 1
@@ -2060,8 +2060,8 @@ mod tests {
         // Both should have been consensus-called
         assert!(caller.stats().overlapping_bases > 0);
         assert_eq!(
-            noodles_raw_bam::quality_scores_slice(&records[0])[0],
-            noodles_raw_bam::quality_scores_slice(&records[1])[0]
+            fgumi_raw_bam::quality_scores_slice(&records[0])[0],
+            fgumi_raw_bam::quality_scores_slice(&records[1])[0]
         );
     }
 
