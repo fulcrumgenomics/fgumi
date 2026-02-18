@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "fgumi"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Nils Homer <nils@fulcrumgenomics.com>", "Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "High-performance tools for UMI-tagged sequencing data: extraction, grouping, and consensus calling"
 repository = "https://github.com/fulcrumgenomics/fgumi"
