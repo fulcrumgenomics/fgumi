@@ -23,7 +23,7 @@
 //! 4. **Spill phase**: Compress and write sorted chunk to temp file
 //! 5. **Merge phase**: K-way merge of sorted temp files using min-heap
 
-pub use noodles_raw_bam as bam_fields;
+pub use fgumi_raw_bam as bam_fields;
 pub mod external;
 pub mod inline_buffer;
 pub mod keys;

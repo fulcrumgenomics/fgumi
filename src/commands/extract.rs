@@ -31,10 +31,10 @@ use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_raw_bam::UnmappedBamRecordBuilder;
+use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
-use noodles_raw_bam::UnmappedBamRecordBuilder;
-use noodles_raw_bam::fields::flags;
 
 #[cfg(test)]
 use fgumi_lib::bam_io::create_bam_reader;

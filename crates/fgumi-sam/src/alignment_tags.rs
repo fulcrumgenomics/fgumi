@@ -228,7 +228,7 @@ pub fn regenerate_alignment_tags(
 // Raw-byte alignment tag regeneration
 // ============================================================================
 
-use noodles_raw_bam;
+use fgumi_raw_bam;
 
 /// Regenerates NM, UQ, and MD tags for a raw BAM record after base masking.
 ///
@@ -253,25 +253,25 @@ pub fn regenerate_alignment_tags_raw(
     header: &Header,
     reference: &impl ReferenceProvider,
 ) -> Result<bool> {
-    if record.len() < noodles_raw_bam::MIN_BAM_RECORD_LEN {
+    if record.len() < fgumi_raw_bam::MIN_BAM_RECORD_LEN {
         anyhow::bail!(
             "BAM record too short ({} bytes, minimum {})",
             record.len(),
-            noodles_raw_bam::MIN_BAM_RECORD_LEN
+            fgumi_raw_bam::MIN_BAM_RECORD_LEN
         );
     }
-    let flg = noodles_raw_bam::flags(record);
+    let flg = fgumi_raw_bam::flags(record);
 
     // For unmapped reads, remove alignment tags
-    if (flg & noodles_raw_bam::flags::UNMAPPED) != 0 {
-        noodles_raw_bam::remove_tag(record, b"NM");
-        noodles_raw_bam::remove_tag(record, b"UQ");
-        noodles_raw_bam::remove_tag(record, b"MD");
+    if (flg & fgumi_raw_bam::flags::UNMAPPED) != 0 {
+        fgumi_raw_bam::remove_tag(record, b"NM");
+        fgumi_raw_bam::remove_tag(record, b"UQ");
+        fgumi_raw_bam::remove_tag(record, b"MD");
         return Ok(false);
     }
 
     // Get reference sequence ID and look up name in header
-    let ref_seq_id = noodles_raw_bam::ref_id(record);
+    let ref_seq_id = fgumi_raw_bam::ref_id(record);
     if ref_seq_id < 0 {
         return Ok(false);
     }
@@ -281,7 +281,7 @@ pub fn regenerate_alignment_tags_raw(
         .context("Reference sequence ID not found in header")?;
     let ref_name = std::str::from_utf8(ref_name_bytes.as_ref())?;
 
-    let alignment_start_0based = noodles_raw_bam::pos(record);
+    let alignment_start_0based = fgumi_raw_bam::pos(record);
     if alignment_start_0based < 0 {
         anyhow::bail!("Invalid alignment start position: {alignment_start_0based}");
     }
@@ -289,7 +289,7 @@ pub fn regenerate_alignment_tags_raw(
         .context("Invalid alignment start position")?;
 
     // Get CIGAR ops (one small Vec allocation - typically 1-5 ops)
-    let cigar_ops = noodles_raw_bam::get_cigar_ops(record);
+    let cigar_ops = fgumi_raw_bam::get_cigar_ops(record);
 
     // Calculate reference span from CIGAR ops
     let ref_span: usize = cigar_ops
@@ -306,9 +306,9 @@ pub fn regenerate_alignment_tags_raw(
 
     // Handle edge case: CIGAR with no reference-consuming operations
     if ref_span == 0 {
-        noodles_raw_bam::update_int_tag(record, b"NM", 0);
-        noodles_raw_bam::update_int_tag(record, b"UQ", 0);
-        noodles_raw_bam::update_string_tag(record, b"MD", b"0");
+        fgumi_raw_bam::update_int_tag(record, b"NM", 0);
+        fgumi_raw_bam::update_int_tag(record, b"UQ", 0);
+        fgumi_raw_bam::update_string_tag(record, b"MD", b"0");
         return Ok(false);
     }
 
@@ -318,9 +318,9 @@ pub fn regenerate_alignment_tags_raw(
     let all_ref_bases = reference.fetch(ref_name, ref_start, ref_end)?;
 
     // Get seq/qual offsets and validate bounds
-    let seq_off = noodles_raw_bam::seq_offset(record);
-    let qual_off = noodles_raw_bam::qual_offset(record);
-    let l_seq = noodles_raw_bam::l_seq(record) as usize;
+    let seq_off = fgumi_raw_bam::seq_offset(record);
+    let qual_off = fgumi_raw_bam::qual_offset(record);
+    let l_seq = fgumi_raw_bam::l_seq(record) as usize;
     let seq_bytes = l_seq.div_ceil(2);
     if seq_off + seq_bytes > record.len() || qual_off + l_seq > record.len() {
         anyhow::bail!("Truncated BAM record: seq/qual extends past record end");
@@ -349,9 +349,9 @@ pub fn regenerate_alignment_tags_raw(
                 }
                 let ref_bases = &all_ref_bases[ref_offset..ref_offset + op_len];
                 for &ref_base in ref_bases {
-                    let seq_base = noodles_raw_bam::BAM_BASE_TO_ASCII
-                        [noodles_raw_bam::get_base(record, seq_off, seq_pos) as usize];
-                    let qual_score = noodles_raw_bam::get_qual(record, qual_off, seq_pos);
+                    let seq_base = fgumi_raw_bam::BAM_BASE_TO_ASCII
+                        [fgumi_raw_bam::get_base(record, seq_off, seq_pos) as usize];
+                    let qual_score = fgumi_raw_bam::get_qual(record, qual_off, seq_pos);
 
                     if seq_base == b'N' {
                         // Masked base: count as mismatch
@@ -417,9 +417,9 @@ pub fn regenerate_alignment_tags_raw(
     md_string.push_str(&match_count.to_string());
 
     // Update tags
-    noodles_raw_bam::update_int_tag(record, b"NM", nm);
-    noodles_raw_bam::update_int_tag(record, b"UQ", uq.min(i32::MAX as u32) as i32);
-    noodles_raw_bam::update_string_tag(record, b"MD", md_string.as_bytes());
+    fgumi_raw_bam::update_int_tag(record, b"NM", nm);
+    fgumi_raw_bam::update_int_tag(record, b"UQ", uq.min(i32::MAX as u32) as i32);
+    fgumi_raw_bam::update_string_tag(record, b"MD", md_string.as_bytes());
 
     Ok(true)
 }
@@ -919,7 +919,7 @@ mod tests {
         let raw = encode_record_buf_to_raw(&header, &record)?;
 
         // Truncate to remove quality scores (but keep seq)
-        let qual_off = noodles_raw_bam::qual_offset(&raw);
+        let qual_off = fgumi_raw_bam::qual_offset(&raw);
         let mut truncated = raw[..qual_off].to_vec();
 
         let result = regenerate_alignment_tags_raw(&mut truncated, &header, &reference);
@@ -958,12 +958,12 @@ mod tests {
         regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
 
         // Read tags back from raw bytes
-        let aux_off = noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
-        let nm = noodles_raw_bam::find_int_tag(aux, b"NM");
-        let uq = noodles_raw_bam::find_int_tag(aux, b"UQ");
-        let md = noodles_raw_bam::find_string_tag(aux, b"MD");
+        let nm = fgumi_raw_bam::find_int_tag(aux, b"NM");
+        let uq = fgumi_raw_bam::find_int_tag(aux, b"UQ");
+        let md = fgumi_raw_bam::find_string_tag(aux, b"MD");
 
         // Verify raw path produces same results as RecordBuf path
         assert_eq!(nm, Some(1i64), "NM should be 1 (one mismatch)");
@@ -986,12 +986,12 @@ mod tests {
         let mut raw = encode_record_buf_to_raw(&header, &record_buf)?;
         regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
 
-        let aux_off = noodles_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
-        let nm = noodles_raw_bam::find_int_tag(aux, b"NM");
-        let uq = noodles_raw_bam::find_int_tag(aux, b"UQ");
-        let md = noodles_raw_bam::find_string_tag(aux, b"MD");
+        let nm = fgumi_raw_bam::find_int_tag(aux, b"NM");
+        let uq = fgumi_raw_bam::find_int_tag(aux, b"UQ");
+        let md = fgumi_raw_bam::find_string_tag(aux, b"MD");
 
         assert_eq!(nm, Some(1i64), "NM should be 1 (masked base = mismatch)");
         assert_eq!(uq, Some(0i64), "UQ should be 0 (masked base quality is 0)");

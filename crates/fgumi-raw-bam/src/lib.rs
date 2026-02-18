@@ -14,7 +14,7 @@ pub mod testutil;
 #[cfg(feature = "noodles")]
 pub mod noodles_compat;
 
-// Flat re-exports — callers use noodles_raw_bam::flags() etc.
+// Flat re-exports — callers use fgumi_raw_bam::flags() etc.
 pub use builder::*;
 pub use cigar::*;
 pub use fields::*;

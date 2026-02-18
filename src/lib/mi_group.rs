@@ -1965,8 +1965,8 @@ mod tests {
             10,
             |bam: &[u8]| {
                 // Check flag field
-                let flag = noodles_raw_bam::flags(bam);
-                flag & noodles_raw_bam::flags::SECONDARY == 0 // keep if NOT secondary
+                let flag = fgumi_raw_bam::flags(bam);
+                flag & fgumi_raw_bam::flags::SECONDARY == 0 // keep if NOT secondary
             },
             |raw: &[u8]| {
                 let s = String::from_utf8_lossy(raw);

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/noodles-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-umi", "crates/fgumi-consensus"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-umi", "crates/fgumi-consensus"]
 resolver = "2"
 
 [package]
@@ -61,13 +61,13 @@ wide = "1.1"
 rand_distr = "0.6"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
-noodles-raw-bam = { path = "crates/noodles-raw-bam", features = ["noodles"] }
-fgumi-dna = { path = "crates/fgumi-dna" }
-fgumi-bgzf = { path = "crates/fgumi-bgzf" }
-fgumi-metrics = { path = "crates/fgumi-metrics" }
-fgumi-sam = { path = "crates/fgumi-sam" }
-fgumi-umi = { path = "crates/fgumi-umi" }
-fgumi-consensus = { path = "crates/fgumi-consensus", default-features = false }
+fgumi-raw-bam = { version = "0.1.0", path = "crates/fgumi-raw-bam", features = ["noodles"] }
+fgumi-dna = { version = "0.1.0", path = "crates/fgumi-dna" }
+fgumi-bgzf = { version = "0.1.0", path = "crates/fgumi-bgzf" }
+fgumi-metrics = { version = "0.1.0", path = "crates/fgumi-metrics" }
+fgumi-sam = { version = "0.1.0", path = "crates/fgumi-sam" }
+fgumi-umi = { version = "0.1.0", path = "crates/fgumi-umi" }
+fgumi-consensus = { version = "0.1.0", path = "crates/fgumi-consensus", default-features = false }
 
 [features]
 default = ["simplex", "duplex", "codec"]
@@ -90,7 +90,7 @@ stress-tests = []
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
-noodles-raw-bam = { path = "crates/noodles-raw-bam", features = ["test-utils"] }
+fgumi-raw-bam = { version = "0.1.0", path = "crates/fgumi-raw-bam", features = ["test-utils"] }
 
 [[bench]]
 name = "core_functions"

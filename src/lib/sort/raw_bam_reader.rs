@@ -32,7 +32,7 @@ use std::io::{self, BufReader, Read};
 /// Number of BGZF blocks to read per batch.
 const BLOCKS_PER_BATCH: usize = 64;
 
-use noodles_raw_bam::BAM_MAGIC;
+use fgumi_raw_bam::BAM_MAGIC;
 
 /// A raw BAM record reader that reads directly from BGZF blocks.
 ///
