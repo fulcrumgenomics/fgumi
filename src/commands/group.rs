@@ -758,6 +758,24 @@ pub struct GroupReadsByUmi {
     #[arg(long = "allow-unmapped")]
     pub allow_unmapped: bool,
 
+    /// Enable parallel UMI assignment for position groups with at least this many
+    /// templates. Useful for amplicon data where few position groups contain
+    /// millions of reads.
+    ///
+    /// When set, Edit, Adjacency, and Paired strategies use parallel edge
+    /// discovery (via rayon) for groups exceeding this size. Identity
+    /// strategy is unaffected (already O(n)).
+    ///
+    /// WARNING: The parallel assigner uses rayon's thread pool, which is
+    /// separate from the pipeline's worker threads (--threads). This may
+    /// cause thread over-subscription, where total active threads exceed
+    /// available CPU cores. For amplicon data (few large groups), pipeline
+    /// threads are mostly idle so over-subscription is minimal. For mixed
+    /// workloads with many active pipeline threads, brief over-subscription
+    /// during edge discovery is possible.
+    #[arg(long = "parallel-group-min-templates")]
+    pub parallel_group_min_templates: Option<usize>,
+
     /// The UMI assignment strategy
     #[arg(short = 's', long = "strategy", value_enum)]
     pub strategy: Strategy,
@@ -996,6 +1014,7 @@ impl Command for GroupReadsByUmi {
         let strategy = self.strategy;
         let index_threshold = self.index_threshold;
         let allow_unmapped = self.allow_unmapped;
+        let parallel_group_min_templates = self.parallel_group_min_templates;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
         // Setup comprehensive memory monitoring first if debug mode is enabled
@@ -1195,26 +1214,16 @@ impl Command for GroupReadsByUmi {
                 }
 
                 // Create UMI assigner for this group
-                // Use parallel assigner when allow_unmapped is enabled (large single groups)
-                let assigner: Box<dyn UmiAssigner> = if allow_unmapped {
-                    match strategy {
-                        Strategy::Identity => {
-                            Box::new(ParallelIdentityAssigner::new(num_threads))
-                        }
-                        Strategy::Edit => {
-                            Box::new(ParallelEditAssigner::new(effective_edits, num_threads))
-                        }
-                        Strategy::Adjacency => {
-                            Box::new(ParallelAdjacencyAssigner::new(effective_edits, num_threads))
-                        }
-                        Strategy::Paired => {
-                            Box::new(ParallelPairedAssigner::new(effective_edits, num_threads))
-                        }
-                    }
-                } else {
-                    // Use existing sequential assigner for mapped data
-                    strategy.new_assigner_full(effective_edits, 1, index_threshold)
-                };
+                let use_parallel = allow_unmapped
+                    || parallel_group_min_templates
+                        .is_some_and(|t| filtered_templates.len() >= t);
+                let assigner = create_umi_assigner(
+                    strategy,
+                    effective_edits,
+                    index_threshold,
+                    num_threads,
+                    use_parallel,
+                );
 
                 // Assign UMI groups using the unified _impl function
                 let mut templates = filtered_templates;
@@ -1482,6 +1491,30 @@ impl Command for GroupReadsByUmi {
     }
 }
 
+/// Create a UMI assigner, choosing the parallel variant when `use_parallel` is true.
+///
+/// Identity strategy always uses the sequential assigner (already O(n)).
+fn create_umi_assigner(
+    strategy: Strategy,
+    effective_edits: u32,
+    index_threshold: usize,
+    num_threads: usize,
+    use_parallel: bool,
+) -> Box<dyn UmiAssigner> {
+    if use_parallel {
+        match strategy {
+            Strategy::Identity => Box::new(ParallelIdentityAssigner::new(num_threads)),
+            Strategy::Edit => Box::new(ParallelEditAssigner::new(effective_edits, num_threads)),
+            Strategy::Adjacency => {
+                Box::new(ParallelAdjacencyAssigner::new(effective_edits, num_threads))
+            }
+            Strategy::Paired => Box::new(ParallelPairedAssigner::new(effective_edits, num_threads)),
+        }
+    } else {
+        strategy.new_assigner_full(effective_edits, 1, index_threshold)
+    }
+}
+
 impl GroupReadsByUmi {
     /// Execute in single-threaded mode for `--threads 1`.
     ///
@@ -1547,7 +1580,8 @@ impl GroupReadsByUmi {
                     self.strategy,
                     effective_edits,
                     self.index_threshold,
-                    1, // Single-threaded mode
+                    std::thread::available_parallelism().map_or(1, |n| n.get()),
+                    self.parallel_group_min_templates,
                     raw_tag,
                     assign_tag_bytes,
                     &mut total_filter_metrics,
@@ -1569,7 +1603,8 @@ impl GroupReadsByUmi {
                 self.strategy,
                 effective_edits,
                 self.index_threshold,
-                1, // Single-threaded mode
+                std::thread::available_parallelism().map_or(1, |n| n.get()),
+                self.parallel_group_min_templates,
                 raw_tag,
                 assign_tag_bytes,
                 &mut total_filter_metrics,
@@ -1625,6 +1660,7 @@ impl GroupReadsByUmi {
         effective_edits: u32,
         index_threshold: usize,
         threads: usize,
+        parallel_group_min_templates: Option<usize>,
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
@@ -1652,20 +1688,10 @@ impl GroupReadsByUmi {
         }
 
         // Create UMI assigner
-        // Use parallel assigner when allow_unmapped is enabled (large single groups)
-        let assigner: Box<dyn UmiAssigner> = if filter_config.allow_unmapped {
-            match strategy {
-                Strategy::Identity => Box::new(ParallelIdentityAssigner::new(threads)),
-                Strategy::Edit => Box::new(ParallelEditAssigner::new(effective_edits, threads)),
-                Strategy::Adjacency => {
-                    Box::new(ParallelAdjacencyAssigner::new(effective_edits, threads))
-                }
-                Strategy::Paired => Box::new(ParallelPairedAssigner::new(effective_edits, threads)),
-            }
-        } else {
-            // Use existing sequential assigner for mapped data
-            strategy.new_assigner_full(effective_edits, 1, index_threshold)
-        };
+        let use_parallel = filter_config.allow_unmapped
+            || parallel_group_min_templates.is_some_and(|t| filtered_templates.len() >= t);
+        let assigner =
+            create_umi_assigner(strategy, effective_edits, index_threshold, threads, use_parallel);
 
         // Assign UMI groups
         let mut templates = filtered_templates;
@@ -1833,6 +1859,7 @@ mod tests {
                 queue_memory_limit_mb: None,
             },
             allow_unmapped: false,
+            parallel_group_min_templates: None,
             #[cfg(feature = "memory-debug")]
             debug_memory: false,
             #[cfg(feature = "memory-debug")]
@@ -4826,6 +4853,83 @@ mod tests {
         // All records with same UMI should be in one group
         let unique_groups = count_unique_mi_tags(&output_records);
         assert_eq!(unique_groups, 1, "All records with same UMI should be in 1 group");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_group_min_templates_activates_for_mapped_data() -> Result<()> {
+        let mut records = Vec::new();
+
+        // Two mapped pairs with same UMI at same position -> should be grouped
+        let (r1_a, r2_a) = build_test_pair("read_a", 0, 100, 300, 60, 60, "AAAAAA");
+        let (r1_b, r2_b) = build_test_pair("read_b", 0, 100, 300, 60, 60, "AAAAAA");
+        records.push(r1_a);
+        records.push(r2_a);
+        records.push(r1_b);
+        records.push(r2_b);
+
+        // One mapped pair with different UMI -> separate group
+        let (r1_c, r2_c) = build_test_pair("read_c", 0, 100, 300, 60, 60, "TTTTTT");
+        records.push(r1_c);
+        records.push(r2_c);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        // Set threshold to 1 so parallel path activates for any group
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            parallel_group_min_templates: Some(1),
+            ..test_group_cmd(Strategy::Edit, 1)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 6, "Should have all 6 records (3 pairs)");
+
+        // 2 unique MI groups: 2 reads with AAAAAA, 1 with TTTTTT
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 2, "Should have 2 unique UMI groups");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_group_min_templates_none_uses_sequential() -> Result<()> {
+        let mut records = Vec::new();
+
+        // Two mapped pairs with same UMI at same position -> should be grouped
+        let (r1_a, r2_a) = build_test_pair("read_a", 0, 100, 300, 60, 60, "AAAAAA");
+        let (r1_b, r2_b) = build_test_pair("read_b", 0, 100, 300, 60, 60, "AAAAAA");
+        records.push(r1_a);
+        records.push(r2_a);
+        records.push(r1_b);
+        records.push(r2_b);
+
+        // One mapped pair with different UMI -> separate group
+        let (r1_c, r2_c) = build_test_pair("read_c", 0, 100, 300, 60, 60, "TTTTTT");
+        records.push(r1_c);
+        records.push(r2_c);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        // No parallel threshold -> sequential path
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            ..test_group_cmd(Strategy::Edit, 1)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 6, "Should have all 6 records (3 pairs)");
+
+        // Same result regardless of parallel/sequential
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 2, "Should have 2 unique UMI groups");
 
         Ok(())
     }
