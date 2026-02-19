@@ -12,3 +12,5 @@ pub use fgumi_umi::assigner::{
     AdjacencyUmiAssigner, IdentityUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner, Strategy,
     Umi, UmiAssigner,
 };
+
+pub mod parallel_assigner;
