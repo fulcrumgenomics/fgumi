@@ -8,7 +8,7 @@ repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [dependencies]
-noodles = { version = "0.104.0", features = ["bam", "sam", "core"] }
+noodles = { version = "0.105.0", features = ["bam", "sam", "core"] }
 fgumi-raw-bam = { version = "0.1.0", path = "../fgumi-raw-bam", features = ["noodles"] }
 bstr = "1.12.1"
 log = "0"

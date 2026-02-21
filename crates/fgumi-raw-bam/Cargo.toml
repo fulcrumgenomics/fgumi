@@ -8,8 +8,8 @@ repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [dependencies]
-noodles = { version = "0.104.0", features = ["bam", "sam"], optional = true }
-anyhow = { version = "1.0.100", optional = true }
+noodles = { version = "0.105.0", features = ["bam", "sam"], optional = true }
+anyhow = { version = "1.0.102", optional = true }
 
 [features]
 default = []

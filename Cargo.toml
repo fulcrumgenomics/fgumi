@@ -21,13 +21,13 @@ rust-version = "1.87.0"
 clap = { version = "4", features = ["derive", "string"] }
 log = "0"
 thiserror = "2"
-noodles = { version = "0.104.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
-noodles-bgzf = { version = "0.45.0", features = ["libdeflate"] }
+noodles = { version = "0.105.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
 mimalloc = { version = "0.1.48", default-features = false }
 libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
-anyhow = "1.0.100"
+anyhow = "1.0.102"
 read-structure = "0.2.0"
 seq_io = "0.3.4"
 bstr = "1.12.1"
@@ -55,7 +55,7 @@ rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"
 bytemuck = { version = "1.14", features = ["derive"] }
-noodles-csi = "0.53.0"
+noodles-csi = "0.54.0"
 bgzf = "0.3.0"
 wide = "1.1"
 rand_distr = "0.6"
