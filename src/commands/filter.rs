@@ -106,9 +106,10 @@ pub struct Filter {
     #[command(flatten)]
     pub io: BamIoOptions,
 
-    /// Reference FASTA file for NM/UQ/MD tag regeneration
+    /// Reference FASTA file for NM/UQ/MD tag regeneration.
+    /// If not provided, alignment tag regeneration (NM/UQ/MD) is skipped.
     #[arg(short = 'r', long = "ref")]
-    pub reference: PathBuf,
+    pub reference: Option<PathBuf>,
 
     /// Minimum number of raw reads to support a single-strand consensus base/read.
     /// For duplex: provide 1-3 values for [duplex, single-strand consensus, single-strand consensus]
@@ -266,7 +267,9 @@ impl Command for Filter {
         // Validate inputs
         validate_file_exists(&self.io.input, "Input BAM")?;
 
-        validate_file_exists(&self.reference, "Reference FASTA")?;
+        if let Some(ref reference) = self.reference {
+            validate_file_exists(reference, "Reference FASTA")?;
+        }
 
         // Validate parameter counts (1-3 values for duplex support)
         self.validate_parameters()?;
@@ -276,7 +279,10 @@ impl Command for Filter {
         info!("Starting Filter");
         info!("Input: {}", self.io.input.display());
         info!("Output: {}", self.io.output.display());
-        info!("Reference: {}", self.reference.display());
+        match &self.reference {
+            Some(r) => info!("Reference: {}", r.display()),
+            None => info!("Reference: <none> (tag regeneration disabled)"),
+        }
         info!("Min reads: {:?}", self.min_reads);
         info!("Max read error rate: {:?}", self.max_read_error_rate);
         info!("Max base error rate: {:?}", self.max_base_error_rate);
@@ -336,11 +342,16 @@ impl Filter {
             self.max_no_call_fraction,
         ));
 
-        info!("Loading reference genome into memory...");
-        let ref_load_start = Instant::now();
-        let reference: Option<Arc<ReferenceReader>> =
-            Some(Arc::new(ReferenceReader::new(&self.reference)?));
-        info!("Reference loaded in {:.1}s", ref_load_start.elapsed().as_secs_f64());
+        let reference: Option<Arc<ReferenceReader>> = match &self.reference {
+            Some(ref_path) => {
+                info!("Loading reference genome into memory...");
+                let ref_load_start = Instant::now();
+                let r = Arc::new(ReferenceReader::new(ref_path)?);
+                info!("Reference loaded in {:.1}s", ref_load_start.elapsed().as_secs_f64());
+                Some(r)
+            }
+            None => None,
+        };
 
         let collected_metrics: Arc<SegQueue<CollectedFilterMetrics>> = Arc::new(SegQueue::new());
         let progress_counter = Arc::new(AtomicU64::new(0));
@@ -660,6 +671,18 @@ impl Filter {
         min_mean_base_quality: Option<f64>,
         max_no_call_fraction: f64,
     ) -> Result<(u64, bool)> {
+        // Fail fast if we encounter a mapped read without a reference, since masking
+        // can invalidate NM/UQ/MD tags and we have no way to regenerate them.
+        if reference.is_none() {
+            let flags = bam_fields::flags(record);
+            if (flags & bam_fields::flags::UNMAPPED) == 0 {
+                bail!(
+                    "--ref is required when filtering mapped reads \
+                     to keep NM/UQ/MD tags consistent"
+                );
+            }
+        }
+
         if reverse_tags {
             reverse_per_base_tags_raw(record)?;
         }
@@ -898,7 +921,7 @@ mod tests {
     fn create_filter_with_paths(input: PathBuf, output: PathBuf, reference: PathBuf) -> Filter {
         Filter {
             io: BamIoOptions { input, output },
-            reference,
+            reference: Some(reference),
             min_reads: vec![1],
             max_read_error_rate: vec![0.025],
             max_base_error_rate: vec![0.1],
@@ -961,7 +984,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -992,7 +1015,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1021,7 +1044,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1052,7 +1075,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![1, 2, 3, 4], // Too many values
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1081,7 +1104,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![1, 10], // Invalid: AB > CC
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1446,7 +1469,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1481,7 +1504,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1514,7 +1537,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1544,7 +1567,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1574,7 +1597,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1603,7 +1626,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1632,7 +1655,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1661,7 +1684,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1690,7 +1713,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1719,7 +1742,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1748,7 +1771,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.01],
             max_base_error_rate: vec![0.005],
@@ -1779,7 +1802,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.5],
             max_base_error_rate: vec![0.5],
@@ -1810,7 +1833,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![10],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1840,7 +1863,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 3, 3], // CC=5, AB=3, BA=3
             max_read_error_rate: vec![0.05, 0.1, 0.1],
             max_base_error_rate: vec![0.05, 0.1, 0.1],
@@ -1872,7 +1895,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1903,7 +1926,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -1932,7 +1955,7 @@ mod tests {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.2],
@@ -2035,7 +2058,7 @@ mod tests {
     ) -> Result<()> {
         let cmd = Filter {
             io: BamIoOptions { input: input.to_path_buf(), output: output.to_path_buf() },
-            reference: reference.to_path_buf(),
+            reference: Some(reference.to_path_buf()),
             min_reads,
             max_read_error_rate,
             max_base_error_rate,
@@ -2155,7 +2178,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![0.5],
             max_base_error_rate: vec![0.5],
@@ -2308,7 +2331,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -2380,7 +2403,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
             max_base_error_rate: vec![1.0],
@@ -2446,7 +2469,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
             max_base_error_rate: vec![1.0],
@@ -2569,7 +2592,7 @@ mod tests {
         // Use 3-value thresholds: duplex=5, AB=5, BA=5 (must be high-to-low)
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds (duplex >= AB >= BA)
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -2637,7 +2660,7 @@ mod tests {
         // With filter_by_template: false, reads are filtered independently
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -2703,7 +2726,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -2773,7 +2796,7 @@ mod tests {
         // Run single-threaded
         let cmd_single = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_single.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -2796,7 +2819,7 @@ mod tests {
         // Run multi-threaded with 4 threads
         let cmd_multi = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_multi.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -2859,7 +2882,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
             max_base_error_rate: vec![1.0],
@@ -2913,7 +2936,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
             max_base_error_rate: vec![1.0],
@@ -2970,7 +2993,7 @@ mod tests {
         // Run multi-threaded with rejects output
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3036,7 +3059,7 @@ mod tests {
         // Run single-threaded
         let cmd_single = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_single.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA (must be high-to-low)
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3059,7 +3082,7 @@ mod tests {
         // Run multi-threaded
         let cmd_multi = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_multi.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3140,7 +3163,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3249,7 +3272,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3364,7 +3387,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3400,7 +3423,7 @@ mod tests {
         // Test validation of error rate ordering (AB <= BA)
         let cmd = Filter {
             io: BamIoOptions { input: PathBuf::from("test.bam"), output: PathBuf::from("out.bam") },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1, 0.2, 0.1], // AB (0.2) > BA (0.1) - invalid!
             max_base_error_rate: vec![0.3],
@@ -3431,7 +3454,7 @@ mod tests {
         // Test validation of base error rate ordering (AB <= BA)
         let cmd = Filter {
             io: BamIoOptions { input: PathBuf::from("test.bam"), output: PathBuf::from("out.bam") },
-            reference: PathBuf::from("ref.fa"),
+            reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.1, 0.3, 0.2], // AB (0.3) > BA (0.2) - invalid!
@@ -3486,7 +3509,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3546,7 +3569,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
-            reference: ref_path.clone(),
+            reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds
             max_read_error_rate: vec![0.1],
             max_base_error_rate: vec![0.3],
@@ -3609,7 +3632,7 @@ mod tests {
 
         let cmd = Filter {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
-            reference: ref_path,
+            reference: Some(ref_path),
             min_reads: vec![1],
             max_read_error_rate: vec![0.5],
             max_base_error_rate: vec![0.5],
@@ -3832,6 +3855,96 @@ mod tests {
             2.0,
         )?;
         assert!(!result, "Should fail with 3 Ns and count threshold 2.0");
+
+        Ok(())
+    }
+
+    /// Verifies that `process_record_raw` works correctly when `reference` is `None`.
+    /// The function should still mask bases and check filters without attempting
+    /// to regenerate alignment tags.
+    #[test]
+    fn test_process_record_raw_no_reference() -> Result<()> {
+        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+
+        // Build an unmapped record with consensus tags
+        let record = RecordBuilder::new()
+            .name("unmapped_read")
+            .sequence("ACGTACGT")
+            .qualities(&[35, 35, 35, 35, 35, 35, 35, 35])
+            .unmapped(true)
+            .consensus_tags(
+                fgumi_lib::sam::builder::ConsensusTagsBuilder::new()
+                    .per_base_depths(&[10; 8])
+                    .per_base_errors(&[0; 8]),
+            )
+            .build();
+
+        let header = Header::default();
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &header, &record)?;
+
+        let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
+
+        let (bases_masked, pass) = Filter::process_record_raw(
+            &mut raw, &config, None, // no reference
+            &header, false, // no tag reversal
+            None,  // no min base quality
+            false, // no single-strand agreement
+            None,  // no min mean base quality
+            0.2,   // max no-call fraction
+        )?;
+
+        assert_eq!(bases_masked, 0, "No bases should be masked with good tags");
+        assert!(pass, "Unmapped record should pass filtering without reference");
+
+        Ok(())
+    }
+
+    /// Verifies that `process_record_raw` fails when `reference` is `None`
+    /// and the record is mapped, since NM/UQ/MD tags would become stale.
+    #[test]
+    fn test_process_record_raw_no_reference_mapped_fails() -> Result<()> {
+        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+
+        let sam_builder = fgumi_lib::sam::builder::SamBuilder::with_single_ref("chr1", 1000);
+        let record = RecordBuilder::new()
+            .name("mapped_read")
+            .sequence("ACGTACGT")
+            .qualities(&[35; 8])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .cigar("8M")
+            .consensus_tags(
+                fgumi_lib::sam::builder::ConsensusTagsBuilder::new()
+                    .per_base_depths(&[10; 8])
+                    .per_base_errors(&[0; 8]),
+            )
+            .build();
+
+        let mut raw = Vec::new();
+        encode_record_buf(&mut raw, &sam_builder.header, &record)?;
+
+        let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
+
+        let result = Filter::process_record_raw(
+            &mut raw,
+            &config,
+            None, // no reference
+            &sam_builder.header,
+            false,
+            None,
+            false,
+            None,
+            0.2,
+        );
+
+        assert!(result.is_err(), "Should fail for mapped reads without reference");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("--ref is required"),
+            "Error should mention --ref requirement, got: {err_msg}"
+        );
 
         Ok(())
     }
