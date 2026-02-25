@@ -220,3 +220,185 @@ fn test_filter_command_with_stats() {
     assert!(!content.trim().is_empty(), "Stats file should not be empty");
     assert!(content.contains("total_reads"), "Stats should contain total_reads");
 }
+
+/// Test filter command without --ref on unmapped consensus reads.
+///
+/// When all reads are unmapped (e.g. pre-alignment consensus pipeline), the reference
+/// is never consulted for tag regeneration, so --ref should be optional.
+#[test]
+fn test_filter_command_no_ref_unmapped_reads() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Create unmapped consensus reads with good per-base tags
+    let r1 = RecordBuilder::new()
+        .name("cons1")
+        .sequence("ACGTACGT")
+        .qualities(&[35; 8])
+        .unmapped(true)
+        .consensus_tags(
+            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
+        )
+        .build();
+
+    let r2 = RecordBuilder::new()
+        .name("cons2")
+        .sequence("ACGTACGT")
+        .qualities(&[35; 8])
+        .unmapped(true)
+        .consensus_tags(
+            ConsensusTagsBuilder::new().per_base_depths(&[5; 8]).per_base_errors(&[0; 8]),
+        )
+        .build();
+
+    create_consensus_bam(&input_bam, vec![r1, r2]);
+
+    // Run filter WITHOUT --ref
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "filter",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--max-no-call-fraction",
+            "1.0",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run filter command");
+
+    assert!(status.success(), "Filter command without --ref failed");
+    assert!(output_bam.exists(), "Output BAM not created");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let count = reader.records().count();
+    assert_eq!(count, 2, "Both unmapped reads should pass filtering without --ref");
+}
+
+/// Test filter command without --ref, with --rejects output for unmapped reads.
+///
+/// One good unmapped read and one low-depth unmapped read. The good read should
+/// pass and the low-depth read should be rejected.
+#[test]
+fn test_filter_command_no_ref_with_rejects() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // Good unmapped read: per-base depth 10 (above min-reads=3)
+    let good = RecordBuilder::new()
+        .name("good")
+        .sequence("ACGTACGT")
+        .qualities(&[35; 8])
+        .unmapped(true)
+        .consensus_tags(
+            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
+        )
+        .build();
+
+    // Low-depth unmapped read: per-base depth 1 (below min-reads=3), all bases masked
+    let low_depth = RecordBuilder::new()
+        .name("low_depth")
+        .sequence("ACGTACGT")
+        .qualities(&[35; 8])
+        .unmapped(true)
+        .consensus_tags(
+            ConsensusTagsBuilder::new().per_base_depths(&[1; 8]).per_base_errors(&[0; 8]),
+        )
+        .build();
+
+    create_consensus_bam(&input_bam, vec![good, low_depth]);
+
+    // Run filter WITHOUT --ref, with --rejects
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "filter",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "3",
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run filter command");
+
+    assert!(status.success(), "Filter command without --ref with rejects failed");
+    assert!(output_bam.exists(), "Output BAM not created");
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+
+    // Verify the good read passed
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let output_count = reader.records().count();
+    assert_eq!(output_count, 1, "Only the good read should pass filtering");
+
+    // Verify the low-depth read was rejected
+    let mut reject_reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let _header = reject_reader.read_header().unwrap();
+    let reject_count = reject_reader.records().count();
+    assert_eq!(reject_count, 1, "The low-depth read should be rejected");
+}
+
+/// Test that filter command without --ref fails when given mapped reads.
+///
+/// Mapped reads require the reference for NM/UQ/MD tag regeneration after base masking.
+/// The command should fail with a clear error rather than emit stale tags.
+#[test]
+fn test_filter_command_no_ref_mapped_reads_fails() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+
+    // Create a mapped consensus read (has ref_id, alignment_start, cigar)
+    let mapped = RecordBuilder::new()
+        .name("mapped_read")
+        .sequence("ACGTACGT")
+        .qualities(&[35; 8])
+        .reference_sequence_id(0)
+        .alignment_start(100)
+        .mapping_quality(60)
+        .cigar("8M")
+        .consensus_tags(
+            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
+        )
+        .build();
+
+    create_consensus_bam(&input_bam, vec![mapped]);
+
+    // Run filter WITHOUT --ref on mapped reads — should fail
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "filter",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--max-no-call-fraction",
+            "1.0",
+            "--compression-level",
+            "1",
+        ])
+        .output()
+        .expect("Failed to run filter command");
+
+    assert!(!output.status.success(), "Filter command should fail for mapped reads without --ref");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--ref is required"),
+        "Error should mention --ref requirement, got stderr: {stderr}"
+    );
+}
