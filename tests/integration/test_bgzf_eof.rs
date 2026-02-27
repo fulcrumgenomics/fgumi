@@ -12,7 +12,7 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_has_bgzf_eof;
@@ -527,5 +527,70 @@ fn test_correct_output_has_bgzf_eof() {
         .expect("Failed to run correct command");
 
     assert!(status.success(), "correct command failed");
+    assert_has_bgzf_eof(&output_bam);
+}
+
+/// Regression test for the streaming pipe scenario from issue #125:
+/// `fgumi simplex ... -o /dev/stdout | fgumi filter -i /dev/stdin ...`
+///
+/// Verifies that piped BAM output contains the BGZF EOF marker when the
+/// downstream command writes to a file.
+#[test]
+#[allow(clippy::zombie_processes)]
+fn test_piped_simplex_to_filter_has_bgzf_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    // Create grouped input with consensus-worthy families
+    let family = create_umi_family("ACGT", 5, "fam", "ACGTACGT", 30);
+    write_grouped_bam(&input_bam, &[("1", &family)]);
+
+    // Spawn simplex writing to stdout
+    let mut simplex = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            "/dev/stdout",
+            "--min-reads",
+            "2",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to spawn simplex");
+
+    // Spawn filter reading from simplex stdout
+    let filter = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "filter",
+            "--input",
+            "/dev/stdin",
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--min-reads",
+            "1",
+            "--max-no-call-fraction",
+            "1.0",
+            "--compression-level",
+            "1",
+        ])
+        .stdin(simplex.stdout.take().unwrap())
+        .stderr(Stdio::null())
+        .output()
+        .expect("Failed to run filter");
+
+    let simplex_status = simplex.wait().expect("Failed to wait for simplex");
+    assert!(simplex_status.success(), "simplex command failed in pipe");
+    assert!(filter.status.success(), "filter command failed in pipe");
     assert_has_bgzf_eof(&output_bam);
 }
