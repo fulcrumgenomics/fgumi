@@ -5,6 +5,7 @@
 
 mod helpers;
 mod test_bam_pipeline;
+mod test_bgzf_eof;
 mod test_clip_command;
 mod test_codec_command;
 mod test_codec_pipeline;
