@@ -43,6 +43,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
     environment: github-actions
     steps:
       - name: Checkout code
