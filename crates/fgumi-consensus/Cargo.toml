@@ -13,7 +13,7 @@ anyhow = "1.0"
 approx = "0.5"
 bstr = "1.12.1"
 log = "0"
-noodles = { version = "0.104.0", features = ["bam", "sam", "core"] }
+noodles = { version = "0.105.0", features = ["bam", "sam", "core"] }
 rand = "0.10"
 wide = "1.1"
 fgumi-dna = { version = "0.1.0", path = "../fgumi-dna" }
