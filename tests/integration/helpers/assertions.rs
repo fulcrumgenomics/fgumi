@@ -10,6 +10,28 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
+/// The standard 28-byte BGZF EOF marker block.
+const BGZF_EOF: [u8; 28] = [
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Asserts that a file ends with the standard 28-byte BGZF EOF marker block.
+///
+/// # Panics
+///
+/// Panics if the file cannot be read, is too small, or is missing the BGZF EOF block.
+pub fn assert_has_bgzf_eof(path: &std::path::Path) {
+    let data = std::fs::read(path).expect("Failed to read file for EOF check");
+    assert!(data.len() >= 28, "File too small to contain BGZF EOF: {}", path.display());
+    assert_eq!(
+        &data[data.len() - 28..],
+        &BGZF_EOF,
+        "File missing BGZF EOF block: {}",
+        path.display()
+    );
+}
+
 /// Asserts that a record has a specific MI (molecule ID) tag value.
 ///
 /// # Panics

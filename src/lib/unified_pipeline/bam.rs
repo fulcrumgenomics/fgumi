@@ -830,13 +830,15 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         self.output.set_draining(value);
     }
 
-    /// Flush the output writer and finalize.
+    /// Flush the output writer, write the BGZF EOF marker, and finalize.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if flushing the output writer fails.
+    /// Returns an I/O error if writing the BGZF EOF or flushing fails.
     pub fn flush_output(&self) -> io::Result<()> {
         if let Some(mut writer) = self.output.output.lock().take() {
+            writer.flush()?;
+            writer.write_all(&BGZF_EOF)?;
             writer.flush()?;
         }
         Ok(())
@@ -3216,7 +3218,9 @@ where
     compressor.flush()?;
     compressor.write_blocks_to(output.as_mut())?;
 
-    // Flush output
+    // Flush output and write BGZF EOF marker
+    output.flush()?;
+    output.write_all(&BGZF_EOF)?;
     output.flush()?;
 
     // Finalize secondary output writer
@@ -3722,47 +3726,6 @@ impl BamPipelineConfig {
     }
 }
 
-/// Writer wrapper that appends the BGZF EOF marker on drop, but only on success.
-///
-/// Drop order ensures correctness: when wrapping as `BufWriter<EofWriter<W>>`,
-/// `BufWriter` flushes buffered data first, then `EofWriter` appends the EOF block.
-///
-/// The EOF block is only written if `arm()` has been called (via the shared
-/// `armed` flag). This prevents a failed pipeline from producing a seemingly
-/// complete BAM file that masks truncated output.
-struct EofWriter<W: Write> {
-    inner: Option<W>,
-    armed: Arc<AtomicBool>,
-}
-
-impl<W: Write> EofWriter<W> {
-    fn new(inner: W) -> (Self, Arc<AtomicBool>) {
-        let armed = Arc::new(AtomicBool::new(false));
-        (Self { inner: Some(inner), armed: Arc::clone(&armed) }, armed)
-    }
-}
-
-impl<W: Write> Write for EofWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.as_mut().expect("write after finish").write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.as_mut().expect("flush after finish").flush()
-    }
-}
-
-impl<W: Write> Drop for EofWriter<W> {
-    fn drop(&mut self) {
-        if self.armed.load(Ordering::Acquire) {
-            if let Some(mut w) = self.inner.take() {
-                let _ = w.write_all(&BGZF_EOF);
-                let _ = w.flush();
-            }
-        }
-    }
-}
-
 /// Open an output writer for pipeline use, supporting stdout via "-" or "/dev/stdout".
 fn open_pipeline_output(output_path: &Path) -> io::Result<Box<dyn Write + Send>> {
     if is_stdout_path(output_path) {
@@ -3853,10 +3816,7 @@ where
         .map_err(|e| io::Error::new(e.kind(), format!("Failed to re-open input: {e}")))?;
     let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
-    // Wrap output in EofWriter then BufWriter.
-    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
-    let (eof_writer, eof_armed) = EofWriter::new(output);
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Build GroupKeyConfig from header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
@@ -3876,8 +3836,7 @@ where
         serialize_fn(p, &header_clone, buf)
     });
 
-    // Run the pipeline — only arm EOF on success
-    let result = run_bam_pipeline(
+    run_bam_pipeline(
         config.pipeline,
         Box::new(input),
         Box::new(output),
@@ -3885,11 +3844,7 @@ where
         fns,
         group_key_config,
         None,
-    );
-    if result.is_ok() {
-        eof_armed.store(true, Ordering::Release);
-    }
-    result
+    )
 }
 
 /// Run a BAM file through the pipeline with a custom output header.
@@ -3971,10 +3926,7 @@ where
         .map_err(|e| io::Error::new(e.kind(), format!("Failed to re-open input: {e}")))?;
     let input = BufReader::with_capacity(IO_BUFFER_SIZE, input);
 
-    // Wrap output in EofWriter then BufWriter.
-    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
-    let (eof_writer, eof_armed) = EofWriter::new(output);
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Build GroupKeyConfig from input header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
@@ -3993,8 +3945,7 @@ where
         serialize_fn(p, &output_header, buf)
     });
 
-    // Run the pipeline — only arm EOF on success
-    let result = run_bam_pipeline(
+    run_bam_pipeline(
         config.pipeline,
         Box::new(input),
         Box::new(output),
@@ -4002,11 +3953,7 @@ where
         fns,
         group_key_config,
         None,
-    );
-    if result.is_ok() {
-        eof_armed.store(true, Ordering::Release);
-    }
-    result
+    )
 }
 
 // ============================================================================
@@ -4081,10 +4028,7 @@ where
         .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
     let output = bgzf_writer.into_inner();
 
-    // Wrap output in EofWriter then BufWriter.
-    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
-    let (eof_writer, eof_armed) = EofWriter::new(output);
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Build GroupKeyConfig from input header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
@@ -4102,8 +4046,7 @@ where
         serialize_fn(p, &output_header, buf)
     });
 
-    // Run the pipeline — only arm EOF on success
-    let result = run_bam_pipeline(
+    run_bam_pipeline(
         config.pipeline,
         Box::new(input),
         Box::new(output),
@@ -4111,11 +4054,7 @@ where
         fns,
         group_key_config,
         None,
-    );
-    if result.is_ok() {
-        eof_armed.store(true, Ordering::Release);
-    }
-    result
+    )
 }
 
 /// Run a BAM pipeline from an already-opened reader, with a secondary output file.
@@ -4176,10 +4115,7 @@ where
         .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
     let output = bgzf_writer.into_inner();
 
-    // Wrap output in EofWriter then BufWriter.
-    // Drop order: BufWriter flushes first, then EofWriter appends EOF (only if armed).
-    let (eof_writer, eof_armed) = EofWriter::new(output);
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, eof_writer);
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
 
     // Create secondary output (reject BAM) with its own BGZF compression
     let secondary_writer = crate::bam_io::create_raw_bam_writer(
@@ -4207,7 +4143,7 @@ where
 
     let pipeline_config = config.pipeline;
 
-    let result = run_bam_pipeline(
+    run_bam_pipeline(
         pipeline_config,
         Box::new(input),
         Box::new(output),
@@ -4215,44 +4151,13 @@ where
         fns,
         group_key_config,
         Some(secondary_writer),
-    );
-
-    // Only arm EOF on success — failed pipeline leaves truncated BAM as error signal
-    if result.is_ok() {
-        eof_armed.store(true, Ordering::Release);
-    }
-
-    result
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::read_info::LibraryIndex;
-
-    #[test]
-    fn test_eof_writer_writes_eof_when_armed() {
-        let mut buf = Vec::new();
-        {
-            let (mut writer, armed) = EofWriter::new(&mut buf);
-            writer.write_all(b"hello").unwrap();
-            armed.store(true, Ordering::Release);
-        }
-        assert!(buf.starts_with(b"hello"));
-        assert!(buf.ends_with(&BGZF_EOF));
-    }
-
-    #[test]
-    fn test_eof_writer_skips_eof_when_not_armed() {
-        let mut buf = Vec::new();
-        {
-            let (mut writer, _armed) = EofWriter::new(&mut buf);
-            writer.write_all(b"hello").unwrap();
-            // Don't arm — simulates pipeline error
-        }
-        assert_eq!(&buf, b"hello");
-        assert!(!buf.ends_with(&BGZF_EOF));
-    }
 
     /// Create a minimal `BamPipelineState` for testing memory backpressure.
     fn create_test_state(memory_limit: u64) -> BamPipelineState<(), ()> {
