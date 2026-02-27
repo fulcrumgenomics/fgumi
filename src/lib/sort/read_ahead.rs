@@ -28,7 +28,7 @@ use noodles::bam::Record;
 use std::thread::{self, JoinHandle};
 
 use crate::bam_io::{BamReaderAuto, RawBamReaderAuto};
-use crate::vendored::RawRecord;
+use fgumi_raw_bam::RawRecord;
 
 /// Number of records per batch sent through the channel.
 /// This reduces channel synchronization overhead by sending multiple records per send.

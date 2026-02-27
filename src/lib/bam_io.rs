@@ -25,8 +25,8 @@ use noodles::sam::Header;
 use noodles_bgzf::io::{MultithreadedReader, Reader as BgzfReader, Writer as BgzfWriter};
 // Use vendored MultithreadedWriter with position tracking (until upstream PR merges)
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
-// Use vendored RawBamReader for raw byte access (until noodles exposes Record bytes)
-use crate::vendored::RawBamReader;
+// Use RawBamReader for raw byte access (until noodles exposes Record bytes)
+use fgumi_raw_bam::RawBamReader;
 // Use bgzf crate for CompressionLevel
 use bgzf::CompressionLevel;
 use noodles_csi::binning_index::Indexer;

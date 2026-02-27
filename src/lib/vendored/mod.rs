@@ -9,7 +9,6 @@
 
 pub mod bam_codec;
 pub mod bgzf_multithreaded;
-pub mod raw_bam_record;
 
 // Re-export MultithreadedWriter types
 pub use bgzf_multithreaded::{
@@ -20,6 +19,3 @@ pub use bgzf_multithreaded::{
 pub use bam_codec::{
     DecodeError, EncodeError, decode, encode, encode_record_buf, encode_with_prealloc,
 };
-
-// Re-export raw BAM record types
-pub use raw_bam_record::{RawBamReader, RawRecord, read_raw_record};

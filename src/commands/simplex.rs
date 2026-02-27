@@ -25,7 +25,7 @@ use fgumi_lib::read_info::LibraryIndex;
 use fgumi_lib::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
-use fgumi_lib::vendored::RawRecord;
+use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crossbeam_queue::SegQueue;
 use fgumi_lib::validation::optional_string_to_tag;
