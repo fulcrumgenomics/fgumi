@@ -52,7 +52,7 @@ fn create_paired_bam(path: &PathBuf, read_pairs: Vec<(&str, &str, &str, &str, &s
         writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Parse FASTQ records from a file.
@@ -268,7 +268,7 @@ fn create_bam_with_flags(path: &PathBuf) {
         .build();
     writer.write_alignment_record(&header, &supplementary).expect("Failed to write supplementary");
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Test flag filtering with -F option.

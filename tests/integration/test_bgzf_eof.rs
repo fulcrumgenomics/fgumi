@@ -29,7 +29,7 @@ fn write_test_bam(path: &Path, records: &[RecordBuf]) {
     for record in records {
         writer.write_alignment_record(&header, record).expect("Failed to write record");
     }
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Write a BAM file with MI-tagged records (grouped input for consensus callers).
@@ -47,7 +47,7 @@ fn write_grouped_bam(path: &Path, families: &[(&str, &[RecordBuf])]) {
             writer.write_alignment_record(&header, &rec).expect("Failed to write record");
         }
     }
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Create paired-end duplicate reads at a given position with MC tags.
@@ -156,6 +156,49 @@ fn create_duplex_pair(
     r2.data_mut().insert(mi, Value::from(mi_tag));
 
     (r1, r2)
+}
+
+/// Create a single-template family (will be rejected by --min-reads > 1).
+fn create_rejected_family(name: &str, umi: &str, start: usize) -> Vec<RecordBuf> {
+    let cigar = "8M";
+    let r1 = RecordBuilder::new()
+        .name(name)
+        .sequence("ACGTACGT")
+        .qualities(&[30; 8])
+        .paired(true)
+        .first_segment(true)
+        .properly_paired(true)
+        .reference_sequence_id(0)
+        .alignment_start(start)
+        .mapping_quality(60)
+        .cigar(cigar)
+        .mate_reference_sequence_id(0)
+        .mate_alignment_start(start + 100)
+        .template_length(108)
+        .tag("RX", umi)
+        .tag("MC", cigar)
+        .build();
+
+    let r2 = RecordBuilder::new()
+        .name(name)
+        .sequence("ACGTACGT")
+        .qualities(&[30; 8])
+        .paired(true)
+        .first_segment(false)
+        .properly_paired(true)
+        .reverse_complement(true)
+        .reference_sequence_id(0)
+        .alignment_start(start + 100)
+        .mapping_quality(60)
+        .cigar(cigar)
+        .mate_reference_sequence_id(0)
+        .mate_alignment_start(start)
+        .template_length(-108)
+        .tag("RX", umi)
+        .tag("MC", cigar)
+        .build();
+
+    vec![r1, r2]
 }
 
 /// Create a CODEC read pair (FR orientation, same position).
@@ -593,4 +636,217 @@ fn test_piped_simplex_to_filter_has_bgzf_eof() {
     assert!(simplex_status.success(), "simplex command failed in pipe");
     assert!(filter.status.success(), "filter command failed in pipe");
     assert_has_bgzf_eof(&output_bam);
+}
+
+// ============================================================================
+// Rejects writer BGZF EOF tests
+// ============================================================================
+
+#[test]
+fn test_simplex_rejects_has_bgzf_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // One family with 3 reads (kept) and one singleton family (rejected by --min-reads 2)
+    let kept = create_umi_family("ACGT", 3, "kept", "ACGTACGT", 30);
+    let rejected = create_rejected_family("reject", "TTTT", 500);
+    write_grouped_bam(&input_bam, &[("1", &kept), ("2", &rejected)]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "simplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run simplex command");
+
+    assert!(status.success(), "simplex command with rejects failed");
+    assert_has_bgzf_eof(&output_bam);
+    assert_has_bgzf_eof(&rejects_bam);
+}
+
+#[test]
+fn test_duplex_rejects_has_bgzf_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // 3 /A pairs and 3 /B pairs (kept), plus a singleton /A pair (rejected by --min-reads 2)
+    let mut records = Vec::new();
+    for i in 0..3 {
+        let (r1, r2) = create_duplex_pair(&format!("a_{i}"), "1/A", "ACGTACGT", 100, false);
+        records.push(r1);
+        records.push(r2);
+    }
+    for i in 0..3 {
+        let (r1, r2) = create_duplex_pair(&format!("b_{i}"), "1/B", "ACGTACGT", 100, true);
+        records.push(r1);
+        records.push(r2);
+    }
+    // Singleton family that will be rejected
+    let (r1, r2) = create_duplex_pair("reject_a", "2/A", "ACGTACGT", 500, false);
+    records.push(r1);
+    records.push(r2);
+    write_test_bam(&input_bam, &records);
+
+    // Use single-threaded mode: duplex multi-threaded pipeline doesn't collect
+    // raw reject bytes, so rejects writing only happens in the single-threaded path.
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run duplex command");
+
+    assert!(status.success(), "duplex command with rejects failed");
+    assert_has_bgzf_eof(&output_bam);
+    assert_has_bgzf_eof(&rejects_bam);
+}
+
+#[test]
+fn test_codec_rejects_has_bgzf_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // One family with 3 reads (kept) and one singleton (rejected by --min-reads 2)
+    let mut records = Vec::new();
+    for i in 0..3 {
+        let (r1, r2) = create_codec_pair(&format!("read{i}"), "1", 100);
+        records.push(r1);
+        records.push(r2);
+    }
+    let (r1, r2) = create_codec_pair("reject", "2", 500);
+    records.push(r1);
+    records.push(r2);
+    write_test_bam(&input_bam, &records);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "codec",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run codec command");
+
+    assert!(status.success(), "codec command with rejects failed");
+    assert_has_bgzf_eof(&output_bam);
+    assert_has_bgzf_eof(&rejects_bam);
+}
+
+#[test]
+fn test_correct_rejects_has_bgzf_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // Reads with matching UMI (kept) and non-matching UMI (rejected)
+    let mut records = create_umi_family("ACGTACGT", 3, "kept", "AAAAGGGG", 30);
+    records.extend(create_umi_family("NNNNNNNN", 2, "reject", "AAAAGGGG", 30));
+    write_test_bam(&input_bam, &records);
+    fs::write(&whitelist, "ACGTACGT").expect("Failed to write whitelist");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "correct",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--umi-files",
+            whitelist.to_str().unwrap(),
+            "--max-mismatches",
+            "1",
+            "--min-distance",
+            "1",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run correct command");
+
+    assert!(status.success(), "correct command with rejects failed");
+    assert_has_bgzf_eof(&output_bam);
+    assert_has_bgzf_eof(&rejects_bam);
+}
+
+#[test]
+fn test_correct_single_threaded_rejects_has_bgzf_eof() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    let mut records = create_umi_family("ACGTACGT", 3, "kept", "AAAAGGGG", 30);
+    records.extend(create_umi_family("NNNNNNNN", 2, "reject", "AAAAGGGG", 30));
+    write_test_bam(&input_bam, &records);
+    fs::write(&whitelist, "ACGTACGT").expect("Failed to write whitelist");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "correct",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--umi-files",
+            whitelist.to_str().unwrap(),
+            "--max-mismatches",
+            "1",
+            "--min-distance",
+            "1",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run correct command");
+
+    assert!(status.success(), "correct single-threaded with rejects failed");
+    assert_has_bgzf_eof(&output_bam);
+    assert_has_bgzf_eof(&rejects_bam);
 }

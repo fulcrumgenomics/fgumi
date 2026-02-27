@@ -100,7 +100,7 @@ fn create_codec_test_bam(path: &PathBuf, pairs: Vec<(RecordBuf, RecordBuf)>) {
         writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Test basic CODEC consensus calling.

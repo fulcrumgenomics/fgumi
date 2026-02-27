@@ -29,7 +29,7 @@ fn create_sorted_bam(path: &PathBuf, records: Vec<RecordBuf>) {
     for record in records {
         writer.write_alignment_record(&header, &record).expect("Failed to write record");
     }
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Create a group of paired-end reads at the same position with the same UMI

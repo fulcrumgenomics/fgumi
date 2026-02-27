@@ -2314,7 +2314,7 @@ mod tests {
         let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&bam_path)?);
         writer.write_header(&header)?;
         writer.write_alignment_record(&header, &rec)?;
-        writer.finish(&header)?;
+        writer.try_finish()?;
         drop(writer);
 
         // Try to run duplex-metrics on this consensus BAM

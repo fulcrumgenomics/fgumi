@@ -27,7 +27,7 @@ fn create_paired_bam(path: &Path, pairs: Vec<(RecordBuf, RecordBuf)>) {
         writer.write_alignment_record(&header, &r1).expect("Failed to write R1");
         writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
     }
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Test basic clip command with fixed-end clipping.
