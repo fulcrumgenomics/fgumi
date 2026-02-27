@@ -1253,7 +1253,7 @@ impl CorrectUmis {
                     rejects_writer.get_mut().write_all(raw)?;
                 }
 
-                rejects_writer.finish(&header_for_rejects)?;
+                rejects_writer.into_inner().finish()?;
                 let total_reject_records = all_rejects.len() + all_raw_rejects.len();
                 info!("Wrote {total_reject_records} rejected records to rejects file");
             }
@@ -1451,9 +1451,9 @@ impl CorrectUmis {
         progress.log_final();
 
         // Finish writers
-        writer.finish(&header)?;
-        if let Some(ref mut rw) = reject_writer {
-            rw.finish(&header)?;
+        writer.into_inner().finish()?;
+        if let Some(rw) = reject_writer {
+            rw.into_inner().finish()?;
         }
 
         // Finalize and write metrics
@@ -1904,7 +1904,7 @@ mod tests {
             writer.write_alignment_record(&header, &record)?;
         }
 
-        writer.finish(&header)?;
+        writer.try_finish()?;
         Ok(temp_file)
     }
 

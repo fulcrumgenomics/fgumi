@@ -253,7 +253,7 @@ fn create_test_input_bam(path: &PathBuf) {
         writer.write_alignment_record(&header, record).expect("Failed to write record");
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Create a test BAM with already-grouped reads (MI tag set).
@@ -291,5 +291,5 @@ fn create_grouped_test_bam(path: &PathBuf) {
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }

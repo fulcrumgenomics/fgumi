@@ -42,7 +42,7 @@ fn create_grouped_bam(path: &PathBuf, families: Vec<(&str, usize)>) {
         }
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Read records from a BAM file.

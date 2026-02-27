@@ -133,7 +133,7 @@ fn create_test_input_bam(path: &PathBuf) {
         writer.write_alignment_record(&header, record).expect("Failed to write record");
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Helper function to create a BAM file with UMIs containing N bases.
@@ -153,5 +153,5 @@ fn create_test_bam_with_n_umis(path: &PathBuf) {
         writer.write_alignment_record(&header, record).expect("Failed to write record");
     }
 
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }

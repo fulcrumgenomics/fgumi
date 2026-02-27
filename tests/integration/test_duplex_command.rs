@@ -104,7 +104,7 @@ fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RecordBuf, RecordBuf)>>) {
             writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
         }
     }
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Create a single duplex molecule with `depth` read pairs on each strand.

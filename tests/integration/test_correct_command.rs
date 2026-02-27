@@ -29,7 +29,7 @@ fn create_umi_bam(
             writer.write_alignment_record(&header, &record).expect("Failed to write record");
         }
     }
-    writer.finish(&header).expect("Failed to finish BAM");
+    writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Write a UMI whitelist file.

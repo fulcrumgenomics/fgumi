@@ -38,7 +38,6 @@ use fgumi_raw_bam::RawRecord;
 use fgumi_lib::validation::{optional_string_to_tag, validate_file_exists};
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
 
@@ -442,8 +441,8 @@ impl Command for Codec {
         timer.log_completion(consensus_count);
 
         // Close rejects writer if it was opened
-        if let Some(mut rw) = rejects_writer {
-            rw.finish(&header).context("Failed to finish rejects file")?;
+        if let Some(rw) = rejects_writer {
+            rw.into_inner().finish().context("Failed to finish rejects file")?;
             info!("Rejected reads written successfully");
         }
 
@@ -645,13 +644,13 @@ impl Codec {
         if track_rejects && !all_rejects.is_empty() {
             if let Some(rejects_path) = &self.rejects_opts.rejects {
                 let writer_threads = self.threading.num_threads();
-                let mut rejects_writer = create_optional_bam_writer(
+                let rejects_writer = create_optional_bam_writer(
                     Some(rejects_path),
                     &rejects_header,
                     writer_threads,
                     self.compression.compression_level,
                 )?;
-                if let Some(ref mut rw) = rejects_writer {
+                if let Some(mut rw) = rejects_writer {
                     for raw_record in &all_rejects {
                         let block_size = raw_record.len() as u32;
                         rw.get_mut()
@@ -661,7 +660,7 @@ impl Codec {
                             .write_all(raw_record)
                             .context("Failed to write rejected read")?;
                     }
-                    rw.finish(&rejects_header).context("Failed to finish rejects file")?;
+                    rw.into_inner().finish().context("Failed to finish rejects file")?;
                     info!("Wrote {} rejected reads", all_rejects.len());
                 }
             }
@@ -695,6 +694,7 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
     use rstest::rstest;
     use std::path::PathBuf;
 
