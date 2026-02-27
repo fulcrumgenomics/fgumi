@@ -140,6 +140,36 @@ pub fn create_consensus_read(
         .build()
 }
 
+/// Builds a SAM header with the given header tags and one reference sequence.
+///
+/// This is a shared helper used by the public header constructors to avoid
+/// duplicating the noodles header building boilerplate.
+fn build_header_with_tags(ref_name: &str, ref_len: usize, tags: &[([u8; 2], &str)]) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+    use noodles::sam::header::record::value::{
+        Map, map::Header as HeaderRecord, map::ReferenceSequence,
+    };
+    use std::num::NonZeroUsize;
+
+    let mut builder = HeaderRecordMap::<HeaderRecord>::builder();
+    for &(tag_bytes, value) in tags {
+        let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+        builder = builder.insert(tag, value);
+    }
+    let header_map = builder.build().expect("valid header map");
+
+    let reference_sequence = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
+    );
+
+    Header::builder()
+        .set_header(header_map)
+        .add_reference_sequence(BString::from(ref_name), reference_sequence)
+        .build()
+}
+
 /// Creates a minimal SAM header with one reference sequence.
 ///
 /// The header is configured with template-coordinate sort order tags
@@ -155,34 +185,25 @@ pub fn create_consensus_read(
 ///
 /// Configured SAM Header with template-coordinate sort order
 pub fn create_minimal_header(ref_name: &str, ref_len: usize) -> Header {
-    use bstr::BString;
-    use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
-    use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
-    use noodles::sam::header::record::value::{
-        Map, map::Header as HeaderRecord, map::ReferenceSequence,
-    };
-    use std::num::NonZeroUsize;
+    build_header_with_tags(
+        ref_name,
+        ref_len,
+        &[(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")],
+    )
+}
 
-    // Create header with template-coordinate sort order tags
-    let HeaderTag::Other(sort_order_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
-    let HeaderTag::Other(group_order_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
-    let HeaderTag::Other(sub_sort_tag) = HeaderTag::from([b'S', b'S']) else { unreachable!() };
-
-    let header_map = HeaderRecordMap::<HeaderRecord>::builder()
-        .insert(sort_order_tag, "unsorted")
-        .insert(group_order_tag, "query")
-        .insert(sub_sort_tag, "template-coordinate")
-        .build()
-        .expect("valid header map");
-
-    let reference_sequence = Map::<ReferenceSequence>::new(
-        NonZeroUsize::new(ref_len).expect("reference length must be non-zero"),
-    );
-
-    Header::builder()
-        .set_header(header_map)
-        .add_reference_sequence(BString::from(ref_name), reference_sequence)
-        .build()
+/// Creates a coordinate-sorted SAM header with one reference sequence.
+///
+/// # Arguments
+///
+/// * `ref_name` - Reference sequence name (e.g., "chr1")
+/// * `ref_len` - Reference sequence length
+///
+/// # Returns
+///
+/// Configured SAM Header with SO:coordinate sort order
+pub fn create_coordinate_sorted_header(ref_name: &str, ref_len: usize) -> Header {
+    build_header_with_tags(ref_name, ref_len, &[(*b"SO", "coordinate")])
 }
 
 /// Creates a UMI family with intentional sequencing errors.
@@ -228,15 +249,17 @@ pub fn create_umi_family_with_errors(
     records
 }
 
-/// Create a reference FASTA + FAI that matches the test header (chr1, 10000bp).
+/// Create a reference FASTA + FAI + sequence dictionary that matches the test header
+/// (chr1, 10000bp).
 ///
-/// Writes `ref.fa` and `ref.fa.fai` into the given directory.
+/// Writes `ref.fa`, `ref.fa.fai`, and `ref.dict` into the given directory.
 /// Returns the path to `ref.fa`.
 pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
     use std::io::Write;
 
     let ref_path = dir.join("ref.fa");
     let fai_path = dir.join("ref.fa.fai");
+    let dict_path = dir.join("ref.dict");
 
     let ref_seq = "ACGTACGT".repeat(1250); // 10000 bases
     let mut fasta = std::fs::File::create(&ref_path).unwrap();
@@ -244,8 +267,13 @@ pub fn create_test_reference(dir: &std::path::Path) -> std::path::PathBuf {
     writeln!(fasta, "{ref_seq}").unwrap();
     fasta.flush().unwrap();
 
-    let fai_content = "chr1\t10000\t6\t10000\t10001\n".to_string();
+    let fai_content = "chr1\t10000\t6\t10000\t10001\n";
     std::fs::write(&fai_path, fai_content).unwrap();
+
+    let mut dict = std::fs::File::create(&dict_path).unwrap();
+    writeln!(dict, "@HD\tVN:1.6\tSO:unsorted").unwrap();
+    writeln!(dict, "@SQ\tSN:chr1\tLN:10000").unwrap();
+    dict.flush().unwrap();
 
     ref_path
 }
