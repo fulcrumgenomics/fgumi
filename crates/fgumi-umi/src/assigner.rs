@@ -645,7 +645,7 @@ pub fn count_mismatches(a: &str, b: &str) -> usize {
     if a.len() != b.len() {
         return usize::MAX;
     }
-    a.chars().zip(b.chars()).filter(|(x, y)| x != y).count()
+    a.as_bytes().iter().zip(b.as_bytes()).filter(|(x, y)| x != y).count()
 }
 
 /// Check if two UMI sequences match within a maximum mismatch threshold.
@@ -855,27 +855,22 @@ impl UmiAssigner for IdentityUmiAssigner {
             return Vec::new();
         }
 
-        // Map each UMI to its canonical (uppercase) form and track unique canonicals
-        let mut canonical_to_id: HashMap<String, MoleculeId> = HashMap::new();
-        let mut unique_canonicals: Vec<String> = Vec::new();
-
-        for umi in raw_umis {
-            let canonical = umi.to_uppercase();
-            if !canonical_to_id.contains_key(&canonical) {
-                unique_canonicals.push(canonical);
-            }
-        }
+        // Uppercase each UMI once and collect unique canonicals
+        let canonicals: Vec<String> = raw_umis.iter().map(|umi| umi.to_uppercase()).collect();
+        let mut unique_canonicals: Vec<&str> =
+            canonicals.iter().map(String::as_str).collect::<HashSet<_>>().into_iter().collect();
 
         // Sort for deterministic ID assignment
-        unique_canonicals.sort();
+        unique_canonicals.sort_unstable();
 
         // Assign IDs in sorted order
-        for canonical in unique_canonicals {
-            canonical_to_id.insert(canonical, MoleculeId::Single(self.next_id()));
-        }
+        let canonical_to_id: HashMap<&str, MoleculeId> = unique_canonicals
+            .into_iter()
+            .map(|c| (c, MoleculeId::Single(self.next_id())))
+            .collect();
 
         // Build result Vec indexed by input position
-        raw_umis.iter().map(|umi| canonical_to_id[&umi.to_uppercase()]).collect()
+        canonicals.iter().map(|c| canonical_to_id[c.as_str()]).collect()
     }
 
     fn as_any(&self) -> &dyn Any {
