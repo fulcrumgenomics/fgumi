@@ -14,7 +14,7 @@ use fgumi_lib::bam_io::{
 use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
 use fgumi_lib::grouper::TemplateGrouper;
 use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::clip::ClippingMetricsCollection;
+use fgumi_lib::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use fgumi_lib::metrics::writer::write_metrics as write_metrics_tsv;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::reference::ReferenceReader;
@@ -472,11 +472,12 @@ impl Clip {
         if let Some(metrics) = metrics {
             metrics.fragment.update(
                 record,
-                prior_bases_clipped,
-                num_five_prime,
-                num_three_prime,
-                0, // no overlapping
-                0, // no extending
+                ClipCounts {
+                    prior: prior_bases_clipped,
+                    five_prime: num_five_prime,
+                    three_prime: num_three_prime,
+                    ..ClipCounts::default()
+                },
             );
         }
 
@@ -580,45 +581,32 @@ impl Clip {
 
         // Update metrics
         if let Some(metrics) = metrics {
+            let r1_counts = ClipCounts {
+                prior: prior_bases_clipped_r1,
+                five_prime: num_r1_five_prime,
+                three_prime: num_r1_three_prime,
+                overlapping: num_overlapping_r1,
+                extending: num_extending_r1,
+            };
+            let r2_counts = ClipCounts {
+                prior: prior_bases_clipped_r2,
+                five_prime: num_r2_five_prime,
+                three_prime: num_r2_three_prime,
+                overlapping: num_overlapping_r2,
+                extending: num_extending_r2,
+            };
+
             // Determine which metric to update based on read flags
             if is_r1_first {
-                metrics.read_one.update(
-                    r1,
-                    prior_bases_clipped_r1,
-                    num_r1_five_prime,
-                    num_r1_three_prime,
-                    num_overlapping_r1,
-                    num_extending_r1,
-                );
+                metrics.read_one.update(r1, r1_counts);
             } else {
-                metrics.read_two.update(
-                    r1,
-                    prior_bases_clipped_r1,
-                    num_r1_five_prime,
-                    num_r1_three_prime,
-                    num_overlapping_r1,
-                    num_extending_r1,
-                );
+                metrics.read_two.update(r1, r1_counts);
             }
 
             if is_r2_last {
-                metrics.read_two.update(
-                    r2,
-                    prior_bases_clipped_r2,
-                    num_r2_five_prime,
-                    num_r2_three_prime,
-                    num_overlapping_r2,
-                    num_extending_r2,
-                );
+                metrics.read_two.update(r2, r2_counts);
             } else {
-                metrics.read_one.update(
-                    r2,
-                    prior_bases_clipped_r2,
-                    num_r2_five_prime,
-                    num_r2_three_prime,
-                    num_overlapping_r2,
-                    num_extending_r2,
-                );
+                metrics.read_one.update(r2, r2_counts);
             }
         }
 
@@ -2487,5 +2475,221 @@ mod tests {
             estimate >= vec_overhead,
             "estimate {estimate} should include Vec<RecordBuf> overhead {vec_overhead}"
         );
+    }
+
+    /// Helper to create a `Clip` struct with specified clipping parameters and
+    /// all other fields set to sensible defaults.
+    fn make_clip(
+        read_one_five_prime: usize,
+        read_one_three_prime: usize,
+        read_two_five_prime: usize,
+        read_two_three_prime: usize,
+    ) -> Clip {
+        Clip {
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+            },
+            reference: PathBuf::from("reference.fa"),
+            clipping_mode: "soft".to_string(),
+            clip_overlapping_reads: false,
+            clip_extending_past_mate: false,
+            regenerate_tags: true,
+            read_one_five_prime,
+            read_one_three_prime,
+            read_two_five_prime,
+            read_two_three_prime,
+            upgrade_clipping: false,
+            auto_clip_attributes: false,
+            metrics: None,
+            sort_order: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        }
+    }
+
+    #[test]
+    fn test_clip_fragment_with_metrics() {
+        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
+        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
+        use fgumi_lib::sam::builder::RecordBuilder;
+
+        let clip = make_clip(3, 2, 0, 0);
+        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let mut metrics = ClippingMetricsCollection::new();
+
+        // Build a mapped fragment record with 20M CIGAR
+        let mut record = RecordBuilder::new()
+            .sequence("ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar("20M")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .build();
+
+        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics)).unwrap();
+
+        // Fragment metrics should be updated
+        assert_eq!(metrics.fragment.reads, 1);
+        assert_eq!(metrics.fragment.bases_clipped_five_prime, 3);
+        assert_eq!(metrics.fragment.bases_clipped_three_prime, 2);
+        // Remaining aligned bases: 20 - 3 - 2 = 15
+        assert_eq!(metrics.fragment.bases, 15);
+    }
+
+    #[test]
+    fn test_clip_fragment_no_clipping_with_metrics() {
+        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
+        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
+        use fgumi_lib::sam::builder::RecordBuilder;
+
+        let clip = make_clip(0, 0, 0, 0);
+        // Need at least one clipping option active for the Clip struct to be valid,
+        // but clip_fragment only uses read_one_*; we just test the method directly.
+        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let mut metrics = ClippingMetricsCollection::new();
+
+        let mut record = RecordBuilder::new()
+            .sequence("ACGTACGTACGT")
+            .qualities(&[30; 12])
+            .cigar("12M")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .build();
+
+        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics)).unwrap();
+
+        assert_eq!(metrics.fragment.reads, 1);
+        assert_eq!(metrics.fragment.bases, 12);
+        assert_eq!(metrics.fragment.bases_clipped_five_prime, 0);
+        assert_eq!(metrics.fragment.bases_clipped_three_prime, 0);
+    }
+
+    #[test]
+    fn test_clip_pair_with_metrics() {
+        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
+        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
+        use fgumi_lib::sam::builder::RecordBuilder;
+
+        let clip = make_clip(2, 1, 1, 2);
+        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let mut metrics = ClippingMetricsCollection::new();
+
+        // R1: first segment, forward strand, 20M
+        let mut r1 = RecordBuilder::new()
+            .name("pair1")
+            .sequence("ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar("20M")
+            .paired(true)
+            .first_segment(true)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(200)
+            .template_length(120)
+            .build();
+
+        // R2: last segment, reverse strand, 20M (non-overlapping)
+        let mut r2 = RecordBuilder::new()
+            .name("pair1")
+            .sequence("ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar("20M")
+            .paired(true)
+            .first_segment(false)
+            .reverse_complement(true)
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .mapping_quality(60)
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .template_length(-120)
+            .build();
+
+        let (overlap, extend) =
+            clip.clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics)).unwrap();
+
+        assert!(!overlap, "no overlapping clipping expected");
+        assert!(!extend, "no extending clipping expected");
+
+        // R1 is first segment -> gets read_one clipping: 5'=2, 3'=1
+        assert_eq!(metrics.read_one.reads, 1);
+        assert_eq!(metrics.read_one.bases_clipped_five_prime, 2);
+        assert_eq!(metrics.read_one.bases_clipped_three_prime, 1);
+
+        // R2 is last segment -> gets read_two clipping: 5'=1, 3'=2
+        assert_eq!(metrics.read_two.reads, 1);
+        assert_eq!(metrics.read_two.bases_clipped_five_prime, 1);
+        assert_eq!(metrics.read_two.bases_clipped_three_prime, 2);
+    }
+
+    #[test]
+    fn test_clip_pair_with_metrics_swapped_flags() {
+        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
+        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
+        use fgumi_lib::sam::builder::RecordBuilder;
+
+        // Test the !is_r1_first and !is_r2_last branches:
+        // r1 is NOT first_segment, r2 is NOT last_segment
+        let clip = make_clip(2, 1, 1, 2);
+        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let mut metrics = ClippingMetricsCollection::new();
+
+        // r1: last segment (not first)
+        let mut r1 = RecordBuilder::new()
+            .name("pair1")
+            .sequence("ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar("20M")
+            .paired(true)
+            .first_segment(false)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(200)
+            .template_length(120)
+            .build();
+
+        // r2: first segment (not last)
+        let mut r2 = RecordBuilder::new()
+            .name("pair1")
+            .sequence("ACGTACGTACGTACGTACGT")
+            .qualities(&[30; 20])
+            .cigar("20M")
+            .paired(true)
+            .first_segment(true)
+            .reverse_complement(true)
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .mapping_quality(60)
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(100)
+            .template_length(-120)
+            .build();
+
+        let (overlap, extend) =
+            clip.clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics)).unwrap();
+
+        assert!(!overlap);
+        assert!(!extend);
+
+        // r1 is not first_segment -> goes to read_two metrics
+        // r1 gets read_two clipping: 5'=1, 3'=2
+        assert_eq!(metrics.read_two.reads, 1);
+        assert_eq!(metrics.read_two.bases_clipped_five_prime, 1);
+        assert_eq!(metrics.read_two.bases_clipped_three_prime, 2);
+
+        // r2 is not last_segment -> goes to read_one metrics
+        // r2 gets read_one clipping: 5'=2, 3'=1
+        assert_eq!(metrics.read_one.reads, 1);
+        assert_eq!(metrics.read_one.bases_clipped_five_prime, 2);
+        assert_eq!(metrics.read_one.bases_clipped_three_prime, 1);
     }
 }

@@ -9,6 +9,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::Metric;
 
+/// Bundled counts for a single clipping operation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClipCounts {
+    /// Number of bases clipped before `clip`
+    pub prior: usize,
+    /// Number of bases clipped from 5' end
+    pub five_prime: usize,
+    /// Number of bases clipped from 3' end
+    pub three_prime: usize,
+    /// Number of bases clipped due to overlap
+    pub overlapping: usize,
+    /// Number of bases clipped due to extending past mate
+    pub extending: usize,
+}
+
 /// Type of read for metrics tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadType {
@@ -99,20 +114,8 @@ impl ClippingMetrics {
     ///
     /// # Arguments
     /// * `record` - The record that was clipped
-    /// * `prior_bases_clipped` - Number of bases clipped before `clip`
-    /// * `num_five_prime` - Number of bases clipped from 5' end
-    /// * `num_three_prime` - Number of bases clipped from 3' end
-    /// * `num_overlapping` - Number of bases clipped due to overlap
-    /// * `num_extending` - Number of bases clipped due to extending past mate
-    pub fn update(
-        &mut self,
-        record: &RecordBuf,
-        prior_bases_clipped: usize,
-        num_five_prime: usize,
-        num_three_prime: usize,
-        num_overlapping: usize,
-        num_extending: usize,
-    ) {
+    /// * `counts` - The clip counts for this operation
+    pub fn update(&mut self, record: &RecordBuf, counts: ClipCounts) {
         self.reads += 1;
 
         // Count aligned bases
@@ -131,38 +134,39 @@ impl ClippingMetrics {
         self.bases += aligned_bases;
 
         // Track pre-clipping
-        if prior_bases_clipped > 0 {
+        if counts.prior > 0 {
             self.reads_clipped_pre += 1;
-            self.bases_clipped_pre += prior_bases_clipped;
+            self.bases_clipped_pre += counts.prior;
         }
 
         // Track 5' clipping
-        if num_five_prime > 0 {
+        if counts.five_prime > 0 {
             self.reads_clipped_five_prime += 1;
-            self.bases_clipped_five_prime += num_five_prime;
+            self.bases_clipped_five_prime += counts.five_prime;
         }
 
         // Track 3' clipping
-        if num_three_prime > 0 {
+        if counts.three_prime > 0 {
             self.reads_clipped_three_prime += 1;
-            self.bases_clipped_three_prime += num_three_prime;
+            self.bases_clipped_three_prime += counts.three_prime;
         }
 
         // Track overlapping clipping
-        if num_overlapping > 0 {
+        if counts.overlapping > 0 {
             self.reads_clipped_overlapping += 1;
-            self.bases_clipped_overlapping += num_overlapping;
+            self.bases_clipped_overlapping += counts.overlapping;
         }
 
         // Track extending clipping
-        if num_extending > 0 {
+        if counts.extending > 0 {
             self.reads_clipped_extending += 1;
-            self.bases_clipped_extending += num_extending;
+            self.bases_clipped_extending += counts.extending;
         }
 
         // Total clipping after ClipBam
-        let additional_clipped = num_five_prime + num_three_prime + num_overlapping + num_extending;
-        let total_clipped = additional_clipped + prior_bases_clipped;
+        let additional_clipped =
+            counts.five_prime + counts.three_prime + counts.overlapping + counts.extending;
+        let total_clipped = additional_clipped + counts.prior;
 
         if total_clipped > 0 {
             self.reads_clipped_post += 1;
@@ -177,6 +181,12 @@ impl ClippingMetrics {
 
     /// Adds metrics from another `ClippingMetrics` instance
     pub fn add(&mut self, other: &ClippingMetrics) {
+        *self += other;
+    }
+}
+
+impl std::ops::AddAssign<&ClippingMetrics> for ClippingMetrics {
+    fn add_assign(&mut self, other: &ClippingMetrics) {
         self.reads += other.reads;
         self.reads_unmapped += other.reads_unmapped;
         self.reads_clipped_pre += other.reads_clipped_pre;
@@ -242,8 +252,8 @@ impl ClippingMetricsCollection {
 
     /// Returns all metrics in order
     #[must_use]
-    pub fn all_metrics(&self) -> Vec<&ClippingMetrics> {
-        vec![&self.fragment, &self.read_one, &self.read_two, &self.pair, &self.all]
+    pub fn all_metrics(&self) -> [&ClippingMetrics; 5] {
+        [&self.fragment, &self.read_one, &self.read_two, &self.pair, &self.all]
     }
 }
 
@@ -281,11 +291,21 @@ mod tests {
     }
 
     #[test]
+    fn test_clip_counts_default() {
+        let counts = ClipCounts::default();
+        assert_eq!(counts.prior, 0);
+        assert_eq!(counts.five_prime, 0);
+        assert_eq!(counts.three_prime, 0);
+        assert_eq!(counts.overlapping, 0);
+        assert_eq!(counts.extending, 0);
+    }
+
+    #[test]
     fn test_clipping_metrics_update_no_clipping() {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("100M", false);
 
-        metrics.update(&record, 0, 0, 0, 0, 0);
+        metrics.update(&record, ClipCounts::default());
 
         assert_eq!(metrics.reads, 1);
         assert_eq!(metrics.bases, 100);
@@ -298,7 +318,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("90M", false);
 
-        metrics.update(&record, 10, 0, 0, 0, 0);
+        metrics.update(&record, ClipCounts { prior: 10, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads, 1);
         assert_eq!(metrics.reads_clipped_pre, 1);
@@ -312,7 +332,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("95M", false);
 
-        metrics.update(&record, 0, 5, 0, 0, 0);
+        metrics.update(&record, ClipCounts { five_prime: 5, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads_clipped_five_prime, 1);
         assert_eq!(metrics.bases_clipped_five_prime, 5);
@@ -325,7 +345,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("97M", false);
 
-        metrics.update(&record, 0, 0, 3, 0, 0);
+        metrics.update(&record, ClipCounts { three_prime: 3, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads_clipped_three_prime, 1);
         assert_eq!(metrics.bases_clipped_three_prime, 3);
@@ -338,7 +358,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("80M", false);
 
-        metrics.update(&record, 0, 0, 0, 20, 0);
+        metrics.update(&record, ClipCounts { overlapping: 20, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads_clipped_overlapping, 1);
         assert_eq!(metrics.bases_clipped_overlapping, 20);
@@ -351,7 +371,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("85M", false);
 
-        metrics.update(&record, 0, 0, 0, 0, 15);
+        metrics.update(&record, ClipCounts { extending: 15, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads_clipped_extending, 1);
         assert_eq!(metrics.bases_clipped_extending, 15);
@@ -364,7 +384,10 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("50M", false);
 
-        metrics.update(&record, 10, 5, 3, 20, 12);
+        metrics.update(
+            &record,
+            ClipCounts { prior: 10, five_prime: 5, three_prime: 3, overlapping: 20, extending: 12 },
+        );
 
         assert_eq!(metrics.reads, 1);
         assert_eq!(metrics.bases_clipped_pre, 10);
@@ -380,7 +403,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("", true);
 
-        metrics.update(&record, 0, 100, 0, 0, 0);
+        metrics.update(&record, ClipCounts { five_prime: 100, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads_unmapped, 1);
     }
@@ -391,7 +414,7 @@ mod tests {
 
         for _ in 0..5 {
             let record = create_test_record("90M", false);
-            metrics.update(&record, 0, 10, 0, 0, 0);
+            metrics.update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
         }
 
         assert_eq!(metrics.reads, 5);
@@ -404,11 +427,11 @@ mod tests {
     fn test_clipping_metrics_add() {
         let mut metrics1 = ClippingMetrics::new(ReadType::ReadOne);
         let record1 = create_test_record("90M", false);
-        metrics1.update(&record1, 0, 10, 0, 0, 0);
+        metrics1.update(&record1, ClipCounts { five_prime: 10, ..ClipCounts::default() });
 
         let mut metrics2 = ClippingMetrics::new(ReadType::ReadOne);
         let record2 = create_test_record("85M", false);
-        metrics2.update(&record2, 0, 0, 15, 0, 0);
+        metrics2.update(&record2, ClipCounts { three_prime: 15, ..ClipCounts::default() });
 
         metrics1.add(&metrics2);
 
@@ -442,9 +465,15 @@ mod tests {
         let mut collection = ClippingMetricsCollection::new();
 
         let record = create_test_record("90M", false);
-        collection.read_one.update(&record, 0, 10, 0, 0, 0);
-        collection.read_two.update(&record, 0, 0, 10, 0, 0);
-        collection.fragment.update(&record, 0, 5, 0, 0, 0);
+        collection
+            .read_one
+            .update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
+        collection
+            .read_two
+            .update(&record, ClipCounts { three_prime: 10, ..ClipCounts::default() });
+        collection
+            .fragment
+            .update(&record, ClipCounts { five_prime: 5, ..ClipCounts::default() });
 
         collection.finalize();
 
@@ -476,7 +505,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("40M10D40M", false);
 
-        metrics.update(&record, 0, 0, 0, 0, 0);
+        metrics.update(&record, ClipCounts::default());
 
         // Only matches count as aligned bases
         assert_eq!(metrics.bases, 80);
@@ -487,7 +516,7 @@ mod tests {
         let mut metrics = ClippingMetrics::new(ReadType::ReadOne);
         let record = create_test_record("45M5I45M", false);
 
-        metrics.update(&record, 0, 0, 0, 0, 0);
+        metrics.update(&record, ClipCounts::default());
 
         // Only matches count as aligned bases
         assert_eq!(metrics.bases, 90);
@@ -499,7 +528,7 @@ mod tests {
         let record = create_test_record("", true);
 
         // No additional clipping, so shouldn't count as unmapped
-        metrics.update(&record, 10, 0, 0, 0, 0);
+        metrics.update(&record, ClipCounts { prior: 10, ..ClipCounts::default() });
 
         assert_eq!(metrics.reads_unmapped, 0);
     }
@@ -517,12 +546,30 @@ mod tests {
         let metrics2 = ClippingMetrics::new(ReadType::ReadOne);
 
         let record = create_test_record("90M", false);
-        metrics1.update(&record, 0, 10, 0, 0, 0);
+        metrics1.update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
 
         metrics1.add(&metrics2);
 
         // Should still have just the one record's data
         assert_eq!(metrics1.reads, 1);
+    }
+
+    #[test]
+    fn test_clipping_metrics_add_assign() {
+        let mut metrics1 = ClippingMetrics::new(ReadType::ReadOne);
+        let record1 = create_test_record("90M", false);
+        metrics1.update(&record1, ClipCounts { five_prime: 10, ..ClipCounts::default() });
+
+        let mut metrics2 = ClippingMetrics::new(ReadType::ReadOne);
+        let record2 = create_test_record("85M", false);
+        metrics2.update(&record2, ClipCounts { three_prime: 15, ..ClipCounts::default() });
+
+        metrics1 += &metrics2;
+
+        assert_eq!(metrics1.reads, 2);
+        assert_eq!(metrics1.bases, 175);
+        assert_eq!(metrics1.reads_clipped_five_prime, 1);
+        assert_eq!(metrics1.reads_clipped_three_prime, 1);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Metric;
+use crate::{Metric, frac};
 
 /// Metrics quantifying the distribution of different kinds of read family sizes.
 ///
@@ -272,6 +272,54 @@ impl Metric for DuplexUmiMetric {
     }
 }
 
+/// Tracks raw, error, and unique UMI observation counts.
+#[allow(clippy::struct_field_names)]
+struct UmiCountTracker {
+    raw_counts: HashMap<String, usize>,
+    error_counts: HashMap<String, usize>,
+    unique_counts: HashMap<String, usize>,
+}
+
+impl UmiCountTracker {
+    /// Creates an empty tracker.
+    fn new() -> Self {
+        Self {
+            raw_counts: HashMap::new(),
+            error_counts: HashMap::new(),
+            unique_counts: HashMap::new(),
+        }
+    }
+
+    /// Records an observation for a UMI.
+    fn record(&mut self, umi: &str, raw_count: usize, error_count: usize, is_unique: bool) {
+        let key = umi.to_string();
+        *self.raw_counts.entry(key.clone()).or_insert(0) += raw_count;
+        *self.error_counts.entry(key.clone()).or_insert(0) += error_count;
+        if is_unique {
+            *self.unique_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Total raw observations across all UMIs.
+    fn total_raw(&self) -> usize {
+        self.raw_counts.values().sum()
+    }
+
+    /// Total unique observations across all UMIs.
+    fn total_unique(&self) -> usize {
+        self.unique_counts.values().sum()
+    }
+
+    /// Iterates over all tracked UMIs, yielding `(umi, raw_count, error_count, unique_count)`.
+    fn iter(&self) -> impl Iterator<Item = (&str, usize, usize, usize)> {
+        self.raw_counts.iter().map(|(umi, &raw)| {
+            let errors = self.error_counts.get(umi).copied().unwrap_or(0);
+            let unique = self.unique_counts.get(umi).copied().unwrap_or(0);
+            (umi.as_str(), raw, errors, unique)
+        })
+    }
+}
+
 /// Collector for duplex sequencing metrics.
 ///
 /// Tracks family sizes, UMI frequencies, and yields at multiple sampling levels.
@@ -286,12 +334,8 @@ pub struct DuplexMetricsCollector {
     duplex_family_sizes: HashMap<(usize, usize), usize>,
 
     // UMI tracking
-    umi_raw_counts: HashMap<String, usize>,
-    umi_raw_error_counts: HashMap<String, usize>,
-    umi_unique_counts: HashMap<String, usize>,
-    duplex_umi_raw_counts: HashMap<String, usize>,
-    duplex_umi_raw_error_counts: HashMap<String, usize>,
-    duplex_umi_unique_counts: HashMap<String, usize>,
+    umi_counts: UmiCountTracker,
+    duplex_umi_counts: UmiCountTracker,
 }
 
 impl DuplexMetricsCollector {
@@ -304,12 +348,8 @@ impl DuplexMetricsCollector {
             ss_family_sizes: HashMap::new(),
             ds_family_sizes: HashMap::new(),
             duplex_family_sizes: HashMap::new(),
-            umi_raw_counts: HashMap::new(),
-            umi_raw_error_counts: HashMap::new(),
-            umi_unique_counts: HashMap::new(),
-            duplex_umi_raw_counts: HashMap::new(),
-            duplex_umi_raw_error_counts: HashMap::new(),
-            duplex_umi_unique_counts: HashMap::new(),
+            umi_counts: UmiCountTracker::new(),
+            duplex_umi_counts: UmiCountTracker::new(),
         }
     }
 
@@ -343,12 +383,7 @@ impl DuplexMetricsCollector {
     /// * `error_count` - Number of raw observations that had errors (differed from consensus)
     /// * `is_unique` - Whether this is a unique family observation
     pub fn record_umi(&mut self, umi: &str, raw_count: usize, error_count: usize, is_unique: bool) {
-        let key = umi.to_string();
-        *self.umi_raw_counts.entry(key.clone()).or_insert(0) += raw_count;
-        *self.umi_raw_error_counts.entry(key.clone()).or_insert(0) += error_count;
-        if is_unique {
-            *self.umi_unique_counts.entry(key).or_insert(0) += 1;
-        }
+        self.umi_counts.record(umi, raw_count, error_count, is_unique);
     }
 
     /// Records a duplex UMI observation
@@ -368,12 +403,7 @@ impl DuplexMetricsCollector {
         if !self.collect_duplex_umi_counts {
             return;
         }
-        let key = umi.to_string();
-        *self.duplex_umi_raw_counts.entry(key.clone()).or_insert(0) += raw_count;
-        *self.duplex_umi_raw_error_counts.entry(key.clone()).or_insert(0) += error_count;
-        if is_unique {
-            *self.duplex_umi_unique_counts.entry(key).or_insert(0) += 1;
-        }
+        self.duplex_umi_counts.record(umi, raw_count, error_count, is_unique);
     }
 
     /// Generates family size metrics
@@ -403,34 +433,13 @@ impl DuplexMetricsCollector {
             let mut metric = FamilySizeMetric::new(size);
 
             metric.cs_count = *self.cs_family_sizes.get(&size).unwrap_or(&0);
-            #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-            {
-                metric.cs_fraction = if coord_strand_total > 0 {
-                    metric.cs_count as f64 / coord_strand_total as f64
-                } else {
-                    0.0
-                };
-            }
+            metric.cs_fraction = frac(metric.cs_count, coord_strand_total);
 
             metric.ss_count = *self.ss_family_sizes.get(&size).unwrap_or(&0);
-            #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-            {
-                metric.ss_fraction = if single_strand_total > 0 {
-                    metric.ss_count as f64 / single_strand_total as f64
-                } else {
-                    0.0
-                };
-            }
+            metric.ss_fraction = frac(metric.ss_count, single_strand_total);
 
             metric.ds_count = *self.ds_family_sizes.get(&size).unwrap_or(&0);
-            #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-            {
-                metric.ds_fraction = if double_strand_total > 0 {
-                    metric.ds_count as f64 / double_strand_total as f64
-                } else {
-                    0.0
-                };
-            }
+            metric.ds_fraction = frac(metric.ds_count, double_strand_total);
 
             metrics.push(metric);
         }
@@ -463,10 +472,7 @@ impl DuplexMetricsCollector {
             .map(|((ab, ba), count)| {
                 let mut metric = DuplexFamilySizeMetric::new(*ab, *ba);
                 metric.count = *count;
-                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-                {
-                    metric.fraction = if total > 0 { *count as f64 / total as f64 } else { 0.0 };
-                }
+                metric.fraction = frac(*count, total);
                 metric
             })
             .collect();
@@ -499,10 +505,7 @@ impl DuplexMetricsCollector {
             }
             for metric in &mut metrics {
                 let cumulative_count = grid[metric.ab_size * cols + metric.ba_size];
-                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-                {
-                    metric.fraction_gt_or_eq_size = cumulative_count as f64 / total as f64;
-                }
+                metric.fraction_gt_or_eq_size = frac(cumulative_count, total);
             }
         }
 
@@ -512,34 +515,19 @@ impl DuplexMetricsCollector {
     /// Generates UMI metrics
     #[must_use]
     pub fn umi_metrics(&self) -> Vec<UmiMetric> {
-        let total_raw: usize = self.umi_raw_counts.values().sum();
-        let total_unique: usize = self.umi_unique_counts.values().sum();
+        let total_raw = self.umi_counts.total_raw();
+        let total_unique = self.umi_counts.total_unique();
 
         let mut metrics: Vec<_> = self
-            .umi_raw_counts
-            .keys()
-            .map(|umi| {
-                let mut metric = UmiMetric::new(umi.clone());
-                metric.raw_observations = *self.umi_raw_counts.get(umi).unwrap_or(&0);
-                metric.raw_observations_with_errors =
-                    *self.umi_raw_error_counts.get(umi).unwrap_or(&0);
-                metric.unique_observations = *self.umi_unique_counts.get(umi).unwrap_or(&0);
-                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-                {
-                    metric.fraction_raw_observations = if total_raw > 0 {
-                        metric.raw_observations as f64 / total_raw as f64
-                    } else {
-                        0.0
-                    };
-                }
-                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-                {
-                    metric.fraction_unique_observations = if total_unique > 0 {
-                        metric.unique_observations as f64 / total_unique as f64
-                    } else {
-                        0.0
-                    };
-                }
+            .umi_counts
+            .iter()
+            .map(|(umi, raw, errors, unique)| {
+                let mut metric = UmiMetric::new(umi.to_string());
+                metric.raw_observations = raw;
+                metric.raw_observations_with_errors = errors;
+                metric.unique_observations = unique;
+                metric.fraction_raw_observations = frac(raw, total_raw);
+                metric.fraction_unique_observations = frac(unique, total_unique);
                 metric
             })
             .collect();
@@ -563,34 +551,19 @@ impl DuplexMetricsCollector {
         let single_umi_fractions: HashMap<&str, f64> =
             umi_metrics.iter().map(|m| (m.umi.as_str(), m.fraction_unique_observations)).collect();
 
-        let total_raw: usize = self.duplex_umi_raw_counts.values().sum();
-        let total_unique: usize = self.duplex_umi_unique_counts.values().sum();
+        let total_raw = self.duplex_umi_counts.total_raw();
+        let total_unique = self.duplex_umi_counts.total_unique();
 
         let mut metrics: Vec<_> = self
-            .duplex_umi_raw_counts
-            .keys()
-            .map(|umi| {
-                let mut metric = DuplexUmiMetric::new(umi.clone());
-                metric.raw_observations = *self.duplex_umi_raw_counts.get(umi).unwrap_or(&0);
-                metric.raw_observations_with_errors =
-                    *self.duplex_umi_raw_error_counts.get(umi).unwrap_or(&0);
-                metric.unique_observations = *self.duplex_umi_unique_counts.get(umi).unwrap_or(&0);
-                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-                {
-                    metric.fraction_raw_observations = if total_raw > 0 {
-                        metric.raw_observations as f64 / total_raw as f64
-                    } else {
-                        0.0
-                    };
-                }
-                #[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
-                {
-                    metric.fraction_unique_observations = if total_unique > 0 {
-                        metric.unique_observations as f64 / total_unique as f64
-                    } else {
-                        0.0
-                    };
-                }
+            .duplex_umi_counts
+            .iter()
+            .map(|(umi, raw, errors, unique)| {
+                let mut metric = DuplexUmiMetric::new(umi.to_string());
+                metric.raw_observations = raw;
+                metric.raw_observations_with_errors = errors;
+                metric.unique_observations = unique;
+                metric.fraction_raw_observations = frac(raw, total_raw);
+                metric.fraction_unique_observations = frac(unique, total_unique);
 
                 // Calculate expected fraction based on individual UMI frequencies
                 // Expected frequency = freq(umi1) * freq(umi2) assuming independence
@@ -616,6 +589,35 @@ impl DuplexMetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // UmiCountTracker tests
+    // =========================================================================
+
+    #[test]
+    fn test_umi_count_tracker_empty() {
+        let tracker = UmiCountTracker::new();
+        assert_eq!(tracker.total_raw(), 0);
+        assert_eq!(tracker.total_unique(), 0);
+        assert_eq!(tracker.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_umi_count_tracker_record_and_iter() {
+        let mut tracker = UmiCountTracker::new();
+        tracker.record("AAAA", 10, 2, true);
+        tracker.record("AAAA", 5, 1, false);
+        tracker.record("CCCC", 8, 0, true);
+
+        assert_eq!(tracker.total_raw(), 23); // 15 + 8
+        assert_eq!(tracker.total_unique(), 2); // 1 + 1
+
+        let mut items: Vec<_> = tracker.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], ("AAAA", 15, 3, 1));
+        assert_eq!(items[1], ("CCCC", 8, 0, 1));
+    }
 
     // =========================================================================
     // FamilySizeMetric tests

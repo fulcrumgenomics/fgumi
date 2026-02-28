@@ -38,6 +38,20 @@ pub fn format_float(value: f64) -> String {
     format!("{value:.FLOAT_PRECISION$}")
 }
 
+/// Computes `numerator / denominator`, returning 0.0 if the denominator is zero.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
+pub fn frac(numerator: usize, denominator: usize) -> f64 {
+    if denominator > 0 { numerator as f64 / denominator as f64 } else { 0.0 }
+}
+
+/// Computes `numerator / denominator` for `u64` values, returning 0.0 if denominator is zero.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "metric counts never exceed 2^53")]
+pub fn frac_u64(numerator: u64, denominator: u64) -> f64 {
+    if denominator > 0 { numerator as f64 / denominator as f64 } else { 0.0 }
+}
+
 /// A metric type that can be serialized to TSV files.
 ///
 /// All metric types in fgumi implement this trait, providing a consistent
@@ -65,19 +79,13 @@ pub trait ProcessingMetrics {
 
     /// Processing efficiency as a percentage (output / input * 100).
     fn efficiency(&self) -> f64 {
-        if self.total_input() == 0 {
-            0.0
-        } else {
-            #[expect(clippy::cast_precision_loss, reason = "read counts never exceed 2^53")]
-            let result = self.total_output() as f64 / self.total_input() as f64 * 100.0;
-            result
-        }
+        frac_u64(self.total_output(), self.total_input()) * 100.0
     }
 }
 
 // Re-export commonly used types
 #[cfg(feature = "clip")]
-pub use clip::{ClippingMetrics, ClippingMetricsCollection, ReadType};
+pub use clip::{ClipCounts, ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
 pub use duplex::{
@@ -86,11 +94,41 @@ pub use duplex::{
 };
 pub use group::{FamilySizeMetrics, UmiGroupingMetrics};
 pub use rejection::{RejectionReason, format_count};
-pub use writer::write_metrics;
+pub use writer::{read_metrics, read_metrics_auto, write_metrics};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_frac_normal() {
+        assert!((frac(3, 4) - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frac_zero_denominator() {
+        assert!((frac(5, 0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frac_zero_numerator() {
+        assert!((frac(0, 10)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frac_u64_normal() {
+        assert!((frac_u64(3, 4) - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frac_u64_zero_denominator() {
+        assert!((frac_u64(5, 0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_frac_u64_zero_numerator() {
+        assert!((frac_u64(0, 10)).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn test_processing_metrics_consensus() {
