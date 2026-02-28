@@ -1,6 +1,6 @@
 [package]
 name = "fgumi-metrics"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.87.0"
 description = "Structured metric types and TSV writer for fgumi operations"
@@ -15,7 +15,7 @@ noodles = { version = "0.105.0", features = ["sam"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.3.0"
-fgumi-sam = { version = "0.1.0", path = "../fgumi-sam" }
+fgumi-sam = { version = "0.1.1", path = "../fgumi-sam" }
 
 [features]
 default = ["clip"]
