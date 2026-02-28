@@ -1269,29 +1269,10 @@ pub mod cigar_utils {
             .sum()
     }
 
-    /// Counts reference-consuming operations
-    #[must_use]
-    #[expect(
-        clippy::redundant_closure_for_method_calls,
-        reason = "Op::len is not a method on the trait"
-    )]
-    pub fn reference_length(cigar: &impl CigarTrait) -> usize {
-        cigar
-            .iter()
-            .filter_map(Result::ok)
-            .filter(|op| {
-                matches!(
-                    op.kind(),
-                    Kind::Match
-                        | Kind::SequenceMatch
-                        | Kind::SequenceMismatch
-                        | Kind::Deletion
-                        | Kind::Skip
-                )
-            })
-            .map(|op| op.len())
-            .sum()
-    }
+    /// Counts reference-consuming operations.
+    ///
+    /// Re-exported from [`crate::record_utils::reference_length`] to avoid duplication.
+    pub use crate::record_utils::reference_length;
 
     /// Simplified CIGAR representation: a vector of (operation kind, length) pairs.
     pub type SimplifiedCigar = Vec<(Kind, usize)>;

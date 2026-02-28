@@ -258,48 +258,27 @@ pub fn check_sort(header: &Header, path: &Path, name: &str) {
 /// ```
 #[must_use]
 pub fn reverse_buf_value(value: &BufValue) -> BufValue {
-    use noodles::sam::alignment::record_buf::data::field::value::Array::{
-        Float, Int8, Int16, Int32, UInt8, UInt16, UInt32,
-    };
+    use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+    /// Clones a vec and reverses it, wrapping back in the same Array variant.
+    macro_rules! clone_reverse {
+        ($variant:ident, $vec:expr) => {{
+            let mut values = $vec.clone();
+            values.reverse();
+            Array::$variant(values)
+        }};
+    }
+
     match value {
         BufValue::Array(arr) => {
-            use noodles::sam::alignment::record_buf::data::field::value::Array;
-            let new_arr: Array = match arr {
-                Int8(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    Int8(values)
-                }
-                UInt8(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    UInt8(values)
-                }
-                Int16(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    Int16(values)
-                }
-                UInt16(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    UInt16(values)
-                }
-                Int32(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    Int32(values)
-                }
-                UInt32(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    UInt32(values)
-                }
-                Float(vec) => {
-                    let mut values = vec.clone();
-                    values.reverse();
-                    Float(values)
-                }
+            let new_arr = match arr {
+                Array::Int8(v) => clone_reverse!(Int8, v),
+                Array::UInt8(v) => clone_reverse!(UInt8, v),
+                Array::Int16(v) => clone_reverse!(Int16, v),
+                Array::UInt16(v) => clone_reverse!(UInt16, v),
+                Array::Int32(v) => clone_reverse!(Int32, v),
+                Array::UInt32(v) => clone_reverse!(UInt32, v),
+                Array::Float(v) => clone_reverse!(Float, v),
             };
             BufValue::Array(new_arr)
         }
