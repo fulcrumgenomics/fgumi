@@ -1,11 +1,11 @@
 [package]
 name = "fgumi-bgzf"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.87.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "BGZF block reading, decompression, and compression utilities"
-repository = "https://github.com/fulcrumgenomics/fgumi"
-license = "MIT"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 libdeflater = "1.22"

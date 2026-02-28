@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-bgzf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bgzf",
  "crc32fast",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-dna"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "fgumi-metrics"
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-umi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "anyhow",
