@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use fgoxide::io::DelimFile;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::Metric;
@@ -76,6 +76,37 @@ pub fn write_metrics<P: AsRef<Path>, T: Serialize>(
 /// ```
 pub fn write_metrics_auto<P: AsRef<Path>, T: Metric>(path: P, metrics: &[T]) -> Result<()> {
     write_metrics(path, metrics, T::metric_name())
+}
+
+/// Read metrics from a TSV file with consistent error handling.
+///
+/// # Arguments
+/// * `path` - Path to the TSV file
+/// * `description` - Human-readable description for error messages
+///
+/// # Errors
+/// Returns an error if the file cannot be read or parsed
+pub fn read_metrics<P: AsRef<Path>, T: for<'de> Deserialize<'de>>(
+    path: P,
+    description: &str,
+) -> Result<Vec<T>> {
+    let path_ref = path.as_ref();
+    DelimFile::default()
+        .read_tsv(path_ref)
+        .with_context(|| format!("Failed to read {} metrics: {}", description, path_ref.display()))
+}
+
+/// Read metrics implementing the Metric trait from a TSV file.
+///
+/// Uses the metric's own name for error messages.
+///
+/// # Arguments
+/// * `path` - Path to the TSV file
+///
+/// # Errors
+/// Returns an error if the file cannot be read or parsed
+pub fn read_metrics_auto<P: AsRef<Path>, T: Metric>(path: P) -> Result<Vec<T>> {
+    read_metrics(path, T::metric_name())
 }
 
 #[cfg(test)]
@@ -177,6 +208,44 @@ mod tests {
         let content = fs::read_to_string(temp_file.path())?;
         assert!(content.contains("auto"));
         assert!(content.contains("42"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_metrics_roundtrip() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let original = vec![
+            TestMetrics { name: "a".to_string(), count: 1, value: 1.1 },
+            TestMetrics { name: "b".to_string(), count: 2, value: 2.2 },
+        ];
+
+        write_metrics(temp_file.path(), &original, "test")?;
+        let read_back: Vec<TestMetrics> = read_metrics(temp_file.path(), "test")?;
+
+        assert_eq!(original, read_back);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_metrics_invalid_path() {
+        let result: Result<Vec<TestMetrics>> =
+            read_metrics("/nonexistent/path/file.tsv", "test");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to read test metrics"));
+    }
+
+    #[test]
+    fn test_read_metrics_auto_roundtrip() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let original = vec![TestMetrics { name: "auto".to_string(), count: 42, value: 3.14 }];
+
+        write_metrics_auto(temp_file.path(), &original)?;
+        let read_back: Vec<TestMetrics> = read_metrics_auto(temp_file.path())?;
+
+        assert_eq!(original, read_back);
 
         Ok(())
     }

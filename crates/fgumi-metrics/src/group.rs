@@ -11,7 +11,7 @@ use crate::Metric;
 ///
 /// These metrics track how reads are grouped by UMI and provide insight into
 /// data quality and molecule representation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UmiGroupingMetrics {
     /// Total SAM records processed
     pub total_records: u64,
@@ -54,26 +54,7 @@ impl UmiGroupingMetrics {
     /// Creates a new UMI grouping metrics struct with all counts initialized to zero.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            total_records: 0,
-            accepted_records: 0,
-            discarded_non_pf: 0,
-            discarded_poor_alignment: 0,
-            discarded_ns_in_umi: 0,
-            discarded_umi_too_short: 0,
-            unique_molecule_ids: 0,
-            total_families: 0,
-            avg_reads_per_molecule: 0.0,
-            median_reads_per_molecule: 0,
-            min_reads_per_molecule: 0,
-            max_reads_per_molecule: 0,
-        }
-    }
-}
-
-impl Default for UmiGroupingMetrics {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 

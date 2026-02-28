@@ -2,8 +2,7 @@
 //!
 //! This module provides metrics for tracking UMI correction operations.
 
-use anyhow::{Context, Result};
-use fgoxide::io::DelimFile;
+use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 
@@ -141,9 +140,7 @@ impl UmiCorrectionMetrics {
     ///
     /// Returns an error if the file cannot be created or written to.
     pub fn write_metrics(metrics: &[Self], path: &Path) -> Result<()> {
-        DelimFile::default()
-            .write_tsv(path, metrics)
-            .with_context(|| format!("Failed to write UMI correction metrics: {}", path.display()))
+        crate::writer::write_metrics_auto(path, metrics)
     }
 
     /// Reads metrics from a TSV file.
@@ -161,9 +158,7 @@ impl UmiCorrectionMetrics {
     /// - The file format is invalid
     /// - Any values cannot be parsed
     pub fn read_metrics(path: &Path) -> Result<Vec<Self>> {
-        DelimFile::default()
-            .read_tsv(path)
-            .with_context(|| format!("Failed to read UMI correction metrics: {}", path.display()))
+        crate::writer::read_metrics_auto(path)
     }
 }
 
