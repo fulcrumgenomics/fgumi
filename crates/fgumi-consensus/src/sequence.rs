@@ -191,17 +191,8 @@ impl ConsensusSequence {
 
     /// Returns the error rate (total errors / total depth).
     #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "u32 values from u16 sums are small enough for f32 precision"
-    )]
     pub fn error_rate(&self) -> f32 {
-        let total_depth: u32 = self.depths.iter().map(|&d| u32::from(d)).sum();
-        if total_depth == 0 {
-            return 0.0;
-        }
-        let total_errors: u32 = self.errors.iter().map(|&e| u32::from(e)).sum();
-        total_errors as f32 / total_depth as f32
+        crate::caller::calculate_error_rate(&self.depths, &self.errors)
     }
 
     /// Decomposes this sequence into its component vectors.
@@ -419,5 +410,115 @@ mod tests {
         let seq = ConsensusSequence::with_capacity(100);
         assert!(seq.is_empty());
         // Capacity is an implementation detail, but we can verify the struct is usable
+    }
+
+    // =====================================================================
+    // Tests for mutable accessors
+    // =====================================================================
+
+    #[test]
+    fn test_bases_mut() {
+        let mut seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+
+        seq.bases_mut()[0] = b'T';
+        assert_eq!(seq.bases(), &[b'T', b'C']);
+    }
+
+    #[test]
+    fn test_quals_mut() {
+        let mut seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+
+        seq.quals_mut()[1] = 40;
+        assert_eq!(seq.quals(), &[30, 40]);
+    }
+
+    #[test]
+    fn test_depths_mut() {
+        let mut seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+
+        seq.depths_mut()[0] = 20;
+        assert_eq!(seq.depths(), &[20, 8]);
+    }
+
+    #[test]
+    fn test_errors_mut() {
+        let mut seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+
+        seq.errors_mut()[1] = 3;
+        assert_eq!(seq.errors(), &[0, 3]);
+    }
+
+    #[test]
+    fn test_default_is_empty() {
+        let seq = ConsensusSequence::default();
+        assert!(seq.is_empty());
+        assert_eq!(seq.len(), 0);
+        assert_eq!(seq.max_depth(), 0);
+        assert_eq!(seq.min_depth(), 0);
+    }
+
+    // =====================================================================
+    // Tests for padded edge cases
+    // =====================================================================
+
+    #[test]
+    #[should_panic(expected = "must be >= current length")]
+    fn test_padded_too_short_panics() {
+        let seq = ConsensusSequence::from_vecs(
+            vec![b'A', b'C', b'G'],
+            vec![30, 25, 20],
+            vec![10, 8, 5],
+            vec![0, 1, 0],
+        );
+        let _ = seq.padded(2, false, b'N', 2);
+    }
+
+    #[test]
+    fn test_padded_left_preserves_errors() {
+        let seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![2, 3]);
+
+        let padded = seq.padded(4, true, b'N', 2);
+        assert_eq!(padded.errors(), &[0, 0, 2, 3]);
+        assert_eq!(padded.depths(), &[0, 0, 10, 8]);
+    }
+
+    // =====================================================================
+    // Tests for clone and extend
+    // =====================================================================
+
+    #[test]
+    fn test_clone() {
+        let seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+        let cloned = seq.clone();
+        assert_eq!(cloned.bases(), seq.bases());
+        assert_eq!(cloned.quals(), seq.quals());
+        assert_eq!(cloned.depths(), seq.depths());
+        assert_eq!(cloned.errors(), seq.errors());
+    }
+
+    #[test]
+    fn test_extend_empty_into_existing() {
+        let mut seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+        let empty = ConsensusSequence::new();
+        seq.extend(&empty);
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq.bases(), &[b'A', b'C']);
+    }
+
+    #[test]
+    fn test_extend_into_empty() {
+        let mut empty = ConsensusSequence::new();
+        let seq =
+            ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
+        empty.extend(&seq);
+        assert_eq!(empty.len(), 2);
+        assert_eq!(empty.bases(), &[b'A', b'C']);
     }
 }
