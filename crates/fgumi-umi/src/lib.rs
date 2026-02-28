@@ -144,37 +144,17 @@ impl std::fmt::Display for MoleculeId {
 pub struct TagSets;
 
 impl TagSets {
-    /// Returns the list of Consensus tags that should be reversed
+    /// Consensus tags that should be reversed.
     ///
     /// These are per-base tags from fgbio consensus callers that need to be
     /// reversed when the read is mapped to the negative strand.
-    ///
-    /// # Returns
-    ///
-    /// Vector of tag names: `["ad", "ae", "bd", "be", "cd"]`
-    #[must_use]
-    pub fn consensus_reverse() -> Vec<String> {
-        vec![
-            "ad".to_string(),
-            "ae".to_string(),
-            "bd".to_string(),
-            "be".to_string(),
-            "cd".to_string(),
-        ]
-    }
+    pub const CONSENSUS_REVERSE: &[&str] = &["ad", "ae", "bd", "be", "cd"];
 
-    /// Returns the list of Consensus tags that should be reverse complemented
+    /// Consensus tags that should be reverse complemented.
     ///
     /// These are per-base sequence tags from fgbio consensus callers that need
     /// to be reverse complemented when the read is mapped to the negative strand.
-    ///
-    /// # Returns
-    ///
-    /// Vector of tag names: `["aD", "bD", "cD"]`
-    #[must_use]
-    pub fn consensus_revcomp() -> Vec<String> {
-        vec!["aD".to_string(), "bD".to_string(), "cD".to_string()]
-    }
+    pub const CONSENSUS_REVCOMP: &[&str] = &["aD", "bD", "cD"];
 }
 
 /// Information about which tags to remove, reverse, or reverse complement
@@ -220,7 +200,7 @@ impl TagInfo {
 
         for tag in reverse {
             if tag == "Consensus" {
-                reverse_set.extend(TagSets::consensus_reverse());
+                reverse_set.extend(TagSets::CONSENSUS_REVERSE.iter().map(|&s| s.to_owned()));
             } else {
                 reverse_set.insert(tag);
             }
@@ -228,7 +208,7 @@ impl TagInfo {
 
         for tag in revcomp {
             if tag == "Consensus" {
-                revcomp_set.extend(TagSets::consensus_revcomp());
+                revcomp_set.extend(TagSets::CONSENSUS_REVCOMP.iter().map(|&s| s.to_owned()));
             } else {
                 revcomp_set.insert(tag);
             }
@@ -339,16 +319,14 @@ mod tests {
 
     #[test]
     fn test_consensus_reverse_returns_correct_tags() {
-        let tags = TagSets::consensus_reverse();
-        assert_eq!(tags.len(), 5);
-        assert_eq!(tags, vec!["ad", "ae", "bd", "be", "cd"]);
+        assert_eq!(TagSets::CONSENSUS_REVERSE.len(), 5);
+        assert_eq!(TagSets::CONSENSUS_REVERSE, &["ad", "ae", "bd", "be", "cd"]);
     }
 
     #[test]
     fn test_consensus_revcomp_returns_correct_tags() {
-        let tags = TagSets::consensus_revcomp();
-        assert_eq!(tags.len(), 3);
-        assert_eq!(tags, vec!["aD", "bD", "cD"]);
+        assert_eq!(TagSets::CONSENSUS_REVCOMP.len(), 3);
+        assert_eq!(TagSets::CONSENSUS_REVCOMP, &["aD", "bD", "cD"]);
     }
 
     #[test]
