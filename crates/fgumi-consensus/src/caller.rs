@@ -305,44 +305,6 @@ pub fn log_consensus_statistics(caller_name: &str, stats: &ConsensusCallingStats
     }
 }
 
-/// Common options shared across consensus callers.
-///
-/// These fields are duplicated across `VanillaUmiConsensusOptions`, `CodecConsensusOptions`,
-/// and `DuplexConsensusOptions`. This struct provides a common base to reduce duplication.
-#[derive(Debug, Clone)]
-pub struct ConsensusOptionsBase {
-    /// Pre-UMI error rate (Phred scale)
-    pub error_rate_pre_umi: crate::phred::PhredScore,
-
-    /// Post-UMI error rate (Phred scale)
-    pub error_rate_post_umi: crate::phred::PhredScore,
-
-    /// Minimum base quality to include in consensus
-    pub min_input_base_quality: crate::phred::PhredScore,
-
-    /// Whether to produce per-base tags (cd, ce, etc.)
-    pub produce_per_base_tags: bool,
-
-    /// Whether to quality-trim reads before consensus calling
-    pub trim: bool,
-
-    /// Minimum consensus base quality (output bases below this are masked to N)
-    pub min_consensus_base_quality: crate::phred::PhredScore,
-}
-
-impl Default for ConsensusOptionsBase {
-    fn default() -> Self {
-        Self {
-            error_rate_pre_umi: 45,
-            error_rate_post_umi: 40,
-            min_input_base_quality: 10,
-            produce_per_base_tags: true,
-            trim: false,
-            min_consensus_base_quality: 40,
-        }
-    }
-}
-
 /// Calculates error rate from depths and errors arrays.
 ///
 /// This is the standard formula used across all consensus callers:
@@ -361,56 +323,6 @@ pub fn calculate_error_rate(depths: &[u16], errors: &[u16]) -> f32 {
     }
     let total_errors: u32 = errors.iter().map(|&e| u32::from(e)).sum();
     total_errors as f32 / total_depth as f32
-}
-
-/// Tracker for rejected reads during consensus calling.
-///
-/// This struct encapsulates the common pattern of tracking rejected reads
-/// that's duplicated across `VanillaUmiConsensusCaller` and `CodecConsensusCaller`.
-#[derive(Debug, Default)]
-pub struct RejectionTracker {
-    /// Whether to track rejected reads
-    pub track_rejects: bool,
-
-    /// Rejected reads as raw bytes (only populated if `track_rejects` is true)
-    rejected_records: Vec<Vec<u8>>,
-}
-
-impl RejectionTracker {
-    /// Creates a new rejection tracker.
-    #[must_use]
-    pub fn new(track_rejects: bool) -> Self {
-        Self { track_rejects, rejected_records: Vec::new() }
-    }
-
-    /// Adds rejected raw-byte records to the tracker (if tracking is enabled).
-    pub fn add_rejected(&mut self, records: impl IntoIterator<Item = Vec<u8>>) {
-        if self.track_rejects {
-            self.rejected_records.extend(records);
-        }
-    }
-
-    /// Returns a reference to the rejected records.
-    #[must_use]
-    pub fn rejected_records(&self) -> &[Vec<u8>] {
-        &self.rejected_records
-    }
-
-    /// Takes ownership of the rejected records, leaving an empty vector.
-    pub fn take_rejected_records(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.rejected_records)
-    }
-
-    /// Clears the rejected records without returning them.
-    pub fn clear(&mut self) {
-        self.rejected_records.clear();
-    }
-
-    /// Returns whether rejection tracking is enabled.
-    #[must_use]
-    pub fn is_tracking(&self) -> bool {
-        self.track_rejects
-    }
 }
 
 /// Reasons why reads might be rejected and not used in consensus calling
@@ -562,7 +474,8 @@ pub fn make_prefix_from_header(header: &Header) -> String {
     ids.dedup();
 
     // Calculate total length including separators
-    let total_len: usize = ids.iter().map(|s| s.len() + 1).sum();
+    let total_len: usize =
+        ids.iter().map(String::len).sum::<usize>() + ids.len().saturating_sub(1);
 
     if total_len <= 200 {
         ids.join("|")
@@ -905,5 +818,298 @@ mod tests {
         let prefix = make_prefix_from_header(&header);
         // Empty string when no read groups
         assert_eq!(prefix, "");
+    }
+
+    /// Test `make_prefix_from_header` returns joined names when total length is exactly 200
+    #[test]
+    fn test_make_prefix_from_header_exact_200_boundary() {
+        use bstr::BString;
+        use noodles::sam::header::Builder as HeaderBuilder;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReadGroup;
+        use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+        // Two names of 100 chars each: joined = 100 + "|" + 100 = 201 > 200 → hash
+        // So use 100 + 99 = 199 + 1 separator = 200 → joined
+        let lib_a = "A".repeat(100);
+        let lib_b = "B".repeat(99);
+
+        let rg1 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, lib_a.clone())
+            .build()
+            .unwrap();
+        let rg2 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, lib_b.clone())
+            .build()
+            .unwrap();
+        let header = HeaderBuilder::default()
+            .add_read_group(BString::from("RG1"), rg1)
+            .add_read_group(BString::from("RG2"), rg2)
+            .build();
+
+        let prefix = make_prefix_from_header(&header);
+        // Exactly 200 chars should return joined names, not a hash
+        assert_eq!(prefix, format!("{lib_a}|{lib_b}"));
+    }
+
+    /// Test `make_prefix_from_header` falls back to hash when combined length exceeds 200
+    #[test]
+    fn test_make_prefix_from_header_long_names_use_hash() {
+        use bstr::BString;
+        use noodles::sam::header::Builder as HeaderBuilder;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReadGroup;
+        use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
+
+        // Create library names whose combined length (including separators) exceeds 200
+        let long_lib_a = "A".repeat(100);
+        let long_lib_b = "B".repeat(101);
+
+        let rg1 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, long_lib_a.clone())
+            .build()
+            .unwrap();
+        let rg2 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, long_lib_b.clone())
+            .build()
+            .unwrap();
+        let header = HeaderBuilder::default()
+            .add_read_group(BString::from("RG1"), rg1)
+            .add_read_group(BString::from("RG2"), rg2)
+            .build();
+
+        let prefix = make_prefix_from_header(&header);
+        // Should use hash (hex string) instead of joined names
+        assert_ne!(prefix, format!("{long_lib_a}|{long_lib_b}"));
+        // Hash output is a hex string - verify it only contains hex characters
+        assert!(prefix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // =====================================================================
+    // Tests for calculate_error_rate
+    // =====================================================================
+
+    #[test]
+    fn test_calculate_error_rate_zero_depth() {
+        assert!((calculate_error_rate(&[], &[]) - 0.0).abs() < f32::EPSILON);
+        assert!((calculate_error_rate(&[0, 0], &[0, 0]) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_error_rate_no_errors() {
+        let depths = [10, 20, 30];
+        let errors = [0, 0, 0];
+        assert!((calculate_error_rate(&depths, &errors) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_error_rate_some_errors() {
+        let depths = [10, 10, 10, 10]; // total = 40
+        let errors = [0, 1, 1, 2]; // total = 4
+        let rate = calculate_error_rate(&depths, &errors);
+        assert!((rate - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_error_rate_all_errors() {
+        let depths = [5, 5];
+        let errors = [5, 5];
+        let rate = calculate_error_rate(&depths, &errors);
+        assert!((rate - 1.0).abs() < f32::EPSILON);
+    }
+
+    // =====================================================================
+    // Tests for ConsensusOutput
+    // =====================================================================
+
+    #[test]
+    fn test_consensus_output_new_is_empty() {
+        let output = ConsensusOutput::new();
+        assert!(output.data.is_empty());
+        assert_eq!(output.count, 0);
+    }
+
+    #[test]
+    fn test_consensus_output_default() {
+        let output = ConsensusOutput::default();
+        assert!(output.data.is_empty());
+        assert_eq!(output.count, 0);
+    }
+
+    #[test]
+    fn test_consensus_output_extend() {
+        let mut output1 = ConsensusOutput { data: vec![1, 2, 3], count: 1 };
+        let output2 = ConsensusOutput { data: vec![4, 5, 6], count: 2 };
+
+        output1.extend(&output2);
+        assert_eq!(output1.data, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(output1.count, 3);
+    }
+
+    #[test]
+    fn test_consensus_output_merge() {
+        let mut output1 = ConsensusOutput { data: vec![1, 2, 3], count: 1 };
+        let output2 = ConsensusOutput { data: vec![4, 5, 6], count: 2 };
+
+        output1.merge(output2);
+        assert_eq!(output1.data, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(output1.count, 3);
+    }
+
+    #[test]
+    fn test_consensus_output_extend_empty() {
+        let mut output1 = ConsensusOutput { data: vec![1, 2], count: 1 };
+        let output2 = ConsensusOutput::new();
+
+        output1.extend(&output2);
+        assert_eq!(output1.data, vec![1, 2]);
+        assert_eq!(output1.count, 1);
+    }
+
+    #[test]
+    fn test_consensus_output_merge_into_empty() {
+        let mut output1 = ConsensusOutput::new();
+        let output2 = ConsensusOutput { data: vec![7, 8, 9], count: 3 };
+
+        output1.merge(output2);
+        assert_eq!(output1.data, vec![7, 8, 9]);
+        assert_eq!(output1.count, 3);
+    }
+
+    // =====================================================================
+    // Tests for log_consensus_statistics (verify it runs without panicking)
+    // =====================================================================
+
+    #[test]
+    fn test_log_consensus_statistics_empty_stats() {
+        let stats = ConsensusCallingStats::new();
+        // Should not panic even with empty stats
+        log_consensus_statistics("TestCaller", &stats);
+    }
+
+    #[test]
+    fn test_log_consensus_statistics_with_rejections() {
+        let mut stats = ConsensusCallingStats::new();
+        stats.record_input(100);
+        stats.record_consensus();
+        stats.record_rejection(RejectionReason::QualityTooLow, 10);
+        stats.record_rejection(RejectionReason::TooManyNs, 5);
+        // Should not panic with populated stats
+        log_consensus_statistics("TestCaller", &stats);
+    }
+
+    // =====================================================================
+    // Comprehensive RejectionReason tests
+    // =====================================================================
+
+    #[test]
+    fn test_all_rejection_reasons_have_descriptions() {
+        let reasons = [
+            RejectionReason::FragmentRead,
+            RejectionReason::InsufficientReads,
+            RejectionReason::QualityTooLow,
+            RejectionReason::Unmapped,
+            RejectionReason::Mapped,
+            RejectionReason::TooManyNs,
+            RejectionReason::MinorityAlignment,
+            RejectionReason::SecondaryOrSupplementary,
+            RejectionReason::FailedQC,
+            RejectionReason::MissingUmi,
+            RejectionReason::QualityTrimmed,
+            RejectionReason::ZeroLengthAfterTrimming,
+            RejectionReason::InsufficientOverlap,
+            RejectionReason::OrphanConsensus,
+            RejectionReason::IndelErrorBetweenStrands,
+            RejectionReason::PotentialCollision,
+            RejectionReason::Other,
+        ];
+
+        for reason in &reasons {
+            let desc = reason.description();
+            assert!(!desc.is_empty(), "Description should not be empty for {reason:?}");
+        }
+    }
+
+    #[test]
+    fn test_all_rejection_reasons_to_centralized() {
+        use fgumi_metrics::rejection::RejectionReason as CentralReason;
+
+        // Test every variant maps to a centralized reason
+        let mappings = [
+            (RejectionReason::FragmentRead, CentralReason::SameStrandOnly),
+            (RejectionReason::InsufficientReads, CentralReason::InsufficientSupport),
+            (RejectionReason::QualityTooLow, CentralReason::LowBaseQuality),
+            (RejectionReason::Unmapped, CentralReason::NoValidAlignment),
+            (RejectionReason::Mapped, CentralReason::NoValidAlignment),
+            (RejectionReason::TooManyNs, CentralReason::ExcessiveNBases),
+            (RejectionReason::MinorityAlignment, CentralReason::MinorityAlignment),
+            (RejectionReason::SecondaryOrSupplementary, CentralReason::NoValidAlignment),
+            (RejectionReason::FailedQC, CentralReason::NotPassingFilter),
+            (RejectionReason::MissingUmi, CentralReason::MissingUmi),
+            (RejectionReason::QualityTrimmed, CentralReason::LowBaseQuality),
+            (RejectionReason::ZeroLengthAfterTrimming, CentralReason::ZeroBasesPostTrimming),
+            (RejectionReason::InsufficientOverlap, CentralReason::InsufficientSupport),
+            (RejectionReason::OrphanConsensus, CentralReason::OrphanConsensus),
+            (RejectionReason::IndelErrorBetweenStrands, CentralReason::NoValidAlignment),
+            (RejectionReason::PotentialCollision, CentralReason::DuplicateUmi),
+            (RejectionReason::Other, CentralReason::InsufficientSupport),
+        ];
+
+        for (caller_reason, expected_central) in &mappings {
+            assert_eq!(
+                caller_reason.to_centralized(),
+                *expected_central,
+                "Mismatch for {caller_reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_rejection_reasons_codes_and_descriptions_complete() {
+        // Verify all newer variants that were missing from earlier tests
+        assert_eq!(RejectionReason::ZeroLengthAfterTrimming.code(), 'Z');
+        assert_eq!(RejectionReason::InsufficientOverlap.code(), 'V');
+        assert_eq!(RejectionReason::OrphanConsensus.code(), 'P');
+        assert_eq!(RejectionReason::IndelErrorBetweenStrands.code(), 'D');
+        assert_eq!(RejectionReason::PotentialCollision.code(), 'C');
+
+        assert_eq!(
+            RejectionReason::ZeroLengthAfterTrimming.description(),
+            "Zero length after masking low quality bases"
+        );
+        assert_eq!(
+            RejectionReason::InsufficientOverlap.description(),
+            "Insufficient overlap between reads"
+        );
+        assert_eq!(
+            RejectionReason::OrphanConsensus.description(),
+            "Only one of R1 or R2 consensus generated"
+        );
+        assert_eq!(
+            RejectionReason::IndelErrorBetweenStrands.description(),
+            "Overlap boundary lands in indel between strands"
+        );
+        assert_eq!(
+            RejectionReason::PotentialCollision.description(),
+            "Potential collisions (reads with the same MI but different strands)"
+        );
+    }
+
+    #[test]
+    fn test_rejection_reason_debug_format() {
+        // Verify Debug trait is working for all variants
+        let reason = RejectionReason::QualityTooLow;
+        let debug_str = format!("{reason:?}");
+        assert_eq!(debug_str, "QualityTooLow");
+    }
+
+    #[test]
+    fn test_rejection_reason_hash() {
+        // Verify Hash trait works by using rejection reasons as HashMap keys
+        let mut map = HashMap::new();
+        map.insert(RejectionReason::QualityTooLow, 5);
+        map.insert(RejectionReason::TooManyNs, 3);
+        assert_eq!(map[&RejectionReason::QualityTooLow], 5);
+        assert_eq!(map[&RejectionReason::TooManyNs], 3);
     }
 }

@@ -27,6 +27,21 @@
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::value::Value;
 
+/// Converts a two-character tag string to a noodles `Tag`.
+///
+/// # Panics
+///
+/// Panics if `s` is not exactly 2 ASCII bytes.
+#[must_use]
+pub fn tag(s: &str) -> Tag {
+    let bytes = s.as_bytes();
+    assert!(
+        bytes.len() == 2 && bytes[0].is_ascii() && bytes[1].is_ascii(),
+        "SAM tag must be exactly 2 ASCII bytes: {s:?}"
+    );
+    Tag::from([bytes[0], bytes[1]])
+}
+
 /// Converts a sequence (`Vec<u8>`) to a String value for SAM tags.
 ///
 /// This matches fgbio's format for ac/bc tags (Z string type).
@@ -62,7 +77,11 @@ pub const MOLECULAR_ID: &str = "MI";
 
 /// Per-base consensus tags
 pub mod per_base {
-    use super::Tag;
+    /// Converts a tag string to a noodles Tag (delegates to top-level [`super::tag`])
+    #[must_use]
+    pub fn tag(s: &str) -> super::Tag {
+        super::tag(s)
+    }
 
     /// The per-base number of raw-reads contributing to the consensus (stored as a short[])
     pub const RAW_READ_COUNT: &str = "cd"; // consensus depth
@@ -143,18 +162,15 @@ pub mod per_base {
     pub fn all_tags() -> &'static [&'static str] {
         ALL_TAGS
     }
-
-    /// Converts a tag string to a noodles Tag
-    #[must_use]
-    pub fn tag(s: &str) -> Tag {
-        let bytes = s.as_bytes();
-        Tag::from([bytes[0], bytes[1]])
-    }
 }
 
 /// Per-read consensus tags
 pub mod per_read {
-    use super::Tag;
+    /// Converts a tag string to a noodles Tag (delegates to top-level [`super::tag`])
+    #[must_use]
+    pub fn tag(s: &str) -> super::Tag {
+        super::tag(s)
+    }
 
     /// The number of raw reads that contributed to the consensus (max of per-base counts)
     pub const RAW_READ_COUNT: &str = "cD"; // consensus Depth
@@ -201,13 +217,6 @@ pub mod per_read {
     #[must_use]
     pub fn all_tags() -> &'static [&'static str] {
         ALL_TAGS
-    }
-
-    /// Converts a tag string to a noodles Tag
-    #[must_use]
-    pub fn tag(s: &str) -> Tag {
-        let bytes = s.as_bytes();
-        Tag::from([bytes[0], bytes[1]])
     }
 }
 
@@ -309,6 +318,186 @@ mod tests {
     fn test_is_not_consensus() {
         // Create a record without consensus tags (raw read)
         let rec = RecordBuilder::new().sequence("ACGT").tag("RX", "ACGT").build();
+
+        assert!(!is_simplex_consensus(&rec));
+        assert!(!is_duplex_consensus(&rec));
+        assert!(!is_consensus(&rec));
+    }
+
+    // =====================================================================
+    // Tests for top-level tag() function
+    // =====================================================================
+
+    #[test]
+    fn test_top_level_tag_conversion() {
+        let t = tag("MI");
+        assert_eq!(t, Tag::from([b'M', b'I']));
+
+        let t = tag("RX");
+        assert_eq!(t, Tag::from([b'R', b'X']));
+    }
+
+    // =====================================================================
+    // Tests for sequence_to_tag_value and qualities_to_tag_value
+    // =====================================================================
+
+    #[test]
+    fn test_sequence_to_tag_value() {
+        let bases = b"ACGT";
+        let value = sequence_to_tag_value(bases);
+        match value {
+            noodles::sam::alignment::record_buf::data::field::value::Value::String(s) => {
+                assert_eq!(s, "ACGT");
+            }
+            _ => panic!("Expected String value"),
+        }
+    }
+
+    #[test]
+    fn test_sequence_to_tag_value_empty() {
+        let bases = b"";
+        let value = sequence_to_tag_value(bases);
+        match value {
+            noodles::sam::alignment::record_buf::data::field::value::Value::String(s) => {
+                assert_eq!(s, "");
+            }
+            _ => panic!("Expected String value"),
+        }
+    }
+
+    #[test]
+    fn test_qualities_to_tag_value() {
+        // Q0 -> '!' (33), Q10 -> '+' (43), Q30 -> '?' (63)
+        let quals = vec![0, 10, 30];
+        let value = qualities_to_tag_value(&quals);
+        match value {
+            noodles::sam::alignment::record_buf::data::field::value::Value::String(s) => {
+                assert_eq!(s.as_bytes(), &[33, 43, 63]);
+            }
+            _ => panic!("Expected String value"),
+        }
+    }
+
+    #[test]
+    fn test_qualities_to_tag_value_empty() {
+        let quals: Vec<u8> = vec![];
+        let value = qualities_to_tag_value(&quals);
+        match value {
+            noodles::sam::alignment::record_buf::data::field::value::Value::String(s) => {
+                assert_eq!(s, "");
+            }
+            _ => panic!("Expected String value"),
+        }
+    }
+
+    // =====================================================================
+    // Tests for per_base helper functions
+    // =====================================================================
+
+    #[test]
+    fn test_per_base_tags_to_reverse() {
+        let tags = per_base::tags_to_reverse();
+        assert!(tags.contains(&"cd"));
+        assert!(tags.contains(&"ce"));
+        assert!(tags.contains(&"ad"));
+        assert!(tags.contains(&"ae"));
+        assert!(tags.contains(&"bd"));
+        assert!(tags.contains(&"be"));
+        assert!(tags.contains(&"aq"));
+        assert!(tags.contains(&"bq"));
+    }
+
+    #[test]
+    fn test_per_base_tags_to_reverse_complement() {
+        let tags = per_base::tags_to_reverse_complement();
+        assert!(tags.contains(&"ac"));
+        assert!(tags.contains(&"bc"));
+        assert_eq!(tags.len(), 2);
+    }
+
+    // =====================================================================
+    // Tests for per_read tag constants
+    // =====================================================================
+
+    #[test]
+    fn test_per_read_tag_constants() {
+        assert_eq!(per_read::RAW_READ_COUNT, "cD");
+        assert_eq!(per_read::MIN_RAW_READ_COUNT, "cM");
+        assert_eq!(per_read::RAW_READ_ERROR_RATE, "cE");
+        assert_eq!(per_read::AB_RAW_READ_COUNT, "aD");
+        assert_eq!(per_read::BA_RAW_READ_COUNT, "bD");
+        assert_eq!(per_read::AB_MIN_RAW_READ_COUNT, "aM");
+        assert_eq!(per_read::BA_MIN_RAW_READ_COUNT, "bM");
+        assert_eq!(per_read::AB_RAW_READ_ERROR_RATE, "aE");
+        assert_eq!(per_read::BA_RAW_READ_ERROR_RATE, "bE");
+    }
+
+    #[test]
+    fn test_per_base_tag_constants() {
+        assert_eq!(per_base::RAW_READ_COUNT, "cd");
+        assert_eq!(per_base::RAW_READ_ERRORS, "ce");
+        assert_eq!(per_base::AB_RAW_READ_COUNT, "ad");
+        assert_eq!(per_base::BA_RAW_READ_COUNT, "bd");
+        assert_eq!(per_base::AB_RAW_READ_ERRORS, "ae");
+        assert_eq!(per_base::BA_RAW_READ_ERRORS, "be");
+        assert_eq!(per_base::AB_CONSENSUS_BASES, "ac");
+        assert_eq!(per_base::BA_CONSENSUS_BASES, "bc");
+        assert_eq!(per_base::AB_CONSENSUS_QUALS, "aq");
+        assert_eq!(per_base::BA_CONSENSUS_QUALS, "bq");
+    }
+
+    // =====================================================================
+    // Tests for tag string constants
+    // =====================================================================
+
+    #[test]
+    fn test_umi_tag_constants() {
+        assert_eq!(UMI_BASES, "RX");
+        assert_eq!(UMI_QUALS, "QX");
+        assert_eq!(ORIGINAL_UMI_BASES, "OX");
+        assert_eq!(ORIGINAL_UMI_QUALS, "BZ");
+        assert_eq!(MOLECULAR_ID, "MI");
+    }
+
+    // =====================================================================
+    // Tests for per_read::tag and per_base::tag delegation
+    // =====================================================================
+
+    #[test]
+    fn test_per_read_tag_function() {
+        let t = per_read::tag("cD");
+        assert_eq!(t, Tag::from([b'c', b'D']));
+    }
+
+    #[test]
+    fn test_per_base_tag_function() {
+        let t = per_base::tag("cd");
+        assert_eq!(t, Tag::from([b'c', b'd']));
+    }
+
+    // =====================================================================
+    // Test consensus detection with both simplex and duplex tags present
+    // =====================================================================
+
+    #[test]
+    fn test_is_consensus_with_all_tags() {
+        // Record with cD, aD, and bD is duplex, not simplex
+        let rec = RecordBuilder::new()
+            .sequence("ACGT")
+            .tag("cD", 10_i32)
+            .tag("aD", 5_i32)
+            .tag("bD", 3_i32)
+            .build();
+
+        assert!(!is_simplex_consensus(&rec));
+        assert!(is_duplex_consensus(&rec));
+        assert!(is_consensus(&rec));
+    }
+
+    #[test]
+    fn test_is_not_duplex_with_only_one_strand() {
+        // Record with only aD (no bD) is not duplex
+        let rec = RecordBuilder::new().sequence("ACGT").tag("aD", 5_i32).build();
 
         assert!(!is_simplex_consensus(&rec));
         assert!(!is_duplex_consensus(&rec));

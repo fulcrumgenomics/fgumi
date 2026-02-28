@@ -35,10 +35,7 @@ mod vendored;
 
 // Re-export commonly used items
 pub use base_builder::ConsensusBaseBuilder;
-pub use caller::{
-    ConsensusCaller, ConsensusOptionsBase, RejectionTracker, calculate_error_rate,
-    log_consensus_statistics,
-};
+pub use caller::{ConsensusCaller, calculate_error_rate, log_consensus_statistics};
 pub use filter::{
     ConsensusType, FilterConfig, FilterResult, FilterThresholds, compute_read_stats,
     count_no_calls, filter_duplex_read, filter_read, is_duplex_consensus, mask_bases,

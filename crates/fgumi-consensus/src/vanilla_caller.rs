@@ -193,17 +193,8 @@ impl VanillaConsensusRead {
 
     /// Returns the error rate (total errors / total depth)
     #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "u32 values from u16 sums are small enough for f32 precision"
-    )]
     pub fn error_rate(&self) -> f32 {
-        let total_depth: u32 = self.depths.iter().map(|&d| u32::from(d)).sum();
-        if total_depth == 0 {
-            return 0.0;
-        }
-        let total_errors: u32 = self.errors.iter().map(|&e| u32::from(e)).sum();
-        total_errors as f32 / total_depth as f32
+        crate::caller::calculate_error_rate(&self.depths, &self.errors)
     }
 
     /// Pads the read to a new length by adding bases to the left or right.
