@@ -55,7 +55,8 @@ impl BitEnc {
             bits |= encoded << (i * 2);
         }
 
-        let len = u8::try_from(seq.len()).ok()?;
+        #[expect(clippy::cast_possible_truncation, reason = "guarded by seq.len() <= 32")]
+        let len = seq.len() as u8;
         Some(Self { bits, len })
     }
 
@@ -83,7 +84,8 @@ impl BitEnc {
             // Dash is silently skipped
         }
 
-        let len = u8::try_from(base_count).ok()?;
+        #[expect(clippy::cast_possible_truncation, reason = "guarded by base_count <= 32")]
+        let len = base_count as u8;
         Some(Self { bits, len })
     }
 

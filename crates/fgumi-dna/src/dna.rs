@@ -63,6 +63,11 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 ///
 /// Returns the reverse complement of the input string, preserving case.
 ///
+/// # Panics
+///
+/// Cannot panic in practice: the byte-level complement maps ASCII to ASCII,
+/// so `String::from_utf8` always succeeds.
+///
 /// # Examples
 ///
 /// ```
@@ -74,20 +79,22 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 /// ```
 #[must_use]
 pub fn reverse_complement_str(seq: &str) -> String {
-    seq.chars()
+    let bytes: Vec<u8> = seq
+        .bytes()
         .rev()
-        .map(|c| match c {
-            'A' => 'T',
-            'T' => 'A',
-            'C' => 'G',
-            'G' => 'C',
-            'a' => 't',
-            't' => 'a',
-            'c' => 'g',
-            'g' => 'c',
-            _ => c,
+        .map(|b| match b {
+            b'A' => b'T',
+            b'T' => b'A',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'a' => b't',
+            b't' => b'a',
+            b'c' => b'g',
+            b'g' => b'c',
+            other => other,
         })
-        .collect()
+        .collect();
+    String::from_utf8(bytes).expect("complement of ASCII is ASCII")
 }
 
 #[cfg(test)]
