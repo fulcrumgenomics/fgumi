@@ -91,7 +91,8 @@ impl UnmappedBamRecordBuilder {
         self.sealed = false;
 
         assert!(name.len() < 255, "read name too long ({} bytes, max 254)", name.len());
-        let l_read_name = u8::try_from(name.len() + 1).expect("read name length overflow"); // +1 for NUL
+        #[expect(clippy::cast_possible_truncation, reason = "assert above guarantees name.len() < 255")]
+        let l_read_name = (name.len() + 1) as u8; // +1 for NUL
         let l_seq = u32::try_from(bases.len()).expect("sequence length overflow");
         let packed_seq_len = bases.len().div_ceil(2);
 

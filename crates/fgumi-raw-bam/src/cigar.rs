@@ -865,6 +865,129 @@ mod tests {
     // unclipped_start_from_cigar / unclipped_end_from_cigar tests
     // ========================================================================
 
+    // ========================================================================
+    // query_length_from_cigar tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_length_from_cigar_simple_match() {
+        // 50M: query length = 50
+        let cigar = &[encode_op(0, 50)];
+        assert_eq!(query_length_from_cigar(cigar), 50);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_with_insertion() {
+        // 10M5I10M: M and I consume query
+        // query_len = 10 + 5 + 10 = 25
+        let cigar = &[encode_op(0, 10), encode_op(1, 5), encode_op(0, 10)];
+        assert_eq!(query_length_from_cigar(cigar), 25);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_with_soft_clip() {
+        // 5S10M3S: S and M consume query
+        // query_len = 5 + 10 + 3 = 18
+        let cigar = &[encode_op(4, 5), encode_op(0, 10), encode_op(4, 3)];
+        assert_eq!(query_length_from_cigar(cigar), 18);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_with_deletion() {
+        // 10M3D5M: D does not consume query
+        // query_len = 10 + 5 = 15
+        let cigar = &[encode_op(0, 10), encode_op(2, 3), encode_op(0, 5)];
+        assert_eq!(query_length_from_cigar(cigar), 15);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_with_eq_and_x() {
+        // 10=3X2I: =, X, and I consume query
+        // query_len = 10 + 3 + 2 = 15
+        let cigar = &[encode_op(7, 10), encode_op(8, 3), encode_op(1, 2)];
+        assert_eq!(query_length_from_cigar(cigar), 15);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_empty() {
+        assert_eq!(query_length_from_cigar(&[]), 0);
+    }
+
+    #[test]
+    fn test_query_length_from_cigar_hard_clip_only() {
+        // 5H: hard clips do not consume query
+        let cigar = &[encode_op(5, 5)];
+        assert_eq!(query_length_from_cigar(cigar), 0);
+    }
+
+    // ========================================================================
+    // read_pos_at_ref_pos_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_simple_match() {
+        // 10M starting at ref pos 100 (1-based)
+        let cigar = &[encode_op(0, 10)];
+        // Position 100: first query base
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, false), Some(1));
+        // Position 105: 6th query base
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 105, false), Some(6));
+        // Position 109: last query base
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 109, false), Some(10));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_before_alignment() {
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 99, false), None);
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_past_alignment() {
+        let cigar = &[encode_op(0, 10)];
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 110, false), None);
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_in_deletion() {
+        // 5M3D5M: deletion at ref 105-107
+        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)];
+        // Position 106 is in deletion
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 106, false), None);
+        // With return_last_base_if_deleted=true
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 106, true), Some(5));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_with_insertion() {
+        // 5M3I5M: insertion between ref 104 and 105
+        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)];
+        // Position 104: 5th query base (before insertion)
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 104, false), Some(5));
+        // Position 105: 9th query base (after 5M + 3I)
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 105, false), Some(9));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_with_soft_clip() {
+        // 3S10M: soft clip consumes 3 query bases, then 10M
+        let cigar = &[encode_op(4, 3), encode_op(0, 10)];
+        // Position 100: 4th query base (after 3S)
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, false), Some(4));
+    }
+
+    #[test]
+    fn test_read_pos_at_ref_pos_raw_deletion_at_start() {
+        // 2D5M: deletion at ref 100-101
+        let cigar = &[encode_op(2, 2), encode_op(0, 5)];
+        // Position 100 is in the deletion with no prior query bases
+        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, true), Some(1));
+    }
+
+    // ========================================================================
+    // unclipped_start_from_cigar / unclipped_end_from_cigar tests
+    // ========================================================================
+
     #[test]
     fn test_unclipped_start_from_cigar_no_clips() {
         // 10M = (10 << 4)
@@ -1654,25 +1777,10 @@ mod tests {
     }
 
     #[test]
-    fn test_read_pos_at_ref_pos_raw_before_alignment() {
-        // ref_pos < alignment_start => None
-        let cigar = &[encode_op(0, 10)];
-        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 99, false), None);
-    }
-
-    #[test]
     fn test_read_pos_at_ref_pos_raw_after_alignment() {
         // ref_pos after alignment => None
         let cigar = &[encode_op(0, 10)];
         assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 110, false), None);
-    }
-
-    #[test]
-    fn test_read_pos_at_ref_pos_raw_in_deletion() {
-        // 5M3D5M: deletion at ref 105-107
-        // ref_pos=106 is in deletion => None (without return_last_base_if_deleted)
-        let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)];
-        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 106, false), None);
     }
 
     #[test]
@@ -1681,22 +1789,6 @@ mod tests {
         // ref_pos=106 is in deletion, return_last_base_if_deleted=true => returns 5
         let cigar = &[encode_op(0, 5), encode_op(2, 3), encode_op(0, 5)];
         assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 106, true), Some(5));
-    }
-
-    #[test]
-    fn test_read_pos_at_ref_pos_raw_with_insertion() {
-        // 5M3I5M: insertion doesn't consume reference
-        // ref 105 is first base of second 5M, query pos = 5 (from first M) + 3 (from I) + 1 = 9
-        let cigar = &[encode_op(0, 5), encode_op(1, 3), encode_op(0, 5)];
-        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 105, false), Some(9));
-    }
-
-    #[test]
-    fn test_read_pos_at_ref_pos_raw_with_soft_clip() {
-        // 3S10M: soft clip consumes query but not reference
-        // ref 100 = first ref base in 10M, query pos = 3 (from S) + 1 = 4
-        let cigar = &[encode_op(4, 3), encode_op(0, 10)];
-        assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, false), Some(4));
     }
 
     #[test]
@@ -1755,11 +1847,6 @@ mod tests {
         // 5=3X: both consume query, total 8
         let cigar = &[encode_op(7, 5), encode_op(8, 3)];
         assert_eq!(query_length_from_cigar(cigar), 8);
-    }
-
-    #[test]
-    fn test_query_length_from_cigar_empty() {
-        assert_eq!(query_length_from_cigar(&[]), 0);
     }
 
     // ========================================================================

@@ -736,4 +736,109 @@ mod tests {
         assert_eq!(ref_id(&rec), -1);
         assert_eq!(pos(&rec), -1);
     }
+
+    // ========================================================================
+    // TemplateCoordFlags tests
+    // ========================================================================
+
+    #[test]
+    fn test_template_coord_flags_all_set() {
+        let flag = flags::REVERSE
+            | flags::MATE_REVERSE
+            | flags::UNMAPPED
+            | flags::MATE_UNMAPPED
+            | flags::PAIRED;
+        let tcf = TemplateCoordFlags::from_flag(flag);
+        assert!(tcf.reverse());
+        assert!(tcf.mate_reverse());
+        assert!(tcf.unmapped());
+        assert!(tcf.mate_unmapped());
+        assert!(tcf.paired());
+    }
+
+    #[test]
+    fn test_template_coord_flags_none_set() {
+        let tcf = TemplateCoordFlags::from_flag(0);
+        assert!(!tcf.reverse());
+        assert!(!tcf.mate_reverse());
+        assert!(!tcf.unmapped());
+        assert!(!tcf.mate_unmapped());
+        assert!(!tcf.paired());
+    }
+
+    #[test]
+    fn test_template_coord_flags_individual_bits() {
+        let tcf = TemplateCoordFlags::from_flag(flags::REVERSE | flags::PAIRED);
+        assert!(tcf.reverse());
+        assert!(!tcf.mate_reverse());
+        assert!(!tcf.unmapped());
+        assert!(!tcf.mate_unmapped());
+        assert!(tcf.paired());
+    }
+
+    #[test]
+    fn test_template_coord_flags_default() {
+        let tcf = TemplateCoordFlags::default();
+        assert!(!tcf.reverse());
+        assert!(!tcf.mate_reverse());
+        assert!(!tcf.unmapped());
+        assert!(!tcf.mate_unmapped());
+        assert!(!tcf.paired());
+    }
+
+    // ========================================================================
+    // extract_template_coordinate_fields tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_template_coordinate_fields_basic() {
+        let rec = make_bam_bytes_with_tlen(
+            3,                                                     // tid
+            200,                                                   // pos
+            flags::PAIRED | flags::REVERSE | flags::MATE_REVERSE,  // flag
+            b"read1",                                              // name
+            &[encode_op(0, 10)],                                   // 10M cigar
+            6,                                                     // seq_len
+            5,                                                     // mate_tid
+            400,                                                   // mate_pos
+            150,                                                   // tlen
+            &[],                                                   // aux
+        );
+        let fields = extract_template_coordinate_fields(&rec);
+        assert_eq!(fields.tid, 3);
+        assert_eq!(fields.pos, 200);
+        assert_eq!(fields.mate_tid, 5);
+        assert_eq!(fields.mate_pos, 400);
+        assert!(fields.flags.reverse());
+        assert!(fields.flags.mate_reverse());
+        assert!(!fields.flags.unmapped());
+        assert!(!fields.flags.mate_unmapped());
+        assert!(fields.flags.paired());
+        assert_eq!(fields.name, b"read1");
+        assert_eq!(fields.l_read_name, 6); // "read1" + NUL
+        assert_eq!(fields.n_cigar_op, 1);
+        assert_eq!(fields.l_seq, 6);
+    }
+
+    #[test]
+    fn test_extract_template_coordinate_fields_unmapped() {
+        let rec = make_bam_bytes(
+            -1,
+            -1,
+            flags::UNMAPPED | flags::PAIRED | flags::MATE_UNMAPPED,
+            b"rd",
+            &[],
+            0,
+            -1,
+            -1,
+            &[],
+        );
+        let fields = extract_template_coordinate_fields(&rec);
+        assert_eq!(fields.tid, -1);
+        assert_eq!(fields.pos, -1);
+        assert!(fields.flags.unmapped());
+        assert!(fields.flags.mate_unmapped());
+        assert!(fields.flags.paired());
+        assert_eq!(fields.name, b"rd");
+    }
 }
