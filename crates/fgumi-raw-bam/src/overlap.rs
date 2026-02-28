@@ -128,14 +128,25 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
     }
 }
 
-/// Compute number of read bases at or past a reference position (for positive strand).
+/// Whether to return the read position at or past the target reference position,
+/// or the read position before it.
+#[derive(Clone, Copy)]
+enum RefPosMode {
+    /// Return the 1-based read position at the target (for positive strand clipping).
+    AtOrPast,
+    /// Return the 1-based read position before the target (for negative strand clipping).
+    Before,
+}
+
+/// Compute the read position relative to a reference position by walking the CIGAR.
 ///
-/// Returns the 1-based read position at the given reference position,
-/// or 0 if the position falls in a deletion or outside the alignment.
-fn compute_bases_past_ref_pos(
+/// Returns the 1-based read position at (or just before) the given reference position,
+/// or 0 if the position falls in a deletion/skip or outside the alignment.
+fn compute_read_pos_at_ref(
     cigar_ops: &[u32],
     alignment_start_1based: i32,
     target_ref_pos: i32,
+    mode: RefPosMode,
 ) -> usize {
     let mut ref_pos = alignment_start_1based;
     let mut read_pos: usize = 0;
@@ -150,7 +161,10 @@ fn compute_bases_past_ref_pos(
                 for _ in 0..op_len {
                     read_pos += 1;
                     if ref_pos == target_ref_pos {
-                        return read_pos;
+                        return match mode {
+                            RefPosMode::AtOrPast => read_pos,
+                            RefPosMode::Before => read_pos.saturating_sub(1),
+                        };
                     }
                     ref_pos += 1;
                 }
@@ -179,52 +193,25 @@ fn compute_bases_past_ref_pos(
     0
 }
 
+/// Compute number of read bases at or past a reference position (for positive strand).
+///
+/// Returns the 1-based read position at the given reference position,
+/// or 0 if the position falls in a deletion or outside the alignment.
+fn compute_bases_past_ref_pos(
+    cigar_ops: &[u32],
+    alignment_start_1based: i32,
+    target_ref_pos: i32,
+) -> usize {
+    compute_read_pos_at_ref(cigar_ops, alignment_start_1based, target_ref_pos, RefPosMode::AtOrPast)
+}
+
 /// Compute number of read bases before a reference position (for negative strand).
 fn compute_bases_before_ref_pos(
     cigar_ops: &[u32],
     alignment_start_1based: i32,
     target_ref_pos: i32,
 ) -> usize {
-    let mut ref_pos = alignment_start_1based;
-    let mut read_pos: usize = 0;
-
-    for &op in cigar_ops {
-        let op_type = op & 0xF;
-        let op_len = (op >> 4) as usize;
-
-        match op_type {
-            0 | 7 | 8 => {
-                // M, =, X: consume both query and reference
-                for _ in 0..op_len {
-                    read_pos += 1;
-                    if ref_pos == target_ref_pos {
-                        return read_pos.saturating_sub(1);
-                    }
-                    ref_pos += 1;
-                }
-            }
-            1 => {
-                // I: consume query only
-                read_pos += op_len;
-            }
-            4 => {
-                // S: consume query only
-                read_pos += op_len;
-            }
-            2 | 3 => {
-                // D, N: consume reference only
-                for _ in 0..op_len {
-                    if ref_pos == target_ref_pos {
-                        return 0;
-                    }
-                    ref_pos += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    0
+    compute_read_pos_at_ref(cigar_ops, alignment_start_1based, target_ref_pos, RefPosMode::Before)
 }
 
 /// Count trailing soft clips from CIGAR ops.

@@ -1,5 +1,5 @@
 use crate::fields::{
-    TAG_FIXED_SIZES, aux_data_offset, aux_data_offset_from_record, aux_data_slice, tag_value_size,
+    TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size,
 };
 
 /// Find a string (Z-type) tag in auxiliary data, returning value bytes without null terminator.
@@ -288,17 +288,7 @@ fn parse_mi_bytes(s: &[u8]) -> Option<(u64, bool)> {
 /// Returns `(integer_value, is_A_suffix)` or `(0, true)` if not found.
 #[must_use]
 pub fn find_mi_tag_in_record(bam: &[u8]) -> (u64, bool) {
-    let l_read_name = bam[8] as usize;
-    let n_cigar_op = u16::from_le_bytes([bam[12], bam[13]]) as usize;
-    let l_seq = u32::from_le_bytes([bam[16], bam[17], bam[18], bam[19]]) as usize;
-
-    let aux_start = aux_data_offset(l_read_name, n_cigar_op, l_seq);
-
-    if aux_start >= bam.len() {
-        return (0, true);
-    }
-
-    find_mi_tag(&bam[aux_start..]).unwrap_or((0, true))
+    find_mi_tag(aux_data_slice(bam)).unwrap_or((0, true))
 }
 
 /// Find the MC (mate CIGAR) tag in auxiliary data.
@@ -306,45 +296,13 @@ pub fn find_mi_tag_in_record(bam: &[u8]) -> (u64, bool) {
 /// Returns the CIGAR string, or None if not found.
 #[must_use]
 pub fn find_mc_tag(aux_data: &[u8]) -> Option<&str> {
-    let mut pos = 0;
-    while pos + 3 <= aux_data.len() {
-        let tag = &aux_data[pos..pos + 2];
-        let val_type = aux_data[pos + 2];
-
-        if tag == b"MC" {
-            return match val_type {
-                b'Z' => {
-                    let start = pos + 3;
-                    let end = aux_data[start..].iter().position(|&b| b == 0)?;
-                    std::str::from_utf8(&aux_data[start..start + end]).ok()
-                }
-                _ => None,
-            };
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[pos + 3..]) {
-            pos += 3 + size;
-        } else {
-            break;
-        }
-    }
-    None
+    find_string_tag(aux_data, b"MC").and_then(|v| std::str::from_utf8(v).ok())
 }
 
 /// Find MC tag in a complete BAM record.
 #[must_use]
 pub fn find_mc_tag_in_record(bam: &[u8]) -> Option<&str> {
-    let l_read_name = bam[8] as usize;
-    let n_cigar_op = u16::from_le_bytes([bam[12], bam[13]]) as usize;
-    let l_seq = u32::from_le_bytes([bam[16], bam[17], bam[18], bam[19]]) as usize;
-
-    let aux_start = aux_data_offset(l_read_name, n_cigar_op, l_seq);
-
-    if aux_start >= bam.len() {
-        return None;
-    }
-
-    find_mc_tag(&bam[aux_start..])
+    find_mc_tag(aux_data_slice(bam))
 }
 
 /// Result of a single-pass extraction of multiple string tags from aux data.
@@ -1842,6 +1800,280 @@ mod tests {
         assert_eq!(buf[5], b'?'); // 30 + 33
         assert_eq!(buf[6], b'I'); // 40 + 33
         assert_eq!(buf[7], 0); // NUL
+    }
+
+    // ========================================================================
+    // find_array_tag tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_array_tag_int_array() {
+        let aux = make_b_int_array_tag(*b"cd", &[10, 20, 30]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(tag_ref.elem_type, b'i');
+        assert_eq!(tag_ref.count, 3);
+        assert_eq!(tag_ref.elem_size, 4);
+        assert_eq!(tag_ref.data.len(), 12);
+    }
+
+    #[test]
+    fn test_find_array_tag_uint8_array() {
+        let aux = make_b_uint8_array_tag(*b"XC", &[1, 2, 3, 4]);
+        let tag_ref = find_array_tag(&aux, b"XC").unwrap();
+        assert_eq!(tag_ref.elem_type, b'C');
+        assert_eq!(tag_ref.count, 4);
+        assert_eq!(tag_ref.elem_size, 1);
+    }
+
+    #[test]
+    fn test_find_array_tag_not_found() {
+        let aux = make_b_int_array_tag(*b"cd", &[10]);
+        assert!(find_array_tag(&aux, b"ZZ").is_none());
+    }
+
+    #[test]
+    fn test_find_array_tag_not_b_type() {
+        // Tag exists but as Z type, not B
+        let aux = b"cdZhello\x00";
+        assert!(find_array_tag(aux.as_ref(), b"cd").is_none());
+    }
+
+    #[test]
+    fn test_find_array_tag_after_other_tags() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
+        aux.extend_from_slice(&make_b_int16_array_tag(*b"cd", &[10, 20]));
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(tag_ref.elem_type, b's');
+        assert_eq!(tag_ref.count, 2);
+    }
+
+    // ========================================================================
+    // array_tag_element_u16 tests
+    // ========================================================================
+
+    #[test]
+    fn test_array_tag_element_u16_uint8() {
+        let aux = make_b_uint8_array_tag(*b"cd", &[10, 200, 0]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(array_tag_element_u16(&tag_ref, 0), 10);
+        assert_eq!(array_tag_element_u16(&tag_ref, 1), 200);
+        assert_eq!(array_tag_element_u16(&tag_ref, 2), 0);
+    }
+
+    #[test]
+    fn test_array_tag_element_u16_uint16() {
+        let aux = make_b_uint16_array_tag(*b"cd", &[100, 60000, 0]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(array_tag_element_u16(&tag_ref, 0), 100);
+        assert_eq!(array_tag_element_u16(&tag_ref, 1), 60000);
+        assert_eq!(array_tag_element_u16(&tag_ref, 2), 0);
+    }
+
+    #[test]
+    fn test_array_tag_element_u16_int16_clamped() {
+        let aux = make_b_int16_array_tag(*b"cd", &[-5, 100, 0]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        // Negative values clamped to 0
+        assert_eq!(array_tag_element_u16(&tag_ref, 0), 0);
+        assert_eq!(array_tag_element_u16(&tag_ref, 1), 100);
+    }
+
+    #[test]
+    fn test_array_tag_element_u16_int8_clamped() {
+        let aux = make_b_int8_array_tag(*b"cd", &[-1, 42, 0]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(array_tag_element_u16(&tag_ref, 0), 0); // clamped
+        assert_eq!(array_tag_element_u16(&tag_ref, 1), 42);
+    }
+
+    #[test]
+    fn test_array_tag_element_u16_out_of_bounds() {
+        let aux = make_b_uint8_array_tag(*b"cd", &[10]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(array_tag_element_u16(&tag_ref, 1), 0); // out of bounds
+    }
+
+    #[test]
+    fn test_array_tag_element_u16_unsupported_type() {
+        // i32 array: not directly supported by array_tag_element_u16
+        let aux = make_b_int_array_tag(*b"cd", &[42]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(array_tag_element_u16(&tag_ref, 0), 0); // unsupported returns 0
+    }
+
+    // ========================================================================
+    // array_tag_to_vec_u16 tests
+    // ========================================================================
+
+    #[test]
+    fn test_array_tag_to_vec_u16() {
+        let aux = make_b_uint8_array_tag(*b"cd", &[10, 20, 30]);
+        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        assert_eq!(array_tag_to_vec_u16(&tag_ref), vec![10u16, 20, 30]);
+    }
+
+    // ========================================================================
+    // update_int_tag tests
+    // ========================================================================
+
+    #[test]
+    fn test_update_int_tag_existing_i32_in_place() {
+        // Create a record with NM:i:42 (4-byte int, in-place update)
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        // Manually append an i32 tag
+        rec.extend_from_slice(&[b'N', b'M', b'i']);
+        rec.extend_from_slice(&42i32.to_le_bytes());
+        update_int_tag(&mut rec, b"NM", 99);
+        let aux = aux_data_slice(&rec);
+        assert_eq!(find_int_tag(aux, b"NM"), Some(99));
+    }
+
+    #[test]
+    fn test_update_int_tag_existing_different_size() {
+        // Create a record with NM:c:5 (1-byte int), update to a value needing 2 bytes
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        rec.extend_from_slice(&[b'N', b'M', b'c', 5]);
+        update_int_tag(&mut rec, b"NM", 300);
+        let aux = aux_data_slice(&rec);
+        assert_eq!(find_int_tag(aux, b"NM"), Some(300));
+    }
+
+    #[test]
+    fn test_update_int_tag_absent() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        update_int_tag(&mut rec, b"NM", 42);
+        let aux = aux_data_slice(&rec);
+        assert_eq!(find_int_tag(aux, b"NM"), Some(42));
+    }
+
+    // ========================================================================
+    // reverse_array_tag_in_place tests
+    // ========================================================================
+
+    #[test]
+    fn test_reverse_array_tag_in_place_i16() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&make_b_int16_array_tag(*b"cd", &[10, 20, 30]));
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
+        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd").unwrap();
+        let values: Vec<i16> = (0..tag_ref.count)
+            .map(|i| {
+                let off = i * tag_ref.elem_size;
+                i16::from_le_bytes([tag_ref.data[off], tag_ref.data[off + 1]])
+            })
+            .collect();
+        assert_eq!(values, vec![30, 20, 10]);
+    }
+
+    #[test]
+    fn test_reverse_array_tag_in_place_uint8() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&make_b_uint8_array_tag(*b"cd", &[1, 2, 3, 4]));
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
+        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd").unwrap();
+        assert_eq!(tag_ref.data, &[4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_reverse_array_tag_in_place_not_found() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        // Should be a no-op
+        reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
+    }
+
+    #[test]
+    fn test_reverse_array_tag_in_place_offset_past_end() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        // aux_offset >= record.len() should be a no-op
+        reverse_array_tag_in_place(&mut rec, rec.len() + 10, b"cd");
+    }
+
+    // ========================================================================
+    // reverse_string_tag_in_place tests
+    // ========================================================================
+
+    #[test]
+    fn test_reverse_string_tag_in_place() {
+        let aux = b"RXZhello\x00";
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"olleh".as_ref()));
+    }
+
+    #[test]
+    fn test_reverse_string_tag_in_place_single_char() {
+        let aux = b"RXZa\x00";
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"a".as_ref()));
+    }
+
+    #[test]
+    fn test_reverse_string_tag_in_place_not_found() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        // No-op
+        reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
+    }
+
+    #[test]
+    fn test_reverse_string_tag_in_place_offset_past_end() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        reverse_string_tag_in_place(&mut rec, rec.len() + 10, b"RX");
+    }
+
+    // ========================================================================
+    // reverse_complement_string_tag_in_place tests
+    // ========================================================================
+
+    #[test]
+    fn test_reverse_complement_string_tag_in_place() {
+        let aux = b"RXZACGT\x00";
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACGT".as_ref()));
+    }
+
+    #[test]
+    fn test_reverse_complement_string_tag_in_place_lowercase() {
+        let aux = b"RXZacgt\x00";
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        // lowercase a->T, c->G, g->C, t->A, reversed: ACGT
+        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACGT".as_ref()));
+    }
+
+    #[test]
+    fn test_reverse_complement_string_tag_in_place_with_n() {
+        let aux = b"RXZANGT\x00";
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        // ANGT -> reverse TGNA -> complement ACNT
+        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACNT".as_ref()));
+    }
+
+    #[test]
+    fn test_reverse_complement_string_tag_in_place_not_found() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+    }
+
+    #[test]
+    fn test_reverse_complement_string_tag_in_place_offset_past_end() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
+        reverse_complement_string_tag_in_place(&mut rec, rec.len() + 10, b"RX");
     }
 
     // ========================================================================

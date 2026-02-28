@@ -31,9 +31,6 @@ const fn build_seq_codes() -> [u8; 256] {
     codes
 }
 
-/// Decode table: 4-bit BAM base code -> ASCII base.
-const BASE_DECODE: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
-
 /// Extract a 4-bit base from packed sequence data.
 ///
 /// BAM packs two bases per byte: high nibble = even index, low nibble = odd index.
@@ -88,7 +85,7 @@ pub fn extract_sequence(bam: &[u8]) -> Vec<u8> {
     let mut bases = Vec::with_capacity(l);
     for i in 0..l {
         let code = get_base(bam, off, i);
-        bases.push(BASE_DECODE[code as usize]);
+        bases.push(BAM_BASE_TO_ASCII[code as usize]);
     }
     bases
 }
@@ -165,6 +162,47 @@ pub fn quality_scores_slice_mut(bam: &mut [u8]) -> &mut [u8] {
 mod tests {
     use super::*;
     use crate::testutil::*;
+
+    // ========================================================================
+    // is_base_n tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_base_n_true() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0xFF; // N(15), N(15)
+        rec[so + 1] = 0xFF;
+        assert!(is_base_n(&rec, so, 0));
+        assert!(is_base_n(&rec, so, 1));
+        assert!(is_base_n(&rec, so, 2));
+        assert!(is_base_n(&rec, so, 3));
+    }
+
+    #[test]
+    fn test_is_base_n_false() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0x12; // A(1), C(2)
+        rec[so + 1] = 0x48; // G(4), T(8)
+        assert!(!is_base_n(&rec, so, 0));
+        assert!(!is_base_n(&rec, so, 1));
+        assert!(!is_base_n(&rec, so, 2));
+        assert!(!is_base_n(&rec, so, 3));
+    }
+
+    #[test]
+    fn test_is_base_n_after_mask() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        rec[so] = 0x12; // A(1), C(2)
+        rec[so + 1] = 0x48; // G(4), T(8)
+        assert!(!is_base_n(&rec, so, 1));
+        mask_base(&mut rec, so, 1);
+        assert!(is_base_n(&rec, so, 1));
+        // Other bases unaffected
+        assert!(!is_base_n(&rec, so, 0));
+    }
 
     // ========================================================================
     // get_base and mask_base tests

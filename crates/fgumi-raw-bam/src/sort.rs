@@ -2,20 +2,19 @@ use std::cmp::Ordering;
 
 use crate::cigar::mate_unclipped_5prime;
 use crate::cigar::unclipped_5prime_sort;
-use crate::fields::flags;
+use crate::fields::{self, flags, mate_pos, mate_ref_id, pos, read_name, ref_id};
 use crate::tags::{find_mc_tag_in_record, find_mi_tag_in_record};
 
 #[must_use]
 pub fn compare_coordinate_raw(a: &[u8], b: &[u8]) -> Ordering {
-    // Extract fields at fixed offsets
-    let a_tid = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-    let b_tid = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let a_tid = ref_id(a);
+    let b_tid = ref_id(b);
 
-    let a_pos = i32::from_le_bytes([a[4], a[5], a[6], a[7]]);
-    let b_pos = i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    let a_pos = pos(a);
+    let b_pos = pos(b);
 
-    let a_flag = u16::from_le_bytes([a[14], a[15]]);
-    let b_flag = u16::from_le_bytes([b[14], b[15]]);
+    let a_flag = fields::flags(a);
+    let b_flag = fields::flags(b);
 
     // Handle reads with no reference (tid = -1) - sort last
     // Unmapped reads with a valid tid (mate's position) sort by that position
@@ -45,28 +44,14 @@ pub fn compare_coordinate_raw(a: &[u8], b: &[u8]) -> Ordering {
 #[inline]
 #[must_use]
 pub fn compare_names_raw(a: &[u8], b: &[u8]) -> Ordering {
-    let a_name_len = a[8] as usize;
-    let b_name_len = b[8] as usize;
-
-    // Exclude null terminator
-    let a_len = if a_name_len > 0 { a_name_len - 1 } else { 0 };
-    let b_len = if b_name_len > 0 { b_name_len - 1 } else { 0 };
-
-    let a_name = &a[32..32 + a_len];
-    let b_name = &b[32..32 + b_len];
-
-    a_name.cmp(b_name)
+    read_name(a).cmp(read_name(b))
 }
 
 /// Compare for queryname ordering using raw bytes.
 #[inline]
 #[must_use]
 pub fn compare_queryname_raw(a: &[u8], b: &[u8]) -> Ordering {
-    compare_names_raw(a, b).then_with(|| {
-        let a_flag = u16::from_le_bytes([a[14], a[15]]);
-        let b_flag = u16::from_le_bytes([b[14], b[15]]);
-        a_flag.cmp(&b_flag)
-    })
+    compare_names_raw(a, b).then_with(|| fields::flags(a).cmp(&fields::flags(b)))
 }
 
 /// Compare for template-coordinate ordering using raw bytes.
@@ -76,17 +61,17 @@ pub fn compare_queryname_raw(a: &[u8], b: &[u8]) -> Ordering {
 #[must_use]
 pub fn compare_template_coordinate_raw(a: &[u8], b: &[u8]) -> Ordering {
     // Extract all needed fields from both records
-    let a_tid = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-    let a_pos = i32::from_le_bytes([a[4], a[5], a[6], a[7]]);
-    let a_flag = u16::from_le_bytes([a[14], a[15]]);
-    let a_mate_tid = i32::from_le_bytes([a[20], a[21], a[22], a[23]]);
-    let a_mate_pos = i32::from_le_bytes([a[24], a[25], a[26], a[27]]);
+    let a_tid = ref_id(a);
+    let a_pos = pos(a);
+    let a_flag = fields::flags(a);
+    let a_mate_tid = mate_ref_id(a);
+    let a_mate_pos = mate_pos(a);
 
-    let b_tid = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    let b_pos = i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-    let b_flag = u16::from_le_bytes([b[14], b[15]]);
-    let b_mate_tid = i32::from_le_bytes([b[20], b[21], b[22], b[23]]);
-    let b_mate_pos = i32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+    let b_tid = ref_id(b);
+    let b_pos = pos(b);
+    let b_flag = fields::flags(b);
+    let b_mate_tid = mate_ref_id(b);
+    let b_mate_pos = mate_pos(b);
 
     // Extract strand information
     let a_reverse = (a_flag & flags::REVERSE) != 0;

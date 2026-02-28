@@ -84,163 +84,27 @@ impl ParsedBamRecord {
 }
 
 fn unpack_sequence_for_test(packed: &[u8], l_seq: usize) -> Vec<u8> {
-    const DECODE: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
+    use crate::sequence::BAM_BASE_TO_ASCII;
     let mut bases = Vec::with_capacity(l_seq);
     for i in 0..l_seq {
         let byte = packed[i / 2];
         let code = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-        bases.push(DECODE[code as usize]);
+        bases.push(BAM_BASE_TO_ASCII[code as usize]);
     }
     bases
 }
 
 fn find_z_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    let mut i = 0;
-    while i + 3 <= aux.len() {
-        let t = [aux[i], aux[i + 1]];
-        let typ = aux[i + 2];
-        i += 3;
-        match typ {
-            b'Z' => {
-                let start = i;
-                while i < aux.len() && aux[i] != 0 {
-                    i += 1;
-                }
-                if t == tag {
-                    return Some(aux[start..i].to_vec());
-                }
-                i += 1; // skip NUL
-            }
-            b'c' => {
-                i += 1;
-            }
-            b's' => {
-                i += 2;
-            }
-            b'i' | b'f' => {
-                i += 4;
-            }
-            b'B' => {
-                let sub = aux[i];
-                i += 1;
-                let count =
-                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
-                i += 4;
-                let elem_size = match sub {
-                    b's' | b'S' => 2,
-                    b'i' | b'I' | b'f' => 4,
-                    _ => 1,
-                };
-                i += count * elem_size;
-            }
-            _ => break,
-        }
-    }
-    None
+    crate::tags::find_string_tag(aux, &tag).map(<[u8]>::to_vec)
 }
 
+#[expect(clippy::cast_possible_truncation, reason = "test values always fit in i32")]
 fn find_int_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<i32> {
-    let mut i = 0;
-    while i + 3 <= aux.len() {
-        let t = [aux[i], aux[i + 1]];
-        let typ = aux[i + 2];
-        i += 3;
-        match typ {
-            b'c' => {
-                let v = i32::from(aux[i].cast_signed());
-                if t == tag {
-                    return Some(v);
-                }
-                i += 1;
-            }
-            b's' => {
-                let v = i32::from(i16::from_le_bytes([aux[i], aux[i + 1]]));
-                if t == tag {
-                    return Some(v);
-                }
-                i += 2;
-            }
-            b'i' => {
-                let v = i32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]);
-                if t == tag {
-                    return Some(v);
-                }
-                i += 4;
-            }
-            b'f' => {
-                i += 4;
-            }
-            b'Z' => {
-                while i < aux.len() && aux[i] != 0 {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'B' => {
-                let sub = aux[i];
-                i += 1;
-                let count =
-                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
-                i += 4;
-                let elem_size = match sub {
-                    b's' | b'S' => 2,
-                    b'i' | b'I' | b'f' => 4,
-                    _ => 1,
-                };
-                i += count * elem_size;
-            }
-            _ => break,
-        }
-    }
-    None
+    crate::tags::find_int_tag(aux, &tag).map(|v| v as i32)
 }
 
 fn find_float_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<f32> {
-    let mut i = 0;
-    while i + 3 <= aux.len() {
-        let t = [aux[i], aux[i + 1]];
-        let typ = aux[i + 2];
-        i += 3;
-        match typ {
-            b'f' => {
-                let v = f32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]);
-                if t == tag {
-                    return Some(v);
-                }
-                i += 4;
-            }
-            b'c' => {
-                i += 1;
-            }
-            b's' => {
-                i += 2;
-            }
-            b'i' => {
-                i += 4;
-            }
-            b'Z' => {
-                while i < aux.len() && aux[i] != 0 {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'B' => {
-                let sub = aux[i];
-                i += 1;
-                let count =
-                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
-                i += 4;
-                let elem_size = match sub {
-                    b's' | b'S' => 2,
-                    b'i' | b'I' | b'f' => 4,
-                    _ => 1,
-                };
-                i += count * elem_size;
-            }
-            _ => break,
-        }
-    }
-    None
+    crate::tags::find_float_tag(aux, &tag)
 }
 
 fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
