@@ -463,6 +463,35 @@ fn compute_group_key_from_raw(
     // Check if paired
     let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
     if !is_paired {
+        // Check for pa tag — if present and 5' matches, use pos2 as 3' end for grouping.
+        if let Some(pa_arr) = bam_fields::find_array_tag(aux_data, b"pa") {
+            if pa_arr.elem_type == b'i' && pa_arr.count == 6 {
+                let pa_tid1 = i32::from_le_bytes(pa_arr.data[0..4].try_into().unwrap_or([0; 4]));
+                let pa_pos1 = i32::from_le_bytes(pa_arr.data[4..8].try_into().unwrap_or([0; 4]));
+                let pa_neg1 =
+                    i32::from_le_bytes(pa_arr.data[8..12].try_into().unwrap_or([0; 4])) != 0;
+                let pa_tid2 = i32::from_le_bytes(pa_arr.data[12..16].try_into().unwrap_or([0; 4]));
+                let pa_pos2 = i32::from_le_bytes(pa_arr.data[16..20].try_into().unwrap_or([0; 4]));
+                let pa_neg2 =
+                    i32::from_le_bytes(pa_arr.data[20..24].try_into().unwrap_or([0; 4])) != 0;
+
+                let pa_five_prime_matches =
+                    pa_tid1 == own_ref_id && pa_pos1 == own_pos && u8::from(pa_neg1) == strand;
+                if pa_five_prime_matches {
+                    return GroupKey::paired(
+                        own_ref_id,
+                        own_pos,
+                        strand,
+                        pa_tid2,
+                        pa_pos2,
+                        u8::from(pa_neg2),
+                        library_idx,
+                        cell_hash,
+                        name_hash,
+                    );
+                }
+            }
+        }
         return GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash);
     }
 
@@ -3182,8 +3211,10 @@ where
         }
     }
 
-    // Finish grouper - process any remaining partial group
-    if let Some(final_group) = grouper.finish()? {
+    // Finish grouper - process any remaining partial groups
+    // The grouper may have multiple remaining groups when templates at EOF have different
+    // position keys (e.g., single-end reads with --single-end-three-prime enabled).
+    while let Some(final_group) = grouper.finish()? {
         // Step 6: Process
         let processed = (fns.process_fn)(final_group)?;
 
