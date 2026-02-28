@@ -107,9 +107,6 @@ impl LibraryIndex {
     /// Panics if the header contains more than 65,535 distinct libraries.
     #[must_use]
     pub fn from_header(header: &Header) -> Self {
-        use ahash::AHasher;
-        use std::hash::{Hash, Hasher};
-
         let mut lookup = ahash::AHashMap::new();
         let mut names = vec![Arc::clone(&UNKNOWN_LIBRARY)]; // Index 0 = unknown
         let mut library_to_idx: ahash::AHashMap<Arc<str>, u16> = ahash::AHashMap::new();
@@ -131,9 +128,7 @@ impl LibraryIndex {
             });
 
             // Hash the RG string and map to library index
-            let mut hasher = AHasher::default();
-            id.as_bytes().hash(&mut hasher);
-            let rg_hash = hasher.finish();
+            let rg_hash = Self::hash_rg(id.as_bytes());
             lookup.insert(rg_hash, lib_idx);
         }
 
@@ -154,44 +149,39 @@ impl LibraryIndex {
         self.names.get(idx as usize).unwrap_or(&self.names[0])
     }
 
+    /// Hash a byte slice using `AHash`. Returns 0 for `None`.
+    ///
+    /// This is the single hashing implementation used by all `hash_*` methods.
+    #[must_use]
+    pub fn hash_bytes(bytes: Option<&[u8]>) -> u64 {
+        use ahash::AHasher;
+        use std::hash::{Hash, Hasher};
+        match bytes {
+            Some(b) => {
+                let mut hasher = AHasher::default();
+                b.hash(&mut hasher);
+                hasher.finish()
+            }
+            None => 0,
+        }
+    }
+
     /// Hash an RG tag value for lookup.
     #[must_use]
     pub fn hash_rg(rg_bytes: &[u8]) -> u64 {
-        use ahash::AHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = AHasher::default();
-        rg_bytes.hash(&mut hasher);
-        hasher.finish()
+        Self::hash_bytes(Some(rg_bytes))
     }
 
     /// Hash a cell barcode for `GroupKey`.
     #[must_use]
     pub fn hash_cell_barcode(cell_bytes: Option<&[u8]>) -> u64 {
-        use ahash::AHasher;
-        use std::hash::{Hash, Hasher};
-        match cell_bytes {
-            Some(bytes) => {
-                let mut hasher = AHasher::default();
-                bytes.hash(&mut hasher);
-                hasher.finish()
-            }
-            None => 0,
-        }
+        Self::hash_bytes(cell_bytes)
     }
 
     /// Hash a read name for `GroupKey`.
     #[must_use]
     pub fn hash_name(name_bytes: Option<&[u8]>) -> u64 {
-        use ahash::AHasher;
-        use std::hash::{Hash, Hasher};
-        match name_bytes {
-            Some(bytes) => {
-                let mut hasher = AHasher::default();
-                bytes.hash(&mut hasher);
-                hasher.finish()
-            }
-            None => 0,
-        }
+        Self::hash_bytes(name_bytes)
     }
 }
 
