@@ -2,20 +2,36 @@
 members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-umi", "crates/fgumi-consensus"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.87.0"
+repository = "https://github.com/fulcrumgenomics/fgumi"
+license = "MIT"
+
+[workspace.dependencies]
+fgumi-bgzf = { version = "0.1.1", path = "crates/fgumi-bgzf" }
+fgumi-consensus = { version = "0.1.1", path = "crates/fgumi-consensus", default-features = false }
+fgumi-dna = { version = "0.1.1", path = "crates/fgumi-dna" }
+fgumi-metrics = { version = "0.1.1", path = "crates/fgumi-metrics" }
+fgumi-raw-bam = { version = "0.1.1", path = "crates/fgumi-raw-bam" }
+fgumi-sam = { version = "0.1.1", path = "crates/fgumi-sam" }
+fgumi-umi = { version = "0.1.1", path = "crates/fgumi-umi" }
+
 [package]
 name = "fgumi"
-version = "0.1.1"
+version.workspace = true
 authors = ["Nils Homer <nils@fulcrumgenomics.com>", "Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "High-performance tools for UMI-tagged sequencing data: extraction, grouping, and consensus calling"
-repository = "https://github.com/fulcrumgenomics/fgumi"
+repository.workspace = true
 homepage = "https://github.com/fulcrumgenomics/fgumi"
 documentation = "https://docs.rs/fgumi"
 readme = "README.md"
 categories = ["command-line-utilities", "science"]
 keywords = ["bioinformatics", "umi", "consensus", "sequencing", "ngs"]
-license = "MIT"
-edition = "2024"
-rust-version = "1.87.0"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive", "string"] }
@@ -61,13 +77,13 @@ wide = "1.1"
 rand_distr = "0.6"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
-fgumi-raw-bam = { version = "0.1.1", path = "crates/fgumi-raw-bam", features = ["noodles"] }
-fgumi-dna = { version = "0.1.0", path = "crates/fgumi-dna" }
-fgumi-bgzf = { version = "0.1.0", path = "crates/fgumi-bgzf" }
-fgumi-metrics = { version = "0.1.1", path = "crates/fgumi-metrics" }
-fgumi-sam = { version = "0.1.1", path = "crates/fgumi-sam" }
-fgumi-umi = { version = "0.1.0", path = "crates/fgumi-umi" }
-fgumi-consensus = { version = "0.1.1", path = "crates/fgumi-consensus", default-features = false }
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-dna = { workspace = true }
+fgumi-bgzf = { workspace = true }
+fgumi-metrics = { workspace = true }
+fgumi-sam = { workspace = true }
+fgumi-umi = { workspace = true }
+fgumi-consensus = { workspace = true }
 
 [features]
 default = ["simplex", "duplex", "codec"]
@@ -90,7 +106,7 @@ stress-tests = []
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
-fgumi-raw-bam = { version = "0.1.1", path = "crates/fgumi-raw-bam", features = ["test-utils"] }
+fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 
 [[bench]]
 name = "core_functions"

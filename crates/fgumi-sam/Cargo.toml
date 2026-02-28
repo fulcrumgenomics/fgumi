@@ -1,23 +1,23 @@
 [package]
 name = "fgumi-sam"
-version = "0.1.1"
-edition = "2024"
-rust-version = "1.87.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "SAM/BAM record utilities, CIGAR parsing, and read-pair clipping for fgumi"
-repository = "https://github.com/fulcrumgenomics/fgumi"
-license = "MIT"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 noodles = { version = "0.105.0", features = ["bam", "sam", "core"] }
-fgumi-raw-bam = { version = "0.1.1", path = "../fgumi-raw-bam", features = ["noodles"] }
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 bstr = "1.12.1"
 log = "0"
 anyhow = "1.0"
-fgumi-dna = { version = "0.1.0", path = "../fgumi-dna" }
+fgumi-dna = { workspace = true }
 tempfile = "3.3.0"
 
 [dev-dependencies]
-fgumi-raw-bam = { version = "0.1.1", path = "../fgumi-raw-bam", features = ["test-utils"] }
+fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
