@@ -144,53 +144,33 @@ pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
     }
 
     // Must be on the same reference as mate
-    let ref_id = read.reference_sequence_id();
-    let mate_ref_id = read.mate_reference_sequence_id();
-    if ref_id != mate_ref_id {
+    if read.reference_sequence_id() != read.mate_reference_sequence_id() {
         return false;
     }
 
-    // Check strand orientation - must be opposite strands for FR or RF
-    let is_reverse = flags.is_reverse_complemented();
-    let mate_reverse = flags.is_mate_reverse_complemented();
-    if is_reverse == mate_reverse {
-        // Same strand = TANDEM, not FR
-        return false;
-    }
+    // Delegate to get_pair_orientation for the FR/RF/Tandem determination
+    get_pair_orientation(read) == PairOrientation::FR
+}
 
-    // Now determine if FR or RF using htsjdk's logic:
-    // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
-    // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
-    let alignment_start = read.alignment_start().map_or(0, usize::from);
-    let mate_start = read.mate_alignment_start().map_or(0, usize::from);
-    let insert_size = read.template_length();
+/// Parses the MC (mate CIGAR) tag from a record, returning the parsed CIGAR ops
+/// and the mate alignment start position.
+///
+/// Returns `None` if the MC tag is missing/invalid or mate position is missing.
+fn parse_mate_cigar(read: &RecordBuf) -> Option<(Vec<(Kind, usize)>, usize)> {
+    let mc_tag = Tag::from([b'M', b'C']);
+    let mc_value = read.data().get(&mc_tag)?;
 
-    // Genomic positions fit in i32 (SAM format uses i32 for positions)
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "genomic positions are guaranteed to fit in i32 per SAM spec"
-    )]
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "genomic positions are non-negative and fit in i32 per SAM spec"
-    )]
-    let (positive_five_prime, negative_five_prime) = if is_reverse {
-        // This read is on reverse strand, mate is on positive strand
-        // Need alignment end for this read's 5' position
-        let ref_len = reference_length(&read.cigar());
-        let end = alignment_start + ref_len.saturating_sub(1);
-        // positiveStrandFivePrimePos = mateStart
-        // negativeStrandFivePrimePos = alignmentEnd (this read)
-        (mate_start as i32, end as i32)
-    } else {
-        // This read is on positive strand, mate is on reverse strand
-        // positiveStrandFivePrimePos = alignmentStart (this read)
-        // negativeStrandFivePrimePos = alignmentStart + insertSize
-        (alignment_start as i32, alignment_start as i32 + insert_size)
+    let cigar_str = match mc_value {
+        Value::String(s) => std::str::from_utf8(s.as_ref()).ok()?,
+        _ => return None,
     };
 
-    // FR if positive strand 5' < negative strand 5'
-    positive_five_prime < negative_five_prime
+    let mate_start = usize::from(read.mate_alignment_start()?);
+    let ops = parse_cigar_string(cigar_str);
+    if ops.is_empty() {
+        return None;
+    }
+    Some((ops, mate_start))
 }
 
 /// Gets the mate's unclipped start position from the MC tag and mate position.
@@ -206,27 +186,20 @@ pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
 /// Returns `None` if the MC tag is missing or invalid, or if mate position is missing.
 #[must_use]
 pub fn mate_unclipped_start(read: &RecordBuf) -> Option<isize> {
-    let mc_tag = Tag::from([b'M', b'C']);
-    let mc_value = read.data().get(&mc_tag)?;
-
-    let cigar_str = match mc_value {
-        Value::String(s) => String::from_utf8_lossy(s.as_ref()).to_string(),
-        _ => return None,
-    };
+    let (ops, mate_start) = parse_mate_cigar(read)?;
 
     #[expect(
         clippy::cast_possible_wrap,
         reason = "genomic positions fit in isize on all supported platforms (64-bit)"
     )]
-    let mate_start = usize::from(read.mate_alignment_start()?) as isize;
-    let ops = parse_cigar_string(&cigar_str);
+    let mate_start_signed = mate_start as isize;
     #[expect(
         clippy::cast_possible_wrap,
         reason = "CIGAR clipping lengths are small relative to isize::MAX"
     )]
     let leading_clip = leading_clipping(&ops) as isize;
 
-    Some(mate_start - leading_clip)
+    Some(mate_start_signed - leading_clip)
 }
 
 /// Gets the mate's unclipped end position from the MC tag and mate position.
@@ -236,16 +209,7 @@ pub fn mate_unclipped_start(read: &RecordBuf) -> Option<isize> {
 /// Returns `None` if the MC tag is missing or invalid, or if mate position is missing.
 #[must_use]
 pub fn mate_unclipped_end(read: &RecordBuf) -> Option<usize> {
-    let mc_tag = Tag::from([b'M', b'C']);
-    let mc_value = read.data().get(&mc_tag)?;
-
-    let cigar_str = match mc_value {
-        Value::String(s) => String::from_utf8_lossy(s.as_ref()).to_string(),
-        _ => return None,
-    };
-
-    let mate_start = usize::from(read.mate_alignment_start()?);
-    let ops = parse_cigar_string(&cigar_str);
+    let (ops, mate_start) = parse_mate_cigar(read)?;
     let ref_len = cigar_reference_length(&ops);
     let trailing_clip = trailing_clipping(&ops);
 
@@ -1050,6 +1014,27 @@ mod tests {
             .first_segment(true)
             .build();
 
+        assert_eq!(mate_unclipped_start(&record), None);
+        assert_eq!(mate_unclipped_end(&record), None);
+    }
+
+    #[test]
+    fn test_mate_unclipped_invalid_utf8_mc_tag() {
+        use noodles::sam::alignment::record_buf::data::field::value::Value;
+        let mc_tag = Tag::from([b'M', b'C']);
+        // Create a read then replace the MC tag with invalid UTF-8 bytes
+        let mut record = create_mc_test_read("invalid_utf8", 200, "50M");
+        record
+            .data_mut()
+            .insert(mc_tag, Value::String(vec![0xFF, 0xFE].into()));
+
+        assert_eq!(mate_unclipped_start(&record), None);
+        assert_eq!(mate_unclipped_end(&record), None);
+    }
+
+    #[test]
+    fn test_mate_unclipped_empty_cigar_mc_tag() {
+        let record = create_mc_test_read("empty_cigar", 200, "");
         assert_eq!(mate_unclipped_start(&record), None);
         assert_eq!(mate_unclipped_end(&record), None);
     }
