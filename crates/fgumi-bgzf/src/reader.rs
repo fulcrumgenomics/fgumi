@@ -48,6 +48,44 @@ pub const BGZF_EOF: [u8; 28] = [
 ];
 
 // ============================================================================
+// Footer-parsing helpers (operate on raw byte slices)
+// ============================================================================
+
+/// Get the compressed data portion from a raw BGZF block slice (between header and footer).
+#[must_use]
+fn compressed_data_from_slice(data: &[u8]) -> &[u8] {
+    if data.len() <= BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
+        return &[];
+    }
+    &data[BGZF_HEADER_SIZE..data.len() - BGZF_FOOTER_SIZE]
+}
+
+/// Get the expected uncompressed size (ISIZE field) from the footer of a raw BGZF block slice.
+///
+/// Returns 0 if the slice is too short to contain a footer.
+#[must_use]
+fn uncompressed_size_from_slice(data: &[u8]) -> usize {
+    if data.len() < BGZF_FOOTER_SIZE {
+        return 0;
+    }
+    let len = data.len();
+    // ISIZE is always < 64KB for BGZF blocks, fits in usize on all platforms
+    u32::from_le_bytes([data[len - 4], data[len - 3], data[len - 2], data[len - 1]]) as usize
+}
+
+/// Get the CRC32 from the footer of a raw BGZF block slice.
+///
+/// Returns 0 if the slice is too short to contain a footer.
+#[must_use]
+fn crc32_from_slice(data: &[u8]) -> u32 {
+    if data.len() < BGZF_FOOTER_SIZE {
+        return 0;
+    }
+    let len = data.len();
+    u32::from_le_bytes([data[len - 8], data[len - 7], data[len - 6], data[len - 5]])
+}
+
+// ============================================================================
 // Raw Block Types
 // ============================================================================
 
@@ -80,41 +118,19 @@ impl RawBgzfBlock {
     /// Get the compressed data portion (between header and footer).
     #[must_use]
     pub fn compressed_data(&self) -> &[u8] {
-        if self.data.len() <= BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
-            return &[];
-        }
-        &self.data[BGZF_HEADER_SIZE..self.data.len() - BGZF_FOOTER_SIZE]
+        compressed_data_from_slice(&self.data)
     }
 
     /// Get the expected uncompressed size from the footer (ISIZE field).
     #[must_use]
     pub fn uncompressed_size(&self) -> usize {
-        if self.data.len() < BGZF_FOOTER_SIZE {
-            return 0;
-        }
-        let len = self.data.len();
-        // ISIZE is always < 64KB for BGZF blocks, fits in usize on all platforms
-        u32::from_le_bytes([
-            self.data[len - 4],
-            self.data[len - 3],
-            self.data[len - 2],
-            self.data[len - 1],
-        ]) as usize
+        uncompressed_size_from_slice(&self.data)
     }
 
     /// Get the CRC32 from the footer.
     #[must_use]
     pub fn crc32(&self) -> u32 {
-        if self.data.len() < BGZF_FOOTER_SIZE {
-            return 0;
-        }
-        let len = self.data.len();
-        u32::from_le_bytes([
-            self.data[len - 8],
-            self.data[len - 7],
-            self.data[len - 6],
-            self.data[len - 5],
-        ])
+        crc32_from_slice(&self.data)
     }
 }
 
@@ -235,6 +251,52 @@ pub fn read_raw_blocks<R: Read + ?Sized>(
 }
 
 // ============================================================================
+// Decompression Helpers
+// ============================================================================
+
+/// Verify that decompressed data matches the expected size and CRC32 checksum.
+///
+/// # Arguments
+///
+/// * `decompressed` - The decompressed data to verify.
+/// * `expected_size` - The expected uncompressed size from the BGZF footer.
+/// * `expected_crc` - The expected CRC32 checksum from the BGZF footer.
+/// * `block_len` - The total block length (for error messages).
+///
+/// # Errors
+///
+/// Returns an error if the size or CRC32 does not match.
+fn verify_decompression(
+    decompressed: &[u8],
+    expected_size: usize,
+    expected_crc: u32,
+    block_len: usize,
+) -> io::Result<()> {
+    let actual_size = decompressed.len();
+    if actual_size != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF decompression size mismatch: expected {expected_size}, got {actual_size}"
+            ),
+        ));
+    }
+
+    let actual_crc = crc32fast::hash(decompressed);
+    if expected_crc != actual_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
+                 block_size={block_len}, uncompressed_size={expected_size}",
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Decompression Functions
 // ============================================================================
 
@@ -258,47 +320,9 @@ pub fn decompress_block(
     block: &RawBgzfBlock,
     decompressor: &mut Decompressor,
 ) -> io::Result<Vec<u8>> {
-    // Handle empty/EOF blocks
-    if block.is_eof() || block.uncompressed_size() == 0 {
-        return Ok(Vec::new());
-    }
-
-    let compressed = block.compressed_data();
-    let uncompressed_size = block.uncompressed_size();
-
-    // Allocate output buffer
-    let mut uncompressed = vec![0u8; uncompressed_size];
-
-    // Decompress and validate byte count
-    let bytes_written =
-        decompressor.deflate_decompress(compressed, &mut uncompressed).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
-        })?;
-
-    if bytes_written != uncompressed_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF decompression size mismatch: expected {uncompressed_size}, got {bytes_written}"
-            ),
-        ));
-    }
-
-    // Verify CRC32 to detect corruption
-    let expected_crc = block.crc32();
-    let actual_crc = crc32fast::hash(&uncompressed);
-    if expected_crc != actual_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
-                 block_size={}, uncompressed_size={uncompressed_size}",
-                block.len(),
-            ),
-        ));
-    }
-
-    Ok(uncompressed)
+    let mut output = Vec::new();
+    decompress_block_into(block, decompressor, &mut output)?;
+    Ok(output)
 }
 
 /// Decompress a BGZF block into a provided buffer, appending to existing data.
@@ -333,36 +357,21 @@ pub fn decompress_block_into(
     let start = output.len();
     output.resize(start + uncompressed_size, 0);
 
-    // Decompress directly into the buffer and validate byte count
+    // Decompress directly into the buffer
     let bytes_written =
         decompressor.deflate_decompress(compressed, &mut output[start..]).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
         })?;
 
-    if bytes_written != uncompressed_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF decompression size mismatch: expected {uncompressed_size}, got {bytes_written}"
-            ),
-        ));
-    }
-
-    // Verify CRC32 to detect corruption
-    let expected_crc = block.crc32();
-    let actual_crc = crc32fast::hash(&output[start..]);
-    if expected_crc != actual_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
-                 block_size={}, uncompressed_size={uncompressed_size}",
-                block.len(),
-            ),
-        ));
-    }
-
-    Ok(())
+    // Verify size and CRC32
+    // Note: bytes_written may differ from output[start..].len() if decompressor wrote fewer bytes,
+    // so we check bytes_written against expected size, then verify CRC on the written portion.
+    verify_decompression(
+        &output[start..start + bytes_written],
+        uncompressed_size,
+        block.crc32(),
+        block.len(),
+    )
 }
 
 /// Decompress a BGZF block from raw bytes into a provided buffer.
@@ -384,28 +393,19 @@ pub fn decompress_block_slice_into(
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // Check for EOF block
-    if data == BGZF_EOF {
-        return Ok(());
-    }
-
     // Need at least header + footer
     if data.len() < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
         return Ok(());
     }
 
-    // Get uncompressed size from ISIZE field (last 4 bytes)
-    let len = data.len();
-    // ISIZE is always < 64KB for BGZF blocks, fits in usize on all platforms
-    let uncompressed_size =
-        u32::from_le_bytes([data[len - 4], data[len - 3], data[len - 2], data[len - 1]]) as usize;
+    let uncompressed_size = uncompressed_size_from_slice(data);
 
     if uncompressed_size == 0 {
         return Ok(());
     }
 
     // Get compressed data (between header and footer)
-    let compressed = &data[BGZF_HEADER_SIZE..len - BGZF_FOOTER_SIZE];
+    let compressed = compressed_data_from_slice(data);
 
     // Extend output buffer and decompress directly into it
     let start = output.len();
@@ -416,30 +416,13 @@ pub fn decompress_block_slice_into(
             io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
         })?;
 
-    if bytes_written != uncompressed_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF decompression size mismatch: expected {uncompressed_size}, got {bytes_written}"
-            ),
-        ));
-    }
-
-    // Verify CRC32 to detect corruption
-    let expected_crc =
-        u32::from_le_bytes([data[len - 8], data[len - 7], data[len - 6], data[len - 5]]);
-    let actual_crc = crc32fast::hash(&output[start..]);
-    if expected_crc != actual_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "BGZF CRC32 mismatch: expected 0x{expected_crc:08x}, got 0x{actual_crc:08x}, \
-                 block_size={len}, uncompressed_size={uncompressed_size}",
-            ),
-        ));
-    }
-
-    Ok(())
+    // Verify size and CRC32
+    verify_decompression(
+        &output[start..start + bytes_written],
+        uncompressed_size,
+        crc32_from_slice(data),
+        data.len(),
+    )
 }
 
 // ============================================================================

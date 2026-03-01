@@ -200,18 +200,6 @@ impl InlineBgzfCompressor {
         Ok(())
     }
 
-    /// Recycle block buffers back to the pool for reuse.
-    ///
-    /// Call this after writing blocks to return their buffers for reuse,
-    /// reducing allocation overhead in the single-threaded pipeline.
-    pub fn recycle_blocks(&mut self, blocks: Vec<CompressedBlock>) {
-        for block in blocks {
-            let mut buf = block.data;
-            buf.clear();
-            self.buffer_pool.push(buf);
-        }
-    }
-
     /// Compress the current buffer and add to completed blocks.
     fn compress_current_buffer(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
