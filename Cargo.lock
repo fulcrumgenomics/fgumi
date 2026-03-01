@@ -1142,9 +1142,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jiff"
-version = "0.2.21"
+version = "0.2.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3e3d65f018c6ae946ab16e80944b97096ed73c35b221d1c478a6c81d8f57940"
+checksum = "819b44bc7c87d9117eb522f14d46e918add69ff12713c475946b0a29363ed1c2"
 dependencies = [
  "jiff-static",
  "log",
@@ -1155,9 +1155,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.21"
+version = "0.2.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a17c2b211d863c7fde02cbea8a3c1a439b98e109286554f2860bdded7ff83818"
+checksum = "470252db18ecc35fd766c0891b1e3ec6cbbcd62507e85276c01bf75d8e94d4a1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1420,9 +1420,9 @@ dependencies = [
 
 [[package]]
 name = "noodles"
-version = "0.105.0"
+version = "0.106.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "503328e4a529f23164ed7a6d0ebe3df5bbd6d6f3d2cdf2f9473b4b9fd115aab5"
+checksum = "34395c8dba986b5706354a4a761eb3e601fdbf1177df6e91b90f53d5f658245e"
 dependencies = [
  "noodles-bam",
  "noodles-bgzf",
@@ -1483,9 +1483,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-fasta"
-version = "0.59.0"
+version = "0.60.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "474485116c9683e8fbe1ebdedcf42eab8749b1727c324bdd0568677bb2bddd3a"
+checksum = "a5c8ccd951d43ba0a1c4dcc1f86fdc2ee86c1742de2988956bcdf1bc58905769"
 dependencies = [
  "bstr 1.12.1",
  "memchr",
