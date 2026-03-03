@@ -273,50 +273,40 @@ impl Metric for DuplexUmiMetric {
 }
 
 /// Tracks raw, error, and unique UMI observation counts.
-#[allow(clippy::struct_field_names)]
 struct UmiCountTracker {
-    raw_counts: HashMap<String, usize>,
-    error_counts: HashMap<String, usize>,
-    unique_counts: HashMap<String, usize>,
+    /// Maps UMI string to `(raw_count, error_count, unique_count)`.
+    counts: HashMap<String, (usize, usize, usize)>,
 }
 
 impl UmiCountTracker {
     /// Creates an empty tracker.
     fn new() -> Self {
-        Self {
-            raw_counts: HashMap::new(),
-            error_counts: HashMap::new(),
-            unique_counts: HashMap::new(),
-        }
+        Self { counts: HashMap::new() }
     }
 
     /// Records an observation for a UMI.
     fn record(&mut self, umi: &str, raw_count: usize, error_count: usize, is_unique: bool) {
-        let key = umi.to_string();
-        *self.raw_counts.entry(key.clone()).or_insert(0) += raw_count;
-        *self.error_counts.entry(key.clone()).or_insert(0) += error_count;
+        let entry = self.counts.entry(umi.to_string()).or_insert((0, 0, 0));
+        entry.0 += raw_count;
+        entry.1 += error_count;
         if is_unique {
-            *self.unique_counts.entry(key).or_insert(0) += 1;
+            entry.2 += 1;
         }
     }
 
     /// Total raw observations across all UMIs.
     fn total_raw(&self) -> usize {
-        self.raw_counts.values().sum()
+        self.counts.values().map(|(raw, _, _)| raw).sum()
     }
 
     /// Total unique observations across all UMIs.
     fn total_unique(&self) -> usize {
-        self.unique_counts.values().sum()
+        self.counts.values().map(|(_, _, unique)| unique).sum()
     }
 
     /// Iterates over all tracked UMIs, yielding `(umi, raw_count, error_count, unique_count)`.
     fn iter(&self) -> impl Iterator<Item = (&str, usize, usize, usize)> {
-        self.raw_counts.iter().map(|(umi, &raw)| {
-            let errors = self.error_counts.get(umi).copied().unwrap_or(0);
-            let unique = self.unique_counts.get(umi).copied().unwrap_or(0);
-            (umi.as_str(), raw, errors, unique)
-        })
+        self.counts.iter().map(|(umi, &(raw, errors, unique))| (umi.as_str(), raw, errors, unique))
     }
 }
 
