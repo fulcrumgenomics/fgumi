@@ -22,7 +22,7 @@ use crate::sort::inline_buffer::{RecordBuffer, TemplateKey, TemplateRecordBuffer
 use crate::sort::keys::SortOrder;
 use crate::sort::radix::{heap_make, heap_sift_down};
 use crate::sort::read_ahead::RawReadAheadReader;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bstr::BString;
 use crossbeam_channel::{Receiver, bounded};
 use log::info;
@@ -53,6 +53,8 @@ use tempfile::TempDir;
 pub struct LibraryLookup {
     /// RG ID -> library ordinal
     rg_to_ordinal: HashMap<Vec<u8>, u32>,
+    /// Deterministic hasher for read name hashing, constructed once for reuse.
+    hasher: ahash::RandomState,
 }
 
 impl LibraryLookup {
@@ -96,81 +98,32 @@ impl LibraryLookup {
             })
             .collect();
 
-        Self { rg_to_ordinal }
+        let hasher = ahash::RandomState::with_seeds(
+            0x517c_c1b7_2722_0a95,
+            0x1234_5678_90ab_cdef,
+            0xfedc_ba98_7654_3210,
+            0x0123_4567_89ab_cdef,
+        );
+
+        Self { rg_to_ordinal, hasher }
+    }
+
+    /// Hash a read name deterministically.
+    #[inline]
+    #[must_use]
+    pub fn hash_name(&self, name: &[u8]) -> u64 {
+        self.hasher.hash_one(name)
     }
 
     /// Get library ordinal for a record (from RG tag in aux data).
     #[inline]
     #[must_use]
     pub fn get_ordinal(&self, bam: &[u8]) -> u32 {
-        find_rg_tag_raw(bam).and_then(|rg| self.rg_to_ordinal.get(rg)).copied().unwrap_or(0)
+        fgumi_raw_bam::tags::find_string_tag_in_record(bam, b"RG")
+            .and_then(|rg| self.rg_to_ordinal.get(rg))
+            .copied()
+            .unwrap_or(0)
     }
-}
-
-/// Find RG tag value in BAM auxiliary data.
-fn find_rg_tag_raw(bam: &[u8]) -> Option<&[u8]> {
-    let l_read_name = bam[8] as usize;
-    let n_cigar_op = u16::from_le_bytes([bam[12], bam[13]]) as usize;
-    let l_seq = u32::from_le_bytes([bam[16], bam[17], bam[18], bam[19]]) as usize;
-
-    let aux_offset = 32 + l_read_name + n_cigar_op * 4 + l_seq.div_ceil(2) + l_seq;
-
-    if aux_offset >= bam.len() {
-        return None;
-    }
-
-    find_string_tag_in_aux(&bam[aux_offset..], *b"RG")
-}
-
-/// Find a string tag in auxiliary data, returning the value without type prefix.
-fn find_string_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<&[u8]> {
-    let mut pos = 0;
-    while pos + 3 <= aux.len() {
-        let tag_bytes = &aux[pos..pos + 2];
-        let val_type = aux[pos + 2];
-
-        if tag_bytes == tag && val_type == b'Z' {
-            // Found the tag, find null terminator
-            let start = pos + 3;
-            let end = aux[start..].iter().position(|&b| b == 0)?;
-            return Some(&aux[start..start + end]);
-        }
-
-        // Skip to next tag based on type
-        pos += 3;
-        match val_type {
-            b'A' | b'c' | b'C' => pos += 1,
-            b's' | b'S' => pos += 2,
-            b'i' | b'I' | b'f' => pos += 4,
-            b'Z' | b'H' => {
-                // Null-terminated string
-                while pos < aux.len() && aux[pos] != 0 {
-                    pos += 1;
-                }
-                pos += 1; // Skip null
-            }
-            b'B' => {
-                // Array: subtype (1 byte) + count (4 bytes) + data
-                if pos + 5 > aux.len() {
-                    return None;
-                }
-                let subtype = aux[pos];
-                let count =
-                    u32::from_le_bytes([aux[pos + 1], aux[pos + 2], aux[pos + 3], aux[pos + 4]])
-                        as usize;
-                pos += 5;
-                let elem_size = match subtype {
-                    b'c' | b'C' => 1,
-                    b's' | b'S' => 2,
-                    b'i' | b'I' | b'f' => 4,
-                    _ => return None,
-                };
-                pos += count * elem_size;
-            }
-            _ => return None, // Unknown type
-        }
-    }
-    None
 }
 
 /// Number of records to prefetch per chunk during merge.
@@ -1726,13 +1679,7 @@ impl RawExternalSorter {
 
     /// Create temporary directory for spill files.
     fn create_temp_dir(&self) -> Result<TempDir> {
-        match &self.temp_dir {
-            Some(base) => {
-                std::fs::create_dir_all(base)?;
-                TempDir::new_in(base).context("Failed to create temp directory")
-            }
-            None => TempDir::new().context("Failed to create temp directory"),
-        }
+        super::create_temp_dir(self.temp_dir.as_deref())
     }
 }
 
@@ -1776,17 +1723,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
     } else {
         &[]
     };
-    // Use fixed seeds for deterministic hashing across runs.
-    // This ensures template-coordinate sort produces consistent output.
-    let name_hash = {
-        let state = ahash::RandomState::with_seeds(
-            0x517c_c1b7_2722_0a95,
-            0x1234_5678_90ab_cdef,
-            0xfedc_ba98_7654_3210,
-            0x0123_4567_89ab_cdef,
-        );
-        state.hash_one(name)
-    };
+    let name_hash = lib_lookup.hash_name(name);
 
     // Handle unmapped reads
     if is_unmapped {
@@ -1847,16 +1784,8 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
     TemplateKey::new(tid1, pos1, neg1, tid2, pos2, neg2, library, mi, name_hash, is_upper)
 }
 
-/// Statistics from a raw-bytes sort operation.
-#[derive(Default, Debug)]
-pub struct RawSortStats {
-    /// Total records read from input.
-    pub total_records: u64,
-    /// Records written to output.
-    pub output_records: u64,
-    /// Number of temporary chunk files written.
-    pub chunks_written: usize,
-}
+// Use shared SortStats from the parent module.
+pub use super::SortStats as RawSortStats;
 
 #[cfg(test)]
 mod tests {
@@ -2038,7 +1967,7 @@ mod tests {
     }
 
     // ========================================================================
-    // find_rg_tag_raw tests
+    // find_string_tag_in_record tests (via fgumi_raw_bam)
     // ========================================================================
 
     /// Helper to build minimal BAM bytes with aux data appended.
@@ -2057,35 +1986,25 @@ mod tests {
         bam
     }
 
-    #[test]
-    fn test_find_rg_tag_raw_present() {
-        // RG:Z:group1\0
-        let aux = b"RGZgroup1\0";
-        let bam = build_bam_with_aux(aux);
-        let result = find_rg_tag_raw(&bam);
-        assert_eq!(result, Some(b"group1".as_slice()));
+    #[rstest::rstest]
+    #[case::present(b"RGZgroup1\0".as_slice(), Some(b"group1".as_slice()))]
+    #[case::absent(b"".as_slice(), None)]
+    fn test_find_rg_tag(#[case] aux_data: &[u8], #[case] expected: Option<&[u8]>) {
+        let bam = build_bam_with_aux(aux_data);
+        assert_eq!(fgumi_raw_bam::tags::find_string_tag_in_record(&bam, b"RG"), expected);
     }
 
     #[test]
-    fn test_find_rg_tag_raw_absent() {
-        // No aux data at all
-        let bam = build_bam_with_aux(&[]);
-        let result = find_rg_tag_raw(&bam);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_find_rg_tag_raw_after_other_tags() {
-        // First an integer tag: XY:i:<4 bytes>, then RG:Z:mygroup\0
+    fn test_find_rg_tag_after_other_tags() {
+        // XY:i:42 followed by RG:Z:mygroup — aux built dynamically for the integer tag
         let mut aux = Vec::new();
-        // XY:i:42
         aux.extend_from_slice(b"XYi");
         aux.extend_from_slice(&42i32.to_le_bytes());
-        // RG:Z:mygroup\0
         aux.extend_from_slice(b"RGZmygroup\0");
-
         let bam = build_bam_with_aux(&aux);
-        let result = find_rg_tag_raw(&bam);
-        assert_eq!(result, Some(b"mygroup".as_slice()));
+        assert_eq!(
+            fgumi_raw_bam::tags::find_string_tag_in_record(&bam, b"RG"),
+            Some(b"mygroup".as_slice())
+        );
     }
 }
