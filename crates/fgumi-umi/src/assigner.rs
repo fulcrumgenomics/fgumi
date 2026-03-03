@@ -1119,6 +1119,7 @@ impl AdjacencyUmiAssigner {
     }
 
     /// Build adjacency graph using `BitEnc` for efficient matching.
+    #[expect(clippy::too_many_lines, reason = "complex graph-building algorithm")]
     fn build_adjacency_graph_bitenc(
         &self,
         umi_counts: &[(BitEnc, usize, usize)], // (encoded, count, first_raw_index)
@@ -1188,11 +1189,16 @@ impl AdjacencyUmiAssigner {
 
                 let max_child_count = nodes[idx].count / 2 + 1;
 
-                // Find where to start searching (for count constraint)
-                let search_from = count_index
-                    .iter()
-                    .find(|(count, _)| *count <= max_child_count)
-                    .map_or(nodes.len(), |(_, idx)| *idx);
+                // Find where to start searching (for count constraint).
+                // count_index is sorted by descending count; binary search for the
+                // first entry with count <= max_child_count.
+                let ci_pos =
+                    count_index.partition_point(|(count, _)| *count > max_child_count);
+                let search_from = if ci_pos < count_index.len() {
+                    count_index[ci_pos].1
+                } else {
+                    nodes.len()
+                };
 
                 if search_from < nodes.len() {
                     let parent_enc = &umi_counts[idx].0;
@@ -1342,11 +1348,16 @@ impl AdjacencyUmiAssigner {
 
                 let max_child_count = nodes[idx].count / 2 + 1;
 
-                // Find where to start searching (for count constraint)
-                let search_from = count_index
-                    .iter()
-                    .find(|(count, _)| *count <= max_child_count)
-                    .map_or(nodes.len(), |(_, idx)| *idx);
+                // Find where to start searching (for count constraint).
+                // count_index is sorted by descending count; binary search for the
+                // first entry with count <= max_child_count.
+                let ci_pos =
+                    count_index.partition_point(|(count, _)| *count > max_child_count);
+                let search_from = if ci_pos < count_index.len() {
+                    count_index[ci_pos].1
+                } else {
+                    nodes.len()
+                };
 
                 if search_from < nodes.len() {
                     let parent_umi = &umi_counts[idx].0;
