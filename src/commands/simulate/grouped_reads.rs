@@ -8,13 +8,14 @@ use super::sort::TemplateCoordKey;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, PositionDistArgs, QualityArgs, ReferenceArgs, SimulationCommon,
-    StrandBiasArgs,
+    FamilySizeArgs, InsertSizeArgs, MoleculeInfo, PositionDistArgs, QualityArgs, ReferenceArgs,
+    SimulationCommon, StrandBiasArgs, compute_position, generate_random_sequence, pad_sequence,
 };
 use anyhow::{Context, Result};
 use bstr::BString;
 use clap::Parser;
 use fgumi_lib::bam_io::create_bam_writer;
+use fgumi_lib::dna::reverse_complement;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::sam::builder::RecordBuilder;
 use fgumi_lib::simulate::{
@@ -92,33 +93,6 @@ pub struct GroupedReads {
     #[command(flatten)]
     pub strand_bias: StrandBiasArgs,
 }
-
-/// Lightweight molecule info for position-first sorting.
-struct MoleculeInfo {
-    mol_id: usize,
-    seed: u64,
-    sort_key: TemplateCoordKey,
-}
-
-impl Ord for MoleculeInfo {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sort_key.cmp(&other.sort_key)
-    }
-}
-
-impl PartialOrd for MoleculeInfo {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for MoleculeInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.sort_key == other.sort_key
-    }
-}
-
-impl Eq for MoleculeInfo {}
 
 /// Parameters needed for molecule generation.
 struct GenerationParams {
@@ -318,13 +292,6 @@ impl Command for GroupedReads {
 
         Ok(())
     }
-}
-
-/// Compute the genomic position for a molecule based on its ID.
-#[inline]
-fn compute_position(mol_id: usize, num_positions: usize, ref_length: usize) -> usize {
-    let position_idx = mol_id % num_positions;
-    ((position_idx as f64 / num_positions as f64) * (ref_length - 1000) as f64) as usize + 100
 }
 
 /// Generate all read pairs for a single molecule.
@@ -570,37 +537,6 @@ fn build_record(
         .tag("MC", mate_cigar)
         .tag("MQ", i32::from(mate_mapq))
         .build()
-}
-
-fn generate_random_sequence(len: usize, rng: &mut impl Rng) -> Vec<u8> {
-    const BASES: &[u8] = b"ACGT";
-    let mut seq = Vec::with_capacity(len);
-    for _ in 0..len {
-        seq.push(BASES[rng.random_range(0..4)]);
-    }
-    seq
-}
-
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(seq.len());
-    for &b in seq.iter().rev() {
-        result.push(match b {
-            b'A' => b'T',
-            b'T' => b'A',
-            b'C' => b'G',
-            b'G' => b'C',
-            _ => b'N',
-        });
-    }
-    result
-}
-
-fn pad_sequence(mut seq: Vec<u8>, target_len: usize, rng: &mut impl Rng) -> Vec<u8> {
-    while seq.len() < target_len {
-        seq.push(b"ACGT"[rng.random_range(0..4)]);
-    }
-    seq.truncate(target_len);
-    seq
 }
 
 #[cfg(test)]

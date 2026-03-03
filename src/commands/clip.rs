@@ -287,46 +287,10 @@ impl Clip {
 
         // Open input BAM with MT BGZF decompression
         let reader_threads = self.threading.num_threads();
-        let (mut reader, mut header) = create_bam_reader(&self.io.input, reader_threads)?;
+        let (mut reader, header) = create_bam_reader(&self.io.input, reader_threads)?;
 
         // Update header sort order if specified
-        if let Some(ref sort_order) = self.sort_order {
-            use bstr::BString;
-            use noodles::sam::header::record::value::Map;
-            use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
-
-            // Get or create the header map
-            let mut header_map = if let Some(hd) = header.header() {
-                hd.clone()
-            } else {
-                Map::<noodles::sam::header::record::value::map::Header>::default()
-            };
-
-            // Update sort order
-            *header_map.other_fields_mut().entry(SORT_ORDER).or_insert(BString::from("")) =
-                BString::from(sort_order.as_str());
-
-            // Rebuild header with new header map
-            let mut builder = noodles::sam::Header::builder();
-
-            // Copy existing components
-            for (name, rg) in header.read_groups() {
-                builder = builder.add_read_group(name.clone(), rg.clone());
-            }
-            for (name, reference) in header.reference_sequences() {
-                builder = builder.add_reference_sequence(name.clone(), reference.clone());
-            }
-            for (id, pg) in header.programs().as_ref() {
-                builder = builder.add_program(id.clone(), pg.clone());
-            }
-            for comment in header.comments() {
-                builder = builder.add_comment(comment.clone());
-            }
-
-            // Set the modified header
-            builder = builder.set_header(header_map);
-            header = builder.build();
-        }
+        let header = self.update_header_sort_order(header)?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
