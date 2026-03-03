@@ -7,6 +7,8 @@
 //! - **UQ**: Phred likelihood of the segment (sum of mismatch qualities)
 //! - **MD**: Mismatched and deleted reference bases
 
+use std::fmt::Write;
+
 use anyhow::{Context, Result};
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -145,7 +147,7 @@ pub fn regenerate_alignment_tags(
                         uq += u32::from(qual_score);
 
                         // Always push match count (even 0) before mismatch per SAM spec
-                        md_string.push_str(&match_count.to_string());
+                        write!(md_string, "{match_count}").unwrap();
                         match_count = 0;
                         // Preserve reference case (matches fgbio behavior)
                         md_string.push(ref_base as char);
@@ -155,7 +157,7 @@ pub fn regenerate_alignment_tags(
                         uq += u32::from(qual_score);
 
                         // Always push match count (even 0) before mismatch per SAM spec
-                        md_string.push_str(&match_count.to_string());
+                        write!(md_string, "{match_count}").unwrap();
                         match_count = 0;
                         // Preserve reference case (matches fgbio behavior)
                         md_string.push(ref_base as char);
@@ -184,7 +186,7 @@ pub fn regenerate_alignment_tags(
                 nm += len;
 
                 // Always push match count (even 0) before deletion per SAM spec
-                md_string.push_str(&match_count.to_string());
+                write!(md_string, "{match_count}").unwrap();
                 match_count = 0;
 
                 md_string.push('^');
@@ -214,7 +216,7 @@ pub fn regenerate_alignment_tags(
     }
 
     // Add final match count to MD (always, even if 0, per SAM spec)
-    md_string.push_str(&match_count.to_string());
+    write!(md_string, "{match_count}").unwrap();
 
     // Update tags
     record.data_mut().insert(nm_tag(), Value::from(nm as i32));
@@ -292,17 +294,7 @@ pub fn regenerate_alignment_tags_raw(
     let cigar_ops = fgumi_raw_bam::get_cigar_ops(record);
 
     // Calculate reference span from CIGAR ops
-    let ref_span: usize = cigar_ops
-        .iter()
-        .map(|&op| {
-            let op_type = op & 0xF;
-            let op_len = (op >> 4) as usize;
-            match op_type {
-                0 | 2 | 3 | 7 | 8 => op_len, // M, D, N, =, X
-                _ => 0,
-            }
-        })
-        .sum();
+    let ref_span = fgumi_raw_bam::reference_length_from_cigar(&cigar_ops) as usize;
 
     // Handle edge case: CIGAR with no reference-consuming operations
     if ref_span == 0 {
@@ -357,14 +349,14 @@ pub fn regenerate_alignment_tags_raw(
                         // Masked base: count as mismatch
                         nm += 1;
                         uq += u32::from(qual_score);
-                        md_string.push_str(&match_count.to_string());
+                        write!(md_string, "{match_count}").unwrap();
                         match_count = 0;
                         md_string.push(ref_base as char);
                     } else if !seq_base.eq_ignore_ascii_case(&ref_base) {
                         // Mismatch
                         nm += 1;
                         uq += u32::from(qual_score);
-                        md_string.push_str(&match_count.to_string());
+                        write!(md_string, "{match_count}").unwrap();
                         match_count = 0;
                         md_string.push(ref_base as char);
                     } else {
@@ -388,7 +380,7 @@ pub fn regenerate_alignment_tags_raw(
                     anyhow::bail!("CIGAR deletion references beyond fetched reference span");
                 }
                 nm += op_len as i32;
-                md_string.push_str(&match_count.to_string());
+                write!(md_string, "{match_count}").unwrap();
                 match_count = 0;
                 md_string.push('^');
                 let ref_bases = &all_ref_bases[ref_offset..ref_offset + op_len];
@@ -414,7 +406,7 @@ pub fn regenerate_alignment_tags_raw(
     }
 
     // Add final match count
-    md_string.push_str(&match_count.to_string());
+    write!(md_string, "{match_count}").unwrap();
 
     // Update tags
     fgumi_raw_bam::update_int_tag(record, b"NM", nm);

@@ -96,7 +96,6 @@ use bstr::ByteSlice;
 use log::warn;
 use noodles::sam::Header;
 
-use fgumi_dna::dna::complement_base;
 use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 use noodles::sam::header::record::value::map::header::sort_order::{QUERY_NAME, UNSORTED};
 use std::path::Path;
@@ -311,6 +310,11 @@ pub fn reverse_buf_value(value: &BufValue) -> BufValue {
 ///
 /// A new `BufValue` with reverse complemented sequence, or a clone if not a string
 ///
+/// # Panics
+///
+/// Cannot panic in practice: the byte-level complement maps ASCII to ASCII,
+/// so `String::from_utf8` always succeeds.
+///
 /// # Examples
 ///
 /// ```rust,ignore
@@ -323,8 +327,8 @@ pub fn reverse_buf_value(value: &BufValue) -> BufValue {
 pub fn revcomp_buf_value(value: &BufValue) -> BufValue {
     match value {
         BufValue::String(s) => {
-            let revcomp: Vec<u8> = s.as_bytes().iter().rev().map(|&b| complement_base(b)).collect();
-            BufValue::from(String::from_utf8_lossy(&revcomp).to_string())
+            let revcomp = fgumi_dna::reverse_complement(s.as_bytes());
+            BufValue::from(String::from_utf8(revcomp).expect("complement of ASCII is ASCII"))
         }
         _ => value.clone(),
     }
