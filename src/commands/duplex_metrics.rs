@@ -16,7 +16,7 @@ use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
 use fgumi_lib::template::TemplateIterator;
 use fgumi_lib::umi::extract_mi_base;
-use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::validation::{string_to_tag, validate_file_exists};
 use log::info;
 use murmur3::murmur3_32;
 use noodles::sam::alignment::record::Cigar;
@@ -40,10 +40,6 @@ struct Interval {
     ref_name: String,
     start: i32,
     end: i32,
-}
-
-impl Interval {
-    // Interval overlap checking is done directly in overlaps_intervals function
 }
 
 /// Read name and template information for downsampling
@@ -361,25 +357,6 @@ impl Command for DuplexMetrics {
 }
 
 impl DuplexMetrics {
-    /// Converts a two-character tag string to a noodles Tag object.
-    ///
-    /// # Arguments
-    ///
-    /// * `tag_name` - Two-character tag name (e.g., "RX", "MI", "CB")
-    ///
-    /// # Returns
-    ///
-    /// A noodles Tag object
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag name is not exactly 2 characters
-    fn tag_from_string(tag_name: &str) -> noodles::sam::alignment::record::data::field::Tag {
-        assert_eq!(tag_name.len(), 2, "Tag name must be exactly 2 characters");
-        let bytes = tag_name.as_bytes();
-        noodles::sam::alignment::record::data::field::Tag::from([bytes[0], bytes[1]])
-    }
-
     /// Validates that the input BAM is not a consensus BAM.
     ///
     /// Consensus BAMs (output from simplex/duplex callers) should not be used with this tool.
@@ -579,6 +556,8 @@ impl DuplexMetrics {
         let mut template_count = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
         let mut fraction_template_counts: Vec<usize> = vec![0; fractions.len()];
+        let mi_tag = string_to_tag(&self.mi_tag, "MI tag")?;
+        let umi_tag = string_to_tag(&self.umi_tag, "UMI tag")?;
 
         for template in template_iter {
             let template = template?;
@@ -620,7 +599,6 @@ impl DuplexMetrics {
                 .unwrap_or_default();
 
             // Get MI tag (molecular identifier)
-            let mi_tag = Self::tag_from_string(&self.mi_tag);
             let mi =
                 if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
                     record.data().get(&mi_tag)
@@ -631,7 +609,6 @@ impl DuplexMetrics {
                 };
 
             // Get UMI tag (raw UMI)
-            let umi_tag = Self::tag_from_string(&self.umi_tag);
             let rx =
                 if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
                     record.data().get(&umi_tag)
@@ -1242,8 +1219,6 @@ mod tests {
         ref_id: usize,
         pos1: i32,
         pos2: i32,
-        _mapq1: u8,
-        _mapq2: u8,
         rx_umi: &str,
         mi_tag: &str,
         strand1_plus: bool,
@@ -1287,14 +1262,12 @@ mod tests {
 
         // Two pairs at the same location with complementary UMIs
         // NOTE: MI tag should contain UMI with strand suffix for duplex-metrics
-        let (r1, r2) =
-            build_test_pair("q1", 0, 100, 200, 60, 60, "AAA-TTT", "AAA-TTT/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "AAA-TTT/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // /B reads: swap positions (200, 100) and use opposite strands to match fgbio's test setup
-        let (r1, r2) =
-            build_test_pair("q2", 0, 200, 100, 60, 60, "TTT-AAA", "AAA-TTT/B", false, true);
+        let (r1, r2) = build_test_pair("q2", 0, 200, 100, "TTT-AAA", "AAA-TTT/B", false, true);
         records.push(r1);
         records.push(r2);
 
@@ -1347,8 +1320,7 @@ mod tests {
         // A strand: AAA-TTT (2 exact + 1 with 1 error: CAA-TTT)
         for i in 1..=3 {
             let umi = if i == 3 { "CAA-TTT" } else { "AAA-TTT" };
-            let (r1, r2) =
-                build_test_pair(&format!("a{i}"), 0, 100, 200, 60, 60, umi, "1/A", true, false);
+            let (r1, r2) = build_test_pair(&format!("a{i}"), 0, 100, 200, umi, "1/A", true, false);
             records.push(r1);
             records.push(r2);
         }
@@ -1357,8 +1329,7 @@ mod tests {
         // Swap positions (200, 100) to match fgbio's test setup for /B reads
         for i in 1..=3 {
             let umi = if i == 3 { "CTT-AAA" } else { "TTT-AAA" };
-            let (r1, r2) =
-                build_test_pair(&format!("b{i}"), 0, 200, 100, 60, 60, umi, "1/B", false, true);
+            let (r1, r2) = build_test_pair(&format!("b{i}"), 0, 200, 100, umi, "1/B", false, true);
             records.push(r1);
             records.push(r2);
         }
@@ -1418,36 +1389,26 @@ mod tests {
         let mut records = Vec::new();
 
         // Family 1: AAA-TTT + TTT-AAA at position 100-200
-        let (r1, r2) = build_test_pair("q1", 0, 100, 200, 60, 60, "AAA-TTT", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // /B reads: swap positions (200, 100) to match fgbio's test setup
-        let (r1, r2) = build_test_pair("q2", 0, 200, 100, 60, 60, "TTT-AAA", "1/B", false, true);
+        let (r1, r2) = build_test_pair("q2", 0, 200, 100, "TTT-AAA", "1/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // Family 2: TTT-AAA + error variant (NTT-AAA) at position 150-250
         for i in 1..=3 {
             let umi = if i == 3 { "NTT-AAA" } else { "TTT-AAA" };
-            let (r1, r2) = build_test_pair(
-                &format!("q{}", i + 2),
-                0,
-                150,
-                250,
-                60,
-                60,
-                umi,
-                "2/A",
-                true,
-                false,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("q{}", i + 2), 0, 150, 250, umi, "2/A", true, false);
             records.push(r1);
             records.push(r2);
         }
 
         // Family 3: CCC-GGG at position 250-350
-        let (r1, r2) = build_test_pair("q6", 0, 250, 350, 60, 60, "CCC-GGG", "3/B", false, true);
+        let (r1, r2) = build_test_pair("q6", 0, 250, 350, "CCC-GGG", "3/B", false, true);
         records.push(r1);
         records.push(r2);
 
@@ -1506,74 +1467,54 @@ mod tests {
         // Three SS families at the same location (100-200)
         // Family 1/A: 2 reads
         for i in 1..=2 {
-            let (r1, r2) = build_test_pair(
-                &format!("a{i}"),
-                0,
-                100,
-                200,
-                60,
-                60,
-                "AAA-TTT",
-                "1/A",
-                true,
-                false,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("a{i}"), 0, 100, 200, "AAA-TTT", "1/A", true, false);
             records.push(r1);
             records.push(r2);
         }
         // Family 2/A: 1 read
-        let (r1, r2) = build_test_pair("b1", 0, 100, 200, 60, 60, "ACG-GGA", "2/A", true, false);
+        let (r1, r2) = build_test_pair("b1", 0, 100, 200, "ACG-GGA", "2/A", true, false);
         records.push(r1);
         records.push(r2);
         // Family 3/B: 1 read - swap positions for /B
-        let (r1, r2) = build_test_pair("c1", 0, 200, 100, 60, 60, "TAT-CGT", "3/B", false, true);
+        let (r1, r2) = build_test_pair("c1", 0, 200, 100, "TAT-CGT", "3/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // Two duplex families at the same location (200-300)
         // Duplex family 4: 1/A + 1/B
-        let (r1, r2) = build_test_pair("d1", 0, 200, 300, 60, 60, "TTT-AAA", "4/A", true, false);
+        let (r1, r2) = build_test_pair("d1", 0, 200, 300, "TTT-AAA", "4/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("d2", 0, 300, 200, 60, 60, "AAA-AAA", "4/B", false, true);
+        let (r1, r2) = build_test_pair("d2", 0, 300, 200, "AAA-AAA", "4/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // Duplex family 5: 1/A + 1/B
-        let (r1, r2) = build_test_pair("e1", 0, 200, 300, 60, 60, "CCC-GGG", "5/A", true, false);
+        let (r1, r2) = build_test_pair("e1", 0, 200, 300, "CCC-GGG", "5/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("e2", 0, 300, 200, 60, 60, "GGG-CCC", "5/B", false, true);
+        let (r1, r2) = build_test_pair("e2", 0, 300, 200, "GGG-CCC", "5/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // One duplex and one SS family at the same location (400-500)
         // SS family 6/A: 1 read
-        let (r1, r2) = build_test_pair("f1", 0, 400, 500, 60, 60, "GCG-GAA", "6/A", true, false);
+        let (r1, r2) = build_test_pair("f1", 0, 400, 500, "GCG-GAA", "6/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // Duplex family 7: 2/A + 1/B
         for i in 1..=2 {
-            let (r1, r2) = build_test_pair(
-                &format!("g{i}"),
-                0,
-                400,
-                500,
-                60,
-                60,
-                "ACG-CCT",
-                "7/A",
-                true,
-                false,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("g{i}"), 0, 400, 500, "ACG-CCT", "7/A", true, false);
             records.push(r1);
             records.push(r2);
         }
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("g3", 0, 500, 400, 60, 60, "CCT-ACG", "7/B", false, true);
+        let (r1, r2) = build_test_pair("g3", 0, 500, 400, "CCT-ACG", "7/B", false, true);
         records.push(r1);
         records.push(r2);
 
@@ -1627,54 +1568,34 @@ mod tests {
         let mut records = Vec::new();
 
         // 1/0
-        let (r1, r2) = build_test_pair("q1", 0, 100, 200, 60, 60, "AAA-ACG", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-ACG", "1/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // 1/1
-        let (r1, r2) = build_test_pair("q2", 0, 200, 300, 60, 60, "AAA-ACG", "2/A", true, false);
+        let (r1, r2) = build_test_pair("q2", 0, 200, 300, "AAA-ACG", "2/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("q3", 0, 300, 200, 60, 60, "ACG-AAA", "2/B", false, true);
+        let (r1, r2) = build_test_pair("q3", 0, 300, 200, "ACG-AAA", "2/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // 2/1 - swap positions for /B
         for i in 1..=2 {
-            let (r1, r2) = build_test_pair(
-                &format!("q{}", i + 3),
-                0,
-                400,
-                300,
-                60,
-                60,
-                "AAC-GGG",
-                "3/B",
-                false,
-                true,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("q{}", i + 3), 0, 400, 300, "AAC-GGG", "3/B", false, true);
             records.push(r1);
             records.push(r2);
         }
-        let (r1, r2) = build_test_pair("q6", 0, 300, 400, 60, 60, "GGG-AAC", "3/A", true, false);
+        let (r1, r2) = build_test_pair("q6", 0, 300, 400, "GGG-AAC", "3/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // 4/3
         for i in 1..=4 {
-            let (r1, r2) = build_test_pair(
-                &format!("q{}", i + 6),
-                0,
-                400,
-                500,
-                60,
-                60,
-                "GGG-AAC",
-                "4/A",
-                true,
-                false,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("q{}", i + 6), 0, 400, 500, "GGG-AAC", "4/A", true, false);
             records.push(r1);
             records.push(r2);
         }
@@ -1685,8 +1606,6 @@ mod tests {
                 0,
                 500,
                 400,
-                60,
-                60,
                 "AAC-GGG",
                 "4/B",
                 false,
@@ -1703,8 +1622,6 @@ mod tests {
                 0,
                 600,
                 700,
-                60,
-                60,
                 "AGT-GCT",
                 "6/A",
                 true,
@@ -1720,8 +1637,6 @@ mod tests {
                 0,
                 700,
                 600,
-                60,
-                60,
                 "GCT-AGT",
                 "6/B",
                 false,
@@ -1788,67 +1703,37 @@ mod tests {
         let mut records = Vec::new();
 
         // Duplex 1: 1/A + 1/B
-        let (r1, r2) = build_test_pair("q1", 0, 300, 400, 60, 60, "AAA-GGG", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 300, 400, "AAA-GGG", "1/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("q2", 0, 400, 300, 60, 60, "GGG-AAA", "1/B", false, true);
+        let (r1, r2) = build_test_pair("q2", 0, 400, 300, "GGG-AAA", "1/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // Duplex 2: 1/A + 2/B
-        let (r1, r2) = build_test_pair("q3", 0, 300, 400, 60, 60, "ACT-TTA", "2/A", true, false);
+        let (r1, r2) = build_test_pair("q3", 0, 300, 400, "ACT-TTA", "2/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
         for i in 1..=2 {
-            let (r1, r2) = build_test_pair(
-                &format!("q{}", i + 3),
-                0,
-                400,
-                300,
-                60,
-                60,
-                "TTA-ACT",
-                "2/B",
-                false,
-                true,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("q{}", i + 3), 0, 400, 300, "TTA-ACT", "2/B", false, true);
             records.push(r1);
             records.push(r2);
         }
 
         // Duplex 3: 2/A + 2/B
         for i in 1..=2 {
-            let (r1, r2) = build_test_pair(
-                &format!("q{}", i + 5),
-                0,
-                300,
-                400,
-                60,
-                60,
-                "CGA-GGT",
-                "3/A",
-                true,
-                false,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("q{}", i + 5), 0, 300, 400, "CGA-GGT", "3/A", true, false);
             records.push(r1);
             records.push(r2);
         }
         // Swap positions for /B
         for i in 1..=2 {
-            let (r1, r2) = build_test_pair(
-                &format!("q{}", i + 7),
-                0,
-                400,
-                300,
-                60,
-                60,
-                "GGT-CGA",
-                "3/B",
-                false,
-                true,
-            );
+            let (r1, r2) =
+                build_test_pair(&format!("q{}", i + 7), 0, 400, 300, "GGT-CGA", "3/B", false, true);
             records.push(r1);
             records.push(r2);
         }
@@ -1950,7 +1835,7 @@ mod tests {
         let mut records = Vec::new();
 
         // Family 1 at chr1:1000-1100
-        let (r1, r2) = build_test_pair("q1", 0, 1000, 1100, 60, 60, "AAA-GGG", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 1000, 1100, "AAA-GGG", "1/A", true, false);
         records.push(r1);
         records.push(r2);
 
@@ -1961,8 +1846,6 @@ mod tests {
                 0,
                 2000,
                 2100,
-                60,
-                60,
                 "GGG-AAA",
                 "2/A",
                 true,
@@ -1979,8 +1862,6 @@ mod tests {
                 0,
                 3000,
                 3100,
-                60,
-                60,
                 "ACT-TTA",
                 "3/A",
                 true,
@@ -1997,8 +1878,6 @@ mod tests {
                 1,
                 4000,
                 4100,
-                60,
-                60,
                 "TTA-ACT",
                 "4/A",
                 true,
@@ -2015,8 +1894,6 @@ mod tests {
                 1,
                 5000,
                 5100,
-                60,
-                60,
                 "CGA-GGT",
                 "5/A",
                 true,
@@ -2033,8 +1910,6 @@ mod tests {
                 1,
                 6000,
                 6100,
-                60,
-                60,
                 "GGT-CGA",
                 "6/A",
                 true,
@@ -2102,8 +1977,6 @@ mod tests {
                 0,
                 i * 100,
                 i * 100 + 100,
-                60,
-                60,
                 "AAA-TTT",
                 &format!("{i}/A"),
                 true,
@@ -2514,7 +2387,7 @@ mod tests {
         let mut records = Vec::new();
 
         // Family 1 at chr1:1000-1100
-        let (r1, r2) = build_test_pair("q1", 0, 1000, 1100, 60, 60, "AAA-GGG", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 1000, 1100, "AAA-GGG", "1/A", true, false);
         records.push(r1);
         records.push(r2);
 
@@ -2525,8 +2398,6 @@ mod tests {
                 0,
                 2000,
                 2100,
-                60,
-                60,
                 "GGG-AAA",
                 "2/A",
                 true,
@@ -2543,8 +2414,6 @@ mod tests {
                 0,
                 3000,
                 3100,
-                60,
-                60,
                 "ACT-TTA",
                 "3/A",
                 true,
@@ -2561,8 +2430,6 @@ mod tests {
                 1,
                 4000,
                 4100,
-                60,
-                60,
                 "TTA-ACT",
                 "4/A",
                 true,
@@ -2579,8 +2446,6 @@ mod tests {
                 1,
                 5000,
                 5100,
-                60,
-                60,
                 "CGA-GGT",
                 "5/A",
                 true,
@@ -2597,8 +2462,6 @@ mod tests {
                 1,
                 6000,
                 6100,
-                60,
-                60,
                 "GGT-CGA",
                 "6/A",
                 true,
@@ -2672,35 +2535,35 @@ mod tests {
         let mut records = Vec::new();
 
         // Family 1: Valid duplex UMI "AAA-TTT"
-        let (r1, r2) = build_test_pair("q1", 0, 100, 200, 60, 60, "AAA-TTT", "1/A", true, false);
+        let (r1, r2) = build_test_pair("q1", 0, 100, 200, "AAA-TTT", "1/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("q2", 0, 200, 100, 60, 60, "TTT-AAA", "1/B", false, true);
+        let (r1, r2) = build_test_pair("q2", 0, 200, 100, "TTT-AAA", "1/B", false, true);
         records.push(r1);
         records.push(r2);
 
         // Family 2: Empty first component "-CCC" (should be skipped gracefully)
-        let (r1, r2) = build_test_pair("q3", 0, 200, 300, 60, 60, "-CCC", "2/A", true, false);
+        let (r1, r2) = build_test_pair("q3", 0, 200, 300, "-CCC", "2/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // Family 3: Empty second component "AAA-" (should be skipped gracefully)
-        let (r1, r2) = build_test_pair("q4", 0, 300, 400, 60, 60, "AAA-", "3/A", true, false);
+        let (r1, r2) = build_test_pair("q4", 0, 300, 400, "AAA-", "3/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // Family 4: Single component "GGG" without dash (should be skipped)
-        let (r1, r2) = build_test_pair("q5", 0, 400, 500, 60, 60, "GGG", "4/A", true, false);
+        let (r1, r2) = build_test_pair("q5", 0, 400, 500, "GGG", "4/A", true, false);
         records.push(r1);
         records.push(r2);
 
         // Family 5: Another valid duplex "CCC-GGG"
-        let (r1, r2) = build_test_pair("q6", 0, 500, 600, 60, 60, "CCC-GGG", "5/A", true, false);
+        let (r1, r2) = build_test_pair("q6", 0, 500, 600, "CCC-GGG", "5/A", true, false);
         records.push(r1);
         records.push(r2);
         // Swap positions for /B
-        let (r1, r2) = build_test_pair("q7", 0, 600, 500, 60, 60, "GGG-CCC", "5/B", false, true);
+        let (r1, r2) = build_test_pair("q7", 0, 600, 500, "GGG-CCC", "5/B", false, true);
         records.push(r1);
         records.push(r2);
 

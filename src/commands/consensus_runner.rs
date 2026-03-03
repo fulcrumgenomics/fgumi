@@ -5,23 +5,17 @@
 
 use anyhow::Result;
 use bstr::BString;
-use fgumi_lib::bam_io::create_bam_reader;
 use fgumi_lib::consensus::codec_caller::CodecConsensusStats;
-use fgumi_lib::consensus_caller::{ConsensusCallingStats, make_prefix_from_header};
-use fgumi_lib::logging::OperationTimer;
+use fgumi_lib::consensus_caller::ConsensusCallingStats;
 use fgumi_lib::metrics::consensus::ConsensusMetrics;
 use fgumi_lib::overlapping_consensus::CorrectionStats;
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles::sam::header::record::value::map::tag::Other;
-use std::path::PathBuf;
-
-use crate::commands::common::ThreadingOptions;
 
 /// Trait for converting command-specific statistics to metrics.
 pub trait ConsensusStatsOps: Clone + Default + Send {
@@ -173,121 +167,6 @@ pub fn log_overlapping_stats(stats: &CorrectionStats) {
     info!("  Bases agreeing: {}", stats.bases_agreeing);
     info!("  Bases disagreeing: {}", stats.bases_disagreeing);
     info!("  Bases corrected: {}", stats.bases_corrected);
-}
-
-/// Type alias for consensus result tuple: (UMI, consensus reads result, stats, rejects, overlapping stats)
-pub type ConsensusResultTuple<S> =
-    (String, Result<Vec<RecordBuf>>, S, Vec<RecordBuf>, Option<CorrectionStats>);
-
-/// Configuration for consensus command execution.
-#[derive(Clone)]
-pub struct ConsensusConfig {
-    pub input: PathBuf,
-    pub output: PathBuf,
-    pub rejects: Option<PathBuf>,
-    pub stats_path: Option<PathBuf>,
-    pub threading: ThreadingOptions,
-    pub overlapping_enabled: bool,
-    pub tag: String,
-    pub operation_name: String,
-}
-
-impl ConsensusConfig {
-    /// Returns the number of threads from threading options.
-    pub fn num_threads(&self) -> usize {
-        self.threading.num_threads()
-    }
-
-    /// Returns whether parallel processing is enabled.
-    pub fn is_parallel(&self) -> bool {
-        self.threading.is_parallel()
-    }
-
-    /// Returns whether rejects tracking is enabled.
-    pub fn track_rejects(&self) -> bool {
-        self.rejects.is_some()
-    }
-}
-
-/// Helper for executing consensus commands with common setup/teardown.
-pub struct ConsensusExecutionContext {
-    pub config: ConsensusConfig,
-    pub timer: OperationTimer,
-    pub header: Header,
-    pub output_header: Header,
-    pub read_name_prefix: String,
-}
-
-impl ConsensusExecutionContext {
-    /// Creates a new execution context.
-    ///
-    /// Opens the input BAM to read the header, creates the output header,
-    /// and sets up the read name prefix.
-    pub fn new(
-        config: ConsensusConfig,
-        output_header: Header,
-        read_name_prefix_override: Option<String>,
-    ) -> Result<Self> {
-        let timer = OperationTimer::new(&config.operation_name);
-
-        // Open input to get header
-        let (_reader, header) = create_bam_reader(&config.input, 1)?;
-
-        // Determine read name prefix
-        let read_name_prefix =
-            read_name_prefix_override.unwrap_or_else(|| make_prefix_from_header(&header));
-
-        Ok(Self { config, timer, header, output_header, read_name_prefix })
-    }
-
-    /// Creates a new execution context with an unmapped consensus header.
-    pub fn new_with_unmapped_header(
-        config: ConsensusConfig,
-        read_group_id: &str,
-        comment_prefix: &str,
-        command_line: &str,
-        read_name_prefix_override: Option<String>,
-    ) -> Result<Self> {
-        let timer = OperationTimer::new(&config.operation_name);
-
-        // Open input to get header
-        let (_reader, header) = create_bam_reader(&config.input, 1)?;
-
-        // Create output header for unmapped consensus reads
-        let output_header =
-            create_unmapped_consensus_header(&header, read_group_id, comment_prefix, command_line)?;
-
-        // Determine read name prefix
-        let read_name_prefix =
-            read_name_prefix_override.unwrap_or_else(|| make_prefix_from_header(&header));
-
-        Ok(Self { config, timer, header, output_header, read_name_prefix })
-    }
-
-    /// Creates a new execution context with a passthrough header.
-    pub fn new_with_passthrough_header(
-        config: ConsensusConfig,
-        read_name_prefix_override: Option<String>,
-    ) -> Result<Self> {
-        let timer = OperationTimer::new(&config.operation_name);
-
-        // Open input to get header
-        let (_reader, header) = create_bam_reader(&config.input, 1)?;
-
-        // Use input header as output header (passthrough)
-        let output_header = header.clone();
-
-        // Determine read name prefix
-        let read_name_prefix =
-            read_name_prefix_override.unwrap_or_else(|| make_prefix_from_header(&header));
-
-        Ok(Self { config, timer, header, output_header, read_name_prefix })
-    }
-
-    /// Logs completion with consensus count.
-    pub fn log_completion(&self, consensus_count: u64) {
-        self.timer.log_completion(consensus_count);
-    }
 }
 
 #[cfg(test)]
