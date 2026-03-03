@@ -59,14 +59,41 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&base| complement_base(base)).collect()
 }
 
-/// Reverse complements a DNA string.
+/// Complements a single DNA base, preserving case.
 ///
-/// Returns the reverse complement of the input string, preserving case.
+/// Returns the Watson-Crick complement: A<->T, C<->G.
+/// Unlike [`complement_base`], this preserves the case of the input:
+/// uppercase input produces uppercase output, lowercase produces lowercase.
 ///
-/// # Panics
+/// # Examples
 ///
-/// Cannot panic in practice: the byte-level complement maps ASCII to ASCII,
-/// so `String::from_utf8` always succeeds.
+/// ```
+/// use fgumi_dna::dna::complement_base_preserve_case;
+///
+/// assert_eq!(complement_base_preserve_case(b'A'), b'T');
+/// assert_eq!(complement_base_preserve_case(b'a'), b't');
+/// ```
+#[inline]
+#[must_use]
+pub const fn complement_base_preserve_case(base: u8) -> u8 {
+    match base {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'C' => b'G',
+        b'G' => b'C',
+        b'a' => b't',
+        b't' => b'a',
+        b'c' => b'g',
+        b'g' => b'c',
+        other => other,
+    }
+}
+
+/// Reverse complements a DNA string, preserving case.
+///
+/// Returns the reverse complement of the input string.
+/// Unlike [`reverse_complement`], this preserves the case of each base.
+/// Non-ASCII characters are passed through unchanged.
 ///
 /// # Examples
 ///
@@ -79,26 +106,22 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 /// ```
 #[must_use]
 pub fn reverse_complement_str(seq: &str) -> String {
-    let bytes: Vec<u8> = seq
-        .bytes()
+    seq.chars()
         .rev()
-        .map(|b| match b {
-            b'A' => b'T',
-            b'T' => b'A',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'a' => b't',
-            b't' => b'a',
-            b'c' => b'g',
-            b'g' => b'c',
-            other => other,
+        .map(|c| {
+            if c.is_ascii() {
+                complement_base_preserve_case(c as u8) as char
+            } else {
+                c
+            }
         })
-        .collect();
-    String::from_utf8(bytes).expect("complement of ASCII is ASCII")
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -154,6 +177,26 @@ mod tests {
         assert_eq!(reverse_complement(&reverse_complement(seq)), seq.to_vec());
     }
 
+    #[rstest]
+    #[case(b'A', b'T')]
+    #[case(b'T', b'A')]
+    #[case(b'C', b'G')]
+    #[case(b'G', b'C')]
+    #[case(b'a', b't')]
+    #[case(b't', b'a')]
+    #[case(b'c', b'g')]
+    #[case(b'g', b'c')]
+    #[case(b'N', b'N')]
+    #[case(b'n', b'n')]
+    #[case(b'.', b'.')]
+    #[case(b'-', b'-')]
+    #[case(b'*', b'*')]
+    #[case(b'0', b'0')]
+    #[case(b'X', b'X')]
+    fn test_complement_base_preserve_case(#[case] input: u8, #[case] expected: u8) {
+        assert_eq!(complement_base_preserve_case(input), expected);
+    }
+
     #[test]
     fn test_reverse_complement_str() {
         // Basic cases
@@ -172,5 +215,13 @@ mod tests {
         for seq in ["ACGT", "acgt", "AcGt"] {
             assert_eq!(reverse_complement_str(&reverse_complement_str(seq)), seq);
         }
+    }
+
+    #[test]
+    fn test_reverse_complement_str_non_ascii() {
+        // Non-ASCII characters (e.g. multi-byte UTF-8) should pass through unchanged
+        let input = "A\u{00e9}T"; // 'é' is a 2-byte UTF-8 character
+        let result = reverse_complement_str(input);
+        assert_eq!(result, "A\u{00e9}T");
     }
 }

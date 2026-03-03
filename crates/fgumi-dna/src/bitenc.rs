@@ -139,8 +139,7 @@ impl BitEnc {
         let start_bit = start_base * 2;
         let mask = (1u64 << (num_bases * 2)) - 1;
         #[expect(clippy::cast_possible_truncation, reason = "masked to at most 32 bits")]
-        let result = ((self.bits >> start_bit) & mask) as u32;
-        result
+        { ((self.bits >> start_bit) & mask) as u32 }
     }
 }
 
