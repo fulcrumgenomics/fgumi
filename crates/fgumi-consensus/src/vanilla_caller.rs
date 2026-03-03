@@ -365,7 +365,6 @@ pub struct VanillaUmiConsensusCaller {
 
 #[expect(
     clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     reason = "consensus calling uses numeric casts for quality/position math"
 )]
@@ -1169,16 +1168,9 @@ impl VanillaUmiConsensusCaller {
             // Record depth
             depths.push(depth);
 
-            // Count errors (bases that disagree with consensus)
-            let error_count: usize = source_reads
-                .iter()
-                .filter(|sr| {
-                    pos < sr.bases.len() && sr.bases[pos] != NO_CALL_BASE && sr.bases[pos] != base
-                })
-                .count();
-            let error_u16 =
-                if error_count > u16::MAX as usize { u16::MAX } else { error_count as u16 };
-            errors.push(error_u16);
+            // Errors = total contributing bases minus those matching consensus
+            let error_count = depth - self.consensus_builder.observations_for_base(base);
+            errors.push(error_count);
 
             // Apply minimum depth and quality thresholds
             let (final_base, final_qual) = if (depth as usize) < min_reads {

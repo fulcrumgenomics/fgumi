@@ -30,6 +30,9 @@ pub const MAX_PHRED: u8 = 93;
 /// Precision constant used in Phred score conversion (matching fgbio)
 const PHRED_PRECISION: f64 = 0.001;
 
+/// Precomputed `phred_to_ln_error_prob(MAX_PHRED)` used as a threshold in `ln_prob_to_phred`.
+const MAX_PHRED_AS_LN_ERROR: f64 = -(MAX_PHRED as f64) * LN_10 / 10.0;
+
 /// Phred score type
 pub type PhredScore = u8;
 
@@ -117,8 +120,7 @@ pub fn ln_prob_to_phred(ln_prob: LogProbability) -> PhredScore {
     // Match fgbio's PhredScore.fromLogProbability:
     // if (lnProbError < MaxValueAsLogDouble) MaxValue
     // else Math.floor(-10.0 * (lnProbError/ Ln10) + Precision).toByte
-    let max_value_as_log = phred_to_ln_error_prob(MAX_PHRED);
-    if ln_prob < max_value_as_log {
+    if ln_prob < MAX_PHRED_AS_LN_ERROR {
         return MAX_PHRED;
     }
     let phred = (-10.0 * ln_prob / LN_10 + PHRED_PRECISION).floor();
