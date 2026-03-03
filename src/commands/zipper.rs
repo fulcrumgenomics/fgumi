@@ -964,24 +964,14 @@ mod tests {
         };
 
         zipper.execute("test")?;
+        read_bam_records(&output_path)
+    }
 
-        // Read output
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&output_path)?;
+    /// Read all records from a BAM file.
+    fn read_bam_records(path: &std::path::Path) -> Result<Vec<RecordBuf>> {
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
         let header = reader.read_header()?;
-
-        let mut records = Vec::new();
-        let mut record = RecordBuf::default();
-        loop {
-            match reader.read_record_buf(&header, &mut record) {
-                Ok(0) => break,
-                Ok(_) => {
-                    records.push(record.clone());
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(records)
+        Ok(reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?)
     }
 
     /// Tests basic tag merging from unmapped to mapped reads
@@ -1693,21 +1683,7 @@ mod tests {
 
         zipper.execute("test")?;
 
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&output_path)?;
-        let header = reader.read_header()?;
-
-        let mut records = Vec::new();
-        let mut record = RecordBuf::default();
-        loop {
-            match reader.read_record_buf(&header, &mut record) {
-                Ok(0) => break,
-                Ok(_) => {
-                    records.push(record.clone());
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
+        let records = read_bam_records(&output_path)?;
         assert_eq!(records.len(), 20);
 
         // Verify all records have both unmapped and mapped tags
@@ -1956,24 +1932,7 @@ mod tests {
         };
 
         zipper.execute("test")?;
-
-        // Read output
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&output_path)?;
-        let header = reader.read_header()?;
-
-        let mut records = Vec::new();
-        let mut record = RecordBuf::default();
-        loop {
-            match reader.read_record_buf(&header, &mut record) {
-                Ok(0) => break,
-                Ok(_) => {
-                    records.push(record.clone());
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(records)
+        read_bam_records(&output_path)
     }
 
     /// Tests that both inputs being empty produces empty output (not an error)

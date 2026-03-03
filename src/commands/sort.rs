@@ -206,6 +206,45 @@ fn parse_memory(s: &str) -> Result<usize, String> {
     Ok((num * multiplier as f64) as usize)
 }
 
+/// Summary of sort-order verification: `(total_records, violations, first_violation)`.
+type VerifySummary = (u64, u64, Option<(u64, String)>);
+
+/// Verify that records from a raw BAM reader are in sorted order.
+///
+/// Iterates all records, extracting a sort key from each and checking that
+/// consecutive keys satisfy the ordering invariant (no violations).
+fn verify_sort_order<K>(
+    raw_reader: fgumi_lib::sort::raw_bam_reader::RawBamRecordReader<std::fs::File>,
+    extract_key: impl Fn(&[u8]) -> K,
+    is_violation: impl Fn(&K, &K) -> bool,
+) -> Result<VerifySummary> {
+    let mut total_records: u64 = 0;
+    let mut violations: u64 = 0;
+    let mut first_violation: Option<(u64, String)> = None;
+    let mut prev_key: Option<K> = None;
+
+    for result in raw_reader {
+        let record_bytes = result?;
+        total_records += 1;
+        let bam = record_bytes.as_slice();
+
+        let key = extract_key(bam);
+
+        if let Some(ref prev) = prev_key {
+            if is_violation(&key, prev) {
+                violations += 1;
+                if first_violation.is_none() {
+                    let name = String::from_utf8_lossy(fgumi_raw_bam::read_name(bam)).to_string();
+                    first_violation = Some((total_records, name));
+                }
+            }
+        }
+        prev_key = Some(key);
+    }
+
+    Ok((total_records, violations, first_violation))
+}
+
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
@@ -304,8 +343,8 @@ impl Sort {
     fn execute_verify(&self) -> Result<()> {
         use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
         use fgumi_lib::sort::{
-            LibraryLookup, RawQuerynameKey, RawSortKey, SortContext, TemplateKey,
-            extract_coordinate_key_inline, extract_template_key_inline,
+            LibraryLookup, RawQuerynameKey, RawSortKey, SortContext, extract_coordinate_key_inline,
+            extract_template_key_inline,
         };
         use std::cmp::Ordering;
         use std::fs::File;
@@ -319,106 +358,38 @@ impl Sort {
         // Get header using noodles reader, then use raw reader for records
         let (_, header) = create_bam_reader(&self.input, 1)?;
 
-        let mut total_records: u64 = 0;
-        let mut violations: u64 = 0;
-        let mut first_violation: Option<(u64, String)> = None;
+        let file = File::open(&self.input)?;
+        let mut raw_reader = RawBamRecordReader::new(file)?;
+        raw_reader.skip_header()?;
 
-        // Helper to extract name from raw BAM bytes
-        let extract_name = |bam: &[u8]| -> String {
-            let l_read_name = bam.get(8).copied().unwrap_or(0) as usize;
-            let name_len = l_read_name.saturating_sub(1);
-            if name_len > 0 && 32 + name_len <= bam.len() {
-                String::from_utf8_lossy(&bam[32..32 + name_len]).to_string()
-            } else {
-                "<unnamed>".to_string()
-            }
-        };
-
-        match self.order {
+        let (total_records, violations, first_violation) = match self.order {
             SortOrderArg::Coordinate => {
-                // Use raw BAM reading with same key extraction as sort
-                let file = File::open(&self.input)?;
-                let mut raw_reader = RawBamRecordReader::new(file)?;
-                raw_reader.skip_header()?;
                 let nref = header.reference_sequences().len() as u32;
-
-                let mut prev_key: Option<u64> = None;
-
-                for result in raw_reader {
-                    let record_bytes = result?;
-                    total_records += 1;
-                    let bam = record_bytes.as_slice();
-
-                    let key = extract_coordinate_key_inline(bam, nref);
-
-                    if let Some(prev) = prev_key {
-                        if key < prev {
-                            violations += 1;
-                            if first_violation.is_none() {
-                                first_violation = Some((total_records, extract_name(bam)));
-                            }
-                        }
-                    }
-                    prev_key = Some(key);
-                }
+                verify_sort_order(
+                    raw_reader,
+                    |bam| extract_coordinate_key_inline(bam, nref),
+                    |key, prev| key < prev,
+                )?
             }
             SortOrderArg::Queryname => {
-                // Use raw BAM reading with same key extraction as sort
-                let file = File::open(&self.input)?;
-                let mut raw_reader = RawBamRecordReader::new(file)?;
-                raw_reader.skip_header()?;
                 let ctx = SortContext::from_header(&header);
-
-                let mut prev_key: Option<RawQuerynameKey> = None;
-
-                for result in raw_reader {
-                    let record_bytes = result?;
-                    total_records += 1;
-                    let bam = record_bytes.as_slice();
-
-                    let key = RawQuerynameKey::extract(bam, &ctx);
-
-                    if let Some(ref prev) = prev_key {
-                        if key < *prev {
-                            violations += 1;
-                            if first_violation.is_none() {
-                                first_violation = Some((total_records, extract_name(bam)));
-                            }
-                        }
-                    }
-                    prev_key = Some(key);
-                }
+                verify_sort_order(
+                    raw_reader,
+                    |bam| RawQuerynameKey::extract(bam, &ctx),
+                    |key, prev| key < prev,
+                )?
             }
             SortOrderArg::TemplateCoordinate => {
-                // Use raw BAM reading with same key extraction as sort
-                let file = File::open(&self.input)?;
-                let mut raw_reader = RawBamRecordReader::new(file)?;
-                raw_reader.skip_header()?;
                 let lib_lookup = LibraryLookup::from_header(&header);
-
-                let mut prev_key: Option<TemplateKey> = None;
-
-                for result in raw_reader {
-                    let record_bytes = result?;
-                    total_records += 1;
-                    let bam = record_bytes.as_slice();
-
-                    let key = extract_template_key_inline(bam, &lib_lookup);
-
-                    if let Some(ref prev) = prev_key {
-                        // Use core_cmp to ignore name_hash tie-breaker differences
-                        // This allows both fgumi and samtools sorted files to pass
-                        if key.core_cmp(prev) == Ordering::Less {
-                            violations += 1;
-                            if first_violation.is_none() {
-                                first_violation = Some((total_records, extract_name(bam)));
-                            }
-                        }
-                    }
-                    prev_key = Some(key);
-                }
+                verify_sort_order(
+                    raw_reader,
+                    |bam| extract_template_key_inline(bam, &lib_lookup),
+                    // Use core_cmp to ignore name_hash tie-breaker differences
+                    // This allows both fgumi and samtools sorted files to pass
+                    |key, prev| key.core_cmp(prev) == Ordering::Less,
+                )?
             }
-        }
+        };
 
         // Summary
         info!("=== Verification Summary ===");
@@ -494,5 +465,97 @@ mod tests {
             SortOrder::from(SortOrderArg::TemplateCoordinate),
             SortOrder::TemplateCoordinate
         );
+    }
+
+    #[test]
+    fn test_verify_sort_order_sorted() -> Result<()> {
+        use fgumi_lib::sam::builder::SamBuilder;
+        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+
+        let mut builder = SamBuilder::new();
+        // Add records with names in sorted order
+        let _ = builder.add_pair().name("aaa").build();
+        let _ = builder.add_pair().name("bbb").build();
+        let _ = builder.add_pair().name("ccc").build();
+
+        let dir = tempfile::tempdir()?;
+        let bam_path = dir.path().join("sorted.bam");
+        builder.write_bam(&bam_path)?;
+
+        let file = std::fs::File::open(&bam_path)?;
+        let mut reader = RawBamRecordReader::new(file)?;
+        reader.skip_header()?;
+
+        let (total, violations, first_violation) = verify_sort_order(
+            reader,
+            |bam| fgumi_raw_bam::read_name(bam).to_vec(),
+            |key, prev| key < prev,
+        )?;
+
+        assert_eq!(total, 6); // 3 pairs = 6 records
+        assert_eq!(violations, 0);
+        assert!(first_violation.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_sort_order_unsorted() -> Result<()> {
+        use fgumi_lib::sam::builder::SamBuilder;
+        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+
+        let mut builder = SamBuilder::new();
+        // Add records with names out of order (pairs are interleaved)
+        let _ = builder.add_pair().name("ccc").build();
+        let _ = builder.add_pair().name("aaa").build();
+        let _ = builder.add_pair().name("bbb").build();
+
+        let dir = tempfile::tempdir()?;
+        let bam_path = dir.path().join("unsorted.bam");
+        builder.write_bam(&bam_path)?;
+
+        let file = std::fs::File::open(&bam_path)?;
+        let mut reader = RawBamRecordReader::new(file)?;
+        reader.skip_header()?;
+
+        let (total, violations, first_violation) = verify_sort_order(
+            reader,
+            |bam| fgumi_raw_bam::read_name(bam).to_vec(),
+            |key, prev| key < prev,
+        )?;
+
+        assert_eq!(total, 6);
+        assert!(violations > 0);
+        assert!(first_violation.is_some());
+        let (record_num, name) = first_violation.unwrap();
+        assert!(record_num > 1); // violation can't be on first record
+        assert!(!name.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_sort_order_empty() -> Result<()> {
+        use fgumi_lib::sam::builder::SamBuilder;
+        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+
+        let builder = SamBuilder::new();
+
+        let dir = tempfile::tempdir()?;
+        let bam_path = dir.path().join("empty.bam");
+        builder.write_bam(&bam_path)?;
+
+        let file = std::fs::File::open(&bam_path)?;
+        let mut reader = RawBamRecordReader::new(file)?;
+        reader.skip_header()?;
+
+        let (total, violations, first_violation) = verify_sort_order(
+            reader,
+            |bam| fgumi_raw_bam::read_name(bam).to_vec(),
+            |key, prev| key < prev,
+        )?;
+
+        assert_eq!(total, 0);
+        assert_eq!(violations, 0);
+        assert!(first_violation.is_none());
+        Ok(())
     }
 }
