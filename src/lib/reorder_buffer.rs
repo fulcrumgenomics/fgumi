@@ -43,12 +43,10 @@ use crate::unified_pipeline::MemoryEstimate;
 /// memory-bounded backpressure without expensive per-item size calculations.
 #[derive(Debug)]
 pub struct ReorderBuffer<T> {
-    /// Sparse buffer: index (seq - `base_seq`) maps to `Option<(T, usize)>` where
+    /// Sparse buffer: index (seq - `next_seq`) maps to `Option<(T, usize)>` where
     /// usize is the pre-computed heap size (0 if not tracked).
     buffer: VecDeque<Option<(T, usize)>>,
-    /// The sequence number corresponding to buffer[0].
-    base_seq: u64,
-    /// Next sequence number to release.
+    /// Next sequence number to release (also the sequence number corresponding to buffer[0]).
     next_seq: u64,
     /// Number of items currently stored.
     count: usize,
@@ -63,14 +61,7 @@ impl<T> ReorderBuffer<T> {
     /// Create a new reorder buffer.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            buffer: VecDeque::new(),
-            base_seq: 0,
-            next_seq: 0,
-            count: 0,
-            heap_bytes: 0,
-            can_pop: false,
-        }
+        Self { buffer: VecDeque::new(), next_seq: 0, count: 0, heap_bytes: 0, can_pop: false }
     }
 
     /// Insert an item with a sequence number (without memory tracking).
@@ -109,12 +100,12 @@ impl<T> ReorderBuffer<T> {
     #[allow(clippy::cast_possible_truncation)]
     pub fn insert_with_size(&mut self, seq: u64, item: T, heap_size: usize) {
         debug_assert!(
-            seq >= self.base_seq,
+            seq >= self.next_seq,
             "Sequence number {seq} is before base {}",
-            self.base_seq
+            self.next_seq
         );
 
-        let index = (seq - self.base_seq) as usize;
+        let index = (seq - self.next_seq) as usize;
 
         // Extend buffer with None entries if needed
         while self.buffer.len() <= index {
@@ -161,7 +152,6 @@ impl<T> ReorderBuffer<T> {
 
         // Pop the front item
         let (item, size) = self.buffer.pop_front().unwrap().unwrap();
-        self.base_seq += 1;
         self.next_seq += 1;
         self.count -= 1;
         self.heap_bytes = self.heap_bytes.saturating_sub(size as u64);
@@ -295,11 +285,10 @@ impl<T> ReorderBuffer<T> {
             .sum()
     }
 
-    /// Set the starting sequence numbers (for testing or reset scenarios).
+    /// Set the next expected sequence number (for testing or reset scenarios).
     #[cfg(test)]
-    pub fn set_base_seq(&mut self, base: u64) {
-        self.base_seq = base;
-        self.next_seq = base;
+    pub fn set_next_seq(&mut self, seq: u64) {
+        self.next_seq = seq;
     }
 }
 
@@ -426,7 +415,7 @@ mod tests {
 
         // Start from a large sequence number
         let start = 1_000_000u64;
-        buffer.set_base_seq(start);
+        buffer.set_next_seq(start);
 
         buffer.insert(start, 100);
         buffer.insert(start + 1, 200);

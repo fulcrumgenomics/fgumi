@@ -90,25 +90,30 @@ fn read_sequence_raw(file: &mut File, record: &fai::Record) -> Result<Vec<u8>> {
     Ok(sequence)
 }
 
+/// Find a sibling file for a FASTA file by trying two naming conventions:
+/// 1. Replace extension (e.g., `ref.fasta` → `ref.<replace_ext>`)
+/// 2. Append extension to full path (e.g., `ref.fa` → `ref.fa.<append_ext>`)
+fn find_sibling_file(fasta_path: &Path, replace_ext: &str, append_ext: &str) -> Option<PathBuf> {
+    let replaced = fasta_path.with_extension(replace_ext);
+    if replaced.exists() {
+        return Some(replaced);
+    }
+
+    let appended = PathBuf::from(format!("{}.{append_ext}", fasta_path.display()));
+    if appended.exists() {
+        return Some(appended);
+    }
+
+    None
+}
+
 /// Find FAI index path for a FASTA file.
 ///
 /// Tries multiple naming conventions:
 /// 1. Replace extension with `.fa.fai` (e.g., `ref.fasta` → `ref.fa.fai`)
 /// 2. Append `.fai` to full path (e.g., `ref.fa` → `ref.fa.fai`, `ref.fasta` → `ref.fasta.fai`)
 fn find_fai_path(fasta_path: &Path) -> Option<PathBuf> {
-    // Try replacing extension with .fa.fai
-    let fai_path = fasta_path.with_extension("fa.fai");
-    if fai_path.exists() {
-        return Some(fai_path);
-    }
-
-    // Try appending .fai to full path (handles ref.fa -> ref.fa.fai and ref.fasta -> ref.fasta.fai)
-    let fai_path = PathBuf::from(format!("{}.fai", fasta_path.display()));
-    if fai_path.exists() {
-        return Some(fai_path);
-    }
-
-    None
+    find_sibling_file(fasta_path, "fa.fai", "fai")
 }
 
 /// Find sequence dictionary path for a FASTA file.
@@ -135,21 +140,7 @@ fn find_fai_path(fasta_path: &Path) -> Option<PathBuf> {
 /// ```
 #[must_use]
 pub fn find_dict_path(fasta_path: &Path) -> Option<PathBuf> {
-    // Try replacing extension with .dict (fgbio/HTSJDK/Picard convention)
-    // e.g., ref.fa -> ref.dict, ref.fasta -> ref.dict
-    let dict_path = fasta_path.with_extension("dict");
-    if dict_path.exists() {
-        return Some(dict_path);
-    }
-
-    // Try appending .dict to full path (GATK convention)
-    // e.g., ref.fa -> ref.fa.dict, ref.fasta -> ref.fasta.dict
-    let dict_path = PathBuf::from(format!("{}.dict", fasta_path.display()));
-    if dict_path.exists() {
-        return Some(dict_path);
-    }
-
-    None
+    find_sibling_file(fasta_path, "dict", "dict")
 }
 
 /// A thread-safe reference genome reader with all sequences preloaded into memory.
