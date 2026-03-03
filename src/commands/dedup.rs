@@ -1423,31 +1423,7 @@ fn write_dedup_metrics(metrics: &DedupMetrics, path: &PathBuf) -> Result<()> {
 }
 
 fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathBuf) -> Result<()> {
-    // Collect and sort by family size
-    let mut sorted: Vec<_> = family_sizes.iter().map(|(&s, &c)| (s, c)).collect();
-    sorted.sort_by_key(|(size, _)| *size);
-
-    // Calculate total count
-    #[allow(clippy::cast_precision_loss)]
-    let total: f64 = sorted.iter().map(|(_, count)| *count as f64).sum();
-
-    // Build metrics in reverse to calculate cumulative fraction in one pass
-    let mut metrics = Vec::with_capacity(sorted.len());
-    let mut cumulative = 0.0;
-    #[allow(clippy::cast_precision_loss)]
-    for &(family_size, count) in sorted.iter().rev() {
-        let fraction = count as f64 / total;
-        cumulative += fraction;
-        metrics.push(FamilySizeMetrics {
-            family_size,
-            count,
-            fraction,
-            fraction_gt_or_eq_family_size: cumulative,
-        });
-    }
-    metrics.reverse();
-
-    // Write to file
+    let metrics = FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
     DelimFile::default()
         .write_tsv(path, metrics)
         .with_context(|| format!("Failed to write family size histogram: {}", path.display()))?;
