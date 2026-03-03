@@ -655,7 +655,7 @@ impl Duplex {
                     // Call duplex consensus directly -- records are already raw bytes!
                     match caller.consensus_reads(group_reads) {
                         Ok(batch_output) => {
-                            all_output.extend(&batch_output);
+                            all_output.merge(batch_output);
                             batch_stats.merge(&caller.statistics());
                             if track_rejects {
                                 all_rejects.extend(caller.take_rejected_reads());
