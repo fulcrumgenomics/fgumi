@@ -12,7 +12,9 @@ pub mod dna;
 
 // Re-export submodule contents at crate root for convenience
 pub use bitenc::BitEnc;
-pub use dna::{complement_base, reverse_complement, reverse_complement_str};
+pub use dna::{
+    complement_base, complement_base_preserve_case, reverse_complement, reverse_complement_str,
+};
 
 /// No-call base character (matches fgbio's `NoCallBase`).
 pub const NO_CALL_BASE: u8 = b'N';
