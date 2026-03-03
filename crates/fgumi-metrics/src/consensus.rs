@@ -149,27 +149,10 @@ const OPTIONAL_REJECTIONS: [RejectionReason; 14] = [
     RejectionReason::DuplicateUmi,
 ];
 
-/// All rejection reasons, combining core and optional.
-const ALL_REJECTIONS: [RejectionReason; 18] = [
-    RejectionReason::InsufficientSupport,
-    RejectionReason::MinorityAlignment,
-    RejectionReason::InsufficientStrandSupport,
-    RejectionReason::LowBaseQuality,
-    RejectionReason::ExcessiveNBases,
-    RejectionReason::NoValidAlignment,
-    RejectionReason::LowMappingQuality,
-    RejectionReason::NBasesInUmi,
-    RejectionReason::MissingUmi,
-    RejectionReason::NotPassingFilter,
-    RejectionReason::LowMeanQuality,
-    RejectionReason::InsufficientMinDepth,
-    RejectionReason::ExcessiveErrorRate,
-    RejectionReason::UmiTooShort,
-    RejectionReason::SameStrandOnly,
-    RejectionReason::DuplicateUmi,
-    RejectionReason::OrphanConsensus,
-    RejectionReason::ZeroBasesPostTrimming,
-];
+/// Returns an iterator over all rejection reasons (core + optional).
+fn all_rejections() -> impl Iterator<Item = RejectionReason> {
+    CORE_REJECTIONS.into_iter().chain(OPTIONAL_REJECTIONS)
+}
 
 impl ConsensusMetrics {
     /// Creates a new consensus metrics struct with all counts initialized to zero.
@@ -267,7 +250,7 @@ impl ConsensusMetrics {
     /// Returns the total number of rejections across all reasons.
     #[must_use]
     pub fn total_rejections(&self) -> u64 {
-        ALL_REJECTIONS.iter().map(|r| self.rejection_count(*r)).sum()
+        all_rejections().map(|r| self.rejection_count(r)).sum()
     }
 
     /// Returns a map of rejection reasons to their counts.
@@ -275,9 +258,8 @@ impl ConsensusMetrics {
     /// Only includes rejection reasons with non-zero counts.
     #[must_use]
     pub fn rejection_summary(&self) -> HashMap<RejectionReason, u64> {
-        ALL_REJECTIONS
-            .iter()
-            .filter_map(|&reason| {
+        all_rejections()
+            .filter_map(|reason| {
                 let count = self.rejection_count(reason);
                 if count > 0 { Some((reason, count)) } else { None }
             })
