@@ -31,19 +31,6 @@ pub struct ChaseBottleneckScheduler {
 }
 
 impl ChaseBottleneckScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Create a new chase-bottleneck scheduler.
     #[must_use]
     pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
@@ -53,7 +40,7 @@ impl ChaseBottleneckScheduler {
             num_threads,
             current_step,
             direction: Direction::Forward,
-            priority_buffer: Self::STEPS, // Will be reordered in get_priorities
+            priority_buffer: PipelineStep::all(), // Will be reordered in get_priorities
             active_steps,
         }
     }
@@ -73,17 +60,12 @@ impl ChaseBottleneckScheduler {
         }
     }
 
-    /// Get the index of a step in the pipeline.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
-    }
-
     /// Build priority list starting from current step, expanding outward.
     /// If direction is Forward, prefer downstream steps (toward Write).
     /// If direction is Backward, prefer upstream steps (toward Read).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn build_priorities(&mut self) {
-        let current_idx = Self::step_index(self.current_step);
+        let current_idx = self.current_step.index();
         let mut priorities = [PipelineStep::Read; 9];
         let mut idx = 0;
 
@@ -106,14 +88,14 @@ impl ChaseBottleneckScheduler {
             let first_idx = (current_idx as i32 + first_dir * forward_offset as i32) as usize;
             if first_dir > 0 && forward_offset <= 8 - current_idx {
                 if first_idx < 9 {
-                    priorities[idx] = Self::STEPS[first_idx];
+                    priorities[idx] = PipelineStep::all()[first_idx];
                     idx += 1;
                     forward_offset += 1;
                 }
             } else if first_dir < 0 && backward_offset <= current_idx {
                 let back_idx = current_idx - backward_offset;
                 if back_idx < 9 {
-                    priorities[idx] = Self::STEPS[back_idx];
+                    priorities[idx] = PipelineStep::all()[back_idx];
                     idx += 1;
                     backward_offset += 1;
                 }
@@ -127,14 +109,14 @@ impl ChaseBottleneckScheduler {
             let second_idx = (current_idx as i32 + second_dir * backward_offset as i32) as usize;
             if second_dir > 0 && forward_offset <= 8 - current_idx {
                 if second_idx < 9 {
-                    priorities[idx] = Self::STEPS[second_idx];
+                    priorities[idx] = PipelineStep::all()[second_idx];
                     idx += 1;
                     forward_offset += 1;
                 }
             } else if second_dir < 0 && backward_offset <= current_idx {
                 let back_idx = current_idx - backward_offset;
                 if back_idx < 9 {
-                    priorities[idx] = Self::STEPS[back_idx];
+                    priorities[idx] = PipelineStep::all()[back_idx];
                     idx += 1;
                     backward_offset += 1;
                 }
@@ -147,14 +129,14 @@ impl ChaseBottleneckScheduler {
                 if remaining_forward > 0 {
                     let fwd_idx = current_idx + forward_offset;
                     if fwd_idx < 9 {
-                        priorities[idx] = Self::STEPS[fwd_idx];
+                        priorities[idx] = PipelineStep::all()[fwd_idx];
                         idx += 1;
                         forward_offset += 1;
                     }
                 }
                 if idx < 9 && remaining_backward > 0 && backward_offset <= current_idx {
                     let back_idx = current_idx - backward_offset;
-                    priorities[idx] = Self::STEPS[back_idx];
+                    priorities[idx] = PipelineStep::all()[back_idx];
                     idx += 1;
                     backward_offset += 1;
                 }
@@ -188,22 +170,22 @@ impl Scheduler for ChaseBottleneckScheduler {
             self.current_step = step;
         } else {
             // On failure, move in current direction to find work
-            let idx = Self::step_index(self.current_step);
+            let idx = self.current_step.index();
             match self.direction {
                 Direction::Forward => {
                     // Move downstream
                     if idx < 8 {
-                        self.current_step = Self::STEPS[idx + 1];
+                        self.current_step = PipelineStep::all()[idx + 1];
                     } else {
-                        self.current_step = Self::STEPS[0]; // Wrap
+                        self.current_step = PipelineStep::all()[0]; // Wrap
                     }
                 }
                 Direction::Backward => {
                     // Move upstream
                     if idx > 0 {
-                        self.current_step = Self::STEPS[idx - 1];
+                        self.current_step = PipelineStep::all()[idx - 1];
                     } else {
-                        self.current_step = Self::STEPS[8]; // Wrap
+                        self.current_step = PipelineStep::all()[8]; // Wrap
                     }
                 }
             }

@@ -354,6 +354,31 @@ pub trait Scheduler: Send {
     }
 }
 
+/// Determine thread role for balanced-chase schedulers.
+///
+/// Returns `(initial_step, exclusive_role)` where `initial_step` is the step the thread
+/// should start on, and `exclusive_role` is the exclusive step it owns (if any).
+fn balanced_chase_determine_role(
+    thread_id: usize,
+    num_threads: usize,
+) -> (PipelineStep, Option<PipelineStep>) {
+    use PipelineStep::{Compress, FindBoundaries, Group, Read, Serialize, Write};
+
+    if thread_id == 0 {
+        (Compress, Some(Read))
+    } else if thread_id == num_threads - 1 && num_threads > 1 {
+        (Compress, Some(Write))
+    } else if thread_id == 1 && num_threads > 2 {
+        (FindBoundaries, Some(FindBoundaries))
+    } else if thread_id == num_threads - 2 && num_threads > 3 {
+        (Group, Some(Group))
+    } else {
+        // Middle threads start spread across bottleneck steps
+        let step = if thread_id.is_multiple_of(2) { Compress } else { Serialize };
+        (step, None)
+    }
+}
+
 /// Create a scheduler based on strategy.
 #[must_use]
 pub fn create_scheduler(

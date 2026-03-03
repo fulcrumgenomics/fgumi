@@ -44,19 +44,6 @@ pub struct LearnedAffinityScheduler {
 }
 
 impl LearnedAffinityScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Initial exploration rate.
     const DEFAULT_EXPLORATION_RATE: f64 = 0.3;
     /// Decay factor per 1000 attempts.
@@ -81,14 +68,9 @@ impl LearnedAffinityScheduler {
             min_exploration_rate: Self::DEFAULT_MIN_EXPLORATION,
             total_attempts: 0,
             rng: SmallRng::seed_from_u64(seed),
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             active_steps,
         }
-    }
-
-    /// Get the index of a step.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
     }
 
     /// Get affinity score for a step.
@@ -122,7 +104,7 @@ impl Scheduler for LearnedAffinityScheduler {
 
         if self.rng.random::<f64>() < explore_rate {
             // Explore: random order
-            self.priority_buffer = Self::STEPS;
+            self.priority_buffer = PipelineStep::all();
             self.priority_buffer.shuffle(&mut self.rng);
         } else {
             // Exploit: sort by learned affinity
@@ -133,7 +115,7 @@ impl Scheduler for LearnedAffinityScheduler {
             affinities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             for (priority, (_, step_idx)) in affinities.iter().enumerate() {
-                self.priority_buffer[priority] = Self::STEPS[*step_idx];
+                self.priority_buffer[priority] = PipelineStep::all()[*step_idx];
             }
         }
 
@@ -142,7 +124,7 @@ impl Scheduler for LearnedAffinityScheduler {
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
-        let idx = Self::step_index(step);
+        let idx = step.index();
         self.total_attempts += 1;
         self.attempts[idx] += 1;
         if success {

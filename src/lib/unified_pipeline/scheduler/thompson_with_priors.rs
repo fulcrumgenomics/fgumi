@@ -35,19 +35,6 @@ pub struct ThompsonWithPriorsScheduler {
 }
 
 impl ThompsonWithPriorsScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Prior strength for specialized threads.
     const STRONG_PRIOR: f64 = 20.0;
     /// Prior strength for secondary preferences.
@@ -95,14 +82,9 @@ impl ThompsonWithPriorsScheduler {
             alphas,
             betas,
             rng: SmallRng::seed_from_u64(seed),
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             active_steps,
         }
-    }
-
-    /// Get the index of a step.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
     }
 
     /// Sample from Beta distribution.
@@ -128,7 +110,7 @@ impl Scheduler for ThompsonWithPriorsScheduler {
         samples.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         for (priority, (_, step_idx)) in samples.iter().enumerate() {
-            self.priority_buffer[priority] = Self::STEPS[*step_idx];
+            self.priority_buffer[priority] = PipelineStep::all()[*step_idx];
         }
 
         let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
@@ -136,7 +118,7 @@ impl Scheduler for ThompsonWithPriorsScheduler {
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
-        let idx = Self::step_index(step);
+        let idx = step.index();
         if success {
             self.alphas[idx] += 1.0;
         } else {

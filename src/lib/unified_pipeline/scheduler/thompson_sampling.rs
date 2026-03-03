@@ -36,19 +36,6 @@ pub struct ThompsonSamplingScheduler {
 }
 
 impl ThompsonSamplingScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Create a new Thompson Sampling scheduler.
     #[must_use]
     pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
@@ -63,14 +50,9 @@ impl ThompsonSamplingScheduler {
             alphas: [1.0; 9], // Uniform prior Beta(1, 1)
             betas: [1.0; 9],
             rng: SmallRng::seed_from_u64(seed),
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             active_steps,
         }
-    }
-
-    /// Get the index of a step.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
     }
 
     /// Sample from Beta distribution, clamping to avoid edge cases.
@@ -100,7 +82,7 @@ impl Scheduler for ThompsonSamplingScheduler {
 
         // Build priority buffer
         for (priority, (_, step_idx)) in samples.iter().enumerate() {
-            self.priority_buffer[priority] = Self::STEPS[*step_idx];
+            self.priority_buffer[priority] = PipelineStep::all()[*step_idx];
         }
 
         let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
@@ -108,7 +90,7 @@ impl Scheduler for ThompsonSamplingScheduler {
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
-        let idx = Self::step_index(step);
+        let idx = step.index();
         if success {
             self.alphas[idx] += 1.0;
         } else {
