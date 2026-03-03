@@ -2,6 +2,7 @@
 
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
+use crate::commands::simulate::common::generate_random_sequence;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
@@ -395,15 +396,6 @@ fn generate_correct_read_pair(
         r2_record,
         truth: (true_umi.clone(), observed_umi, expected_correction, edit_distance, error_type),
     }
-}
-
-fn generate_random_sequence(len: usize, rng: &mut impl Rng) -> Vec<u8> {
-    const BASES: &[u8] = b"ACGT";
-    let mut seq = Vec::with_capacity(len);
-    for _ in 0..len {
-        seq.push(BASES[rng.random_range(0..4)]);
-    }
-    seq
 }
 
 fn introduce_n_errors(umi: &str, n: usize, rng: &mut impl Rng) -> String {

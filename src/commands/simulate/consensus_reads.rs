@@ -2,11 +2,12 @@
 
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
-use crate::commands::simulate::common::StrandBiasArgs;
+use crate::commands::simulate::common::{StrandBiasArgs, generate_random_sequence};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_lib::bam_io::create_bam_writer;
+use fgumi_lib::dna::reverse_complement;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
 use fgumi_lib::simulate::{StrandBiasModel, create_rng};
@@ -395,29 +396,6 @@ fn build_consensus_record(
         .build()
 }
 
-fn generate_random_sequence(len: usize, rng: &mut impl Rng) -> Vec<u8> {
-    const BASES: &[u8] = b"ACGT";
-    let mut seq = Vec::with_capacity(len);
-    for _ in 0..len {
-        seq.push(BASES[rng.random_range(0..4)]);
-    }
-    seq
-}
-
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(seq.len());
-    for &b in seq.iter().rev() {
-        result.push(match b {
-            b'A' => b'T',
-            b'T' => b'A',
-            b'C' => b'G',
-            b'G' => b'C',
-            _ => b'N',
-        });
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,7 +686,7 @@ mod tests {
     #[test]
     fn test_reverse_complement_unknown_bases() {
         assert_eq!(reverse_complement(b"N"), b"N");
-        assert_eq!(reverse_complement(b"X"), b"N");
+        assert_eq!(reverse_complement(b"X"), b"X");
         assert_eq!(reverse_complement(b"ANCG"), b"CGNT");
     }
 
