@@ -294,7 +294,8 @@ pub fn regenerate_alignment_tags_raw(
     let cigar_ops = fgumi_raw_bam::get_cigar_ops(record);
 
     // Calculate reference span from CIGAR ops
-    let ref_span = fgumi_raw_bam::reference_length_from_cigar(&cigar_ops) as usize;
+    let ref_span = usize::try_from(fgumi_raw_bam::reference_length_from_cigar(&cigar_ops))
+        .context("CIGAR-derived reference span is negative")?;
 
     // Handle edge case: CIGAR with no reference-consuming operations
     if ref_span == 0 {
