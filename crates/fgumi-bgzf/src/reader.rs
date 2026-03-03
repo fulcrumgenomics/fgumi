@@ -345,32 +345,17 @@ pub fn decompress_block_into(
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // Handle empty/EOF blocks
     if block.is_eof() || block.uncompressed_size() == 0 {
         return Ok(());
     }
 
-    let compressed = block.compressed_data();
-    let uncompressed_size = block.uncompressed_size();
-
-    // Record current length and extend buffer
-    let start = output.len();
-    output.resize(start + uncompressed_size, 0);
-
-    // Decompress directly into the buffer
-    let bytes_written =
-        decompressor.deflate_decompress(compressed, &mut output[start..]).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
-        })?;
-
-    // Verify size and CRC32
-    // Note: bytes_written may differ from output[start..].len() if decompressor wrote fewer bytes,
-    // so we check bytes_written against expected size, then verify CRC on the written portion.
-    verify_decompression(
-        &output[start..start + bytes_written],
-        uncompressed_size,
+    decompress_and_verify(
+        block.compressed_data(),
+        block.uncompressed_size(),
         block.crc32(),
         block.len(),
+        decompressor,
+        output,
     )
 }
 
@@ -393,36 +378,61 @@ pub fn decompress_block_slice_into(
     decompressor: &mut Decompressor,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // Need at least header + footer
     if data.len() < BGZF_HEADER_SIZE + BGZF_FOOTER_SIZE {
         return Ok(());
     }
 
     let uncompressed_size = uncompressed_size_from_slice(data);
-
     if uncompressed_size == 0 {
         return Ok(());
     }
 
-    // Get compressed data (between header and footer)
-    let compressed = compressed_data_from_slice(data);
-
-    // Extend output buffer and decompress directly into it
-    let start = output.len();
-    output.resize(start + uncompressed_size, 0);
-
-    let bytes_written =
-        decompressor.deflate_decompress(compressed, &mut output[start..]).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("BGZF decompression failed: {e:?}"))
-        })?;
-
-    // Verify size and CRC32
-    verify_decompression(
-        &output[start..start + bytes_written],
+    decompress_and_verify(
+        compressed_data_from_slice(data),
         uncompressed_size,
         crc32_from_slice(data),
         data.len(),
+        decompressor,
+        output,
     )
+}
+
+/// Decompress raw deflate data into the output buffer and verify the result.
+///
+/// This is the shared implementation for both [`decompress_block_into`] and
+/// [`decompress_block_slice_into`], consolidating the decompress + resize + verify logic.
+fn decompress_and_verify(
+    compressed: &[u8],
+    uncompressed_size: usize,
+    expected_crc: u32,
+    block_len: usize,
+    decompressor: &mut Decompressor,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    let start = output.len();
+    output.resize(start + uncompressed_size, 0);
+
+    let result = (|| {
+        let bytes_written =
+            decompressor.deflate_decompress(compressed, &mut output[start..]).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("BGZF decompression failed: {e:?}"),
+                )
+            })?;
+
+        verify_decompression(
+            &output[start..start + bytes_written],
+            uncompressed_size,
+            expected_crc,
+            block_len,
+        )
+    })();
+
+    if result.is_err() {
+        output.truncate(start);
+    }
+    result
 }
 
 // ============================================================================
@@ -559,5 +569,35 @@ mod tests {
         // Should produce identical results
         assert_eq!(result1, result2);
         assert_eq!(result1, original_data);
+    }
+
+    #[test]
+    fn test_decompress_and_verify_truncates_output_on_error() {
+        // Create a valid compressed block
+        use crate::writer::InlineBgzfCompressor;
+
+        let original_data = b"Test data for truncation check";
+        let mut compressor = InlineBgzfCompressor::new(6);
+        compressor.write_all(original_data).unwrap();
+        compressor.flush().unwrap();
+        let blocks = compressor.take_blocks();
+        let block = RawBgzfBlock { data: blocks[0].data.clone() };
+
+        let mut decompressor = Decompressor::new();
+        let mut output = vec![1, 2, 3];
+
+        // Call decompress_and_verify with a wrong CRC to trigger failure
+        let result = decompress_and_verify(
+            block.compressed_data(),
+            block.uncompressed_size(),
+            block.crc32().wrapping_add(1), // wrong CRC
+            block.len(),
+            &mut decompressor,
+            &mut output,
+        );
+
+        assert!(result.is_err());
+        // The output buffer should be rolled back to its original length
+        assert_eq!(output, vec![1, 2, 3]);
     }
 }
