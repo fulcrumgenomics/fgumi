@@ -2,23 +2,19 @@ use crate::fields::{
     TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size,
 };
 
-/// Find a string (Z-type) tag in auxiliary data, returning value bytes without null terminator.
+/// Find a tag's position and type byte in auxiliary data.
+///
+/// Returns `(offset, type_byte)` where `offset` is the position of the tag entry
+/// (the first byte of the 2-byte tag identifier). Returns `None` if not found.
 #[must_use]
-pub fn find_string_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<&'a [u8]> {
+fn find_tag_position(aux_data: &[u8], tag: [u8; 2]) -> Option<(usize, u8)> {
     let mut p = 0;
     while p + 3 <= aux_data.len() {
         let t = &aux_data[p..p + 2];
         let val_type = aux_data[p + 2];
 
         if t == tag {
-            return match val_type {
-                b'Z' => {
-                    let start = p + 3;
-                    let end = aux_data[start..].iter().position(|&b| b == 0)?;
-                    Some(&aux_data[start..start + end])
-                }
-                _ => None,
-            };
+            return Some((p, val_type));
         }
 
         if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
@@ -30,28 +26,25 @@ pub fn find_string_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<&'a [u8]
     None
 }
 
+/// Find a string (Z-type) tag in auxiliary data, returning value bytes without null terminator.
+#[must_use]
+pub fn find_string_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<&'a [u8]> {
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    if val_type != b'Z' {
+        return None;
+    }
+    let start = p + 3;
+    let end = aux_data[start..].iter().position(|&b| b == 0)?;
+    Some(&aux_data[start..start + end])
+}
+
 /// Check whether a tag exists in auxiliary data, returning its type byte if found.
 ///
 /// Returns `Some(type_byte)` (e.g. `b'Z'`, `b'C'`, `b'i'`) if the tag is present,
 /// `None` if the tag is absent.
 #[must_use]
 pub fn find_tag_type(aux_data: &[u8], tag: &[u8; 2]) -> Option<u8> {
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag {
-            return Some(val_type);
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
-        }
-    }
-    None
+    find_tag_position(aux_data, *tag).map(|(_, val_type)| val_type)
 }
 
 /// Find a string tag in a complete BAM record.
@@ -70,69 +63,32 @@ pub fn find_string_tag_in_record<'a>(bam: &'a [u8], tag: &[u8; 2]) -> Option<&'a
 /// Returns `None` if the tag is not found.
 #[must_use]
 pub fn find_tag_bounds(aux_data: &[u8], tag: &[u8; 2]) -> Option<(usize, usize)> {
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            let entry_end = p + 3 + size;
-            if t == tag {
-                return Some((p, entry_end));
-            }
-            p = entry_end;
-        } else {
-            break;
-        }
-    }
-    None
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    let size = tag_value_size(val_type, &aux_data[p + 3..])?;
+    Some((p, p + 3 + size))
 }
 
 /// Find a uint8 (C-type) tag value in auxiliary data.
 #[must_use]
 pub fn find_uint8_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<u8> {
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag && val_type == b'C' && p + 4 <= aux_data.len() {
-            return Some(aux_data[p + 3]);
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
-        }
-    }
-    None
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    if val_type == b'C' && p + 4 <= aux_data.len() { Some(aux_data[p + 3]) } else { None }
 }
 
 /// Find a float (f-type) tag value in auxiliary data.
 #[must_use]
 pub fn find_float_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<f32> {
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag && val_type == b'f' && p + 7 <= aux_data.len() {
-            return Some(f32::from_le_bytes([
-                aux_data[p + 3],
-                aux_data[p + 4],
-                aux_data[p + 5],
-                aux_data[p + 6],
-            ]));
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
-        }
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    if val_type == b'f' && p + 7 <= aux_data.len() {
+        Some(f32::from_le_bytes([
+            aux_data[p + 3],
+            aux_data[p + 4],
+            aux_data[p + 5],
+            aux_data[p + 6],
+        ]))
+    } else {
+        None
     }
-    None
 }
 
 /// Find an integer tag value in auxiliary data.
@@ -140,44 +96,37 @@ pub fn find_float_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<f32> {
 /// Supports signed/unsigned byte, short, and int types (c/C/s/S/i/I).
 #[must_use]
 pub fn find_int_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<i64> {
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    extract_int_value(aux_data, p, val_type)
+}
 
-        if t == tag {
-            return match val_type {
-                b'c' if p + 4 <= aux_data.len() => Some(i64::from(aux_data[p + 3].cast_signed())),
-                b'C' if p + 4 <= aux_data.len() => Some(i64::from(aux_data[p + 3])),
-                b's' if p + 5 <= aux_data.len() => {
-                    Some(i64::from(i16::from_le_bytes([aux_data[p + 3], aux_data[p + 4]])))
-                }
-                b'S' if p + 5 <= aux_data.len() => {
-                    Some(i64::from(u16::from_le_bytes([aux_data[p + 3], aux_data[p + 4]])))
-                }
-                b'i' if p + 7 <= aux_data.len() => Some(i64::from(i32::from_le_bytes([
-                    aux_data[p + 3],
-                    aux_data[p + 4],
-                    aux_data[p + 5],
-                    aux_data[p + 6],
-                ]))),
-                b'I' if p + 7 <= aux_data.len() => Some(i64::from(u32::from_le_bytes([
-                    aux_data[p + 3],
-                    aux_data[p + 4],
-                    aux_data[p + 5],
-                    aux_data[p + 6],
-                ]))),
-                _ => None,
-            };
+/// Extract an integer value at position `p` with the given type byte.
+///
+/// Shared by [`find_int_tag`] and [`find_mi_tag`].
+fn extract_int_value(aux_data: &[u8], p: usize, val_type: u8) -> Option<i64> {
+    match val_type {
+        b'c' if p + 4 <= aux_data.len() => Some(i64::from(aux_data[p + 3].cast_signed())),
+        b'C' if p + 4 <= aux_data.len() => Some(i64::from(aux_data[p + 3])),
+        b's' if p + 5 <= aux_data.len() => {
+            Some(i64::from(i16::from_le_bytes([aux_data[p + 3], aux_data[p + 4]])))
         }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
+        b'S' if p + 5 <= aux_data.len() => {
+            Some(i64::from(u16::from_le_bytes([aux_data[p + 3], aux_data[p + 4]])))
         }
+        b'i' if p + 7 <= aux_data.len() => Some(i64::from(i32::from_le_bytes([
+            aux_data[p + 3],
+            aux_data[p + 4],
+            aux_data[p + 5],
+            aux_data[p + 6],
+        ]))),
+        b'I' if p + 7 <= aux_data.len() => Some(i64::from(u32::from_le_bytes([
+            aux_data[p + 3],
+            aux_data[p + 4],
+            aux_data[p + 5],
+            aux_data[p + 6],
+        ]))),
+        _ => None,
     }
-    None
 }
 
 /// Find MI (Molecular Identifier) tag in auxiliary data.
@@ -188,64 +137,22 @@ pub fn find_int_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<i64> {
 /// - Returns `None` if MI tag not found.
 #[must_use]
 pub fn find_mi_tag(aux_data: &[u8]) -> Option<(u64, bool)> {
-    let mut pos = 0;
-    while pos + 3 <= aux_data.len() {
-        let tag = &aux_data[pos..pos + 2];
-        let val_type = aux_data[pos + 2];
-
-        if tag == b"MI" {
-            return match val_type {
-                // String type - parse "12345" or "12345/A" or "12345/B"
-                b'Z' => {
-                    let start = pos + 3;
-                    let end = aux_data[start..].iter().position(|&b| b == 0)?;
-                    let s = &aux_data[start..start + end];
-                    parse_mi_bytes(s)
-                }
-                // Integer types (with per-type bounds checks)
-                // Signed types: return None for negative values (MI must be non-negative)
-                b'c' if pos + 4 <= aux_data.len() => {
-                    let v = i8::from_le_bytes([aux_data[pos + 3]]);
-                    if v >= 0 { Some((u64::from(v.cast_unsigned()), true)) } else { None }
-                }
-                b'C' if pos + 4 <= aux_data.len() => Some((u64::from(aux_data[pos + 3]), true)),
-                b's' if pos + 5 <= aux_data.len() => {
-                    let v = i16::from_le_bytes([aux_data[pos + 3], aux_data[pos + 4]]);
-                    if v >= 0 { Some((u64::from(v.cast_unsigned()), true)) } else { None }
-                }
-                b'S' if pos + 5 <= aux_data.len() => Some((
-                    u64::from(u16::from_le_bytes([aux_data[pos + 3], aux_data[pos + 4]])),
-                    true,
-                )),
-                b'i' if pos + 7 <= aux_data.len() => {
-                    let v = i32::from_le_bytes([
-                        aux_data[pos + 3],
-                        aux_data[pos + 4],
-                        aux_data[pos + 5],
-                        aux_data[pos + 6],
-                    ]);
-                    if v >= 0 { Some((u64::from(v.cast_unsigned()), true)) } else { None }
-                }
-                b'I' if pos + 7 <= aux_data.len() => Some((
-                    u64::from(u32::from_le_bytes([
-                        aux_data[pos + 3],
-                        aux_data[pos + 4],
-                        aux_data[pos + 5],
-                        aux_data[pos + 6],
-                    ])),
-                    true,
-                )),
-                _ => None,
-            };
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[pos + 3..]) {
-            pos += 3 + size;
+    let (pos, val_type) = find_tag_position(aux_data, *b"MI")?;
+    if val_type == b'Z' {
+        // String type - parse "12345" or "12345/A" or "12345/B"
+        let start = pos + 3;
+        let end = aux_data[start..].iter().position(|&b| b == 0)?;
+        parse_mi_bytes(&aux_data[start..start + end])
+    } else {
+        // Integer types: delegate to shared extractor, reject negative values
+        let v = extract_int_value(aux_data, pos, val_type)?;
+        if v >= 0 {
+            #[expect(clippy::cast_sign_loss, reason = "guarded by v >= 0")]
+            Some((v as u64, true))
         } else {
-            break;
+            None
         }
     }
-    None
 }
 
 /// Parse MI tag bytes to `(integer, is_A_suffix)`.
@@ -370,52 +277,41 @@ pub struct ArrayTagRef<'a> {
 
 /// Find a B-type (array) tag in auxiliary data, returning a zero-allocation reference.
 ///
-/// Scans aux linearly (same pattern as `find_string_tag`). Returns `None` if
-/// the tag is absent or is not of type `B`.
+/// Returns `None` if the tag is absent or is not of type `B`.
 #[must_use]
 pub fn find_array_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<ArrayTagRef<'a>> {
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag && val_type == b'B' {
-            let data_start = p + 3;
-            if data_start + 5 > aux_data.len() {
-                return None;
-            }
-            let elem_type = aux_data[data_start];
-            let count = u32::from_le_bytes([
-                aux_data[data_start + 1],
-                aux_data[data_start + 2],
-                aux_data[data_start + 3],
-                aux_data[data_start + 4],
-            ]) as usize;
-            let elem_size = TAG_FIXED_SIZES[elem_type as usize] as usize;
-            if elem_size == 0 {
-                return None;
-            }
-            let elements_start = data_start + 5;
-            let total_bytes = count.checked_mul(elem_size)?;
-            let elements_end = elements_start.checked_add(total_bytes)?;
-            if elements_end > aux_data.len() {
-                return None;
-            }
-            return Some(ArrayTagRef {
-                data: &aux_data[elements_start..elements_end],
-                elem_type,
-                count,
-                elem_size,
-            });
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
-        }
+    let (p, val_type) = find_tag_position(aux_data, *tag)?;
+    if val_type != b'B' {
+        return None;
     }
-    None
+    parse_array_tag_at(aux_data, p + 3)
+}
+
+/// Parse B-type array tag data starting at the given offset (after the type byte).
+///
+/// Shared by [`find_array_tag`] and [`reverse_array_tag_in_place`].
+fn parse_array_tag_at(aux_data: &[u8], data_start: usize) -> Option<ArrayTagRef<'_>> {
+    if data_start + 5 > aux_data.len() {
+        return None;
+    }
+    let elem_type = aux_data[data_start];
+    let count = u32::from_le_bytes([
+        aux_data[data_start + 1],
+        aux_data[data_start + 2],
+        aux_data[data_start + 3],
+        aux_data[data_start + 4],
+    ]) as usize;
+    let elem_size = TAG_FIXED_SIZES[elem_type as usize] as usize;
+    if elem_size == 0 {
+        return None;
+    }
+    let elements_start = data_start + 5;
+    let total_bytes = count.checked_mul(elem_size)?;
+    let elements_end = elements_start.checked_add(total_bytes)?;
+    if elements_end > aux_data.len() {
+        return None;
+    }
+    Some(ArrayTagRef { data: &aux_data[elements_start..elements_end], elem_type, count, elem_size })
 }
 
 /// Read one element from an `ArrayTagRef` as `u16`.
@@ -613,129 +509,73 @@ pub fn reverse_array_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u
     if aux_offset >= record.len() {
         return;
     }
-    let aux_data = &record[aux_offset..];
-    // First find the tag to get its offset and element info
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag && val_type == b'B' {
-            let data_start = p + 3;
-            if data_start + 5 > aux_data.len() {
-                return;
-            }
-            let elem_type = aux_data[data_start];
-            let count = u32::from_le_bytes([
-                aux_data[data_start + 1],
-                aux_data[data_start + 2],
-                aux_data[data_start + 3],
-                aux_data[data_start + 4],
-            ]) as usize;
-            let elem_size = TAG_FIXED_SIZES[elem_type as usize] as usize;
-            if elem_size == 0 || count == 0 {
-                return;
-            }
-            let Some(total_bytes) = count.checked_mul(elem_size) else {
-                return;
-            };
-            let elements_start = aux_offset + data_start + 5;
-            let Some(elements_end) = elements_start.checked_add(total_bytes) else {
-                return;
-            };
-            if elements_end > record.len() {
-                return;
-            }
-            // Reverse elements by swapping elem_size-byte chunks
-            let mut i = 0;
-            let mut j = count - 1;
-            while i < j {
-                let off_i = elements_start + i * elem_size;
-                let off_j = elements_start + j * elem_size;
-                for k in 0..elem_size {
-                    record.swap(off_i + k, off_j + k);
-                }
-                i += 1;
-                j -= 1;
-            }
-            return;
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
-        }
+    let Some((p, val_type)) = find_tag_position(&record[aux_offset..], *tag) else {
+        return;
+    };
+    if val_type != b'B' {
+        return;
     }
+    // Extract array metadata before taking mutable borrow
+    let Some(arr) = parse_array_tag_at(&record[aux_offset..], p + 3) else {
+        return;
+    };
+    let count = arr.count;
+    let elem_size = arr.elem_size;
+    if count == 0 {
+        return;
+    }
+    let elements_start = aux_offset + p + 3 + 5;
+    // Reverse elements by swapping elem_size-byte chunks
+    let mut i = 0;
+    let mut j = count - 1;
+    while i < j {
+        let off_i = elements_start + i * elem_size;
+        let off_j = elements_start + j * elem_size;
+        for k in 0..elem_size {
+            record.swap(off_i + k, off_j + k);
+        }
+        i += 1;
+        j -= 1;
+    }
+}
+
+/// Find the byte range of a Z-type string tag value within a mutable record.
+///
+/// Returns `Some((start, end))` where `start..end` is the value range (excluding NUL).
+/// Returns `None` if the tag is not found or is not Z-type.
+fn find_string_tag_range(record: &[u8], aux_offset: usize, tag: [u8; 2]) -> Option<(usize, usize)> {
+    if aux_offset >= record.len() {
+        return None;
+    }
+    let (p, val_type) = find_tag_position(&record[aux_offset..], tag)?;
+    if val_type != b'Z' {
+        return None;
+    }
+    let start = aux_offset + p + 3;
+    let nul_off = record[start..].iter().position(|&b| b == 0)?;
+    let end = start + nul_off;
+    if end > start { Some((start, end)) } else { None }
 }
 
 /// Reverse bytes of a Z-type string tag value in place. No-op if tag not found.
 pub fn reverse_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
-    if aux_offset >= record.len() {
-        return;
-    }
-    let aux_data = &record[aux_offset..];
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag && val_type == b'Z' {
-            let start = aux_offset + p + 3;
-            if let Some(nul_off) = record[start..].iter().position(|&b| b == 0) {
-                let end = start + nul_off;
-                if end > start {
-                    record[start..end].reverse();
-                }
-            }
-            return;
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
-        }
+    if let Some((start, end)) = find_string_tag_range(record, aux_offset, *tag) {
+        record[start..end].reverse();
     }
 }
 
 /// Reverse-complement a Z-type string tag value in place (A<->T, C<->G).
 pub fn reverse_complement_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
-    if aux_offset >= record.len() {
-        return;
-    }
-    let aux_data = &record[aux_offset..];
-    let mut p = 0;
-    while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
-        let val_type = aux_data[p + 2];
-
-        if t == tag && val_type == b'Z' {
-            let start = aux_offset + p + 3;
-            if let Some(nul_off) = record[start..].iter().position(|&b| b == 0) {
-                let end = start + nul_off;
-                if end > start {
-                    // Reverse
-                    record[start..end].reverse();
-                    // Complement each base
-                    for b in &mut record[start..end] {
-                        *b = match *b {
-                            b'A' | b'a' => b'T',
-                            b'T' | b't' => b'A',
-                            b'C' | b'c' => b'G',
-                            b'G' | b'g' => b'C',
-                            other => other,
-                        };
-                    }
-                }
-            }
-            return;
-        }
-
-        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
-            p += 3 + size;
-        } else {
-            break;
+    if let Some((start, end)) = find_string_tag_range(record, aux_offset, *tag) {
+        record[start..end].reverse();
+        for b in &mut record[start..end] {
+            *b = match *b {
+                b'A' | b'a' => b'T',
+                b'T' | b't' => b'A',
+                b'C' | b'c' => b'G',
+                b'G' | b'g' => b'C',
+                other => other,
+            };
         }
     }
 }
@@ -1991,7 +1831,8 @@ mod tests {
     fn test_reverse_array_tag_in_place_offset_past_end() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         // aux_offset >= record.len() should be a no-op
-        reverse_array_tag_in_place(&mut rec, rec.len() + 10, b"cd");
+        let offset = rec.len() + 10;
+        reverse_array_tag_in_place(&mut rec, offset, b"cd");
     }
 
     // ========================================================================
@@ -2027,7 +1868,8 @@ mod tests {
     #[test]
     fn test_reverse_string_tag_in_place_offset_past_end() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        reverse_string_tag_in_place(&mut rec, rec.len() + 10, b"RX");
+        let offset = rec.len() + 10;
+        reverse_string_tag_in_place(&mut rec, offset, b"RX");
     }
 
     // ========================================================================
@@ -2073,7 +1915,8 @@ mod tests {
     #[test]
     fn test_reverse_complement_string_tag_in_place_offset_past_end() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        reverse_complement_string_tag_in_place(&mut rec, rec.len() + 10, b"RX");
+        let offset = rec.len() + 10;
+        reverse_complement_string_tag_in_place(&mut rec, offset, b"RX");
     }
 
     // ========================================================================

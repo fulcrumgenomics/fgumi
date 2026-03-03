@@ -4,6 +4,27 @@ use crate::fields::{
     l_read_name, n_cigar_op, pos,
 };
 
+/// Returns true if the CIGAR op type consumes the reference (M, D, N, =, X).
+#[inline]
+#[must_use]
+pub const fn consumes_ref(op_type: u32) -> bool {
+    matches!(op_type, 0 | 2 | 3 | 7 | 8)
+}
+
+/// Returns true if the CIGAR op type consumes the query including soft clips (M, I, S, =, X).
+#[inline]
+#[must_use]
+pub const fn consumes_query(op_type: u32) -> bool {
+    matches!(op_type, 0 | 1 | 4 | 7 | 8)
+}
+
+/// Returns true if the CIGAR op type consumes the read/query excluding soft clips (M, I, =, X).
+#[inline]
+#[must_use]
+pub const fn consumes_read(op_type: u32) -> bool {
+    matches!(op_type, 0 | 1 | 7 | 8)
+}
+
 /// Extract CIGAR operations from BAM record.
 #[inline]
 #[must_use]
@@ -41,8 +62,7 @@ pub fn reference_length_from_cigar(cigar_ops: &[u32]) -> i32 {
         let op_len = (op >> 4).cast_signed();
         let op_type = op & 0xF;
 
-        // M (0), D (2), N (3), = (7), X (8) consume reference bases
-        if matches!(op_type, 0 | 2 | 3 | 7 | 8) {
+        if consumes_ref(op_type) {
             ref_len += op_len;
         }
     }
@@ -69,7 +89,7 @@ pub fn reference_length_from_raw_bam(bam: &[u8]) -> i32 {
     for i in 0..n_cigar_op {
         let op = cigar_op_at(bam, cigar_start + i * 4);
         let op_type = op & 0xF;
-        if matches!(op_type, 0 | 2 | 3 | 7 | 8) {
+        if consumes_ref(op_type) {
             ref_len += (op >> 4).cast_signed();
         }
     }
@@ -86,7 +106,7 @@ pub fn query_length_from_cigar(cigar_ops: &[u32]) -> usize {
     for &op in cigar_ops {
         let op_type = op & 0xF;
         let op_len = (op >> 4) as usize;
-        if matches!(op_type, 0 | 1 | 4 | 7 | 8) {
+        if consumes_query(op_type) {
             len += op_len;
         }
     }
@@ -131,8 +151,7 @@ pub fn unclipped_end_from_cigar(pos: i32, cigar_ops: &[u32]) -> i32 {
         let op_type = op & 0xF;
 
         match op_type {
-            0 | 2 | 3 | 7 | 8 => {
-                // M (0), D (2), N (3), = (7), X (8)
+            _ if consumes_ref(op_type) => {
                 ref_len += op_len;
                 trailing_clips = 0;
                 saw_ref_op = true;
@@ -399,16 +418,13 @@ pub fn read_pos_at_ref_pos_raw(
         let op_type = op & 0xF;
         let op_len = (op >> 4) as usize;
 
-        let consumes_ref = matches!(op_type, 0 | 2 | 3 | 7 | 8); // M, D, N, =, X
-        let consumes_query = matches!(op_type, 0 | 1 | 4 | 7 | 8); // M, I, S, =, X
-
         let op_ref_start = alignment_start + ref_offset;
 
-        if consumes_ref {
+        if consumes_ref(op_type) {
             let op_ref_end = op_ref_start + op_len - 1;
 
             if ref_pos >= op_ref_start && ref_pos <= op_ref_end {
-                if consumes_query {
+                if consumes_query(op_type) {
                     // M, =, X: we have a base at this position
                     let offset_in_op = ref_pos - op_ref_start;
                     return Some(query_offset + offset_in_op + 1); // 1-based
@@ -421,10 +437,10 @@ pub fn read_pos_at_ref_pos_raw(
             }
         }
 
-        if consumes_ref {
+        if consumes_ref(op_type) {
             ref_offset += op_len;
         }
-        if consumes_query {
+        if consumes_query(op_type) {
             query_offset += op_len;
         }
     }
@@ -494,16 +510,12 @@ fn unclipped_end_from_raw_cigar(pos: i32, bam: &[u8], cigar_start: usize, n_ops:
         let op_len = (op >> 4).cast_signed();
         let op_type = op & 0xF;
 
-        match op_type {
-            0 | 2 | 3 | 7 | 8 => {
-                ref_len += op_len;
-                trailing_clips = 0;
-                saw_ref_op = true;
-            }
-            4 | 5 if saw_ref_op => {
-                trailing_clips += op_len;
-            }
-            _ => {}
+        if consumes_ref(op_type) {
+            ref_len += op_len;
+            trailing_clips = 0;
+            saw_ref_op = true;
+        } else if matches!(op_type, 4 | 5) && saw_ref_op {
+            trailing_clips += op_len;
         }
     }
 
@@ -719,10 +731,10 @@ fn clip_cigar_start_raw(
         // Note: S (soft clip) is NOT read-consuming here, matching the Clipper.
         // After stripping leading H+S, remaining S ops (e.g. trailing) should not
         // count toward read bases clipped.
-        let consumes_read = matches!(op_type, 0 | 1 | 7 | 8); // M, I, =, X
-        let consumes_ref = matches!(op_type, 0 | 2 | 3 | 7 | 8); // M, D, N, =, X
+        let is_read = consumes_read(op_type); // M, I, =, X
+        let is_ref = consumes_ref(op_type); // M, D, N, =, X
 
-        if consumes_read && op_len > (clip_amount - read_bases_clipped) {
+        if is_read && op_len > (clip_amount - read_bases_clipped) {
             if op_type == 1 {
                 // Insertion: consume entire at clip boundary
                 read_bases_clipped += op_len;
@@ -731,16 +743,16 @@ fn clip_cigar_start_raw(
                 let remaining_clip = clip_amount - read_bases_clipped;
                 let remaining_length = op_len - remaining_clip;
                 read_bases_clipped += remaining_clip;
-                if consumes_ref {
+                if is_ref {
                     ref_bases_clipped += remaining_clip;
                 }
                 new_ops.push(encode_op(op_type, remaining_length));
             }
         } else {
-            if consumes_read {
+            if is_read {
                 read_bases_clipped += op_len;
             }
-            if consumes_ref {
+            if is_ref {
                 ref_bases_clipped += op_len;
             }
         }
@@ -821,9 +833,9 @@ fn clip_cigar_end_raw(
         }
 
         // Note: S (soft clip) is NOT read-consuming here, matching the Clipper.
-        let consumes_read = matches!(op_type, 0 | 1 | 7 | 8); // M, I, =, X
+        let is_read = consumes_read(op_type); // M, I, =, X
 
-        if consumes_read && op_len > (clip_amount - read_bases_clipped) {
+        if is_read && op_len > (clip_amount - read_bases_clipped) {
             if op_type == 1 {
                 // Insertion: consume entire at clip boundary
                 read_bases_clipped += op_len;
@@ -834,7 +846,7 @@ fn clip_cigar_end_raw(
                 read_bases_clipped += remaining_clip;
                 new_ops.push(encode_op(op_type, remaining_length));
             }
-        } else if consumes_read {
+        } else if is_read {
             read_bases_clipped += op_len;
         }
 
