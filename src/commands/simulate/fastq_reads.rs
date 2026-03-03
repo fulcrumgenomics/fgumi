@@ -2,11 +2,12 @@
 
 use crate::commands::command::Command;
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, QualityArgs, SimulationCommon,
+    FamilySizeArgs, InsertSizeArgs, QualityArgs, SimulationCommon, generate_random_sequence,
 };
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_dna::dna::complement_base;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simulate::{FastqWriter, create_rng};
 use log::info;
@@ -532,27 +533,11 @@ fn generate_molecule_reads(
     records
 }
 
-/// Generate a random DNA sequence.
-fn generate_random_sequence(len: usize, rng: &mut impl Rng) -> Vec<u8> {
-    const BASES: &[u8] = b"ACGT";
-    let mut seq = Vec::with_capacity(len);
-    for _ in 0..len {
-        seq.push(BASES[rng.random_range(0..4)]);
-    }
-    seq
-}
-
 /// Reverse complement a DNA sequence into an existing buffer.
 fn reverse_complement_into(seq: &[u8], output: &mut Vec<u8>) {
     output.reserve(seq.len());
     for &b in seq.iter().rev() {
-        output.push(match b {
-            b'A' => b'T',
-            b'T' => b'A',
-            b'C' => b'G',
-            b'G' => b'C',
-            _ => b'N',
-        });
+        output.push(complement_base(b));
     }
 }
 
@@ -698,9 +683,9 @@ mod tests {
 
     #[test]
     fn test_reverse_complement_unknown_bases() {
-        // Unknown bases should become N
+        // Unknown bases are returned unchanged by the library complement_base
         assert_eq!(reverse_complement(b"N"), b"N");
-        assert_eq!(reverse_complement(b"X"), b"N");
+        assert_eq!(reverse_complement(b"X"), b"X");
         assert_eq!(reverse_complement(b"ANT"), b"ANT"); // A->T, N->N, T->A, reversed = ANT
     }
 

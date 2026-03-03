@@ -1,6 +1,8 @@
-//! Shared CLI arguments for simulation commands.
+//! Shared CLI arguments and utilities for simulation commands.
 
+use super::sort::TemplateCoordKey;
 use clap::Args;
+use rand::{Rng, RngExt};
 use std::path::PathBuf;
 
 /// Common simulation options shared across all simulate subcommands.
@@ -205,10 +207,73 @@ pub struct PositionDistArgs {
     pub umis_per_position: usize,
 }
 
+/// Generate a random DNA sequence of the given length.
+pub(super) fn generate_random_sequence(len: usize, rng: &mut impl Rng) -> Vec<u8> {
+    const BASES: &[u8] = b"ACGT";
+    let mut seq = Vec::with_capacity(len);
+    for _ in 0..len {
+        seq.push(BASES[rng.random_range(0..4)]);
+    }
+    seq
+}
+
+/// Pad a sequence to the target length with random bases, or truncate if too long.
+pub(super) fn pad_sequence(mut seq: Vec<u8>, target_len: usize, rng: &mut impl Rng) -> Vec<u8> {
+    while seq.len() < target_len {
+        seq.push(b"ACGT"[rng.random_range(0..4)]);
+    }
+    seq.truncate(target_len);
+    seq
+}
+
+/// Compute the genomic position for a molecule based on its ID.
+#[inline]
+pub(super) fn compute_position(mol_id: usize, num_positions: usize, ref_length: usize) -> usize {
+    let fallback = ref_length.saturating_sub(1).min(100);
+    if num_positions == 0 {
+        return fallback;
+    }
+    let usable_span = ref_length.saturating_sub(1000);
+    if usable_span == 0 {
+        return fallback;
+    }
+    let position_idx = mol_id % num_positions;
+    ((position_idx as f64 / num_positions as f64) * usable_span as f64) as usize + fallback
+}
+
+/// Lightweight molecule info for position-first sorting.
+#[derive(Debug)]
+pub(super) struct MoleculeInfo {
+    pub mol_id: usize,
+    pub seed: u64,
+    pub sort_key: TemplateCoordKey,
+}
+
+impl Ord for MoleculeInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key.cmp(&other.sort_key)
+    }
+}
+
+impl PartialOrd for MoleculeInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MoleculeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_key == other.sort_key
+    }
+}
+
+impl Eq for MoleculeInfo {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fgumi_lib::simulate::create_rng;
+    use rstest::rstest;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -584,5 +649,69 @@ mod tests {
 
         // Should not panic
         let _ = args_lower.to_family_size_distribution().unwrap();
+    }
+
+    #[rstest]
+    // num_positions == 0 should not panic
+    #[case(5, 0, 250_000_000, 0, 250_000_000)]
+    // ref_length < 1000 should not underflow
+    #[case(0, 10, 500, 0, 500)]
+    // Very small reference (ref_length <= 100) — fallback must stay within bounds
+    #[case(0, 10, 50, 0, 50)]
+    // Normal: first position
+    #[case(0, 10, 10_000, 0, 10_000)]
+    // Normal: last position in range
+    #[case(9, 10, 10_000, 101, 10_000)]
+    fn test_compute_position(
+        #[case] mol_id: usize,
+        #[case] num_positions: usize,
+        #[case] ref_length: usize,
+        #[case] min_expected: usize,
+        #[case] max_expected: usize,
+    ) {
+        let pos = compute_position(mol_id, num_positions, ref_length);
+        assert!(
+            pos >= min_expected && pos < max_expected,
+            "compute_position({mol_id}, {num_positions}, {ref_length}) = {pos}, expected [{min_expected}, {max_expected})"
+        );
+    }
+
+    fn make_molecule_info(mol_id: usize, tid1: i32, pos1: i64) -> MoleculeInfo {
+        MoleculeInfo {
+            mol_id,
+            seed: 0,
+            sort_key: TemplateCoordKey {
+                tid1,
+                tid2: 0,
+                pos1,
+                pos2: 0,
+                neg1: false,
+                neg2: false,
+                mid: String::new(),
+                name: String::new(),
+                is_upper_of_pair: false,
+            },
+        }
+    }
+
+    #[test]
+    fn test_molecule_info_ordering() {
+        let a = make_molecule_info(0, 1, 100);
+        let b = make_molecule_info(1, 1, 200);
+        let c = make_molecule_info(2, 2, 50);
+
+        // Same tid, earlier position comes first
+        assert!(a < b);
+        assert!(b > a);
+        // Higher tid comes later regardless of position
+        assert!(b < c);
+
+        // PartialOrd consistent with Ord
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
+
+        // Equal sort keys are equal
+        let a2 = make_molecule_info(99, 1, 100);
+        assert_eq!(a, a2);
+        assert_eq!(a.cmp(&a2), std::cmp::Ordering::Equal);
     }
 }
