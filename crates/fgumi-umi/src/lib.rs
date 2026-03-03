@@ -59,12 +59,9 @@ impl MoleculeId {
     /// need to be converted to global IDs by adding the base offset.
     #[must_use]
     pub fn to_string_with_offset(&self, base: u64) -> String {
-        match self {
-            MoleculeId::None => String::new(),
-            MoleculeId::Single(id) => format!("{}", base + id),
-            MoleculeId::PairedA(id) => format!("{}/A", base + id),
-            MoleculeId::PairedB(id) => format!("{}/B", base + id),
-        }
+        let mut buf = String::new();
+        self.write_with_offset(base, &mut buf);
+        buf
     }
 
     /// Write string representation into a reusable buffer, returning the bytes.
