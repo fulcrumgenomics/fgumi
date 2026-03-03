@@ -337,84 +337,42 @@ impl Template {
         self.r2.map(|(i, _)| &self.records[i])
     }
 
-    /// Returns supplementary alignments for R1.
-    /// Returns empty in raw-byte mode.
-    ///
-    /// Supplementary alignments represent additional mapping locations for chimeric
-    /// reads (reads that map to multiple locations due to structural variants or
-    /// fusion events).
-    ///
-    /// # Returns
-    ///
-    /// Vector of references to R1 supplementary records
-    #[must_use]
-    pub fn r1_supplementals(&self) -> Vec<&RecordBuf> {
-        if let Some((start, end)) = self.r1_supplementals {
-            if end <= self.records.len() {
-                return self.records[start..end].iter().collect();
+    /// Returns the records in the given range, or an empty slice if the range is invalid.
+    fn records_in_range(&self, range: Option<(usize, usize)>) -> &[RecordBuf] {
+        if let Some((start, end)) = range {
+            if start <= end && end <= self.records.len() {
+                return &self.records[start..end];
             }
         }
-        Vec::new()
+        &[]
+    }
+
+    /// Returns supplementary alignments for R1.
+    /// Returns empty in raw-byte mode.
+    #[must_use]
+    pub fn r1_supplementals(&self) -> &[RecordBuf] {
+        self.records_in_range(self.r1_supplementals)
     }
 
     /// Returns supplementary alignments for R2.
     /// Returns empty in raw-byte mode.
-    ///
-    /// Supplementary alignments represent additional mapping locations for chimeric
-    /// reads (reads that map to multiple locations due to structural variants or
-    /// fusion events).
-    ///
-    /// # Returns
-    ///
-    /// Vector of references to R2 supplementary records
     #[must_use]
-    pub fn r2_supplementals(&self) -> Vec<&RecordBuf> {
-        if let Some((start, end)) = self.r2_supplementals {
-            if end <= self.records.len() {
-                return self.records[start..end].iter().collect();
-            }
-        }
-        Vec::new()
+    pub fn r2_supplementals(&self) -> &[RecordBuf] {
+        self.records_in_range(self.r2_supplementals)
     }
 
     /// Returns secondary alignments for R1.
     /// Returns empty in raw-byte mode.
-    ///
-    /// Secondary alignments represent alternative mapping locations for reads with
-    /// ambiguous alignments. These differ from supplementary alignments in that they
-    /// represent the full read aligned to multiple locations (not chimeric reads).
-    ///
-    /// # Returns
-    ///
-    /// Vector of references to R1 secondary records
     #[must_use]
-    pub fn r1_secondaries(&self) -> Vec<&RecordBuf> {
-        if let Some((start, end)) = self.r1_secondaries {
-            if end <= self.records.len() {
-                return self.records[start..end].iter().collect();
-            }
-        }
-        Vec::new()
+    pub fn r1_secondaries(&self) -> &[RecordBuf] {
+        self.records_in_range(self.r1_secondaries)
     }
 
     /// Returns secondary alignments for R2.
     /// Returns empty in raw-byte mode.
-    ///
-    /// Secondary alignments represent alternative mapping locations for reads with
-    /// ambiguous alignments. These differ from supplementary alignments in that they
-    /// represent the full read aligned to multiple locations (not chimeric reads).
-    ///
-    /// # Returns
-    ///
-    /// Vector of references to R2 secondary records
     #[must_use]
-    pub fn r2_secondaries(&self) -> Vec<&RecordBuf> {
-        if let Some((start, end)) = self.r2_secondaries {
-            if end <= self.records.len() {
-                return self.records[start..end].iter().collect();
-            }
-        }
-        Vec::new()
+    pub fn r2_secondaries(&self) -> &[RecordBuf] {
+        self.records_in_range(self.r2_secondaries)
     }
 
     /// Creates a new empty template with the given name
@@ -4004,5 +3962,33 @@ mod tests {
             let result = mi.write_with_offset(100, &mut buf);
             assert_eq!(result, expected.as_bytes(), "Mismatch for {mi:?}");
         }
+    }
+
+    #[test]
+    fn test_records_in_range_invalid_start_gt_end() {
+        let template = Template {
+            name: b"read1".to_vec(),
+            records: vec![
+                create_test_record(b"read1", FLAG_PAIRED | FLAG_READ1),
+                create_test_record(b"read1", FLAG_PAIRED | FLAG_READ2),
+            ],
+            raw_records: None,
+            r1: Some((0, 1)),
+            r2: Some((1, 2)),
+            r1_supplementals: None,
+            r2_supplementals: None,
+            r1_secondaries: None,
+            r2_secondaries: None,
+            mi: MoleculeId::None,
+        };
+
+        // start > end should return empty, not panic
+        assert!(template.records_in_range(Some((2, 1))).is_empty());
+        // valid range
+        assert_eq!(template.records_in_range(Some((0, 2))).len(), 2);
+        // None returns empty
+        assert!(template.records_in_range(None).is_empty());
+        // end > len returns empty
+        assert!(template.records_in_range(Some((0, 10))).is_empty());
     }
 }

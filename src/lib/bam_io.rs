@@ -525,58 +525,13 @@ impl IndexingBamWriter {
 
         // Calculate alignment end from CIGAR using byte-safe access
         // (doesn't require 4-byte alignment like get_cigar_ops)
-        let ref_len = Self::calculate_reference_length(bam);
+        let ref_len = fgumi_raw_bam::reference_length_from_raw_bam(bam);
 
         // BAM positions are 0-based, Position is 1-based
         let start = Position::try_from((pos + 1) as usize).ok()?;
         let end = Position::try_from((pos + ref_len) as usize).ok()?;
 
         Some((tid as usize, start, end, true))
-    }
-
-    /// Calculate reference-consuming length from CIGAR using byte-safe access.
-    ///
-    /// This is similar to `reference_length_from_cigar` but reads CIGAR ops
-    /// byte-by-byte to avoid alignment requirements.
-    #[inline]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn calculate_reference_length(bam: &[u8]) -> i32 {
-        let l_read_name = bam[8] as usize;
-        let n_cigar_op = u16::from_le_bytes([bam[12], bam[13]]) as usize;
-
-        if n_cigar_op == 0 {
-            return 0;
-        }
-
-        let cigar_start = 32 + l_read_name;
-        let cigar_end = cigar_start + n_cigar_op * 4;
-
-        if cigar_end > bam.len() {
-            return 0;
-        }
-
-        let mut ref_len = 0i32;
-
-        // Read CIGAR ops byte-by-byte
-        for i in 0..n_cigar_op {
-            let offset = cigar_start + i * 4;
-            let op = u32::from_le_bytes([
-                bam[offset],
-                bam[offset + 1],
-                bam[offset + 2],
-                bam[offset + 3],
-            ]);
-
-            let op_len = (op >> 4) as i32;
-            let op_type = op & 0xF;
-
-            // M (0), D (2), N (3), = (7), X (8) consume reference bases
-            if matches!(op_type, 0 | 2 | 3 | 7 | 8) {
-                ref_len += op_len;
-            }
-        }
-
-        ref_len
     }
 
     /// Finish writing, flush the BGZF stream, and return the index.
