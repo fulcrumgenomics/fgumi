@@ -31,19 +31,6 @@ pub struct UCBScheduler {
 }
 
 impl UCBScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Default exploration constant (sqrt(2)).
     const DEFAULT_EXPLORATION_C: f64 = 1.414;
 
@@ -57,14 +44,9 @@ impl UCBScheduler {
             attempts: [0; 9],
             successes: [0; 9],
             exploration_c: Self::DEFAULT_EXPLORATION_C,
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             active_steps,
         }
-    }
-
-    /// Get the index of a step.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
     }
 
     /// Calculate UCB score for a step.
@@ -98,7 +80,7 @@ impl Scheduler for UCBScheduler {
 
         // Build priority buffer
         for (priority, (_, step_idx)) in scores.iter().enumerate() {
-            self.priority_buffer[priority] = Self::STEPS[*step_idx];
+            self.priority_buffer[priority] = PipelineStep::all()[*step_idx];
         }
 
         let n = self.active_steps.filter_in_place(&mut self.priority_buffer);
@@ -106,7 +88,7 @@ impl Scheduler for UCBScheduler {
     }
 
     fn record_outcome(&mut self, step: PipelineStep, success: bool, _was_contention: bool) {
-        let idx = Self::step_index(step);
+        let idx = step.index();
         self.total_attempts += 1;
         self.attempts[idx] += 1;
         if success {

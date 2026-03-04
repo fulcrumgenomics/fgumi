@@ -43,19 +43,6 @@ pub struct OptimizedChaseScheduler {
 }
 
 impl OptimizedChaseScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Exclusive steps that only one thread can execute at a time.
     const EXCLUSIVE_STEPS: [PipelineStep; 4] = [
         PipelineStep::Read,
@@ -84,7 +71,7 @@ impl OptimizedChaseScheduler {
             num_threads,
             current_step,
             direction: Direction::Forward,
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             bottleneck_streak: 0,
             exclusive_backoff: 0,
             is_exclusive_specialist,
@@ -121,11 +108,6 @@ impl OptimizedChaseScheduler {
         }
     }
 
-    /// Get the index of a step in the pipeline.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
-    }
-
     /// Check if a step is exclusive.
     fn is_exclusive(step: PipelineStep) -> bool {
         Self::EXCLUSIVE_STEPS.contains(&step)
@@ -140,7 +122,7 @@ impl OptimizedChaseScheduler {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn build_priorities(&mut self, _bp: BackpressureState) {
         let mut priorities = Vec::with_capacity(9);
-        let current_idx = Self::step_index(self.current_step);
+        let current_idx = self.current_step.index();
 
         // 1. Current step first (if not backing off from exclusive)
         let skip_current = Self::is_exclusive(self.current_step)
@@ -179,7 +161,7 @@ impl OptimizedChaseScheduler {
             // Primary direction
             let idx1 = current_idx as i32 + first_dir * distance;
             if (0..9).contains(&idx1) {
-                let step = Self::STEPS[idx1 as usize];
+                let step = PipelineStep::all()[idx1 as usize];
                 if !priorities.contains(&step) && self.should_include_step(step) {
                     priorities.push(step);
                 }
@@ -188,7 +170,7 @@ impl OptimizedChaseScheduler {
             // Secondary direction
             let idx2 = current_idx as i32 + second_dir * distance;
             if (0..9).contains(&idx2) {
-                let step = Self::STEPS[idx2 as usize];
+                let step = PipelineStep::all()[idx2 as usize];
                 if !priorities.contains(&step) && self.should_include_step(step) {
                     priorities.push(step);
                 }
@@ -196,7 +178,7 @@ impl OptimizedChaseScheduler {
         }
 
         // 5. Fill any remaining steps (shouldn't happen, but safety)
-        for &step in &Self::STEPS {
+        for &step in &PipelineStep::all() {
             if !priorities.contains(&step) {
                 priorities.push(step);
             }
@@ -277,11 +259,11 @@ impl Scheduler for OptimizedChaseScheduler {
             }
 
             // Normal movement: advance in current direction
-            let idx = Self::step_index(self.current_step);
+            let idx = self.current_step.index();
             self.current_step = match self.direction {
                 Direction::Forward => {
                     if idx < 8 {
-                        Self::STEPS[idx + 1]
+                        PipelineStep::all()[idx + 1]
                     } else {
                         // Wrap to first parallel step, not Read
                         PipelineStep::Decompress
@@ -289,7 +271,7 @@ impl Scheduler for OptimizedChaseScheduler {
                 }
                 Direction::Backward => {
                     if idx > 1 {
-                        Self::STEPS[idx - 1]
+                        PipelineStep::all()[idx - 1]
                     } else {
                         // Wrap to last parallel step, not Write
                         PipelineStep::Compress

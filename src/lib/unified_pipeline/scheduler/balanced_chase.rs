@@ -34,22 +34,10 @@ pub struct BalancedChaseScheduler {
 }
 
 impl BalancedChaseScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Create a new balanced chase scheduler.
     #[must_use]
     pub fn new(thread_id: usize, num_threads: usize, active_steps: ActiveSteps) -> Self {
+        assert!(num_threads > 0, "num_threads must be > 0");
         let (current_step, exclusive_role) = Self::determine_role(thread_id, num_threads);
 
         Self {
@@ -57,7 +45,7 @@ impl BalancedChaseScheduler {
             num_threads,
             current_step,
             direction: Direction::Forward,
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             exclusive_role,
             active_steps,
         }
@@ -68,30 +56,7 @@ impl BalancedChaseScheduler {
         thread_id: usize,
         num_threads: usize,
     ) -> (PipelineStep, Option<PipelineStep>) {
-        use PipelineStep::{Compress, FindBoundaries, Group, Read, Serialize, Write};
-
-        if thread_id == 0 {
-            // T0 handles Read, but starts ready to help with Compress
-            (Compress, Some(Read))
-        } else if thread_id == num_threads - 1 && num_threads > 1 {
-            // T7 handles Write, but starts ready to help with Compress
-            (Compress, Some(Write))
-        } else if thread_id == 1 && num_threads > 2 {
-            // T1 handles FindBoundaries
-            (FindBoundaries, Some(FindBoundaries))
-        } else if thread_id == num_threads - 2 && num_threads > 3 {
-            // T6 handles Group
-            (Group, Some(Group))
-        } else {
-            // Middle threads start spread across bottleneck steps
-            let step = if thread_id.is_multiple_of(2) { Compress } else { Serialize };
-            (step, None)
-        }
-    }
-
-    /// Get the index of a step.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
+        super::balanced_chase_determine_role(thread_id, num_threads)
     }
 
     /// Build priority list with bottleneck focus.
@@ -188,20 +153,20 @@ impl Scheduler for BalancedChaseScheduler {
             }
         } else {
             // On failure, move toward bottleneck steps
-            let idx = Self::step_index(self.current_step);
+            let idx = self.current_step.index();
 
             // Bias movement toward Compress (index 7) and Serialize (index 6)
             self.current_step = match self.direction {
                 Direction::Forward => {
                     if idx < 7 {
-                        Self::STEPS[idx + 1]
+                        PipelineStep::all()[idx + 1]
                     } else {
                         PipelineStep::Compress
                     }
                 }
                 Direction::Backward => {
                     if idx > 1 && idx != 7 && idx != 6 {
-                        Self::STEPS[idx - 1]
+                        PipelineStep::all()[idx - 1]
                     } else {
                         // Stay near bottleneck
                         PipelineStep::Serialize
@@ -289,5 +254,11 @@ mod tests {
         // Both should be in top 3
         assert!(compress_pos.unwrap() < 3);
         assert!(serialize_pos.unwrap() < 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_threads must be > 0")]
+    fn test_zero_threads_panics() {
+        let _ = BalancedChaseScheduler::new(0, 0, all());
     }
 }

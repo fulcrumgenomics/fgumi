@@ -24,19 +24,6 @@ pub struct BackpressureProportionalScheduler {
 }
 
 impl BackpressureProportionalScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Default EMA alpha (10% per update).
     const DEFAULT_ALPHA: f64 = 0.1;
     /// High weight value.
@@ -55,7 +42,7 @@ impl BackpressureProportionalScheduler {
             num_threads,
             weights,
             alpha: Self::DEFAULT_ALPHA,
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             active_steps,
         }
     }
@@ -95,8 +82,9 @@ impl Scheduler for BackpressureProportionalScheduler {
         }
         weighted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        let all_steps = PipelineStep::all();
         for (priority, (_, step_idx)) in weighted.iter().enumerate() {
-            self.priority_buffer[priority] = Self::STEPS[*step_idx];
+            self.priority_buffer[priority] = all_steps[*step_idx];
         }
 
         let n = self.active_steps.filter_in_place(&mut self.priority_buffer);

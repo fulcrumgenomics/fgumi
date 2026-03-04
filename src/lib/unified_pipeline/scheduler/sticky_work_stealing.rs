@@ -28,19 +28,6 @@ pub struct StickyWorkStealingScheduler {
 }
 
 impl StickyWorkStealingScheduler {
-    /// All pipeline steps in order.
-    const STEPS: [PipelineStep; 9] = [
-        PipelineStep::Read,
-        PipelineStep::Decompress,
-        PipelineStep::FindBoundaries,
-        PipelineStep::Decode,
-        PipelineStep::Group,
-        PipelineStep::Process,
-        PipelineStep::Serialize,
-        PipelineStep::Compress,
-        PipelineStep::Write,
-    ];
-
     /// Steps to try before returning home.
     const DEFAULT_HOME_RETURN_THRESHOLD: usize = 10;
 
@@ -56,7 +43,7 @@ impl StickyWorkStealingScheduler {
             current_step: home_step,
             away_counter: 0,
             home_return_threshold: Self::DEFAULT_HOME_RETURN_THRESHOLD,
-            priority_buffer: Self::STEPS,
+            priority_buffer: PipelineStep::all(),
             active_steps,
         }
     }
@@ -83,14 +70,9 @@ impl StickyWorkStealingScheduler {
         }
     }
 
-    /// Get the index of a step.
-    fn step_index(step: PipelineStep) -> usize {
-        Self::STEPS.iter().position(|&s| s == step).unwrap_or(0)
-    }
-
     /// Build priorities: home first, then adjacent, then others.
     fn build_priorities(&mut self) {
-        let current_idx = Self::step_index(self.current_step);
+        let current_idx = self.current_step.index();
 
         let mut idx = 0;
 
@@ -106,14 +88,14 @@ impl StickyWorkStealingScheduler {
 
         // 3. Adjacent to current step
         if current_idx > 0 {
-            let prev = Self::STEPS[current_idx - 1];
+            let prev = PipelineStep::all()[current_idx - 1];
             if prev != self.home_step {
                 self.priority_buffer[idx] = prev;
                 idx += 1;
             }
         }
         if current_idx < 8 {
-            let next = Self::STEPS[current_idx + 1];
+            let next = PipelineStep::all()[current_idx + 1];
             if next != self.home_step {
                 self.priority_buffer[idx] = next;
                 idx += 1;
@@ -121,7 +103,7 @@ impl StickyWorkStealingScheduler {
         }
 
         // 4. Remaining steps
-        for step in Self::STEPS {
+        for step in PipelineStep::all() {
             if !self.priority_buffer[..idx].contains(&step) {
                 self.priority_buffer[idx] = step;
                 idx += 1;
