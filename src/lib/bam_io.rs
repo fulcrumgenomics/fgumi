@@ -23,9 +23,11 @@ use noodles::core::Position;
 use noodles::sam::Header;
 // Use noodles_bgzf for standard BGZF types
 use noodles_bgzf::io::{MultithreadedReader, Reader as BgzfReader, Writer as BgzfWriter};
-// Use vendored MultithreadedWriter with position tracking (until upstream PR merges)
+// Use vendored MultithreadedWriter with position tracking
+// (until https://github.com/zaeleus/noodles/pull/371 merges)
 use crate::vendored::{BlockInfoRx, MultithreadedWriter, MultithreadedWriterBuilder};
-// Use RawBamReader for raw byte access (until noodles exposes Record bytes)
+// Use RawBamReader for raw byte access
+// (until https://github.com/zaeleus/noodles/pull/373 merges)
 use fgumi_raw_bam::RawBamReader;
 // Use bgzf crate for CompressionLevel
 use bgzf::CompressionLevel;

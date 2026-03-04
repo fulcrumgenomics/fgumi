@@ -30,7 +30,8 @@
 //! 32+     var   read_name, CIGAR, sequence, quality, aux data
 //! ```
 //!
-//! This module will be removed once noodles exposes raw bytes from Record.
+//! This module will be removed once noodles exposes raw bytes from Record
+//! (<https://github.com/zaeleus/noodles/pull/373>).
 
 use std::io::{self, Read};
 

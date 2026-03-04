@@ -1,9 +1,10 @@
 //! Vendored code that will be removed once upstream PRs are merged.
 //!
 //! This module contains temporary implementations that are waiting on:
-//! - noodles-bgzf PR for `MultithreadedWriter` with position tracking
-//! - noodles-bam PR for BAM codec optimizations
-//! - noodles-bam PR for `Record::as_ref()` (raw bytes access)
+//! - noodles-bgzf: `MultithreadedWriter` with position tracking (<https://github.com/zaeleus/noodles/pull/371>)
+//! - noodles-bam: expose record codec encode/decode (<https://github.com/zaeleus/noodles/pull/364>)
+//! - noodles-bam: optimized `RecordBuf` encoding (<https://github.com/zaeleus/noodles/pull/367>)
+//! - noodles-bam: `Record::as_ref()` raw bytes access (<https://github.com/zaeleus/noodles/pull/373>)
 //!
 //! This module should be removed once the upstream PRs are merged and released.
 
