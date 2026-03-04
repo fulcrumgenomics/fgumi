@@ -448,29 +448,6 @@ pub fn read_pos_at_ref_pos_raw(
     None
 }
 
-/// Zero-allocation unclipped 5' position from raw BAM bytes (0-based, for sorting).
-///
-/// Unlike [`unclipped_5prime_from_raw_bam`] which adds 1 for 1-based group keys,
-/// this uses the raw 0-based BAM position directly — matching what the sort
-/// comparator needs.
-#[inline]
-pub(crate) fn unclipped_5prime_sort(bam: &[u8], pos_0based: i32, reverse: bool) -> i32 {
-    let n_cigar_op = n_cigar_op(bam) as usize;
-    if n_cigar_op == 0 {
-        return pos_0based;
-    }
-    let l_read_name = l_read_name(bam) as usize;
-    let cigar_start = 32 + l_read_name;
-    if cigar_start + n_cigar_op * 4 > bam.len() {
-        return pos_0based;
-    }
-    if reverse {
-        unclipped_end_from_raw_cigar(pos_0based, bam, cigar_start, n_cigar_op)
-    } else {
-        unclipped_start_from_raw_cigar(pos_0based, bam, cigar_start, n_cigar_op)
-    }
-}
-
 /// Read a single CIGAR op directly from raw BAM bytes at the given byte offset.
 #[inline]
 fn cigar_op_at(bam: &[u8], offset: usize) -> u32 {

@@ -6,7 +6,7 @@
 //! Reference implementation:
 //! - samtools: `bam_sort.c` - `template_coordinate_key_t` and `bam1_cmp_template_coordinate`
 //!
-//! Note: fgbio's `SamOrder.scala` `TemplateCoordinateKey` has a different strand comparison
+//! Note: fgbio's `SamOrder.scala` `TemplateCoordinate` has a different strand comparison
 //! (forward before reverse) vs samtools (reverse before forward). We match samtools since
 //! that's what `fgumi group` validates against.
 

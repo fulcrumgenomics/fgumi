@@ -67,7 +67,7 @@ pub use external::ExternalSorter;
 pub use inline_buffer::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     CoordinateKey, PA_TAG, PrimaryAlignmentInfo, QuerynameKey, RawCoordinateKey, RawQuerynameKey,
-    RawSortKey, SortContext, SortKey, SortOrder, TemplateCoordinateKey,
+    RawSortKey, SortContext, SortKey, SortOrder,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
 pub use raw::{LibraryLookup, RawExternalSorter, extract_template_key_inline};

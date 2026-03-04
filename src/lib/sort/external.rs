@@ -22,7 +22,7 @@ use crate::bam_io::{
     BamReaderAuto, create_bam_reader, create_bam_writer, create_indexing_bam_writer,
     write_bai_index,
 };
-use crate::sort::keys::{CoordinateKey, QuerynameKey, SortKey, SortOrder, TemplateCoordinateKey};
+use crate::sort::keys::{CoordinateKey, QuerynameKey, SortKey, SortOrder};
 use anyhow::{Context, Result};
 use bstr::BString;
 use log::info;
@@ -165,7 +165,9 @@ impl ExternalSorter {
                 self.sort_with_key::<QuerynameKey>(reader, &header, output, temp_path)
             }
             SortOrder::TemplateCoordinate => {
-                self.sort_with_key::<TemplateCoordinateKey>(reader, &header, output, temp_path)
+                anyhow::bail!(
+                    "ExternalSorter does not support TemplateCoordinate; use RawExternalSorter"
+                )
             }
         }
     }
@@ -583,7 +585,7 @@ fn estimate_record_size(record: &RecordBuf) -> usize {
         + 256; // Estimated tag overhead
 
     // Add estimated sort key size (varies by sort order, ~100-200 bytes typical)
-    // TemplateCoordinateKey is the largest at ~150 bytes
+    // QuerynameKey is the largest at ~100 bytes
     record_size + 200
 }
 
