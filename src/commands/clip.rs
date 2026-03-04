@@ -92,7 +92,11 @@ pub struct Clip {
     pub clipping_mode: String,
 
     /// Output sort order (if not specified, output is in same order as input)
-    #[arg(short = 'S', long = "sort-order")]
+    #[arg(
+        short = 'S',
+        long = "sort-order",
+        value_parser = ["unknown", "unsorted", "queryname", "coordinate"]
+    )]
     pub sort_order: Option<String>,
 
     /// Clip overlapping read pairs
