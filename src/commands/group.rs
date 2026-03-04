@@ -18,7 +18,7 @@ use fgumi_lib::grouper::{
     build_templates_from_records,
 };
 use fgumi_lib::logging::{OperationTimer, log_umi_grouping_summary};
-use fgumi_lib::metrics::group::UmiGroupingMetrics;
+use fgumi_lib::metrics::group::{FamilySizeMetrics, UmiGroupingMetrics};
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
 use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
@@ -37,7 +37,6 @@ use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,20 +57,7 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
     }
 }
 
-/// Metrics describing the distribution of tag family sizes
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TagFamilySizeMetric {
-    /// The family size (number of templates per family)
-    pub family_size: usize,
-    /// The number of families with this size
-    pub count: u64,
-    /// The fraction of all families with this size
-    pub fraction: f64,
-    /// The fraction of families with size >= this size
-    pub fraction_gt_or_eq_family_size: f64,
-}
-
-// UmiGroupingMetrics is now imported from fgumi_lib::metrics
+// UmiGroupingMetrics and FamilySizeMetrics are imported from fgumi_lib::metrics
 
 /// Collected metrics from `serialize_fn`, aggregated after pipeline completion.
 #[derive(Default, Debug)]
@@ -481,7 +467,6 @@ fn assign_umi_groups_impl(
     templates: &mut [Template],
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
-    assign_tag_bytes: [u8; 2],
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
@@ -511,7 +496,6 @@ fn assign_umi_groups_impl(
                 indices,
                 assigner,
                 raw_tag,
-                assign_tag_bytes,
                 min_umi_length,
                 no_umi,
             )?;
@@ -524,7 +508,6 @@ fn assign_umi_groups_impl(
             &all_indices,
             assigner,
             raw_tag,
-            assign_tag_bytes,
             min_umi_length,
             no_umi,
         )?;
@@ -542,7 +525,6 @@ fn assign_umi_groups_for_indices_impl(
     indices: &[usize],
     assigner: &dyn UmiAssigner,
     raw_tag: [u8; 2],
-    _assign_tag_bytes: [u8; 2], // No longer used here - tags set during serialization
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
@@ -1195,7 +1177,6 @@ impl Command for GroupReadsByUmi {
                     &mut templates,
                     assigner.as_ref(),
                     raw_tag,
-                    assign_tag_bytes,
                     filter_config.min_umi_length,
                     no_umi,
                 ) {
@@ -1632,7 +1613,6 @@ impl GroupReadsByUmi {
             &mut templates,
             assigner.as_ref(),
             raw_tag,
-            assign_tag_bytes,
             filter_config.min_umi_length,
             filter_config.no_umi,
         ) {
@@ -1697,36 +1677,12 @@ impl GroupReadsByUmi {
     /// Write family size histogram
     fn write_family_size_histogram(&self, family_sizes: &AHashMap<usize, u64>) -> Result<()> {
         if let Some(path) = &self.family_size_histogram {
-            // Collect and sort by family size
-            let mut sorted: Vec<_> = family_sizes.iter().map(|(&s, &c)| (s, c)).collect();
-            sorted.sort_by_key(|(size, _)| *size);
-
-            // Calculate total count
-            #[allow(clippy::cast_precision_loss)]
-            let total: f64 = sorted.iter().map(|(_, count)| *count as f64).sum();
-
-            // Build metrics in reverse to calculate cumulative fraction in one pass
-            let mut metrics = Vec::with_capacity(sorted.len());
-            let mut cumulative = 0.0;
-            #[allow(clippy::cast_precision_loss)]
-            for &(family_size, count) in sorted.iter().rev() {
-                let fraction = count as f64 / total;
-                cumulative += fraction;
-                metrics.push(TagFamilySizeMetric {
-                    family_size,
-                    count,
-                    fraction,
-                    fraction_gt_or_eq_family_size: cumulative,
-                });
-            }
-            metrics.reverse();
-
-            // Write to file
+            let metrics =
+                FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
             DelimFile::default()
                 .write_tsv(path, metrics)
                 .with_context(|| format!("Failed to create file: {}", path.display()))?;
         }
-
         Ok(())
     }
 }
@@ -2290,11 +2246,11 @@ mod tests {
         // Check histogram was created
         assert!(&paths.histogram.exists(), "Histogram file should exist");
 
-        let metrics: Vec<TagFamilySizeMetric> = DelimFile::default().read_tsv(&paths.histogram)?;
+        let metrics: Vec<FamilySizeMetrics> = DelimFile::default().read_tsv(&paths.histogram)?;
         assert_eq!(metrics.len(), 3);
         assert_eq!(
             metrics[0],
-            TagFamilySizeMetric {
+            FamilySizeMetrics {
                 family_size: 1,
                 count: 1,
                 fraction: 0.333_333_333_333_333_3,
@@ -2303,7 +2259,7 @@ mod tests {
         );
         assert_eq!(
             metrics[1],
-            TagFamilySizeMetric {
+            FamilySizeMetrics {
                 family_size: 2,
                 count: 1,
                 fraction: 0.333_333_333_333_333_3,
@@ -2312,7 +2268,7 @@ mod tests {
         );
         assert_eq!(
             metrics[2],
-            TagFamilySizeMetric {
+            FamilySizeMetrics {
                 family_size: 3,
                 count: 1,
                 fraction: 0.333_333_333_333_333_3,

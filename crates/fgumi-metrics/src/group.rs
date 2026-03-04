@@ -84,7 +84,7 @@ impl crate::ProcessingMetrics for UmiGroupingMetrics {
 /// Family size distribution metrics.
 ///
 /// Describes the distribution of UMI family sizes in the dataset.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FamilySizeMetrics {
     /// Family size (number of reads)
     pub family_size: usize,
@@ -104,6 +104,32 @@ impl FamilySizeMetrics {
     #[must_use]
     pub fn new(family_size: usize) -> Self {
         Self { family_size, count: 0, fraction: 0.0, fraction_gt_or_eq_family_size: 0.0 }
+    }
+
+    /// Build family size metrics from (`family_size`, count) pairs.
+    ///
+    /// Returns a `Vec` sorted by ascending family size, with cumulative
+    /// fractions computed from largest to smallest.
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn from_size_counts(counts: impl IntoIterator<Item = (usize, u64)>) -> Vec<Self> {
+        let mut sorted: Vec<_> = counts.into_iter().collect();
+        sorted.sort_by_key(|(size, _)| *size);
+
+        let total: f64 = sorted.iter().map(|(_, count)| *count as f64).sum();
+        if total == 0.0 {
+            return Vec::new();
+        }
+
+        let mut metrics = Vec::with_capacity(sorted.len());
+        let mut cumulative = 0.0;
+        for &(family_size, count) in sorted.iter().rev() {
+            let fraction = count as f64 / total;
+            cumulative += fraction;
+            metrics.push(Self { family_size, count, fraction, fraction_gt_or_eq_family_size: cumulative });
+        }
+        metrics.reverse();
+        metrics
     }
 }
 
@@ -150,5 +176,26 @@ mod tests {
     fn test_metric_trait_impl() {
         assert_eq!(UmiGroupingMetrics::metric_name(), "UMI grouping");
         assert_eq!(FamilySizeMetrics::metric_name(), "family size");
+    }
+
+    #[test]
+    fn test_from_size_counts() {
+        let counts = vec![(3, 1u64), (1, 1), (2, 1)];
+        let metrics = FamilySizeMetrics::from_size_counts(counts);
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].family_size, 1);
+        assert_eq!(metrics[1].family_size, 2);
+        assert_eq!(metrics[2].family_size, 3);
+        // Each is 1/3 of total
+        assert!((metrics[0].fraction - 1.0 / 3.0).abs() < 1e-10);
+        // Cumulative from largest: size 3 = 1/3, size 2 = 2/3, size 1 = 1.0
+        assert!((metrics[0].fraction_gt_or_eq_family_size - 1.0).abs() < 1e-10);
+        assert!((metrics[2].fraction_gt_or_eq_family_size - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_from_size_counts_empty() {
+        let metrics = FamilySizeMetrics::from_size_counts(std::iter::empty());
+        assert!(metrics.is_empty());
     }
 }
