@@ -310,11 +310,6 @@ pub fn reverse_buf_value(value: &BufValue) -> BufValue {
 ///
 /// A new `BufValue` with reverse complemented sequence, or a clone if not a string
 ///
-/// # Panics
-///
-/// Cannot panic in practice: the byte-level complement maps ASCII to ASCII,
-/// so `String::from_utf8` always succeeds.
-///
 /// # Examples
 ///
 /// ```rust,ignore
@@ -328,7 +323,7 @@ pub fn revcomp_buf_value(value: &BufValue) -> BufValue {
     match value {
         BufValue::String(s) => {
             let revcomp = fgumi_dna::reverse_complement(s.as_bytes());
-            BufValue::from(String::from_utf8(revcomp).expect("complement of ASCII is ASCII"))
+            BufValue::from(String::from_utf8_lossy(&revcomp).into_owned())
         }
         _ => value.clone(),
     }
