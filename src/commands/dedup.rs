@@ -1039,7 +1039,7 @@ is selected as the representative; all others are marked as duplicates.
 # Input Requirements
 
 - Must be processed with `fgumi zipper` (adds `pa` tag for secondary/supplementary reads)
-- Must be sorted with `fgumi sort --order template-coordinate`
+- Must be sorted with `fgumi sort --order template-coordinate` (use matching `--cell-tag` value)
 - UMI tags on reads (default: RX tag)
 
 Note: Using `samtools sort` will NOT work correctly because it doesn't use the
@@ -1188,7 +1188,9 @@ impl Command for MarkDuplicates {
                 "Input BAM must be template-coordinate sorted.\n\n\
                 To prepare your BAM file, run:\n  \
                 fgumi zipper -u unmapped.bam -r reference.fa -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
+                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate \
+                --cell-tag {}",
+                self.cell_tag
             );
         }
         info!("Template-coordinate sorted");
@@ -1398,9 +1400,11 @@ impl Command for MarkDuplicates {
                 `fgumi zipper` during the merge of unmapped and mapped BAMs.\n\n\
                 To fix this, re-run your pipeline starting from `fgumi zipper`:\n  \
                 fgumi zipper --unmapped unmapped.bam --mapped aligned.bam -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
+                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate \
+                --cell-tag {}\n  \
                 fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_pa_tag
+                final_metrics.missing_pa_tag,
+                self.cell_tag
             );
         }
 

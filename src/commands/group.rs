@@ -670,8 +670,9 @@ Accepts reads in any order (including unsorted) and outputs reads sorted by:
    4. Read Name
 
 It is recommended to sort the reads into template-coordinate order prior to running
-this tool to avoid re-sorting the input. Use `fgumi sort --order template-coordinate` for
-the pre-sorting. The output will always be written in template-coordinate order.
+this tool to avoid re-sorting the input. Use `fgumi sort --order template-coordinate`
+(with matching `--cell-tag`) for the pre-sorting. The output will always be written
+in template-coordinate order.
 
 During grouping, reads and templates are filtered out as follows:
 
@@ -965,7 +966,9 @@ impl Command for GroupReadsByUmi {
                 bail!(
                     "Input BAM must be template-coordinate sorted.\n\n\
                     To sort your BAM file, run:\n  \
-                    fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
+                    fgumi sort -i input.bam -o sorted.bam --order template-coordinate \
+                    --cell-tag {}",
+                    self.cell_tag
                 );
             }
         }

@@ -401,6 +401,9 @@ pub struct RawExternalSorter {
     pg_info: Option<(String, String)>,
     /// Maximum temp files before consolidation (0 = unlimited).
     max_temp_files: usize,
+    /// Cell barcode tag for template-coordinate sort (e.g., `[b'C', b'B']`).
+    /// When `Some`, CB hash is included in sort key for single-cell data.
+    cell_tag: Option<[u8; 2]>,
 }
 
 impl RawExternalSorter {
@@ -417,6 +420,7 @@ impl RawExternalSorter {
             write_index: false,
             pg_info: None,
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
+            cell_tag: None,
         }
     }
 
@@ -485,6 +489,16 @@ impl RawExternalSorter {
     #[must_use]
     pub fn max_temp_files(mut self, max: usize) -> Self {
         self.max_temp_files = max;
+        self
+    }
+
+    /// Set the cell barcode tag for template-coordinate sort.
+    ///
+    /// When set, the CB hash is included in the sort key so that templates
+    /// from different cells at the same locus are not interleaved.
+    #[must_use]
+    pub fn cell_tag(mut self, tag: [u8; 2]) -> Self {
+        self.cell_tag = Some(tag);
         self
     }
 
@@ -1089,11 +1103,11 @@ impl RawExternalSorter {
 
         // Estimate capacity accounting for inline headers and cached-key refs
         // Memory layout per record:
-        //   - data: 40 bytes (inline header) + ~250 bytes (BAM record) = 290 bytes
-        //   - refs: 48 bytes (TemplateKey + u64 offset + u32 len + u32 pad)
-        //   - Total: ~338 bytes per record
+        //   - data: 48 bytes (inline header) + ~250 bytes (BAM record) = 298 bytes
+        //   - refs: 56 bytes (TemplateKey + u64 offset + u32 len + u32 pad)
+        //   - Total: ~354 bytes per record
         // The larger refs trade memory for cache locality during sort
-        let bytes_per_record = 338;
+        let bytes_per_record = 354;
         let estimated_records = self.memory_limit / bytes_per_record;
         // Allocate ~86% for data, ~14% for refs (48/338 ≈ 14%)
         let estimated_data_bytes = self.memory_limit * 86 / 100;
@@ -1112,7 +1126,7 @@ impl RawExternalSorter {
 
             // Extract template key and push to buffer
             let bam_bytes = record.as_ref();
-            let key = extract_template_key_inline(bam_bytes, &lib_lookup);
+            let key = extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag.as_ref());
             buffer.push(bam_bytes, key);
 
             // Check memory usage
@@ -1687,12 +1701,19 @@ impl RawExternalSorter {
 ///
 /// This function computes the template-coordinate sort key inline, avoiding
 /// heap allocations for the read name by using a hash instead.
+///
+/// When `cell_tag` is `Some`, the CB (cellular barcode) tag value is hashed
+/// and included in the sort key between neg2 and MI, matching fgbio's order.
 #[must_use]
-pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup) -> TemplateKey {
+pub fn extract_template_key_inline(
+    bam_bytes: &[u8],
+    lib_lookup: &LibraryLookup,
+    cell_tag: Option<&[u8; 2]>,
+) -> TemplateKey {
     use crate::sort::bam_fields;
     use bam_fields::{
-        find_mc_tag_in_record, find_mi_tag_in_record, flags, get_cigar_ops, mate_unclipped_5prime,
-        unclipped_5prime,
+        find_mc_tag_in_record, find_mi_tag_in_record, find_string_tag_in_record, flags,
+        get_cigar_ops, mate_unclipped_5prime, unclipped_5prime,
     };
 
     // Extract MI tag using fast raw byte scan (bypasses noodles overhead)
@@ -1700,6 +1721,19 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
 
     // Get library ordinal
     let library = lib_lookup.get_ordinal(bam_bytes);
+
+    // Hash cell barcode tag if requested
+    let cb_hash = cell_tag.map_or(0u64, |tag| {
+        find_string_tag_in_record(bam_bytes, tag).map_or(0u64, |cb_bytes| {
+            let state = ahash::RandomState::with_seeds(
+                0xa1b2_c3d4_e5f6_0718,
+                0x9182_7364_5546_3728,
+                0xfede_dcba_0987_6543,
+                0x0011_2233_4455_6677,
+            );
+            state.hash_one(cb_bytes)
+        })
+    });
 
     // Extract fields from raw bytes
     let tid = bam_fields::ref_id(bam_bytes);
@@ -1739,6 +1773,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
                 i32::MAX,
                 i32::MAX,
                 false,
+                cb_hash,
                 library,
                 mi,
                 name_hash,
@@ -1748,7 +1783,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
 
         // Completely unmapped - sort to end
         let is_read2 = (flag & 0x80) != 0; // is_last_segment flag
-        return TemplateKey::unmapped(name_hash, is_read2);
+        return TemplateKey::unmapped(name_hash, cb_hash, is_read2);
     }
 
     // Calculate unclipped 5' position for this read
@@ -1781,7 +1816,7 @@ pub fn extract_template_key_inline(bam_bytes: &[u8], lib_lookup: &LibraryLookup)
         (tid, i32::MAX, this_pos, i32::MAX, is_reverse, false, false)
     };
 
-    TemplateKey::new(tid1, pos1, neg1, tid2, pos2, neg2, library, mi, name_hash, is_upper)
+    TemplateKey::new(tid1, pos1, neg1, tid2, pos2, neg2, cb_hash, library, mi, name_hash, is_upper)
 }
 
 // Use shared SortStats from the parent module.
@@ -2006,5 +2041,148 @@ mod tests {
             fgumi_raw_bam::tags::find_string_tag_in_record(&bam, b"RG"),
             Some(b"mygroup".as_slice())
         );
+    }
+
+    // ========================================================================
+    // RawExternalSorter cell_tag builder tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_sorter_cell_tag_default_is_none() {
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        assert!(sorter.cell_tag.is_none());
+    }
+
+    #[test]
+    fn test_raw_sorter_cell_tag_builder() {
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(*b"CB");
+        assert_eq!(sorter.cell_tag, Some(*b"CB"));
+    }
+
+    // ========================================================================
+    // extract_template_key_inline cell_tag tests
+    // ========================================================================
+
+    /// Build minimal BAM bytes with mapped read at (tid, pos) on the forward strand,
+    /// with optional aux data appended.
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_mapped_bam(tid: i32, pos: i32, name: &[u8], aux: &[u8]) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
+        let mut bam = vec![0u8; 32];
+        // ref_id at offset 0..4
+        bam[0..4].copy_from_slice(&tid.to_le_bytes());
+        // pos at offset 4..8
+        bam[4..8].copy_from_slice(&pos.to_le_bytes());
+        // l_read_name at offset 8
+        bam[8] = l_read_name;
+        // flags at offset 14..16: paired + proper pair = 0x03
+        bam[14..16].copy_from_slice(&3u16.to_le_bytes());
+        // mate_ref_id at offset 20..24: same tid
+        bam[20..24].copy_from_slice(&tid.to_le_bytes());
+        // mate_pos at offset 24..28: same pos
+        bam[24..28].copy_from_slice(&pos.to_le_bytes());
+        // read name
+        bam.extend_from_slice(name);
+        bam.push(0); // null terminator
+        // no cigar, no seq, no qual
+        // aux data
+        bam.extend_from_slice(aux);
+        bam
+    }
+
+    /// Build CB:Z: aux tag bytes.
+    fn cb_aux(value: &[u8]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"CBZ");
+        aux.extend_from_slice(value);
+        aux.push(0); // null terminator
+        aux
+    }
+
+    #[test]
+    fn test_extract_template_key_cb_present_has_nonzero_hash() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+
+        let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"));
+        assert_ne!(key.cb_hash, 0, "CB present should produce non-zero cb_hash");
+    }
+
+    #[test]
+    fn test_extract_template_key_cb_absent_has_zero_hash() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        // No CB tag in aux data
+        let bam = build_mapped_bam(0, 100, b"read1", &[]);
+
+        let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"));
+        assert_eq!(key.cb_hash, 0, "missing CB tag should produce cb_hash=0");
+    }
+
+    #[test]
+    fn test_extract_template_key_cell_tag_none_has_zero_hash() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+
+        let key = extract_template_key_inline(&bam, &lib_lookup, None);
+        assert_eq!(key.cb_hash, 0, "cell_tag=None should produce cb_hash=0");
+    }
+
+    #[test]
+    fn test_extract_template_key_different_cb_values_differ() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+
+        let aux1 = cb_aux(b"ACGTACGT");
+        let bam1 = build_mapped_bam(0, 100, b"read1", &aux1);
+        let key1 = extract_template_key_inline(&bam1, &lib_lookup, Some(b"CB"));
+
+        let aux2 = cb_aux(b"TGCATGCA");
+        let bam2 = build_mapped_bam(0, 100, b"read1", &aux2);
+        let key2 = extract_template_key_inline(&bam2, &lib_lookup, Some(b"CB"));
+
+        assert_ne!(
+            key1.cb_hash, key2.cb_hash,
+            "different CB values should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_extract_template_key_cb_hash_is_deterministic() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+        let bam = build_mapped_bam(0, 100, b"read1", &aux);
+
+        let key1 = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"));
+        let key2 = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"));
+        assert_eq!(key1.cb_hash, key2.cb_hash, "same input should produce same cb_hash");
+    }
+
+    #[test]
+    fn test_extract_template_key_unmapped_with_cb() {
+        let header = Header::builder().build();
+        let lib_lookup = LibraryLookup::from_header(&header);
+        let aux = cb_aux(b"ACGTACGT");
+
+        // Build unmapped read (flag = PAIRED | UNMAPPED | MATE_UNMAPPED = 0x0D)
+        let mut bam = vec![0u8; 32];
+        bam[8] = 6; // l_read_name = 6 ("read1" + null)
+        bam[14..16].copy_from_slice(&0x000Du16.to_le_bytes()); // flags
+        // ref_id = -1 (unmapped)
+        bam[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        bam[4..8].copy_from_slice(&(-1i32).to_le_bytes()); // pos = -1
+        bam[20..24].copy_from_slice(&(-1i32).to_le_bytes()); // mate_ref_id = -1
+        bam[24..28].copy_from_slice(&(-1i32).to_le_bytes()); // mate_pos = -1
+        bam.extend_from_slice(b"read1\0");
+        bam.extend_from_slice(&aux);
+
+        let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"));
+        assert_ne!(key.cb_hash, 0, "unmapped read with CB should have non-zero cb_hash");
+        assert_eq!(key.primary, u64::MAX, "unmapped both-mates should have MAX primary");
     }
 }
