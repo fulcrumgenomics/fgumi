@@ -17,6 +17,7 @@
 //! - **Buffer recycling**: Reuses temp file buffers
 //! - **Fast compression**: Level 1 for temp files, configurable for output
 
+use super::MERGE_BUFFER_SIZE;
 use crate::bam_io::{
     BamReaderAuto, create_bam_reader, create_bam_writer, create_indexing_bam_writer,
     write_bai_index,
@@ -46,9 +47,6 @@ const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 /// This should be conservative to prevent OOM but not so high that we spill unnecessarily.
 /// Actual `RecordBuf` + Key overhead is ~800-1200 bytes for typical BAM records.
 const ESTIMATED_RECORD_SIZE: usize = 800;
-
-/// Buffer size for reading temp files during merge.
-const MERGE_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Compression level for temporary files (fast compression).
 const TEMP_COMPRESSION_LEVEL: u32 = 1;
@@ -570,13 +568,7 @@ impl ExternalSorter {
 
     /// Create temporary directory for spill files.
     fn create_temp_dir(&self) -> Result<TempDir> {
-        match &self.temp_dir {
-            Some(base) => {
-                std::fs::create_dir_all(base)?;
-                TempDir::new_in(base).context("Failed to create temp directory")
-            }
-            None => TempDir::new().context("Failed to create temp directory"),
-        }
+        super::create_temp_dir(self.temp_dir.as_deref())
     }
 }
 
@@ -654,16 +646,8 @@ impl<K: Ord> Ord for HeapEntry<K> {
     }
 }
 
-/// Statistics from a sort operation.
-#[derive(Default, Debug)]
-pub struct SortStats {
-    /// Total records read from input.
-    pub total_records: u64,
-    /// Records written to output.
-    pub output_records: u64,
-    /// Number of temporary chunk files written.
-    pub chunks_written: usize,
-}
+// Re-export SortStats from the parent module.
+pub use super::SortStats;
 
 #[cfg(test)]
 mod tests {

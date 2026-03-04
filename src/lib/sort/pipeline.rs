@@ -36,10 +36,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
+use super::MERGE_BUFFER_SIZE;
 use crate::bam_io::create_bam_writer;
-
-/// Buffer size for reading temp files during merge.
-const MERGE_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Number of records to prefetch per chunk reader.
 const PREFETCH_BUFFER_SIZE: usize = 128;
