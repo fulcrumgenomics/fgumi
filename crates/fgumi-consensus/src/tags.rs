@@ -254,6 +254,7 @@ pub fn is_consensus(rec: &impl noodles::sam::alignment::Record) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bstr::ByteSlice;
     use fgumi_sam::builder::RecordBuilder;
 
     #[test]

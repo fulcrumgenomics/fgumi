@@ -1760,7 +1760,7 @@ mod tests {
         // Create a record with NM:i:42 (4-byte int, in-place update)
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         // Manually append an i32 tag
-        rec.extend_from_slice(&[b'N', b'M', b'i']);
+        rec.extend_from_slice(b"NMi");
         rec.extend_from_slice(&42i32.to_le_bytes());
         update_int_tag(&mut rec, b"NM", 99);
         let aux = aux_data_slice(&rec);

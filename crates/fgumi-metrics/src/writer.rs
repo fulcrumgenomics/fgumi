@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn test_read_metrics_auto_roundtrip() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let original = vec![TestMetrics { name: "auto".to_string(), count: 42, value: 3.14 }];
+        let original = vec![TestMetrics { name: "auto".to_string(), count: 42, value: 1.5 }];
 
         write_metrics_auto(temp_file.path(), &original)?;
         let read_back: Vec<TestMetrics> = read_metrics_auto(temp_file.path())?;

@@ -228,11 +228,7 @@ mod tests {
             RejectionReason::ZeroBasesPostTrimming,
         ];
         for reason in &all_reasons {
-            assert!(
-                !reason.kv_description().is_empty(),
-                "kv_description for {:?} is empty",
-                reason
-            );
+            assert!(!reason.kv_description().is_empty(), "kv_description for {reason:?} is empty");
         }
     }
 

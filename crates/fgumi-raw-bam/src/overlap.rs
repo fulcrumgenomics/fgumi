@@ -834,13 +834,13 @@ mod tests {
         aux.extend_from_slice(b"MCZ87S182M\x00");
         let rec = make_bam_bytes_with_tlen(
             0,
-            11576620,                                   // 0-based pos
+            11_576_620,                                 // 0-based pos
             flags::PAIRED | flags::MATE_REVERSE | 0x40, // flag=97 (0x40=first_in_pair)
             b"rea",
             &[encode_op(0, 145), encode_op(4, 124)], // 145M124S
             269,                                     // seq_len = 145 + 124
             0,                                       // same ref
-            11576412,                                // 0-based mate pos
+            11_576_412,                              // 0-based mate pos
             -28,                                     // TLEN
             &aux,
         );
@@ -857,13 +857,13 @@ mod tests {
         aux.extend_from_slice(b"MCZ145M124S\x00");
         let rec = make_bam_bytes_with_tlen(
             0,
-            11576412,                              // 0-based pos
+            11_576_412,                            // 0-based pos
             flags::PAIRED | flags::REVERSE | 0x80, // flag=145 (0x80=second_in_pair)
             b"rea",
             &[encode_op(4, 87), encode_op(0, 182)], // 87S182M
             269,                                    // seq_len = 87 + 182
             0,                                      // same ref
-            11576620,                               // 0-based mate pos
+            11_576_620,                             // 0-based mate pos
             28,                                     // TLEN
             &aux,
         );

@@ -4055,16 +4055,17 @@ mod tests {
     }
 
     /// Test that orphan consensus rejection does not double-count reads that were already
-    /// individually rejected inside `process_subgroup` (e.g. as MinorityAlignment).
+    /// individually rejected inside `process_subgroup` (e.g. as `MinorityAlignment`).
     ///
     /// Scenario: R1 succeeds with internal rejections, R2 fails entirely.
     /// - 3 read pairs. R1: 2 reads with 50M (majority), 1 with 25M25I (minority alignment).
-    /// - R2: all bases low quality → ZeroLengthAfterTrimming for all 3.
-    /// - R1 builds consensus from 2 surviving reads, 1 rejected as MinorityAlignment.
+    /// - R2: all bases low quality -> `ZeroLengthAfterTrimming` for all 3.
+    /// - R1 builds consensus from 2 surviving reads, 1 rejected as `MinorityAlignment`.
     /// - R2 fails completely, triggering orphan handler.
-    /// - OrphanConsensus should count 2 (surviving R1 reads), not 3 (original R1 count).
-    /// - filtered_reads must not exceed total_reads.
+    /// - `OrphanConsensus` should count 2 (surviving R1 reads), not 3 (original R1 count).
+    /// - `filtered_reads` must not exceed `total_reads`.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_orphan_consensus_no_double_count_r1_succeeds_r2_fails() {
         let seq_50 = "A".repeat(50);
         let good_quals = vec![30u8; 50];
@@ -4205,11 +4206,12 @@ mod tests {
     ///
     /// Scenario: R2 succeeds with internal rejections, R1 fails entirely.
     /// - 3 read pairs. R2: 2 reads with 50M (majority), 1 with 25M25I (minority alignment).
-    /// - R1: all bases low quality → ZeroLengthAfterTrimming for all 3.
-    /// - R2 builds consensus from 2 surviving reads, 1 rejected as MinorityAlignment.
+    /// - R1: all bases low quality -> `ZeroLengthAfterTrimming` for all 3.
+    /// - R2 builds consensus from 2 surviving reads, 1 rejected as `MinorityAlignment`.
     /// - R1 fails completely, triggering orphan handler.
-    /// - OrphanConsensus should count 2 (surviving R2 reads), not 3 (original R2 count).
+    /// - `OrphanConsensus` should count 2 (surviving R2 reads), not 3 (original R2 count).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_orphan_consensus_no_double_count_r1_fails_r2_succeeds() {
         let seq_50 = "A".repeat(50);
         let good_quals = vec![30u8; 50];
