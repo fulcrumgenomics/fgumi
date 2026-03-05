@@ -1,6 +1,4 @@
-use crate::fields::{
-    TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size,
-};
+use crate::fields::{TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size};
 
 /// Find a tag's position and type byte in auxiliary data.
 ///

@@ -474,8 +474,7 @@ pub fn make_prefix_from_header(header: &Header) -> String {
     ids.dedup();
 
     // Calculate total length including separators
-    let total_len: usize =
-        ids.iter().map(String::len).sum::<usize>() + ids.len().saturating_sub(1);
+    let total_len: usize = ids.iter().map(String::len).sum::<usize>() + ids.len().saturating_sub(1);
 
     if total_len <= 200 {
         ids.join("|")
@@ -834,14 +833,10 @@ mod tests {
         let lib_a = "A".repeat(100);
         let lib_b = "B".repeat(99);
 
-        let rg1 = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, lib_a.clone())
-            .build()
-            .unwrap();
-        let rg2 = Map::<ReadGroup>::builder()
-            .insert(rg_tag::LIBRARY, lib_b.clone())
-            .build()
-            .unwrap();
+        let rg1 =
+            Map::<ReadGroup>::builder().insert(rg_tag::LIBRARY, lib_a.clone()).build().unwrap();
+        let rg2 =
+            Map::<ReadGroup>::builder().insert(rg_tag::LIBRARY, lib_b.clone()).build().unwrap();
         let header = HeaderBuilder::default()
             .add_read_group(BString::from("RG1"), rg1)
             .add_read_group(BString::from("RG2"), rg2)

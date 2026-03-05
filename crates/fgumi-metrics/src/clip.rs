@@ -465,15 +465,11 @@ mod tests {
         let mut collection = ClippingMetricsCollection::new();
 
         let record = create_test_record("90M", false);
-        collection
-            .read_one
-            .update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
+        collection.read_one.update(&record, ClipCounts { five_prime: 10, ..ClipCounts::default() });
         collection
             .read_two
             .update(&record, ClipCounts { three_prime: 10, ..ClipCounts::default() });
-        collection
-            .fragment
-            .update(&record, ClipCounts { five_prime: 5, ..ClipCounts::default() });
+        collection.fragment.update(&record, ClipCounts { five_prime: 5, ..ClipCounts::default() });
 
         collection.finalize();
 

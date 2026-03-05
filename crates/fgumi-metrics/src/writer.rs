@@ -230,8 +230,7 @@ mod tests {
 
     #[test]
     fn test_read_metrics_invalid_path() {
-        let result: Result<Vec<TestMetrics>> =
-            read_metrics("/nonexistent/path/file.tsv", "test");
+        let result: Result<Vec<TestMetrics>> = read_metrics("/nonexistent/path/file.tsv", "test");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to read test metrics"));

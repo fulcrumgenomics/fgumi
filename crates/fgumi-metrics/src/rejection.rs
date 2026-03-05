@@ -82,9 +82,7 @@ impl RejectionReason {
         match self {
             Self::InsufficientSupport => "raw_reads_rejected_for_insufficient_support",
             Self::MinorityAlignment => "raw_reads_rejected_for_minority_alignment",
-            Self::InsufficientStrandSupport => {
-                "raw_reads_rejected_for_insufficient_strand_support"
-            }
+            Self::InsufficientStrandSupport => "raw_reads_rejected_for_insufficient_strand_support",
             Self::LowBaseQuality => "raw_reads_rejected_for_low_base_quality",
             Self::ExcessiveNBases => "raw_reads_rejected_for_excessive_n_bases",
             Self::NoValidAlignment => "raw_reads_rejected_for_no_valid_alignment",
@@ -230,7 +228,11 @@ mod tests {
             RejectionReason::ZeroBasesPostTrimming,
         ];
         for reason in &all_reasons {
-            assert!(!reason.kv_description().is_empty(), "kv_description for {:?} is empty", reason);
+            assert!(
+                !reason.kv_description().is_empty(),
+                "kv_description for {:?} is empty",
+                reason
+            );
         }
     }
 
