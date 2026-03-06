@@ -1024,9 +1024,7 @@ mod tests {
         let mc_tag = Tag::from([b'M', b'C']);
         // Create a read then replace the MC tag with invalid UTF-8 bytes
         let mut record = create_mc_test_read("invalid_utf8", 200, "50M");
-        record
-            .data_mut()
-            .insert(mc_tag, Value::String(vec![0xFF, 0xFE].into()));
+        record.data_mut().insert(mc_tag, Value::String(vec![0xFF, 0xFE].into()));
 
         assert_eq!(mate_unclipped_start(&record), None);
         assert_eq!(mate_unclipped_end(&record), None);

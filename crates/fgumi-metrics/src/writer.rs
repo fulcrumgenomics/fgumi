@@ -230,8 +230,7 @@ mod tests {
 
     #[test]
     fn test_read_metrics_invalid_path() {
-        let result: Result<Vec<TestMetrics>> =
-            read_metrics("/nonexistent/path/file.tsv", "test");
+        let result: Result<Vec<TestMetrics>> = read_metrics("/nonexistent/path/file.tsv", "test");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to read test metrics"));
@@ -240,7 +239,7 @@ mod tests {
     #[test]
     fn test_read_metrics_auto_roundtrip() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
-        let original = vec![TestMetrics { name: "auto".to_string(), count: 42, value: 3.14 }];
+        let original = vec![TestMetrics { name: "auto".to_string(), count: 42, value: 1.5 }];
 
         write_metrics_auto(temp_file.path(), &original)?;
         let read_back: Vec<TestMetrics> = read_metrics_auto(temp_file.path())?;

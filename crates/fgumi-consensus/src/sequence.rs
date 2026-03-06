@@ -422,7 +422,7 @@ mod tests {
             ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
 
         seq.bases_mut()[0] = b'T';
-        assert_eq!(seq.bases(), &[b'T', b'C']);
+        assert_eq!(seq.bases(), b"TC");
     }
 
     #[test]
@@ -509,7 +509,7 @@ mod tests {
         let empty = ConsensusSequence::new();
         seq.extend(&empty);
         assert_eq!(seq.len(), 2);
-        assert_eq!(seq.bases(), &[b'A', b'C']);
+        assert_eq!(seq.bases(), b"AC");
     }
 
     #[test]
@@ -519,6 +519,6 @@ mod tests {
             ConsensusSequence::from_vecs(vec![b'A', b'C'], vec![30, 25], vec![10, 8], vec![0, 1]);
         empty.extend(&seq);
         assert_eq!(empty.len(), 2);
-        assert_eq!(empty.bases(), &[b'A', b'C']);
+        assert_eq!(empty.bases(), b"AC");
     }
 }

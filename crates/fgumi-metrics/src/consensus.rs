@@ -196,9 +196,7 @@ impl ConsensusMetrics {
         match reason {
             RejectionReason::InsufficientSupport => self.rejected_insufficient_support,
             RejectionReason::MinorityAlignment => self.rejected_minority_alignment,
-            RejectionReason::InsufficientStrandSupport => {
-                self.rejected_insufficient_strand_support
-            }
+            RejectionReason::InsufficientStrandSupport => self.rejected_insufficient_strand_support,
             RejectionReason::LowBaseQuality => self.rejected_low_base_quality,
             RejectionReason::ExcessiveNBases => self.rejected_excessive_n_bases,
             RejectionReason::NoValidAlignment => self.rejected_no_valid_alignment,

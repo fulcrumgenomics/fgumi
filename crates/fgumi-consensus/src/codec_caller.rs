@@ -84,8 +84,8 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
-use noodles::sam::alignment::record::data::field::Tag;
 use fgumi_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
+use noodles::sam::alignment::record::data::field::Tag;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -1567,13 +1567,13 @@ impl CodecConsensusCaller {
 )]
 mod tests {
     use super::*;
+    use fgumi_raw_bam::ParsedBamRecord;
     use fgumi_sam::builder::RecordBuilder;
     use fgumi_sam::clipper::cigar_utils;
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::Cigar as CigarTrait;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::cigar::op::Kind;
-    use fgumi_raw_bam::ParsedBamRecord;
 
     #[test]
     fn test_codec_caller_creation() {

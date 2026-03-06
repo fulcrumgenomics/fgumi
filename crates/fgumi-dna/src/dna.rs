@@ -108,13 +108,7 @@ pub const fn complement_base_preserve_case(base: u8) -> u8 {
 pub fn reverse_complement_str(seq: &str) -> String {
     seq.chars()
         .rev()
-        .map(|c| {
-            if c.is_ascii() {
-                complement_base_preserve_case(c as u8) as char
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_ascii() { complement_base_preserve_case(c as u8) as char } else { c })
         .collect()
 }
 

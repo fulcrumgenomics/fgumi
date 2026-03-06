@@ -793,16 +793,16 @@ mod tests {
     #[test]
     fn test_extract_template_coordinate_fields_basic() {
         let rec = make_bam_bytes_with_tlen(
-            3,                                                     // tid
-            200,                                                   // pos
-            flags::PAIRED | flags::REVERSE | flags::MATE_REVERSE,  // flag
-            b"read1",                                              // name
-            &[encode_op(0, 10)],                                   // 10M cigar
-            6,                                                     // seq_len
-            5,                                                     // mate_tid
-            400,                                                   // mate_pos
-            150,                                                   // tlen
-            &[],                                                   // aux
+            3,                                                    // tid
+            200,                                                  // pos
+            flags::PAIRED | flags::REVERSE | flags::MATE_REVERSE, // flag
+            b"read1",                                             // name
+            &[encode_op(0, 10)],                                  // 10M cigar
+            6,                                                    // seq_len
+            5,                                                    // mate_tid
+            400,                                                  // mate_pos
+            150,                                                  // tlen
+            &[],                                                  // aux
         );
         let fields = extract_template_coordinate_fields(&rec);
         assert_eq!(fields.tid, 3);

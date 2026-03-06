@@ -126,7 +126,12 @@ impl FamilySizeMetrics {
         for &(family_size, count) in sorted.iter().rev() {
             let fraction = count as f64 / total;
             cumulative += fraction;
-            metrics.push(Self { family_size, count, fraction, fraction_gt_or_eq_family_size: cumulative });
+            metrics.push(Self {
+                family_size,
+                count,
+                fraction,
+                fraction_gt_or_eq_family_size: cumulative,
+            });
         }
         metrics.reverse();
         metrics

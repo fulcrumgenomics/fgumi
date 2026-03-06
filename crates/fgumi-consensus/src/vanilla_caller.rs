@@ -13,11 +13,11 @@ use crate::phred::{
 use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
+use fgumi_raw_bam::{UnmappedBamRecordBuilder, flags};
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 #[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
-use fgumi_raw_bam::{UnmappedBamRecordBuilder, flags};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -936,15 +936,13 @@ impl VanillaUmiConsensusCaller {
                 output.extend(&r1r2_output);
             }
             (true, false) => {
-                self.stats
-                    .record_rejection(RejectionReason::OrphanConsensus, r1_surviving_count);
+                self.stats.record_rejection(RejectionReason::OrphanConsensus, r1_surviving_count);
                 if self.track_rejects {
                     self.rejected_reads.extend(r1_surviving_reads);
                 }
             }
             (false, true) => {
-                self.stats
-                    .record_rejection(RejectionReason::OrphanConsensus, r2_surviving_count);
+                self.stats.record_rejection(RejectionReason::OrphanConsensus, r2_surviving_count);
                 if self.track_rejects {
                     self.rejected_reads.extend(r2_surviving_reads);
                 }
@@ -1359,6 +1357,7 @@ pub(crate) enum ReadType {
 mod tests {
     use super::*;
     use bstr::BString;
+    use fgumi_raw_bam::ParsedBamRecord;
     use fgumi_sam::builder::{RecordBuilder, RecordPairBuilder};
     use fgumi_sam::record_utils;
     use noodles::core::Position;
@@ -1366,7 +1365,6 @@ mod tests {
     use noodles::sam::alignment::record::cigar::op::Op;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence, data::field::Value};
-    use fgumi_raw_bam::ParsedBamRecord;
 
     /// Build a SAM header with a dummy reference sequence so that records
     /// with `reference_sequence_id(0)` or `mate_reference_sequence_id(0)` can be encoded.
@@ -4057,16 +4055,17 @@ mod tests {
     }
 
     /// Test that orphan consensus rejection does not double-count reads that were already
-    /// individually rejected inside `process_subgroup` (e.g. as MinorityAlignment).
+    /// individually rejected inside `process_subgroup` (e.g. as `MinorityAlignment`).
     ///
     /// Scenario: R1 succeeds with internal rejections, R2 fails entirely.
     /// - 3 read pairs. R1: 2 reads with 50M (majority), 1 with 25M25I (minority alignment).
-    /// - R2: all bases low quality → ZeroLengthAfterTrimming for all 3.
-    /// - R1 builds consensus from 2 surviving reads, 1 rejected as MinorityAlignment.
+    /// - R2: all bases low quality -> `ZeroLengthAfterTrimming` for all 3.
+    /// - R1 builds consensus from 2 surviving reads, 1 rejected as `MinorityAlignment`.
     /// - R2 fails completely, triggering orphan handler.
-    /// - OrphanConsensus should count 2 (surviving R1 reads), not 3 (original R1 count).
-    /// - filtered_reads must not exceed total_reads.
+    /// - `OrphanConsensus` should count 2 (surviving R1 reads), not 3 (original R1 count).
+    /// - `filtered_reads` must not exceed `total_reads`.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_orphan_consensus_no_double_count_r1_succeeds_r2_fails() {
         let seq_50 = "A".repeat(50);
         let good_quals = vec![30u8; 50];
@@ -4207,11 +4206,12 @@ mod tests {
     ///
     /// Scenario: R2 succeeds with internal rejections, R1 fails entirely.
     /// - 3 read pairs. R2: 2 reads with 50M (majority), 1 with 25M25I (minority alignment).
-    /// - R1: all bases low quality → ZeroLengthAfterTrimming for all 3.
-    /// - R2 builds consensus from 2 surviving reads, 1 rejected as MinorityAlignment.
+    /// - R1: all bases low quality -> `ZeroLengthAfterTrimming` for all 3.
+    /// - R2 builds consensus from 2 surviving reads, 1 rejected as `MinorityAlignment`.
     /// - R1 fails completely, triggering orphan handler.
-    /// - OrphanConsensus should count 2 (surviving R2 reads), not 3 (original R2 count).
+    /// - `OrphanConsensus` should count 2 (surviving R2 reads), not 3 (original R2 count).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_orphan_consensus_no_double_count_r1_fails_r2_succeeds() {
         let seq_50 = "A".repeat(50);
         let good_quals = vec![30u8; 50];

@@ -2121,9 +2121,9 @@ impl ConsensusCaller for DuplexConsensusCaller {
 )]
 mod tests {
     use super::*;
+    use fgumi_raw_bam::ParsedBamRecord;
     use fgumi_sam::builder::RecordBuilder;
     use noodles::sam::alignment::record_buf::data::field::Value;
-    use fgumi_raw_bam::ParsedBamRecord;
 
     fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
         let header = noodles::sam::Header::default();
