@@ -302,9 +302,9 @@ pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
 /// Extended key for template-coordinate sorting.
 ///
 /// Template-coordinate requires comparing multiple fields:
-/// tid1, tid2, pos1, pos2, neg1, neg2, library, MI, name, `is_upper`
+/// tid1, tid2, pos1, pos2, neg1, neg2, CB, library, MI, name, `is_upper`
 ///
-/// We pack these into 4 u64 values for efficient comparison.
+/// We pack these into 5 u64 values for efficient comparison.
 /// The `name_hash_upper` field packs both `name_hash` and `is_upper`:
 /// - Upper 63 bits: name hash (groups same names together)
 /// - Lowest bit: `is_upper` (false=0, true=1)
@@ -320,6 +320,10 @@ pub struct TemplateKey {
     /// Packed: (pos2 << 32) | (!neg1 << 1) | !neg2
     /// neg flags inverted so reverse (neg=true) sorts before forward (neg=false)
     pub secondary: u64,
+    /// Hash of the CB (cellular barcode) tag value.
+    /// Inserted between neg2 and MI to match fgbio's sort order.
+    /// 0 when no cell tag is present or `cell_tag` is disabled.
+    pub cb_hash: u64,
     /// Packed: (library << 48) | (`mi_value` << 1) | `mi_suffix`
     pub tertiary: u64,
     /// Packed: (`name_hash` << 1) | `is_upper`
@@ -338,6 +342,7 @@ impl TemplateKey {
         tid2: i32,
         pos2: i32,
         neg2: bool,
+        cb_hash: u64,
         library: u32,
         mi: (u64, bool),
         name_hash: u64,
@@ -371,15 +376,16 @@ impl TemplateKey {
         // This ensures same-name records group together, with is_upper=false before is_upper=true
         let p4 = (name_hash << 1) | u64::from(is_upper);
 
-        Self { primary: p1, secondary: p2, tertiary: p3, name_hash_upper: p4 }
+        Self { primary: p1, secondary: p2, cb_hash, tertiary: p3, name_hash_upper: p4 }
     }
 
     /// Create a key for completely unmapped records.
     #[must_use]
-    pub fn unmapped(name_hash: u64, is_read2: bool) -> Self {
+    pub fn unmapped(name_hash: u64, cb_hash: u64, is_read2: bool) -> Self {
         Self {
             primary: u64::MAX,
             secondary: u64::MAX,
+            cb_hash,
             tertiary: 0,
             name_hash_upper: (name_hash << 1) | u64::from(is_read2),
         }
@@ -389,7 +395,7 @@ impl TemplateKey {
     #[inline]
     #[must_use]
     pub fn zeroed() -> Self {
-        Self { primary: 0, secondary: 0, tertiary: 0, name_hash_upper: 0 }
+        Self { primary: 0, secondary: 0, cb_hash: 0, tertiary: 0, name_hash_upper: 0 }
     }
 }
 
@@ -403,19 +409,20 @@ impl TemplateKey {
     /// Serialize to bytes for storage in keyed temp files.
     #[inline]
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 32] {
-        let mut buf = [0u8; 32];
+    pub fn to_bytes(&self) -> [u8; 40] {
+        let mut buf = [0u8; 40];
         buf[0..8].copy_from_slice(&self.primary.to_le_bytes());
         buf[8..16].copy_from_slice(&self.secondary.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.tertiary.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.name_hash_upper.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.cb_hash.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.tertiary.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.name_hash_upper.to_le_bytes());
         buf
     }
 
     /// Deserialize from bytes read from keyed temp files.
     #[inline]
     #[must_use]
-    pub fn from_bytes(buf: &[u8; 32]) -> Self {
+    pub fn from_bytes(buf: &[u8; 40]) -> Self {
         Self {
             primary: u64::from_le_bytes([
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -423,11 +430,14 @@ impl TemplateKey {
             secondary: u64::from_le_bytes([
                 buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
             ]),
-            tertiary: u64::from_le_bytes([
+            cb_hash: u64::from_le_bytes([
                 buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
             ]),
-            name_hash_upper: u64::from_le_bytes([
+            tertiary: u64::from_le_bytes([
                 buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+            ]),
+            name_hash_upper: u64::from_le_bytes([
+                buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
             ]),
         }
     }
@@ -444,6 +454,7 @@ impl Ord for TemplateKey {
         self.primary
             .cmp(&other.primary)
             .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.cb_hash.cmp(&other.cb_hash))
             .then_with(|| self.tertiary.cmp(&other.tertiary))
             // name_hash_upper comparison handles both name grouping AND is_upper ordering
             .then_with(|| self.name_hash_upper.cmp(&other.name_hash_upper))
@@ -451,7 +462,7 @@ impl Ord for TemplateKey {
 }
 
 impl TemplateKey {
-    /// Compare only core fields (tid1, tid2, pos1, pos2, neg1, neg2, library, MI).
+    /// Compare only core fields (tid1, tid2, pos1, pos2, neg1, neg2, CB, library, MI).
     ///
     /// This ignores the `name_hash` tie-breaker, allowing verification to accept
     /// both fgumi and samtools sorted files (which differ only in tie-breaking).
@@ -461,12 +472,13 @@ impl TemplateKey {
         self.primary
             .cmp(&other.primary)
             .then_with(|| self.secondary.cmp(&other.secondary))
+            .then_with(|| self.cb_hash.cmp(&other.cb_hash))
             .then_with(|| self.tertiary.cmp(&other.tertiary))
     }
 }
 
 impl RawSortKey for TemplateKey {
-    const SERIALIZED_SIZE: Option<usize> = Some(32);
+    const SERIALIZED_SIZE: Option<usize> = Some(40);
 
     fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
         // TemplateKey extraction requires LibraryLookup context not available through the
@@ -485,7 +497,7 @@ impl RawSortKey for TemplateKey {
 
     #[inline]
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 40];
         reader.read_exact(&mut buf)?;
         Ok(Self::from_bytes(&buf))
     }
@@ -495,9 +507,10 @@ impl RawSortKey for TemplateKey {
 /// This allows us to use a minimal ref structure while still having
 /// fast access to the full sort key.
 ///
-/// Layout (40 bytes total):
+/// Layout (48 bytes total):
 /// - primary: 8 bytes (u64)
 /// - secondary: 8 bytes (u64)
+/// - `cb_hash`: 8 bytes (u64)
 /// - tertiary: 8 bytes (u64)
 /// - `name_hash_upper`: 8 bytes (u64)
 /// - `record_len`: 4 bytes (u32)
@@ -514,7 +527,7 @@ pub struct TemplateInlineHeader {
 }
 
 /// Size of `TemplateInlineHeader` in bytes.
-pub const TEMPLATE_HEADER_SIZE: usize = 40; // 4 * 8 (key) + 4 + 4
+pub const TEMPLATE_HEADER_SIZE: usize = 48; // 5 * 8 (key) + 4 + 4
 
 impl TemplateInlineHeader {
     /// Write header to a byte buffer.
@@ -522,6 +535,7 @@ impl TemplateInlineHeader {
     pub fn write_to(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.key.primary.to_le_bytes());
         buf.extend_from_slice(&self.key.secondary.to_le_bytes());
+        buf.extend_from_slice(&self.key.cb_hash.to_le_bytes());
         buf.extend_from_slice(&self.key.tertiary.to_le_bytes());
         buf.extend_from_slice(&self.key.name_hash_upper.to_le_bytes());
         buf.extend_from_slice(&self.record_len.to_le_bytes());
@@ -538,16 +552,19 @@ impl TemplateInlineHeader {
         let secondary = u64::from_le_bytes([
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
-        let tertiary = u64::from_le_bytes([
+        let cb_hash = u64::from_le_bytes([
             data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
         ]);
-        let name_hash_upper = u64::from_le_bytes([
+        let tertiary = u64::from_le_bytes([
             data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
         ]);
-        let record_len = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+        let name_hash_upper = u64::from_le_bytes([
+            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
+        ]);
+        let record_len = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
 
         Self {
-            key: TemplateKey { primary, secondary, tertiary, name_hash_upper },
+            key: TemplateKey { primary, secondary, cb_hash, tertiary, name_hash_upper },
             record_len,
             padding: 0,
         }
@@ -964,10 +981,11 @@ pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     }
 
     // Sort by each field from least significant to most significant
-    // This ensures the final order is: primary → secondary → tertiary → name_hash_upper
+    // This ensures the final order is: primary → secondary → cb_hash → tertiary → name_hash_upper
     let fields = [
         |r: &TemplateRecordRef| r.key.name_hash_upper,
         |r: &TemplateRecordRef| r.key.tertiary,
+        |r: &TemplateRecordRef| r.key.cb_hash,
         |r: &TemplateRecordRef| r.key.secondary,
         |r: &TemplateRecordRef| r.key.primary,
     ];
@@ -1180,25 +1198,27 @@ mod tests {
 
     #[test]
     fn test_template_key_ordering() {
-        let k1 = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 0, false);
-        let k2 = TemplateKey::new(0, 100, false, 0, 200, false, 0, (2, true), 0, false);
+        let k1 = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 0, false);
+        let k2 = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (2, true), 0, false);
         assert!(k1 < k2);
 
         // /A suffix should come before /B
-        let ka = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 0, false);
-        let kb = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, false), 0, false);
+        let ka = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 0, false);
+        let kb = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, false), 0, false);
         assert!(ka < kb);
 
         // Same name hash: is_upper=false should come before is_upper=true
-        let lower = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 12345, false);
-        let upper = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 12345, true);
+        let lower = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 12345, false);
+        let upper = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 12345, true);
         assert!(lower < upper, "is_upper=false should sort before is_upper=true");
 
         // Different name hashes should group separately
         let first_hash_lo =
-            TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 100, false);
-        let first_hash_hi = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 100, true);
-        let second_hash = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 200, false);
+            TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 100, false);
+        let first_hash_hi =
+            TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 100, true);
+        let second_hash =
+            TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 200, false);
         // first_hash records should come before second_hash records
         assert!(first_hash_lo < second_hash);
         assert!(first_hash_hi < second_hash);
@@ -1366,7 +1386,7 @@ mod tests {
     fn test_radix_sort_template_refs_stability() {
         // Test that template radix sort is stable for equal keys
         // Create refs with identical TemplateKey but different offsets to track order
-        let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 12345, false);
+        let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 12345, false);
 
         let mut refs: Vec<TemplateRecordRef> = (0..500)
             .map(|i| TemplateRecordRef {
@@ -1408,6 +1428,7 @@ mod tests {
                     200,
                     false,
                     0,
+                    0,
                     (1, true),
                     group as u64, // Different hash per group
                     false,
@@ -1448,7 +1469,7 @@ mod tests {
         let mut buffer = TemplateRecordBuffer::with_capacity(100, 10000);
 
         // Add records with identical keys - they should maintain insertion order after sort
-        let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, (1, true), 12345, false);
+        let key = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 12345, false);
 
         // Create distinct records (different sequence bytes) with same sort key
         for i in 0..100u8 {
@@ -1494,5 +1515,79 @@ mod tests {
             }
             prev_seq_byte = Some(seq_byte);
         }
+    }
+
+    // ========================================================================
+    // TemplateKey cb_hash tests
+    // ========================================================================
+
+    #[test]
+    fn test_template_key_cb_hash_ordering() {
+        // Same position but different cb_hash — lower hash sorts first
+        let k1 = TemplateKey::new(0, 100, false, 0, 200, false, 10, 0, (1, true), 0, false);
+        let k2 = TemplateKey::new(0, 100, false, 0, 200, false, 20, 0, (1, true), 0, false);
+        assert!(k1 < k2, "lower cb_hash should sort before higher cb_hash");
+    }
+
+    #[test]
+    fn test_template_key_cb_hash_zero_sorts_first() {
+        // cb_hash=0 (no CB) should sort before non-zero cb_hash
+        let k_no_cb = TemplateKey::new(0, 100, false, 0, 200, false, 0, 0, (1, true), 0, false);
+        let k_cb = TemplateKey::new(0, 100, false, 0, 200, false, 42, 0, (1, true), 0, false);
+        assert!(k_no_cb < k_cb, "cb_hash=0 should sort before non-zero cb_hash");
+    }
+
+    #[test]
+    fn test_template_key_cb_hash_between_secondary_and_tertiary() {
+        // Verify cb_hash is compared AFTER secondary but BEFORE tertiary.
+        // Same primary+secondary, different cb_hash and tertiary values
+        let k1 = TemplateKey::new(0, 100, false, 0, 200, false, 10, 0, (1, true), 0, false);
+        let k2 = TemplateKey::new(0, 100, false, 0, 200, false, 20, 0, (0, true), 0, false);
+        // k1 has lower cb_hash, so it should sort first regardless of tertiary
+        assert!(k1 < k2, "cb_hash should be compared before tertiary (library/MI)");
+    }
+
+    #[test]
+    fn test_template_key_serialization_with_cb_hash() {
+        let key =
+            TemplateKey::new(1, 500, true, 2, 600, false, 0xDEAD_BEEF, 3, (7, true), 999, false);
+        let bytes = key.to_bytes();
+        assert_eq!(bytes.len(), 40);
+        let roundtrip = TemplateKey::from_bytes(&bytes);
+        assert_eq!(key, roundtrip, "serialization roundtrip should preserve cb_hash");
+        assert_eq!(roundtrip.cb_hash, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn test_template_key_unmapped_with_cb_hash() {
+        let key = TemplateKey::unmapped(12345, 0xCAFE, false);
+        assert_eq!(key.primary, u64::MAX);
+        assert_eq!(key.secondary, u64::MAX);
+        assert_eq!(key.cb_hash, 0xCAFE, "unmapped should preserve cb_hash");
+        assert_eq!(key.tertiary, 0);
+    }
+
+    #[test]
+    fn test_template_key_core_cmp_includes_cb_hash() {
+        let k1 = TemplateKey::new(0, 100, false, 0, 200, false, 10, 0, (1, true), 0, false);
+        let k2 = TemplateKey::new(0, 100, false, 0, 200, false, 20, 0, (1, true), 0, false);
+        assert_eq!(k1.core_cmp(&k2), std::cmp::Ordering::Less, "core_cmp should include cb_hash");
+
+        // Same cb_hash, different name_hash — core_cmp should be Equal
+        let k3 = TemplateKey::new(0, 100, false, 0, 200, false, 10, 0, (1, true), 100, false);
+        let k4 = TemplateKey::new(0, 100, false, 0, 200, false, 10, 0, (1, true), 200, false);
+        assert_eq!(k3.core_cmp(&k4), std::cmp::Ordering::Equal, "core_cmp should ignore name_hash");
+    }
+
+    #[test]
+    fn test_template_key_zeroed_has_zero_cb_hash() {
+        let key = TemplateKey::zeroed();
+        assert_eq!(key.cb_hash, 0);
+    }
+
+    #[test]
+    fn test_template_key_default_has_zero_cb_hash() {
+        let key = TemplateKey::default();
+        assert_eq!(key.cb_hash, 0);
     }
 }

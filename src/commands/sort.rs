@@ -25,7 +25,7 @@ use clap::{Parser, ValueEnum};
 use fgumi_lib::bam_io::create_bam_reader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::sort::{RawExternalSorter, SortOrder};
-use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::validation::{string_to_tag, validate_file_exists};
 use log::info;
 use std::path::PathBuf;
 
@@ -176,6 +176,15 @@ pub struct Sort {
     /// position tracking.
     #[arg(long = "write-index", default_value = "false")]
     pub write_index: bool,
+
+    /// Cell barcode tag for template-coordinate sort.
+    ///
+    /// When sorting in template-coordinate order, this tag is included in the
+    /// sort key so that templates from different cells at the same locus are
+    /// not interleaved. Use the same value as `--cell-tag` in `fgumi group`
+    /// and `fgumi dedup`. Only used for template-coordinate sort.
+    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    pub cell_tag: String,
 }
 
 /// Parse memory size string (e.g., "512M", "1G", "2G").
@@ -264,6 +273,17 @@ impl Command for Sort {
 }
 
 impl Sort {
+    /// Parse the cell tag for template-coordinate sort/verify, returning `None`
+    /// for other sort orders.
+    fn parse_cell_tag(&self) -> Result<Option<[u8; 2]>> {
+        if matches!(self.order, SortOrderArg::TemplateCoordinate) {
+            let tag = string_to_tag(&self.cell_tag, "cell-tag")?;
+            Ok(Some([tag.as_ref()[0], tag.as_ref()[1]]))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Execute sort mode: read, sort, and write output.
     fn execute_sort(&self, command_line: &str) -> Result<()> {
         let output = self.output.as_ref().expect("output required for sort mode");
@@ -286,10 +306,15 @@ impl Sort {
             self.max_memory
         };
 
+        let cell_tag = self.parse_cell_tag()?;
+
         info!("Starting Sort");
         info!("Input: {}", self.input.display());
         info!("Output: {}", output.display());
         info!("Sort order: {:?}", self.order);
+        if let Some(ct) = cell_tag {
+            info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
+        }
         if self.memory_per_thread {
             info!(
                 "Max memory: {} MB ({} MB/thread × {} threads)",
@@ -317,6 +342,10 @@ impl Sort {
             .temp_compression(self.temp_compression)
             .write_index(self.write_index)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
+
+        if let Some(ct) = cell_tag {
+            sorter = sorter.cell_tag(ct);
+        }
 
         if let Some(ref tmp) = self.tmp_dir {
             sorter = sorter.temp_dir(tmp.clone());
@@ -349,11 +378,16 @@ impl Sort {
         use std::cmp::Ordering;
         use std::fs::File;
 
+        let cell_tag = self.parse_cell_tag()?;
+
         let timer = OperationTimer::new("Verifying BAM sort order");
 
         info!("Starting Sort Verification");
         info!("Input: {}", self.input.display());
         info!("Expected order: {:?}", self.order);
+        if let Some(ct) = cell_tag {
+            info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
+        }
 
         // Get header using noodles reader, then use raw reader for records
         let (_, header) = create_bam_reader(&self.input, 1)?;
@@ -383,7 +417,7 @@ impl Sort {
                 let lib_lookup = LibraryLookup::from_header(&header);
                 verify_sort_order(
                     raw_reader,
-                    |bam| extract_template_key_inline(bam, &lib_lookup),
+                    |bam| extract_template_key_inline(bam, &lib_lookup, cell_tag.as_ref()),
                     // Use core_cmp to ignore name_hash tie-breaker differences
                     // This allows both fgumi and samtools sorted files to pass
                     |key, prev| key.core_cmp(prev) == Ordering::Less,
@@ -416,6 +450,51 @@ impl Sort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// Helper to construct a `Sort` struct with a given order and cell tag.
+    fn make_sort(order: SortOrderArg, cell_tag: &str) -> Sort {
+        Sort {
+            input: PathBuf::from("test.bam"),
+            output: None,
+            verify: false,
+            order,
+            max_memory: 512 * 1024 * 1024,
+            memory_per_thread: true,
+            tmp_dir: None,
+            threads: 1,
+            compression: CompressionOptions::default(),
+            temp_compression: 1,
+            write_index: false,
+            cell_tag: cell_tag.to_string(),
+        }
+    }
+
+    #[rstest]
+    #[case(SortOrderArg::TemplateCoordinate, "CB", Some(*b"CB"))]
+    #[case(SortOrderArg::TemplateCoordinate, "CR", Some(*b"CR"))]
+    #[case(SortOrderArg::Coordinate, "CB", None)]
+    #[case(SortOrderArg::Queryname, "CB", None)]
+    fn test_parse_cell_tag(
+        #[case] order: SortOrderArg,
+        #[case] cell_tag: &str,
+        #[case] expected: Option<[u8; 2]>,
+    ) {
+        let sort = make_sort(order, cell_tag);
+        assert_eq!(sort.parse_cell_tag().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_parse_cell_tag_invalid_single_char() {
+        let sort = make_sort(SortOrderArg::TemplateCoordinate, "X");
+        assert!(sort.parse_cell_tag().is_err());
+    }
+
+    #[test]
+    fn test_parse_cell_tag_invalid_too_long() {
+        let sort = make_sort(SortOrderArg::TemplateCoordinate, "ABC");
+        assert!(sort.parse_cell_tag().is_err());
+    }
 
     #[test]
     fn test_parse_memory_megabytes() {
