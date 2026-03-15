@@ -116,6 +116,25 @@ pub mod per_base {
     /// The phred-scaled qualities (as phred-33 ascii values) of the BA single-strand consensus
     pub const BA_CONSENSUS_QUALS: &str = "bq";
 
+    // EM-Seq methylation count tags
+    /// Per-base count of unconverted bases (combined/simplex consensus)
+    pub const UNCONVERTED_COUNT: &str = "cu";
+
+    /// Per-base count of converted bases (combined/simplex consensus)
+    pub const CONVERTED_COUNT: &str = "ct";
+
+    /// Per-base count of unconverted bases (AB strand, duplex)
+    pub const AB_UNCONVERTED_COUNT: &str = "au";
+
+    /// Per-base count of converted bases (AB strand, duplex)
+    pub const AB_CONVERTED_COUNT: &str = "at";
+
+    /// Per-base count of unconverted bases (BA strand, duplex)
+    pub const BA_UNCONVERTED_COUNT: &str = "bu";
+
+    /// Per-base count of converted bases (BA strand, duplex)
+    pub const BA_CONVERTED_COUNT: &str = "bt";
+
     /// All per-base tags that need to be reversed for negative-strand reads
     pub const TAGS_TO_REVERSE: &[&str] = &[
         RAW_READ_COUNT,
@@ -254,7 +273,6 @@ pub fn is_consensus(rec: &impl noodles::sam::alignment::Record) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bstr::ByteSlice;
     use fgumi_sam::builder::RecordBuilder;
 
     #[test]
@@ -373,7 +391,7 @@ mod tests {
         let value = qualities_to_tag_value(&quals);
         match value {
             noodles::sam::alignment::record_buf::data::field::value::Value::String(s) => {
-                assert_eq!(s.as_bytes(), &[33, 43, 63]);
+                assert_eq!(&**s, &[33, 43, 63]);
             }
             _ => panic!("Expected String value"),
         }

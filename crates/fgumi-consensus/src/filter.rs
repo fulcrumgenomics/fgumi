@@ -13,6 +13,19 @@ use crate::phred::{MIN_PHRED, NO_CALL_BASE};
 use crate::tags::{per_base, per_read};
 use fgumi_metrics::rejection::RejectionReason;
 
+/// Expands a 1-3 element slice to a 3-element array, filling missing values from the last.
+///
+/// # Panics
+/// Panics if `values` is empty.
+fn expand_three_from_last<T: Copy>(values: &[T]) -> [T; 3] {
+    match values {
+        [a, b, c, ..] => [*a, *b, *c],
+        [a, b] => [*a, *b, *b],
+        [a] => [*a, *a, *a],
+        [] => panic!("at least one value required"),
+    }
+}
+
 /// Filter thresholds for consensus reads
 #[derive(Debug, Clone)]
 pub struct FilterThresholds {
@@ -229,53 +242,28 @@ impl FilterConfig {
         min_mean_base_quality: Option<f64>,
         max_no_call_fraction: f64,
     ) -> Self {
-        // Helper to get threshold at index with fallback
-        let get_threshold = |values: &[usize], index: usize| -> usize {
-            match values.len() {
-                2 => {
-                    if index == 0 {
-                        values[0]
-                    } else {
-                        values[1]
-                    }
-                }
-                3 => values[index],
-                _ => values[0],
-            }
-        };
-
-        let get_threshold_f64 = |values: &[f64], index: usize| -> f64 {
-            match values.len() {
-                2 => {
-                    if index == 0 {
-                        values[0]
-                    } else {
-                        values[1]
-                    }
-                }
-                3 => values[index],
-                _ => values[0],
-            }
-        };
+        let [cc_reads, ab_reads, ba_reads] = expand_three_from_last(min_reads);
+        let [cc_read_err, ab_read_err, ba_read_err] = expand_three_from_last(max_read_error_rate);
+        let [cc_base_err, ab_base_err, ba_base_err] = expand_three_from_last(max_base_error_rate);
 
         // Create thresholds for all levels - matching fgbio which always creates all three
         // when filtering either simplex or duplex reads. Single values are replicated to all levels.
         let duplex_thresholds = Some(FilterThresholds {
-            min_reads: get_threshold(min_reads, 0),
-            max_read_error_rate: get_threshold_f64(max_read_error_rate, 0),
-            max_base_error_rate: get_threshold_f64(max_base_error_rate, 0),
+            min_reads: cc_reads,
+            max_read_error_rate: cc_read_err,
+            max_base_error_rate: cc_base_err,
         });
 
         let ab_thresholds = Some(FilterThresholds {
-            min_reads: get_threshold(min_reads, 1),
-            max_read_error_rate: get_threshold_f64(max_read_error_rate, 1),
-            max_base_error_rate: get_threshold_f64(max_base_error_rate, 1),
+            min_reads: ab_reads,
+            max_read_error_rate: ab_read_err,
+            max_base_error_rate: ab_base_err,
         });
 
         let ba_thresholds = Some(FilterThresholds {
-            min_reads: get_threshold(min_reads, 2),
-            max_read_error_rate: get_threshold_f64(max_read_error_rate, 2),
-            max_base_error_rate: get_threshold_f64(max_base_error_rate, 2),
+            min_reads: ba_reads,
+            max_read_error_rate: ba_read_err,
+            max_base_error_rate: ba_base_err,
         });
 
         // Also create single-strand thresholds using the first value
@@ -905,6 +893,62 @@ pub fn is_duplex_consensus(record: &RecordBuf) -> bool {
 // ============================================================================
 
 use fgumi_raw_bam as bam_fields;
+use noodles::sam::alignment::record::cigar::op::Kind;
+
+/// Pre-parsed methylation aux tags from a raw BAM record.
+///
+/// Avoids repeated linear scans of the aux block when multiple filters
+/// need the same tag arrays.
+pub struct MethylationTags {
+    /// Unconverted counts (combined/simplex).
+    pub cu: Option<Vec<u16>>,
+    /// Converted counts (combined/simplex).
+    pub ct: Option<Vec<u16>>,
+    /// AB-strand unconverted counts (duplex).
+    pub au: Option<Vec<u16>>,
+    /// AB-strand converted counts (duplex).
+    pub at: Option<Vec<u16>>,
+    /// BA-strand unconverted counts (duplex).
+    pub bu: Option<Vec<u16>>,
+    /// BA-strand converted counts (duplex).
+    pub bt: Option<Vec<u16>>,
+}
+
+impl MethylationTags {
+    /// Parses all methylation tags from a raw BAM record's aux data.
+    #[must_use]
+    pub fn from_record(record: &[u8]) -> Self {
+        use crate::tags::per_base;
+
+        let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
+        let aux = &record[aux_off..];
+        Self {
+            cu: Self::find_tag(aux, per_base::UNCONVERTED_COUNT),
+            ct: Self::find_tag(aux, per_base::CONVERTED_COUNT),
+            au: Self::find_tag(aux, per_base::AB_UNCONVERTED_COUNT),
+            at: Self::find_tag(aux, per_base::AB_CONVERTED_COUNT),
+            bu: Self::find_tag(aux, per_base::BA_UNCONVERTED_COUNT),
+            bt: Self::find_tag(aux, per_base::BA_CONVERTED_COUNT),
+        }
+    }
+
+    /// Looks up a 2-character tag in the aux data and returns its values as `Vec<u16>`.
+    fn find_tag(aux: &[u8], tag: &str) -> Option<Vec<u16>> {
+        let tag_bytes: [u8; 2] = [tag.as_bytes()[0], tag.as_bytes()[1]];
+        bam_fields::find_array_tag(aux, &tag_bytes).map(|r| bam_fields::array_tag_to_vec_u16(&r))
+    }
+
+    /// Returns whether any methylation tags are present.
+    #[must_use]
+    pub fn has_any(&self) -> bool {
+        self.cu.is_some()
+            || self.ct.is_some()
+            || self.au.is_some()
+            || self.at.is_some()
+            || self.bu.is_some()
+            || self.bt.is_some()
+    }
+}
 
 /// Detects if a raw BAM record is a duplex consensus.
 ///
@@ -1232,6 +1276,424 @@ pub fn mask_duplex_bases_raw(
     }
 
     Ok(masked_count)
+}
+
+// ============================================================================
+// Methylation (EM-Seq) filter functions
+// ============================================================================
+
+/// Thresholds for methylation depth filtering.
+///
+/// Mirrors the 1-3 value pattern used by other duplex thresholds:
+/// `[duplex, AB, BA]` where missing values are filled from the last provided.
+#[derive(Debug, Clone)]
+pub struct MethylationDepthThresholds {
+    /// Minimum combined depth (cu+ct) for the final consensus.
+    pub duplex: usize,
+    /// Minimum depth (au+at) for the AB strand.
+    pub ab: usize,
+    /// Minimum depth (bu+bt) for the BA strand.
+    pub ba: usize,
+}
+
+impl MethylationDepthThresholds {
+    /// Creates thresholds from a 1-3 element slice, filling missing values from the last.
+    ///
+    /// # Panics
+    /// Panics if `values` is empty.
+    #[must_use]
+    pub fn from_values(values: &[usize]) -> Self {
+        assert!(!values.is_empty(), "min-methylation-depth must have at least 1 value");
+        let [duplex, ab, ba] = expand_three_from_last(values);
+        Self { duplex, ab, ba }
+    }
+}
+
+/// Masks bases in a raw simplex consensus read where methylation depth is too low.
+///
+/// At each position, checks if `cu[i] + ct[i] < min_depth` and masks if so.
+/// Returns the number of newly masked bases.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_methylation_depth_simplex_raw(record: &mut [u8], min_depth: usize) -> Result<usize> {
+    let tags = MethylationTags::from_record(record);
+    mask_methylation_depth_simplex_raw_with_tags(record, min_depth, &tags)
+}
+
+/// Like [`mask_methylation_depth_simplex_raw`] but accepts pre-parsed methylation tags.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_methylation_depth_simplex_raw_with_tags(
+    record: &mut [u8],
+    min_depth: usize,
+    tags: &MethylationTags,
+) -> Result<usize> {
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    let seq_off = bam_fields::seq_offset(record);
+    let qual_off = bam_fields::qual_offset(record);
+    let len = bam_fields::l_seq(record) as usize;
+
+    // If no methylation tags present, nothing to filter
+    if tags.cu.is_none() && tags.ct.is_none() {
+        return Ok(0);
+    }
+
+    let mut masked_count = 0;
+    for i in 0..len {
+        if bam_fields::is_base_n(record, seq_off, i) {
+            continue;
+        }
+        let cu = tags.cu.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ct = tags.ct.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let total = (cu as usize) + (ct as usize);
+        if total < min_depth {
+            masked_count += 1;
+            bam_fields::mask_base(record, seq_off, i);
+            bam_fields::set_qual(record, qual_off, i, MIN_PHRED);
+        }
+    }
+    Ok(masked_count)
+}
+
+/// Masks bases in a raw duplex consensus read where methylation depth is too low.
+///
+/// Checks combined (cu+ct), AB (au+at), and BA (bu+bt) depths against their
+/// respective thresholds.
+/// Returns the number of newly masked bases.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_methylation_depth_duplex_raw(
+    record: &mut [u8],
+    thresholds: &MethylationDepthThresholds,
+) -> Result<usize> {
+    let tags = MethylationTags::from_record(record);
+    mask_methylation_depth_duplex_raw_with_tags(record, thresholds, &tags)
+}
+
+/// Like [`mask_methylation_depth_duplex_raw`] but accepts pre-parsed methylation tags.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_methylation_depth_duplex_raw_with_tags(
+    record: &mut [u8],
+    thresholds: &MethylationDepthThresholds,
+    tags: &MethylationTags,
+) -> Result<usize> {
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    let seq_off = bam_fields::seq_offset(record);
+    let qual_off = bam_fields::qual_offset(record);
+    let len = bam_fields::l_seq(record) as usize;
+
+    // If no methylation tags present, nothing to filter
+    if tags.cu.is_none() && tags.ct.is_none() {
+        return Ok(0);
+    }
+
+    let mut masked_count = 0;
+    for i in 0..len {
+        if bam_fields::is_base_n(record, seq_off, i) {
+            continue;
+        }
+        let cu = tags.cu.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ct = tags.ct.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let au = tags.au.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let at = tags.at.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let bu = tags.bu.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let bt = tags.bt.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+
+        let cc_total = (cu as usize) + (ct as usize);
+        let ab_total = (au as usize) + (at as usize);
+        let ba_total = (bu as usize) + (bt as usize);
+
+        if cc_total < thresholds.duplex || ab_total < thresholds.ab || ba_total < thresholds.ba {
+            masked_count += 1;
+            bam_fields::mask_base(record, seq_off, i);
+            bam_fields::set_qual(record, qual_off, i, MIN_PHRED);
+        }
+    }
+    Ok(masked_count)
+}
+
+/// Resolves the reference bases for a raw BAM record's alignment region.
+///
+/// Returns a vector of `Option<u8>` mapping each query position to its reference base
+/// (uppercased), or `None` for insertions/soft-clips. Returns `None` if the record is
+/// unmapped or the reference cannot be resolved.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ref_id and pos are non-negative for mapped records (checked above)"
+)]
+pub fn resolve_ref_bases_for_record(
+    record: &[u8],
+    reference: &dyn crate::methylation::RefBaseProvider,
+    ref_names: &[String],
+) -> Option<Vec<Option<u8>>> {
+    let flags = bam_fields::flags(record);
+    if flags & bam_fields::flags::UNMAPPED != 0 {
+        return None;
+    }
+
+    let tid = bam_fields::ref_id(record);
+    if tid < 0 {
+        return None;
+    }
+    let ref_name = ref_names.get(tid as usize)?;
+    let alignment_start = bam_fields::pos(record) as u64; // 0-based
+
+    // Try to get the full sequence slice for O(1) indexed access per base,
+    // avoiding a HashMap lookup per position.
+    let ref_seq = reference.sequence_for(ref_name);
+
+    let cigar_ops = bam_fields::get_cigar_ops(record);
+    let len = bam_fields::l_seq(record) as usize;
+    let mut result = Vec::with_capacity(len);
+    let mut ref_pos = alignment_start;
+
+    for &op in &cigar_ops {
+        let op_len = (op >> 4) as usize;
+        let kind = bam_fields::cigar_op_kind(op);
+        match kind {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for _ in 0..op_len {
+                    let base = if let Some(seq) = ref_seq {
+                        usize::try_from(ref_pos)
+                            .ok()
+                            .and_then(|p| seq.get(p).copied())
+                            .map(|b| b.to_ascii_uppercase())
+                    } else {
+                        reference.base_at_0based(ref_name, ref_pos).map(|b| b.to_ascii_uppercase())
+                    };
+                    result.push(base);
+                    ref_pos += 1;
+                }
+            }
+            Kind::Insertion | Kind::SoftClip => {
+                for _ in 0..op_len {
+                    result.push(None);
+                }
+            }
+            Kind::Deletion | Kind::Skip => {
+                ref_pos += op_len as u64;
+            }
+            _ => {}
+        }
+    }
+
+    result.truncate(len);
+    while result.len() < len {
+        result.push(None);
+    }
+
+    Some(result)
+}
+
+/// Masks `CpG` positions in a raw duplex consensus where top and bottom strands disagree
+/// on methylation status.
+///
+/// At a `CpG` dinucleotide (ref positions X and `X+1`):
+/// - Position X (`ref=C`): top-strand methylation from `au`/`at` tags
+/// - Position `X+1` (`ref=G`): bottom-strand methylation from `bu`/`bt` tags (complement)
+///
+/// If one strand calls methylated and the other calls unmethylated, both positions
+/// are masked.
+///
+/// Returns the number of newly masked bases.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_strand_methylation_agreement_raw(
+    record: &mut [u8],
+    reference: &dyn crate::methylation::RefBaseProvider,
+    ref_names: &[String],
+) -> Result<usize> {
+    let ref_base_map = resolve_ref_bases_for_record(record, reference, ref_names);
+    let tags = MethylationTags::from_record(record);
+    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
+        record,
+        ref_base_map.as_deref(),
+        &tags,
+    )
+}
+
+/// Like [`mask_strand_methylation_agreement_raw`] but accepts pre-resolved reference bases
+/// and pre-parsed methylation tags.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_strand_methylation_agreement_raw_with_ref_bases(
+    record: &mut [u8],
+    ref_base_map: Option<&[Option<u8>]>,
+) -> Result<usize> {
+    let tags = MethylationTags::from_record(record);
+    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(record, ref_base_map, &tags)
+}
+
+/// Like [`mask_strand_methylation_agreement_raw`] but accepts both pre-resolved reference
+/// bases and pre-parsed methylation tags, avoiding all redundant work.
+///
+/// # Errors
+/// Returns an error if the record is too short.
+pub fn mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
+    record: &mut [u8],
+    ref_base_map: Option<&[Option<u8>]>,
+    tags: &MethylationTags,
+) -> Result<usize> {
+    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+
+    let Some(ref_base_map) = ref_base_map else {
+        return Ok(0);
+    };
+
+    let seq_off = bam_fields::seq_offset(record);
+    let qual_off = bam_fields::qual_offset(record);
+    let len = bam_fields::l_seq(record) as usize;
+
+    // If no per-strand methylation tags, nothing to check
+    if tags.au.is_none() && tags.bu.is_none() {
+        return Ok(0);
+    }
+
+    // Identify CpG dinucleotides and check strand agreement.
+    // A CpG is where ref_base[i] = C and ref_base[i+1] = G,
+    // and both positions are aligned (Some).
+    let mut should_mask = vec![false; len];
+
+    for i in 0..len.saturating_sub(1) {
+        let (Some(Some(b'C')), Some(Some(b'G'))) = (ref_base_map.get(i), ref_base_map.get(i + 1))
+        else {
+            continue;
+        };
+
+        // Position i: top-strand C → check au/at for methylation
+        let top_unconverted = tags.au.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let top_converted = tags.at.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+
+        // Position i+1: bottom-strand G (complement of C) → check bu/bt for methylation
+        let bot_unconverted = tags.bu.as_ref().map_or(0u16, |v| v.get(i + 1).copied().unwrap_or(0));
+        let bot_converted = tags.bt.as_ref().map_or(0u16, |v| v.get(i + 1).copied().unwrap_or(0));
+
+        let top_total = top_unconverted + top_converted;
+        let bot_total = bot_unconverted + bot_converted;
+
+        // Skip if either strand has no evidence
+        if top_total == 0 || bot_total == 0 {
+            continue;
+        }
+
+        // Call methylated if unconverted > converted (majority rule)
+        let top_methylated = top_unconverted > top_converted;
+        let bot_methylated = bot_unconverted > bot_converted;
+
+        if top_methylated != bot_methylated {
+            should_mask[i] = true;
+            should_mask[i + 1] = true;
+        }
+    }
+
+    let mut masked_count = 0;
+    for (i, &mask) in should_mask.iter().enumerate() {
+        if mask && !bam_fields::is_base_n(record, seq_off, i) {
+            masked_count += 1;
+            bam_fields::mask_base(record, seq_off, i);
+            bam_fields::set_qual(record, qual_off, i, MIN_PHRED);
+        }
+    }
+
+    Ok(masked_count)
+}
+
+/// Checks the bisulfite/enzymatic conversion fraction at non-CpG cytosines.
+///
+/// Returns `true` if the read passes (conversion fraction >= threshold), or if
+/// there are no non-CpG cytosine positions to evaluate.
+///
+/// At non-CpG ref-C positions, the expected behavior is conversion (C→T).
+/// A low conversion rate suggests incomplete enzymatic conversion.
+pub fn check_conversion_fraction_raw(
+    record: &[u8],
+    min_fraction: f64,
+    reference: &dyn crate::methylation::RefBaseProvider,
+    ref_names: &[String],
+) -> bool {
+    let ref_base_map = resolve_ref_bases_for_record(record, reference, ref_names);
+    let tags = MethylationTags::from_record(record);
+    check_conversion_fraction_raw_with_ref_bases_and_tags(
+        record,
+        min_fraction,
+        ref_base_map.as_deref(),
+        &tags,
+    )
+}
+
+/// Like [`check_conversion_fraction_raw`] but accepts pre-resolved reference bases.
+#[must_use]
+pub fn check_conversion_fraction_raw_with_ref_bases(
+    record: &[u8],
+    min_fraction: f64,
+    ref_base_map: Option<&[Option<u8>]>,
+) -> bool {
+    let tags = MethylationTags::from_record(record);
+    check_conversion_fraction_raw_with_ref_bases_and_tags(record, min_fraction, ref_base_map, &tags)
+}
+
+/// Like [`check_conversion_fraction_raw`] but accepts both pre-resolved reference bases
+/// and pre-parsed methylation tags, avoiding all redundant work.
+#[must_use]
+pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
+    record: &[u8],
+    min_fraction: f64,
+    ref_base_map: Option<&[Option<u8>]>,
+    tags: &MethylationTags,
+) -> bool {
+    let Some(ref_base_map) = ref_base_map else {
+        return true; // unmapped reads pass
+    };
+
+    let len = bam_fields::l_seq(record) as usize;
+
+    // If no methylation tags, pass
+    if tags.cu.is_none() && tags.ct.is_none() {
+        return true;
+    }
+
+    let mut total_converted: u64 = 0;
+    let mut total_evidence: u64 = 0;
+
+    for i in 0..len {
+        // Only consider non-CpG ref-C positions
+        let Some(Some(b'C')) = ref_base_map.get(i) else {
+            continue;
+        };
+
+        // Check if this is a CpG (next base is G) — skip CpG sites
+        let is_cpg = i + 1 < len && matches!(ref_base_map.get(i + 1), Some(Some(b'G')));
+        if is_cpg {
+            continue;
+        }
+
+        let cu = tags.cu.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ct = tags.ct.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let evidence = u64::from(cu) + u64::from(ct);
+        if evidence > 0 {
+            total_converted += u64::from(ct);
+            total_evidence += evidence;
+        }
+    }
+
+    // If no non-CpG C positions with evidence, pass
+    if total_evidence == 0 {
+        return true;
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for fraction calculation"
+    )]
+    let fraction = total_converted as f64 / total_evidence as f64;
+    fraction >= min_fraction
 }
 
 #[cfg(test)]
@@ -2403,5 +2865,441 @@ mod tests {
 
         let result = super::find_string_or_uint8_array(&aux, *b"ac");
         assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // Methylation filter tests
+    // ========================================================================
+
+    /// Helper: build a raw BAM record with methylation tags from a `RecordBuf`.
+    fn build_raw_with_methylation_tags(
+        header: &noodles::sam::Header,
+        record: &RecordBuf,
+    ) -> Vec<u8> {
+        let mut raw = Vec::new();
+        crate::vendored::bam_codec::encoder::encode_record_buf(&mut raw, header, record)
+            .expect("encoding should succeed");
+        raw
+    }
+
+    /// Helper: create a `SamBuilder` for mapped record tests.
+    fn sam_builder_for_methylation() -> fgumi_sam::builder::SamBuilder {
+        //                  0123456789
+        // Reference:       ACGTCGATCG
+        fgumi_sam::builder::SamBuilder::with_single_ref("chr1", 1000)
+    }
+
+    /// Helper: add an i16 array tag to a `RecordBuf`.
+    fn add_i16_array_tag(record: &mut RecordBuf, tag_str: &str, values: &[i16]) {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::data::field::value::Array;
+        let tag = Tag::from([tag_str.as_bytes()[0], tag_str.as_bytes()[1]]);
+        record.data_mut().insert(tag, Value::Array(Array::Int16(values.to_vec())));
+    }
+
+    // -- MethylationDepthThresholds tests --
+
+    #[test]
+    fn test_methylation_depth_thresholds_single_value() {
+        let t = MethylationDepthThresholds::from_values(&[5]);
+        assert_eq!(t.duplex, 5);
+        assert_eq!(t.ab, 5);
+        assert_eq!(t.ba, 5);
+    }
+
+    #[test]
+    fn test_methylation_depth_thresholds_two_values() {
+        let t = MethylationDepthThresholds::from_values(&[10, 3]);
+        assert_eq!(t.duplex, 10);
+        assert_eq!(t.ab, 3);
+        assert_eq!(t.ba, 3);
+    }
+
+    #[test]
+    fn test_methylation_depth_thresholds_three_values() {
+        let t = MethylationDepthThresholds::from_values(&[10, 5, 2]);
+        assert_eq!(t.duplex, 10);
+        assert_eq!(t.ab, 5);
+        assert_eq!(t.ba, 2);
+    }
+
+    // -- mask_methylation_depth_simplex_raw tests --
+
+    #[test]
+    fn test_mask_methylation_depth_simplex_all_pass() {
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("4M")
+            .build();
+        // cu+ct = 5+3=8 at each position, min_depth=5 → all pass
+        add_i16_array_tag(&mut record, "cu", &[5, 5, 5, 5]);
+        add_i16_array_tag(&mut record, "ct", &[3, 3, 3, 3]);
+
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
+        assert_eq!(masked, 0);
+    }
+
+    #[test]
+    fn test_mask_methylation_depth_simplex_some_fail() {
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("4M")
+            .build();
+        // Position 0: cu+ct = 5+3=8 → pass
+        // Position 1: cu+ct = 1+1=2 → fail (< 5)
+        // Position 2: cu+ct = 0+0=0 → fail
+        // Position 3: cu+ct = 10+0=10 → pass
+        add_i16_array_tag(&mut record, "cu", &[5, 1, 0, 10]);
+        add_i16_array_tag(&mut record, "ct", &[3, 1, 0, 0]);
+
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
+        assert_eq!(masked, 2, "Positions 1 and 2 should be masked");
+    }
+
+    #[test]
+    fn test_mask_methylation_depth_simplex_no_tags_no_masking() {
+        let sam = sam_builder_for_methylation();
+        let record = RecordBuilder::new()
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("4M")
+            .build();
+        // No cu/ct tags
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
+        assert_eq!(masked, 0, "No methylation tags should mean no masking");
+    }
+
+    // -- mask_methylation_depth_duplex_raw tests --
+
+    #[test]
+    fn test_mask_methylation_depth_duplex_all_pass() {
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("4M")
+            .build();
+        add_i16_array_tag(&mut record, "cu", &[10, 10, 10, 10]);
+        add_i16_array_tag(&mut record, "ct", &[2, 2, 2, 2]);
+        add_i16_array_tag(&mut record, "au", &[5, 5, 5, 5]);
+        add_i16_array_tag(&mut record, "at", &[1, 1, 1, 1]);
+        add_i16_array_tag(&mut record, "bu", &[5, 5, 5, 5]);
+        add_i16_array_tag(&mut record, "bt", &[1, 1, 1, 1]);
+
+        let thresholds = MethylationDepthThresholds { duplex: 5, ab: 3, ba: 3 };
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked = mask_methylation_depth_duplex_raw(&mut raw, &thresholds).unwrap();
+        assert_eq!(masked, 0);
+    }
+
+    #[test]
+    fn test_mask_methylation_depth_duplex_ab_fails() {
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("4M")
+            .build();
+        // Duplex passes (cu+ct=12), but AB fails at position 1 (au+at=1 < 3)
+        add_i16_array_tag(&mut record, "cu", &[10, 10, 10, 10]);
+        add_i16_array_tag(&mut record, "ct", &[2, 2, 2, 2]);
+        add_i16_array_tag(&mut record, "au", &[5, 0, 5, 5]);
+        add_i16_array_tag(&mut record, "at", &[1, 1, 1, 1]);
+        add_i16_array_tag(&mut record, "bu", &[5, 5, 5, 5]);
+        add_i16_array_tag(&mut record, "bt", &[1, 1, 1, 1]);
+
+        let thresholds = MethylationDepthThresholds { duplex: 5, ab: 3, ba: 3 };
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked = mask_methylation_depth_duplex_raw(&mut raw, &thresholds).unwrap();
+        assert_eq!(masked, 1, "Position 1 should be masked (AB depth too low)");
+    }
+
+    // -- mask_strand_methylation_agreement_raw tests --
+
+    #[test]
+    fn test_strand_methylation_agreement_concordant() {
+        use crate::methylation::tests::TestRef;
+        // Reference: ...CG... at positions 5,6
+        // Both strands agree: methylated at CpG
+        let ref_seq = b"AAAAACGAAAA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("AAAAACGAAAA")
+            .qualities(&[30; 11])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("11M")
+            .build();
+        // au/at at position 5 (C): methylated (au=10, at=1)
+        // bu/bt at position 6 (G): methylated (bu=10, bt=1)
+        add_i16_array_tag(&mut record, "au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "bu", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "bt", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked =
+            mask_strand_methylation_agreement_raw(&mut raw, &reference, &ref_names).unwrap();
+        assert_eq!(masked, 0, "Concordant CpG should not be masked");
+    }
+
+    #[test]
+    fn test_strand_methylation_agreement_discordant() {
+        use crate::methylation::tests::TestRef;
+        // Reference: ...CG... at positions 5,6
+        // Top strand says methylated, bottom says unmethylated
+        let ref_seq = b"AAAAACGAAAA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("AAAAACGAAAA")
+            .qualities(&[30; 11])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("11M")
+            .build();
+        // au/at at position 5 (C): methylated (au=10, at=1)
+        // bu/bt at position 6 (G): unmethylated (bu=1, bt=10)
+        add_i16_array_tag(&mut record, "au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "bu", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "bt", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
+
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked =
+            mask_strand_methylation_agreement_raw(&mut raw, &reference, &ref_names).unwrap();
+        assert_eq!(masked, 2, "Both CpG positions should be masked when strands disagree");
+    }
+
+    #[test]
+    fn test_strand_methylation_agreement_non_cpg_ignored() {
+        use crate::methylation::tests::TestRef;
+        // Reference: no CpG sites, just scattered C and G
+        let ref_seq = b"ACAGTGCATGA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACAGTGCATGA")
+            .qualities(&[30; 11])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("11M")
+            .build();
+        add_i16_array_tag(&mut record, "au", &[0; 11]);
+        add_i16_array_tag(&mut record, "at", &[0; 11]);
+        add_i16_array_tag(&mut record, "bu", &[0; 11]);
+        add_i16_array_tag(&mut record, "bt", &[0; 11]);
+
+        let mut raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let masked =
+            mask_strand_methylation_agreement_raw(&mut raw, &reference, &ref_names).unwrap();
+        assert_eq!(masked, 0, "Non-CpG sites should not be masked");
+    }
+
+    // -- check_conversion_fraction_raw tests --
+
+    #[test]
+    fn test_conversion_fraction_passes_high_conversion() {
+        use crate::methylation::tests::TestRef;
+        // Reference: ACATACATA (non-CpG C at positions 1, 4 — A before each C means not CpG)
+        //            012345678
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // Non-CpG C at positions 1 and 4: high conversion (ct >> cu)
+        // cu: unconverted count, ct: converted count
+        add_i16_array_tag(&mut record, "cu", &[0, 1, 0, 0, 1, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 9, 0, 0, 9, 0, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        // 18 converted out of 20 = 90% conversion
+        assert!(
+            check_conversion_fraction_raw(&raw, 0.8, &reference, &ref_names),
+            "Should pass with high conversion fraction"
+        );
+    }
+
+    #[test]
+    fn test_conversion_fraction_fails_low_conversion() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // Non-CpG C at positions 1 and 4: low conversion (cu >> ct)
+        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 9, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 1, 0, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        // 2 converted out of 20 = 10% conversion
+        assert!(
+            !check_conversion_fraction_raw(&raw, 0.8, &reference, &ref_names),
+            "Should fail with low conversion fraction"
+        );
+    }
+
+    #[test]
+    fn test_conversion_fraction_skips_cpg() {
+        use crate::methylation::tests::TestRef;
+        // Reference with CpG at position 4-5: AAAA CG AAA
+        let ref_seq = b"AAAACGAAA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("AAAACGAAA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // CpG C at position 4: high unconverted (methylated) — should be EXCLUDED
+        // No non-CpG C positions → should pass vacuously
+        add_i16_array_tag(&mut record, "cu", &[0, 0, 0, 0, 10, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        assert!(
+            check_conversion_fraction_raw(&raw, 0.9, &reference, &ref_names),
+            "Should pass because CpG sites are excluded from conversion check"
+        );
+    }
+
+    #[test]
+    fn test_conversion_fraction_no_methylation_tags_passes() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // No cu/ct tags
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        assert!(
+            check_conversion_fraction_raw(&raw, 0.9, &reference, &ref_names),
+            "Should pass with no methylation tags"
+        );
+    }
+
+    #[test]
+    fn test_conversion_fraction_unmapped_passes() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let record = RecordBuilder::new().sequence("ACATACATA").qualities(&[30; 9]).build();
+        // Unmapped record (no ref_id, no cigar)
+        let raw = build_raw_with_methylation_tags(&noodles::sam::Header::default(), &record);
+        assert!(
+            check_conversion_fraction_raw(&raw, 0.9, &reference, &ref_names),
+            "Unmapped reads should pass"
+        );
+    }
+
+    // -- resolve_ref_bases_for_record tests --
+
+    #[test]
+    fn test_resolve_ref_bases_simple_match() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACGTACGTAC";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let record = RecordBuilder::new()
+            .sequence("ACGT")
+            .qualities(&[30; 4])
+            .reference_sequence_id(0)
+            .alignment_start(1) // 1-based → 0-based pos=0
+            .mapping_quality(60)
+            .cigar("4M")
+            .build();
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let bases = resolve_ref_bases_for_record(&raw, &reference, &ref_names).unwrap();
+        assert_eq!(bases, vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')]);
+    }
+
+    #[test]
+    fn test_resolve_ref_bases_with_insertion() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACGTACGTAC";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let record = RecordBuilder::new()
+            .sequence("ACNNGT") // 2M2I2M → positions 2,3 are insertions
+            .qualities(&[30; 6])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("2M2I2M")
+            .build();
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        let bases = resolve_ref_bases_for_record(&raw, &reference, &ref_names).unwrap();
+        assert_eq!(bases, vec![Some(b'A'), Some(b'C'), None, None, Some(b'G'), Some(b'T')]);
     }
 }
