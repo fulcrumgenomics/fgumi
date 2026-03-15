@@ -386,6 +386,27 @@ fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
 // Static _impl functions - core logic used by both closures and &self methods
 // =============================================================================
 
+/// Creates a parallel UMI assigner for the given strategy and parameters.
+fn new_parallel_assigner(
+    strategy: Strategy,
+    effective_edits: u32,
+    threads: usize,
+    allow_c_to_t: bool,
+) -> Box<dyn UmiAssigner> {
+    match strategy {
+        Strategy::Identity => Box::new(ParallelIdentityAssigner::new(threads)),
+        Strategy::Edit => {
+            Box::new(ParallelEditAssigner::new(effective_edits, threads, allow_c_to_t))
+        }
+        Strategy::Adjacency => {
+            Box::new(ParallelAdjacencyAssigner::new(effective_edits, threads, allow_c_to_t))
+        }
+        Strategy::Paired => {
+            Box::new(ParallelPairedAssigner::new(effective_edits, threads, allow_c_to_t))
+        }
+    }
+}
+
 /// Extract UMI for a read, handling paired UMI strategies (static implementation).
 fn umi_for_read_impl(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> Result<String> {
     if assigner.split_templates_by_pair_orientation() {
@@ -720,6 +741,7 @@ Threads are allocated based on the command's workload profile to optimize perfor
 Example: --threads 8 spawns exactly 8 threads (2 reader, 4 workers, 2 writer)
 "#
 )]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GroupReadsByUmi {
     /// Input and output BAM files
     #[command(flatten)]
@@ -799,6 +821,14 @@ pub struct GroupReadsByUmi {
     /// and ignores any existing UMI tags.
     #[arg(long = "no-umi")]
     pub no_umi: bool,
+
+    /// Treat C→T mismatches as zero cost (for EM-Seq methylated UMIs).
+    ///
+    /// When enabled, positions where the expected UMI has C and the observed UMI has T are not
+    /// counted as mismatches. This accounts for incomplete conversion protection of 5mC bases
+    /// in enzymatic methyl-seq (EM-Seq) library preparation.
+    #[arg(long)]
+    pub allow_c_to_t: bool,
 
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
@@ -1041,6 +1071,7 @@ impl Command for GroupReadsByUmi {
         let index_threshold = self.index_threshold;
         let no_umi = self.no_umi;
         let allow_unmapped = self.allow_unmapped;
+        let allow_c_to_t = self.allow_c_to_t;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
         // Setup comprehensive memory monitoring first if debug mode is enabled
@@ -1242,23 +1273,10 @@ impl Command for GroupReadsByUmi {
                 // Create UMI assigner for this group
                 // Use parallel assigner when allow_unmapped is enabled (large single groups)
                 let assigner: Box<dyn UmiAssigner> = if allow_unmapped {
-                    match strategy {
-                        Strategy::Identity => {
-                            Box::new(ParallelIdentityAssigner::new(num_threads))
-                        }
-                        Strategy::Edit => {
-                            Box::new(ParallelEditAssigner::new(effective_edits, num_threads))
-                        }
-                        Strategy::Adjacency => {
-                            Box::new(ParallelAdjacencyAssigner::new(effective_edits, num_threads))
-                        }
-                        Strategy::Paired => {
-                            Box::new(ParallelPairedAssigner::new(effective_edits, num_threads))
-                        }
-                    }
+                    new_parallel_assigner(strategy, effective_edits, num_threads, allow_c_to_t)
                 } else {
                     // Use existing sequential assigner for mapped data
-                    strategy.new_assigner_full(effective_edits, 1, index_threshold)
+                    strategy.new_assigner_full(effective_edits, 1, index_threshold, allow_c_to_t)
                 };
 
                 // Assign UMI groups using the unified _impl function
@@ -1594,6 +1612,7 @@ impl GroupReadsByUmi {
                     effective_edits,
                     self.index_threshold,
                     1, // Single-threaded mode
+                    self.allow_c_to_t,
                     raw_tag,
                     assign_tag_bytes,
                     &mut total_filter_metrics,
@@ -1616,6 +1635,7 @@ impl GroupReadsByUmi {
                 effective_edits,
                 self.index_threshold,
                 1, // Single-threaded mode
+                self.allow_c_to_t,
                 raw_tag,
                 assign_tag_bytes,
                 &mut total_filter_metrics,
@@ -1671,6 +1691,7 @@ impl GroupReadsByUmi {
         effective_edits: u32,
         index_threshold: usize,
         threads: usize,
+        allow_c_to_t: bool,
         raw_tag: [u8; 2],
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
@@ -1700,17 +1721,10 @@ impl GroupReadsByUmi {
         // Create UMI assigner
         // Use parallel assigner when allow_unmapped is enabled (large single groups)
         let assigner: Box<dyn UmiAssigner> = if filter_config.allow_unmapped {
-            match strategy {
-                Strategy::Identity => Box::new(ParallelIdentityAssigner::new(threads)),
-                Strategy::Edit => Box::new(ParallelEditAssigner::new(effective_edits, threads)),
-                Strategy::Adjacency => {
-                    Box::new(ParallelAdjacencyAssigner::new(effective_edits, threads))
-                }
-                Strategy::Paired => Box::new(ParallelPairedAssigner::new(effective_edits, threads)),
-            }
+            new_parallel_assigner(strategy, effective_edits, threads, allow_c_to_t)
         } else {
             // Use existing sequential assigner for mapped data
-            strategy.new_assigner_full(effective_edits, 1, index_threshold)
+            strategy.new_assigner_full(effective_edits, 1, index_threshold, allow_c_to_t)
         };
 
         // Assign UMI groups
@@ -1849,6 +1863,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
             no_umi: false,
+            allow_c_to_t: false,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions {
                 queue_memory: "768".to_string(),

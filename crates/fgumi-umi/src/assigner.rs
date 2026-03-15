@@ -560,7 +560,7 @@ impl Strategy {
     /// Panics if `edits` is non-zero when using the Identity strategy.
     #[must_use]
     pub fn new_assigner(&self, edits: u32) -> Box<dyn UmiAssigner> {
-        self.new_assigner_full(edits, 1, DEFAULT_INDEX_THRESHOLD)
+        self.new_assigner_full(edits, 1, DEFAULT_INDEX_THRESHOLD, false)
     }
 
     /// Create a new UMI assigner with thread count specified
@@ -575,7 +575,7 @@ impl Strategy {
     /// A boxed trait object implementing the `UmiAssigner` trait
     #[must_use]
     pub fn new_assigner_with_threads(&self, edits: u32, threads: usize) -> Box<dyn UmiAssigner> {
-        self.new_assigner_full(edits, threads, DEFAULT_INDEX_THRESHOLD)
+        self.new_assigner_full(edits, threads, DEFAULT_INDEX_THRESHOLD, false)
     }
 
     /// Create a new UMI assigner with all parameters specified
@@ -599,19 +599,23 @@ impl Strategy {
         edits: u32,
         threads: usize,
         index_threshold: usize,
+        allow_c_to_t: bool,
     ) -> Box<dyn UmiAssigner> {
         match self {
             Strategy::Identity => {
                 assert_eq!(edits, 0, "Edits should be zero when using the identity UMI assigner");
                 Box::new(IdentityUmiAssigner::new())
             }
-            Strategy::Edit => Box::new(SimpleErrorUmiAssigner::new(edits)),
+            Strategy::Edit => Box::new(SimpleErrorUmiAssigner::new(edits, allow_c_to_t)),
             Strategy::Adjacency => {
-                Box::new(AdjacencyUmiAssigner::new(edits, threads, index_threshold))
+                Box::new(AdjacencyUmiAssigner::new(edits, threads, index_threshold, allow_c_to_t))
             }
-            Strategy::Paired => {
-                Box::new(PairedUmiAssigner::new_with_threads(edits, threads, index_threshold))
-            }
+            Strategy::Paired => Box::new(PairedUmiAssigner::new_with_threads(
+                edits,
+                threads,
+                index_threshold,
+                allow_c_to_t,
+            )),
         }
     }
 }
@@ -716,6 +720,80 @@ pub fn matches_within_threshold(a: &str, b: &str, max_mismatches: usize) -> bool
     // Handle remaining bytes
     for i in (chunks * 8)..len {
         if a_bytes[i] != b_bytes[i] {
+            mismatches += 1;
+            if mismatches >= too_many {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Check if two UMI sequences match within a mismatch threshold, treating C→T as zero cost.
+///
+/// Uses the bidirectional minimum: the distance is the minimum of `a→b` and `b→a` C→T-aware
+/// distances. This is appropriate when there is no parent/child relationship between UMIs
+/// (e.g., in simple edit-distance clustering).
+///
+/// Returns `true` if the sequences are the same length and their bidirectional C→T-aware
+/// distance is at most `max_mismatches`.
+#[must_use]
+pub fn matches_within_threshold_allow_c_to_t(a: &str, b: &str, max_mismatches: usize) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    // Count mismatches in both directions, skipping C→T conversions
+    let mut mismatches_ab = 0usize; // a=expected, b=observed
+    let mut mismatches_ba = 0usize; // b=expected, a=observed
+    let too_many = max_mismatches + 1;
+
+    for i in 0..a_bytes.len() {
+        if a_bytes[i] != b_bytes[i] {
+            // a→b direction: skip if a=C and b=T
+            if !(a_bytes[i] == b'C' && b_bytes[i] == b'T') {
+                mismatches_ab += 1;
+            }
+            // b→a direction: skip if b=C and a=T
+            if !(b_bytes[i] == b'C' && a_bytes[i] == b'T') {
+                mismatches_ba += 1;
+            }
+            // Early exit: if both directions exceed threshold, min also exceeds
+            if mismatches_ab >= too_many && mismatches_ba >= too_many {
+                return false;
+            }
+        }
+    }
+
+    mismatches_ab.min(mismatches_ba) <= max_mismatches
+}
+
+/// Check if two UMI sequences match within a mismatch threshold using directed C→T tolerance.
+///
+/// `a` is the expected (parent/whitelist) sequence, `b` is the observed (child) sequence.
+/// Positions where `a[i] == 'C'` and `b[i] == 'T'` are not counted as mismatches.
+/// This is asymmetric: `a=T, b=C` is a real mismatch.
+#[must_use]
+pub fn matches_within_threshold_ct_directed(a: &str, b: &str, max_mismatches: usize) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let too_many = max_mismatches + 1;
+    let mut mismatches = 0;
+
+    for i in 0..a_bytes.len() {
+        if a_bytes[i] != b_bytes[i] {
+            // Skip if expected=C and observed=T (conversion artifact)
+            if a_bytes[i] == b'C' && b_bytes[i] == b'T' {
+                continue;
+            }
             mismatches += 1;
             if mismatches >= too_many {
                 return false;
@@ -898,6 +976,7 @@ impl UmiAssigner for IdentityUmiAssigner {
 /// Uses atomic counter for ID generation, making it safe to use across threads.
 pub struct SimpleErrorUmiAssigner {
     max_mismatches: u32,
+    allow_c_to_t: bool,
     counter: AtomicU64,
 }
 
@@ -907,13 +986,14 @@ impl SimpleErrorUmiAssigner {
     /// # Arguments
     ///
     /// * `max_mismatches` - Maximum number of mismatches allowed between UMIs in the same group
+    /// * `allow_c_to_t` - If true, C→T mismatches are not counted (bidirectional min)
     ///
     /// # Returns
     ///
     /// A new `SimpleErrorUmiAssigner` instance
     #[must_use]
-    pub fn new(max_mismatches: u32) -> Self {
-        Self { max_mismatches, counter: AtomicU64::new(0) }
+    pub fn new(max_mismatches: u32, allow_c_to_t: bool) -> Self {
+        Self { max_mismatches, allow_c_to_t, counter: AtomicU64::new(0) }
     }
 
     /// Generate the next unique molecule ID
@@ -948,11 +1028,15 @@ impl UmiAssigner for SimpleErrorUmiAssigner {
             let mut matched_sets = Vec::new();
 
             // Find all sets that match this UMI
+            let max_mm = self.max_mismatches as usize;
             for (idx, set) in umi_sets.iter().enumerate() {
-                if set
-                    .iter()
-                    .any(|other| matches_within_threshold(other, umi, self.max_mismatches as usize))
-                {
+                let matches = if self.allow_c_to_t {
+                    set.iter()
+                        .any(|other| matches_within_threshold_allow_c_to_t(other, umi, max_mm))
+                } else {
+                    set.iter().any(|other| matches_within_threshold(other, umi, max_mm))
+                };
+                if matches {
                     matched_sets.push(idx);
                 }
             }
@@ -1056,6 +1140,7 @@ pub struct AdjacencyUmiAssigner {
     max_mismatches: u32,
     threads: usize,
     index_threshold: usize,
+    allow_c_to_t: bool,
     counter: AtomicU64,
 }
 
@@ -1067,13 +1152,19 @@ impl AdjacencyUmiAssigner {
     /// * `max_mismatches` - Maximum number of mismatches allowed for UMIs to be adjacent
     /// * `threads` - Number of threads to use for matching (default: 1)
     /// * `index_threshold` - Minimum UMIs per position to use N-gram/BK-tree index (default: 1000)
+    /// * `allow_c_to_t` - If true, C→T mismatches cost 0 (parent-as-expected direction)
     ///
     /// # Returns
     ///
     /// A new `AdjacencyUmiAssigner` instance
     #[must_use]
-    pub fn new(max_mismatches: u32, threads: usize, index_threshold: usize) -> Self {
-        Self { max_mismatches, threads, index_threshold, counter: AtomicU64::new(0) }
+    pub fn new(
+        max_mismatches: u32,
+        threads: usize,
+        index_threshold: usize,
+        allow_c_to_t: bool,
+    ) -> Self {
+        Self { max_mismatches, threads, index_threshold, allow_c_to_t, counter: AtomicU64::new(0) }
     }
 
     /// Generate the next unique molecule ID
@@ -1119,6 +1210,7 @@ impl AdjacencyUmiAssigner {
     }
 
     /// Build adjacency graph using `BitEnc` for efficient matching.
+    #[expect(clippy::too_many_lines, reason = "graph-building algorithm with index and C→T paths")]
     fn build_adjacency_graph_bitenc(
         &self,
         umi_counts: &[(BitEnc, usize, usize)], // (encoded, count, first_raw_index)
@@ -1157,8 +1249,13 @@ impl AdjacencyUmiAssigner {
             None
         };
 
-        // Try to build index for fast candidate search (if enough UMIs)
-        let ngram_index = if nodes.len() >= self.index_threshold && self.max_mismatches == 1 {
+        // Try to build index for fast candidate search (if enough UMIs).
+        // Skip index when allow_c_to_t is enabled — N-gram index uses standard Hamming
+        // distance and cannot correctly handle the asymmetric C→T tolerance.
+        let ngram_index = if !self.allow_c_to_t
+            && nodes.len() >= self.index_threshold
+            && self.max_mismatches == 1
+        {
             // For BitEnc-based matching, we need to use the original strings for NgramIndex
             // since it internally converts to BitEnc
             let umis: Vec<(usize, &str)> = umi_counts
@@ -1215,32 +1312,36 @@ impl AdjacencyUmiAssigner {
                                 }
                             })
                             .collect()
-                    } else if let Some(ref pool) = pool {
-                        // Parallel linear search using BitEnc hamming distance
-                        let start_idx = search_from;
-                        let max_mm = self.max_mismatches;
-                        pool.install(|| {
-                            (start_idx..nodes.len())
-                                .into_par_iter()
-                                .filter(|&child_idx| {
-                                    !nodes[child_idx].assigned
-                                        && nodes[child_idx].count <= max_child_count
-                                        && parent_enc.hamming_distance(&umi_counts[child_idx].0)
-                                            <= max_mm
-                                })
-                                .collect()
-                        })
                     } else {
-                        // Sequential linear search using BitEnc hamming distance
+                        // Filter predicate shared by parallel and sequential paths
+                        let max_mm = self.max_mismatches;
+                        let allow_ct = self.allow_c_to_t;
+                        let is_child_match = |child_idx: &usize| -> bool {
+                            let child_idx = *child_idx;
+                            if nodes[child_idx].assigned || nodes[child_idx].count > max_child_count
+                            {
+                                return false;
+                            }
+                            let child_enc = &umi_counts[child_idx].0;
+                            let dist = if allow_ct {
+                                parent_enc.hamming_distance_allow_c_to_t(child_enc)
+                            } else {
+                                parent_enc.hamming_distance(child_enc)
+                            };
+                            dist <= max_mm
+                        };
+
                         let start_idx = search_from;
-                        (start_idx..nodes.len())
-                            .filter(|&child_idx| {
-                                !nodes[child_idx].assigned
-                                    && nodes[child_idx].count <= max_child_count
-                                    && parent_enc.hamming_distance(&umi_counts[child_idx].0)
-                                        <= self.max_mismatches
+                        if let Some(ref pool) = pool {
+                            pool.install(|| {
+                                (start_idx..nodes.len())
+                                    .into_par_iter()
+                                    .filter(is_child_match)
+                                    .collect()
                             })
-                            .collect()
+                        } else {
+                            (start_idx..nodes.len()).filter(is_child_match).collect()
+                        }
                     };
 
                     // Add matching children
@@ -1312,9 +1413,10 @@ impl AdjacencyUmiAssigner {
             None
         };
 
-        // Try to build index for fast candidate search (if enough UMIs)
-        // Use N-gram index for k=1 (most efficient), BK-tree for k>1
-        let (ngram_index, bktree) = if nodes.len() >= self.index_threshold {
+        // Try to build index for fast candidate search (if enough UMIs).
+        // Skip indices when allow_c_to_t is enabled — they use standard Hamming distance
+        // and cannot handle the asymmetric C→T tolerance.
+        let (ngram_index, bktree) = if !self.allow_c_to_t && nodes.len() >= self.index_threshold {
             let umis: Vec<(usize, &str)> =
                 umi_counts.iter().enumerate().map(|(i, (umi, _))| (i, umi.as_str())).collect();
 
@@ -1599,7 +1701,7 @@ impl PairedUmiAssigner {
     /// A new `PairedUmiAssigner` instance
     #[must_use]
     pub fn new(max_mismatches: u32) -> Self {
-        Self::new_with_threads(max_mismatches, 1, DEFAULT_INDEX_THRESHOLD)
+        Self::new_with_threads(max_mismatches, 1, DEFAULT_INDEX_THRESHOLD, false)
     }
 
     /// Create a new paired UMI assigner with specified thread count
@@ -1609,15 +1711,26 @@ impl PairedUmiAssigner {
     /// * `max_mismatches` - Maximum number of mismatches allowed for UMIs to be adjacent
     /// * `threads` - Number of threads to use for matching
     /// * `index_threshold` - Minimum UMIs per position to use N-gram/BK-tree index
+    /// * `allow_c_to_t` - If true, C→T mismatches cost 0 (parent-as-expected direction)
     ///
     /// # Returns
     ///
     /// A new `PairedUmiAssigner` instance
     #[must_use]
-    pub fn new_with_threads(max_mismatches: u32, threads: usize, index_threshold: usize) -> Self {
+    pub fn new_with_threads(
+        max_mismatches: u32,
+        threads: usize,
+        index_threshold: usize,
+        allow_c_to_t: bool,
+    ) -> Self {
         let prefix_len = max_mismatches as usize + 1;
         Self {
-            adjacency: AdjacencyUmiAssigner::new(max_mismatches, threads, index_threshold),
+            adjacency: AdjacencyUmiAssigner::new(
+                max_mismatches,
+                threads,
+                index_threshold,
+                allow_c_to_t,
+            ),
             lower_prefix: "a".repeat(prefix_len),
             higher_prefix: "b".repeat(prefix_len),
         }
@@ -1768,11 +1881,18 @@ impl PairedUmiAssigner {
     /// `true` if UMIs match (forward or reversed) within threshold
     fn matches_paired(&self, lhs: &str, rhs: &str) -> bool {
         let max_mismatches = self.adjacency.max_mismatches as usize;
-        if matches_within_threshold(lhs, rhs, max_mismatches) {
+        // In adjacency graph context, lhs=parent (expected), rhs=child (observed).
+        // Use directed C→T tolerance when enabled; standard threshold otherwise.
+        let matcher: fn(&str, &str, usize) -> bool = if self.adjacency.allow_c_to_t {
+            matches_within_threshold_ct_directed
+        } else {
+            matches_within_threshold
+        };
+        if matcher(lhs, rhs, max_mismatches) {
             return true;
         }
         if let Ok(lhs_rev) = Self::reverse(lhs) {
-            matches_within_threshold(&lhs_rev, rhs, max_mismatches)
+            matcher(&lhs_rev, rhs, max_mismatches)
         } else {
             false
         }
@@ -2013,7 +2133,7 @@ mod tests {
 
     #[test]
     fn test_simple_error_assigner_basic() {
-        let assigner = SimpleErrorUmiAssigner::new(1);
+        let assigner = SimpleErrorUmiAssigner::new(1, false);
         let umis = vec![
             "AAAAAA".to_string(),
             "AAAATT".to_string(),
@@ -2033,7 +2153,7 @@ mod tests {
     #[test]
     #[expect(clippy::similar_names, reason = "umi variable names intentionally similar")]
     fn test_simple_error_assigner_groups_by_mismatches() {
-        let assigner = SimpleErrorUmiAssigner::new(1);
+        let assigner = SimpleErrorUmiAssigner::new(1, false);
         let umis = vec![
             "AAAAAA".to_string(),
             "AAAATT".to_string(),
@@ -2067,7 +2187,7 @@ mod tests {
 
     #[test]
     fn test_simple_error_assigner_groups_everything_with_high_edits() {
-        let assigner = SimpleErrorUmiAssigner::new(6);
+        let assigner = SimpleErrorUmiAssigner::new(6, false);
         let umis = vec![
             "AAAAAA".to_string(),
             "AAAATT".to_string(),
@@ -2088,7 +2208,7 @@ mod tests {
 
     #[test]
     fn test_simple_error_with_zero_edits() {
-        let assigner = SimpleErrorUmiAssigner::new(0);
+        let assigner = SimpleErrorUmiAssigner::new(0, false);
         let umis = vec!["AAAAAA".to_string(), "AAAAAA".to_string(), "AAAAAT".to_string()];
         let assignments = assigner.assign(&umis);
         let groups = group_assignments(&umis, &assignments, false);
@@ -2099,7 +2219,7 @@ mod tests {
 
     #[test]
     fn test_adjacency_with_zero_edits() {
-        let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
+        let assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD, false);
         let umis = vec!["AAAAAA".to_string(), "AAAAAA".to_string(), "AAAAAT".to_string()];
         let assignments = assigner.assign(&umis);
         let groups = group_assignments(&umis, &assignments, false);
@@ -2126,7 +2246,7 @@ mod tests {
     /// - Result: AAAA, ACAA, CCAA in same group; GGGG separate
     #[test]
     fn test_adjacency_backward_capture() {
-        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD);
+        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD, false);
 
         // Construct input with counts: AAAA(100), CCAA(1), GGGG(2), ACAA(2)
         // Note: CCAA count=1 so it satisfies count constraint: 1 < ACAA_count/2+1 = 2
@@ -2569,7 +2689,7 @@ mod tests {
         #[test]
         fn prop_adjacency_zero_edits_like_identity(umis in prop::collection::vec("[ACGT]{8}", 1..10)) {
             let identity_assigner = IdentityUmiAssigner::new();
-            let adjacency_assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD);
+            let adjacency_assigner = AdjacencyUmiAssigner::new(0, 1, DEFAULT_INDEX_THRESHOLD, false);
 
             let identity_assignments = identity_assigner.assign(&umis);
             let adjacency_assignments = adjacency_assigner.assign(&umis);
@@ -2736,7 +2856,7 @@ mod tests {
     #[test]
     fn test_simple_error_assigner_deterministic() {
         // Verify that edit distance assigner produces consistent groupings on repeated runs
-        let assigner = SimpleErrorUmiAssigner::new(1);
+        let assigner = SimpleErrorUmiAssigner::new(1, false);
         let umis = vec![
             "GGGGGG".to_string(),
             "GGGGGC".to_string(), // 1 edit from GGGGGG
@@ -2775,7 +2895,7 @@ mod tests {
     #[test]
     fn test_adjacency_assigner_deterministic() {
         // Verify that adjacency assigner produces consistent groupings on repeated runs
-        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD);
+        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD, false);
         let umis = vec![
             "GGGGGG".to_string(),
             "GGGGGC".to_string(),
@@ -2811,7 +2931,7 @@ mod tests {
         // Both AAAAAA and AAAGAC are within 1 edit of AAAAAC (can capture it)
         // AAAGAC is 2 edits from AAAAAA (positions 3 and 5), so they won't be grouped together
         // With deterministic sorting, AAAAAA (lexicographically first) should capture AAAAAC
-        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD);
+        let assigner = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD, false);
         let umis = vec![
             "AAAAAA".to_string(),
             "AAAAAA".to_string(),
@@ -2841,7 +2961,8 @@ mod tests {
             "AAAGAC".to_string(),
             "AAAAAC".to_string(),
         ];
-        let assignments2 = AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD).assign(&umis2);
+        let assignments2 =
+            AdjacencyUmiAssigner::new(1, 1, DEFAULT_INDEX_THRESHOLD, false).assign(&umis2);
         assert!(
             assignments_structurally_equal(&umis, &assignments, &umis2, &assignments2),
             "Equal-count adjacency grouping should be deterministic across runs"
@@ -2868,10 +2989,10 @@ mod tests {
         }
 
         // With index (threshold = 100, so 200 UMIs will trigger indexing)
-        let indexed_assignments = AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis);
+        let indexed_assignments = AdjacencyUmiAssigner::new(1, 1, 100, false).assign(&umis);
 
         // Without index (threshold = 1000, so 200 UMIs will use linear scan)
-        let linear_assignments = AdjacencyUmiAssigner::new(1, 1, 1000).assign(&umis);
+        let linear_assignments = AdjacencyUmiAssigner::new(1, 1, 1000, false).assign(&umis);
 
         // Both should produce structurally equivalent results
         assert!(
@@ -2888,7 +3009,7 @@ mod tests {
         umis.push("AAAAAAAC".to_string()); // Child with 1 read (1 < 10/2 + 1 = 6)
         umis.extend(vec!["TTTTTTTT".to_string(); 5]); // Distinct UMI
 
-        let assignments = AdjacencyUmiAssigner::new(1, 1, 0).assign(&umis);
+        let assignments = AdjacencyUmiAssigner::new(1, 1, 0, false).assign(&umis);
         let map = build_assignment_map(&umis, &assignments);
 
         // Should still produce correct results
@@ -2915,7 +3036,7 @@ mod tests {
         umis.extend(vec!["TTTTTT".to_string(); 5]); // Distinct UMI
 
         // Using Adjacency strategy with custom threshold
-        let assigner = UmiStrategy::Adjacency.new_assigner_full(1, 1, 100);
+        let assigner = UmiStrategy::Adjacency.new_assigner_full(1, 1, 100, false);
         let assignments = assigner.assign(&umis);
         let map = build_assignment_map(&umis, &assignments);
 
@@ -2943,7 +3064,8 @@ mod tests {
         let assignments1 = assigner1.assign(&umis);
 
         // new_assigner_full with explicit DEFAULT_INDEX_THRESHOLD should produce same result
-        let assigner2 = UmiStrategy::Adjacency.new_assigner_full(1, 1, DEFAULT_INDEX_THRESHOLD);
+        let assigner2 =
+            UmiStrategy::Adjacency.new_assigner_full(1, 1, DEFAULT_INDEX_THRESHOLD, false);
         let assignments2 = assigner2.assign(&umis);
 
         assert!(
@@ -2960,7 +3082,7 @@ mod tests {
         umis.push("AAAC-CCCC".to_string()); // Child with 1 read (1 mismatch in first half)
         umis.extend(vec!["TTTT-GGGG".to_string(); 5]); // Distinct UMI
 
-        let assigner = PairedUmiAssigner::new_with_threads(1, 1, 100);
+        let assigner = PairedUmiAssigner::new_with_threads(1, 1, 100, false);
         let assignments = assigner.assign(&umis);
         let assignment_map = build_assignment_map(&umis, &assignments);
 
@@ -2996,10 +3118,10 @@ mod tests {
         }
 
         // Run with indexing (threshold=100, we have 150 UMIs)
-        let assignments_indexed = AdjacencyUmiAssigner::new(1, 1, 100).assign(&umis);
+        let assignments_indexed = AdjacencyUmiAssigner::new(1, 1, 100, false).assign(&umis);
 
         // Run without indexing (threshold > 150)
-        let assignments_linear = AdjacencyUmiAssigner::new(1, 1, 200).assign(&umis);
+        let assignments_linear = AdjacencyUmiAssigner::new(1, 1, 200, false).assign(&umis);
 
         // Verify indexing produces same result as linear scan
         // (the actual number of groups depends on UMI edit distances)
@@ -3254,5 +3376,176 @@ mod tests {
                 "BkTree and NgramIndex should return same results for query {query}"
             );
         }
+    }
+
+    // ==================== C→T tolerance tests ====================
+
+    #[test]
+    fn test_matches_within_threshold_ct_directed_no_conversion() {
+        // No C→T, same result as standard
+        assert!(matches_within_threshold_ct_directed("AAGGTTAA", "AAGGTTAA", 1));
+        assert!(matches_within_threshold_ct_directed("AAGGTTAA", "AAGGTTAG", 1));
+        assert!(!matches_within_threshold_ct_directed("AAGGTTAA", "AAGGTTGG", 1));
+    }
+
+    #[test]
+    fn test_matches_within_threshold_ct_directed_single_ct() {
+        // expected=C observed=T → ignored
+        assert!(matches_within_threshold_ct_directed("ACGT", "ATGT", 0));
+    }
+
+    #[test]
+    fn test_matches_within_threshold_ct_directed_reverse_tc() {
+        // expected=T observed=C → real mismatch (asymmetric)
+        assert!(!matches_within_threshold_ct_directed("ATGT", "ACGT", 0));
+        assert!(matches_within_threshold_ct_directed("ATGT", "ACGT", 1));
+    }
+
+    #[test]
+    fn test_matches_within_threshold_ct_directed_mixed() {
+        // C→T at pos 1 (ignored) + A→G at pos 3 (real) → distance 1
+        assert!(matches_within_threshold_ct_directed("ACGA", "ATGG", 1));
+        assert!(!matches_within_threshold_ct_directed("ACGA", "ATGG", 0));
+    }
+
+    #[test]
+    fn test_matches_within_threshold_ct_directed_all_ct() {
+        // All C→T → distance 0
+        assert!(matches_within_threshold_ct_directed("CCCC", "TTTT", 0));
+    }
+
+    #[test]
+    fn test_matches_within_threshold_allow_c_to_t_bidirectional() {
+        // Bidirectional: takes min of both directions
+        // a→b: C→T at pos 0 (ignored), distance=0
+        // b→a: T→C at pos 0 (real mismatch), distance=1
+        // min(0, 1) = 0
+        assert!(matches_within_threshold_allow_c_to_t("CAGT", "TAGT", 0));
+
+        // a→b: T→C at pos 0 (real mismatch), distance=1
+        // b→a: C→T at pos 0 (ignored), distance=0
+        // min(1, 0) = 0
+        assert!(matches_within_threshold_allow_c_to_t("TAGT", "CAGT", 0));
+    }
+
+    #[test]
+    fn test_matches_within_threshold_allow_c_to_t_real_mismatch() {
+        // A→G at pos 0 — real mismatch in both directions
+        assert!(!matches_within_threshold_allow_c_to_t("AAGT", "GAGT", 0));
+        assert!(matches_within_threshold_allow_c_to_t("AAGT", "GAGT", 1));
+    }
+
+    #[test]
+    fn test_simple_error_assigner_allow_c_to_t() {
+        // Two UMIs: ACGT and ATGT (C→T at pos 1)
+        let assigner = SimpleErrorUmiAssigner::new(0, true);
+        let umis = vec!["ACGT".to_string(), "ATGT".to_string()];
+        let assignments = assigner.assign(&umis);
+        assert_eq!(
+            assignments[0], assignments[1],
+            "C→T converted UMIs should be grouped with allow_c_to_t"
+        );
+    }
+
+    #[test]
+    fn test_simple_error_assigner_allow_c_to_t_real_mismatch_separate() {
+        // ACGT and AGGT differ at pos 1 (C→G), not C→T
+        let assigner = SimpleErrorUmiAssigner::new(0, true);
+        let umis = vec!["ACGT".to_string(), "AGGT".to_string()];
+        let assignments = assigner.assign(&umis);
+        assert_ne!(assignments[0], assignments[1], "Non-C→T mismatches should still separate UMIs");
+    }
+
+    #[test]
+    fn test_adjacency_assigner_allow_c_to_t_parent_as_expected() {
+        // Parent (high-count) = ACGT (has C at pos 1)
+        // Child (low-count) = ATGT (T at pos 1 — C→T conversion)
+        // Parent-as-expected: parent=ACGT, child=ATGT → C→T ignored → grouped
+        let mut umis: Vec<String> = vec!["ACGT".to_string(); 10]; // Parent: 10 reads
+        umis.push("ATGT".to_string()); // Child: 1 read
+        let assigner = AdjacencyUmiAssigner::new(0, 1, 0, true);
+        let assignments = assigner.assign(&umis);
+        assert_eq!(
+            assignments[0], assignments[10],
+            "C→T child should be grouped with parent when allow_c_to_t=true"
+        );
+    }
+
+    #[test]
+    fn test_adjacency_assigner_allow_c_to_t_reverse_not_grouped() {
+        // Parent (high-count) = ATGT (has T at pos 1)
+        // Child (low-count) = ACGT (has C at pos 1)
+        // Parent-as-expected: parent=ATGT, child=ACGT → T→C at pos 1 → real mismatch
+        // Should NOT be grouped at max_mismatches=0
+        let mut umis: Vec<String> = vec!["ATGT".to_string(); 10]; // Parent: 10 reads
+        umis.push("ACGT".to_string()); // Child: 1 read
+        let assigner = AdjacencyUmiAssigner::new(0, 1, 0, true);
+        let assignments = assigner.assign(&umis);
+        assert_ne!(
+            assignments[0], assignments[10],
+            "T→C (reverse direction) should NOT be ignored in parent-as-expected model"
+        );
+    }
+
+    #[test]
+    fn test_adjacency_assigner_allow_c_to_t_with_real_error() {
+        // Parent = ACGA, Child = ATGG (C→T at pos 1, A→G at pos 3)
+        // C→T is ignored, but A→G is a real mismatch → distance 1
+        let mut umis: Vec<String> = vec!["ACGA".to_string(); 10];
+        umis.push("ATGG".to_string());
+        let assigner_0 = AdjacencyUmiAssigner::new(0, 1, 0, true);
+        let assignments_0 = assigner_0.assign(&umis);
+        assert_ne!(
+            assignments_0[0], assignments_0[10],
+            "Should not group when real mismatch exceeds max_mismatches=0"
+        );
+
+        let assigner_1 = AdjacencyUmiAssigner::new(1, 1, 0, true);
+        let assignments_1 = assigner_1.assign(&umis);
+        assert_eq!(
+            assignments_1[0], assignments_1[10],
+            "Should group when real mismatch within max_mismatches=1"
+        );
+    }
+
+    #[test]
+    fn test_adjacency_assigner_allow_c_to_t_multiple_conversions() {
+        // Parent = CCCC, Child = TTTT (all C→T)
+        let mut umis: Vec<String> = vec!["CCCC".to_string(); 10];
+        umis.push("TTTT".to_string());
+        let assigner = AdjacencyUmiAssigner::new(0, 1, 0, true);
+        let assignments = assigner.assign(&umis);
+        assert_eq!(assignments[0], assignments[10], "All C→T conversions should be ignored");
+    }
+
+    #[test]
+    fn test_adjacency_assigner_allow_c_to_t_disabled() {
+        // Same scenario but without allow_c_to_t → should NOT group
+        let mut umis: Vec<String> = vec!["ACGT".to_string(); 10];
+        umis.push("ATGT".to_string());
+        let assigner = AdjacencyUmiAssigner::new(0, 1, 0, false);
+        let assignments = assigner.assign(&umis);
+        assert_ne!(
+            assignments[0], assignments[10],
+            "Without allow_c_to_t, C→T should be a real mismatch at max_mismatches=0"
+        );
+    }
+
+    #[test]
+    fn test_adjacency_assigner_allow_c_to_t_three_tier_chain() {
+        // Test that C→T tolerance propagates through the adjacency graph:
+        // Grandparent (20 reads): CCCC
+        // Parent (5 reads): TCCC (T→C at pos 0 from grandparent's perspective, but
+        //   grandparent=CCCC, this=TCCC → at pos 0: expected=C, observed=T → C→T → ignored)
+        // Child (1 read): TTCC (from parent's perspective: parent=TCCC, child=TTCC →
+        //   pos 1: expected=C, observed=T → C→T → ignored)
+        let mut umis = vec!["CCCC".to_string(); 20];
+        umis.extend(vec!["TCCC".to_string(); 5]);
+        umis.push("TTCC".to_string());
+        let assigner = AdjacencyUmiAssigner::new(0, 1, 0, true);
+        let assignments = assigner.assign(&umis);
+        // All should be in the same group
+        assert_eq!(assignments[0], assignments[20], "Parent should group with grandparent");
+        assert_eq!(assignments[0], assignments[25], "Child should group via parent");
     }
 }

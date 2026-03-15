@@ -92,7 +92,7 @@ fn test_adjacency_assigner_with_error_correction() {
         .collect();
 
     // Apply adjacency assigner with 1 mismatch allowed
-    let assigner = AdjacencyUmiAssigner::new(1, 1, 100);
+    let assigner = AdjacencyUmiAssigner::new(1, 1, 100, false);
     let assignments = assigner.assign(&umis);
 
     // Helper to find the MoleculeId for a given UMI string
@@ -147,7 +147,7 @@ fn test_adjacency_respects_count_gradient() {
         .collect();
 
     // Apply adjacency assigner
-    let assigner = AdjacencyUmiAssigner::new(1, 1, 100);
+    let assigner = AdjacencyUmiAssigner::new(1, 1, 100, false);
     let assignments = assigner.assign(&umis);
 
     // Helper to find the MoleculeId for a given UMI string

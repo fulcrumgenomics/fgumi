@@ -1051,6 +1051,7 @@ Note: Using `samtools sort` will NOT work correctly because it doesn't use the
 - Remove (--remove-duplicates): Exclude duplicate reads from output entirely
 "#
 )]
+#[expect(clippy::struct_excessive_bools, reason = "CLI struct with boolean flags")]
 pub struct MarkDuplicates {
     /// Input and output BAM files
     #[command(flatten)]
@@ -1116,6 +1117,14 @@ pub struct MarkDuplicates {
     /// and ignores any existing UMI tags.
     #[arg(long = "no-umi")]
     pub no_umi: bool,
+
+    /// Treat C→T mismatches as zero cost (for EM-Seq methylated UMIs).
+    ///
+    /// When enabled, positions where the expected UMI has C and the observed UMI has T are not
+    /// counted as mismatches. This accounts for incomplete conversion protection of 5mC bases
+    /// in enzymatic methyl-seq (EM-Seq) library preparation.
+    #[arg(long)]
+    pub allow_c_to_t: bool,
 
     /// Scheduler and pipeline options
     #[command(flatten)]
@@ -1227,6 +1236,7 @@ impl Command for MarkDuplicates {
         let index_threshold = self.index_threshold;
         let min_umi_length = self.min_umi_length;
         let no_umi = self.no_umi;
+        let allow_c_to_t = self.allow_c_to_t;
         let remove_duplicates = self.remove_duplicates;
         let collected_metrics_clone = Arc::clone(&collected_metrics);
 
@@ -1262,7 +1272,8 @@ impl Command for MarkDuplicates {
             },
             // Process function (parallel) — builds templates from raw records
             move |group: RawPositionGroup| -> io::Result<ProcessedDedupGroup> {
-                let assigner = strategy.new_assigner_full(effective_edits, 1, index_threshold);
+                let assigner =
+                    strategy.new_assigner_full(effective_edits, 1, index_threshold, allow_c_to_t);
                 process_position_group(
                     group,
                     &filter_config,
@@ -1969,21 +1980,21 @@ mod tests {
 
     #[test]
     fn test_umi_for_read_identity_uppercase() {
-        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
+        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100, false);
         let result = umi_for_read("ACGTACGT", true, assigner.as_ref()).unwrap();
         assert_eq!(result, "ACGTACGT");
     }
 
     #[test]
     fn test_umi_for_read_identity_lowercase_gets_uppercased() {
-        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
+        let assigner = Strategy::Identity.new_assigner_full(0, 1, 100, false);
         let result = umi_for_read("acgtacgt", true, assigner.as_ref()).unwrap();
         assert_eq!(result, "ACGTACGT");
     }
 
     #[test]
     fn test_umi_for_read_paired_r1_earlier() {
-        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
+        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100, false);
         // With max_mismatches=1, prefix_len=2, so lower_prefix="aa", higher_prefix="bb"
         let result = umi_for_read("ACGT-TGCA", true, assigner.as_ref()).unwrap();
         // is_r1_earlier=true => lower_prefix:parts[0]-higher_prefix:parts[1]
@@ -1992,7 +2003,7 @@ mod tests {
 
     #[test]
     fn test_umi_for_read_paired_r2_earlier() {
-        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
+        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100, false);
         // With max_mismatches=1, prefix_len=2, so lower_prefix="aa", higher_prefix="bb"
         let result = umi_for_read("ACGT-TGCA", false, assigner.as_ref()).unwrap();
         // is_r1_earlier=false => higher_prefix:parts[0]-lower_prefix:parts[1]
@@ -2001,7 +2012,7 @@ mod tests {
 
     #[test]
     fn test_umi_for_read_paired_missing_dash_error() {
-        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
+        let assigner = Strategy::Paired.new_assigner_full(1, 1, 100, false);
         let result = umi_for_read("ACGTACGT", true, assigner.as_ref());
         assert!(result.is_err());
         assert!(

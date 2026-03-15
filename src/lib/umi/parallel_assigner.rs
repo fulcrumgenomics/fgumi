@@ -22,6 +22,17 @@ use crate::template::MoleculeId;
 
 use super::{Umi, UmiAssigner};
 
+/// Creates a rayon thread pool with the given number of threads.
+///
+/// # Panics
+/// Panics if the thread pool cannot be created.
+fn build_thread_pool(threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("Failed to build rayon thread pool")
+}
+
 /// Thread-safe union-find data structure for parallel connected component discovery.
 ///
 /// Uses path compression and union-by-rank for near-O(1) amortized operations.
@@ -210,7 +221,14 @@ pub fn discover_edges_parallel_k1(
 pub fn discover_edges_parallel_k(
     umis: &[(BitEnc, usize)],
     max_mismatches: u32,
+    allow_c_to_t: bool,
 ) -> Vec<(usize, usize)> {
+    // When allow_c_to_t is enabled, the neighbor-generation approach cannot correctly
+    // enumerate all C→T variant neighbors, so fall back to parallel pairwise comparison.
+    if allow_c_to_t {
+        return discover_edges_pairwise_c_to_t(umis, max_mismatches);
+    }
+
     if max_mismatches == 1 {
         return discover_edges_parallel_k1(umis);
     }
@@ -241,6 +259,37 @@ pub fn discover_edges_parallel_k(
         .collect()
 }
 
+/// Parallel pairwise edge discovery using C→T-aware Hamming distance.
+///
+/// Falls back to O(n²/P) pairwise comparison because the asymmetric C→T tolerance
+/// means neighbor generation (which enumerates symmetric Hamming neighbors) cannot
+/// correctly find all edges. The asymmetric distance is checked in both directions
+/// (a→b and b→a), matching the sequential assigner behavior.
+///
+/// # Complexity
+/// O(U² / P) where U = unique UMIs, P = threads
+#[must_use]
+fn discover_edges_pairwise_c_to_t(
+    umis: &[(BitEnc, usize)],
+    max_mismatches: u32,
+) -> Vec<(usize, usize)> {
+    umis.par_iter()
+        .enumerate()
+        .flat_map(|(i, (enc_i, _))| {
+            let mut edges = Vec::new();
+            for (j, (enc_j, _)) in umis.iter().enumerate().skip(i + 1) {
+                // Check both directions: i as parent of j, and j as parent of i
+                let dist_ij = enc_i.hamming_distance_allow_c_to_t(enc_j);
+                let dist_ji = enc_j.hamming_distance_allow_c_to_t(enc_i);
+                if dist_ij <= max_mismatches || dist_ji <= max_mismatches {
+                    edges.push((i, j));
+                }
+            }
+            edges
+        })
+        .collect()
+}
+
 /// Parallel UMI assigner for Identity strategy.
 ///
 /// Uses a partition-merge approach: splits UMIs into chunks, builds per-chunk
@@ -260,10 +309,7 @@ impl ParallelIdentityAssigner {
     /// Panics if the rayon thread pool cannot be created.
     #[must_use]
     pub fn new(threads: usize) -> Self {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("Failed to build rayon thread pool");
+        let pool = build_thread_pool(threads);
         Self { pool }
     }
 }
@@ -326,6 +372,7 @@ impl UmiAssigner for ParallelIdentityAssigner {
 /// Produces identical results to `SimpleErrorUmiAssigner` in `assigner.rs`.
 pub struct ParallelEditAssigner {
     max_mismatches: u32,
+    allow_c_to_t: bool,
     pool: rayon::ThreadPool,
 }
 
@@ -335,16 +382,14 @@ impl ParallelEditAssigner {
     /// # Arguments
     /// * `max_mismatches` - Maximum Hamming distance for UMIs to be grouped
     /// * `threads` - Number of threads for the rayon thread pool
+    /// * `allow_c_to_t` - If true, C→T mismatches cost 0 (for EM-seq)
     ///
     /// # Panics
     /// Panics if the rayon thread pool cannot be created.
     #[must_use]
-    pub fn new(max_mismatches: u32, threads: usize) -> Self {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool }
+    pub fn new(max_mismatches: u32, threads: usize, allow_c_to_t: bool) -> Self {
+        let pool = build_thread_pool(threads);
+        Self { max_mismatches, allow_c_to_t, pool }
     }
 }
 
@@ -383,8 +428,9 @@ impl UmiAssigner for ParallelEditAssigner {
 
         // Discover edges and build components using the configured thread pool
         let max_mismatches = self.max_mismatches;
+        let allow_c_to_t = self.allow_c_to_t;
         let (edges, uf) = self.pool.install(|| {
-            let edges = discover_edges_parallel_k(&unique_umis, max_mismatches);
+            let edges = discover_edges_parallel_k(&unique_umis, max_mismatches, allow_c_to_t);
             let uf = UnionFind::new(unique_umis.len());
             uf.union_parallel(&edges);
             (edges, uf)
@@ -428,6 +474,7 @@ impl UmiAssigner for ParallelEditAssigner {
 /// Produces identical results to `AdjacencyUmiAssigner` in `assigner.rs`.
 pub struct ParallelAdjacencyAssigner {
     max_mismatches: u32,
+    allow_c_to_t: bool,
     pool: rayon::ThreadPool,
 }
 
@@ -437,16 +484,14 @@ impl ParallelAdjacencyAssigner {
     /// # Arguments
     /// * `max_mismatches` - Maximum Hamming distance for UMIs to be adjacent
     /// * `threads` - Number of threads for the rayon thread pool
+    /// * `allow_c_to_t` - If true, C→T mismatches cost 0 (for EM-seq)
     ///
     /// # Panics
     /// Panics if the rayon thread pool cannot be created.
     #[must_use]
-    pub fn new(max_mismatches: u32, threads: usize) -> Self {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool }
+    pub fn new(max_mismatches: u32, threads: usize, allow_c_to_t: bool) -> Self {
+        let pool = build_thread_pool(threads);
+        Self { max_mismatches, allow_c_to_t, pool }
     }
 }
 
@@ -488,7 +533,10 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
 
         // Phase 1: Parallel edge discovery (using configured thread pool)
         let max_mismatches = self.max_mismatches;
-        let edges = self.pool.install(|| discover_edges_parallel_k(&unique_umis, max_mismatches));
+        let allow_c_to_t = self.allow_c_to_t;
+        let edges = self
+            .pool
+            .install(|| discover_edges_parallel_k(&unique_umis, max_mismatches, allow_c_to_t));
 
         // Build adjacency list
         let mut adj_list: Vec<Vec<usize>> = vec![Vec::new(); unique_umis.len()];
@@ -576,6 +624,7 @@ impl UmiAssigner for ParallelAdjacencyAssigner {
 /// Produces identical results to `PairedUmiAssigner` in `assigner.rs`.
 pub struct ParallelPairedAssigner {
     max_mismatches: u32,
+    allow_c_to_t: bool,
     pool: rayon::ThreadPool,
 }
 
@@ -585,16 +634,14 @@ impl ParallelPairedAssigner {
     /// # Arguments
     /// * `max_mismatches` - Maximum Hamming distance for UMIs to be adjacent
     /// * `threads` - Number of threads for the rayon thread pool
+    /// * `allow_c_to_t` - If true, C→T mismatches cost 0 (for EM-seq)
     ///
     /// # Panics
     /// Panics if the rayon thread pool cannot be created.
     #[must_use]
-    pub fn new(max_mismatches: u32, threads: usize) -> Self {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("Failed to build rayon thread pool");
-        Self { max_mismatches, pool }
+    pub fn new(max_mismatches: u32, threads: usize, allow_c_to_t: bool) -> Self {
+        let pool = build_thread_pool(threads);
+        Self { max_mismatches, allow_c_to_t, pool }
     }
 
     /// Reverse a paired UMI: "AAAA-CCCC" -> "CCCC-AAAA"
@@ -666,7 +713,10 @@ impl UmiAssigner for ParallelPairedAssigner {
         // and reversed orientations with the same threshold; canonicalization achieves the
         // same effect by ensuring reversed pairs share the same canonical form.
         let max_mismatches = self.max_mismatches;
-        let edges = self.pool.install(|| discover_edges_parallel_k(&unique_umis, max_mismatches));
+        let allow_c_to_t = self.allow_c_to_t;
+        let edges = self
+            .pool
+            .install(|| discover_edges_parallel_k(&unique_umis, max_mismatches, allow_c_to_t));
 
         // Build adjacency list
         let mut adj_list: Vec<Vec<usize>> = vec![Vec::new(); unique_umis.len()];
@@ -877,7 +927,7 @@ mod tests {
             (BitEnc::from_bytes(b"TTTT").unwrap(), 3), // 4 edits from AAAA, 2 from AATT
         ];
 
-        let edges = discover_edges_parallel_k(&umis, 2);
+        let edges = discover_edges_parallel_k(&umis, 2, false);
 
         // AAAA-AATT (2 edits) and AATT-TTTT (2 edits) should be connected
         assert_eq!(edges.len(), 2);
@@ -991,7 +1041,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_basic() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> =
             vec!["AAAA", "AAAT", "TTTT"].into_iter().map(String::from).collect();
 
@@ -1005,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_k2() {
-        let assigner = ParallelEditAssigner::new(2, 2);
+        let assigner = ParallelEditAssigner::new(2, 2, false);
         let umis: Vec<String> =
             vec!["AAAA", "AATT", "TTTT"].into_iter().map(String::from).collect();
 
@@ -1020,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_transitive() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         // A-B-C chain where A~B and B~C but A and C are 2 apart
         let umis: Vec<String> =
             vec!["AAAA", "AAAT", "AATT"].into_iter().map(String::from).collect();
@@ -1034,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_empty() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> = vec![];
         let assignments = assigner.assign(&umis);
         assert!(assignments.is_empty());
@@ -1042,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_single() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> = vec!["ACGT".to_string()];
         let assignments = assigner.assign(&umis);
         assert_eq!(assignments.len(), 1);
@@ -1050,7 +1100,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_identical_umis() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> =
             vec!["ACGT", "ACGT", "ACGT"].into_iter().map(String::from).collect();
 
@@ -1065,7 +1115,7 @@ mod tests {
     fn test_parallel_edit_paired_umis_with_dash() {
         // Test that paired UMIs with dashes (e.g., "ACGT-TGCA") are handled correctly
         // This is a regression test for the bug where dashes caused all UMIs to be invalid
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> = vec![
             "ACGTACGT-TGCATGCA".to_string(), // Same UMI, should be grouped
             "ACGTACGT-TGCATGCA".to_string(),
@@ -1088,7 +1138,7 @@ mod tests {
     #[test]
     fn test_parallel_adjacency_paired_umis_with_dash() {
         // Test that adjacency also handles paired UMIs with dashes
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
         let umis: Vec<String> = vec![
             "ACGTACGT-TGCATGCA".to_string(),
             "ACGTACGT-TGCATGCA".to_string(),
@@ -1104,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_case_insensitive() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> =
             vec!["ACGT", "acgt", "AcGt"].into_iter().map(String::from).collect();
 
@@ -1117,7 +1167,7 @@ mod tests {
 
     #[test]
     fn test_parallel_edit_invalid_umis() {
-        let assigner = ParallelEditAssigner::new(1, 2);
+        let assigner = ParallelEditAssigner::new(1, 2, false);
         let umis: Vec<String> = vec!["ACGT", "ACGN", "ACGT"] // ACGN is invalid
             .into_iter()
             .map(String::from)
@@ -1135,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_parallel_adjacency_basic() {
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
         let umis: Vec<String> =
             vec!["AAAA", "AAAA", "AAAT"].into_iter().map(String::from).collect(); // AAAA count=2, AAAT count=1
 
@@ -1148,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_parallel_adjacency_count_constraint() {
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
         // AAAA appears 4x, AAAT appears 1x
         // max_child_count = 4/2 + 1 = 3
         // AAAT count (1) <= 3, so it will be captured by AAAA
@@ -1177,7 +1227,7 @@ mod tests {
 
     #[test]
     fn test_parallel_adjacency_cascade() {
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
         // Test cascade: A(10) -> B(4) -> C(1)
         // B can be captured by A: 4 <= 10/2+1 = 6
         // C can be captured by B: 1 <= 4/2+1 = 3
@@ -1198,7 +1248,7 @@ mod tests {
     #[test]
     fn test_parallel_adjacency_deterministic_tiebreak() {
         // Test that equal-count UMIs are handled deterministically
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
 
         // AAAAAA and AAAGAC both have count=2, AAAAAC has count=1
         // Both are within 1 edit of AAAAAC
@@ -1224,7 +1274,7 @@ mod tests {
 
     #[test]
     fn test_parallel_adjacency_empty() {
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
         let umis: Vec<String> = vec![];
         let assignments = assigner.assign(&umis);
         assert!(assignments.is_empty());
@@ -1232,7 +1282,7 @@ mod tests {
 
     #[test]
     fn test_parallel_adjacency_single() {
-        let assigner = ParallelAdjacencyAssigner::new(1, 2);
+        let assigner = ParallelAdjacencyAssigner::new(1, 2, false);
         let umis: Vec<String> = vec!["ACGT".to_string()];
         let assignments = assigner.assign(&umis);
         assert_eq!(assignments.len(), 1);
@@ -1242,7 +1292,7 @@ mod tests {
 
     #[test]
     fn test_parallel_paired_basic() {
-        let assigner = ParallelPairedAssigner::new(1, 2);
+        let assigner = ParallelPairedAssigner::new(1, 2, false);
         let umis: Vec<String> = vec![
             "AAAA-CCCC".to_string(), // Top strand
             "CCCC-AAAA".to_string(), // Bottom strand (same molecule!)
@@ -1260,7 +1310,7 @@ mod tests {
 
     #[test]
     fn test_parallel_paired_with_errors() {
-        let assigner = ParallelPairedAssigner::new(1, 2);
+        let assigner = ParallelPairedAssigner::new(1, 2, false);
         let umis: Vec<String> = vec![
             "AAAA-CCCC".to_string(),
             "AAAA-CCCC".to_string(),
@@ -1321,7 +1371,7 @@ mod tests {
     #[test]
     fn test_edit_equivalence_with_sequential() {
         // This test verifies parallel Edit produces same groupings as expected
-        let parallel = ParallelEditAssigner::new(1, 4);
+        let parallel = ParallelEditAssigner::new(1, 4, false);
 
         let umis: Vec<String> = vec!["AAAAAA", "AAAAAT", "AAAATT", "TTTTTT", "TTTTTA", "GGGGGG"]
             .into_iter()
@@ -1384,8 +1434,8 @@ mod tests {
         .map(String::from)
         .collect();
 
-        let assigner1 = ParallelEditAssigner::new(1, 4);
-        let assigner2 = ParallelEditAssigner::new(1, 4);
+        let assigner1 = ParallelEditAssigner::new(1, 4, false);
+        let assigner2 = ParallelEditAssigner::new(1, 4, false);
 
         let result1 = assigner1.assign(&umis);
         let result2 = assigner2.assign(&umis);
@@ -1402,8 +1452,8 @@ mod tests {
         umis.extend(std::iter::repeat_n("TTTTTT".to_string(), 8));
         umis.extend(std::iter::repeat_n("TTTTTA".to_string(), 2));
 
-        let assigner1 = ParallelAdjacencyAssigner::new(1, 4);
-        let assigner2 = ParallelAdjacencyAssigner::new(1, 4);
+        let assigner1 = ParallelAdjacencyAssigner::new(1, 4, false);
+        let assigner2 = ParallelAdjacencyAssigner::new(1, 4, false);
 
         let result1 = assigner1.assign(&umis);
         let result2 = assigner2.assign(&umis);
