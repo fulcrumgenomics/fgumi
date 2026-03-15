@@ -31,6 +31,7 @@
 //!     cache_size: 100_000,
 //!     min_corrected: None,
 //!     revcomp: false,
+//!     allow_c_to_t: false,
 //!     threading: ThreadingOptions::new(4),
 //!     compression: CompressionOptions::default(),
 //!     scheduler_opts: SchedulerOptions::default(),
@@ -136,6 +137,7 @@ pub struct UmiMatch {
 ///     cache_size: 100_000,
 ///     min_corrected: None,
 ///     revcomp: false,
+///     allow_c_to_t: false,
 ///     threading: ThreadingOptions::new(4),
 ///     compression: CompressionOptions::default(),
 ///     scheduler_opts: SchedulerOptions::default(),
@@ -245,6 +247,14 @@ pub struct CorrectUmis {
     /// Reverse complement UMIs before matching.
     #[arg(long)]
     pub revcomp: bool,
+
+    /// Treat C→T mismatches as zero cost (for EM-Seq methylated UMIs).
+    ///
+    /// When enabled, positions where the whitelist UMI has C and the observed UMI has T are not
+    /// counted as mismatches. This accounts for incomplete conversion protection of 5mC bases
+    /// in enzymatic methyl-seq (EM-Seq) library preparation.
+    #[arg(long)]
+    pub allow_c_to_t: bool,
 
     /// Threading options for parallel processing.
     #[command(flatten)]
@@ -407,6 +417,7 @@ impl Command for CorrectUmis {
     /// #   cache_size: 100_000,
     /// #   min_corrected: None,
     /// #   revcomp: false,
+    /// #   allow_c_to_t: false,
     /// #   threading: ThreadingOptions::new(4),
     /// };
     ///
@@ -541,7 +552,11 @@ impl CorrectUmis {
     ///
     /// * `umi_sequences` - Slice of UMI sequences to check
     fn check_umi_distances(&self, umi_sequences: &[String]) {
-        let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
+        let pairs = find_umi_pairs_within_distance(
+            umi_sequences,
+            self.min_distance_diff - 1,
+            self.allow_c_to_t,
+        );
 
         if !pairs.is_empty() {
             warn!("###################################################################");
@@ -630,6 +645,7 @@ impl CorrectUmis {
         min_distance_diff: usize,
         encoded_umi_set: &EncodedUmiSet,
         cache: &mut Option<LruCache<Vec<u8>, UmiMatch>>,
+        allow_c_to_t: bool,
     ) -> TemplateCorrection {
         let original_umi = umi.to_string();
 
@@ -668,6 +684,7 @@ impl CorrectUmis {
                         encoded_umi_set,
                         max_mismatches,
                         min_distance_diff,
+                        allow_c_to_t,
                     );
                     c.put(seq_bytes, result.clone());
                     result
@@ -678,6 +695,7 @@ impl CorrectUmis {
                     encoded_umi_set,
                     max_mismatches,
                     min_distance_diff,
+                    allow_c_to_t,
                 )
             };
 
@@ -687,11 +705,12 @@ impl CorrectUmis {
         // Determine if all segments matched
         let all_matched = matches.iter().all(|m| m.matched);
         let has_mismatches = matches.iter().any(|m| m.mismatches > 0);
-        let needs_correction = has_mismatches || revcomp;
 
         if all_matched {
             let corrected_umi: String =
                 matches.iter().map(|m| m.umi.clone()).collect::<Vec<_>>().join("-");
+            // C→T-tolerant matches may have zero mismatches but still need canonical rewrite
+            let needs_correction = revcomp || corrected_umi != original_umi;
             TemplateCorrection {
                 matched: true,
                 corrected_umi: Some(corrected_umi),
@@ -901,6 +920,7 @@ impl CorrectUmis {
         let min_distance_diff = self.min_distance_diff;
         let umi_tag = Tag::new(self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]);
         let revcomp = self.revcomp;
+        let allow_c_to_t = self.allow_c_to_t;
         let cache_size = self.cache_size;
         let dont_store_original_umis = self.dont_store_original_umis;
 
@@ -982,6 +1002,7 @@ impl CorrectUmis {
                                     min_distance_diff,
                                     &encoded_umi_set,
                                     &mut cache_ref,
+                                    allow_c_to_t,
                                 );
                                 let num_records = raw_records.len() as u64;
 
@@ -1064,6 +1085,7 @@ impl CorrectUmis {
                                     min_distance_diff,
                                     &encoded_umi_set,
                                     &mut cache_ref,
+                                    allow_c_to_t,
                                 );
                                 let num_records = records.len() as u64;
 
@@ -1362,6 +1384,7 @@ impl CorrectUmis {
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
         let revcomp = self.revcomp;
+        let allow_c_to_t = self.allow_c_to_t;
         let dont_store_original_umis = self.dont_store_original_umis;
 
         // Process templates
@@ -1398,6 +1421,7 @@ impl CorrectUmis {
                         min_distance_diff,
                         &encoded_umi_set,
                         &mut cache,
+                        allow_c_to_t,
                     );
 
                     if correction.matched {
@@ -1518,11 +1542,41 @@ impl CorrectUmis {
 /// ```
 #[must_use]
 pub fn count_mismatches_with_max(a: &[u8], b: &[u8], max_mismatches: usize) -> usize {
+    count_mismatches_inner(a, b, max_mismatches, false)
+}
+
+/// Count mismatches between two byte sequences, ignoring C→T conversions.
+///
+/// `a` is the expected (whitelist) sequence, `b` is the observed sequence.
+/// Positions where `a[i] == b'C' && b[i] == b'T'` are not counted.
+/// Early-exits when mismatch count exceeds `max_mismatches`.
+///
+/// # Example
+///
+/// ```
+/// # use fgumi_lib::correct_umis::count_mismatches_allow_c_to_t;
+/// assert_eq!(count_mismatches_allow_c_to_t(b"ACGA", b"ATGA", 10), 0); // C→T ignored
+/// assert_eq!(count_mismatches_allow_c_to_t(b"ACGA", b"ATGG", 10), 1); // C→T ignored, A→G counted
+/// assert_eq!(count_mismatches_allow_c_to_t(b"ATGA", b"ACGA", 10), 1); // T→C is real mismatch
+/// ```
+#[must_use]
+pub fn count_mismatches_allow_c_to_t(a: &[u8], b: &[u8], max_mismatches: usize) -> usize {
+    count_mismatches_inner(a, b, max_mismatches, true)
+}
+
+/// Inner implementation for mismatch counting with optional C→T tolerance.
+///
+/// When `allow_c_to_t` is true, positions where `a[i] == b'C' && b[i] == b'T'`
+/// are not counted as mismatches (EM-seq C→T conversion artifacts).
+fn count_mismatches_inner(a: &[u8], b: &[u8], max_mismatches: usize, allow_c_to_t: bool) -> usize {
     let mut mismatches = 0;
     let min_len = a.len().min(b.len());
 
     for i in 0..min_len {
         if a[i] != b[i] {
+            if allow_c_to_t && a[i] == b'C' && b[i] == b'T' {
+                continue;
+            }
             mismatches += 1;
             if mismatches > max_mismatches {
                 return mismatches;
@@ -1591,6 +1645,7 @@ fn find_best_match_encoded(
     umi_set: &EncodedUmiSet,
     max_mismatches: usize,
     min_distance_diff: usize,
+    allow_c_to_t: bool,
 ) -> UmiMatch {
     let mut best_index: Option<usize> = None;
     let mut best_mismatches = usize::MAX;
@@ -1605,10 +1660,26 @@ fn find_best_match_encoded(
             for (i, fixed_enc) in umi_set.encoded.iter().enumerate() {
                 let mismatches = if let Some(enc) = fixed_enc {
                     // Both can be compared with BitEnc
-                    enc.hamming_distance(&obs_enc) as usize
+                    if allow_c_to_t {
+                        enc.hamming_distance_allow_c_to_t(&obs_enc) as usize
+                    } else {
+                        enc.hamming_distance(&obs_enc) as usize
+                    }
                 } else {
                     // Fixed UMI couldn't be encoded, fall back to bytes
-                    count_mismatches_with_max(observed, &umi_set.bytes[i], second_best_mismatches)
+                    if allow_c_to_t {
+                        count_mismatches_allow_c_to_t(
+                            &umi_set.bytes[i],
+                            observed,
+                            second_best_mismatches,
+                        )
+                    } else {
+                        count_mismatches_with_max(
+                            observed,
+                            &umi_set.bytes[i],
+                            second_best_mismatches,
+                        )
+                    }
                 };
 
                 if mismatches < best_mismatches {
@@ -1623,8 +1694,11 @@ fn find_best_match_encoded(
         None => {
             // Slow path: observed UMI can't be encoded, use byte comparison
             for (i, fixed_umi) in umi_set.bytes.iter().enumerate() {
-                let mismatches =
-                    count_mismatches_with_max(observed, fixed_umi, second_best_mismatches);
+                let mismatches = if allow_c_to_t {
+                    count_mismatches_allow_c_to_t(fixed_umi, observed, second_best_mismatches)
+                } else {
+                    count_mismatches_with_max(observed, fixed_umi, second_best_mismatches)
+                };
 
                 if mismatches < best_mismatches {
                     second_best_mismatches = best_mismatches;
@@ -1671,18 +1745,35 @@ fn find_best_match_encoded(
 /// ```
 /// # use fgumi_lib::correct_umis::find_umi_pairs_within_distance;
 /// let umis = vec!["AAAA".to_string(), "AAAT".to_string()];
-/// let pairs = find_umi_pairs_within_distance(&umis, 2);
+/// let pairs = find_umi_pairs_within_distance(&umis, 2, false);
 /// assert_eq!(pairs.len(), 1);
 /// ```
 #[must_use]
 pub fn find_umi_pairs_within_distance(
     umis: &[String],
     distance: usize,
+    allow_c_to_t: bool,
 ) -> Vec<(String, String, usize)> {
     let mut pairs = Vec::new();
     for i in 0..umis.len() {
         for j in (i + 1)..umis.len() {
-            let d = count_mismatches_with_max(umis[i].as_bytes(), umis[j].as_bytes(), distance + 1);
+            // For EM-Seq, check both directions since C→T is asymmetric:
+            // either UMI could be the "expected" one from the observer's perspective.
+            let d = if allow_c_to_t {
+                let d1 = count_mismatches_allow_c_to_t(
+                    umis[i].as_bytes(),
+                    umis[j].as_bytes(),
+                    distance + 1,
+                );
+                let d2 = count_mismatches_allow_c_to_t(
+                    umis[j].as_bytes(),
+                    umis[i].as_bytes(),
+                    distance + 1,
+                );
+                d1.min(d2)
+            } else {
+                count_mismatches_with_max(umis[i].as_bytes(), umis[j].as_bytes(), distance + 1)
+            };
             if d <= distance {
                 pairs.push((umis[i].clone(), umis[j].clone(), d));
             }
@@ -1740,12 +1831,12 @@ mod tests {
     fn test_find_best_match_perfect() {
         let umi_set = get_encoded_umi_set();
 
-        let hit1 = find_best_match_encoded(b"AAAAAA", &umi_set, 2, 2);
+        let hit1 = find_best_match_encoded(b"AAAAAA", &umi_set, 2, 2, false);
         assert!(hit1.matched);
         assert_eq!(hit1.mismatches, 0);
         assert_eq!(hit1.umi, "AAAAAA");
 
-        let hit2 = find_best_match_encoded(b"CCCCCC", &umi_set, 2, 2);
+        let hit2 = find_best_match_encoded(b"CCCCCC", &umi_set, 2, 2, false);
         assert!(hit2.matched);
         assert_eq!(hit2.mismatches, 0);
         assert_eq!(hit2.umi, "CCCCCC");
@@ -1755,22 +1846,22 @@ mod tests {
     fn test_find_best_match_with_mismatches() {
         let umi_set = get_encoded_umi_set();
 
-        let m1 = find_best_match_encoded(b"AAAAAA", &umi_set, 2, 2);
+        let m1 = find_best_match_encoded(b"AAAAAA", &umi_set, 2, 2, false);
         assert!(m1.matched);
         assert_eq!(m1.umi, "AAAAAA");
         assert_eq!(m1.mismatches, 0);
 
-        let m2 = find_best_match_encoded(b"AAAAAT", &umi_set, 2, 2);
+        let m2 = find_best_match_encoded(b"AAAAAT", &umi_set, 2, 2, false);
         assert!(m2.matched);
         assert_eq!(m2.umi, "AAAAAA");
         assert_eq!(m2.mismatches, 1);
 
-        let m3 = find_best_match_encoded(b"AAAACT", &umi_set, 2, 2);
+        let m3 = find_best_match_encoded(b"AAAACT", &umi_set, 2, 2, false);
         assert!(m3.matched);
         assert_eq!(m3.umi, "AAAAAA");
         assert_eq!(m3.mismatches, 2);
 
-        let m4 = find_best_match_encoded(b"AAAGCT", &umi_set, 2, 2);
+        let m4 = find_best_match_encoded(b"AAAGCT", &umi_set, 2, 2, false);
         assert!(!m4.matched);
         assert_eq!(m4.mismatches, 3);
     }
@@ -1779,7 +1870,7 @@ mod tests {
     fn test_no_match_when_umis_too_similar() {
         let umi_set = EncodedUmiSet::new(&["AAAG".to_string(), "AAAT".to_string()]);
 
-        let m = find_best_match_encoded(b"AAAG", &umi_set, 2, 2);
+        let m = find_best_match_encoded(b"AAAG", &umi_set, 2, 2, false);
         assert!(!m.matched);
     }
 
@@ -1787,21 +1878,21 @@ mod tests {
     fn test_match_with_many_mismatches() {
         let umi_set = get_encoded_umi_set();
 
-        let m1 = find_best_match_encoded(b"AAAAAA", &umi_set, 3, 2);
+        let m1 = find_best_match_encoded(b"AAAAAA", &umi_set, 3, 2, false);
         assert!(m1.matched);
         assert_eq!(m1.umi, "AAAAAA");
         assert_eq!(m1.mismatches, 0);
 
-        let m2 = find_best_match_encoded(b"AAACGT", &umi_set, 3, 2);
+        let m2 = find_best_match_encoded(b"AAACGT", &umi_set, 3, 2, false);
         assert!(m2.matched);
         assert_eq!(m2.umi, "AAAAAA");
         assert_eq!(m2.mismatches, 3);
 
-        let m3 = find_best_match_encoded(b"AAACCC", &umi_set, 3, 2);
+        let m3 = find_best_match_encoded(b"AAACCC", &umi_set, 3, 2, false);
         assert!(!m3.matched);
         assert_eq!(m3.mismatches, 3);
 
-        let m4 = find_best_match_encoded(b"AAACCT", &umi_set, 3, 2);
+        let m4 = find_best_match_encoded(b"AAACCT", &umi_set, 3, 2, false);
         assert!(!m4.matched);
         assert_eq!(m4.mismatches, 3);
     }
@@ -1811,6 +1902,7 @@ mod tests {
         let pairs = find_umi_pairs_within_distance(
             &["AAAA".to_string(), "TTTT".to_string(), "CCCC".to_string(), "GGGG".to_string()],
             2,
+            false,
         );
         assert!(pairs.is_empty());
     }
@@ -1825,7 +1917,7 @@ mod tests {
             "ACAGAC".to_string(),
             "AGAGAG".to_string(),
         ];
-        let pairs = find_umi_pairs_within_distance(&umis, 2);
+        let pairs = find_umi_pairs_within_distance(&umis, 2, false);
         assert_eq!(pairs.len(), 2);
         assert!(pairs.contains(&("ACACAC".to_string(), "ACAGAC".to_string(), 1)));
         assert!(pairs.contains(&("ACAGAC".to_string(), "AGAGAG".to_string(), 2)));
@@ -1958,6 +2050,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -1993,6 +2086,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2022,6 +2116,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2074,6 +2169,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2136,6 +2232,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2193,6 +2290,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2214,6 +2312,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2256,6 +2355,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2296,6 +2396,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2337,6 +2438,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: true,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2391,6 +2493,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2441,6 +2544,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2492,6 +2596,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2534,6 +2639,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2575,6 +2681,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2615,6 +2722,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: Some(0.75), // Require 75% of reads to pass
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2649,6 +2757,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: Some(0.75), // Require 75% but only 25% will pass
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2687,6 +2796,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2741,6 +2851,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::new(4), // Multiple threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2800,6 +2911,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::new(8), // 8 threads
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -2911,7 +3023,7 @@ mod tests {
         let mut cache = None;
 
         let correction = CorrectUmis::compute_template_correction(
-            "AAAAAA", 6, false, 2, 2, &umi_set, &mut cache,
+            "AAAAAA", 6, false, 2, 2, &umi_set, &mut cache, false,
         );
 
         assert!(correction.matched);
@@ -2928,7 +3040,7 @@ mod tests {
         let mut cache = None;
 
         let correction = CorrectUmis::compute_template_correction(
-            "AAAAAT", 6, false, 2, 2, &umi_set, &mut cache,
+            "AAAAAT", 6, false, 2, 2, &umi_set, &mut cache, false,
         );
 
         assert!(correction.matched);
@@ -2944,8 +3056,9 @@ mod tests {
         let umi_set = get_encoded_umi_set();
         let mut cache = None;
 
-        let correction =
-            CorrectUmis::compute_template_correction("AAAA", 6, false, 2, 2, &umi_set, &mut cache);
+        let correction = CorrectUmis::compute_template_correction(
+            "AAAA", 6, false, 2, 2, &umi_set, &mut cache, false,
+        );
 
         assert!(!correction.matched);
         assert!(correction.corrected_umi.is_none());
@@ -2958,7 +3071,7 @@ mod tests {
         let mut cache = None;
 
         let correction = CorrectUmis::compute_template_correction(
-            "AAAGGG", 6, false, 2, 2, &umi_set, &mut cache,
+            "AAAGGG", 6, false, 2, 2, &umi_set, &mut cache, false,
         );
 
         assert!(!correction.matched);
@@ -2972,8 +3085,9 @@ mod tests {
         let mut cache = None;
 
         // TTTTTT revcomp -> AAAAAA
-        let correction =
-            CorrectUmis::compute_template_correction("TTTTTT", 6, true, 2, 2, &umi_set, &mut cache);
+        let correction = CorrectUmis::compute_template_correction(
+            "TTTTTT", 6, true, 2, 2, &umi_set, &mut cache, false,
+        );
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -2996,6 +3110,7 @@ mod tests {
             2,
             &umi_set,
             &mut cache,
+            false,
         );
 
         assert!(correction.matched);
@@ -3136,6 +3251,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3196,6 +3312,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3275,6 +3392,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading: ThreadingOptions::new(4), // Multi-threaded!
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3342,6 +3460,7 @@ mod tests {
             cache_size: 100_000,
             min_corrected: None,
             revcomp: false,
+            allow_c_to_t: false,
             threading,
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
@@ -3569,5 +3688,71 @@ mod tests {
         // OX tag should NOT be present (dont_store_original_umis = true)
         let ox = bam_fields::find_string_tag_in_record(&raw, b"OX");
         assert!(ox.is_none());
+    }
+
+    // EM-Seq tests
+
+    #[test]
+    fn test_count_mismatches_allow_c_to_t() {
+        // C→T ignored
+        assert_eq!(count_mismatches_allow_c_to_t(b"ACGA", b"ATGA", 10), 0);
+        // C→T ignored, A→G counted
+        assert_eq!(count_mismatches_allow_c_to_t(b"ACGA", b"ATGG", 10), 1);
+        // T→C is real mismatch (asymmetric)
+        assert_eq!(count_mismatches_allow_c_to_t(b"ATGA", b"ACGA", 10), 1);
+        // No mismatches
+        assert_eq!(count_mismatches_allow_c_to_t(b"AAAA", b"AAAA", 10), 0);
+        // All C→T
+        assert_eq!(count_mismatches_allow_c_to_t(b"CCCC", b"TTTT", 10), 0);
+        // Early exit
+        assert_eq!(count_mismatches_allow_c_to_t(b"AAAAAA", b"GGGGGG", 2), 3);
+    }
+
+    #[test]
+    fn test_find_best_match_allow_c_to_t_basic() {
+        // Whitelist has "CCCCCC", observed is "TTTTTT" (all C→T)
+        let umi_set = EncodedUmiSet::new(&["CCCCCC".to_string()]);
+        let result = find_best_match_encoded(b"TTTTTT", &umi_set, 0, 1, true);
+        assert!(result.matched);
+        assert_eq!(result.umi, "CCCCCC");
+        assert_eq!(result.mismatches, 0);
+
+        // Without allow_c_to_t, same input should not match at max_mismatches=0
+        let result = find_best_match_encoded(b"TTTTTT", &umi_set, 0, 1, false);
+        assert!(!result.matched);
+    }
+
+    #[test]
+    fn test_find_best_match_allow_c_to_t_with_real_error() {
+        // Whitelist has "ACGTAC", observed is "ATGTAG" — C→T at pos 1 (ignored) + C→G at pos 5 (real)
+        let umi_set = EncodedUmiSet::new(&["ACGTAC".to_string()]);
+        let result = find_best_match_encoded(b"ATGTAG", &umi_set, 1, 1, true);
+        assert!(result.matched);
+        assert_eq!(result.mismatches, 1);
+    }
+
+    #[test]
+    fn test_find_best_match_allow_c_to_t_ambiguous() {
+        // Two whitelist UMIs that both match after C→T: "ACGT" and "ATGT"
+        // Observed "ATGT" matches "ATGT" at distance 0 and "ACGT" at distance 0 (C→T)
+        // Should fail min_distance_diff=1 since both are distance 0
+        let umi_set = EncodedUmiSet::new(&["ACGT".to_string(), "ATGT".to_string()]);
+        let result = find_best_match_encoded(b"ATGT", &umi_set, 1, 1, true);
+        // One matches perfectly (distance 0 standard), the other matches at distance 0 em-seq
+        // So second_best=0, best=0, distance_to_second=0 < min_distance_diff=1 → rejected
+        assert!(!result.matched);
+    }
+
+    #[test]
+    fn test_find_umi_pairs_allow_c_to_t() {
+        // "ACGT" and "ATGT" differ by 1 normally, but under EM-Seq "ACGT"→"ATGT" is distance 0
+        let umis = vec!["ACGT".to_string(), "ATGT".to_string()];
+        let pairs = find_umi_pairs_within_distance(&umis, 0, true);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].2, 0);
+
+        // Without allow_c_to_t, they are distance 1 apart, not within 0
+        let pairs = find_umi_pairs_within_distance(&umis, 0, false);
+        assert_eq!(pairs.len(), 0);
     }
 }

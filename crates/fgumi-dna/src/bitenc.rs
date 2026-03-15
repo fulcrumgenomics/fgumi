@@ -150,6 +150,43 @@ impl BitEnc {
         Self { bits: new_bits, len: self.len }
     }
 
+    /// Compute the Hamming distance, treating C→T conversions as zero cost.
+    ///
+    /// In EM-Seq, methylated UMI cytosines can be enzymatically converted to thymine.
+    /// `self` is the expected (whitelist) sequence and `other` is the observed sequence.
+    /// Positions where expected=C and observed=T are excluded from the mismatch count.
+    ///
+    /// This is asymmetric: expected=T observed=C is counted as a real mismatch.
+    #[inline]
+    #[must_use]
+    pub fn hamming_distance_allow_c_to_t(&self, other: &Self) -> u32 {
+        debug_assert_eq!(self.len, other.len, "Sequences must have equal length");
+
+        // XOR to find differing bits
+        let diff = self.bits ^ other.bits;
+
+        // Standard mismatch detection: a position differs if either of its 2 bits differ
+        let odd_bits = diff & 0xAAAA_AAAA_AAAA_AAAA;
+        let even_bits = diff & 0x5555_5555_5555_5555;
+        let differs = (odd_bits >> 1) | even_bits;
+
+        // Identify expected-C positions: even bit=1, odd bit=0 (C=01)
+        let exp_even = self.bits & 0x5555_5555_5555_5555;
+        let exp_odd = (self.bits & 0xAAAA_AAAA_AAAA_AAAA) >> 1;
+        let is_expected_c = exp_even & !exp_odd;
+
+        // Identify observed-T positions: even bit=1, odd bit=1 (T=11)
+        let obs_even = other.bits & 0x5555_5555_5555_5555;
+        let obs_odd = (other.bits & 0xAAAA_AAAA_AAAA_AAAA) >> 1;
+        let is_observed_t = obs_even & obs_odd;
+
+        // Mask out C→T conversion artifacts
+        let ct_artifacts = is_expected_c & is_observed_t;
+        let real_differs = differs & !ct_artifacts;
+
+        real_differs.count_ones()
+    }
+
     /// Extract bits for bases `[start_base, start_base + len)` as a u32.
     ///
     /// Each base is 2 bits, so this can extract up to 16 bases into a u32.
@@ -303,5 +340,60 @@ mod tests {
         let umi3 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC").unwrap();
         let umi4 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC").unwrap();
         assert_eq!(umi3.hamming_distance(&umi4), 0);
+    }
+
+    #[test]
+    fn test_hamming_distance_allow_c_to_t_no_conversion() {
+        // No C→T positions, same result as standard hamming
+        let seq1 = BitEnc::from_bytes(b"AAGGTTAA").unwrap();
+        let seq2 = BitEnc::from_bytes(b"AAGGTTAA").unwrap();
+        assert_eq!(seq1.hamming_distance_allow_c_to_t(&seq2), 0);
+
+        let seq3 = BitEnc::from_bytes(b"AAGGTTAG").unwrap();
+        assert_eq!(seq1.hamming_distance_allow_c_to_t(&seq3), 1);
+        assert_eq!(seq1.hamming_distance(&seq3), 1);
+    }
+
+    #[test]
+    fn test_hamming_distance_allow_c_to_t_single_ct() {
+        // Expected C, observed T → distance 0
+        let expected = BitEnc::from_bytes(b"ACGT").unwrap();
+        let observed = BitEnc::from_bytes(b"ATGT").unwrap(); // C→T at position 1
+        assert_eq!(expected.hamming_distance(&observed), 1); // standard counts it
+        assert_eq!(expected.hamming_distance_allow_c_to_t(&observed), 0); // em-seq ignores it
+    }
+
+    #[test]
+    fn test_hamming_distance_allow_c_to_t_multiple_ct() {
+        // Multiple C→T conversions, all ignored
+        let expected = BitEnc::from_bytes(b"CCCC").unwrap();
+        let observed = BitEnc::from_bytes(b"TTTT").unwrap();
+        assert_eq!(expected.hamming_distance(&observed), 4);
+        assert_eq!(expected.hamming_distance_allow_c_to_t(&observed), 0);
+    }
+
+    #[test]
+    fn test_hamming_distance_allow_c_to_t_mixed() {
+        // C→T artifacts + real mismatches → only real counted
+        let expected = BitEnc::from_bytes(b"ACGA").unwrap();
+        let observed = BitEnc::from_bytes(b"ATGG").unwrap(); // C→T at pos 1, A→G at pos 3
+        assert_eq!(expected.hamming_distance(&observed), 2);
+        assert_eq!(expected.hamming_distance_allow_c_to_t(&observed), 1); // only A→G counts
+    }
+
+    #[test]
+    fn test_hamming_distance_allow_c_to_t_reverse_tc() {
+        // Expected T, observed C → real mismatch (asymmetric)
+        let expected = BitEnc::from_bytes(b"ATGT").unwrap();
+        let observed = BitEnc::from_bytes(b"ACGT").unwrap(); // T→C at position 1
+        assert_eq!(expected.hamming_distance_allow_c_to_t(&observed), 1);
+    }
+
+    #[test]
+    fn test_hamming_distance_allow_c_to_t_all_c_to_t() {
+        // Whitelist all-C, observed all-T → distance 0
+        let expected = BitEnc::from_bytes(b"CCCCCCCCCC").unwrap();
+        let observed = BitEnc::from_bytes(b"TTTTTTTTTT").unwrap();
+        assert_eq!(expected.hamming_distance_allow_c_to_t(&observed), 0);
     }
 }
