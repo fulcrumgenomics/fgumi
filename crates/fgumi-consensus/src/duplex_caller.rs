@@ -238,7 +238,7 @@ pub struct DuplexConsensusRead {
     /// BA strand single-strand consensus (optional - may be absent for SS-only molecules)
     pub ba_consensus: Option<VanillaConsensusRead>,
 
-    /// Combined duplex methylation annotation (only populated when `em_seq` is enabled)
+    /// Combined duplex methylation annotation (only populated when methylation mode is enabled)
     pub methylation: Option<crate::methylation::MethylationAnnotation>,
 }
 
@@ -428,16 +428,17 @@ impl DuplexConsensusCaller {
         })
     }
 
-    /// Configures the duplex caller for EM-Seq methylation-aware consensus calling.
+    /// Configures the duplex caller for methylation-aware consensus calling.
     ///
-    /// Sets `em_seq: true` on the single-strand caller options and passes the reference
+    /// Sets the methylation mode on the single-strand caller options and passes the reference
     /// and contig name mapping through to the SS caller.
     pub fn set_reference(
         &mut self,
         reference: std::sync::Arc<dyn crate::methylation::RefBaseProvider + Send + Sync>,
         ref_names: std::sync::Arc<Vec<String>>,
+        methylation_mode: crate::MethylationMode,
     ) {
-        self.ss_caller.options.em_seq = true;
+        self.ss_caller.options.methylation_mode = methylation_mode;
         self.ss_caller.set_reference(reference, ref_names);
     }
 
@@ -1076,6 +1077,7 @@ impl DuplexConsensusCaller {
         read_name_prefix: &str,
         read_group_id: &str,
         first_of_pair: bool,
+        methylation_mode: crate::MethylationMode,
         cell_tag: Option<Tag>,
         cell_barcode: Option<&str>,
     ) -> Result<()> {
@@ -1233,7 +1235,7 @@ impl DuplexConsensusCaller {
             builder.append_string_tag(b"RX", consensus_umi.as_bytes());
         }
 
-        // 9b. Methylation tags (EM-Seq)
+        // 9b. Methylation tags (EM-Seq/TAPs)
         if let Some(combined_annot) = &consensus.methylation {
             // Per-strand methylation tags
             // AB strand is top strand, BA strand is bottom strand
@@ -1242,6 +1244,7 @@ impl DuplexConsensusCaller {
                     &consensus.ab_consensus.bases,
                     ab_annot,
                     true,
+                    methylation_mode,
                 ) {
                     builder.append_string_tag(b"am", am.as_bytes());
                 }
@@ -1253,9 +1256,12 @@ impl DuplexConsensusCaller {
 
             if let Some(ba) = &consensus.ba_consensus {
                 if let Some(ba_annot) = &ba.methylation {
-                    if let Some(bm) =
-                        crate::methylation::build_mm_tag_no_ml(&ba.bases, ba_annot, false)
-                    {
+                    if let Some(bm) = crate::methylation::build_mm_tag_no_ml(
+                        &ba.bases,
+                        ba_annot,
+                        false,
+                        methylation_mode,
+                    ) {
                         builder.append_string_tag(b"bm", bm.as_bytes());
                     }
                     let bu = ba_annot.unconverted_counts();
@@ -1267,9 +1273,12 @@ impl DuplexConsensusCaller {
 
             // Combined duplex methylation tags (MM/ML/cu/ct)
             // Use top strand (AB) orientation for MM tag format
-            if let Some((mm, ml)) =
-                crate::methylation::build_mm_ml_tags(&consensus.bases, combined_annot, true)
-            {
+            if let Some((mm, ml)) = crate::methylation::build_mm_ml_tags(
+                &consensus.bases,
+                combined_annot,
+                true,
+                methylation_mode,
+            ) {
                 builder.append_string_tag(b"MM", mm.as_bytes());
                 builder.append_u8_array_tag(b"ML", &ml);
             }
@@ -1722,6 +1731,7 @@ impl DuplexConsensusCaller {
         let mut stats = ConsensusCallingStats::new();
         let mut builder = UnmappedBamRecordBuilder::new();
         let mut output = ConsensusOutput::default();
+        let methylation_mode = ss_caller.options.methylation_mode;
 
         // Check if we have both strands
         if a_records.is_empty() && b_records.is_empty() {
@@ -2022,6 +2032,7 @@ impl DuplexConsensusCaller {
                             read_name_prefix,
                             read_group_id,
                             true, // first of pair
+                            methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
@@ -2037,6 +2048,7 @@ impl DuplexConsensusCaller {
                             read_name_prefix,
                             read_group_id,
                             false, // second of pair
+                            methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
@@ -2071,6 +2083,7 @@ impl DuplexConsensusCaller {
                             read_name_prefix,
                             read_group_id,
                             true,
+                            methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
@@ -2086,6 +2099,7 @@ impl DuplexConsensusCaller {
                             read_name_prefix,
                             read_group_id,
                             false,
+                            methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
@@ -2116,6 +2130,7 @@ impl DuplexConsensusCaller {
                             read_name_prefix,
                             read_group_id,
                             true,
+                            methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
@@ -2131,6 +2146,7 @@ impl DuplexConsensusCaller {
                             read_name_prefix,
                             read_group_id,
                             false,
+                            methylation_mode,
                             cell_tag,
                             cell_barcode.as_deref(),
                         )?;
@@ -2445,7 +2461,7 @@ mod tests {
                 trim: false,
                 min_consensus_base_quality: 40,
                 cell_tag: None,
-                em_seq: false,
+                methylation_mode: crate::MethylationMode::Disabled,
             },
         )
     }
@@ -4494,6 +4510,7 @@ mod tests {
             "consensus",
             "RG1",
             true,
+            crate::MethylationMode::Disabled,
             None,
             None,
         )
@@ -4886,6 +4903,7 @@ mod tests {
             "consensus",
             "RG1",
             true,
+            crate::MethylationMode::Disabled,
             Some(cell_tag),
             Some(cell_barcode),
         )
@@ -4935,6 +4953,7 @@ mod tests {
             "consensus",
             "RG1",
             true,
+            crate::MethylationMode::Disabled,
             None,
             None,
         )
@@ -5064,6 +5083,7 @@ mod tests {
             "consensus",
             "RG1",
             true,
+            crate::MethylationMode::Disabled,
             None,
             None,
         )
@@ -5156,6 +5176,7 @@ mod tests {
             "consensus",
             "RG1",
             true,
+            crate::MethylationMode::Disabled,
             None,
             None,
         )
@@ -5215,6 +5236,7 @@ mod tests {
                 "consensus",
                 "RG1",
                 true,
+                crate::MethylationMode::Disabled,
                 None,
                 None,
             )
@@ -5969,6 +5991,7 @@ mod tests {
             "consensus",
             "RG1",
             false,
+            crate::MethylationMode::EmSeq,
             None,
             None,
         )

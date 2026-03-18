@@ -36,6 +36,31 @@ pub mod methylation;
 
 mod vendored;
 
+/// Methylation chemistry mode for consensus calling.
+///
+/// Controls how C→T conversions at reference cytosine positions are interpreted
+/// during consensus calling and MM/ML tag generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MethylationMode {
+    /// No methylation-aware processing. C→T changes are treated as errors.
+    #[default]
+    Disabled,
+    /// EM-Seq (enzymatic methyl-seq): unmethylated C is converted to T.
+    /// C in read = methylated (protected), T in read = unmethylated (converted).
+    EmSeq,
+    /// TAPs/Illumina 5-base: methylated C is converted to T.
+    /// C in read = unmethylated (not a target), T in read = methylated (converted).
+    Taps,
+}
+
+impl MethylationMode {
+    /// Returns true if any methylation mode is enabled.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
 // Re-export commonly used items
 pub use base_builder::ConsensusBaseBuilder;
 pub use caller::{ConsensusCaller, calculate_error_rate, log_consensus_statistics};
