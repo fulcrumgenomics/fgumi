@@ -54,7 +54,7 @@ use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer, is_stdin_path, is_
 use fgumi_lib::batched_sam_reader::BatchedSamReader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::reference::find_dict_path;
+use fgumi_lib::reference::{ReferenceReader, find_dict_path};
 use fgumi_lib::sam::{
     buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
     unclipped_five_prime_position,
@@ -64,11 +64,15 @@ use fgumi_lib::template::{Template, TemplateIterator};
 use fgumi_lib::umi::TagInfo;
 use fgumi_lib::validation::validate_file_exists;
 use log::{debug, info};
+use noodles::core::Position;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record::Cigar as CigarTrait;
+use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::record_buf::RecordBuf;
+use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -171,6 +175,19 @@ pub struct Zipper {
     /// deduplication of these reads. Use this flag if you don't need this functionality.
     #[arg(long = "skip-pa-tags", default_value = "false")]
     pub skip_pa_tags: bool,
+
+    /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
+    ///
+    /// In EM-seq, unmethylated cytosines are converted to thymine (top strand) or
+    /// adenine (bottom strand). After bwameth re-alignment, this flag replaces converted
+    /// bases back to their unconverted reference form at reference C (top strand) or
+    /// reference G (bottom strand) positions. Uses the bwameth `YD` tag to determine
+    /// the bisulfite strand.
+    ///
+    /// This produces a final BAM where the sequence shows the original (unconverted) bases,
+    /// while methylation state is preserved in MM/ML tags and cu/ct count tags.
+    #[arg(long = "restore-unconverted-bases", default_value = "false")]
+    pub restore_unconverted_bases: bool,
 }
 
 /// Builds the output BAM header from unmapped and mapped headers
@@ -518,6 +535,126 @@ pub fn merge(
     Ok(())
 }
 
+/// YD tag used by bwameth to indicate the bisulfite conversion strand.
+const YD_TAG: Tag = Tag::new(b'Y', b'D');
+/// YD value for the forward (top) bisulfite strand.
+const YD_FORWARD: &[u8] = b"f";
+/// YD value for the reverse (bottom) bisulfite strand.
+const YD_REVERSE: &[u8] = b"r";
+
+/// Restore unconverted bases in EM-seq reads after bwameth re-alignment.
+///
+/// For each mapped record in the template, walks the CIGAR alignment and replaces
+/// converted bases back to their unconverted reference form:
+/// - Top strand (`YD:Z:f`): at reference-C positions, T→C
+/// - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
+///
+/// Skips unmapped reads and reads without a `YD` tag.
+fn restore_unconverted_bases_in_template(
+    template: &mut Template,
+    reference: &ReferenceReader,
+    header: &Header,
+) -> Result<()> {
+    for record in &mut template.records {
+        restore_unconverted_bases_in_record(record, reference, header)?;
+    }
+    Ok(())
+}
+
+/// Restore unconverted bases in a single EM-seq record after bwameth re-alignment.
+fn restore_unconverted_bases_in_record(
+    record: &mut RecordBuf,
+    reference: &ReferenceReader,
+    header: &Header,
+) -> Result<()> {
+    // Skip unmapped reads
+    if record.flags().is_unmapped() {
+        return Ok(());
+    }
+
+    // Get the bisulfite strand from the bwameth YD tag
+    let yd_value = record.data().get(&YD_TAG);
+    let is_top = match yd_value {
+        Some(BufValue::String(s)) if AsRef::<[u8]>::as_ref(s) == YD_FORWARD => true,
+        Some(BufValue::String(s)) if AsRef::<[u8]>::as_ref(s) == YD_REVERSE => false,
+        _ => return Ok(()), // No YD tag or unexpected value; skip
+    };
+
+    // Get reference contig name
+    let ref_id = match record.reference_sequence_id() {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+    let (ref_name, _) = header
+        .reference_sequences()
+        .get_index(ref_id)
+        .context("reference sequence ID not found in header")?;
+    let ref_name = ref_name.to_string();
+
+    // Get alignment start (1-based)
+    let alignment_start = match record.alignment_start().map(usize::from) {
+        Some(pos) => pos,
+        None => return Ok(()),
+    };
+
+    // Compute reference span from CIGAR
+    let ref_span = fgumi_lib::sam::reference_length(&record.cigar());
+
+    if ref_span == 0 {
+        return Ok(());
+    }
+
+    // Fetch the entire aligned reference region at once
+    let ref_start = Position::try_from(alignment_start)?;
+    let ref_end = Position::try_from(alignment_start + ref_span - 1)?;
+    let ref_bases = reference.fetch(&ref_name, ref_start, ref_end)?;
+
+    // Determine replacement parameters
+    let (ref_target, converted_base, unconverted_base) =
+        if is_top { (b'C', b'T', b'C') } else { (b'G', b'A', b'G') };
+
+    // Walk CIGAR and replace converted bases
+    let mut seq: Vec<u8> = record.sequence().as_ref().to_vec();
+    let mut modified = false;
+    let mut read_pos: usize = 0;
+    let mut ref_offset: usize = 0; // 0-based offset into ref_bases
+
+    for op_result in record.cigar().iter() {
+        let op = op_result?;
+        let len = op.len();
+
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for i in 0..len {
+                    let rb = ref_bases[ref_offset + i].to_ascii_uppercase();
+                    if rb == ref_target
+                        && read_pos + i < seq.len()
+                        && seq[read_pos + i].to_ascii_uppercase() == converted_base
+                    {
+                        seq[read_pos + i] = unconverted_base;
+                        modified = true;
+                    }
+                }
+                read_pos += len;
+                ref_offset += len;
+            }
+            Kind::Insertion | Kind::SoftClip => {
+                read_pos += len;
+            }
+            Kind::Deletion | Kind::Skip => {
+                ref_offset += len;
+            }
+            Kind::HardClip | Kind::Pad => {}
+        }
+    }
+
+    if modified {
+        *record.sequence_mut() = seq.into();
+    }
+
+    Ok(())
+}
+
 impl Zipper {
     /// Process templates in single-threaded mode
     fn process_singlethreaded<W, U, M>(
@@ -527,6 +664,7 @@ impl Zipper {
         output_header: &Header,
         writer: &mut W,
         tag_info: &TagInfo,
+        reference: Option<&ReferenceReader>,
     ) -> Result<u64>
     where
         W: AlignmentWrite,
@@ -547,6 +685,13 @@ impl Zipper {
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
                     merge(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
+                    if let Some(ref_reader) = reference {
+                        restore_unconverted_bases_in_template(
+                            mapped_template,
+                            ref_reader,
+                            output_header,
+                        )?;
+                    }
                     for rec in mapped_template.all_reads() {
                         writer.write_alignment_record(output_header, rec)?;
                         progress.log_if_needed(1);
@@ -626,6 +771,7 @@ impl Zipper {
         mut mapped_iter: M,
         output_header: &Header,
         tag_info: &TagInfo,
+        reference: Option<&ReferenceReader>,
     ) -> Result<u64>
     where
         U: Iterator<Item = Result<Template>>,
@@ -656,6 +802,15 @@ impl Zipper {
                 if mapped_template.name == unmapped_template.name {
                     // Merge tags from unmapped to mapped (no cloning needed!)
                     merge(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
+
+                    // Restore unconverted bases if requested
+                    if let Some(ref_reader) = reference {
+                        restore_unconverted_bases_in_template(
+                            mapped_template,
+                            ref_reader,
+                            output_header,
+                        )?;
+                    }
 
                     // Write merged records
                     for rec in mapped_template.all_reads() {
@@ -820,6 +975,14 @@ impl Command for Zipper {
             info!("Tags being reverse complemented: {:?}", tag_info.revcomp);
         }
 
+        // Load reference FASTA if restoring unconverted bases
+        let reference = if self.restore_unconverted_bases {
+            info!("Loading reference FASTA for unconverted base restoration");
+            Some(ReferenceReader::new(&self.reference)?)
+        } else {
+            None
+        };
+
         // Create async unmapped reader - spawn thread to read ahead
         let (unmapped_tx, unmapped_rx) =
             std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
@@ -864,6 +1027,7 @@ impl Command for Zipper {
                 mapped_iter,
                 &output_header,
                 &tag_info,
+                reference.as_ref(),
             )?
         } else {
             // Single-threaded: simple sequential processing
@@ -884,6 +1048,7 @@ impl Command for Zipper {
                 &output_header,
                 &mut writer,
                 &tag_info,
+                reference.as_ref(),
             )?
         };
 
@@ -961,6 +1126,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_pa_tags: false,
+            restore_unconverted_bases: false,
         };
 
         zipper.execute("test")?;
@@ -1679,6 +1845,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_pa_tags: false,
+            restore_unconverted_bases: false,
         };
 
         zipper.execute("test")?;
@@ -1929,6 +2096,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads,
             skip_pa_tags: false,
+            restore_unconverted_bases: false,
         };
 
         zipper.execute("test")?;
@@ -2015,6 +2183,7 @@ mod tests {
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
             skip_pa_tags: false,
+            restore_unconverted_bases: false,
         };
 
         let result = zipper.execute("test");
@@ -2505,6 +2674,210 @@ mod tests {
             .any(|r| r.flags().is_supplementary() && r.data().get(&PA_TAG).is_some());
 
         assert!(has_pa_tag, "Supplementary should have pa tag when skip_pa_tags=false");
+
+        Ok(())
+    }
+
+    /// Tests that `restore_unconverted_bases_in_record` replaces T→C at ref-C positions
+    /// for top-strand reads (YD:Z:f).
+    #[test]
+    fn test_restore_unconverted_bases_top_strand() -> Result<()> {
+        use fgumi_lib::sam::builder::create_test_fasta;
+
+        // Reference: ACGTACGTACGT (chr1)
+        // Positions:  1234567890..
+        // C positions: 2, 6, 10
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        // Build a header with chr1
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        // Create a record aligned to pos 1 with 8M CIGAR
+        // Sequence: ATGTATGT (T at positions 2,6 = ref-C positions → should be restored to C)
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ATGTATGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        // Position 1: A (ref=A, no change)
+        // Position 2: T→C (ref=C, top strand, T was converted)
+        // Position 3: G (ref=G, no change)
+        // Position 4: T (ref=T, no change)
+        // Position 5: A (ref=A, no change)
+        // Position 6: T→C (ref=C, top strand, T was converted)
+        // Position 7: G (ref=G, no change)
+        // Position 8: T (ref=T, no change)
+        assert_eq!(seq, b"ACGTACGT");
+
+        Ok(())
+    }
+
+    /// Tests that `restore_unconverted_bases_in_record` replaces A→G at ref-G positions
+    /// for bottom-strand reads (YD:Z:r).
+    #[test]
+    fn test_restore_unconverted_bases_bottom_strand() -> Result<()> {
+        use fgumi_lib::sam::builder::create_test_fasta;
+
+        // Reference: ACGTACGTACGT (chr1)
+        // G positions: 3, 7, 11
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        // Record at pos 1 with 8M. A at positions 3,7 = ref-G → should be restored to G
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACATACAT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2))
+            .tag("YD", "r")
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        assert_eq!(seq, b"ACGTACGT");
+
+        Ok(())
+    }
+
+    /// Tests that `restore_unconverted_bases_in_record` handles insertions and deletions.
+    #[test]
+    fn test_restore_unconverted_bases_with_indels() -> Result<()> {
+        use fgumi_lib::sam::builder::create_test_fasta;
+
+        // Reference: ACGTACGTACGT
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        // CIGAR: 2M1I2M1D3M → 8 read bases, 8 ref bases consumed
+        // ref_bases (pos 1-8): A C G T A C G T
+        //
+        // Walk:
+        //   2M: read[0,1] vs ref[0,1](A,C) → T stays, T→C
+        //   1I: read[2] (insertion, no ref)
+        //   2M: read[3,4] vs ref[2,3](G,T) → no change (not ref-C)
+        //   1D: ref[4](A) skipped
+        //   3M: read[5,6,7] vs ref[5,6,7](C,G,T) → T→C, G stays, T stays
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence("TTNATTGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("2M1I2M1D3M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        assert_eq!(seq, b"TCNATCGT");
+
+        Ok(())
+    }
+
+    /// Tests that `restore_unconverted_bases_in_record` skips unmapped reads.
+    #[test]
+    fn test_restore_unconverted_bases_skips_unmapped() -> Result<()> {
+        use fgumi_lib::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
+
+        // Unmapped read — should be left unchanged
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence("TTTTTTTT")
+            .qualities(&[30; 8])
+            .flags(Flags::UNMAPPED)
+            .tag("YD", "f")
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        assert_eq!(seq, b"TTTTTTTT"); // Unchanged
+
+        Ok(())
+    }
+
+    /// Tests that `restore_unconverted_bases_in_record` skips reads without YD tag.
+    #[test]
+    fn test_restore_unconverted_bases_skips_no_yd_tag() -> Result<()> {
+        use fgumi_lib::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
+
+        // Mapped read without YD tag — should be left unchanged
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence("TTTTTTTT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        assert_eq!(seq, b"TTTTTTTT"); // Unchanged
+
+        Ok(())
+    }
+
+    /// Tests that non-converted bases at ref-C positions are left alone.
+    #[test]
+    fn test_restore_unconverted_bases_preserves_already_unconverted() -> Result<()> {
+        use fgumi_lib::sam::builder::create_test_fasta;
+
+        // Reference: CCCCCCCC (all C positions)
+        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
+
+        // Top strand: some bases already C (unconverted), some T (converted), some other
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence("CTCACTGC")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        // C stays C, T→C, C stays C, A stays A (not T→C), C stays C, T→C, G stays G, C stays C
+        assert_eq!(seq, b"CCCACCGC");
 
         Ok(())
     }
