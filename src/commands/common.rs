@@ -4,14 +4,47 @@
 //! command structs using `#[command(flatten)]`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use bytesize::ByteSize;
 use clap::Args;
 use fgumi_lib::bam_io::is_stdin_path;
+use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use fgumi_lib::validation::validate_file_exists;
+use log::info;
 use noodles::sam::Header;
+
+/// EM-Seq reference pair: reference base provider + contig name mapping.
+pub type EmSeqRef = Option<(
+    Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
+    Arc<Vec<String>>,
+)>;
+
+/// Loads the reference FASTA and builds contig name mapping for EM-Seq mode.
+///
+/// Returns `None` if `em_seq` is false. Errors if `em_seq` is true but `reference` is `None`.
+pub fn load_em_seq_reference(
+    em_seq: bool,
+    reference: &Option<PathBuf>,
+    header: &Header,
+) -> anyhow::Result<EmSeqRef> {
+    if !em_seq {
+        return Ok(None);
+    }
+    let ref_path = reference
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--ref is required when --em-seq is enabled"))?;
+    let ref_timer = OperationTimer::new("Loading reference FASTA");
+    let reference = Arc::new(fgumi_lib::reference::ReferenceReader::new(ref_path)?);
+    ref_timer.log_completion(0);
+
+    let ref_names: Vec<String> =
+        header.reference_sequences().keys().map(|name| name.to_string()).collect();
+    info!("EM-Seq mode enabled with {} reference contigs", ref_names.len());
+    Ok(Some((reference, Arc::new(ref_names))))
+}
 
 /// Add a @PG record to an existing header, using the current fgumi version.
 ///

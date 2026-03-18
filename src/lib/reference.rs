@@ -363,6 +363,18 @@ impl fgumi_sam::ReferenceProvider for ReferenceReader {
     }
 }
 
+#[cfg(feature = "simplex")]
+impl fgumi_consensus::methylation::RefBaseProvider for ReferenceReader {
+    fn base_at_0based(&self, chrom: &str, pos: u64) -> Option<u8> {
+        let sequence = self.sequences.get(chrom)?;
+        sequence.get(usize::try_from(pos).ok()?).copied()
+    }
+
+    fn sequence_for(&self, chrom: &str) -> Option<&[u8]> {
+        self.sequences.get(chrom).map(Vec::as_slice)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

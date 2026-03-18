@@ -333,6 +333,7 @@ impl CodecConsensusCaller {
             trim: false,
             min_consensus_base_quality: 0, // MIN - we handle quality masking
             cell_tag: None,
+            em_seq: false, // CODEC does not support EM-Seq
         };
 
         let ss_caller = VanillaUmiConsensusCaller::new(
@@ -450,7 +451,23 @@ impl CodecConsensusCaller {
             quals.reverse();
         }
 
-        SourceRead { original_idx, bases, quals, simplified_cigar: simplified, flags: flg }
+        let rid = bam_fields::ref_id(raw);
+        let astart = i64::from(bam_fields::pos(raw));
+        let original_cigar = {
+            let ops = bam_fields::get_cigar_ops(raw);
+            bam_fields::simplify_cigar_from_raw(&ops)
+        };
+
+        SourceRead {
+            original_idx,
+            bases,
+            quals,
+            simplified_cigar: simplified,
+            flags: flg,
+            ref_id: rid,
+            alignment_start: astart,
+            original_cigar,
+        }
     }
 
     /// Converts a `VanillaConsensusRead` to a `SingleStrandConsensus`.
@@ -3202,6 +3219,7 @@ mod tests {
             depths: vec![5, 6, 7, 8],
             errors: vec![0, 1, 0, 1],
             source_reads: None,
+            methylation: None,
         };
 
         let ss = CodecConsensusCaller::vanilla_to_single_strand(vcr.clone(), false, 10);
@@ -3225,6 +3243,7 @@ mod tests {
             depths: vec![5, 6],
             errors: vec![0, 1],
             source_reads: None,
+            methylation: None,
         };
 
         let ss = CodecConsensusCaller::vanilla_to_single_strand(vcr, true, 5);
