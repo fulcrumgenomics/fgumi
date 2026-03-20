@@ -714,6 +714,14 @@ not implemented for reads with UMI pairs (i.e. using the paired assigner).
 Note: the --min-map-q parameter defaults to 0 in duplicate marking mode and 1 otherwise, and is
 directly settable on the command line.
 
+# Cell Barcodes
+
+If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same
+genomic position are partitioned by cell barcode before UMI grouping. This ensures that reads from
+different cells are never grouped together, even if they share a UMI sequence and mapping position.
+The cell barcode is read from the tag specified by `--cell-tag` (default: CB). No correction or
+error-handling is performed on cell barcodes; they must be corrected upstream.
+
 Multi-threaded operation is supported via --threads N which spawns exactly N threads.
 Threads are allocated based on the command's workload profile to optimize performance.
 
@@ -741,7 +749,11 @@ pub struct GroupReadsByUmi {
     #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
     pub assign_tag: String,
 
-    /// SAM tag containing the cell barcode
+    /// SAM tag containing the cell barcode.
+    ///
+    /// When set, reads at the same genomic coordinates are partitioned by cell barcode before
+    /// UMI assignment, so reads from different cells are never grouped together even if they
+    /// share a UMI and position. No correction is performed on the cell barcode itself.
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: String,
 
