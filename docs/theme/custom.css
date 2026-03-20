@@ -1,0 +1,84 @@
+/* fgumi documentation theme */
+
+:root {
+    --fg-brand: #2563eb;
+    --fg-brand-light: #3b82f6;
+    --fg-brand-dark: #1d4ed8;
+}
+
+/* Sidebar branding */
+.sidebar .sidebar-scrollbox {
+    padding-top: 1rem;
+}
+
+/* Category headers in tool reference */
+.tool-category {
+    font-weight: 600;
+    color: var(--fg-brand);
+    margin-top: 1.5rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.9rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* Argument tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+}
+
+table th {
+    background-color: var(--table-header-bg);
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    font-weight: 600;
+}
+
+table td {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--table-border-color);
+}
+
+/* Code blocks in descriptions */
+.tool-description code, .metric-description code {
+    font-size: 0.9em;
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+}
+
+/* Landing page hero */
+.hero {
+    text-align: center;
+    padding: 2rem 0;
+    margin-bottom: 2rem;
+}
+
+.hero h1 {
+    font-size: 2.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.hero .tagline {
+    font-size: 1.2rem;
+    opacity: 0.8;
+}
+
+/* Where-to-use cards */
+.use-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+.use-card {
+    border: 1px solid var(--table-border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+}
+
+.use-card h3 {
+    margin-top: 0;
+}
