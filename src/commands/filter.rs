@@ -175,24 +175,32 @@ pub struct Filter {
     #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false")]
     pub require_single_strand_agreement: bool,
 
-    /// Minimum methylation depth (cu+ct) to keep a base call (EM-Seq only).
+    /// Minimum methylation depth (cu+ct) to keep a base call (EM-Seq/TAPs).
     /// For duplex: provide 1-3 values for [duplex, AB consensus, BA consensus]
     #[arg(long = "min-methylation-depth", value_delimiter = ',')]
     pub min_methylation_depth: Vec<usize>,
 
     #[allow(clippy::doc_markdown)]
-    /// Require strand methylation agreement at CpG sites for duplex consensus (EM-Seq only).
+    /// Require strand methylation agreement at CpG sites for duplex consensus (EM-Seq/TAPs).
     /// Masks both positions of a CpG dinucleotide when top and bottom strands disagree on
     /// methylation status. Requires --ref.
     #[arg(long = "require-strand-methylation-agreement", default_value = "false")]
     pub require_strand_methylation_agreement: bool,
 
     #[allow(clippy::doc_markdown)]
-    /// Minimum bisulfite/enzymatic conversion fraction at non-CpG cytosines (EM-Seq only).
-    /// Reads with conversion rate below this threshold are discarded.
-    /// Requires --ref. Uses cu/ct tags.
+    /// Minimum bisulfite/enzymatic conversion fraction at non-CpG cytosines.
+    /// For EM-Seq: checks converted/total >= threshold (high conversion = good).
+    /// For TAPs: checks unconverted/total >= threshold (low conversion = good).
+    /// Requires --ref and --methylation-mode. Uses cu/ct tags.
     #[arg(long = "min-conversion-fraction")]
     pub min_conversion_fraction: Option<f64>,
+
+    /// Methylation mode for conversion fraction filtering.
+    /// Required when using --min-conversion-fraction.
+    /// Controls whether the conversion fraction check uses converted (em-seq)
+    /// or unconverted (taps) counts as the numerator.
+    #[arg(long = "methylation-mode", value_enum)]
+    pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
 
     /// Compression options for output BAM.
     #[command(flatten)]
@@ -285,6 +293,7 @@ struct FilterProcessCaptures {
     methylation_depth_thresholds: Option<MethylationDepthThresholds>,
     require_strand_methylation_agreement: bool,
     min_conversion_fraction: Option<f64>,
+    methylation_mode: fgumi_consensus::MethylationMode,
     ref_names: Arc<Vec<String>>,
     progress: Arc<AtomicU64>,
     header: Header,
@@ -329,6 +338,9 @@ impl Command for Filter {
         }
         if let Some(frac) = self.min_conversion_fraction {
             info!("Min conversion fraction: {frac}");
+        }
+        if let Some(mode) = &self.methylation_mode {
+            info!("Methylation mode: {mode:?}");
         }
 
         // Open input using streaming-capable reader for pipeline use
@@ -425,6 +437,9 @@ impl Filter {
             },
             require_strand_methylation_agreement: self.require_strand_methylation_agreement,
             min_conversion_fraction: self.min_conversion_fraction,
+            methylation_mode: crate::commands::common::resolve_methylation_mode(
+                self.methylation_mode,
+            ),
             ref_names: Arc::new(ref_names),
             progress: Arc::clone(&setup.progress_counter),
             header: header.clone(),
@@ -559,6 +574,7 @@ impl Filter {
                 ctx.methylation_depth_thresholds.as_ref(),
                 ctx.require_strand_methylation_agreement,
                 ctx.min_conversion_fraction,
+                ctx.methylation_mode,
                 &ctx.ref_names,
             )
             .map_err(io::Error::other)?;
@@ -639,6 +655,7 @@ impl Filter {
                         ctx.methylation_depth_thresholds.as_ref(),
                         ctx.require_strand_methylation_agreement,
                         ctx.min_conversion_fraction,
+                        ctx.methylation_mode,
                         &ctx.ref_names,
                     )
                     .map_err(io::Error::other)?;
@@ -728,6 +745,7 @@ impl Filter {
         methylation_depth_thresholds: Option<&MethylationDepthThresholds>,
         require_strand_methylation_agreement: bool,
         min_conversion_fraction: Option<f64>,
+        methylation_mode: fgumi_consensus::MethylationMode,
         ref_names: &[String],
     ) -> Result<(u64, bool)> {
         // Fail fast if we encounter a mapped read without a reference, since masking
@@ -838,7 +856,7 @@ impl Filter {
             }
         };
 
-        // Conversion fraction filter (EM-Seq read-level)
+        // Conversion fraction filter (EM-Seq/TAPs read-level)
         if pass {
             if let Some(min_frac) = min_conversion_fraction {
                 if !check_conversion_fraction_raw_with_ref_bases_and_tags(
@@ -846,6 +864,7 @@ impl Filter {
                     min_frac,
                     ref_base_map.as_deref(),
                     methylation_tags.as_ref().unwrap(),
+                    methylation_mode,
                 ) {
                     pass = false;
                 }
@@ -1090,6 +1109,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         }
@@ -1156,6 +1176,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1190,6 +1211,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1221,6 +1243,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1256,6 +1279,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1288,6 +1312,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1656,6 +1681,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1694,6 +1720,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1730,6 +1757,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1763,6 +1791,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1796,6 +1825,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1828,6 +1858,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1860,6 +1891,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1892,6 +1924,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1924,6 +1957,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1956,6 +1990,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1988,6 +2023,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2022,6 +2058,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2056,6 +2093,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2089,6 +2127,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2123,6 +2162,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2158,6 +2198,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2190,6 +2231,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2296,6 +2338,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2419,6 +2462,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2575,6 +2619,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2650,6 +2695,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2719,6 +2765,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2845,6 +2892,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2916,6 +2964,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2985,6 +3034,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3058,6 +3108,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3084,6 +3135,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3150,6 +3202,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3207,6 +3260,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3267,6 +3321,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3336,6 +3391,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3362,6 +3418,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3446,6 +3503,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3558,6 +3616,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3676,6 +3735,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3715,6 +3775,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3749,6 +3810,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3807,6 +3869,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3870,6 +3933,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3936,6 +4000,7 @@ mod tests {
             min_methylation_depth: vec![],
             require_strand_methylation_agreement: false,
             min_conversion_fraction: None,
+            methylation_mode: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -4187,7 +4252,8 @@ mod tests {
             None,  // no methylation depth thresholds
             false, // no strand methylation agreement
             None,  // no min conversion fraction
-            &[],   // no ref names
+            fgumi_consensus::MethylationMode::Disabled,
+            &[], // no ref names
         )?;
 
         assert_eq!(bases_masked, 0, "No bases should be masked with good tags");
@@ -4236,7 +4302,8 @@ mod tests {
             None,  // no methylation depth thresholds
             false, // no strand methylation agreement
             None,  // no min conversion fraction
-            &[],   // no ref names
+            fgumi_consensus::MethylationMode::Disabled,
+            &[], // no ref names
         );
 
         assert!(result.is_err(), "Should fail for mapped reads without reference");
