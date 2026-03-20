@@ -1,0 +1,19 @@
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    rust: "1.87"
+  commands:
+    # Install mdbook
+    - cargo install mdbook --version 0.5.2
+
+    # Build the xtask and generate documentation markdown
+    - cargo run --package xtask --release -- generate-docs
+
+    # Build the mdbook site
+    - mdbook build docs
+
+    # Move output to where Read the Docs expects it
+    - mkdir -p _readthedocs/html
+    - cp -r docs/book/* _readthedocs/html/

@@ -562,18 +562,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "enum_dispatch"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
-dependencies = [
- "once_cell",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "env_filter"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,7 +640,6 @@ dependencies = [
  "crossbeam-utils",
  "csv",
  "dhat",
- "enum_dispatch",
  "env_logger",
  "fgoxide",
  "fgumi-bgzf",
@@ -2962,6 +2949,17 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xtask"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fgumi",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "yoke"

@@ -1,0 +1,28 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Build tasks for fgumi (doc generation, etc.)"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Mirror the compare feature from the fgumi crate to include the compare tool in docs
+compare = ["fgumi/compare"]
+# Mirror the simulate feature from the fgumi crate to include simulate tools in docs
+simulate = ["fgumi/simulate"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+fgumi = { path = "../.." }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+# Relaxations for build tool code (heavy string formatting)
+format_push_string = "allow"
+single_char_add_str = "allow"
