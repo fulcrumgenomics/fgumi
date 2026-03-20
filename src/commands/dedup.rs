@@ -1049,6 +1049,14 @@ Note: Using `samtools sort` will NOT work correctly because it doesn't use the
 
 - Mark only (default): Set duplicate flag (0x400) on non-representative reads
 - Remove (--remove-duplicates): Exclude duplicate reads from output entirely
+
+# Cell Barcodes
+
+If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same
+genomic position are partitioned by cell barcode before deduplication. This ensures that reads from
+different cells are never marked as duplicates of each other, even if they share a UMI sequence and
+mapping position. The cell barcode is read from the tag specified by `--cell-tag` (default: CB). No
+correction or error-handling is performed on cell barcodes; they must be corrected upstream.
 "#
 )]
 pub struct MarkDuplicates {
@@ -1076,7 +1084,11 @@ pub struct MarkDuplicates {
     #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
     pub assign_tag: String,
 
-    /// SAM tag containing the cell barcode
+    /// SAM tag containing the cell barcode.
+    ///
+    /// When set, reads at the same genomic coordinates are partitioned by cell barcode before
+    /// deduplication, so reads from different cells are never grouped together even if they
+    /// share a UMI and position. No correction is performed on the cell barcode itself.
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: String,
 
