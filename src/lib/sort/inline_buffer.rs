@@ -10,7 +10,7 @@
 //! - ~24 bytes overhead per record vs ~110 bytes
 
 use crate::sort::bam_fields;
-use crate::sort::keys::{RawSortKey, SortContext};
+use crate::sort::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 
@@ -209,6 +209,54 @@ impl RecordBuffer {
         // Radix sort is already O(n×k), so parallelizing chunks provides
         // linear speedup without the merge overhead of comparison-based parallel sorts
         parallel_radix_sort_record_refs(&mut self.refs);
+    }
+
+    /// Sort in parallel and return each sub-array as a separate sorted chunk.
+    ///
+    /// Instead of merging the parallel sort sub-arrays back into one sorted
+    /// buffer (as `par_sort` does), this returns each sub-array as its own
+    /// `Vec<(RawCoordinateKey, Vec<u8>)>` so they can be passed as separate
+    /// merge sources to the k-way merge, avoiding the intermediate merge step.
+    ///
+    /// When `threads <= 1`, returns a single chunk.
+    pub fn par_sort_into_chunks(
+        &mut self,
+        threads: usize,
+    ) -> Vec<Vec<(RawCoordinateKey, Vec<u8>)>> {
+        use rayon::prelude::*;
+
+        let n = self.refs.len();
+
+        if threads <= 1 || n < RADIX_THRESHOLD * 2 || n <= 10_000 {
+            // Single-threaded path: sort everything, return one chunk
+            radix_sort_record_refs(&mut self.refs);
+            let chunk = self
+                .refs
+                .iter()
+                .map(|r| (RawCoordinateKey { sort_key: r.sort_key }, self.get_record(r).to_vec()))
+                .collect();
+            return vec![chunk];
+        }
+
+        let chunk_size = n.div_ceil(threads);
+
+        // Sort each chunk in parallel using radix sort
+        self.refs.par_chunks_mut(chunk_size).for_each(|chunk| {
+            radix_sort_record_refs(chunk);
+        });
+
+        // Collect each sorted sub-array into its own Vec<(RawCoordinateKey, Vec<u8>)>
+        self.refs
+            .chunks(chunk_size)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|r| {
+                        (RawCoordinateKey { sort_key: r.sort_key }, self.get_record(r).to_vec())
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Get record bytes by reference.
@@ -744,6 +792,40 @@ impl TemplateRecordBuffer {
     #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Sort in parallel and return each sub-array as a separate sorted chunk.
+    ///
+    /// Instead of merging the parallel sort sub-arrays back into one sorted
+    /// buffer (as `par_sort` does), this returns each sub-array as its own
+    /// `Vec<(TemplateKey, Vec<u8>)>` so they can be passed as separate merge
+    /// sources to the k-way merge, avoiding the intermediate merge step.
+    ///
+    /// When `threads <= 1`, returns a single chunk.
+    pub fn par_sort_into_chunks(&mut self, threads: usize) -> Vec<Vec<(TemplateKey, Vec<u8>)>> {
+        use rayon::prelude::*;
+
+        let n = self.refs.len();
+
+        if threads <= 1 || n < RADIX_THRESHOLD * 2 || n <= 10_000 {
+            // Single-threaded path: sort everything, return one chunk
+            radix_sort_template_refs(&mut self.refs);
+            let chunk = self.refs.iter().map(|r| (r.key, self.get_record(r).to_vec())).collect();
+            return vec![chunk];
+        }
+
+        let chunk_size = n.div_ceil(threads);
+
+        // Sort each chunk in parallel using radix sort
+        self.refs.par_chunks_mut(chunk_size).for_each(|chunk| {
+            radix_sort_template_refs(chunk);
+        });
+
+        // Collect each sorted sub-array into its own Vec<(TemplateKey, Vec<u8>)>
+        self.refs
+            .chunks(chunk_size)
+            .map(|chunk| chunk.iter().map(|r| (r.key, self.get_record(r).to_vec())).collect())
+            .collect()
     }
 }
 
@@ -1589,5 +1671,212 @@ mod tests {
     fn test_template_key_default_has_zero_cb_hash() {
         let key = TemplateKey::default();
         assert_eq!(key.cb_hash, 0);
+    }
+
+    /// Helper: build a minimal raw BAM record byte array with a distinguishing index.
+    fn make_bam_record(index: u16) -> Vec<u8> {
+        let mut record = vec![
+            0, 0, 0, 0, // ref_id = 0
+            100, 0, 0, 0, // pos = 100
+            2, // name_len = 2 (including null)
+            0, // mapq = 0
+            0, 0, // bin
+            0, 0, // n_cigar_op = 0
+            99, 0, // flag = 99 (paired, proper, mate reverse, first)
+            1, 0, 0, 0, // seq_len = 1
+            0, 0, 0, 0, // mate_ref_id = 0
+            200, 0, 0, 0, // mate_pos = 200
+            0, 0, 0, 0, // tlen = 0
+            b'A', 0, // read name "A\0"
+        ];
+        // Encode the index into two bytes so each record is distinguishable
+        record.push((index & 0xFF) as u8);
+        record.push((index >> 8) as u8);
+        record.push(0xFF); // qual
+        // Pad to at least 40 bytes
+        while record.len() < 40 {
+            record.push(0);
+        }
+        record
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn test_par_sort_into_chunks_single_threaded_fallback() {
+        // With 1 thread, par_sort_into_chunks should return exactly 1 chunk.
+        let n = 100;
+        let mut buffer = TemplateRecordBuffer::with_capacity(n, n * 50);
+
+        for i in 0..n {
+            let key = TemplateKey::new(
+                0,
+                (n - i) as i32,
+                false,
+                0,
+                200,
+                false,
+                0,
+                0,
+                (1, true),
+                0,
+                false,
+            );
+            buffer.push(&make_bam_record(i as u16), key);
+        }
+
+        let chunks = buffer.par_sort_into_chunks(1);
+        assert_eq!(chunks.len(), 1, "single-threaded should produce exactly 1 chunk");
+        assert_eq!(chunks[0].len(), n, "the single chunk should contain all records");
+
+        // Verify the chunk is sorted
+        for i in 1..chunks[0].len() {
+            assert!(
+                chunks[0][i - 1].0 <= chunks[0][i].0,
+                "single chunk should be sorted at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn test_par_sort_into_chunks_parallel_path() {
+        // Use a dedicated rayon thread pool with multiple threads so that
+        // rayon::current_num_threads() > 1 inside par_sort_into_chunks.
+        let n: usize = 10_500; // > 10_000 and > RADIX_THRESHOLD * 2 (512)
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("failed to build rayon thread pool");
+
+        let chunks = pool.install(|| {
+            let mut buffer = TemplateRecordBuffer::with_capacity(n, n * 50);
+
+            for i in 0..n {
+                // Vary the primary sort field so records are not all equal
+                let key = TemplateKey::new(
+                    0,
+                    (n - i) as i32,
+                    false,
+                    0,
+                    200,
+                    false,
+                    0,
+                    0,
+                    (1, true),
+                    0,
+                    false,
+                );
+                buffer.push(&make_bam_record(i as u16), key);
+            }
+
+            buffer.par_sort_into_chunks(4)
+        });
+
+        // With 4 threads and > 10_000 records we should get multiple chunks
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks from parallel path, got {}",
+            chunks.len()
+        );
+
+        // Verify each chunk is individually sorted
+        for (ci, chunk) in chunks.iter().enumerate() {
+            for i in 1..chunk.len() {
+                assert!(chunk[i - 1].0 <= chunk[i].0, "chunk {ci} not sorted at index {i}");
+            }
+        }
+
+        // Verify total record count across all chunks matches input
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        assert_eq!(total, n, "total records across chunks should equal input count");
+    }
+
+    /// Helper: build a minimal raw BAM record for coordinate sort with a specific position.
+    fn make_coordinate_bam_record(tid: i32, pos: i32) -> Vec<u8> {
+        let mut record = Vec::with_capacity(40);
+        record.extend_from_slice(&tid.to_le_bytes()); // ref_id
+        record.extend_from_slice(&pos.to_le_bytes()); // pos
+        record.push(2); // name_len = 2 (including null)
+        record.push(0); // mapq = 0
+        record.extend_from_slice(&0u16.to_le_bytes()); // bin
+        record.extend_from_slice(&0u16.to_le_bytes()); // n_cigar_op = 0
+        record.extend_from_slice(&0u16.to_le_bytes()); // flags = 0 (forward)
+        record.extend_from_slice(&1u32.to_le_bytes()); // seq_len = 1
+        record.extend_from_slice(&(-1i32).to_le_bytes()); // mate_ref_id
+        record.extend_from_slice(&(-1i32).to_le_bytes()); // mate_pos
+        record.extend_from_slice(&0i32.to_le_bytes()); // tlen
+        record.push(b'A'); // read name
+        record.push(0); // null terminator
+        // Pad to at least 34 bytes (bam_fields::flags reads at offset 14-15)
+        while record.len() < 40 {
+            record.push(0);
+        }
+        record
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn test_par_sort_into_chunks_coordinate_single_threaded() {
+        let nref = 10u32;
+        let n = 100;
+        let mut buffer = RecordBuffer::with_capacity(n, n * 50, nref);
+
+        for i in 0..n {
+            // Reverse order so sorting is non-trivial
+            let pos = (n - i) as i32;
+            buffer.push_coordinate(&make_coordinate_bam_record(0, pos));
+        }
+
+        let chunks = buffer.par_sort_into_chunks(1);
+        assert_eq!(chunks.len(), 1, "single-threaded should produce exactly 1 chunk");
+        assert_eq!(chunks[0].len(), n, "the single chunk should contain all records");
+
+        // Verify the chunk is sorted by key
+        for i in 1..chunks[0].len() {
+            assert!(
+                chunks[0][i - 1].0 <= chunks[0][i].0,
+                "single chunk should be sorted at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn test_par_sort_into_chunks_coordinate_parallel() {
+        let nref = 10u32;
+        let n: usize = 10_500; // > 10_000 and > RADIX_THRESHOLD * 2
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("failed to build rayon thread pool");
+
+        let chunks = pool.install(|| {
+            let mut buffer = RecordBuffer::with_capacity(n, n * 50, nref);
+
+            for i in 0..n {
+                let pos = (n - i) as i32;
+                buffer.push_coordinate(&make_coordinate_bam_record(0, pos));
+            }
+
+            buffer.par_sort_into_chunks(4)
+        });
+
+        // With 4 threads and > 10_000 records we should get multiple chunks
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks from parallel path, got {}",
+            chunks.len()
+        );
+
+        // Verify each chunk is individually sorted
+        for (ci, chunk) in chunks.iter().enumerate() {
+            for i in 1..chunk.len() {
+                assert!(chunk[i - 1].0 <= chunk[i].0, "chunk {ci} not sorted at index {i}");
+            }
+        }
+
+        // Verify total record count across all chunks matches input
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        assert_eq!(total, n, "total records across chunks should equal input count");
     }
 }
