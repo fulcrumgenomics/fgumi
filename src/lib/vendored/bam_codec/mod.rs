@@ -42,7 +42,10 @@
 //! decode(&mut &bam_bytes[..], &mut record).unwrap();
 //! ```
 //!
-//! This is vendored code that will be removed once upstream PRs are merged.
+//! This is vendored from noodles-bam. The upstream PR to expose codec functions
+//! ([#364](https://github.com/zaeleus/noodles/pull/364)) was closed; the maintainer recommended
+//! `Reader::from(src)` for decoding instead. The vendored `encode_record_buf` is still needed
+//! for the raw-byte-mode optimization path. See [`super`] module docs for full context.
 
 pub mod decoder;
 pub mod encoder;
