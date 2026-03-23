@@ -661,6 +661,7 @@ dependencies = [
  "fgumi-metrics",
  "fgumi-raw-bam",
  "fgumi-sam",
+ "fgumi-simd-fastq",
  "fgumi-umi",
  "flate2",
  "indexmap",
@@ -682,7 +683,6 @@ dependencies = [
  "rayon",
  "read-structure",
  "rstest",
- "seq_io",
  "serde",
  "statrs",
  "sysinfo",
@@ -757,6 +757,17 @@ dependencies = [
  "log",
  "noodles",
  "tempfile",
+]
+
+[[package]]
+name = "fgumi-simd-fastq"
+version = "0.1.2"
+dependencies = [
+ "criterion",
+ "memchr",
+ "proptest",
+ "rstest",
+ "seq_io",
 ]
 
 [[package]]

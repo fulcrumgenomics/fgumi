@@ -1,0 +1,24 @@
+[package]
+name = "fgumi-simd-fastq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SIMD-accelerated FASTQ parsing using Helicase-style bitmask operations"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+rstest = "0"
+proptest = "1.10"
+criterion = { version = "0.8", features = ["html_reports"] }
+memchr = "2"
+seq_io = "0.3.4"
+
+[[bench]]
+name = "fastq_parsing"
+harness = false
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
