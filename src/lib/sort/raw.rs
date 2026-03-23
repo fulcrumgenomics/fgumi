@@ -377,6 +377,37 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     }
 }
 
+/// Generates unique file paths for chunk and merged temp files.
+///
+/// Maintains monotonic counters for both chunk files (`chunk_0000.keyed`, ...)
+/// and merged files (`merged_0000.keyed`, ...) to prevent naming collisions
+/// after consolidation drains entries from the chunk file list.
+struct ChunkNamer<'a> {
+    temp_path: &'a Path,
+    chunk_count: usize,
+    merge_count: usize,
+}
+
+impl<'a> ChunkNamer<'a> {
+    fn new(temp_path: &'a Path) -> Self {
+        Self { temp_path, chunk_count: 0, merge_count: 0 }
+    }
+
+    /// Returns the next unique chunk file path.
+    fn next_chunk_path(&mut self) -> PathBuf {
+        let path = self.temp_path.join(format!("chunk_{:04}.keyed", self.chunk_count));
+        self.chunk_count += 1;
+        path
+    }
+
+    /// Returns the next unique merged file path.
+    fn next_merged_path(&mut self) -> PathBuf {
+        let path = self.temp_path.join(format!("merged_{:04}.keyed", self.merge_count));
+        self.merge_count += 1;
+        path
+    }
+}
+
 /// Raw-bytes external sorter for BAM files.
 ///
 /// This sorter uses lazy record parsing to minimize memory usage and avoid
@@ -509,8 +540,7 @@ impl RawExternalSorter {
     fn maybe_consolidate_temp_files<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &mut Vec<PathBuf>,
-        temp_path: &Path,
-        consolidation_count: &mut usize,
+        namer: &mut ChunkNamer<'_>,
     ) -> Result<()> {
         struct HeapEntry<K> {
             key: K,
@@ -528,18 +558,17 @@ impl RawExternalSorter {
         }
 
         // Merge oldest half of files into one (at least 2)
-        let merge_count = (self.max_temp_files / 2).max(2).min(chunk_files.len());
-        let files_to_merge: Vec<PathBuf> = chunk_files.drain(..merge_count).collect();
+        let n_to_merge = (self.max_temp_files / 2).max(2).min(chunk_files.len());
+        let files_to_merge: Vec<PathBuf> = chunk_files.drain(..n_to_merge).collect();
 
         info!(
             "Consolidating {} temp files into 1 (total was {})...",
-            merge_count,
-            merge_count + chunk_files.len()
+            n_to_merge,
+            n_to_merge + chunk_files.len()
         );
 
         // Create merged output file
-        let merged_path = temp_path.join(format!("merged_{:04}.keyed", *consolidation_count));
-        *consolidation_count += 1;
+        let merged_path = namer.next_merged_path();
 
         // Open readers for files to merge
         let mut readers: Vec<GenericKeyedChunkReader<K>> = files_to_merge
@@ -691,8 +720,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
-        let mut consolidation_count = 0usize;
-        let mut chunk_counter = 0usize;
+        let mut namer = ChunkNamer::new(temp_path);
 
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -706,8 +734,7 @@ impl RawExternalSorter {
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
-                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
-                chunk_counter += 1;
+                let chunk_path = namer.next_chunk_path();
 
                 // Sort in place using parallel sort for large buffers
                 if self.threads > 1 {
@@ -735,8 +762,7 @@ impl RawExternalSorter {
                 // Consolidate if we have too many temp files
                 self.maybe_consolidate_temp_files::<RawCoordinateKey>(
                     &mut chunk_files,
-                    temp_path,
-                    &mut consolidation_count,
+                    &mut namer,
                 )?;
 
                 buffer.clear();
@@ -815,7 +841,7 @@ impl RawExternalSorter {
     /// Similar to `sort_coordinate_optimized` but uses `IndexingBamWriter` to
     /// build the BAI index incrementally during write. Uses single-threaded
     /// compression for accurate virtual position tracking.
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_truncation)]
     fn sort_coordinate_with_index(
         &self,
         reader: crate::bam_io::RawBamReaderAuto,
@@ -834,8 +860,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
-        let mut consolidation_count = 0usize;
-        let mut chunk_counter = 0usize;
+        let mut namer = ChunkNamer::new(temp_path);
         let read_ahead = RawReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
@@ -845,8 +870,7 @@ impl RawExternalSorter {
             buffer.push_coordinate(record.as_ref());
 
             if buffer.memory_usage() >= self.memory_limit {
-                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
-                chunk_counter += 1;
+                let chunk_path = namer.next_chunk_path();
 
                 if self.threads > 1 {
                     buffer.par_sort();
@@ -872,8 +896,7 @@ impl RawExternalSorter {
                 // Consolidate if we have too many temp files
                 self.maybe_consolidate_temp_files::<RawCoordinateKey>(
                     &mut chunk_files,
-                    temp_path,
-                    &mut consolidation_count,
+                    &mut namer,
                 )?;
 
                 buffer.clear();
@@ -981,8 +1004,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut entries: Vec<(RawQuerynameKey, Vec<u8>)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
-        let mut consolidation_count = 0usize;
-        let mut chunk_counter = 0usize;
+        let mut namer = ChunkNamer::new(temp_path);
 
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -1003,8 +1025,7 @@ impl RawExternalSorter {
 
             // Check if we need to spill to disk
             if memory_used >= self.memory_limit {
-                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
-                chunk_counter += 1;
+                let chunk_path = namer.next_chunk_path();
 
                 // Sort the entries
                 if self.threads > 1 {
@@ -1029,11 +1050,7 @@ impl RawExternalSorter {
                 chunk_files.push(chunk_path);
 
                 // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<RawQuerynameKey>(
-                    &mut chunk_files,
-                    temp_path,
-                    &mut consolidation_count,
-                )?;
+                self.maybe_consolidate_temp_files::<RawQuerynameKey>(&mut chunk_files, &mut namer)?;
 
                 memory_used = 0;
             }
@@ -1121,8 +1138,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
-        let mut consolidation_count = 0usize;
-        let mut chunk_counter = 0usize;
+        let mut namer = ChunkNamer::new(temp_path);
 
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -1138,9 +1154,7 @@ impl RawExternalSorter {
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
-                // Use .keyed extension to distinguish from BAM chunks
-                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
-                chunk_counter += 1;
+                let chunk_path = namer.next_chunk_path();
 
                 // Sort in place using parallel sort for large buffers
                 if self.threads > 1 {
@@ -1164,11 +1178,7 @@ impl RawExternalSorter {
                 chunk_files.push(chunk_path);
 
                 // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<TemplateKey>(
-                    &mut chunk_files,
-                    temp_path,
-                    &mut consolidation_count,
-                )?;
+                self.maybe_consolidate_temp_files::<TemplateKey>(&mut chunk_files, &mut namer)?;
 
                 buffer.clear();
             }
@@ -2249,8 +2259,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            stats.chunks_written >= 4,
-            "expected at least 4 chunks to trigger consolidation, got {}",
+            stats.chunks_written >= 5,
+            "expected at least 5 chunks to exercise post-consolidation naming, got {}",
             stats.chunks_written
         );
 
