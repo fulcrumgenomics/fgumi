@@ -38,6 +38,7 @@ use noodles_bgzf::io::MultithreadedReader;
 
 #[cfg(test)]
 use fgumi_lib::bam_io::create_bam_reader;
+use fgumi_simd_fastq::SimdFastqReader;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
@@ -50,8 +51,6 @@ use noodles::sam::header::record::value::{
     map::{Header as HeaderRecord, Tag as HeaderTag},
 };
 use read_structure::{ReadStructure, SegmentType};
-use seq_io::fastq::Reader as FastqReader;
-use seq_io::fastq::Record;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -1241,14 +1240,13 @@ impl Command for Extract {
         // Detect quality encoding from first 400 records
         // Use a separate reader for sampling to avoid consuming records from the main reader
         let mut sample_quals = Vec::new();
-        let temp_reader =
-            FastqReader::with_capacity(open_fastq_reader(&self.inputs[0], 1)?, BUFFER_SIZE);
-        for (i, result) in temp_reader.into_records().enumerate() {
-            if i >= QUALITY_DETECTION_SAMPLE_SIZE {
-                break;
-            }
-            if let Ok(rec) = result {
-                sample_quals.push(rec.qual().to_vec());
+        let mut temp_reader =
+            SimdFastqReader::with_capacity(open_fastq_reader(&self.inputs[0], 1)?, BUFFER_SIZE);
+        for _i in 0..QUALITY_DETECTION_SAMPLE_SIZE {
+            match temp_reader.next() {
+                Some(Ok(rec)) => sample_quals.push(rec.quality),
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
             }
         }
 
@@ -1277,9 +1275,9 @@ impl Command for Extract {
                 .map(|p| open_fastq_reader(p, decomp_threads))
                 .collect::<Result<Vec<_>>>()?;
 
-            let fq_sources: Vec<FastqReader<Box<dyn BufRead + Send>>> = fq_readers
+            let fq_sources: Vec<SimdFastqReader<Box<dyn BufRead + Send>>> = fq_readers
                 .into_iter()
-                .map(|fq| FastqReader::with_capacity(fq, BUFFER_SIZE))
+                .map(|fq| SimdFastqReader::with_capacity(fq, BUFFER_SIZE))
                 .collect();
 
             // Create iterators

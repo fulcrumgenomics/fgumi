@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-umi", "crates/fgumi-consensus"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-umi", "crates/fgumi-consensus"]
 resolver = "2"
 
 [workspace.package]
@@ -16,6 +16,7 @@ fgumi-dna = { version = "0.1.2", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.1.2", path = "crates/fgumi-metrics" }
 fgumi-raw-bam = { version = "0.1.2", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.1.2", path = "crates/fgumi-sam" }
+fgumi-simd-fastq = { version = "0.1.2", path = "crates/fgumi-simd-fastq" }
 fgumi-umi = { version = "0.1.2", path = "crates/fgumi-umi" }
 
 [package]
@@ -45,7 +46,6 @@ env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
 anyhow = "1.0.102"
 read-structure = "0.2.0"
-seq_io = "0.3.4"
 bstr = "1.12.1"
 bytes = "1"
 fgoxide = "0.6.0"
@@ -82,6 +82,7 @@ fgumi-dna = { workspace = true }
 fgumi-bgzf = { workspace = true }
 fgumi-metrics = { workspace = true }
 fgumi-sam = { workspace = true }
+fgumi-simd-fastq = { workspace = true }
 fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
 

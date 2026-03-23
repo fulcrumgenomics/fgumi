@@ -446,7 +446,7 @@ impl FastqFormat {
 // Boundary Finding Helper Functions
 // ============================================================================
 
-/// Find FASTQ record boundaries in data (allocation-reducing version).
+/// Find FASTQ record boundaries in data using SIMD-accelerated newline detection.
 ///
 /// Returns (`complete_data`, offsets, `leftover_start`).
 /// - `complete_data`: Bytes containing only complete records (owned)
@@ -459,53 +459,11 @@ fn find_fastq_boundaries_inplace(data: &[u8]) -> (Vec<u8>, Vec<usize>, usize) {
         return (Vec::new(), vec![0], 0);
     }
 
-    let mut offsets = vec![0];
-    let mut pos = 0;
+    let offsets = fgumi_simd_fastq::find_record_offsets(data);
+    let last_offset = offsets.last().copied().unwrap_or(0);
+    let complete_data = data[..last_offset].to_vec();
 
-    // Scan for complete FASTQ records (4 lines each)
-    while pos < data.len() {
-        // Find end of this record (4 newlines)
-        if let Some(record_end) = find_fastq_record_end(&data[pos..]) {
-            pos += record_end;
-            offsets.push(pos);
-        } else {
-            // Incomplete record - everything from pos onwards is leftover
-            break;
-        }
-    }
-
-    // Only allocate for the complete data (unavoidable - we return ownership)
-    let complete_data = data[..pos].to_vec();
-
-    (complete_data, offsets, pos)
-}
-
-/// Find the end of a complete FASTQ record starting at the given position.
-///
-/// Returns the number of bytes consumed (position after the last newline),
-/// or None if the record is incomplete.
-///
-/// FASTQ format:
-/// ```text
-/// @name
-/// ACGT...
-/// +
-/// IIII...
-/// ```
-fn find_fastq_record_end(data: &[u8]) -> Option<usize> {
-    if data.is_empty() || data[0] != b'@' {
-        return None;
-    }
-
-    // Find 4 newlines using SIMD-accelerated memchr
-    let mut pos = 0;
-    for _ in 0..4 {
-        match memchr::memchr(b'\n', &data[pos..]) {
-            Some(nl) => pos += nl + 1,
-            None => return None,
-        }
-    }
-    Some(pos)
+    (complete_data, offsets, last_offset)
 }
 
 /// Parse FASTQ records from boundary data.

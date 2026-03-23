@@ -15,13 +15,15 @@
 //!
 //! ```rust,ignore
 //! use read_structure::ReadStructure;
+//! use fgumi_simd_fastq::SimdFastqReader;
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use seq_io::fastq::Reader;
 //!
 //! let rs = ReadStructure::from_str("8M143T").unwrap();
 //! let file = File::open("reads.fq").unwrap();
-//! let reader = Reader::new(BufReader::new(file));
+//! let reader = SimdFastqReader::new(
+//!     Box::new(BufReader::new(file)) as Box<dyn std::io::BufRead + Send>
+//! );
 //! let mut iter = ReadSetIterator::new(rs, reader, vec![]);
 //!
 //! for read_set in iter {
@@ -30,10 +32,9 @@
 //! ```
 
 use anyhow::{Result, anyhow};
+use fgumi_simd_fastq::SimdFastqReader;
 use read_structure::ReadStructure;
 use read_structure::SegmentType;
-use seq_io::fastq::Reader as FastqReader;
-use seq_io::fastq::Record;
 use std::fmt::Display;
 use std::io::BufRead;
 use std::iter::Filter;
@@ -296,7 +297,9 @@ impl FastqSet {
 /// ```rust,ignore
 /// let read_structure = ReadStructure::from_str("8M143T")?;
 /// let file = File::open("reads.fq")?;
-/// let reader = Reader::new(BufReader::new(file));
+/// let reader = SimdFastqReader::new(
+///     Box::new(BufReader::new(file)) as Box<dyn std::io::BufRead + Send>
+/// );
 /// let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 ///
 /// for read_set in iterator {
@@ -306,8 +309,8 @@ impl FastqSet {
 pub struct ReadSetIterator {
     /// Read structure describing the layout of bases in each read
     read_structure: ReadStructure,
-    /// FASTQ file reader
-    source: FastqReader<Box<dyn BufRead + Send>>,
+    /// SIMD-accelerated FASTQ file reader
+    source: SimdFastqReader<Box<dyn BufRead + Send>>,
     /// Reasons to skip reads instead of panicking (e.g., too few bases)
     skip_reasons: Vec<SkipReason>,
 }
@@ -324,9 +327,9 @@ impl Iterator for ReadSetIterator {
             }
         };
         Some(FastqSet::from_record_with_structure(
-            record.head(),
-            record.seq(),
-            record.qual(),
+            &record.name,
+            &record.sequence,
+            &record.quality,
             &self.read_structure,
             &self.skip_reasons,
         ))
@@ -360,7 +363,7 @@ impl ReadSetIterator {
     #[must_use]
     pub fn new(
         read_structure: ReadStructure,
-        source: FastqReader<Box<dyn BufRead + Send>>,
+        source: SimdFastqReader<Box<dyn BufRead + Send>>,
         skip_reasons: Vec<SkipReason>,
     ) -> Self {
         Self { read_structure, source, skip_reasons }
@@ -544,7 +547,7 @@ mod tests {
         // Create a simple FASTQ record
         let fastq_data = b"@read1\nACGTACGT\n+\nIIIIIIII\n";
         let cursor = Cursor::new(fastq_data.to_vec());
-        let reader: FastqReader<Box<dyn BufRead + Send>> = FastqReader::new(Box::new(cursor));
+        let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // Simple read structure: 4M (molecular barcode) + 4T (template)
         let read_structure = ReadStructure::from_str("4M4T").unwrap();
@@ -577,7 +580,7 @@ mod tests {
         // Create a FASTQ record that's too short for the read structure
         let fastq_data = b"@read1\nACGT\n+\nIIII\n";
         let cursor = Cursor::new(fastq_data.to_vec());
-        let reader: FastqReader<Box<dyn BufRead + Send>> = FastqReader::new(Box::new(cursor));
+        let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // Read structure requires 10 bases total
         let read_structure = ReadStructure::from_str("4M6T").unwrap();
@@ -601,7 +604,7 @@ mod tests {
         // Create a FASTQ record that's too short
         let fastq_data = b"@read1\nACGT\n+\nIIII\n";
         let cursor = Cursor::new(fastq_data.to_vec());
-        let reader: FastqReader<Box<dyn BufRead + Send>> = FastqReader::new(Box::new(cursor));
+        let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // Read structure requires 10 bases total
         let read_structure = ReadStructure::from_str("4M6T").unwrap();
@@ -617,7 +620,7 @@ mod tests {
 
         let fastq_data = b"@read1\nACGTAAAA\n+\nIIIIIIII\n@read2\nTGCATTTT\n+\nIIIIIIII\n";
         let cursor = Cursor::new(fastq_data.to_vec());
-        let reader: FastqReader<Box<dyn BufRead + Send>> = FastqReader::new(Box::new(cursor));
+        let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         let read_structure = ReadStructure::from_str("4M4T").unwrap();
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
@@ -645,7 +648,7 @@ mod tests {
         // Test with variable-length template segment (last segment gets remaining bases)
         let fastq_data = b"@read1\nACGTTTTTTTTT\n+\nIIIIIIIIIIII\n";
         let cursor = Cursor::new(fastq_data.to_vec());
-        let reader: FastqReader<Box<dyn BufRead + Send>> = FastqReader::new(Box::new(cursor));
+        let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // 4M + variable T (remaining bases go to template)
         let read_structure = ReadStructure::from_str("4M+T").unwrap();
