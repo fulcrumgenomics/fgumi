@@ -692,6 +692,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
         let mut consolidation_count = 0usize;
+        let mut chunk_counter = 0usize;
 
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -705,7 +706,8 @@ impl RawExternalSorter {
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
-                let chunk_path = temp_path.join(format!("chunk_{:04}.keyed", chunk_files.len()));
+                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
+                chunk_counter += 1;
 
                 // Sort in place using parallel sort for large buffers
                 if self.threads > 1 {
@@ -813,7 +815,7 @@ impl RawExternalSorter {
     /// Similar to `sort_coordinate_optimized` but uses `IndexingBamWriter` to
     /// build the BAI index incrementally during write. Uses single-threaded
     /// compression for accurate virtual position tracking.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn sort_coordinate_with_index(
         &self,
         reader: crate::bam_io::RawBamReaderAuto,
@@ -833,6 +835,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
         let mut consolidation_count = 0usize;
+        let mut chunk_counter = 0usize;
         let read_ahead = RawReadAheadReader::new(reader);
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
@@ -842,7 +845,8 @@ impl RawExternalSorter {
             buffer.push_coordinate(record.as_ref());
 
             if buffer.memory_usage() >= self.memory_limit {
-                let chunk_path = temp_path.join(format!("chunk_{:04}.keyed", chunk_files.len()));
+                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
+                chunk_counter += 1;
 
                 if self.threads > 1 {
                     buffer.par_sort();
@@ -978,6 +982,7 @@ impl RawExternalSorter {
         let mut entries: Vec<(RawQuerynameKey, Vec<u8>)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
         let mut consolidation_count = 0usize;
+        let mut chunk_counter = 0usize;
 
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -998,7 +1003,8 @@ impl RawExternalSorter {
 
             // Check if we need to spill to disk
             if memory_used >= self.memory_limit {
-                let chunk_path = temp_path.join(format!("chunk_{:04}.keyed", chunk_files.len()));
+                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
+                chunk_counter += 1;
 
                 // Sort the entries
                 if self.threads > 1 {
@@ -1116,6 +1122,7 @@ impl RawExternalSorter {
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
         let mut consolidation_count = 0usize;
+        let mut chunk_counter = 0usize;
 
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -1132,7 +1139,8 @@ impl RawExternalSorter {
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
                 // Use .keyed extension to distinguish from BAM chunks
-                let chunk_path = temp_path.join(format!("chunk_{:04}.keyed", chunk_files.len()));
+                let chunk_path = temp_path.join(format!("chunk_{chunk_counter:04}.keyed"));
+                chunk_counter += 1;
 
                 // Sort in place using parallel sort for large buffers
                 if self.threads > 1 {
@@ -2184,5 +2192,71 @@ mod tests {
         let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"));
         assert_ne!(key.cb_hash, 0, "unmapped read with CB should have non-zero cb_hash");
         assert_eq!(key.primary, u64::MAX, "unmapped both-mates should have MAX primary");
+    }
+
+    // ========================================================================
+    // Consolidation chunk naming tests
+    // ========================================================================
+
+    /// Count records in a BAM file by reading with the raw BAM reader.
+    fn count_bam_records(path: &std::path::Path) -> u64 {
+        use crate::sort::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).unwrap();
+        RawReadAheadReader::new(reader).count() as u64
+    }
+
+    /// Verifies that sort with consolidation preserves all records.
+    ///
+    /// Uses a tiny memory limit and low `max_temp_files` to force many chunks and
+    /// consolidation. Before the fix (chunk files named by `chunk_files.len()`),
+    /// consolidation would drain entries from the vector, shrinking its length,
+    /// causing new chunks to collide with existing non-consolidated chunk files.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate, false)]
+    #[case::coordinate_with_index(SortOrder::Coordinate, true)]
+    #[case::queryname(SortOrder::Queryname, false)]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate, false)]
+    fn test_sort_with_consolidation_preserves_all_records(
+        #[case] sort_order: SortOrder,
+        #[case] write_index: bool,
+    ) {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 30;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Tiny memory limit forces many chunks; low max_temp_files triggers consolidation
+        let stats = RawExternalSorter::new(sort_order)
+            .memory_limit(1024) // 1 KB — each chunk holds very few records
+            .max_temp_files(4)
+            .temp_compression(0)
+            .output_compression(0)
+            .write_index(write_index)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert!(
+            stats.chunks_written >= 4,
+            "expected at least 4 chunks to trigger consolidation, got {}",
+            stats.chunks_written
+        );
+
+        // Count records in the output BAM to verify no data was lost
+        let expected = (num_pairs * 2) as u64;
+        let observed = count_bam_records(&output);
+        assert_eq!(observed, expected, "chunk filename collision likely lost data");
     }
 }
