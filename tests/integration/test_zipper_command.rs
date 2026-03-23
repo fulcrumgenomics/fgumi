@@ -40,6 +40,17 @@ fn create_mapped_sam(path: &Path, header: &sam::Header, records: &[RecordBuf]) {
     }
 }
 
+/// Create a mapped BAM file with aligned reads (same read names as unmapped).
+fn create_mapped_bam(path: &Path, header: &sam::Header, records: &[RecordBuf]) {
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create mapped BAM"));
+    writer.write_header(header).expect("Failed to write header");
+    for record in records {
+        writer.write_alignment_record(header, record).expect("Failed to write record");
+    }
+    writer.finish(header).expect("Failed to finish BAM");
+}
+
 /// Test basic zipper merge — unmapped tags are transferred to mapped reads.
 #[test]
 fn test_zipper_basic_merge() {
@@ -221,4 +232,96 @@ fn test_zipper_missing_input() {
         .expect("Failed to run zipper command");
 
     assert!(!status.success(), "Zipper should fail for nonexistent input");
+}
+
+/// Test zipper accepts BAM as mapped input (--input).
+#[test]
+fn test_zipper_bam_mapped_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let unmapped_bam = temp_dir.path().join("unmapped.bam");
+    let mapped_bam = temp_dir.path().join("mapped.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    let unmapped_records = vec![
+        RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .unmapped(true)
+            .tag("RX", "AACCGGTT")
+            .tag("QX", "IIIIIIII")
+            .build(),
+        RecordBuilder::new()
+            .name("read2")
+            .sequence("TGCATGCA")
+            .qualities(&[30; 8])
+            .unmapped(true)
+            .tag("RX", "GGTTCCAA")
+            .tag("QX", "IIIIIIII")
+            .build(),
+    ];
+    create_unmapped_bam(&unmapped_bam, &unmapped_records);
+
+    let mapped_header = create_minimal_header("chr1", 10000);
+    let mapped_records = vec![
+        RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .cigar("8M")
+            .build(),
+        RecordBuilder::new()
+            .name("read2")
+            .sequence("TGCATGCA")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .mapping_quality(60)
+            .cigar("8M")
+            .build(),
+    ];
+    create_mapped_bam(&mapped_bam, &mapped_header, &mapped_records);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--input",
+            mapped_bam.to_str().unwrap(),
+            "--unmapped",
+            unmapped_bam.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ])
+        .output()
+        .expect("Failed to run zipper command");
+
+    assert!(
+        output.status.success(),
+        "Zipper command failed with BAM input: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_bam.exists(), "Output BAM not created");
+
+    // Verify output records have UMI tags transferred
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let header = reader.read_header().unwrap();
+    let records: Vec<RecordBuf> = reader.record_bufs(&header).map(|r| r.unwrap()).collect();
+    assert_eq!(records.len(), 2, "Should have 2 records in output");
+
+    let rx_tag = Tag::from([b'R', b'X']);
+    for record in &records {
+        assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
+    }
+
+    // Verify warning about BAM input was emitted
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("BAM input detected"), "Should warn about BAM input. stderr: {stderr}");
 }
