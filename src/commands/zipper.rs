@@ -50,7 +50,9 @@ use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use anyhow::{Context, Result};
 use clap::Parser;
-use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer, is_stdin_path, is_stdout_path};
+use fgumi_lib::bam_io::{
+    BamReaderAuto, create_bam_reader, create_bam_writer, is_stdin_path, is_stdout_path,
+};
 use fgumi_lib::batched_sam_reader::BatchedSamReader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
@@ -63,7 +65,7 @@ use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo};
 use fgumi_lib::template::{Template, TemplateIterator};
 use fgumi_lib::umi::TagInfo;
 use fgumi_lib::validation::validate_file_exists;
-use log::{debug, info};
+use log::{debug, info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -114,7 +116,8 @@ workflows like:
 )]
 #[command(verbatim_doc_comment)]
 pub struct Zipper {
-    /// Input mapped SAM file (or `-` for stdin)
+    /// Input mapped SAM or BAM file (or `-` for stdin, SAM only). BAM input is
+    /// discouraged; prefer piping SAM directly from the aligner for best performance.
     #[arg(short = 'i', long, default_value = "-")]
     pub input: PathBuf,
 
@@ -735,6 +738,13 @@ impl Zipper {
     }
 }
 
+/// Wraps SAM and BAM readers so the mapped-reader thread can handle either format.
+/// Moved into the thread where `record_bufs()` is called, since it borrows `&self`.
+enum MappedReader {
+    Sam(noodles::sam::io::Reader<Box<dyn BufRead + Send>>),
+    Bam(BamReaderAuto),
+}
+
 impl Command for Zipper {
     /// Executes the `zipper` command
     ///
@@ -781,20 +791,35 @@ impl Command for Zipper {
 
         let (mut unmapped_reader, unmapped_header) = create_bam_reader(&self.unmapped, 1)?;
 
-        // For stdin, use BatchedSamReader that starts at 64MB and grows based on observed usage.
-        // This handles bwa mem's bursty output pattern (450-750MB SAM text per batch).
-        // The -K parameter (bwa_chunk_size) is used for batch tracking.
-        let mapped_reader: Box<dyn BufRead + Send> = if is_stdin_path(&self.input) {
+        // Read mapped input — detect format by extension.
+        // The reader and header are separated here; record_bufs() is called inside
+        // the spawned thread (it borrows &self, so the reader must live there).
+        let (mapped_reader, mapped_header) = if is_stdin_path(&self.input) {
+            // Stdin is always SAM (streaming from aligner)
             info!("Reading SAM from stdin with adaptive buffer (bwa -K {})", self.bwa_chunk_size);
-            Box::new(BatchedSamReader::new(std::io::stdin(), self.bwa_chunk_size))
+            let reader: Box<dyn BufRead + Send> =
+                Box::new(BatchedSamReader::new(std::io::stdin(), self.bwa_chunk_size));
+            let mut sam_reader = noodles::sam::io::Reader::new(reader);
+            let header = sam_reader.read_header()?;
+            (MappedReader::Sam(sam_reader), header)
+        } else if self.input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bam")) {
+            // BAM file input — functional but discouraged
+            warn!(
+                "BAM input detected for --input. For best performance, pipe SAM directly \
+                 from the aligner (e.g. bwa mem ... | fgumi zipper ...)."
+            );
+            let (bam_reader, header) = create_bam_reader(&self.input, self.threads)?;
+            (MappedReader::Bam(bam_reader), header)
         } else {
-            Box::new(BufReader::with_capacity(
+            // SAM file input
+            let reader: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(
                 256 * 1024,
                 std::fs::File::open(&self.input).context("Failed to open mapped SAM")?,
-            ))
+            ));
+            let mut sam_reader = noodles::sam::io::Reader::new(reader);
+            let header = sam_reader.read_header()?;
+            (MappedReader::Sam(sam_reader), header)
         };
-        let mut mapped_sam_reader = noodles::sam::io::Reader::new(mapped_reader);
-        let mapped_header = mapped_sam_reader.read_header()?;
 
         check_sort(&unmapped_header, &self.unmapped, "unmapped");
         check_sort(&mapped_header, &self.input, "mapped");
@@ -843,14 +868,30 @@ impl Command for Zipper {
         let (mapped_tx, mapped_rx) = std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
         let mapped_header_for_reader = mapped_header.clone();
         std::thread::spawn(move || {
-            let mapped_iter = TemplateIterator::new(
-                mapped_sam_reader
-                    .record_bufs(&mapped_header_for_reader)
-                    .map(|r| r.map_err(anyhow::Error::from)),
-            );
-            for template in mapped_iter {
-                if mapped_tx.send(template).is_err() {
-                    break; // Receiver dropped, main thread done
+            // The reader must be owned for the full duration so that the iterator
+            // (which borrows it via record_bufs) remains valid.
+            match mapped_reader {
+                MappedReader::Sam(mut r) => {
+                    let mapped_iter = TemplateIterator::new(
+                        r.record_bufs(&mapped_header_for_reader)
+                            .map(|rec| rec.map_err(anyhow::Error::from)),
+                    );
+                    for template in mapped_iter {
+                        if mapped_tx.send(template).is_err() {
+                            break;
+                        }
+                    }
+                }
+                MappedReader::Bam(mut r) => {
+                    let mapped_iter = TemplateIterator::new(
+                        r.record_bufs(&mapped_header_for_reader)
+                            .map(|rec| rec.map_err(anyhow::Error::from)),
+                    );
+                    for template in mapped_iter {
+                        if mapped_tx.send(template).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
