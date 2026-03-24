@@ -681,6 +681,144 @@ impl RawExternalSorter {
         }
     }
 
+    /// Merge multiple pre-sorted BAM files into a single sorted BAM.
+    ///
+    /// Each input BAM must already be sorted in the order specified by
+    /// `self.sort_order`. The output preserves the sort order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any input cannot be opened, or writing fails.
+    pub fn merge_bams(&self, inputs: &[PathBuf], header: &Header, output: &Path) -> Result<u64> {
+        use crate::sort::inline_buffer::extract_coordinate_key_inline;
+        use crate::sort::keys::{RawCoordinateKey, RawQuerynameKey, RawSortKey, SortContext};
+
+        info!("Starting k-way merge of {} BAM files", inputs.len());
+
+        let mut readers = Self::open_bam_prefetch_readers(inputs)?;
+        let output_header = self.create_output_header(header);
+
+        match self.sort_order {
+            SortOrder::TemplateCoordinate => {
+                let lib_lookup = LibraryLookup::from_header(header);
+                let cell_tag = self.cell_tag;
+                self.run_merge_loop(&mut readers, &output_header, output, |bam| {
+                    extract_template_key_inline(bam, &lib_lookup, cell_tag.as_ref())
+                })
+            }
+            SortOrder::Coordinate => {
+                #[allow(clippy::cast_possible_truncation)]
+                let nref = header.reference_sequences().len() as u32;
+                self.run_merge_loop(&mut readers, &output_header, output, |bam| RawCoordinateKey {
+                    sort_key: extract_coordinate_key_inline(bam, nref),
+                })
+            }
+            SortOrder::Queryname => {
+                let ctx = SortContext::from_header(header);
+                self.run_merge_loop(&mut readers, &output_header, output, |bam| {
+                    RawQuerynameKey::extract(bam, &ctx)
+                })
+            }
+        }
+    }
+
+    /// Open background prefetch readers for multiple BAM files.
+    fn open_bam_prefetch_readers(inputs: &[PathBuf]) -> Result<Vec<RawReadAheadReader>> {
+        inputs
+            .iter()
+            .map(|path| {
+                let (reader, _header) = create_raw_bam_reader(path, 1)?;
+                Ok(RawReadAheadReader::new(reader))
+            })
+            .collect()
+    }
+
+    /// K-way merge loop: extract keys on the merge thread, write to output.
+    fn run_merge_loop<K: Ord>(
+        &self,
+        readers: &mut [RawReadAheadReader],
+        output_header: &Header,
+        output: &Path,
+        extract_key: impl Fn(&[u8]) -> K,
+    ) -> Result<u64> {
+        use crate::sort::loser_tree::LoserTree;
+
+        const OUTPUT_BUFFER_SIZE: usize = 2048;
+
+        // Initialize: collect first record + key from each reader
+        let mut initial_keys: Vec<K> = Vec::with_capacity(readers.len());
+        let mut records: Vec<Vec<u8>> = Vec::with_capacity(readers.len());
+        let mut source_map: Vec<usize> = Vec::with_capacity(readers.len());
+
+        for (idx, reader) in readers.iter_mut().enumerate() {
+            if let Some(raw_record) = reader.next() {
+                let record_bytes = raw_record.as_ref().to_vec();
+                initial_keys.push(extract_key(&record_bytes));
+                records.push(record_bytes);
+                source_map.push(idx);
+            }
+        }
+
+        if initial_keys.is_empty() {
+            info!("Merge complete: 0 records merged");
+            let writer = crate::bam_io::create_raw_bam_writer(
+                output,
+                output_header,
+                self.threads,
+                self.output_compression,
+            )?;
+            writer.finish()?;
+            return Ok(0);
+        }
+
+        let mut tree = LoserTree::new(initial_keys);
+        let k = tree.len();
+
+        let mut writer = crate::bam_io::create_raw_bam_writer(
+            output,
+            output_header,
+            self.threads,
+            self.output_compression,
+        )?;
+
+        let mut records_merged = 0u64;
+        let mut output_buffer: Vec<Vec<u8>> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
+
+        while tree.winner_is_active() {
+            let winner = tree.winner();
+            let record_bytes = std::mem::take(&mut records[winner]);
+
+            output_buffer.push(record_bytes);
+            records_merged += 1;
+
+            if output_buffer.len() >= OUTPUT_BUFFER_SIZE {
+                for rec in output_buffer.drain(..) {
+                    writer.write_raw_record(&rec)?;
+                }
+            }
+
+            // Fetch next record from the same source
+            let reader_idx = source_map[winner];
+            if let Some(raw_record) = readers[reader_idx].next() {
+                let next_rec = raw_record.as_ref().to_vec();
+                let new_key = extract_key(&next_rec);
+                records[winner] = next_rec;
+                tree.replace_winner(new_key);
+            } else {
+                tree.remove_winner();
+            }
+        }
+
+        for rec in output_buffer {
+            writer.write_raw_record(&rec)?;
+        }
+
+        writer.finish()?;
+
+        info!("Merge complete: {records_merged} records merged (loser tree, k={k})",);
+        Ok(records_merged)
+    }
+
     /// Sort by coordinate order using optimized radix sort for large arrays.
     fn sort_coordinate(
         &self,
@@ -841,7 +979,7 @@ impl RawExternalSorter {
     /// Similar to `sort_coordinate_optimized` but uses `IndexingBamWriter` to
     /// build the BAI index incrementally during write. Uses single-threaded
     /// compression for accurate virtual position tracking.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn sort_coordinate_with_index(
         &self,
         reader: crate::bam_io::RawBamReaderAuto,
@@ -1843,6 +1981,7 @@ pub use super::SortStats as RawSortStats;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sam::builder::SamBuilder;
     use noodles::sam::header::record::value::map::ReadGroup;
 
     // ========================================================================
@@ -2268,5 +2407,207 @@ mod tests {
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
         assert_eq!(observed, expected, "chunk filename collision likely lost data");
+    }
+
+    // ========================================================================
+    // merge_bams tests
+    // ========================================================================
+
+    /// Helper: create a `SamBuilder` with `num_pairs` pairs at non-overlapping positions,
+    /// write an unsorted BAM, sort it with the given order, and return the sorted path.
+    /// `start_offset` shifts all positions so different inputs have distinct read names/positions.
+    fn create_sorted_bam(
+        dir: &Path,
+        prefix: &str,
+        num_pairs: usize,
+        start_offset: usize,
+        sort_order: SortOrder,
+    ) -> (PathBuf, Vec<String>) {
+        let mut builder = SamBuilder::new();
+        let mut names = Vec::with_capacity(num_pairs);
+        for i in 0..num_pairs {
+            let name = format!("{prefix}_read{i:04}");
+            names.push(name.clone());
+            let _ = builder
+                .add_pair()
+                .name(&name)
+                .start1((start_offset + i * 200) + 1)
+                .start2((start_offset + i * 200) + 101)
+                .build();
+        }
+        let unsorted = dir.join(format!("{prefix}_unsorted.bam"));
+        let sorted = dir.join(format!("{prefix}_sorted.bam"));
+        builder.write_bam(&unsorted).unwrap();
+        RawExternalSorter::new(sort_order).output_compression(0).sort(&unsorted, &sorted).unwrap();
+        (sorted, names)
+    }
+
+    /// Collect all read names from a BAM file as strings.
+    fn collect_read_names(path: &Path) -> Vec<String> {
+        use crate::sort::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).unwrap();
+        RawReadAheadReader::new(reader)
+            .map(|rec| {
+                let name_bytes = fgumi_raw_bam::fields::read_name(rec.as_ref());
+                String::from_utf8(name_bytes.to_vec()).unwrap()
+            })
+            .collect()
+    }
+
+    /// Collect (`ref_id`, pos) tuples for every record in a BAM.
+    fn collect_positions(path: &Path) -> Vec<(i32, i32)> {
+        use crate::sort::read_ahead::RawReadAheadReader;
+        let (reader, _) = create_raw_bam_reader(path, 1).unwrap();
+        RawReadAheadReader::new(reader)
+            .map(|rec| {
+                let bytes = rec.as_ref();
+                (fgumi_raw_bam::fields::ref_id(bytes), fgumi_raw_bam::fields::pos(bytes))
+            })
+            .collect()
+    }
+
+    /// Helper to build a merge header from the `SamBuilder` default header.
+    fn default_merge_header() -> Header {
+        SamBuilder::new().header.clone()
+    }
+
+    #[test]
+    fn test_merge_bams_coordinate_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, SortOrder::Coordinate);
+        let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, SortOrder::Coordinate);
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        let count = RawExternalSorter::new(SortOrder::Coordinate)
+            .output_compression(0)
+            .merge_bams(&[bam_a, bam_b], &header, &merged)
+            .unwrap();
+
+        // 10 pairs * 2 records * 2 inputs = 40
+        assert_eq!(count, 40);
+        assert_eq!(count_bam_records(&merged), 40);
+
+        // Verify coordinate sort order: (ref_id, pos) is non-decreasing
+        let positions = collect_positions(&merged);
+        for w in positions.windows(2) {
+            assert!(w[0] <= w[1], "coordinate sort violated: {:?} > {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn test_merge_bams_template_coordinate_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, SortOrder::TemplateCoordinate);
+        let (bam_b, _) =
+            create_sorted_bam(dir.path(), "b", 10, 10_000, SortOrder::TemplateCoordinate);
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        let count = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .output_compression(0)
+            .merge_bams(&[bam_a, bam_b], &header, &merged)
+            .unwrap();
+
+        assert_eq!(count, 40);
+        assert_eq!(count_bam_records(&merged), 40);
+    }
+
+    #[test]
+    fn test_merge_bams_queryname_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, SortOrder::Queryname);
+        let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, SortOrder::Queryname);
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        let count = RawExternalSorter::new(SortOrder::Queryname)
+            .output_compression(0)
+            .merge_bams(&[bam_a, bam_b], &header, &merged)
+            .unwrap();
+
+        assert_eq!(count, 40);
+        assert_eq!(count_bam_records(&merged), 40);
+
+        // Verify queryname sort order: read names are non-decreasing
+        let names = collect_read_names(&merged);
+        for w in names.windows(2) {
+            assert!(w[0] <= w[1], "queryname sort violated: {:?} > {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn test_merge_bams_single_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bam_a, _) = create_sorted_bam(dir.path(), "a", 15, 0, SortOrder::Coordinate);
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        let count = RawExternalSorter::new(SortOrder::Coordinate)
+            .output_compression(0)
+            .merge_bams(&[bam_a], &header, &merged)
+            .unwrap();
+
+        // 15 pairs * 2 = 30
+        assert_eq!(count, 30);
+        assert_eq!(count_bam_records(&merged), 30);
+    }
+
+    #[test]
+    fn test_merge_bams_preserves_all_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bam_a, names_a) = create_sorted_bam(dir.path(), "a", 5, 0, SortOrder::Queryname);
+        let (bam_b, names_b) = create_sorted_bam(dir.path(), "b", 5, 10_000, SortOrder::Queryname);
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        RawExternalSorter::new(SortOrder::Queryname)
+            .output_compression(0)
+            .merge_bams(&[bam_a, bam_b], &header, &merged)
+            .unwrap();
+
+        let merged_names: std::collections::HashSet<String> =
+            collect_read_names(&merged).into_iter().collect();
+
+        // Every expected name (from both inputs) must appear in the merged output
+        for name in names_a.iter().chain(names_b.iter()) {
+            assert!(merged_names.contains(name), "read name {name:?} missing from merged output");
+        }
+    }
+
+    #[test]
+    fn test_merge_bams_many_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = 8;
+        let pairs_per_input = 5;
+        let mut inputs = Vec::with_capacity(k);
+
+        for i in 0..k {
+            let (bam, _) = create_sorted_bam(
+                dir.path(),
+                &format!("in{i}"),
+                pairs_per_input,
+                i * 50_000,
+                SortOrder::Coordinate,
+            );
+            inputs.push(bam);
+        }
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        let count = RawExternalSorter::new(SortOrder::Coordinate)
+            .output_compression(0)
+            .merge_bams(&inputs, &header, &merged)
+            .unwrap();
+
+        let expected = (k * pairs_per_input * 2) as u64; // 8 * 5 * 2 = 80
+        assert_eq!(count, expected);
+        assert_eq!(count_bam_records(&merged), expected);
+
+        // Verify coordinate sort order
+        let positions = collect_positions(&merged);
+        for w in positions.windows(2) {
+            assert!(w[0] <= w[1], "coordinate sort violated with k={k}: {:?} > {:?}", w[0], w[1]);
+        }
     }
 }
