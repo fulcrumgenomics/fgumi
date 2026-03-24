@@ -24,7 +24,7 @@ use crate::sort::radix::{heap_make, heap_sift_down};
 use crate::sort::read_ahead::RawReadAheadReader;
 use anyhow::Result;
 use bstr::BString;
-use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tempfile::TempDir;
 
@@ -133,6 +134,20 @@ const MERGE_PREFETCH_SIZE: usize = 1024;
 /// Maximum number of temp files before consolidation (like samtools).
 /// When this limit is reached, oldest files are merged to reduce file count.
 const DEFAULT_MAX_TEMP_FILES: usize = 64;
+
+/// Counting semaphore for limiting concurrent chunk reader I/O.
+/// Pre-filled with N tokens; readers acquire before decompressing, release after.
+type ChunkReaderSemaphore = (Sender<()>, Receiver<()>);
+
+/// Create a counting semaphore that allows `threads` concurrent readers.
+fn make_reader_semaphore(threads: usize) -> Arc<ChunkReaderSemaphore> {
+    let limit = threads.max(1);
+    let (tx, rx) = bounded(limit);
+    for _ in 0..limit {
+        tx.send(()).unwrap();
+    }
+    Arc::new((tx, rx))
+}
 
 // ============================================================================
 // Generic Keyed Temp File I/O (works with any RawSortKey)
@@ -281,10 +296,14 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     /// Open a keyed chunk file for reading with background prefetching.
     /// Auto-detects BGZF/gzip compression via magic bytes (0x1f 0x8b).
     ///
+    /// An optional `concurrency_limit` semaphore can be provided to cap the number
+    /// of reader threads actively performing I/O. Readers acquire a token before
+    /// reading a batch of records and release it after sending.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, concurrency_limit: Option<Arc<ChunkReaderSemaphore>>) -> Result<Self> {
         let (tx, rx) = bounded(MERGE_PREFETCH_SIZE);
         let path = path.to_path_buf();
 
@@ -317,9 +336,9 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
             // Read using appropriate decoder
             if is_compressed {
                 let bgzf_reader = BgzfReader::new(buf_reader);
-                Self::read_records(bgzf_reader, tx);
+                Self::read_records(bgzf_reader, tx, concurrency_limit);
             } else {
-                Self::read_records(buf_reader, tx);
+                Self::read_records(buf_reader, tx, concurrency_limit);
             }
         });
 
@@ -327,43 +346,76 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     }
 
     /// Read records from a reader and send them through the channel.
+    ///
+    /// When a semaphore is provided, reads records in batches of 64: acquires
+    /// a token, reads the batch (I/O + decompression), releases the token,
+    /// then sends the batch through the channel. This prevents deadlock — the
+    /// token is never held during a blocking `tx.send()`.
     #[allow(clippy::needless_pass_by_value)]
-    fn read_records<R: Read>(mut reader: R, tx: crossbeam_channel::Sender<Option<(K, Vec<u8>)>>) {
+    fn read_records<R: Read>(
+        mut reader: R,
+        tx: crossbeam_channel::Sender<Option<(K, Vec<u8>)>>,
+        semaphore: Option<Arc<ChunkReaderSemaphore>>,
+    ) {
+        const BATCH_SIZE: usize = 64;
+
         loop {
-            // Read key using the trait method
-            let key = match K::read_from(&mut reader) {
-                Ok(k) => k,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Normal EOF
-                    let _ = tx.send(None);
-                    break;
-                }
-                Err(e) => {
-                    log::error!("Error reading keyed chunk key: {e}");
-                    let _ = tx.send(None);
-                    break;
-                }
-            };
-
-            // Read record length
-            let mut len_buf = [0u8; 4];
-            if reader.read_exact(&mut len_buf).is_err() {
-                log::error!("Error reading keyed chunk length");
-                let _ = tx.send(None);
-                break;
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-
-            // Read record data
-            let mut record = vec![0u8; len];
-            if reader.read_exact(&mut record).is_err() {
-                log::error!("Error reading keyed chunk record");
-                let _ = tx.send(None);
-                break;
+            // Phase 1: Acquire token and read a batch of records from disk.
+            if let Some(ref sem) = semaphore {
+                let _ = sem.1.recv();
             }
 
-            if tx.send(Some((key, record))).is_err() {
-                break; // Receiver dropped
+            let mut batch: Vec<(K, Vec<u8>)> = Vec::with_capacity(BATCH_SIZE);
+            let mut eof = false;
+            let mut error = false;
+
+            for _ in 0..BATCH_SIZE {
+                let key = match K::read_from(&mut reader) {
+                    Ok(k) => k,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        eof = true;
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("Error reading keyed chunk key: {e}");
+                        error = true;
+                        break;
+                    }
+                };
+
+                let mut len_buf = [0u8; 4];
+                if reader.read_exact(&mut len_buf).is_err() {
+                    log::error!("Error reading keyed chunk length");
+                    error = true;
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+
+                let mut record = vec![0u8; len];
+                if reader.read_exact(&mut record).is_err() {
+                    log::error!("Error reading keyed chunk record");
+                    error = true;
+                    break;
+                }
+
+                batch.push((key, record));
+            }
+
+            // Phase 2: Release token before any blocking channel sends.
+            if let Some(ref sem) = semaphore {
+                let _ = sem.0.send(());
+            }
+
+            // Phase 3: Send the batch through the channel (may block).
+            for record in batch {
+                if tx.send(Some(record)).is_err() {
+                    return; // Receiver dropped
+                }
+            }
+
+            if eof || error {
+                let _ = tx.send(None);
+                break;
             }
         }
     }
@@ -570,10 +622,11 @@ impl RawExternalSorter {
         // Create merged output file
         let merged_path = namer.next_merged_path();
 
-        // Open readers for files to merge
+        // Open readers with semaphore to cap concurrent I/O
+        let sem = make_reader_semaphore(self.threads);
         let mut readers: Vec<GenericKeyedChunkReader<K>> = files_to_merge
             .iter()
-            .map(|p| GenericKeyedChunkReader::<K>::open(p))
+            .map(|p| GenericKeyedChunkReader::<K>::open(p, Some(Arc::clone(&sem))))
             .collect::<Result<Vec<_>>>()?;
 
         // Create writer for merged output
@@ -932,37 +985,35 @@ impl RawExternalSorter {
             }
             writer.finish()?;
         } else {
-            // Sort remaining records and prepare for merge
-            if self.threads > 1 {
-                buffer.par_sort();
+            // Sort remaining records into separate sub-array chunks (avoids
+            // intermediate merge back into a single sorted buffer)
+            let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
+                Vec::new()
+            } else if self.threads > 1 {
+                buffer.par_sort_into_chunks(self.threads)
             } else {
                 buffer.sort();
-            }
-
-            // Extract keyed pairs from the in-memory buffer
-            let memory_keyed: Vec<(RawCoordinateKey, Vec<u8>)> = if buffer.is_empty() {
-                Vec::new()
-            } else {
-                buffer
+                let chunk = buffer
                     .refs()
                     .iter()
                     .map(|r| {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
-                        let record_bytes = buffer.get_record(r).to_vec();
-                        (key, record_bytes)
+                        (key, buffer.get_record(r).to_vec())
                     })
-                    .collect()
+                    .collect();
+                vec![chunk]
             };
 
+            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
-                chunk_files.len() + usize::from(!memory_keyed.is_empty())
+                chunk_files.len() + n_memory
             );
 
             // Merge disk chunks + in-memory chunks using O(1) key comparisons
             self.merge_chunks_generic::<RawCoordinateKey>(
                 &chunk_files,
-                memory_keyed,
+                memory_chunks,
                 header,
                 output,
             )?;
@@ -1074,36 +1125,35 @@ impl RawExternalSorter {
             write_bai_index(&index_path, &index)?;
             info!("Wrote BAM index: {}", index_path.display());
         } else {
-            // Sort remaining records and prepare for merge
-            if self.threads > 1 {
-                buffer.par_sort();
+            // Sort remaining records into separate sub-array chunks (avoids
+            // intermediate merge back into a single sorted buffer)
+            let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
+                Vec::new()
+            } else if self.threads > 1 {
+                buffer.par_sort_into_chunks(self.threads)
             } else {
                 buffer.sort();
-            }
-
-            let memory_keyed: Vec<(RawCoordinateKey, Vec<u8>)> = if buffer.is_empty() {
-                Vec::new()
-            } else {
-                buffer
+                let chunk = buffer
                     .refs()
                     .iter()
                     .map(|r| {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
-                        let record_bytes = buffer.get_record(r).to_vec();
-                        (key, record_bytes)
+                        (key, buffer.get_record(r).to_vec())
                     })
-                    .collect()
+                    .collect();
+                vec![chunk]
             };
 
+            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
                 "Phase 2: Merging {} chunks with index generation...",
-                chunk_files.len() + usize::from(!memory_keyed.is_empty())
+                chunk_files.len() + n_memory
             );
 
             // Merge with index generation
             let index = self.merge_chunks_with_index::<RawCoordinateKey>(
                 &chunk_files,
-                memory_keyed,
+                memory_chunks,
                 header,
                 output,
             )?;
@@ -1220,21 +1270,40 @@ impl RawExternalSorter {
             }
             writer.finish()?;
         } else {
-            // Sort remaining records
-            if self.threads > 1 {
+            // Sort remaining records into separate sub-array chunks (avoids
+            // intermediate merge back into a single sorted buffer)
+            let memory_chunks: Vec<Vec<(RawQuerynameKey, Vec<u8>)>> = if entries.is_empty() {
+                Vec::new()
+            } else if self.threads > 1 {
                 use rayon::prelude::*;
-                entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let chunk_size = entries.len().div_ceil(self.threads.max(1));
+                entries.par_chunks_mut(chunk_size).for_each(|chunk| {
+                    chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                });
+                let mut chunks = Vec::new();
+                while !entries.is_empty() {
+                    let take = chunk_size.min(entries.len());
+                    chunks.push(entries.drain(..take).collect());
+                }
+                chunks
             } else {
                 entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            }
+                vec![entries]
+            };
 
+            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
                 "Phase 2: Merging {} chunks (keyed comparisons)...",
-                chunk_files.len() + usize::from(!entries.is_empty())
+                chunk_files.len() + n_memory
             );
 
             // Merge disk chunks + in-memory records using keyed comparisons
-            self.merge_chunks_generic::<RawQuerynameKey>(&chunk_files, entries, header, output)?;
+            self.merge_chunks_generic::<RawQuerynameKey>(
+                &chunk_files,
+                memory_chunks,
+                header,
+                output,
+            )?;
         }
 
         stats.output_records = stats.total_records;
@@ -1347,27 +1416,23 @@ impl RawExternalSorter {
             }
             writer.finish()?;
         } else {
-            // Sort remaining records and prepare for merge
-            if self.threads > 1 {
-                buffer.par_sort();
+            // Sort remaining records into separate sub-array chunks (avoids
+            // intermediate merge back into a single sorted buffer)
+            let memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>> = if buffer.is_empty() {
+                Vec::new()
+            } else if self.threads > 1 {
+                buffer.par_sort_into_chunks(self.threads)
             } else {
                 buffer.sort();
-            }
-
-            // Collect keyed in-memory records for merge
-            let memory_keyed: Vec<(TemplateKey, Vec<u8>)> = if buffer.is_empty() {
-                Vec::new()
-            } else {
-                buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect()
+                let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
+                vec![chunk]
             };
 
-            info!(
-                "Phase 2: Merging {} chunks...",
-                chunk_files.len() + usize::from(!memory_keyed.is_empty())
-            );
+            let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+            info!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
-            self.merge_chunks_keyed(&chunk_files, memory_keyed, header, output)?;
+            self.merge_chunks_keyed(&chunk_files, memory_chunks, header, output)?;
         }
 
         stats.output_records = stats.total_records;
@@ -1381,10 +1446,14 @@ impl RawExternalSorter {
     /// This is the fast path for template-coordinate sorting. Instead of parsing
     /// CIGAR/aux data on every comparison (`O(CIGAR_len` + `aux_scan`)), we compare
     /// pre-computed 32-byte keys (O(1) - just 4 u64 comparisons).
+    ///
+    /// `memory_chunks` is a list of sorted in-memory sub-arrays, each of which
+    /// becomes a separate merge source. This avoids merging parallel sort
+    /// sub-arrays back into one buffer before the k-way merge.
     fn merge_chunks_keyed(
         &self,
         chunk_files: &[PathBuf],
-        memory_keyed: Vec<(TemplateKey, Vec<u8>)>,
+        memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>>,
         header: &Header,
         output: &Path,
     ) -> Result<u64> {
@@ -1426,24 +1495,31 @@ impl RawExternalSorter {
         const OUTPUT_BUFFER_SIZE: usize = 2048;
 
         let num_disk = chunk_files.len();
-        let has_memory = !memory_keyed.is_empty();
-        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
+        let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+        info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
 
         // Create output header with sort order tags
         let output_header = self.create_output_header(header);
 
+        // Create semaphore to limit concurrent reader I/O threads
+        let sem = make_reader_semaphore(self.threads);
+
         // Create unified chunk sources
-        let mut sources: Vec<KeyedChunkSource> = Vec::with_capacity(num_disk + 1);
+        let mut sources: Vec<KeyedChunkSource> = Vec::with_capacity(num_disk + num_memory);
 
         // Add disk-based chunks with keyed readers
         for path in chunk_files {
-            sources
-                .push(KeyedChunkSource::Disk(GenericKeyedChunkReader::<TemplateKey>::open(path)?));
+            sources.push(KeyedChunkSource::Disk(GenericKeyedChunkReader::<TemplateKey>::open(
+                path,
+                Some(Arc::clone(&sem)),
+            )?));
         }
 
-        // Add in-memory keyed chunk
-        if has_memory {
-            sources.push(KeyedChunkSource::Memory { records: memory_keyed, idx: 0 });
+        // Add each non-empty in-memory chunk as a separate merge source
+        for chunk in memory_chunks {
+            if !chunk.is_empty() {
+                sources.push(KeyedChunkSource::Memory { records: chunk, idx: 0 });
+            }
         }
 
         // Initialize heap with first record from each chunk
@@ -1534,7 +1610,7 @@ impl RawExternalSorter {
     fn merge_chunks_generic<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_keyed: Vec<(K, Vec<u8>)>,
+        memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
         header: &Header,
         output: &Path,
     ) -> Result<u64> {
@@ -1575,23 +1651,32 @@ impl RawExternalSorter {
         const OUTPUT_BUFFER_SIZE: usize = 2048;
 
         let num_disk = chunk_files.len();
-        let has_memory = !memory_keyed.is_empty();
-        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
+        let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+        info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
 
         // Create output header with sort order tags
         let output_header = self.create_output_header(header);
 
+        // Create semaphore to limit concurrent reader I/O threads
+        let sem = make_reader_semaphore(self.threads);
+
         // Create unified chunk sources
-        let mut sources: Vec<GenericKeyedChunkSource<K>> = Vec::with_capacity(num_disk + 1);
+        let mut sources: Vec<GenericKeyedChunkSource<K>> =
+            Vec::with_capacity(num_disk + num_memory);
 
         // Add disk-based chunks with keyed readers
         for path in chunk_files {
-            sources.push(GenericKeyedChunkSource::Disk(GenericKeyedChunkReader::<K>::open(path)?));
+            sources.push(GenericKeyedChunkSource::Disk(GenericKeyedChunkReader::<K>::open(
+                path,
+                Some(Arc::clone(&sem)),
+            )?));
         }
 
-        // Add in-memory keyed chunk
-        if has_memory {
-            sources.push(GenericKeyedChunkSource::Memory { records: memory_keyed, idx: 0 });
+        // Add each non-empty in-memory chunk as a separate merge source
+        for chunk in memory_chunks {
+            if !chunk.is_empty() {
+                sources.push(GenericKeyedChunkSource::Memory { records: chunk, idx: 0 });
+            }
         }
 
         // Initialize heap with first record from each chunk
@@ -1680,7 +1765,7 @@ impl RawExternalSorter {
     fn merge_chunks_with_index<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_keyed: Vec<(K, Vec<u8>)>,
+        memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
         header: &Header,
         output: &Path,
     ) -> Result<noodles::bam::bai::Index> {
@@ -1717,18 +1802,27 @@ impl RawExternalSorter {
         }
 
         let num_disk = chunk_files.len();
-        let has_memory = !memory_keyed.is_empty();
-        info!("Merging from {} files and {} in-memory blocks...", num_disk, i32::from(has_memory));
+        let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+        info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
 
         let output_header = self.create_output_header(header);
 
+        // Create semaphore to limit concurrent reader I/O threads
+        let sem = make_reader_semaphore(self.threads);
+
         // Create chunk sources
-        let mut sources: Vec<KeyedSource<K>> = Vec::with_capacity(num_disk + 1);
+        let mut sources: Vec<KeyedSource<K>> = Vec::with_capacity(num_disk + num_memory);
         for path in chunk_files {
-            sources.push(KeyedSource::Disk(GenericKeyedChunkReader::<K>::open(path)?));
+            sources.push(KeyedSource::Disk(GenericKeyedChunkReader::<K>::open(
+                path,
+                Some(Arc::clone(&sem)),
+            )?));
         }
-        if has_memory {
-            sources.push(KeyedSource::Memory { records: memory_keyed, idx: 0 });
+        // Add each non-empty in-memory chunk as a separate merge source
+        for chunk in memory_chunks {
+            if !chunk.is_empty() {
+                sources.push(KeyedSource::Memory { records: chunk, idx: 0 });
+            }
         }
 
         // Initialize heap
@@ -2407,6 +2501,152 @@ mod tests {
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
         assert_eq!(observed, expected, "chunk filename collision likely lost data");
+    }
+
+    /// Verifies that sort with many chunks exercises the semaphore-capped
+    /// merge readers during the final merge phase (not just consolidation).
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname(SortOrder::Queryname)]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_sort_many_chunks_with_semaphore(#[case] sort_order: SortOrder) {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 50;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Small memory limit + high max_temp_files = many chunks at final merge
+        // (no consolidation, so the semaphore must cap concurrent readers)
+        let stats = RawExternalSorter::new(sort_order)
+            .memory_limit(1024)
+            .max_temp_files(0) // disable consolidation
+            .threads(2) // semaphore allows 2 concurrent readers
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert!(
+            stats.chunks_written >= 8,
+            "expected many chunks to exercise semaphore, got {}",
+            stats.chunks_written
+        );
+
+        let expected = (num_pairs * 2) as u64;
+        let observed = count_bam_records(&output);
+        assert_eq!(observed, expected, "semaphore-capped merge lost data");
+    }
+
+    // ========================================================================
+    // Sub-array merge source tests
+    // ========================================================================
+
+    /// Verifies that multi-threaded sort produces the same output as single-threaded
+    /// sort for each sort order, exercising the parallel sub-array merge path.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname(SortOrder::Queryname)]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_sort_sub_arrays_match_single_thread(#[case] sort_order: SortOrder) {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 50;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output_st = dir.path().join("output_1t.bam");
+        let output_mt = dir.path().join("output_2t.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Sort single-threaded
+        RawExternalSorter::new(sort_order)
+            .memory_limit(2048) // force spill so merge path is exercised
+            .threads(1)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output_st)
+            .unwrap();
+
+        // Sort multi-threaded (exercises par_sort_into_chunks / par_chunks_mut)
+        RawExternalSorter::new(sort_order)
+            .memory_limit(2048)
+            .threads(2)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output_mt)
+            .unwrap();
+
+        let names_st = collect_read_names(&output_st);
+        let names_mt = collect_read_names(&output_mt);
+
+        let expected = num_pairs * 2;
+        assert_eq!(names_st.len(), expected, "single-thread record count mismatch");
+        assert_eq!(names_mt.len(), expected, "multi-thread record count mismatch");
+
+        // Both outputs must have the same read names in the same order
+        assert_eq!(names_st, names_mt, "multi-thread sort order differs from single-thread");
+    }
+
+    /// Verifies that the in-memory-only path (no spill to disk) also works
+    /// correctly with multi-threaded sub-array chunks.
+    #[rstest::rstest]
+    #[case::coordinate(SortOrder::Coordinate)]
+    #[case::queryname(SortOrder::Queryname)]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_sort_sub_arrays_in_memory_only(#[case] sort_order: SortOrder) {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 20;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Large memory limit so everything stays in memory
+        let stats = RawExternalSorter::new(sort_order)
+            .memory_limit(10 * 1024 * 1024)
+            .threads(2)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert_eq!(stats.chunks_written, 0, "expected no spill to disk");
+
+        let expected = (num_pairs * 2) as u64;
+        let observed = count_bam_records(&output);
+        assert_eq!(observed, expected, "in-memory sub-array sort lost data");
     }
 
     // ========================================================================
