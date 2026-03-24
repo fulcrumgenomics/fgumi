@@ -7,13 +7,13 @@
 //!
 //! ## BAM codec (`bam_codec`)
 //!
-//! The vendored BAM codec provides `encode_record_buf` and `decode` functions used by the
-//! raw-byte-mode optimization path that avoids full `RecordBuf` round-tripping (~30% CPU savings).
+//! The vendored BAM codec provides `encode_record_buf` used by the raw-byte-mode optimization
+//! path that avoids full `RecordBuf` round-tripping (~30% CPU savings).
 //!
-//! PR [#364](https://github.com/zaeleus/noodles/pull/364) proposed exposing these codec functions
+//! PR [#364](https://github.com/zaeleus/noodles/pull/364) proposed exposing codec encode/decode
 //! upstream but was closed — the maintainer recommended `Reader::from(src)` for decoding instead.
-//! That approach is sufficient for decode, but the vendored `encode_record_buf` is still needed
-//! for the encode side of raw-byte-mode. The vendored codec will remain until either:
+//! The decode side now uses the noodles public API. The vendored `encode_record_buf` is still
+//! needed for the encode side of raw-byte-mode. The vendored encoder will remain until either:
 //! - PR [#367](https://github.com/zaeleus/noodles/pull/367) lands (providing optimized encoding upstream), or
 //! - an alternative upstream API for direct `RecordBuf` encoding becomes available.
 //!
@@ -29,6 +29,4 @@ pub use bgzf_multithreaded::{
 };
 
 // Re-export BAM codec functions
-pub use bam_codec::{
-    DecodeError, EncodeError, decode, encode, encode_record_buf, encode_with_prealloc,
-};
+pub use bam_codec::{EncodeError, encode, encode_record_buf, encode_with_prealloc};

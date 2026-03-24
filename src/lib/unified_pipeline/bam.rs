@@ -325,10 +325,11 @@ pub fn decode_records(
     batch: &BoundaryBatch,
     group_key_config: &GroupKeyConfig,
 ) -> io::Result<Vec<DecodedRecord>> {
-    use crate::vendored::bam_codec::decode;
-
     let num_records = batch.offsets.len().saturating_sub(1);
     let mut records = Vec::with_capacity(num_records);
+    // read_record_buf requires a Header for reference name resolution and alignment parsing,
+    // but this non-production path only uses integer reference IDs, so an empty header suffices.
+    let header = noodles::sam::Header::default();
 
     for i in 0..num_records {
         let start = batch.offsets[i];
@@ -396,9 +397,12 @@ pub fn decode_records(
             );
             records.push(DecodedRecord::from_raw_bytes(raw, key));
         } else {
+            // Use noodles' public Reader API for decoding, as recommended by the
+            // noodles maintainer (see noodles#364). Reader::from accepts any R: Read
+            // and read_record_buf reads the block_size prefix then decodes the record.
+            let mut reader = noodles::bam::io::Reader::from(&batch.buffer[start..end]);
             let mut record = RecordBuf::default();
-            decode(&mut &record_data[..], &mut record)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            reader.read_record_buf(&header, &mut record)?;
 
             let key = compute_group_key(
                 &record,
