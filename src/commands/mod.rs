@@ -66,6 +66,7 @@ pub mod extract;
 pub mod fastq;
 pub mod filter;
 pub mod group;
+pub mod merge;
 pub mod review;
 pub mod simplex;
 #[cfg(feature = "simulate")]

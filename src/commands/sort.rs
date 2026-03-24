@@ -188,7 +188,7 @@ pub struct Sort {
 }
 
 /// Parse memory size string (e.g., "512M", "1G", "2G").
-fn parse_memory(s: &str) -> Result<usize, String> {
+pub(crate) fn parse_memory(s: &str) -> Result<usize, String> {
     let s = s.trim().to_uppercase();
 
     if s.is_empty() {
@@ -213,6 +213,17 @@ fn parse_memory(s: &str) -> Result<usize, String> {
     }
 
     Ok((num * multiplier as f64) as usize)
+}
+
+/// Parse the cell tag for template-coordinate sort/verify, returning `None`
+/// for other sort orders.
+pub(crate) fn parse_cell_tag(order: SortOrderArg, cell_tag: &str) -> Result<Option<[u8; 2]>> {
+    if matches!(order, SortOrderArg::TemplateCoordinate) {
+        let tag = string_to_tag(cell_tag, "cell-tag")?;
+        Ok(Some([tag.as_ref()[0], tag.as_ref()[1]]))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Summary of sort-order verification: `(total_records, violations, first_violation)`.
@@ -276,12 +287,7 @@ impl Sort {
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<[u8; 2]>> {
-        if matches!(self.order, SortOrderArg::TemplateCoordinate) {
-            let tag = string_to_tag(&self.cell_tag, "cell-tag")?;
-            Ok(Some([tag.as_ref()[0], tag.as_ref()[1]]))
-        } else {
-            Ok(None)
-        }
+        parse_cell_tag(self.order, &self.cell_tag)
     }
 
     /// Execute sort mode: read, sort, and write output.

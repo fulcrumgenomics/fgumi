@@ -26,6 +26,7 @@ use commands::extract::Extract;
 use commands::fastq::Fastq;
 use commands::filter::Filter;
 use commands::group::GroupReadsByUmi;
+use commands::merge::Merge;
 use commands::review::Review;
 use commands::simplex::Simplex;
 #[cfg(feature = "simulate")]
@@ -81,41 +82,43 @@ enum Subcommand {
     Zipper(Zipper),
     #[command(display_order = 5)]
     Sort(Sort),
+    #[command(display_order = 6)]
+    Merge(Merge),
 
     // Group
-    #[command(display_order = 6)]
+    #[command(display_order = 7)]
     Group(GroupReadsByUmi),
 
     // Deduplication
-    #[command(display_order = 7)]
+    #[command(display_order = 8)]
     Dedup(MarkDuplicates),
 
     // Consensus Calling
-    #[command(display_order = 8)]
-    Simplex(Simplex),
     #[command(display_order = 9)]
-    Duplex(Duplex),
+    Simplex(Simplex),
     #[command(display_order = 10)]
+    Duplex(Duplex),
+    #[command(display_order = 11)]
     Codec(Codec),
 
     // Post-consensus
-    #[command(display_order = 11)]
-    Filter(Filter),
     #[command(display_order = 12)]
-    Clip(Clip),
+    Filter(Filter),
     #[command(display_order = 13)]
-    DuplexMetrics(DuplexMetrics),
+    Clip(Clip),
     #[command(display_order = 14)]
+    DuplexMetrics(DuplexMetrics),
+    #[command(display_order = 15)]
     Review(Review),
 
     // Utilities
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Downsample(Downsample),
     #[cfg(feature = "compare")]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Simulate(Simulate),
 }
 

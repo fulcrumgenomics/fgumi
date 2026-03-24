@@ -32,6 +32,7 @@ pub use fgumi_raw_bam as bam_fields;
 pub mod external;
 pub mod inline_buffer;
 pub mod keys;
+pub mod loser_tree;
 pub mod pipeline;
 pub mod radix;
 pub mod raw;
