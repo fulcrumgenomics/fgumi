@@ -104,6 +104,7 @@ EXAMPLES:
   fgumi sort -i sorted.bam --verify --order template-coordinate
 "#
 )]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Sort {
     /// Input BAM file.
     #[arg(short = 'i', long = "input")]
@@ -185,6 +186,21 @@ pub struct Sort {
     /// and `fgumi dedup`. Only used for template-coordinate sort.
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: String,
+
+    /// Enable background chunk merging during the sort phase.
+    ///
+    /// When enabled, a background thread merges pairs of spilled chunks while
+    /// the main thread continues reading input. This reduces the number of chunks
+    /// for the final merge, but uses additional CPU and disk I/O.
+    ///
+    /// Most effective in pipeline mode (e.g., `bwa mem | fgumi sort`) where the
+    /// sort thread is mostly idle waiting for upstream input. In standalone mode,
+    /// the adaptive heuristic prevents background merge from running when disk
+    /// I/O is already saturated.
+    ///
+    /// Only applies to template-coordinate sort.
+    #[arg(long = "background-merge", default_value = "false")]
+    pub background_merge: bool,
 }
 
 /// Parse memory size string (e.g., "512M", "1G", "2G").
@@ -349,6 +365,8 @@ impl Sort {
             .write_index(self.write_index)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
 
+        sorter = sorter.background_merge(self.background_merge);
+
         if let Some(ct) = cell_tag {
             sorter = sorter.cell_tag(ct);
         }
@@ -473,6 +491,7 @@ mod tests {
             temp_compression: 1,
             write_index: false,
             cell_tag: cell_tag.to_string(),
+            background_merge: false,
         }
     }
 

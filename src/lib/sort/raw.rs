@@ -25,7 +25,7 @@ use crate::sort::read_ahead::RawReadAheadReader;
 use anyhow::Result;
 use bstr::BString;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use log::info;
+use log::{debug, info};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
@@ -35,12 +35,14 @@ use noodles_bgzf::io::{
     writer::CompressionLevel,
 };
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -135,6 +137,9 @@ const MERGE_PREFETCH_SIZE: usize = 1024;
 /// When this limit is reached, oldest files are merged to reduce file count.
 const DEFAULT_MAX_TEMP_FILES: usize = 64;
 
+/// Default idle ratio threshold for enabling background merge.
+const DEFAULT_MERGE_IDLE_THRESHOLD: f64 = 2.0;
+
 /// Counting semaphore for limiting concurrent chunk reader I/O.
 /// Pre-filled with N tokens; readers acquire before decompressing, release after.
 type ChunkReaderSemaphore = (Sender<()>, Receiver<()>);
@@ -147,6 +152,41 @@ fn make_reader_semaphore(threads: usize) -> Arc<ChunkReaderSemaphore> {
         tx.send(()).unwrap();
     }
     Arc::new((tx, rx))
+}
+
+// ============================================================================
+// Adaptive Background Merge State
+// ============================================================================
+
+/// Shared state for the adaptive background merge thread.
+///
+/// The background thread merges pairs of spilled chunks when the main thread is idle
+/// (i.e., waiting for input). This reduces the number of chunks for the final merge
+/// without adding latency when the main thread is CPU-bound.
+struct AdaptiveMergeState {
+    /// Original (un-merged) chunks waiting for background pairwise merge.
+    pending: Arc<Mutex<VecDeque<PathBuf>>>,
+    /// Chunks that have already been merged (level-0 complete). Never re-merged.
+    merged: Arc<Mutex<Vec<PathBuf>>>,
+    /// Set to true while the main thread is spilling. Background merge parks while set.
+    spilling: Arc<AtomicBool>,
+    /// Set to true when `idle_ratio` exceeds the threshold. Background merge only runs when enabled.
+    enabled: Arc<AtomicBool>,
+    /// Set to true to shut down the background thread.
+    shutdown: Arc<AtomicBool>,
+}
+
+impl AdaptiveMergeState {
+    /// Create a new adaptive merge state with all flags initialized to false.
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            merged: Arc::new(Mutex::new(Vec::new())),
+            spilling: Arc::new(AtomicBool::new(false)),
+            enabled: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 // ============================================================================
@@ -460,6 +500,75 @@ impl<'a> ChunkNamer<'a> {
     }
 }
 
+/// Merge multiple sorted keyed chunk files into a single output file.
+///
+/// Uses a heap-based k-way merge with pre-computed sort keys for O(1) comparisons.
+/// Works for any number of input files (k=2 for background merge, k=N for consolidation).
+fn merge_keyed_chunk_files<K: RawSortKey + Default + 'static>(
+    input_files: &[PathBuf],
+    output_path: &Path,
+    compression: u32,
+    threads: usize,
+) -> Result<u64> {
+    struct HeapEntry<K> {
+        key: K,
+        record: Vec<u8>,
+        reader_idx: usize,
+    }
+
+    let sem = make_reader_semaphore(threads);
+    let mut readers: Vec<GenericKeyedChunkReader<K>> = input_files
+        .iter()
+        .map(|p| GenericKeyedChunkReader::<K>::open(p, Some(Arc::clone(&sem))))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut writer = GenericKeyedChunkWriter::<K>::create(output_path, compression, threads)?;
+
+    let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(readers.len());
+    for (reader_idx, reader) in readers.iter_mut().enumerate() {
+        if let Some((key, record)) = reader.next_record() {
+            heap.push(HeapEntry { key, record, reader_idx });
+        }
+    }
+
+    let mut heap_size = heap.len();
+    if heap_size == 0 {
+        writer.finish()?;
+        return Ok(0);
+    }
+
+    let lt = |a: &HeapEntry<K>, b: &HeapEntry<K>| -> bool {
+        a.key.cmp(&b.key).then_with(|| a.reader_idx.cmp(&b.reader_idx)) == Ordering::Greater
+    };
+
+    heap_make(&mut heap, &lt);
+
+    let mut records_merged = 0u64;
+    while heap_size > 0 {
+        let reader_idx = heap[0].reader_idx;
+        let key = std::mem::take(&mut heap[0].key);
+        let record = std::mem::take(&mut heap[0].record);
+
+        writer.write_record(&key, &record)?;
+        records_merged += 1;
+
+        if let Some((next_key, next_record)) = readers[reader_idx].next_record() {
+            heap[0].key = next_key;
+            heap[0].record = next_record;
+            heap_sift_down(&mut heap, 0, heap_size, &lt);
+        } else {
+            heap_size -= 1;
+            if heap_size > 0 {
+                heap.swap(0, heap_size);
+                heap_sift_down(&mut heap, 0, heap_size, &lt);
+            }
+        }
+    }
+
+    writer.finish()?;
+    Ok(records_merged)
+}
+
 /// Raw-bytes external sorter for BAM files.
 ///
 /// This sorter uses lazy record parsing to minimize memory usage and avoid
@@ -487,6 +596,12 @@ pub struct RawExternalSorter {
     /// Cell barcode tag for template-coordinate sort (e.g., `[b'C', b'B']`).
     /// When `Some`, CB hash is included in sort key for single-cell data.
     cell_tag: Option<[u8; 2]>,
+    /// Enable background chunk merging during template-coordinate sort.
+    background_merge: bool,
+    /// Idle ratio threshold for enabling background merge (default 2.0).
+    /// Background merge activates when `fill_time / sort_spill_time` exceeds this value.
+    /// Hysteresis disables at `threshold - 0.5`.
+    merge_idle_threshold: f64,
 }
 
 impl RawExternalSorter {
@@ -504,6 +619,8 @@ impl RawExternalSorter {
             pg_info: None,
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
             cell_tag: None,
+            background_merge: false,
+            merge_idle_threshold: DEFAULT_MERGE_IDLE_THRESHOLD,
         }
     }
 
@@ -585,6 +702,25 @@ impl RawExternalSorter {
         self
     }
 
+    /// Enable background chunk merging during sort.
+    #[must_use]
+    pub fn background_merge(mut self, enabled: bool) -> Self {
+        self.background_merge = enabled;
+        self
+    }
+
+    /// Set the idle ratio threshold for enabling background merge.
+    ///
+    /// Background merge activates when `fill_time / sort_spill_time` exceeds this value,
+    /// and disables when the ratio drops below `threshold - 0.5` (hysteresis).
+    /// Only meaningful when `background_merge` is enabled. Default is 2.0.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn merge_idle_threshold(mut self, threshold: f64) -> Self {
+        self.merge_idle_threshold = threshold;
+        self
+    }
+
     /// Consolidate temp files if we've exceeded the limit.
     ///
     /// Merges the oldest half of temp files into a single new file to reduce
@@ -594,12 +730,6 @@ impl RawExternalSorter {
         chunk_files: &mut Vec<PathBuf>,
         namer: &mut ChunkNamer<'_>,
     ) -> Result<()> {
-        struct HeapEntry<K> {
-            key: K,
-            record: Vec<u8>,
-            reader_idx: usize,
-        }
-
         if self.max_temp_files == 0 || chunk_files.len() < self.max_temp_files {
             return Ok(());
         }
@@ -619,80 +749,23 @@ impl RawExternalSorter {
             n_to_merge + chunk_files.len()
         );
 
-        // Create merged output file
         let merged_path = namer.next_merged_path();
 
-        // Open readers with semaphore to cap concurrent I/O
-        let sem = make_reader_semaphore(self.threads);
-        let mut readers: Vec<GenericKeyedChunkReader<K>> = files_to_merge
-            .iter()
-            .map(|p| GenericKeyedChunkReader::<K>::open(p, Some(Arc::clone(&sem))))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Create writer for merged output
-        let mut writer = GenericKeyedChunkWriter::<K>::create(
+        merge_keyed_chunk_files::<K>(
+            &files_to_merge,
             &merged_path,
             self.temp_compression,
             self.threads,
         )?;
 
-        // Initialize heap with first record from each reader
-        let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(readers.len());
-        for (reader_idx, reader) in readers.iter_mut().enumerate() {
-            if let Some((key, record)) = reader.next_record() {
-                heap.push(HeapEntry { key, record, reader_idx });
-            }
-        }
-
-        let mut heap_size = heap.len();
-        if heap_size == 0 {
-            writer.finish()?;
-            // Insert at beginning to preserve stable order
-            chunk_files.insert(0, merged_path);
-            // Clean up old files
-            for path in &files_to_merge {
-                let _ = std::fs::remove_file(path);
-            }
-            return Ok(());
-        }
-
-        // Use chunk_idx as tie-breaker for stable merge
-        let lt = |a: &HeapEntry<K>, b: &HeapEntry<K>| -> bool {
-            a.key.cmp(&b.key).then_with(|| a.reader_idx.cmp(&b.reader_idx)) == Ordering::Greater
-        };
-
-        heap_make(&mut heap, &lt);
-
-        // Merge loop
-        while heap_size > 0 {
-            let reader_idx = heap[0].reader_idx;
-            let key = std::mem::take(&mut heap[0].key);
-            let record = std::mem::take(&mut heap[0].record);
-
-            writer.write_record(&key, &record)?;
-
-            if let Some((next_key, next_record)) = readers[reader_idx].next_record() {
-                heap[0].key = next_key;
-                heap[0].record = next_record;
-                heap_sift_down(&mut heap, 0, heap_size, &lt);
-            } else {
-                heap_size -= 1;
-                if heap_size > 0 {
-                    heap.swap(0, heap_size);
-                    heap_sift_down(&mut heap, 0, heap_size, &lt);
-                }
-            }
-        }
-
-        writer.finish()?;
-
         // Insert merged file at the beginning to preserve stable order for equal keys.
         // The merged file contains the oldest records, so it should be processed first.
         chunk_files.insert(0, merged_path);
 
-        // Clean up old files
         for path in &files_to_merge {
-            let _ = std::fs::remove_file(path);
+            if let Err(e) = std::fs::remove_file(path) {
+                debug!("Failed to remove merged chunk {}: {e}", path.display());
+            }
         }
 
         info!("Consolidation complete, {} temp files remain", chunk_files.len());
@@ -1319,6 +1392,12 @@ impl RawExternalSorter {
     ///
     /// Writes keyed temp chunks that preserve pre-computed sort keys, enabling O(1)
     /// comparisons during merge (instead of expensive CIGAR/aux parsing).
+    ///
+    /// When `background_merge` is enabled, an adaptive background merge thread merges
+    /// pairs of spilled chunks when the main thread is idle (`fill_time` >>
+    /// `sort_spill_time`). This reduces the number of chunks for the final merge
+    /// without adding latency when the main thread is CPU-bound.
+    #[allow(clippy::too_many_lines)]
     fn sort_template_coordinate(
         &self,
         reader: crate::bam_io::RawBamReaderAuto,
@@ -1342,35 +1421,137 @@ impl RawExternalSorter {
         // Allocate ~86% for data, ~14% for refs (48/338 ≈ 14%)
         let estimated_data_bytes = self.memory_limit * 86 / 100;
 
-        let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(temp_path);
+        let mut chunk_files: Vec<PathBuf> = Vec::new();
+
+        // Create optional background merge state
+        let merge_state =
+            if self.background_merge { Some(AdaptiveMergeState::new()) } else { None };
+
+        // Spawn background merge thread if enabled
+        let bg_handle: Option<JoinHandle<Result<()>>> = merge_state.as_ref().map(|state| {
+            let bg_pending = Arc::clone(&state.pending);
+            let bg_merged = Arc::clone(&state.merged);
+            let bg_spilling = Arc::clone(&state.spilling);
+            let bg_enabled = Arc::clone(&state.enabled);
+            let bg_shutdown = Arc::clone(&state.shutdown);
+            let bg_temp_compression = self.temp_compression;
+            let bg_temp_path = temp_path.to_path_buf();
+            let bg_threads = self.threads;
+
+            thread::spawn(move || {
+                let mut merged_counter = 0usize;
+                loop {
+                    if bg_shutdown.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    if !bg_enabled.load(AtomicOrdering::Relaxed) {
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+
+                    // Only merge pairs of original (un-merged) chunks
+                    let pair = {
+                        let mut q =
+                            bg_pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if q.len() >= 2 {
+                            let a = q.pop_front().unwrap();
+                            let b = q.pop_front().unwrap();
+                            Some((a, b))
+                        } else {
+                            None
+                        }
+                    };
+
+                    let Some((path_a, path_b)) = pair else {
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    };
+
+                    // Wait for the main thread to finish spilling before starting I/O
+                    while bg_spilling.load(AtomicOrdering::Acquire) {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+
+                    let merge_start = Instant::now();
+
+                    let merged_path =
+                        bg_temp_path.join(format!("bg_merged_{merged_counter:04}.keyed"));
+                    merged_counter += 1;
+
+                    let records_merged = merge_keyed_chunk_files::<TemplateKey>(
+                        &[path_a.clone(), path_b.clone()],
+                        &merged_path,
+                        bg_temp_compression,
+                        bg_threads,
+                    )?;
+
+                    if let Err(e) = std::fs::remove_file(&path_a) {
+                        debug!("Failed to remove merged chunk {}: {e}", path_a.display());
+                    }
+                    if let Err(e) = std::fs::remove_file(&path_b) {
+                        debug!("Failed to remove merged chunk {}: {e}", path_b.display());
+                    }
+
+                    // Push to merged list — never re-merged by background thread
+                    bg_merged
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(merged_path.clone());
+
+                    let elapsed = merge_start.elapsed().as_secs_f64();
+                    info!(
+                        "Background merge (L0): {} + {} -> {}, {records_merged} records, {elapsed:.1}s",
+                        path_a.file_name().unwrap_or_default().to_string_lossy(),
+                        path_b.file_name().unwrap_or_default().to_string_lossy(),
+                        merged_path.file_name().unwrap_or_default().to_string_lossy(),
+                    );
+                }
+                Ok(())
+            })
+        });
 
         let read_ahead = RawReadAheadReader::new(reader);
 
-        info!("Phase 1: Reading and sorting chunks (inline buffer)...");
+        if merge_state.is_some() {
+            info!("Phase 1: Reading and sorting chunks (inline buffer, background merge)...");
+        } else {
+            info!("Phase 1: Reading and sorting chunks (inline buffer)...");
+        }
+
+        // Timing state for adaptive merge EMA (only used when background merge is enabled)
+        let mut ema_fill: f64 = 0.0;
+        let mut ema_spill: f64 = 0.0;
+        let mut fill_start: Option<Instant> =
+            if merge_state.is_some() { Some(Instant::now()) } else { None };
+        let mut chunks_spilled = 0usize;
 
         for record in read_ahead {
             stats.total_records += 1;
 
-            // Extract template key and push to buffer
             let bam_bytes = record.as_ref();
             let key = extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag.as_ref());
             buffer.push(bam_bytes, key);
 
-            // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
+                let fill_elapsed = fill_start.map(|s| s.elapsed());
+
                 let chunk_path = namer.next_chunk_path();
 
-                // Sort in place using parallel sort for large buffers
+                let sort_spill_start = Instant::now();
+
                 if self.threads > 1 {
                     buffer.par_sort();
                 } else {
                     buffer.sort();
                 }
 
-                // Write keyed chunk preserving sort keys for O(1) merge comparisons
+                if let Some(ref state) = merge_state {
+                    state.spilling.store(true, AtomicOrdering::Release);
+                }
+
                 let mut keyed_writer = GenericKeyedChunkWriter::<TemplateKey>::create(
                     &chunk_path,
                     self.temp_compression,
@@ -1381,20 +1562,88 @@ impl RawExternalSorter {
                 }
                 keyed_writer.finish()?;
 
-                stats.chunks_written += 1;
-                chunk_files.push(chunk_path);
+                if let Some(ref state) = merge_state {
+                    state.spilling.store(false, AtomicOrdering::Release);
+                }
 
-                // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<TemplateKey>(&mut chunk_files, &mut namer)?;
+                let sort_spill_time = sort_spill_start.elapsed().as_secs_f64();
+
+                stats.chunks_written += 1;
+                chunks_spilled += 1;
+
+                if let Some(ref state) = merge_state {
+                    state
+                        .pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_back(chunk_path);
+
+                    // Compute EMA and adaptive enable/disable
+                    let fill_time = fill_elapsed.map_or(0.0, |d| d.as_secs_f64());
+                    let idle_ratio = if chunks_spilled >= 3 {
+                        ema_fill = 0.3 * fill_time + 0.7 * ema_fill;
+                        ema_spill = 0.3 * sort_spill_time + 0.7 * ema_spill;
+                        let ratio = if ema_spill > 0.0 { ema_fill / ema_spill } else { 0.0 };
+
+                        // Hysteresis: enable above threshold, disable below threshold - 0.5
+                        if ratio > self.merge_idle_threshold {
+                            state.enabled.store(true, AtomicOrdering::Relaxed);
+                        } else if ratio < self.merge_idle_threshold - 0.5 {
+                            state.enabled.store(false, AtomicOrdering::Relaxed);
+                        }
+                        ratio
+                    } else {
+                        if chunks_spilled == 1 {
+                            ema_fill = fill_time;
+                            ema_spill = sort_spill_time;
+                        } else {
+                            ema_fill = 0.3 * fill_time + 0.7 * ema_fill;
+                            ema_spill = 0.3 * sort_spill_time + 0.7 * ema_spill;
+                        }
+                        if ema_spill > 0.0 { ema_fill / ema_spill } else { 0.0 }
+                    };
+
+                    let bg_merge_enabled = state.enabled.load(AtomicOrdering::Relaxed);
+
+                    debug!(
+                        "Chunk {chunks_spilled}: fill={fill_time:.1}s sort+spill={sort_spill_time:.1}s idle_ratio={idle_ratio:.1} bg_merge={bg_merge_enabled}",
+                    );
+                } else {
+                    chunk_files.push(chunk_path);
+                    self.maybe_consolidate_temp_files::<TemplateKey>(&mut chunk_files, &mut namer)?;
+                }
 
                 buffer.clear();
+                fill_start = if merge_state.is_some() { Some(Instant::now()) } else { None };
             }
         }
 
         info!("Read {} records total", stats.total_records);
 
+        // Shut down background merge thread and collect remaining chunks
+        if let Some(ref state) = merge_state {
+            state.shutdown.store(true, AtomicOrdering::Relaxed);
+        }
+        if let Some(handle) = bg_handle {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Background merge thread panicked: {e:?}"));
+                }
+            }
+        }
+        if let Some(ref state) = merge_state {
+            // Remaining un-merged originals
+            let mut pending =
+                state.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            chunk_files.extend(pending.drain(..));
+            // All merged pairs (level-0 complete)
+            let mut merged = state.merged.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            chunk_files.extend(merged.drain(..));
+        }
+
         if chunk_files.is_empty() {
-            // All records fit in memory
             info!("All records fit in memory, performing in-memory sort");
 
             if self.threads > 1 {
@@ -1431,7 +1680,6 @@ impl RawExternalSorter {
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
-            // Merge using O(1) key comparisons
             self.merge_chunks_keyed(&chunk_files, memory_chunks, header, output)?;
         }
 
@@ -2849,5 +3097,293 @@ mod tests {
         for w in positions.windows(2) {
             assert!(w[0] <= w[1], "coordinate sort violated with k={k}: {:?} > {:?}", w[0], w[1]);
         }
+    }
+
+    // ========================================================================
+    // Background merge tests
+    // ========================================================================
+
+    /// Test that background merge produces correct, complete output.
+    ///
+    /// Uses `merge_idle_threshold(0.0)` to force the background thread to
+    /// activate immediately (`idle_ratio` will always exceed 0.0), covering
+    /// the entire background merge code path: thread spawn, adaptive EMA,
+    /// two-way merge loop, shutdown, and final merge of remaining chunks.
+    #[rstest::rstest]
+    #[case::template_coordinate(SortOrder::TemplateCoordinate)]
+    fn test_sort_with_background_merge(#[case] sort_order: SortOrder) {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 50;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Small memory + background merge + low threshold to force activation
+        let stats = RawExternalSorter::new(sort_order)
+            .memory_limit(1024)
+            .max_temp_files(0) // disable consolidation so background merge is the only merge path
+            .background_merge(true)
+            .merge_idle_threshold(0.0) // force immediate activation
+            .threads(2)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert!(
+            stats.chunks_written >= 5,
+            "expected at least 5 spills to exercise background merge, got {}",
+            stats.chunks_written
+        );
+
+        let expected = (num_pairs * 2) as u64;
+        let observed = count_bam_records(&output);
+        assert_eq!(observed, expected, "background merge lost data");
+    }
+
+    /// Test that background merge produces the same output as the standard sort path.
+    #[test]
+    fn test_background_merge_matches_standard_sort() {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 30;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Sort without background merge (standard path)
+        let output_std = dir.path().join("standard.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(1024)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output_std)
+            .unwrap();
+
+        // Sort with background merge
+        let output_bg = dir.path().join("background.bam");
+        RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(1024)
+            .max_temp_files(0)
+            .background_merge(true)
+            .merge_idle_threshold(0.0)
+            .threads(2)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output_bg)
+            .unwrap();
+
+        let count_std = count_bam_records(&output_std);
+        let count_bg = count_bam_records(&output_bg);
+        assert_eq!(
+            count_std, count_bg,
+            "background merge and standard sort should produce same record count"
+        );
+
+        // Both should produce identical read name sequences
+        let names_std = collect_read_names(&output_std);
+        let names_bg = collect_read_names(&output_bg);
+        assert_eq!(
+            names_std, names_bg,
+            "background merge and standard sort should produce same read name order"
+        );
+    }
+
+    /// Test that background merge with the default threshold (2.0) still produces
+    /// correct output even when the background thread stays disabled (`idle_ratio` < 1.5).
+    #[test]
+    fn test_background_merge_disabled_by_heuristic() {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 30;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Use default threshold (2.0) — idle_ratio will be ~0.4 from disk reads,
+        // so background merge stays disabled, but the thread is still spawned
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(1024)
+            .max_temp_files(0)
+            .background_merge(true)
+            .threads(2)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert!(stats.chunks_written >= 5, "expected spills, got {}", stats.chunks_written);
+
+        let expected = (num_pairs * 2) as u64;
+        let observed = count_bam_records(&output);
+        assert_eq!(observed, expected, "background merge (heuristic disabled) lost data");
+    }
+
+    /// Test that background merge in-memory-only path works (no spills).
+    #[test]
+    fn test_background_merge_in_memory_only() {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 10;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        // Large memory limit so everything stays in memory
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(10 * 1024 * 1024)
+            .background_merge(true)
+            .merge_idle_threshold(0.0)
+            .threads(2)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert_eq!(stats.chunks_written, 0, "expected no spill to disk");
+
+        let expected = (num_pairs * 2) as u64;
+        let observed = count_bam_records(&output);
+        assert_eq!(observed, expected, "background merge in-memory path lost data");
+    }
+
+    /// Test that the `merge_idle_threshold` builder method works correctly.
+    #[test]
+    fn test_merge_idle_threshold_builder() {
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .background_merge(true)
+            .merge_idle_threshold(3.5);
+        assert!((sorter.merge_idle_threshold - 3.5).abs() < f64::EPSILON);
+    }
+
+    /// Test that the default `merge_idle_threshold` matches the constant.
+    #[test]
+    fn test_merge_idle_threshold_default() {
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        assert!((sorter.merge_idle_threshold - DEFAULT_MERGE_IDLE_THRESHOLD).abs() < f64::EPSILON);
+    }
+
+    /// Test that many spills force the background merge thread through multiple pairwise merge
+    /// rounds, exercising the `while bg_spilling.load(...)` loop, shutdown check, and repeated
+    /// merge iterations inside the background thread.
+    #[test]
+    fn test_background_merge_many_rounds() {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 100; // 200 records → many chunks at 1KB memory limit
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(1024)
+            .max_temp_files(0) // no consolidation, only background merge
+            .background_merge(true)
+            .merge_idle_threshold(0.0)
+            .threads(2)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert!(
+            stats.chunks_written >= 15,
+            "expected many chunks to force multiple merge rounds, got {}",
+            stats.chunks_written
+        );
+        let expected = (num_pairs * 2) as u64;
+        assert_eq!(count_bam_records(&output), expected);
+    }
+
+    /// Test background merge with a higher thread count (`threads(4)`) to exercise the semaphore
+    /// interaction when background merge chunk readers compete with the main sort for I/O permits.
+    #[test]
+    fn test_background_merge_with_threads() {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 50;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:04}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+        builder.write_bam(&input).unwrap();
+
+        let stats = RawExternalSorter::new(SortOrder::TemplateCoordinate)
+            .memory_limit(1024)
+            .max_temp_files(0)
+            .background_merge(true)
+            .merge_idle_threshold(0.0)
+            .threads(4)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output)
+            .unwrap();
+
+        assert!(stats.chunks_written >= 5);
+        let expected = (num_pairs * 2) as u64;
+        assert_eq!(count_bam_records(&output), expected);
     }
 }
