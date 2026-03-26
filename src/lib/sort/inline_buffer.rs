@@ -11,6 +11,7 @@
 
 use crate::sort::bam_fields;
 use crate::sort::keys::{RawCoordinateKey, RawSortKey, SortContext};
+use crate::sort::radix::bytes_needed_u64;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 
@@ -1033,21 +1034,21 @@ fn insertion_sort_refs(refs: &mut [RecordRef]) {
 // Radix Sort for TemplateRecordRef (multi-field 4×u64 key)
 // ============================================================================
 
-/// Radix sort for `TemplateRecordRef` arrays using multi-field LSD approach.
+/// MSD (Most Significant Digit) hybrid radix sort for `TemplateRecordRef` arrays.
 ///
-/// The `TemplateKey` consists of 4 u64 fields sorted in order:
-/// primary → secondary → tertiary → `name_hash_upper`
+/// Exploits the fact that the `primary` field (tid1/tid2/pos1) is highly discriminating:
+/// most records have unique primary values in typical sequencing data.
 ///
-/// For LSD radix sort, we sort from least significant to most significant:
-/// 1. Sort by `name_hash_upper`
-/// 2. Sort by tertiary (stable, preserves `name_hash_upper` order)
-/// 3. Sort by secondary (stable, preserves tertiary + `name_hash_upper` order)
-/// 4. Sort by primary (stable, final order)
+/// Strategy:
+/// 1. Radix sort by `primary` field — O(n × k₁) where k₁ = adaptive bytes needed
+/// 2. Find runs of equal `primary` values (single O(n) scan)
+/// 3. Sub-sort only the runs that need it:
+///    - Size 1: already sorted (majority of records)
+///    - Size 2–64: insertion sort by remaining fields
+///    - Size >64: LSD radix sort remaining fields
 ///
-/// This is O(n×k) where k is the total bytes to sort (up to 32 bytes).
-///
-/// This is used for stable sorting - LSD radix sort inherently preserves
-/// relative order of records with equal keys.
+/// This avoids full O(n) passes for fields 2–5 when most records are already
+/// resolved by the primary field alone.
 #[allow(clippy::uninit_vec, unsafe_code)]
 pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     let n = refs.len();
@@ -1056,34 +1057,72 @@ pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
         return;
     }
 
-    // Allocate auxiliary buffer
+    // Allocate auxiliary buffer (reused across phases)
     let mut aux: Vec<TemplateRecordRef> = Vec::with_capacity(n);
     unsafe {
         aux.set_len(n);
     }
 
-    // Sort by each field from least significant to most significant
-    // This ensures the final order is: primary → secondary → cb_hash → tertiary → name_hash_upper
-    let fields = [
-        |r: &TemplateRecordRef| r.key.name_hash_upper,
-        |r: &TemplateRecordRef| r.key.tertiary,
-        |r: &TemplateRecordRef| r.key.cb_hash,
-        |r: &TemplateRecordRef| r.key.secondary,
-        |r: &TemplateRecordRef| r.key.primary,
-    ];
+    // Phase 1: Radix sort by primary field
+    let max_primary = refs.iter().map(|r| r.key.primary).max().unwrap_or(0);
+    let bytes_needed = bytes_needed_u64(max_primary);
+    if bytes_needed > 0 {
+        radix_sort_template_field(refs, &mut aux, |r| r.key.primary, bytes_needed, 0);
+    }
 
-    for (field_idx, get_field) in fields.iter().enumerate() {
-        // Find max value for this field to determine bytes needed
-        let max_val = refs.iter().map(get_field).max().unwrap_or(0);
-        let bytes_needed =
-            if max_val == 0 { 0 } else { ((64 - max_val.leading_zeros()) as usize).div_ceil(8) };
+    // Phase 2: Find equal-primary runs and sub-sort by remaining fields
+    sub_sort_runs(refs, &mut aux, |r| r.key.primary, &REMAINING_FIELDS_AFTER_PRIMARY);
+}
 
-        if bytes_needed == 0 {
-            continue; // All values are 0 for this field, skip
+/// Remaining `TemplateKey` fields after `primary`, in sort precedence order.
+const REMAINING_FIELDS_AFTER_PRIMARY: [fn(&TemplateRecordRef) -> u64; 4] =
+    [|r| r.key.secondary, |r| r.key.cb_hash, |r| r.key.tertiary, |r| r.key.name_hash_upper];
+
+/// Threshold for sub-sort runs: below this, use insertion sort.
+const SUB_SORT_INSERTION_THRESHOLD: usize = 64;
+
+/// Find runs of equal values for `run_field` and sub-sort each run by `remaining_fields`.
+fn sub_sort_runs<F>(
+    refs: &mut [TemplateRecordRef],
+    aux: &mut [TemplateRecordRef],
+    run_field: F,
+    remaining_fields: &[fn(&TemplateRecordRef) -> u64],
+) where
+    F: Fn(&TemplateRecordRef) -> u64,
+{
+    if remaining_fields.is_empty() {
+        return;
+    }
+
+    let n = refs.len();
+    let mut start = 0;
+    while start < n {
+        let val = run_field(&refs[start]);
+        let mut end = start + 1;
+        while end < n && run_field(&refs[end]) == val {
+            end += 1;
         }
 
-        // Radix sort this field
-        radix_sort_template_field(refs, &mut aux, get_field, bytes_needed, field_idx);
+        let run = &mut refs[start..end];
+        let run_len = run.len();
+        if run_len > 1 {
+            if run_len <= SUB_SORT_INSERTION_THRESHOLD {
+                insertion_sort_template_refs(run);
+            } else {
+                let next_field = remaining_fields[0];
+                let max_val = run.iter().map(next_field).max().unwrap_or(0);
+                let bytes_needed = bytes_needed_u64(max_val);
+                if bytes_needed > 0 {
+                    let run_aux = &mut aux[start..end];
+                    radix_sort_template_field(run, run_aux, next_field, bytes_needed, 0);
+                }
+
+                if remaining_fields.len() > 1 {
+                    sub_sort_runs(run, &mut aux[start..end], next_field, &remaining_fields[1..]);
+                }
+            }
+        }
+        start = end;
     }
 }
 
@@ -1878,5 +1917,97 @@ mod tests {
         // Verify total record count across all chunks matches input
         let total: usize = chunks.iter().map(Vec::len).sum();
         assert_eq!(total, n, "total records across chunks should equal input count");
+    }
+
+    mod proptest_msd {
+        use super::*;
+        use proptest::{prop_assert_eq, proptest};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn make_ref(key: TemplateKey, offset: u64) -> TemplateRecordRef {
+            TemplateRecordRef { key, offset, len: 10, padding: 0 }
+        }
+
+        fn hash_pair(a: u64, b: u64) -> u64 {
+            let mut h = DefaultHasher::new();
+            (a, b).hash(&mut h);
+            h.finish()
+        }
+
+        proptest! {
+            /// Oracle test: MSD hybrid sort must produce the same ordering as a
+            /// reference sort-by-key on randomized inputs with heavy primary collisions.
+            #[test]
+            fn msd_sort_matches_reference(
+                n_primaries in 1_usize..=4,
+                seed in proptest::num::u64::ANY,
+            ) {
+                let primaries: Vec<u64> = (0..n_primaries)
+                    .map(|i| hash_pair(seed, i as u64))
+                    .collect();
+
+                // Build 300+ refs (above RADIX_THRESHOLD) with random keys sharing primaries
+                let n = 300;
+                let mut refs: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let h = hash_pair(seed, (i + n_primaries) as u64);
+                    let primary = primaries[i % n_primaries];
+                    let key = TemplateKey {
+                        primary,
+                        secondary: h,
+                        cb_hash: h.wrapping_mul(2_654_435_761),
+                        tertiary: h.wrapping_mul(40503),
+                        name_hash_upper: h.rotate_left(17),
+                    };
+                    refs.push(make_ref(key, i as u64));
+                }
+
+                let mut expected = refs.clone();
+                expected.sort_by(|a, b| a.key.cmp(&b.key));
+
+                radix_sort_template_refs(&mut refs);
+
+                for i in 0..n {
+                    prop_assert_eq!(
+                        refs[i].key, expected[i].key,
+                        "Mismatch at index {}: MSD key {:?} != reference {:?}",
+                        i, refs[i].key, expected[i].key
+                    );
+                }
+            }
+
+            /// Oracle test with fully random keys (no forced primary collisions).
+            #[test]
+            fn msd_sort_matches_reference_random_keys(
+                seed in proptest::num::u64::ANY,
+            ) {
+                let n = 500;
+                let mut refs: Vec<TemplateRecordRef> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let h = hash_pair(seed, i as u64);
+                    let key = TemplateKey {
+                        primary: h,
+                        secondary: h.wrapping_mul(6_364_136_223_846_793_005),
+                        cb_hash: h.wrapping_mul(2_654_435_761),
+                        tertiary: h.rotate_left(23),
+                        name_hash_upper: h.rotate_right(7),
+                    };
+                    refs.push(make_ref(key, i as u64));
+                }
+
+                let mut expected = refs.clone();
+                expected.sort_by(|a, b| a.key.cmp(&b.key));
+
+                radix_sort_template_refs(&mut refs);
+
+                for i in 0..n {
+                    prop_assert_eq!(
+                        refs[i].key, expected[i].key,
+                        "Mismatch at index {}", i
+                    );
+                }
+            }
+        }
     }
 }
