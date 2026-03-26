@@ -44,7 +44,6 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
-use std::collections::HashMap;
 use fgumi_lib::bam_io::{
     create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer,
     create_optional_bam_writer,
@@ -66,6 +65,7 @@ use noodles::sam::alignment::io::Write as SamWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::{self, Header};
+use std::collections::HashMap;
 use std::io;
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -425,10 +425,8 @@ impl Command for CorrectUmis {
         // Load UMI sequences grouped by length
         let umi_seqs_by_length = self.load_umi_sequences()?;
         // Create encoded UMI sets for fast comparison (one per length)
-        let encoded_sets_by_length: HashMap<usize, EncodedUmiSet> = umi_seqs_by_length
-            .iter()
-            .map(|(&len, seqs)| (len, EncodedUmiSet::new(seqs)))
-            .collect();
+        let encoded_sets_by_length: HashMap<usize, EncodedUmiSet> =
+            umi_seqs_by_length.iter().map(|(&len, seqs)| (len, EncodedUmiSet::new(seqs))).collect();
         // Create per-length sentinel UMI strings for rejected reads
         let unmatched_by_length: HashMap<usize, String> =
             umi_seqs_by_length.keys().map(|&len| (len, "N".repeat(len))).collect();

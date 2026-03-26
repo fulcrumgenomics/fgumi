@@ -966,7 +966,9 @@ impl Command for GroupReadsByUmi {
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
         if self.truncate && self.min_umi_length.is_none() {
-            bail!("Cannot truncate UMIs unless a minimum UMI length is specified (--min-umi-length)");
+            bail!(
+                "Cannot truncate UMIs unless a minimum UMI length is specified (--min-umi-length)"
+            );
         }
         if self.truncate && matches!(self.strategy, Strategy::Paired) {
             bail!("Paired strategy cannot be used with --truncate");
