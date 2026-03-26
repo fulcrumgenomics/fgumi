@@ -20,7 +20,7 @@ fn collect_mi_tags(bam_path: &std::path::Path) -> Vec<String> {
     let header = reader.read_header().unwrap();
     reader
         .record_bufs(&header)
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|r| {
             r.data().get(&mi_tag).and_then(|v| {
                 if let noodles::sam::alignment::record_buf::data::field::Value::String(s) = v {

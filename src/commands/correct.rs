@@ -293,7 +293,7 @@ struct TemplateCorrection {
     matches: Vec<UmiMatch>,
     /// Rejection reason if not matched.
     rejection_reason: RejectionReason,
-    /// Length of the first failing segment (set when rejection_reason is WrongLength or Mismatched).
+    /// Length of the first failing segment (set when `rejection_reason` is `WrongLength` or `Mismatched`).
     failing_segment_len: usize,
 }
 

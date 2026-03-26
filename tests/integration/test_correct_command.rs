@@ -162,7 +162,7 @@ fn test_correct_command_with_rejects() {
 }
 
 /// Test that mixed-length UMI whitelists are accepted and that reads with a UMI length
-/// not present in the whitelist are rejected (WrongLength), while reads matching a
+/// not present in the whitelist are rejected (`WrongLength`), while reads matching a
 /// whitelist UMI of the correct length are accepted.
 #[test]
 fn test_correct_command_mixed_length_whitelist() {

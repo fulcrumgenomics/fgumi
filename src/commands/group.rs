@@ -73,6 +73,7 @@ struct CollectedMetrics {
 
 /// Configuration for template filtering during group processing.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct GroupFilterConfig {
     /// UMI tag bytes (e.g., [b'R', b'X']).
     umi_tag: [u8; 2],
@@ -541,7 +542,7 @@ fn assign_umi_groups_impl(
 ///
 /// For `PairedUmiAssigner` only, UMIs are formatted as "aaa:XXXX-bbb:YYYY" where the
 /// prefix length is `paired.lower_read_umi_prefix().len()`. The grouping key is the
-/// pair of (shorter_len, longer_len) with prefix+colon stripped.
+/// pair of (`shorter_len`, `longer_len`) with prefix+colon stripped.
 ///
 /// Returns a `Vec<MoleculeId>` indexed the same as the input `umis` slice.
 pub(crate) fn assign_by_length_shape(
@@ -798,6 +799,7 @@ Threads are allocated based on the command's workload profile to optimize perfor
 Example: --threads 8 spawns exactly 8 threads (2 reader, 4 workers, 2 writer)
 "#
 )]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GroupReadsByUmi {
     /// Input and output BAM files
     #[command(flatten)]
