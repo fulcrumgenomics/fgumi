@@ -44,6 +44,7 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
+use std::collections::HashMap;
 use fgumi_lib::bam_io::{
     create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer,
     create_optional_bam_writer,
@@ -163,8 +164,9 @@ the command line or in a file) and produces:
 2. Optionally a set of metrics about the representation of each UMI in the set
 3. Optionally a second BAM file of reads whose UMIs could not be corrected within the specific parameters
 
-All of the fixed UMIs must be of the same length, and all UMIs in the BAM file must also have
-the same length. Multiple UMIs that are concatenated with hyphens (e.g. `AACCAGT-AGGTAGA`) are
+The fixed UMIs may have differing lengths. Each UMI segment in the BAM file is matched only
+against fixed UMIs of the same length; segments whose length does not appear in the whitelist
+are rejected. Multiple UMIs that are concatenated with hyphens (e.g. `AACCAGT-AGGTAGA`) are
 split apart, corrected individually and then re-assembled. A read is accepted only if all the
 UMIs can be corrected.
 
@@ -291,6 +293,8 @@ struct TemplateCorrection {
     matches: Vec<UmiMatch>,
     /// Rejection reason if not matched.
     rejection_reason: RejectionReason,
+    /// Length of the first failing segment (set when rejection_reason is WrongLength or Mismatched).
+    failing_segment_len: usize,
 }
 
 // ============================================================================
@@ -418,13 +422,19 @@ impl Command for CorrectUmis {
 
         let timer = OperationTimer::new("Correcting UMIs");
 
-        // Load UMI sequences
-        let (umi_sequences, umi_length) = self.load_umi_sequences()?;
-        // Create encoded UMI set for fast comparison
-        let encoded_umi_set = EncodedUmiSet::new(&umi_sequences);
+        // Load UMI sequences grouped by length
+        let umi_seqs_by_length = self.load_umi_sequences()?;
+        // Create encoded UMI sets for fast comparison (one per length)
+        let encoded_sets_by_length: HashMap<usize, EncodedUmiSet> = umi_seqs_by_length
+            .iter()
+            .map(|(&len, seqs)| (len, EncodedUmiSet::new(seqs)))
+            .collect();
+        // Create per-length sentinel UMI strings for rejected reads
+        let unmatched_by_length: HashMap<usize, String> =
+            umi_seqs_by_length.keys().map(|&len| (len, "N".repeat(len))).collect();
 
         // Warn about UMIs that are too close together
-        self.check_umi_distances(&umi_sequences);
+        self.check_umi_distances(&umi_seqs_by_length);
 
         // Open input using streaming-capable reader for pipeline use
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
@@ -441,8 +451,8 @@ impl Command for CorrectUmis {
                 threads,
                 reader,
                 header,
-                Arc::new(encoded_umi_set),
-                umi_length,
+                Arc::new(encoded_sets_by_length),
+                Arc::new(unmatched_by_length),
                 self.rejects_opts.rejects.is_some(),
             )?
         } else {
@@ -451,8 +461,8 @@ impl Command for CorrectUmis {
             // Single-threaded: main thread only, template-level optimization
             self.execute_single_thread_mode(
                 header,
-                encoded_umi_set,
-                umi_length,
+                encoded_sets_by_length,
+                unmatched_by_length,
                 self.rejects_opts.rejects.is_some(),
             )?
         };
@@ -489,19 +499,18 @@ impl CorrectUmis {
     /// Loads UMI sequences from command line and files.
     ///
     /// Combines UMIs from both `umis` and `umi_files`, converts them to uppercase,
-    /// and validates that all UMIs are the same length.
+    /// and groups them by length. Mixed-length whitelists are fully supported.
     ///
     /// # Returns
     ///
-    /// A tuple of `(umi_sequences, umi_length)`.
+    /// A `HashMap<usize, Vec<String>>` mapping each UMI length to a sorted list of UMIs.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No UMIs are provided
     /// - UMI files cannot be read
-    /// - UMIs have different lengths
-    fn load_umi_sequences(&self) -> Result<(Vec<String>, usize)> {
+    fn load_umi_sequences(&self) -> Result<HashMap<usize, Vec<String>>> {
         let mut umi_set: std::collections::HashSet<String> =
             self.umis.iter().map(|s| s.to_uppercase()).collect();
 
@@ -519,38 +528,44 @@ impl CorrectUmis {
             bail!("No UMIs provided.");
         }
 
-        let mut umi_sequences: Vec<String> = umi_set.into_iter().collect();
-        umi_sequences.sort_unstable();
-
-        // Check all UMIs have the same length
-        let first_len = umi_sequences[0].len();
-        if !umi_sequences.iter().all(|u| u.len() == first_len) {
-            bail!("All UMIs must have the same length.");
+        let mut by_length: HashMap<usize, Vec<String>> = HashMap::new();
+        for umi in umi_set {
+            by_length.entry(umi.len()).or_default().push(umi);
+        }
+        for seqs in by_length.values_mut() {
+            seqs.sort_unstable();
         }
 
-        info!("Loaded {} UMI sequences of length {}", umi_sequences.len(), first_len);
-        Ok((umi_sequences, first_len))
+        let mut lengths: Vec<usize> = by_length.keys().copied().collect();
+        lengths.sort_unstable();
+        info!(
+            "Loaded {} UMI sequences across {} length(s): {:?}",
+            by_length.values().map(|v| v.len()).sum::<usize>(),
+            by_length.len(),
+            lengths
+        );
+        Ok(by_length)
     }
 
     /// Checks distances between UMI pairs and warns about ambiguities.
     ///
-    /// Identifies pairs of UMIs that are within `min_distance_diff` of each other,
-    /// which could lead to ambiguous matching situations.
+    /// Identifies pairs of UMIs (within the same length group) that are within
+    /// `min_distance_diff` of each other, which could lead to ambiguous matching situations.
     ///
     /// # Arguments
     ///
-    /// * `umi_sequences` - Slice of UMI sequences to check
-    fn check_umi_distances(&self, umi_sequences: &[String]) {
-        let pairs = find_umi_pairs_within_distance(umi_sequences, self.min_distance_diff - 1);
-
-        if !pairs.is_empty() {
-            warn!("###################################################################");
-            warn!("# WARNING: Found pairs of UMIs within min-distance-diff threshold!");
-            warn!("# These pairs may be ambiguous and fail to match:");
-            for (umi1, umi2, dist) in &pairs {
-                warn!("#   {umi1} <-> {umi2} (distance {dist})");
+    /// * `umi_seqs_by_length` - UMI sequences grouped by length
+    fn check_umi_distances(&self, umi_seqs_by_length: &HashMap<usize, Vec<String>>) {
+        for seqs in umi_seqs_by_length.values() {
+            let pairs = find_umi_pairs_within_distance(seqs, self.min_distance_diff - 1);
+            if !pairs.is_empty() {
+                warn!("###################################################################");
+                warn!("# WARNING: Found pairs of UMIs within min-distance-diff threshold!");
+                for (u1, u2, d) in &pairs {
+                    warn!("#   {u1} <-> {u2} (distance {d})");
+                }
+                warn!("###################################################################");
             }
-            warn!("###################################################################");
         }
     }
 
@@ -624,11 +639,10 @@ impl CorrectUmis {
     #[allow(clippy::too_many_arguments)]
     fn compute_template_correction(
         umi: &str,
-        umi_length: usize,
         revcomp: bool,
         max_mismatches: usize,
         min_distance_diff: usize,
-        encoded_umi_set: &EncodedUmiSet,
+        encoded_sets_by_length: &HashMap<usize, EncodedUmiSet>,
         cache: &mut Option<LruCache<Vec<u8>, UmiMatch>>,
     ) -> TemplateCorrection {
         let original_umi = umi.to_string();
@@ -640,24 +654,25 @@ impl CorrectUmis {
             umi.split('-').map(std::string::ToString::to_string).collect()
         };
 
-        // Check length
-        if sequences.iter().any(|s| s.len() != umi_length) {
-            return TemplateCorrection {
-                matched: false,
-                corrected_umi: None,
-                original_umi,
-                needs_correction: false,
-                has_mismatches: false,
-                matches: Vec::new(),
-                rejection_reason: RejectionReason::WrongLength,
-            };
-        }
-
         // Find matches for each UMI segment
         let mut matches = Vec::with_capacity(sequences.len());
         for seq in &sequences {
             // Uppercase using bytes directly - avoids String allocation
             let seq_bytes: Vec<u8> = seq.bytes().map(|b| b.to_ascii_uppercase()).collect();
+
+            // Look up the EncodedUmiSet for this segment's length
+            let Some(umi_set) = encoded_sets_by_length.get(&seq.len()) else {
+                return TemplateCorrection {
+                    matched: false,
+                    corrected_umi: None,
+                    original_umi,
+                    needs_correction: false,
+                    has_mismatches: false,
+                    matches: Vec::new(),
+                    rejection_reason: RejectionReason::WrongLength,
+                    failing_segment_len: seq.len(),
+                };
+            };
 
             let umi_match = if let Some(c) = cache {
                 if let Some(cached) = c.get(&seq_bytes[..]) {
@@ -665,7 +680,7 @@ impl CorrectUmis {
                 } else {
                     let result = find_best_match_encoded(
                         &seq_bytes,
-                        encoded_umi_set,
+                        umi_set,
                         max_mismatches,
                         min_distance_diff,
                     );
@@ -673,12 +688,7 @@ impl CorrectUmis {
                     result
                 }
             } else {
-                find_best_match_encoded(
-                    &seq_bytes,
-                    encoded_umi_set,
-                    max_mismatches,
-                    min_distance_diff,
-                )
+                find_best_match_encoded(&seq_bytes, umi_set, max_mismatches, min_distance_diff)
             };
 
             matches.push(umi_match);
@@ -700,8 +710,12 @@ impl CorrectUmis {
                 has_mismatches,
                 matches,
                 rejection_reason: RejectionReason::None,
+                failing_segment_len: 0,
             }
         } else {
+            // Find the first non-matching segment to record its length
+            let first_non_match_idx = matches.iter().position(|m| !m.matched).unwrap_or(0);
+            let failing_segment_len = sequences[first_non_match_idx].len();
             TemplateCorrection {
                 matched: false,
                 corrected_umi: None,
@@ -710,6 +724,7 @@ impl CorrectUmis {
                 has_mismatches: false,
                 matches,
                 rejection_reason: RejectionReason::Mismatched,
+                failing_segment_len,
             }
         }
     }
@@ -825,13 +840,15 @@ impl CorrectUmis {
     fn finalize_metrics(
         &self,
         umi_metrics: &mut AHashMap<String, UmiCorrectionMetrics>,
-        unmatched_umi: &str,
+        unmatched_by_length: &HashMap<usize, String>,
     ) -> Result<()> {
+        let sentinels: std::collections::HashSet<&String> = unmatched_by_length.values().collect();
+
         // Calculate totals
         let total: u64 = umi_metrics.values().map(|m| m.total_matches).sum();
         let matched_total: u64 = umi_metrics
             .iter()
-            .filter(|(umi, _)| *umi != unmatched_umi)
+            .filter(|(umi, _)| !sentinels.contains(umi))
             .map(|(_, m)| m.total_matches)
             .sum();
 
@@ -842,7 +859,7 @@ impl CorrectUmis {
         }
 
         // Calculate representations (allow NaN/Infinity, matching fgbio behavior)
-        let umi_count = umi_metrics.keys().filter(|umi| *umi != unmatched_umi).count();
+        let umi_count = umi_metrics.keys().filter(|umi| !sentinels.contains(umi)).count();
 
         #[allow(clippy::cast_precision_loss)]
         let mean = matched_total as f64 / umi_count as f64;
@@ -870,8 +887,8 @@ impl CorrectUmis {
         num_threads: usize,
         reader: Box<dyn std::io::Read + Send>,
         header: Header,
-        encoded_umi_set: Arc<EncodedUmiSet>,
-        umi_length: usize,
+        encoded_sets_by_length: Arc<HashMap<usize, EncodedUmiSet>>,
+        unmatched_by_length: Arc<HashMap<usize, String>>,
         track_rejects: bool,
     ) -> Result<u64> {
         // Configure pipeline - correct is ReaderHeavy (70% in decompression)
@@ -908,12 +925,10 @@ impl CorrectUmis {
         let progress_counter = Arc::new(AtomicU64::new(0));
         let progress_for_process = Arc::clone(&progress_counter);
 
-        // Unmatched UMI string for rejected reads (matches fgbio behavior)
-        let unmatched_umi = "N".repeat(umi_length);
-        let unmatched_umi_for_process = unmatched_umi.clone();
-
-        // Clone the UMI set for post-aggregation use (before closure moves original)
-        let encoded_umi_set_for_metrics = Arc::clone(&encoded_umi_set);
+        // Clone for use in closures (before they capture by move)
+        let unmatched_by_length_for_process = Arc::clone(&unmatched_by_length);
+        let encoded_sets_by_length_for_metrics = Arc::clone(&encoded_sets_by_length);
+        let unmatched_by_length_for_metrics = Arc::clone(&unmatched_by_length);
 
         // Grouper: batch templates by QNAME
         let grouper_fn = move |_header: &Header| {
@@ -963,12 +978,7 @@ impl CorrectUmis {
                             None => {
                                 let num_records = raw_records.len() as u64;
                                 missing_umis += num_records;
-                                let entry = umi_matches_map
-                                    .entry(unmatched_umi_for_process.clone())
-                                    .or_insert_with(|| {
-                                        UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
-                                    });
-                                entry.total_matches += num_records;
+                                // Missing UMI is NOT charged to any sentinel
                                 if track_rejects {
                                     rejected_raw_records.extend(raw_records);
                                 }
@@ -976,11 +986,10 @@ impl CorrectUmis {
                             Some(umi) => {
                                 let correction = Self::compute_template_correction(
                                     &umi,
-                                    umi_length,
                                     revcomp,
                                     max_mismatches,
                                     min_distance_diff,
-                                    &encoded_umi_set,
+                                    &encoded_sets_by_length,
                                     &mut cache_ref,
                                 );
                                 let num_records = raw_records.len() as u64;
@@ -1019,17 +1028,21 @@ impl CorrectUmis {
                                         }
                                         RejectionReason::Mismatched => {
                                             mismatched += num_records;
+                                            // Only Mismatched is charged to a per-length sentinel
+                                            let sentinel = unmatched_by_length_for_process
+                                                .get(&correction.failing_segment_len)
+                                                .expect(
+                                                    "Mismatched implies length is in whitelist",
+                                                );
+                                            let entry = umi_matches_map
+                                                .entry(sentinel.clone())
+                                                .or_insert_with(|| {
+                                                    UmiCorrectionMetrics::new(sentinel.clone())
+                                                });
+                                            entry.total_matches += num_records;
                                         }
                                         RejectionReason::None => {}
                                     }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
                                     if track_rejects {
                                         rejected_raw_records.extend(raw_records);
                                     }
@@ -1045,12 +1058,7 @@ impl CorrectUmis {
                             None => {
                                 let num_records = records.len() as u64;
                                 missing_umis += num_records;
-                                let entry = umi_matches_map
-                                    .entry(unmatched_umi_for_process.clone())
-                                    .or_insert_with(|| {
-                                        UmiCorrectionMetrics::new(unmatched_umi_for_process.clone())
-                                    });
-                                entry.total_matches += num_records;
+                                // Missing UMI is NOT charged to any sentinel
                                 if track_rejects {
                                     rejected_records.extend(records);
                                 }
@@ -1058,11 +1066,10 @@ impl CorrectUmis {
                             Some(umi) => {
                                 let correction = Self::compute_template_correction(
                                     &umi,
-                                    umi_length,
                                     revcomp,
                                     max_mismatches,
                                     min_distance_diff,
-                                    &encoded_umi_set,
+                                    &encoded_sets_by_length,
                                     &mut cache_ref,
                                 );
                                 let num_records = records.len() as u64;
@@ -1101,17 +1108,21 @@ impl CorrectUmis {
                                         }
                                         RejectionReason::Mismatched => {
                                             mismatched += num_records;
+                                            // Only Mismatched is charged to a per-length sentinel
+                                            let sentinel = unmatched_by_length_for_process
+                                                .get(&correction.failing_segment_len)
+                                                .expect(
+                                                    "Mismatched implies length is in whitelist",
+                                                );
+                                            let entry = umi_matches_map
+                                                .entry(sentinel.clone())
+                                                .or_insert_with(|| {
+                                                    UmiCorrectionMetrics::new(sentinel.clone())
+                                                });
+                                            entry.total_matches += num_records;
                                         }
                                         RejectionReason::None => {}
                                     }
-                                    let entry = umi_matches_map
-                                        .entry(unmatched_umi_for_process.clone())
-                                        .or_insert_with(|| {
-                                            UmiCorrectionMetrics::new(
-                                                unmatched_umi_for_process.clone(),
-                                            )
-                                        });
-                                    entry.total_matches += num_records;
                                     if track_rejects {
                                         rejected_records.extend(records);
                                     }
@@ -1260,15 +1271,21 @@ impl CorrectUmis {
         }
 
         // Ensure ALL UMI rows are present (even with zero counts) - matches fgbio behavior
-        for umi in encoded_umi_set_for_metrics.strings.iter().chain(std::iter::once(&unmatched_umi))
-        {
+        for seqs in encoded_sets_by_length_for_metrics.values() {
+            for umi in &seqs.strings {
+                merged_umi_matches
+                    .entry(umi.clone())
+                    .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
+            }
+        }
+        for sentinel in unmatched_by_length_for_metrics.values() {
             merged_umi_matches
-                .entry(umi.clone())
-                .or_insert_with(|| UmiCorrectionMetrics::new(umi.clone()));
+                .entry(sentinel.clone())
+                .or_insert_with(|| UmiCorrectionMetrics::new(sentinel.clone()));
         }
 
         // Finalize and write metrics if requested
-        self.finalize_metrics(&mut merged_umi_matches, &unmatched_umi)?;
+        self.finalize_metrics(&mut merged_umi_matches, &unmatched_by_length_for_metrics)?;
 
         // Log summary (records_written = kept records only)
         let rejected = total_missing + total_wrong_length + total_mismatched;
@@ -1313,8 +1330,8 @@ impl CorrectUmis {
     fn execute_single_thread_mode(
         &self,
         header: Header,
-        encoded_umi_set: EncodedUmiSet,
-        umi_length: usize,
+        encoded_sets_by_length: HashMap<usize, EncodedUmiSet>,
+        unmatched_by_length: HashMap<usize, String>,
         track_rejects: bool,
     ) -> Result<u64> {
         info!("Using single-threaded mode with template-level UMI correction");
@@ -1341,14 +1358,16 @@ impl CorrectUmis {
             None
         };
 
-        // Initialize metrics
-        let unmatched_umi = "N".repeat(umi_length);
-        let umi_sequences = encoded_umi_set.strings.clone();
-        let mut umi_metrics: AHashMap<String, UmiCorrectionMetrics> = umi_sequences
-            .iter()
-            .chain(std::iter::once(&unmatched_umi))
-            .map(|umi| (umi.clone(), UmiCorrectionMetrics::new(umi.clone())))
-            .collect();
+        // Initialize metrics: seed all known UMIs and sentinels with zero-count entries
+        let mut umi_metrics: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
+        for seqs in encoded_sets_by_length.values() {
+            for umi in &seqs.strings {
+                umi_metrics.insert(umi.clone(), UmiCorrectionMetrics::new(umi.clone()));
+            }
+        }
+        for sentinel in unmatched_by_length.values() {
+            umi_metrics.insert(sentinel.clone(), UmiCorrectionMetrics::new(sentinel.clone()));
+        }
 
         // Counters
         let mut total_records = 0u64;
@@ -1378,8 +1397,8 @@ impl CorrectUmis {
             match umi_opt {
                 None => {
                     // No UMI in any record - reject all records
+                    // Missing UMI is NOT charged to any sentinel
                     missing_umis += num_records;
-                    umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches += num_records;
                     if track_rejects {
                         if let Some(ref mut rw) = reject_writer {
                             for record in records {
@@ -1392,11 +1411,10 @@ impl CorrectUmis {
                     // Correct UMI once for the template
                     let correction = Self::compute_template_correction(
                         &umi,
-                        umi_length,
                         revcomp,
                         max_mismatches,
                         min_distance_diff,
-                        &encoded_umi_set,
+                        &encoded_sets_by_length,
                         &mut cache,
                     );
 
@@ -1429,10 +1447,16 @@ impl CorrectUmis {
                         // Rejection - update counters based on reason
                         match correction.rejection_reason {
                             RejectionReason::WrongLength => wrong_length += num_records,
-                            RejectionReason::Mismatched => mismatched += num_records,
+                            RejectionReason::Mismatched => {
+                                mismatched += num_records;
+                                // Only Mismatched is charged to a per-length sentinel
+                                let sentinel = unmatched_by_length
+                                    .get(&correction.failing_segment_len)
+                                    .expect("Mismatched implies length is in whitelist");
+                                umi_metrics.get_mut(sentinel).unwrap().total_matches += num_records;
+                            }
                             RejectionReason::None => {}
                         }
-                        umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches += num_records;
 
                         if track_rejects {
                             if let Some(ref mut rw) = reject_writer {
@@ -1457,7 +1481,7 @@ impl CorrectUmis {
         }
 
         // Finalize and write metrics
-        self.finalize_metrics(&mut umi_metrics, &unmatched_umi)?;
+        self.finalize_metrics(&mut umi_metrics, &unmatched_by_length)?;
 
         // Log summary
         let rejected = missing_umis + wrong_length + mismatched;
@@ -1698,6 +1722,34 @@ mod tests {
     use std::{io::Write as IoWrite, path::Path};
     use tempfile::{NamedTempFile, TempDir};
 
+    /// Build a minimal `CorrectUmis` with temp-file paths, suitable for use in unit tests
+    /// that call helper methods (e.g. `load_umi_sequences`) without running the full pipeline.
+    fn test_correct_cmd() -> CorrectUmis {
+        let input = NamedTempFile::new().unwrap();
+        let output = NamedTempFile::new().unwrap();
+        CorrectUmis {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: output.path().to_path_buf(),
+            },
+            rejects_opts: RejectsOptions::default(),
+            metrics: None,
+            max_mismatches: 2,
+            min_distance_diff: 2,
+            umis: vec![],
+            umi_files: vec![],
+            umi_tag: "RX".to_string(),
+            dont_store_original_umis: false,
+            cache_size: 100_000,
+            min_corrected: None,
+            revcomp: false,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        }
+    }
+
     /// Helper struct for managing temporary test file paths.
     /// Keeps `TempDir` alive for the lifetime of the struct.
     struct TestPaths {
@@ -1734,6 +1786,19 @@ mod tests {
     fn get_encoded_umi_set() -> EncodedUmiSet {
         let strings: Vec<String> = FIXED_UMIS.iter().map(|s| (*s).to_string()).collect();
         EncodedUmiSet::new(&strings)
+    }
+
+    #[test]
+    fn test_load_umi_sequences_allows_mixed_lengths() {
+        let tool = CorrectUmis {
+            umis: vec!["AAAAAA".to_string(), "CCCCCCC".to_string()],
+            umi_files: vec![],
+            ..test_correct_cmd()
+        };
+        let by_length = tool.load_umi_sequences().expect("Should succeed");
+        assert_eq!(by_length.len(), 2);
+        assert_eq!(by_length[&6], vec!["AAAAAA"]);
+        assert_eq!(by_length[&7], vec!["CCCCCCC"]);
     }
 
     #[test]
@@ -1973,33 +2038,18 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_different_length_umis() {
-        let temp_input = NamedTempFile::new().unwrap();
-        let temp_output = NamedTempFile::new().unwrap();
-
-        let corrector = CorrectUmis {
-            io: BamIoOptions {
-                input: temp_input.path().to_path_buf(),
-                output: temp_output.path().to_path_buf(),
-            },
-            rejects_opts: RejectsOptions::default(),
-            metrics: None,
-            max_mismatches: 2,
-            min_distance_diff: 2,
+    fn test_validation_different_length_umis_now_allowed() -> Result<()> {
+        // Mixed-length whitelists are now valid; "AAAAAA" (6-mer) and "CCC" (3-mer) should both load.
+        let tool = CorrectUmis {
             umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
-            dont_store_original_umis: false,
-            cache_size: 100_000,
-            min_corrected: None,
-            revcomp: false,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
+            ..test_correct_cmd()
         };
-
-        assert!(corrector.execute("test").is_err());
+        let by_length = tool.load_umi_sequences()?;
+        assert_eq!(by_length.len(), 2);
+        assert_eq!(by_length[&6], vec!["AAAAAA"]);
+        assert_eq!(by_length[&3], vec!["CCC"]);
+        Ok(())
     }
 
     #[test]
@@ -2905,14 +2955,20 @@ mod tests {
         assert!(result.is_none());
     }
 
+    fn make_sets_from_encoded(umi_set: EncodedUmiSet) -> HashMap<usize, EncodedUmiSet> {
+        // All FIXED_UMIS are length 6
+        let mut sets = HashMap::new();
+        sets.insert(6usize, umi_set);
+        sets
+    }
+
     #[test]
     fn test_compute_template_correction_perfect_match() {
-        let umi_set = get_encoded_umi_set();
+        let sets = make_sets_from_encoded(get_encoded_umi_set());
         let mut cache = None;
 
-        let correction = CorrectUmis::compute_template_correction(
-            "AAAAAA", 6, false, 2, 2, &umi_set, &mut cache,
-        );
+        let correction =
+            CorrectUmis::compute_template_correction("AAAAAA", false, 2, 2, &sets, &mut cache);
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -2924,12 +2980,11 @@ mod tests {
 
     #[test]
     fn test_compute_template_correction_with_mismatch() {
-        let umi_set = get_encoded_umi_set();
+        let sets = make_sets_from_encoded(get_encoded_umi_set());
         let mut cache = None;
 
-        let correction = CorrectUmis::compute_template_correction(
-            "AAAAAT", 6, false, 2, 2, &umi_set, &mut cache,
-        );
+        let correction =
+            CorrectUmis::compute_template_correction("AAAAAT", false, 2, 2, &sets, &mut cache);
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -2941,39 +2996,41 @@ mod tests {
 
     #[test]
     fn test_compute_template_correction_wrong_length() {
-        let umi_set = get_encoded_umi_set();
+        let sets = make_sets_from_encoded(get_encoded_umi_set());
         let mut cache = None;
 
+        // "AAAA" has length 4, not in the whitelist (only 6-mers present)
         let correction =
-            CorrectUmis::compute_template_correction("AAAA", 6, false, 2, 2, &umi_set, &mut cache);
+            CorrectUmis::compute_template_correction("AAAA", false, 2, 2, &sets, &mut cache);
 
         assert!(!correction.matched);
         assert!(correction.corrected_umi.is_none());
         assert_eq!(correction.rejection_reason, RejectionReason::WrongLength);
+        assert_eq!(correction.failing_segment_len, 4);
     }
 
     #[test]
     fn test_compute_template_correction_too_many_mismatches() {
-        let umi_set = get_encoded_umi_set();
+        let sets = make_sets_from_encoded(get_encoded_umi_set());
         let mut cache = None;
 
-        let correction = CorrectUmis::compute_template_correction(
-            "AAAGGG", 6, false, 2, 2, &umi_set, &mut cache,
-        );
+        let correction =
+            CorrectUmis::compute_template_correction("AAAGGG", false, 2, 2, &sets, &mut cache);
 
         assert!(!correction.matched);
         assert!(correction.corrected_umi.is_none());
         assert_eq!(correction.rejection_reason, RejectionReason::Mismatched);
+        assert_eq!(correction.failing_segment_len, 6);
     }
 
     #[test]
     fn test_compute_template_correction_with_revcomp() {
-        let umi_set = get_encoded_umi_set();
+        let sets = make_sets_from_encoded(get_encoded_umi_set());
         let mut cache = None;
 
         // TTTTTT revcomp -> AAAAAA
         let correction =
-            CorrectUmis::compute_template_correction("TTTTTT", 6, true, 2, 2, &umi_set, &mut cache);
+            CorrectUmis::compute_template_correction("TTTTTT", true, 2, 2, &sets, &mut cache);
 
         assert!(correction.matched);
         assert_eq!(correction.corrected_umi, Some("AAAAAA".to_string()));
@@ -2984,17 +3041,16 @@ mod tests {
     #[test]
     fn test_compute_template_correction_dual_umi() {
         // Create a UMI set with 6-base UMIs for dual-index testing
-        let umi_set = get_encoded_umi_set();
+        let sets = make_sets_from_encoded(get_encoded_umi_set());
         let mut cache = None;
 
         // Dual UMI: AAAAAA-CCCCCC (both should match)
         let correction = CorrectUmis::compute_template_correction(
             "AAAAAA-CCCCCC",
-            6,
             false,
             2,
             2,
-            &umi_set,
+            &sets,
             &mut cache,
         );
 
@@ -3014,6 +3070,7 @@ mod tests {
             has_mismatches: false,
             matches: vec![],
             rejection_reason: RejectionReason::None,
+            failing_segment_len: 0,
         };
 
         let result = CorrectUmis::apply_correction_to_record(
@@ -3040,6 +3097,7 @@ mod tests {
             has_mismatches: true,
             matches: vec![],
             rejection_reason: RejectionReason::None,
+            failing_segment_len: 0,
         };
 
         let result = CorrectUmis::apply_correction_to_record(
@@ -3081,6 +3139,7 @@ mod tests {
             has_mismatches: true,
             matches: vec![],
             rejection_reason: RejectionReason::None,
+            failing_segment_len: 0,
         };
 
         // dont_store_original_umis = true
@@ -3112,13 +3171,14 @@ mod tests {
 
     #[test]
     fn test_metrics_includes_unmatched_umi_row() -> Result<()> {
-        // Test that uncorrectable reads are tracked in an "NNNNNN" row
+        // Test that Mismatched reads (length in whitelist, no close match) are tracked in "NNNNNN" row.
+        // Missing UMIs (no tag) are NOT charged to the sentinel.
         let input = create_test_bam(vec![
             ("q1", Some("AAAAAA")), // Perfect match
-            ("q2", Some("GGGTTT")), // No match (too far from all UMIs)
+            ("q2", Some("GGGTTT")), // Mismatched (length 6 in whitelist, but no close match)
             ("q3", Some("CCCCCC")), // Perfect match
-            ("q4", Some("ACTGAC")), // No match
-            ("q5", None),           // Missing UMI - should also count as unmatched
+            ("q4", Some("ACTGAC")), // Mismatched
+            ("q5", None),           // Missing UMI - NOT charged to sentinel
         ])?;
 
         let paths = TestPaths::new()?;
@@ -3155,10 +3215,11 @@ mod tests {
         assert!(unmatched.is_some(), "Unmatched UMI row (NNNNNN) not found in metrics");
 
         let unmatched = unmatched.unwrap();
-        // 3 uncorrectable reads: q2, q4, q5
+        // Only 2 Mismatched reads charged to sentinel: q2, q4
+        // q5 (missing UMI) is NOT charged to the sentinel
         assert_eq!(
-            unmatched.total_matches, 3,
-            "Unmatched row should have 3 total_matches for uncorrectable reads"
+            unmatched.total_matches, 2,
+            "Unmatched row should have 2 total_matches for Mismatched reads only (not missing)"
         );
         // All mismatch categories should be 0 for unmatched row (matches fgbio)
         assert_eq!(unmatched.perfect_matches, 0);
@@ -3498,6 +3559,7 @@ mod tests {
             has_mismatches: true,
             matches: vec![],
             rejection_reason: RejectionReason::None,
+            failing_segment_len: 0,
         };
 
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, [b'R', b'X'], false);
@@ -3530,6 +3592,7 @@ mod tests {
             has_mismatches: false,
             matches: vec![],
             rejection_reason: RejectionReason::None,
+            failing_segment_len: 0,
         };
 
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, [b'R', b'X'], false);
@@ -3558,6 +3621,7 @@ mod tests {
             has_mismatches: true,
             matches: vec![],
             rejection_reason: RejectionReason::None,
+            failing_segment_len: 0,
         };
 
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, [b'R', b'X'], true);
