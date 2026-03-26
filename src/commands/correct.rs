@@ -526,6 +526,20 @@ impl CorrectUmis {
             bail!("No UMIs provided.");
         }
 
+        // Reject all-N UMIs: "NNN...N" is reserved as an internal sentinel for tracking
+        // unmatched reads. Accepting it as a whitelist entry would corrupt metrics because
+        // mismatched reads are charged to the same key.
+        for umi in &umi_set {
+            if umi.bytes().all(|b| b == b'N') {
+                bail!(
+                    "UMI '{}' consists entirely of N bases and cannot be used in a whitelist. \
+                    All-N sequences of each length are reserved as internal sentinels for \
+                    unmatched-read tracking in the metrics output.",
+                    umi
+                );
+            }
+        }
+
         let mut by_length: HashMap<usize, Vec<String>> = HashMap::new();
         for umi in umi_set {
             by_length.entry(umi.len()).or_default().push(umi);
@@ -555,7 +569,8 @@ impl CorrectUmis {
     /// * `umi_seqs_by_length` - UMI sequences grouped by length
     fn check_umi_distances(&self, umi_seqs_by_length: &HashMap<usize, Vec<String>>) {
         for seqs in umi_seqs_by_length.values() {
-            let pairs = find_umi_pairs_within_distance(seqs, self.min_distance_diff - 1);
+            let pairs =
+                find_umi_pairs_within_distance(seqs, self.min_distance_diff.saturating_sub(1));
             if !pairs.is_empty() {
                 warn!("###################################################################");
                 warn!("# WARNING: Found pairs of UMIs within min-distance-diff threshold!");
