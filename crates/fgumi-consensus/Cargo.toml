@@ -13,9 +13,9 @@ anyhow = "1.0"
 approx = "0.5"
 bstr = "1.12.1"
 log = "0"
-noodles = { version = "0.106.0", features = ["bam", "sam", "core"] }
+noodles = { version = "0.109.0", features = ["bam", "sam", "core"] }
 rand = "0.10"
-wide = "1.1"
+wide = "1.2"
 fgumi-dna = { workspace = true }
 fgumi-sam = { workspace = true }
 fgumi-metrics = { workspace = true }
