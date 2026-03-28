@@ -24,6 +24,8 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+      - name: Install bwa
+        run: sudo apt-get update && sudo apt-get install -y bwa
       - name: Unit tests
         run: cargo ci-test
   

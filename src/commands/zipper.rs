@@ -46,6 +46,8 @@
 //! - `TemplateIterator`: Lazily groups records by name from a BAM reader
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge()`: Core function that transfers metadata between templates
+use fgumi_lib::defaults;
+
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use anyhow::{Context, Result};
@@ -160,7 +162,7 @@ pub struct Zipper {
     /// BWA -K parameter value (bases per batch). Used to optimize buffer sizing
     /// for stdin input. The buffer grows adaptively based on observed bytes per batch.
     /// Default matches common bwa mem usage.
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
+    #[arg(short = 'K', long = "bwa-chunk-size", default_value_t = defaults::BWA_CHUNK_SIZE)]
     pub bwa_chunk_size: u64,
 
     /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.

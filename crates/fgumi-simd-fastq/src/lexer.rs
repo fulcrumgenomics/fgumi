@@ -41,7 +41,7 @@ pub fn lex_block(block: &[u8; 64]) -> u64 {
 /// Lex a 64-byte block, producing newline bitmask, ACGT bitmask, and 2-bit encoding.
 ///
 /// This is the full classification path for when 2-bit DNA encoding is needed
-/// (e.g., for UMI extraction in a fused pipeline).
+/// (e.g., for UMI extraction in a pipeline).
 #[inline]
 #[must_use]
 pub fn lex_block_full(block: &[u8; 64]) -> FastqBitmask {

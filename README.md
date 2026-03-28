@@ -61,6 +61,7 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 ## Resources
 
 * [Documentation](https://docs.rs/fgumi)
+* [Runall Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/runall.md): End-to-end consensus-calling workflow in one command
 * [Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/best-practice-consensus-pipeline.md): Recommended workflow from FASTQ to consensus
 * [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md): Threading, memory, and compression optimization
 * [Snakemake Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/FastqToConsensus-RnD.smk): Reference implementation
@@ -113,8 +114,14 @@ Enable with: `cargo build --release --features <feature>`
 
 ## Available Tools
 
+Each command can be run individually, giving you full control over each step.
+For a faster, simpler experience, [`fgumi runall`](docs/runall.md) chains any
+or all of these steps into a single command, streaming data in memory to
+eliminate intermediate BAM files.
+
 | Command | Description | Equivalent Tool(s) |
 |---------|-------------|------------------|
+| [`runall`](docs/runall.md) | Run any or all of the consensus-calling workflow in one command | -- |
 | `extract` | Extract UMIs from FASTQ files | `fgbio ExtractUmisFromBam` |
 | `correct` | Correct UMIs based on sequence similarity | `fgbio CorrectUmis` |
 | `zipper` | Restore original FASTQ from unaligned BAM | `fgbio ZipperBams`, `picard MergeBamAlignment` |

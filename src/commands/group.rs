@@ -13,9 +13,11 @@ use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
+use fgumi_lib::defaults;
 use fgumi_lib::grouper::{
-    FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
-    build_templates_from_records,
+    FilterMetrics, GroupFilterConfig, ProcessedPositionGroup, RawPositionGroup,
+    RecordPositionGrouper, build_templates_from_records, filter_template_raw,
+    get_pair_orientation_raw,
 };
 use fgumi_lib::logging::{OperationTimer, log_umi_grouping_summary};
 use fgumi_lib::metrics::group::{FamilySizeMetrics, UmiGroupingMetrics};
@@ -69,23 +71,6 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
 struct CollectedMetrics {
     family_sizes: AHashMap<usize, u64>,
     filter_metrics: FilterMetrics,
-}
-
-/// Configuration for template filtering during group processing.
-#[derive(Clone)]
-struct GroupFilterConfig {
-    /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
-    /// Minimum mapping quality.
-    min_mapq: u8,
-    /// Whether to include non-PF reads.
-    include_non_pf: bool,
-    /// Minimum UMI length (None to disable).
-    min_umi_length: Option<usize>,
-    /// Skip UMI validation (position-only grouping).
-    no_umi: bool,
-    /// Whether to allow fully unmapped templates (both reads unmapped).
-    allow_unmapped: bool,
 }
 
 /// Filter a template based on filtering criteria.
@@ -200,159 +185,8 @@ fn filter_template(
 }
 
 // =============================================================================
-// Raw-byte filter and helper functions
+// Raw-byte helper functions
 // =============================================================================
-
-/// Filter a template in raw-byte mode based on filtering criteria.
-/// Returns true if the template should be kept, false if it should be discarded.
-fn filter_template_raw(
-    template: &Template,
-    config: &GroupFilterConfig,
-    metrics: &mut FilterMetrics,
-) -> bool {
-    use fgumi_lib::sort::bam_fields;
-
-    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-
-    let num_primary_reads = raw_r1.is_some() as u64 + raw_r2.is_some() as u64;
-    metrics.total_templates += num_primary_reads;
-
-    if raw_r1.is_none() && raw_r2.is_none() {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Check if both reads are unmapped
-    let both_unmapped = raw_r1
-        .is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0)
-        && raw_r2.is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0);
-    if both_unmapped && !config.allow_unmapped {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Phase 1: Cheap flag-based checks
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
-
-        if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
-            metrics.discarded_non_pf += num_primary_reads;
-            return false;
-        }
-
-        if (flg & bam_fields::flags::UNMAPPED) == 0 && bam_fields::mapq(raw) < config.min_mapq {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
-        let aux = bam_fields::aux_data_slice(raw);
-        let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
-        let check_umi = !config.no_umi;
-
-        // Single pass over aux data to find both MQ and UMI tags
-        let mut found_mq: Option<i64> = None;
-        let mut found_umi: Option<&[u8]> = None;
-        let mut p = 0;
-        while p + 3 <= aux.len() {
-            let t = [aux[p], aux[p + 1]];
-            let val_type = aux[p + 2];
-
-            if check_umi && t == config.umi_tag && val_type == b'Z' {
-                let start = p + 3;
-                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
-                    found_umi = Some(&aux[start..start + end]);
-                    p = start + end + 1;
-                } else {
-                    break;
-                }
-                if !check_mq || found_mq.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            if check_mq && t == *b"MQ" {
-                // Extract MQ value (common types: C/c/S/s/I/i)
-                found_mq = match val_type {
-                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
-                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
-                    b'S' if p + 5 <= aux.len() => {
-                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b's' if p + 5 <= aux.len() => {
-                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    _ => None,
-                };
-            }
-
-            if let Some(size) = bam_fields::tag_value_size(val_type, &aux[p + 3..]) {
-                p += 3 + size;
-            } else {
-                break;
-            }
-            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
-                break;
-            }
-        }
-
-        // Check mate MAPQ
-        if check_mq {
-            if let Some(mq) = found_mq {
-                if (mq as u8) < config.min_mapq {
-                    metrics.discarded_poor_alignment += num_primary_reads;
-                    return false;
-                }
-            }
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        // Check UMI for Ns and minimum length
-        if let Some(umi_bytes) = found_umi {
-            match validate_umi(umi_bytes) {
-                UmiValidation::ContainsN => {
-                    metrics.discarded_ns_in_umi += num_primary_reads;
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length {
-                        if base_count < min_len {
-                            metrics.discarded_umi_too_short += num_primary_reads;
-                            return false;
-                        }
-                    }
-                }
-            }
-        } else {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    metrics.accepted_templates += num_primary_reads;
-    true
-}
 
 /// Check if R1 is genomically earlier than R2 using raw bytes.
 ///
@@ -369,17 +203,6 @@ fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
     let r1_pos = bam_fields::unclipped_5prime_from_raw_bam(r1);
     let r2_pos = bam_fields::unclipped_5prime_from_raw_bam(r2);
     r1_pos <= r2_pos
-}
-
-/// Get pair orientation from raw-byte template.
-fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
-    use fgumi_lib::sort::bam_fields;
-
-    let r1_positive =
-        template.raw_r1().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
-    let r2_positive =
-        template.raw_r2().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
-    (r1_positive, r2_positive)
 }
 
 // =============================================================================
@@ -742,11 +565,11 @@ pub struct GroupReadsByUmi {
     pub grouping_metrics: Option<PathBuf>,
 
     /// The tag containing the raw UMI
-    #[arg(short = 't', long = "raw-tag", default_value = "RX")]
+    #[arg(short = 't', long = "raw-tag", default_value = defaults::UMI_TAG)]
     pub raw_tag: String,
 
     /// The output tag for UMI grouping
-    #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
+    #[arg(short = 'T', long = "assign-tag", default_value = defaults::MI_TAG)]
     pub assign_tag: String,
 
     /// SAM tag containing the cell barcode.
@@ -754,7 +577,7 @@ pub struct GroupReadsByUmi {
     /// When set, reads at the same genomic coordinates are partitioned by cell barcode before
     /// UMI assignment, so reads from different cells are never grouped together even if they
     /// share a UMI and position. No correction is performed on the cell barcode itself.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: String,
 
     /// Minimum mapping quality for mapped reads
@@ -787,7 +610,7 @@ pub struct GroupReadsByUmi {
     pub strategy: Strategy,
 
     /// The allowable number of edits between UMIs
-    #[arg(short = 'e', long = "edits", default_value = "1")]
+    #[arg(short = 'e', long = "edits", default_value_t = defaults::GROUP_MAX_EDITS)]
     pub edits: u32,
 
     /// The minimum UMI length
@@ -804,7 +627,7 @@ pub struct GroupReadsByUmi {
 
     /// Minimum UMIs per position to use N-gram/BK-tree index for faster grouping.
     /// Set to 0 to always use linear scan. Only affects Adjacency/Paired strategies.
-    #[arg(long = "index-threshold", default_value = "100")]
+    #[arg(long = "index-threshold", default_value_t = defaults::GROUP_INDEX_THRESHOLD)]
     pub index_threshold: usize,
 
     /// Skip UMI-based grouping; group by position only. Forces identity strategy
@@ -1162,11 +985,11 @@ impl Command for GroupReadsByUmi {
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
-                        filter_metrics: FilterMetrics::new(),
+                        filter_metrics: FilterMetrics::default(),
                         input_record_count,
                     });
                 }
-                let mut filter_metrics = FilterMetrics::new();
+                let mut filter_metrics = FilterMetrics::default();
 
                 // Track memory usage if debug mode is enabled (optimized for hot path)
                 #[cfg(feature = "memory-debug")]
@@ -1499,7 +1322,7 @@ impl Command for GroupReadsByUmi {
         // Aggregate collected metrics from lock-free SegQueue
         // Drain all metrics and merge them
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_metrics = FilterMetrics::default();
 
         while let Some(m) = collected_metrics.pop() {
             for (size, count) in m.family_sizes {
@@ -1579,7 +1402,7 @@ impl GroupReadsByUmi {
         let mut grouper = RecordPositionGrouper::new();
 
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_metrics = FilterMetrics::default();
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut next_mi_base: u64 = 0;
 
@@ -1694,7 +1517,7 @@ impl GroupReadsByUmi {
         // Build templates from raw records
         let all_templates = build_templates_from_records(group.records)?;
 
-        let mut filter_metrics = FilterMetrics::new();
+        let mut filter_metrics = FilterMetrics::default();
 
         // Filter templates
         let filtered_templates: Vec<Template> = all_templates
@@ -4535,7 +4358,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
@@ -4559,7 +4382,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -4584,7 +4407,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_non_pf, 1);
     }
@@ -4608,7 +4431,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_ns_in_umi, 1);
     }
@@ -4632,7 +4455,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_umi_too_short, 1);
     }
@@ -4655,7 +4478,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -4703,7 +4526,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
         assert!(!filter_template_raw(&template, &config, &mut metrics));
     }
@@ -4780,7 +4603,7 @@ mod tests {
             allow_unmapped: true,
         };
 
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
@@ -4804,7 +4627,7 @@ mod tests {
             allow_unmapped: false,
         };
 
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");
