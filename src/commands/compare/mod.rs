@@ -5,6 +5,7 @@
 
 pub mod bams;
 pub mod metrics;
+pub(crate) mod raw_compare;
 
 use crate::commands::command::Command;
 use anyhow::Result;

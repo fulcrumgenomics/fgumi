@@ -9,6 +9,8 @@ mod test_bgzf_eof;
 mod test_clip_command;
 mod test_codec_command;
 mod test_codec_pipeline;
+#[cfg(feature = "compare")]
+mod test_compare_bams;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;
