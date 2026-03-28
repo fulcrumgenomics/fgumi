@@ -143,7 +143,7 @@ pub fn radix_sort_coordinate_adaptive<T: Clone>(
 
 /// Calculate number of bytes needed to represent a u64 value.
 #[inline]
-fn bytes_needed_u64(val: u64) -> usize {
+pub(crate) fn bytes_needed_u64(val: u64) -> usize {
     if val == 0 {
         return 0;
     }
