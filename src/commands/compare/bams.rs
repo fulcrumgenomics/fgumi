@@ -17,10 +17,12 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::{Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, bounded};
-use fgumi_lib::bam_io::{BamReaderAuto, create_bam_reader};
+use fgumi_lib::bam_io::{RawBamReaderAuto, create_raw_bam_reader};
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_raw_bam::fields as raw_fields;
+use fgumi_raw_bam::{RawRecord, find_int_tag, find_string_tag};
 use itertools::Itertools;
 use log::info;
 use noodles::sam::Header;
@@ -31,11 +33,13 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::data::field::value::Array;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::thread;
 
 use crate::commands::command::Command;
+
+use super::raw_compare::{raw_compare_structured, raw_records_byte_equal};
 
 /// Comparison mode for BAM files
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -357,199 +361,15 @@ fn format_array(arr: &Array) -> String {
     }
 }
 
-/// Get the MI tag value from a record.
-fn get_mi_tag(record: &RecordBuf) -> Option<String> {
-    let mi_tag = Tag::from([b'M', b'I']);
-    record.data().get(&mi_tag).map(format_tag_value)
-}
-
 /// Convert a record's name to a String, returning "*" if missing.
 fn record_name_to_string(record: &RecordBuf) -> String {
     record.name().map_or_else(|| "*".to_string(), std::string::ToString::to_string)
 }
 
-// ============================================================================
-// Zero-copy comparison helpers
-// ============================================================================
-
-/// Extract the numeric value from an integer Value as i64 for semantic comparison.
-fn value_to_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::Int8(i) => Some(i64::from(*i)),
-        Value::UInt8(i) => Some(i64::from(*i)),
-        Value::Int16(i) => Some(i64::from(*i)),
-        Value::UInt16(i) => Some(i64::from(*i)),
-        Value::Int32(i) => Some(i64::from(*i)),
-        Value::UInt32(i) => Some(i64::from(*i)),
-        _ => None,
-    }
-}
-
-/// Compare two tag values without allocating strings (unless they differ).
-/// For floats, we use bit-exact comparison since BAM comparison requires exact equality.
-/// For integers, we compare semantically (by numeric value, not storage type).
-#[allow(clippy::float_cmp)]
-fn tag_values_equal(v1: &Value, v2: &Value) -> bool {
-    match (v1, v2) {
-        (Value::Character(a), Value::Character(b)) => a == b,
-        // For integers, compare by numeric value regardless of storage type
-        (
-            Value::Int8(_)
-            | Value::UInt8(_)
-            | Value::Int16(_)
-            | Value::UInt16(_)
-            | Value::Int32(_)
-            | Value::UInt32(_),
-            Value::Int8(_)
-            | Value::UInt8(_)
-            | Value::Int16(_)
-            | Value::UInt16(_)
-            | Value::Int32(_)
-            | Value::UInt32(_),
-        ) => value_to_i64(v1) == value_to_i64(v2),
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::String(a), Value::String(b)) => a == b,
-        (Value::Hex(a), Value::Hex(b)) => a == b,
-        (Value::Array(a), Value::Array(b)) => arrays_equal(a, b),
-        _ => false, // Different types (e.g., string vs integer)
-    }
-}
-
-/// Extract array elements as i64 for semantic comparison.
-fn array_to_i64_vec(a: &Array) -> Option<Vec<i64>> {
-    match a {
-        Array::Int8(v) => Some(v.iter().map(|&i| i64::from(i)).collect()),
-        Array::UInt8(v) => Some(v.iter().map(|&i| i64::from(i)).collect()),
-        Array::Int16(v) => Some(v.iter().map(|&i| i64::from(i)).collect()),
-        Array::UInt16(v) => Some(v.iter().map(|&i| i64::from(i)).collect()),
-        Array::Int32(v) => Some(v.iter().map(|&i| i64::from(i)).collect()),
-        Array::UInt32(v) => Some(v.iter().map(|&i| i64::from(i)).collect()),
-        Array::Float(_) => None,
-    }
-}
-
-/// Check if an array is an integer array type.
-fn is_integer_array(a: &Array) -> bool {
-    matches!(
-        a,
-        Array::Int8(_)
-            | Array::UInt8(_)
-            | Array::Int16(_)
-            | Array::UInt16(_)
-            | Array::Int32(_)
-            | Array::UInt32(_)
-    )
-}
-
-/// Compare two arrays for equality.
-/// For integer arrays, we compare semantically (by numeric values, not storage type).
-/// For float arrays, we require exact type match.
-#[allow(clippy::float_cmp)]
-fn arrays_equal(a: &Array, b: &Array) -> bool {
-    // For integer arrays, compare semantically
-    if is_integer_array(a) && is_integer_array(b) {
-        return array_to_i64_vec(a) == array_to_i64_vec(b);
-    }
-    // For float arrays, require exact type match
-    match (a, b) {
-        (Array::Float(va), Array::Float(vb)) => va == vb,
-        _ => false, // Different types or mixed int/float
-    }
-}
-
-/// Lazy tag comparison: returns true if tags are equal (values only, order independent).
-/// Avoids `BTreeMap` allocation when tags match.
-fn tags_equal_lazy(record1: &RecordBuf, record2: &RecordBuf) -> bool {
-    let data1 = record1.data();
-    let data2 = record2.data();
-
-    // Quick length check first
-    if data1.len() != data2.len() {
-        return false;
-    }
-
-    // Compare each tag from record1 against record2
-    for (tag, val1) in data1.iter() {
-        match data2.get(&tag) {
-            Some(val2) if tag_values_equal(val1, val2) => continue,
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// Check if tag order matches (assuming values already match).
-fn tags_order_matches(record1: &RecordBuf, record2: &RecordBuf) -> bool {
-    let iter1 = record1.data().iter();
-    let iter2 = record2.data().iter();
-
-    for ((tag1, _), (tag2, _)) in iter1.zip(iter2) {
-        if tag1 != tag2 {
-            return false;
-        }
-    }
-    true
-}
-
-/// Zero-copy comparison of core fields. Returns true if all core fields match.
-fn core_fields_equal(record1: &RecordBuf, record2: &RecordBuf) -> bool {
-    // Compare in order of likelihood to differ / cost to compare
-    // Flags are cheap and often differ
-    if record1.flags() != record2.flags() {
-        return false;
-    }
-
-    // Names - compare Option<&BStr> directly
-    if record1.name() != record2.name() {
-        return false;
-    }
-
-    // Reference sequence ID
-    if record1.reference_sequence_id() != record2.reference_sequence_id() {
-        return false;
-    }
-
-    // Position
-    if record1.alignment_start() != record2.alignment_start() {
-        return false;
-    }
-
-    // Mapping quality
-    if record1.mapping_quality() != record2.mapping_quality() {
-        return false;
-    }
-
-    // Mate reference sequence ID
-    if record1.mate_reference_sequence_id() != record2.mate_reference_sequence_id() {
-        return false;
-    }
-
-    // Mate position
-    if record1.mate_alignment_start() != record2.mate_alignment_start() {
-        return false;
-    }
-
-    // Template length
-    if record1.template_length() != record2.template_length() {
-        return false;
-    }
-
-    // Sequence - compare bytes directly
-    if record1.sequence().as_ref() != record2.sequence().as_ref() {
-        return false;
-    }
-
-    // Quality scores
-    if record1.quality_scores().as_ref() != record2.quality_scores().as_ref() {
-        return false;
-    }
-
-    // CIGAR - compare ops
-    let cigar1 = record1.cigar();
-    let cigar2 = record2.cigar();
-    let ops1: Vec<_> = cigar1.iter().flatten().collect();
-    let ops2: Vec<_> = cigar2.iter().flatten().collect();
-    ops1 == ops2
+/// Check if the first-in-template (R1) flag is set in raw BAM record bytes.
+fn is_first_segment_raw(raw: &RawRecord) -> bool {
+    let flags = raw_fields::flags(raw.as_ref());
+    flags & raw_fields::flags::FIRST_SEGMENT != 0
 }
 
 // ============================================================================
@@ -569,9 +389,11 @@ struct RecordCompareResult {
 #[derive(Debug)]
 struct GroupingCompareResult {
     record_num: u64,
-    read_key: ReadKey,
-    mi1: Option<String>,
-    mi2: Option<String>,
+    key_hash: ReadKeyHash,
+    /// Read name as String, only populated when needed for error reporting
+    read_name_for_display: Option<String>,
+    mi1: Option<i64>,
+    mi2: Option<i64>,
     name_match: bool,
     flag_match: bool,
     diff_detail: Option<DiffDetail>,
@@ -581,16 +403,12 @@ struct GroupingCompareResult {
 // Types and MI map helpers (using ahash)
 // ============================================================================
 
-/// A unique identifier for a read: (`read_name`, `is_read1`)
-/// For display purposes only - the actual key is a hash
-type ReadKey = (String, bool);
-
 /// Compact read key using hash - saves ~70 bytes per entry vs (String, bool)
 type ReadKeyHash = u64;
 
-/// Compute a hash for a read key (`read_name`, `is_read1`)
+/// Compute a hash for a read key from raw bytes (avoids String allocation).
 #[inline]
-fn hash_read_key(name: &str, is_read1: bool) -> ReadKeyHash {
+fn hash_read_key_raw(name: &[u8], is_read1: bool) -> ReadKeyHash {
     use std::hash::{Hash, Hasher};
     let mut hasher = ahash::AHasher::default();
     name.hash(&mut hasher);
@@ -609,22 +427,20 @@ fn build_mi_groups_compact(
     groups
 }
 
-/// Build a map from MI value to set of read keys that have that MI.
-/// (Used by full mode which needs full keys for error reporting)
-fn build_mi_groups<'a>(
-    mi_map: &'a AHashMap<ReadKey, String>,
-) -> AHashMap<&'a String, AHashSet<&'a ReadKey>> {
-    let mut groups: AHashMap<&'a String, AHashSet<&'a ReadKey>> = AHashMap::new();
-    for (read_key, mi) in mi_map {
-        groups.entry(mi).or_default().insert(read_key);
-    }
-    groups
-}
-
 /// Result from parallel MI extraction for a single record
 struct MiExtractResult {
     key_hash: ReadKeyHash,
     mi: Option<i64>,
+}
+
+/// Extract MI tag from raw BAM record bytes directly as i64.
+/// Tries integer-type MI first, then falls back to string-type MI parsed as i64.
+fn get_mi_tag_raw_i64(raw: &RawRecord) -> Option<i64> {
+    let aux = raw_fields::aux_data_slice(raw.as_ref());
+    if let Some(v) = find_int_tag(aux, b"MI") {
+        return Some(v);
+    }
+    find_string_tag(aux, b"MI").and_then(|bytes| std::str::from_utf8(bytes).ok()?.parse().ok())
 }
 
 /// Build an MI map from a BAM file using parallel batch processing.
@@ -634,24 +450,23 @@ fn build_mi_map_parallel(
     threads: usize,
     batch_size: usize,
 ) -> Result<(AHashMap<ReadKeyHash, i64>, u64)> {
-    let (rx, _header) = start_batch_reader(path.to_path_buf(), threads, batch_size)?;
+    let (rx, _header) = start_raw_batch_reader(path.to_path_buf(), threads, batch_size)?;
 
     let mut mi_map: AHashMap<ReadKeyHash, i64> = AHashMap::new();
     let mut total_records: u64 = 0;
 
     loop {
         match rx.recv() {
-            Ok(BatchMessage::Batch(batch)) => {
+            Ok(RawBatchMessage::Batch(batch)) => {
                 // Extract MI values in parallel using rayon
                 let results: Vec<MiExtractResult> = batch
                     .par_iter()
-                    .map(|record| {
-                        let name = record_name_to_string(record);
-                        let is_read1 = record.flags().is_first_segment();
-                        let key_hash = hash_read_key(&name, is_read1);
+                    .map(|raw| {
+                        let name_bytes = raw_fields::read_name(raw.as_ref());
+                        let is_read1 = is_first_segment_raw(raw);
+                        let key_hash = hash_read_key_raw(name_bytes, is_read1);
 
-                        // Parse MI tag as i64 directly
-                        let mi = get_mi_tag(record).and_then(|s| s.parse::<i64>().ok());
+                        let mi = get_mi_tag_raw_i64(raw);
 
                         MiExtractResult { key_hash, mi }
                     })
@@ -665,8 +480,8 @@ fn build_mi_map_parallel(
                     }
                 }
             }
-            Ok(BatchMessage::Eof) => break,
-            Ok(BatchMessage::Error(e)) => bail!("Error reading BAM: {e}"),
+            Ok(RawBatchMessage::Eof) => break,
+            Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM: {e}"),
             Err(_) => break, // Channel closed
         }
     }
@@ -703,27 +518,26 @@ struct UnorderedGroupingStats {
 // Double-buffered batch reading
 // ============================================================================
 
-/// Message type for the double-buffered reader channel
-enum BatchMessage {
-    /// A batch of records
-    Batch(Vec<RecordBuf>),
-    /// End of file reached
+/// Message type for the double-buffered raw reader channel.
+enum RawBatchMessage {
+    /// A batch of raw records.
+    Batch(Vec<RawRecord>),
+    /// End of file reached.
     Eof,
-    /// Error occurred during reading
+    /// Error occurred during reading.
     Error(String),
 }
 
-/// Reads a single batch of records from a BAM reader.
-fn read_batch(
-    reader: &mut BamReaderAuto,
-    header: &Header,
+/// Reads a single batch of raw records from a BAM reader.
+fn read_raw_batch(
+    reader: &mut RawBamReaderAuto,
     batch_size: usize,
-) -> std::io::Result<(Vec<RecordBuf>, bool)> {
+) -> std::io::Result<(Vec<RawRecord>, bool)> {
     let mut batch = Vec::with_capacity(batch_size);
-    let mut record = RecordBuf::default();
+    let mut record = RawRecord::new();
 
     for _ in 0..batch_size {
-        if reader.read_record_buf(header, &mut record)? == 0 {
+        if reader.read_record(&mut record)? == 0 {
             return Ok((batch, true)); // EOF
         }
         batch.push(std::mem::take(&mut record));
@@ -731,35 +545,34 @@ fn read_batch(
     Ok((batch, false))
 }
 
-/// Starts a background reader thread that sends batches through a channel.
-/// Returns a receiver for the batches.
-fn start_batch_reader(
+/// Starts a background reader thread that sends raw record batches through a channel.
+/// Returns a receiver for the batches and the BAM header.
+fn start_raw_batch_reader(
     path: PathBuf,
     threads: usize,
     batch_size: usize,
-) -> Result<(Receiver<BatchMessage>, Header)> {
+) -> Result<(Receiver<RawBatchMessage>, Header)> {
     // Open the reader on the main thread to get the header
-    let (mut reader, header) = create_bam_reader(&path, threads)?;
-    let header_clone = header.clone();
+    let (mut reader, header) = create_raw_bam_reader(&path, threads)?;
 
     // Create a bounded channel (double buffering = 2 slots)
-    let (tx, rx) = bounded::<BatchMessage>(2);
+    let (tx, rx) = bounded::<RawBatchMessage>(2);
 
     // Spawn the reader thread
     thread::spawn(move || {
         loop {
-            match read_batch(&mut reader, &header_clone, batch_size) {
+            match read_raw_batch(&mut reader, batch_size) {
                 Ok((batch, eof)) => {
-                    if !batch.is_empty() && tx.send(BatchMessage::Batch(batch)).is_err() {
+                    if !batch.is_empty() && tx.send(RawBatchMessage::Batch(batch)).is_err() {
                         break; // Receiver dropped
                     }
                     if eof {
-                        let _ = tx.send(BatchMessage::Eof);
+                        let _ = tx.send(RawBatchMessage::Eof);
                         break;
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(BatchMessage::Error(e.to_string()));
+                    let _ = tx.send(RawBatchMessage::Error(e.to_string()));
                     break;
                 }
             }
@@ -769,10 +582,33 @@ fn start_batch_reader(
     Ok((rx, header))
 }
 
-/// Compares a batch of record pairs in parallel using rayon.
-fn compare_batch_parallel(
-    batch1: &[RecordBuf],
-    batch2: &[RecordBuf],
+/// Deserialize raw BAM record bytes into a noodles `RecordBuf`.
+///
+/// This is used only when records differ at the raw byte level and we need
+/// human-readable field values for diff reporting. The raw bytes are the BAM
+/// record body WITHOUT the 4-byte length prefix.
+///
+/// # Errors
+///
+/// Returns an error if the raw bytes cannot be parsed as a valid BAM record.
+fn deserialize_raw_record(raw: &RawRecord) -> Result<RecordBuf> {
+    let bufs = fgumi_raw_bam::raw_records_to_record_bufs(&[raw.as_ref().to_vec()])?;
+    bufs.into_iter().next().ok_or_else(|| anyhow!("failed to deserialize raw BAM record"))
+}
+
+/// Compares a batch of raw record pairs in parallel using a three-tier strategy.
+///
+/// **Tier 1:** Full byte memcmp — if records are byte-identical, return immediately.
+/// **Tier 2:** Structured raw comparison — compare core fields and tags at the byte
+///   level without full deserialization. If core and tags match (possibly with different
+///   tag order), return without deserializing.
+/// **Tier 3:** Full deserialization — only when records actually differ, deserialize
+///   to `RecordBuf` for human-readable diff reporting.
+///
+/// Returns `(results, core_matches, core_diffs, tag_matches, tag_diffs, tag_order_diffs)`.
+fn compare_raw_batch_parallel(
+    batch1: &[RawRecord],
+    batch2: &[RawRecord],
     header1: &Header,
     header2: &Header,
     start_index: u64,
@@ -784,20 +620,104 @@ fn compare_batch_parallel(
         .map(|(i, (r1, r2))| {
             let record_num = start_index + i as u64 + 1;
 
-            // Use zero-copy comparison first
-            let core_match = core_fields_equal(r1, r2);
+            // Tier 1: Full byte memcmp — handles the common case (identical BAMs)
+            if raw_records_byte_equal(r1, r2) {
+                return RecordCompareResult {
+                    core_match: true,
+                    tags_match: true,
+                    tag_order_match: true,
+                    diff_detail: None,
+                };
+            }
 
-            // Use lazy tag comparison
-            let tags_match = tags_equal_lazy(r1, r2);
-            let tag_order_match = if tags_match { tags_order_matches(r1, r2) } else { false };
+            // Tier 2: Structured raw comparison — avoids full deserialization
+            // Note: RawCompareResult.tags_match = byte-identical tags,
+            //       RawCompareResult.tag_order_match = semantically equal (order-independent)
+            // RecordCompareResult.tags_match = semantic match, .tag_order_match = byte-identical
+            let raw_result = raw_compare_structured(r1, r2);
+            if raw_result.core_match && raw_result.tag_order_match {
+                return RecordCompareResult {
+                    core_match: true,
+                    tags_match: true,
+                    tag_order_match: raw_result.tags_match,
+                    diff_detail: None,
+                };
+            }
 
-            // Collect detailed diff if there's a mismatch.
-            // Note: We collect all diffs here (regardless of max_diffs) because the batch
-            // index `i` doesn't reflect actual diff count. We truncate to max_diffs later
-            // when aggregating results, as diffs are rare and this has minimal overhead.
-            let diff_detail = if !core_match {
-                let core1 = get_core_fields(r1, header1);
-                let core2 = get_core_fields(r2, header2);
+            // Tier 3: Full deserialization for diff reporting
+            let rec1 = match deserialize_raw_record(r1) {
+                Ok(r) => r,
+                Err(e) => {
+                    return RecordCompareResult {
+                        core_match: false,
+                        tags_match: false,
+                        tag_order_match: false,
+                        diff_detail: Some(DiffDetail {
+                            record_num,
+                            qname: format!("<deserialization error: {e}>"),
+                            flags: String::new(),
+                            diff_type: DiffType::CoreDiff,
+                            diffs: vec![format!("Failed to deserialize record from BAM1: {e}")],
+                        }),
+                    };
+                }
+            };
+            let rec2 = match deserialize_raw_record(r2) {
+                Ok(r) => r,
+                Err(e) => {
+                    return RecordCompareResult {
+                        core_match: false,
+                        tags_match: false,
+                        tag_order_match: false,
+                        diff_detail: Some(DiffDetail {
+                            record_num,
+                            qname: record_name_to_string(&rec1),
+                            flags: rec1.flags().bits().to_string(),
+                            diff_type: DiffType::CoreDiff,
+                            diffs: vec![format!("Failed to deserialize record from BAM2: {e}")],
+                        }),
+                    };
+                }
+            };
+
+            let diff_detail = if raw_result.core_match {
+                // Core matches but tags differ
+                let tags1 = get_tags_map(&rec1);
+                let tags2 = get_tags_map(&rec2);
+                let mut all_tags: Vec<&String> = tags1.keys().chain(tags2.keys()).collect();
+                all_tags.sort();
+                all_tags.dedup();
+                let diffs: Vec<String> = all_tags
+                    .iter()
+                    .filter_map(|tag| {
+                        let v1 = tags1.get(*tag);
+                        let v2 = tags2.get(*tag);
+                        if v1 == v2 {
+                            None
+                        } else {
+                            Some(format!(
+                                "{tag}:\n{}\n",
+                                CompareBams::format_diff(
+                                    format!("{v1:?}"),
+                                    format!("{v2:?}"),
+                                    "      "
+                                )
+                            ))
+                        }
+                    })
+                    .collect();
+                let qname = record_name_to_string(&rec1);
+                Some(DiffDetail {
+                    record_num,
+                    qname,
+                    flags: rec1.flags().bits().to_string(),
+                    diff_type: DiffType::TagDiff,
+                    diffs,
+                })
+            } else {
+                // Core fields differ
+                let core1 = get_core_fields(&rec1, header1);
+                let core2 = get_core_fields(&rec2, header2);
                 let diffs: Vec<String> = core1
                     .iter()
                     .zip(core2.iter())
@@ -821,44 +741,14 @@ fn compare_batch_parallel(
                     diff_type: DiffType::CoreDiff,
                     diffs,
                 })
-            } else if !tags_match {
-                let tags1 = get_tags_map(r1);
-                let tags2 = get_tags_map(r2);
-                let mut all_tags: Vec<&String> = tags1.keys().chain(tags2.keys()).collect();
-                all_tags.sort();
-                all_tags.dedup();
-                let diffs: Vec<String> = all_tags
-                    .iter()
-                    .filter_map(|tag| {
-                        let v1 = tags1.get(*tag);
-                        let v2 = tags2.get(*tag);
-                        if v1 == v2 {
-                            None
-                        } else {
-                            Some(format!(
-                                "{tag}:\n{}\n",
-                                CompareBams::format_diff(
-                                    format!("{v1:?}"),
-                                    format!("{v2:?}"),
-                                    "      "
-                                )
-                            ))
-                        }
-                    })
-                    .collect();
-                let qname = record_name_to_string(r1);
-                Some(DiffDetail {
-                    record_num,
-                    qname,
-                    flags: r1.flags().bits().to_string(),
-                    diff_type: DiffType::TagDiff,
-                    diffs,
-                })
-            } else {
-                None
             };
 
-            RecordCompareResult { core_match, tags_match, tag_order_match, diff_detail }
+            RecordCompareResult {
+                core_match: raw_result.core_match,
+                tags_match: raw_result.tag_order_match,
+                tag_order_match: raw_result.tags_match,
+                diff_detail,
+            }
         })
         .collect();
 
@@ -888,10 +778,13 @@ fn compare_batch_parallel(
     (results, core_matches, core_diffs, tag_matches, tag_diffs, tag_order_diffs)
 }
 
-/// Compares a batch of record pairs for grouping mode in parallel.
-fn compare_batch_grouping_parallel(
-    batch1: &[RecordBuf],
-    batch2: &[RecordBuf],
+/// Compare a batch of raw records for grouping data (read name, R1/R2 flag, MI tag).
+///
+/// Uses zero-copy field accessors on raw BAM bytes instead of decoded `RecordBuf`.
+/// Read names are compared as raw bytes; String conversion only happens for error reporting.
+fn compare_raw_batch_grouping_parallel(
+    batch1: &[RawRecord],
+    batch2: &[RawRecord],
     start_index: u64,
     max_diffs: usize,
     existing_diffs: usize,
@@ -902,44 +795,64 @@ fn compare_batch_grouping_parallel(
         .enumerate()
         .map(|(i, (r1, r2))| {
             let record_num = start_index + i as u64 + 1;
-            let qname1 = record_name_to_string(r1);
-            let qname2 = record_name_to_string(r2);
-            let is_read1_r1 = r1.flags().is_first_segment();
-            let is_read1_r2 = r2.flags().is_first_segment();
+            let name1_bytes = raw_fields::read_name(r1.as_ref());
+            let name2_bytes = raw_fields::read_name(r2.as_ref());
+            let is_read1_r1 = is_first_segment_raw(r1);
+            let is_read1_r2 = is_first_segment_raw(r2);
 
-            let name_match = qname1 == qname2;
+            let name_match = name1_bytes == name2_bytes;
             let flag_match = is_read1_r1 == is_read1_r2;
 
-            let read_key = (qname1.clone(), is_read1_r1);
-            let mi1 = get_mi_tag(r1);
-            let mi2 = get_mi_tag(r2);
+            let key_hash = hash_read_key_raw(name1_bytes, is_read1_r1);
+            let mi1 = get_mi_tag_raw_i64(r1);
+            let mi2 = get_mi_tag_raw_i64(r2);
 
-            let diff_detail = if !name_match && existing_diffs + i < max_diffs {
-                Some(DiffDetail {
-                    record_num,
-                    qname: qname1.clone(),
-                    flags: r1.flags().bits().to_string(),
-                    diff_type: DiffType::ReadNameMismatch,
-                    diffs: vec![format!("Read names differ: '{}' vs '{}'", qname1, qname2)],
-                })
-            } else if name_match && !flag_match && existing_diffs + i < max_diffs {
-                Some(DiffDetail {
-                    record_num,
-                    qname: qname1.clone(),
-                    flags: r1.flags().bits().to_string(),
-                    diff_type: DiffType::FlagMismatch,
-                    diffs: vec![format!(
-                        "R1/R2 flags differ: is_read1={} vs is_read1={}",
-                        is_read1_r1, is_read1_r2
-                    )],
-                })
+            let within_diff_budget = existing_diffs + i < max_diffs;
+            let needs_detail = within_diff_budget && (!name_match || !flag_match);
+            let diff_detail = if needs_detail {
+                // Only allocate Strings when we actually need them for error reporting
+                let qname1 = String::from_utf8_lossy(name1_bytes).into_owned();
+                if name_match {
+                    Some(DiffDetail {
+                        record_num,
+                        qname: qname1,
+                        flags: raw_fields::flags(r1.as_ref()).to_string(),
+                        diff_type: DiffType::FlagMismatch,
+                        diffs: vec![format!(
+                            "R1/R2 flags differ: is_read1={} vs is_read1={}",
+                            is_read1_r1, is_read1_r2
+                        )],
+                    })
+                } else {
+                    let qname2 = String::from_utf8_lossy(name2_bytes).into_owned();
+                    Some(DiffDetail {
+                        record_num,
+                        qname: qname1,
+                        flags: raw_fields::flags(r1.as_ref()).to_string(),
+                        diff_type: DiffType::ReadNameMismatch,
+                        diffs: vec![format!(
+                            "Read names differ: '{}' vs '{}'",
+                            String::from_utf8_lossy(name1_bytes),
+                            qname2
+                        )],
+                    })
+                }
+            } else {
+                None
+            };
+
+            // Populate read name for display when we need it for missing-MI error reporting
+            let needs_name = within_diff_budget && (mi1.is_none() ^ mi2.is_none());
+            let read_name_for_display = if needs_name {
+                Some(String::from_utf8_lossy(name1_bytes).into_owned())
             } else {
                 None
             };
 
             GroupingCompareResult {
                 record_num,
-                read_key,
+                key_hash,
+                read_name_for_display,
                 mi1,
                 mi2,
                 name_match,
@@ -1024,8 +937,8 @@ impl CompareBams {
         );
 
         // Start double-buffered readers for both BAM files
-        let (rx1, header1) = start_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
-        let (rx2, header2) = start_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
+        let (rx1, header1) = start_raw_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
+        let (rx2, header2) = start_raw_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
 
         // Progress tracking
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
@@ -1033,20 +946,20 @@ impl CompareBams {
         // Process batches
         let mut bam1_eof = false;
         let mut bam2_eof = false;
-        let mut pending_batch1: Option<Vec<RecordBuf>> = None;
-        let mut pending_batch2: Option<Vec<RecordBuf>> = None;
+        let mut pending_batch1: Option<Vec<RawRecord>> = None;
+        let mut pending_batch2: Option<Vec<RawRecord>> = None;
         let mut current_index = 0u64;
 
         loop {
             // Get next batch from BAM1 if needed
             if pending_batch1.is_none() && !bam1_eof {
                 match rx1.recv() {
-                    Ok(BatchMessage::Batch(batch)) => {
+                    Ok(RawBatchMessage::Batch(batch)) => {
                         stats.bam1_count += batch.len() as u64;
                         pending_batch1 = Some(batch);
                     }
-                    Ok(BatchMessage::Eof) => bam1_eof = true,
-                    Ok(BatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
+                    Ok(RawBatchMessage::Eof) => bam1_eof = true,
+                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
                     Err(_) => bam1_eof = true,
                 }
             }
@@ -1054,12 +967,12 @@ impl CompareBams {
             // Get next batch from BAM2 if needed
             if pending_batch2.is_none() && !bam2_eof {
                 match rx2.recv() {
-                    Ok(BatchMessage::Batch(batch)) => {
+                    Ok(RawBatchMessage::Batch(batch)) => {
                         stats.bam2_count += batch.len() as u64;
                         pending_batch2 = Some(batch);
                     }
-                    Ok(BatchMessage::Eof) => bam2_eof = true,
-                    Ok(BatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
+                    Ok(RawBatchMessage::Eof) => bam2_eof = true,
+                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
                     Err(_) => bam2_eof = true,
                 }
             }
@@ -1081,14 +994,14 @@ impl CompareBams {
                     // Drain remaining batches to get accurate counts
                     if pending_batch1.is_some() {
                         while let Ok(msg) = rx1.recv() {
-                            if let BatchMessage::Batch(batch) = msg {
+                            if let RawBatchMessage::Batch(batch) = msg {
                                 stats.bam1_count += batch.len() as u64;
                             }
                         }
                     }
                     if pending_batch2.is_some() {
                         while let Ok(msg) = rx2.recv() {
-                            if let BatchMessage::Batch(batch) = msg {
+                            if let RawBatchMessage::Batch(batch) = msg {
                                 stats.bam2_count += batch.len() as u64;
                             }
                         }
@@ -1108,8 +1021,13 @@ impl CompareBams {
             let (cmp_batch2, remainder2) = batch2.split_at(min_len);
 
             // Compare the aligned portions in parallel
-            let (results, core_m, core_d, tag_m, tag_d, tag_ord) =
-                compare_batch_parallel(cmp_batch1, cmp_batch2, &header1, &header2, current_index);
+            let (results, core_m, core_d, tag_m, tag_d, tag_ord) = compare_raw_batch_parallel(
+                cmp_batch1,
+                cmp_batch2,
+                &header1,
+                &header2,
+                current_index,
+            );
 
             stats.core_matches += core_m as u64;
             stats.core_diffs += core_d as u64;
@@ -1203,13 +1121,13 @@ impl CompareBams {
 
         info!("Starting full comparison with {} threads, batch size {}", self.threads, batch_size);
 
-        // Maps: read_key -> MI value for each BAM (using ahash)
-        let mut mi_map1: AHashMap<ReadKey, String> = AHashMap::new();
-        let mut mi_map2: AHashMap<ReadKey, String> = AHashMap::new();
+        // Maps: read_key_hash -> MI value for each BAM (compact i64 representation)
+        let mut mi_map1: AHashMap<ReadKeyHash, i64> = AHashMap::new();
+        let mut mi_map2: AHashMap<ReadKeyHash, i64> = AHashMap::new();
 
         // Start double-buffered readers for both BAM files
-        let (rx1, header1) = start_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
-        let (rx2, header2) = start_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
+        let (rx1, header1) = start_raw_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
+        let (rx2, header2) = start_raw_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
 
         // Progress tracking
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
@@ -1217,20 +1135,20 @@ impl CompareBams {
         // Process batches
         let mut bam1_eof = false;
         let mut bam2_eof = false;
-        let mut pending_batch1: Option<Vec<RecordBuf>> = None;
-        let mut pending_batch2: Option<Vec<RecordBuf>> = None;
+        let mut pending_batch1: Option<Vec<RawRecord>> = None;
+        let mut pending_batch2: Option<Vec<RawRecord>> = None;
         let mut current_index = 0u64;
 
         loop {
             // Get next batch from BAM1 if needed
             if pending_batch1.is_none() && !bam1_eof {
                 match rx1.recv() {
-                    Ok(BatchMessage::Batch(batch)) => {
+                    Ok(RawBatchMessage::Batch(batch)) => {
                         stats.bam1_count += batch.len() as u64;
                         pending_batch1 = Some(batch);
                     }
-                    Ok(BatchMessage::Eof) => bam1_eof = true,
-                    Ok(BatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
+                    Ok(RawBatchMessage::Eof) => bam1_eof = true,
+                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
                     Err(_) => bam1_eof = true,
                 }
             }
@@ -1238,12 +1156,12 @@ impl CompareBams {
             // Get next batch from BAM2 if needed
             if pending_batch2.is_none() && !bam2_eof {
                 match rx2.recv() {
-                    Ok(BatchMessage::Batch(batch)) => {
+                    Ok(RawBatchMessage::Batch(batch)) => {
                         stats.bam2_count += batch.len() as u64;
                         pending_batch2 = Some(batch);
                     }
-                    Ok(BatchMessage::Eof) => bam2_eof = true,
-                    Ok(BatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
+                    Ok(RawBatchMessage::Eof) => bam2_eof = true,
+                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
                     Err(_) => bam2_eof = true,
                 }
             }
@@ -1264,14 +1182,14 @@ impl CompareBams {
                     // Drain remaining batches for accurate counts
                     if pending_batch1.is_some() {
                         while let Ok(msg) = rx1.recv() {
-                            if let BatchMessage::Batch(batch) = msg {
+                            if let RawBatchMessage::Batch(batch) = msg {
                                 stats.bam1_count += batch.len() as u64;
                             }
                         }
                     }
                     if pending_batch2.is_some() {
                         while let Ok(msg) = rx2.recv() {
-                            if let BatchMessage::Batch(batch) = msg {
+                            if let RawBatchMessage::Batch(batch) = msg {
                                 stats.bam2_count += batch.len() as u64;
                             }
                         }
@@ -1289,28 +1207,33 @@ impl CompareBams {
             let (cmp_batch2, remainder2) = batch2.split_at(min_len);
 
             // Compare batches in parallel and collect MI data
-            let (results, core_m, core_d, tag_m, tag_d, tag_ord) =
-                compare_batch_parallel(cmp_batch1, cmp_batch2, &header1, &header2, current_index);
+            let (results, core_m, core_d, tag_m, tag_d, tag_ord) = compare_raw_batch_parallel(
+                cmp_batch1,
+                cmp_batch2,
+                &header1,
+                &header2,
+                current_index,
+            );
 
             // Process grouping data from the batch (sequential for MI map building)
             for (r1, r2) in cmp_batch1.iter().zip(cmp_batch2.iter()) {
                 grouping_stats.total_records += 1;
 
-                let qname1 = record_name_to_string(r1);
-                let qname2 = record_name_to_string(r2);
-                let is_read1 = r1.flags().is_first_segment();
+                let name1_bytes = raw_fields::read_name(r1.as_ref());
+                let name2_bytes = raw_fields::read_name(r2.as_ref());
+                let is_read1 = is_first_segment_raw(r1);
 
-                if qname1 != qname2 {
+                if name1_bytes != name2_bytes {
                     grouping_stats.order_mismatches += 1;
                     continue;
                 }
 
-                let read_key: ReadKey = (qname1, is_read1);
-                if let Some(mi1) = get_mi_tag(r1) {
-                    mi_map1.insert(read_key.clone(), mi1);
+                let key_hash = hash_read_key_raw(name1_bytes, is_read1);
+                if let Some(mi1) = get_mi_tag_raw_i64(r1) {
+                    mi_map1.insert(key_hash, mi1);
                 }
-                if let Some(mi2) = get_mi_tag(r2) {
-                    mi_map2.insert(read_key, mi2);
+                if let Some(mi2) = get_mi_tag_raw_i64(r2) {
+                    mi_map2.insert(key_hash, mi2);
                 }
             }
 
@@ -1342,43 +1265,46 @@ impl CompareBams {
         progress.log_final();
         info!("Phase 2: Verifying grouping equivalence...");
 
-        // Phase 2: Verify grouping equivalence
-        let unique_mi1: AHashSet<&String> = mi_map1.values().collect();
-        let unique_mi2: AHashSet<&String> = mi_map2.values().collect();
+        // Phase 2: Verify grouping equivalence (using compact representation)
+        let mi_to_reads1 = build_mi_groups_compact(&mi_map1);
+        let mi_to_reads2 = build_mi_groups_compact(&mi_map2);
 
-        // Build reverse maps: MI -> set of read keys
-        let mi_to_reads1 = build_mi_groups(&mi_map1);
-        let mi_to_reads2 = build_mi_groups(&mi_map2);
+        let unique_mi1_count = mi_to_reads1.len();
+        let unique_mi2_count = mi_to_reads2.len();
 
         // For each MI group in BAM1, verify all reads have the same MI in BAM2
-        for (mi1, reads1) in &mi_to_reads1 {
-            let mi2_values: HashSet<Option<&String>> =
-                reads1.iter().map(|k| mi_map2.get(*k)).collect();
+        for (mi1, read_hashes) in &mi_to_reads1 {
+            let mi2_values: AHashSet<i64> =
+                read_hashes.iter().filter_map(|k| mi_map2.get(k).copied()).collect();
 
-            if mi2_values.len() > 1 || mi2_values.contains(&None) {
+            if mi2_values.len() > 1 {
                 grouping_stats.grouping_mismatches += 1;
                 if grouping_errors.len() < self.max_diffs {
-                    let mi2_strs: Vec<String> =
-                        mi2_values.iter().map(|m| format!("{m:?}")).collect();
                     grouping_errors.push(format!(
-                        "MI group '{mi1}' in BAM1 maps to multiple MIs in BAM2: {mi2_strs:?}"
+                        "MI group '{}' in BAM1 ({} reads) maps to {} different MIs in BAM2: {:?}",
+                        mi1,
+                        read_hashes.len(),
+                        mi2_values.len(),
+                        mi2_values.iter().take(5).collect::<Vec<_>>()
                     ));
                 }
             }
         }
 
         // Verify the reverse: each MI group in BAM2 maps to single MI in BAM1
-        for (mi2, reads2) in &mi_to_reads2 {
-            let mi1_values: HashSet<Option<&String>> =
-                reads2.iter().map(|k| mi_map1.get(*k)).collect();
+        for (mi2, read_hashes) in &mi_to_reads2 {
+            let mi1_values: AHashSet<i64> =
+                read_hashes.iter().filter_map(|k| mi_map1.get(k).copied()).collect();
 
-            if mi1_values.len() > 1 || mi1_values.contains(&None) {
+            if mi1_values.len() > 1 {
                 grouping_stats.grouping_mismatches += 1;
                 if grouping_errors.len() < self.max_diffs {
-                    let mi1_strs: Vec<String> =
-                        mi1_values.iter().map(|m| format!("{m:?}")).collect();
                     grouping_errors.push(format!(
-                        "MI group '{mi2}' in BAM2 maps to multiple MIs in BAM1: {mi1_strs:?}"
+                        "MI group '{}' in BAM2 ({} reads) maps to {} different MIs in BAM1: {:?}",
+                        mi2,
+                        read_hashes.len(),
+                        mi1_values.len(),
+                        mi1_values.iter().take(5).collect::<Vec<_>>()
                     ));
                 }
             }
@@ -1405,7 +1331,7 @@ impl CompareBams {
             println!();
             println!("--- Grouping Comparison ---");
             println!("Total records compared: {}", grouping_stats.total_records);
-            println!("Unique MI values: {} vs {}", unique_mi1.len(), unique_mi2.len());
+            println!("Unique MI values: {} vs {}", unique_mi1_count, unique_mi2_count);
             println!("Order mismatches: {}", grouping_stats.order_mismatches);
             println!("Grouping mismatches: {}", grouping_stats.grouping_mismatches);
             println!();
@@ -1418,11 +1344,10 @@ impl CompareBams {
                         stats.tag_order_diffs
                     );
                 }
-                if unique_mi1.len() != unique_mi2.len() {
+                if unique_mi1_count != unique_mi2_count {
                     println!(
                         "  Note: Different number of unique MI values ({} vs {}), but groupings match",
-                        unique_mi1.len(),
-                        unique_mi2.len()
+                        unique_mi1_count, unique_mi2_count
                     );
                 }
             } else {
@@ -1483,9 +1408,9 @@ impl CompareBams {
         let mut mi_map1: AHashMap<ReadKeyHash, i64> = AHashMap::new();
         let mut mi_map2: AHashMap<ReadKeyHash, i64> = AHashMap::new();
 
-        // Start double-buffered readers for both BAM files
-        let (rx1, _header1) = start_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
-        let (rx2, _header2) = start_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
+        // Start double-buffered raw readers for both BAM files
+        let (rx1, _header1) = start_raw_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
+        let (rx2, _header2) = start_raw_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
 
         // Progress tracking
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
@@ -1493,19 +1418,19 @@ impl CompareBams {
         // Process batches
         let mut bam1_eof = false;
         let mut bam2_eof = false;
-        let mut pending_batch1: Option<Vec<RecordBuf>> = None;
-        let mut pending_batch2: Option<Vec<RecordBuf>> = None;
+        let mut pending_batch1: Option<Vec<RawRecord>> = None;
+        let mut pending_batch2: Option<Vec<RawRecord>> = None;
         let mut current_index = 0u64;
 
         loop {
             // Get next batch from BAM1 if needed
             if pending_batch1.is_none() && !bam1_eof {
                 match rx1.recv() {
-                    Ok(BatchMessage::Batch(batch)) => {
+                    Ok(RawBatchMessage::Batch(batch)) => {
                         pending_batch1 = Some(batch);
                     }
-                    Ok(BatchMessage::Eof) => bam1_eof = true,
-                    Ok(BatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
+                    Ok(RawBatchMessage::Eof) => bam1_eof = true,
+                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
                     Err(_) => bam1_eof = true,
                 }
             }
@@ -1513,11 +1438,11 @@ impl CompareBams {
             // Get next batch from BAM2 if needed
             if pending_batch2.is_none() && !bam2_eof {
                 match rx2.recv() {
-                    Ok(BatchMessage::Batch(batch)) => {
+                    Ok(RawBatchMessage::Batch(batch)) => {
                         pending_batch2 = Some(batch);
                     }
-                    Ok(BatchMessage::Eof) => bam2_eof = true,
-                    Ok(BatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
+                    Ok(RawBatchMessage::Eof) => bam2_eof = true,
+                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
                     Err(_) => bam2_eof = true,
                 }
             }
@@ -1548,7 +1473,7 @@ impl CompareBams {
             let (cmp_batch2, remainder2) = batch2.split_at(min_len);
 
             // Compare batches in parallel for grouping data
-            let results = compare_batch_grouping_parallel(
+            let results = compare_raw_batch_grouping_parallel(
                 cmp_batch1,
                 cmp_batch2,
                 current_index,
@@ -1580,23 +1505,17 @@ impl CompareBams {
                     continue;
                 }
 
-                // Use compact representation: hash the read key and parse MI as i64
-                let key_hash = hash_read_key(&r.read_key.0, r.read_key.1);
-
-                match (&r.mi1, &r.mi2) {
-                    (Some(m1), Some(m2)) => {
-                        // Parse MI strings as i64 for compact storage
-                        if let (Ok(mi1_val), Ok(mi2_val)) = (m1.parse::<i64>(), m2.parse::<i64>()) {
-                            mi_map1.insert(key_hash, mi1_val);
-                            mi_map2.insert(key_hash, mi2_val);
-                        }
+                match (r.mi1, r.mi2) {
+                    (Some(mi1_val), Some(mi2_val)) => {
+                        mi_map1.insert(r.key_hash, mi1_val);
+                        mi_map2.insert(r.key_hash, mi2_val);
                     }
                     (None, Some(_)) => {
                         stats.missing_mi_bam1 += 1;
                         if diff_details.len() < self.max_diffs {
                             diff_details.push(DiffDetail {
                                 record_num: r.record_num,
-                                qname: r.read_key.0,
+                                qname: r.read_name_for_display.unwrap_or_else(|| "?".to_string()),
                                 flags: "N/A".to_string(),
                                 diff_type: DiffType::TagDiff,
                                 diffs: vec!["MI tag missing in BAM1".to_string()],
@@ -1608,7 +1527,7 @@ impl CompareBams {
                         if diff_details.len() < self.max_diffs {
                             diff_details.push(DiffDetail {
                                 record_num: r.record_num,
-                                qname: r.read_key.0,
+                                qname: r.read_name_for_display.unwrap_or_else(|| "?".to_string()),
                                 flags: "N/A".to_string(),
                                 diff_type: DiffType::TagDiff,
                                 diffs: vec!["MI tag missing in BAM2".to_string()],
