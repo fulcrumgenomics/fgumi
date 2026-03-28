@@ -150,8 +150,9 @@ impl Runall {
                     );
                 }
                 // Aligner and reference are only required if the pipeline continues past
-                // the correct stage (i.e. not --stop-after correct).
-                let stops_before_align = matches!(self.stop_after, Some(StopAfter::Correct));
+                // the fastq stage (i.e. not --stop-after correct or --stop-after fastq).
+                let stops_before_align =
+                    matches!(self.stop_after, Some(StopAfter::Correct | StopAfter::Fastq));
                 if !stops_before_align {
                     self.require_reference()?;
                     self.require_aligner_command()?;
@@ -215,8 +216,14 @@ impl Runall {
                         }
                     }
                 }
-                self.require_reference()?;
-                self.require_aligner_command()?;
+                // Aligner and reference are only required if the pipeline continues past
+                // the fastq stage.
+                let stops_before_align =
+                    matches!(self.stop_after, Some(StopAfter::Extract | StopAfter::Fastq));
+                if !stops_before_align {
+                    self.require_reference()?;
+                    self.require_aligner_command()?;
+                }
             }
         }
 

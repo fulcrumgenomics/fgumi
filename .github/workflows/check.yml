@@ -58,6 +58,8 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+      - name: Install bwa
+        run: sudo apt-get update && sudo apt-get install -y bwa
       - name: Generate coverage
         run: cargo llvm-cov nextest --features compare,simulate,profile-adjacency --no-tests=pass --lcov --output-path lcov.info
       - name: Upload to Codecov
