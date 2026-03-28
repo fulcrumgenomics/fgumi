@@ -3,21 +3,21 @@ members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf",
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.87.0"
 repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [workspace.dependencies]
-fgumi-bgzf = { version = "0.1.2", path = "crates/fgumi-bgzf" }
-fgumi-consensus = { version = "0.1.2", path = "crates/fgumi-consensus", default-features = false }
-fgumi-dna = { version = "0.1.2", path = "crates/fgumi-dna" }
-fgumi-metrics = { version = "0.1.2", path = "crates/fgumi-metrics" }
-fgumi-raw-bam = { version = "0.1.2", path = "crates/fgumi-raw-bam" }
-fgumi-sam = { version = "0.1.2", path = "crates/fgumi-sam" }
-fgumi-simd-fastq = { version = "0.1.2", path = "crates/fgumi-simd-fastq" }
-fgumi-umi = { version = "0.1.2", path = "crates/fgumi-umi" }
+fgumi-bgzf = { version = "0.1.3", path = "crates/fgumi-bgzf" }
+fgumi-consensus = { version = "0.1.3", path = "crates/fgumi-consensus", default-features = false }
+fgumi-dna = { version = "0.1.3", path = "crates/fgumi-dna" }
+fgumi-metrics = { version = "0.1.3", path = "crates/fgumi-metrics" }
+fgumi-raw-bam = { version = "0.1.3", path = "crates/fgumi-raw-bam" }
+fgumi-sam = { version = "0.1.3", path = "crates/fgumi-sam" }
+fgumi-simd-fastq = { version = "0.1.3", path = "crates/fgumi-simd-fastq" }
+fgumi-umi = { version = "0.1.3", path = "crates/fgumi-umi" }
 
 [package]
 name = "fgumi"
