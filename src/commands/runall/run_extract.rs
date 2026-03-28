@@ -520,18 +520,23 @@ impl Runall {
             self.extract_opts.extract_sample.as_ref().expect("--sample validated in validate()");
         let library =
             self.extract_opts.extract_library.as_ref().expect("--library validated in validate()");
-        let aligner_command = self.require_aligner_command()?;
-
         info!("Starting pipeline (from extract)");
         info!("FASTQ inputs: {:?}", self.input);
         info!("Output: {}", self.output.display());
         info!("Sample: {sample}, Library: {library}");
-        info!("Aligner: {aligner_command}");
 
         // --stop-after extract: in-process extract to output BAM (no aligner)
         if self.stop_after == Some(StopAfter::Extract) {
             return self.run_stop_after_extract(command_line, tmp_output, &timer);
         }
+
+        // --stop-after fastq: extract to unmapped BAM, then convert to interleaved FASTQ
+        if self.stop_after == Some(StopAfter::Fastq) {
+            return self.run_stop_after_fastq_via_extract(command_line, tmp_output, &timer);
+        }
+
+        let aligner_command = self.require_aligner_command()?;
+        info!("Aligner: {aligner_command}");
 
         // --stop-after align: in-process extract -> aligner -> capture SAM output
         if self.stop_after == Some(StopAfter::Align) {
@@ -612,6 +617,77 @@ impl Runall {
         Ok(())
     }
 
+    /// In-process extract for `--stop-after fastq`: extract to a temp unmapped BAM, then
+    /// convert to interleaved FASTQ. Produces the same FASTQ that would be piped to the
+    /// aligner in the full pipeline.
+    fn run_stop_after_fastq_via_extract(
+        &self,
+        command_line: &str,
+        tmp_output: &Path,
+        timer: &OperationTimer,
+    ) -> Result<()> {
+        info!("Using in-process extract + fastq (--stop-after fastq)");
+
+        // Extract to a temp unmapped BAM first
+        let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+        let temp_bam = temp_dir.path().join("extracted.bam");
+
+        let read_structures = self.get_read_structures()?;
+        let extract_params = self.build_extract_params();
+        let encoding = self.detect_quality_encoding()?;
+        info!("Detected quality encoding: {encoding:?}");
+
+        let header = self.build_unmapped_header(command_line)?;
+        let mut writer = create_raw_bam_writer(&temp_bam, &header, 1, 6)?;
+        let mut fq_iterators = create_fastq_iterators(&self.input, &read_structures)?;
+
+        let progress =
+            ProgressTracker::new("Extracted records (stop-after fastq)").with_interval(1_000_000);
+        let mut record_count: u64 = 0;
+        let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
+
+        loop {
+            next_read_sets.clear();
+            for iter in fq_iterators.iter_mut() {
+                if let Some(rec) = iter.next() {
+                    next_read_sets.push(rec);
+                } else {
+                    break;
+                }
+            }
+
+            if next_read_sets.is_empty() {
+                break;
+            }
+
+            anyhow::ensure!(
+                next_read_sets.len() == fq_iterators.len(),
+                "FASTQ sources out of sync: got {} records but expected {}",
+                next_read_sets.len(),
+                fq_iterators.len()
+            );
+
+            let combined = FastqSet::combine_readsets(std::mem::take(&mut next_read_sets));
+            let extracted = make_raw_records(&combined, encoding, &extract_params)?;
+            writer
+                .write_raw_bytes(&extracted.data)
+                .context("Failed to write extracted records to temp BAM")?;
+
+            record_count += extracted.num_records;
+            progress.log_if_needed(extracted.num_records);
+        }
+
+        writer.finish().context("Failed to finish temp BAM writer")?;
+        progress.log_final();
+        info!("Extract complete: {record_count} records written to temp BAM");
+
+        // Convert the temp BAM to interleaved FASTQ
+        let written = write_bam_to_fastq_file(&temp_bam, tmp_output)?;
+        info!("Stopped after fastq stage ({written} FASTQ records written)");
+        timer.log_completion(written);
+        Ok(())
+    }
+
     /// In-process extract for `--stop-after align`: read FASTQs, build unmapped records,
     /// pipe FASTQ to aligner, and capture aligner SAM output to the output file.
     fn run_stop_after_extract_align(
@@ -687,8 +763,6 @@ impl Runall {
     ) -> Result<()> {
         let timer = OperationTimer::new("Pipeline (from correct)");
         let input = self.single_input()?;
-        let (reference, _dict_path) = self.require_reference()?;
-        let aligner_command = self.require_aligner_command()?;
 
         info!("Starting pipeline (from correct)");
         info!("Input:  {}", input.display());
@@ -837,6 +911,17 @@ impl Runall {
             return Ok(());
         }
 
+        // --stop-after fastq: convert the corrected unmapped BAM to interleaved FASTQ
+        if self.stop_after == Some(StopAfter::Fastq) {
+            let written = write_bam_to_fastq_file(&corrected_bam, tmp_output)?;
+            info!("Stopped after fastq stage ({written} FASTQ records written)");
+            timer.log_completion(0);
+            return Ok(());
+        }
+
+        let (reference, _dict_path) = self.require_reference()?;
+        let aligner_command = self.require_aligner_command()?;
+
         // Step 2: FASTQ + aligner (in-process BAM-to-FASTQ conversion)
         info!("Step 2/3: Aligning (in-process BAM to FASTQ | aligner)...");
 
@@ -904,13 +989,21 @@ impl Runall {
     ) -> Result<()> {
         let timer = OperationTimer::new("Pipeline (from fastq)");
         let input = self.single_input()?;
-        let (reference, _dict_path) = self.require_reference()?;
-        let aligner_command = self.require_aligner_command()?;
 
         info!("Starting pipeline (from fastq)");
         info!("Input:  {}", input.display());
         info!("Output: {}", self.output.display());
 
+        // --stop-after fastq: convert the unmapped BAM to interleaved FASTQ
+        if self.stop_after == Some(StopAfter::Fastq) {
+            let written = write_bam_to_fastq_file(input, tmp_output)?;
+            info!("Stopped after fastq stage ({written} FASTQ records written)");
+            timer.log_completion(0);
+            return Ok(());
+        }
+
+        let (reference, _dict_path) = self.require_reference()?;
+        let aligner_command = self.require_aligner_command()?;
         let fgumi_exe = std::env::current_exe().context("Failed to determine fgumi binary path")?;
 
         // Step 1: FASTQ + aligner
@@ -1198,6 +1291,16 @@ fn bam_to_fastq_writer<W: Write>(bam_path: &Path, mut writer: W) -> Result<u64> 
 
     info!("BAM-to-FASTQ: read {total} records, wrote {written} FASTQ records");
     Ok(written)
+}
+
+/// Convert a BAM file to interleaved FASTQ, writing the output to a file.
+///
+/// Used by `--stop-after fastq` to emit the same interleaved FASTQ that would
+/// normally be piped to the aligner.
+fn write_bam_to_fastq_file(bam_path: &Path, output: &Path) -> Result<u64> {
+    let file = std::fs::File::create(output)
+        .with_context(|| format!("Failed to create FASTQ output: {}", output.display()))?;
+    bam_to_fastq_writer(bam_path, file)
 }
 
 /// Build an [`ExtractSource`] from input FASTQ paths and read structures.
