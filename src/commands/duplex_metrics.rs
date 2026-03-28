@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
+use fgumi_lib::defaults;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
 use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
@@ -112,11 +113,11 @@ pub struct DuplexMetrics {
     pub description: Option<String>,
 
     /// SAM tag containing the raw UMI sequence
-    #[arg(long = "umi-tag", default_value = "RX")]
+    #[arg(long = "umi-tag", default_value = defaults::UMI_TAG)]
     pub umi_tag: String,
 
     /// SAM tag containing the molecular identifier (assigned by `group`)
-    #[arg(long = "mi-tag", default_value = "MI")]
+    #[arg(long = "mi-tag", default_value = defaults::MI_TAG)]
     pub mi_tag: String,
 }
 

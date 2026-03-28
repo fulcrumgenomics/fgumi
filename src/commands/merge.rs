@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::Parser;
 use fgumi_lib::bam_io::create_bam_reader;
+use fgumi_lib::defaults;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::sort::RawExternalSorter;
 use fgumi_lib::validation::validate_file_exists;
@@ -93,7 +94,7 @@ pub struct Merge {
     /// When merging in template-coordinate order, this tag is included in the
     /// sort key so that templates from different cells at the same locus are
     /// not interleaved. Only used for template-coordinate merge.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: String,
 }
 

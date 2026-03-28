@@ -12,6 +12,8 @@ const STYLES: Styles = Styles::styled()
     .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
     .placeholder(AnsiColor::Cyan.on_default());
+use commands::runall::Runall;
+
 use commands::clip::Clip;
 use commands::codec::Codec;
 use commands::command::Command;
@@ -70,6 +72,10 @@ struct Args {
 #[command(version)]
 #[allow(clippy::large_enum_variant)]
 enum Subcommand {
+    // End-to-end pipeline
+    #[command(display_order = 0)]
+    Runall(Runall),
+
     // Grouping
     #[command(display_order = 1)]
     Extract(Extract),

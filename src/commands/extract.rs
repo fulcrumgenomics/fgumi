@@ -19,11 +19,11 @@ use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
 use anyhow::{Result, bail, ensure};
-use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgoxide::io::Io;
 use fgumi_lib::bam_io::{RawBamWriter, create_raw_bam_writer};
-use fgumi_lib::fastq::FastqSegment;
+use fgumi_lib::defaults;
+use fgumi_lib::extract::{self, ExtractParams, QualityEncoding};
 use fgumi_lib::fastq::FastqSet;
 use fgumi_lib::fastq::ReadSetIterator;
 use fgumi_lib::grouper::FastqTemplate;
@@ -31,8 +31,6 @@ use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use fgumi_lib::validation::validate_file_exists;
-use fgumi_raw_bam::UnmappedBamRecordBuilder;
-use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
 
@@ -57,7 +55,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
-const QUALITY_DETECTION_SAMPLE_SIZE: usize = 400;
 
 /// Pre-serialized batch of BAM records for the pipeline output type.
 ///
@@ -166,94 +163,6 @@ fn open_fastq_reader(path: &Path, threads: usize) -> Result<Box<dyn BufRead + Se
         CompressionFormat::Plain => {
             debug!("Detected uncompressed FASTQ");
             Ok(fgio.new_reader(path)?)
-        }
-    }
-}
-
-/// Quality encoding type
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum QualityEncoding {
-    Standard, // Phred+33 (Sanger)
-    Illumina, // Phred+64 (Illumina 1.3-1.7)
-}
-
-impl QualityEncoding {
-    /// Convert quality scores to standard numeric format (Phred+33)
-    fn to_standard_numeric(self, quals: &[u8]) -> Vec<u8> {
-        match self {
-            QualityEncoding::Standard => quals.iter().map(|&q| q.saturating_sub(33)).collect(),
-            QualityEncoding::Illumina => quals.iter().map(|&q| q.saturating_sub(64)).collect(),
-        }
-    }
-
-    /// Detect encoding from sample records using robust heuristics
-    ///
-    /// This implements a more robust detection algorithm that:
-    /// - Checks for quality scores in the Illumina 1.3-1.7 range (64-126)
-    /// - Checks for quality scores in the Sanger/Illumina 1.8+ range (33-126)
-    /// - Handles edge cases like empty reads or very short reads
-    /// - Provides informative error messages for invalid encodings
-    fn detect(records: &[Vec<u8>]) -> Result<Self> {
-        if records.is_empty() {
-            bail!("Cannot detect quality encoding: no records provided");
-        }
-
-        let mut min_qual = u8::MAX;
-        let mut max_qual = u8::MIN;
-        let mut total_bases = 0;
-
-        // Collect statistics from all quality scores
-        for qual in records {
-            if qual.is_empty() {
-                continue; // Skip empty reads
-            }
-            for &q in qual {
-                min_qual = min_qual.min(q);
-                max_qual = max_qual.max(q);
-                total_bases += 1;
-            }
-        }
-
-        // If all reads were empty, we can't detect encoding but we'll default to Standard
-        if total_bases == 0 {
-            return Ok(QualityEncoding::Standard);
-        }
-
-        // Quality scores should be printable ASCII (33-126)
-        if min_qual < 33 || max_qual > 126 {
-            bail!(
-                "Invalid quality scores detected: range [{min_qual}, {max_qual}]. \
-                Quality scores must be in the printable ASCII range (33-126)"
-            );
-        }
-
-        // Detect encoding based on observed range
-        // Phred+64 (Illumina 1.3-1.7) uses range 64-126
-        // Phred+33 (Sanger/Illumina 1.8+) uses range 33-126
-        // If we see scores below 59, it's definitely Phred+33
-        // If we see scores in 59-63, it could be either (low quality Phred+33 or very low Phred+64)
-        // If we only see scores >= 64, it's likely Phred+64 (but could be high-quality Phred+33)
-
-        if min_qual < 59 {
-            // Definitely Phred+33 (Sanger/Illumina 1.8+)
-            Ok(QualityEncoding::Standard)
-        } else if min_qual >= 64 {
-            // Likely Phred+64 (Illumina 1.3-1.7), but warn if range suggests otherwise
-            // Note: Modern data should be Phred+33, so this is increasingly rare
-            if max_qual >= 75 {
-                // Has a reasonable range for Phred+64
-                Ok(QualityEncoding::Illumina)
-            } else {
-                // Narrow range, could be high-quality Phred+33
-                // Default to Phred+33 for modern data
-                Ok(QualityEncoding::Standard)
-            }
-        } else {
-            // Ambiguous range (59-63). This is very unlikely in real data.
-            // Low quality Phred+33 would be in this range (Q26-Q30)
-            // Very low quality Phred+64 would also be here (Q-5 to Q-1)
-            // Default to Phred+33 as it's more common and these are reasonable quality scores
-            Ok(QualityEncoding::Standard)
         }
     }
 }
@@ -389,7 +298,7 @@ pub(crate) struct Extract {
     read_structures: Vec<ReadStructure>,
 
     /// Tag in which to store molecular barcodes/UMIs
-    #[arg(long, short = 'u', default_value = "RX")]
+    #[arg(long, short = 'u', default_value = defaults::UMI_TAG)]
     umi_tag: String,
 
     /// Tag in which to store molecular barcode/UMI qualities
@@ -397,7 +306,7 @@ pub(crate) struct Extract {
     umi_qual_tag: Option<String>,
 
     /// SAM tag containing the cell barcode
-    #[arg(long = "cell-tag", short = 'c', default_value = "CB")]
+    #[arg(long = "cell-tag", short = 'c', default_value = defaults::CELL_TAG)]
     cell_tag: String,
 
     /// Tag in which to store the cellular barcode qualities
@@ -426,7 +335,7 @@ pub(crate) struct Extract {
     clipping_attribute: Option<String>,
 
     /// Read group ID to use in the file header
-    #[arg(long, default_value = "A")]
+    #[arg(long, default_value = defaults::READ_GROUP_ID)]
     read_group_id: String,
 
     /// The name of the sequenced sample
@@ -442,7 +351,7 @@ pub(crate) struct Extract {
     barcode: Option<String>,
 
     /// Sequencing Platform
-    #[arg(long, default_value = "illumina")]
+    #[arg(long, default_value = defaults::PLATFORM)]
     platform: String,
 
     /// Platform unit (e.g. 'flowcell-barcode.lane.sample-barcode')
@@ -586,6 +495,30 @@ impl Extract {
         if let Some(v) = value { rg.insert(tag, v.clone()) } else { rg }
     }
 
+    /// Build [`ExtractParams`] from the command's CLI options.
+    fn build_extract_params(&self) -> ExtractParams {
+        ExtractParams {
+            read_group_id: self.read_group_id.clone(),
+            umi_tag: self.umi_tag.as_bytes().try_into().expect("validated in validate()"),
+            cell_tag: self.cell_tag.as_bytes().try_into().expect("validated in validate()"),
+            umi_qual_tag: self
+                .umi_qual_tag
+                .as_ref()
+                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
+            cell_qual_tag: self
+                .cell_qual_tag
+                .as_ref()
+                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
+            single_tag: self
+                .single_tag
+                .as_ref()
+                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
+            annotate_read_names: self.annotate_read_names,
+            extract_umis_from_read_names: self.extract_umis_from_read_names,
+            store_sample_barcode_qualities: self.store_sample_barcode_qualities,
+        }
+    }
+
     /// Create SAM header
     fn create_header(&self, command_line: &str) -> Result<Header> {
         let mut header = Header::builder();
@@ -630,63 +563,6 @@ impl Extract {
         Ok(header.build())
     }
 
-    /// Joins byte slices with a separator, pre-allocating capacity.
-    /// Returns empty `BString` if iterator is empty.
-    fn join_bytes_with_separator<'a>(
-        segments: impl Iterator<Item = &'a [u8]>,
-        separator: u8,
-    ) -> BString {
-        let segments: Vec<&[u8]> = segments.collect();
-        if segments.is_empty() {
-            return BString::default();
-        }
-        // Calculate total capacity needed
-        let total_len: usize = segments.iter().map(|s| s.len()).sum();
-        let capacity = total_len + segments.len().saturating_sub(1); // separators
-        let mut result = Vec::with_capacity(capacity);
-        for (i, seg) in segments.iter().enumerate() {
-            if i > 0 {
-                result.push(separator);
-            }
-            result.extend_from_slice(seg);
-        }
-        BString::from(result)
-    }
-
-    /// Extracts read name, optionally extracting UMI from the 8th colon-delimited field
-    fn extract_read_name_and_umi(
-        header: &Vec<u8>,
-        extract_umis: bool,
-    ) -> (Vec<u8>, Option<Vec<u8>>) {
-        // Remove @ prefix if present
-        let name_bytes = if header.starts_with(b"@") { &header[1..] } else { header.as_slice() };
-
-        // Split on space to get just the name part
-        let name_part = name_bytes.find_byte(b' ').map_or(name_bytes, |pos| &name_bytes[..pos]);
-
-        if !extract_umis {
-            return (name_part.to_vec(), None);
-        }
-
-        // Count colons to find 8th field (UMI)
-        let parts: Vec<&[u8]> = name_part.split(|&b| b == b':').collect();
-
-        if parts.len() >= 8 {
-            let mut umi = parts[7].to_vec();
-            if !umi.is_empty() {
-                // Normalize '+' to '-' in UMI
-                for byte in &mut umi {
-                    if *byte == b'+' {
-                        *byte = b'-';
-                    }
-                }
-                return (name_part.to_vec(), Some(umi));
-            }
-        }
-
-        (name_part.to_vec(), None)
-    }
-
     /// Validates that all read names match across the read sets
     fn validate_read_names_match(read_sets: &[FastqSet]) -> Result<()> {
         if read_sets.is_empty() {
@@ -724,164 +600,6 @@ impl Extract {
         Ok(())
     }
 
-    /// Write raw BAM records from a read set directly to a writer.
-    ///
-    /// Uses `UnmappedBamRecordBuilder` to construct records as raw bytes,
-    /// bypassing `RecordBuf` allocation and encoding overhead.
-    ///
-    /// Returns the number of records written.
-    #[allow(clippy::too_many_lines)]
-    fn make_raw_records(
-        &self,
-        read_set: &FastqSet,
-        encoding: QualityEncoding,
-        builder: &mut UnmappedBamRecordBuilder,
-        writer: &mut RawBamWriter,
-    ) -> Result<u64> {
-        let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
-
-        let read_name = String::from_utf8_lossy(&read_set.header);
-        ensure!(!templates.is_empty(), "No template segments found for read: {read_name}");
-
-        // Extract various barcode types as BString - use optimized join
-        let cell_barcode_bs = Self::join_bytes_with_separator(
-            read_set.cell_barcode_segments().map(|s| s.seq.as_slice()),
-            b'-',
-        );
-        let cell_quals_bs = Self::join_bytes_with_separator(
-            read_set.cell_barcode_segments().map(|s| s.quals.as_slice()),
-            b' ',
-        );
-        let sample_barcode_bs = Self::join_bytes_with_separator(
-            read_set.sample_barcode_segments().map(|s| s.seq.as_slice()),
-            b'-',
-        );
-        let sample_quals_bs = Self::join_bytes_with_separator(
-            read_set.sample_barcode_segments().map(|s| s.quals.as_slice()),
-            b' ',
-        );
-        let umi_bs = Self::join_bytes_with_separator(
-            read_set.molecular_barcode_segments().map(|s| s.seq.as_slice()),
-            b'-',
-        );
-        let umi_qual_bs = Self::join_bytes_with_separator(
-            read_set.molecular_barcode_segments().map(|s| s.quals.as_slice()),
-            b' ',
-        );
-
-        // Extract UMI from read name if requested
-        let (read_name_bytes, umi_from_name) =
-            Self::extract_read_name_and_umi(&read_set.header, self.extract_umis_from_read_names);
-
-        // Prepare final UMI as BString - avoid format! and unnecessary allocations
-        let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
-            (true, Some(from_name)) => BString::from(from_name.as_slice()),
-            (true, None) => BString::default(),
-            (false, Some(from_name)) => {
-                let mut combined = Vec::with_capacity(from_name.len() + 1 + umi_bs.len());
-                combined.extend_from_slice(from_name);
-                combined.push(b'-');
-                combined.extend_from_slice(umi_bs.as_bytes());
-                BString::from(combined)
-            }
-            (false, None) => umi_bs,
-        };
-
-        let num_templates = templates.len();
-        let umi_tag: &[u8; 2] =
-            self.umi_tag.as_bytes().try_into().expect("umi_tag must be 2 bytes");
-        let cell_tag: &[u8; 2] =
-            self.cell_tag.as_bytes().try_into().expect("cell_tag must be 2 bytes");
-
-        for (index, template) in templates.iter().enumerate() {
-            // Compute flags for unmapped reads
-            let mut flag = flags::UNMAPPED;
-            if num_templates == 2 {
-                flag |= flags::PAIRED | flags::MATE_UNMAPPED;
-                if index == 0 {
-                    flag |= flags::FIRST_SEGMENT;
-                } else {
-                    flag |= flags::LAST_SEGMENT;
-                }
-            }
-
-            // Set read name (optionally with UMI annotation)
-            let annotated_name: Option<Vec<u8>> = if self.annotate_read_names
-                && !final_umi_bs.is_empty()
-            {
-                let mut name = Vec::with_capacity(read_name_bytes.len() + 1 + final_umi_bs.len());
-                name.extend_from_slice(&read_name_bytes);
-                name.push(b'+');
-                name.extend_from_slice(final_umi_bs.as_bytes());
-                Some(name)
-            } else {
-                None
-            };
-            let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
-
-            // Build the record - if empty seq, substitute with single N @ Q2
-            if template.seq.is_empty() {
-                builder.build_record(final_read_name, flag, b"N", &[2u8]);
-            } else {
-                let numeric_quals = encoding.to_standard_numeric(&template.quals);
-                builder.build_record(final_read_name, flag, &template.seq, &numeric_quals);
-            }
-
-            // Append tags
-            // Read group
-            builder.append_string_tag(b"RG", self.read_group_id.as_bytes());
-
-            // Cell barcode
-            if !cell_barcode_bs.is_empty() {
-                builder.append_string_tag(cell_tag, cell_barcode_bs.as_bytes());
-            }
-
-            if !cell_quals_bs.is_empty() {
-                if let Some(ref qual_tag) = self.cell_qual_tag {
-                    let qt: &[u8; 2] =
-                        qual_tag.as_bytes().try_into().expect("cell_qual_tag must be 2 bytes");
-                    builder.append_string_tag(qt, cell_quals_bs.as_bytes());
-                }
-            }
-
-            // Sample barcode
-            if !sample_barcode_bs.is_empty() {
-                builder.append_string_tag(b"BC", sample_barcode_bs.as_bytes());
-            }
-
-            if self.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-                builder.append_string_tag(b"QT", sample_quals_bs.as_bytes());
-            }
-
-            // UMI
-            if !final_umi_bs.is_empty() {
-                builder.append_string_tag(umi_tag, final_umi_bs.as_bytes());
-
-                // Single tag for all concatenated UMIs (if specified)
-                if let Some(ref single_tag) = self.single_tag {
-                    let st: &[u8; 2] =
-                        single_tag.as_bytes().try_into().expect("single_tag must be 2 bytes");
-                    builder.append_string_tag(st, final_umi_bs.as_bytes());
-                }
-
-                // Only add UMI qualities if not extracted from read names
-                if umi_from_name.is_none() && !umi_qual_bs.is_empty() {
-                    if let Some(ref qual_tag) = self.umi_qual_tag {
-                        let qt: &[u8; 2] =
-                            qual_tag.as_bytes().try_into().expect("umi_qual_tag must be 2 bytes");
-                        builder.append_string_tag(qt, umi_qual_bs.as_bytes());
-                    }
-                }
-            }
-
-            // Write the record directly
-            writer.write_raw_record(builder.as_bytes())?;
-            builder.clear();
-        }
-
-        Ok(num_templates as u64)
-    }
-
     /// Process records in single-threaded mode
     ///
     /// Returns the number of records written.
@@ -893,10 +611,11 @@ impl Extract {
     ) -> Result<u64> {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
         let mut read_pair_count: u64 = 0;
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let extract_params = self.build_extract_params();
+        let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
 
         loop {
-            let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
+            next_read_sets.clear();
             for iter in fq_iterators.iter_mut() {
                 if let Some(rec) = iter.next() {
                     next_read_sets.push(rec);
@@ -911,14 +630,14 @@ impl Extract {
 
             ensure!(next_read_sets.len() == fq_iterators.len(), "FASTQ sources out of sync");
 
-            //  Validate read names match across all FASTQs
             Self::validate_read_names_match(&next_read_sets)?;
 
-            let read_set = FastqSet::combine_readsets(next_read_sets);
-            let num_records = self.make_raw_records(&read_set, encoding, &mut builder, writer)?;
+            let read_set = FastqSet::combine_readsets(std::mem::take(&mut next_read_sets));
+            let records = extract::make_raw_records(&read_set, encoding, &extract_params)?;
 
-            read_pair_count += num_records;
-            progress.log_if_needed(num_records);
+            writer.write_raw_bytes(&records.data)?;
+            read_pair_count += records.num_records;
+            progress.log_if_needed(records.num_records);
         }
 
         progress.log_final();
@@ -971,27 +690,7 @@ impl Extract {
         // Clone read_structures for the closure
         let read_structures = read_structures.to_vec();
 
-        // Build config capturing all user options for the pipeline closure
-        let extract_config = ExtractConfig {
-            read_group_id: self.read_group_id.clone(),
-            umi_tag: self.umi_tag.as_bytes().try_into().expect("validated in validate()"),
-            cell_tag: self.cell_tag.as_bytes().try_into().expect("validated in validate()"),
-            umi_qual_tag: self
-                .umi_qual_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
-            cell_qual_tag: self
-                .cell_qual_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
-            single_tag: self
-                .single_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
-            annotate_read_names: self.annotate_read_names,
-            extract_umis_from_read_names: self.extract_umis_from_read_names,
-            store_sample_barcode_qualities: self.store_sample_barcode_qualities,
-        };
+        let extract_config = self.build_extract_params();
 
         let records_written = run_fastq_pipeline(
             config,
@@ -1045,21 +744,20 @@ impl Extract {
                 let combined = FastqSet::combine_readsets(fastq_sets);
 
                 // Build raw BAM records
-                let result = make_raw_records_static(&combined, encoding, &extract_config)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                let raw = extract::make_raw_records(&combined, encoding, &extract_config).map_err(
+                    |e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+                )?;
 
                 // Debug: Check if we produce fewer records than template has
-                if result.num_records as usize != template.records.len() {
+                if raw.num_records as usize != template.records.len() {
                     log::warn!(
                         "Template with {} FASTQ records produced {} BAM records",
                         template.records.len(),
-                        result.num_records
+                        raw.num_records
                     );
                 }
 
-                Ok(result)
+                Ok(ExtractedBatch { data: raw.data, num_records: raw.num_records })
             },
             // serialize_fn: ExtractedBatch → copy pre-serialized bytes to buffer
             |batch: ExtractedBatch, _header: &Header, buffer: &mut Vec<u8>| {
@@ -1071,162 +769,6 @@ impl Extract {
         info!("Wrote {records_written} records via 7-step pipeline");
         Ok(records_written)
     }
-}
-
-/// Cloneable config for the extract pipeline closure, capturing all user options
-/// needed by `make_raw_records_static` so they aren't hardcoded.
-#[derive(Clone)]
-struct ExtractConfig {
-    read_group_id: String,
-    umi_tag: [u8; 2],
-    cell_tag: [u8; 2],
-    umi_qual_tag: Option<[u8; 2]>,
-    cell_qual_tag: Option<[u8; 2]>,
-    single_tag: Option<[u8; 2]>,
-    annotate_read_names: bool,
-    extract_umis_from_read_names: bool,
-    store_sample_barcode_qualities: bool,
-}
-
-/// Build raw BAM records from a `FastqSet` without requiring `&self`.
-/// Uses the provided `ExtractConfig` for all user-configurable options.
-fn make_raw_records_static(
-    read_set: &FastqSet,
-    encoding: QualityEncoding,
-    cfg: &ExtractConfig,
-) -> Result<ExtractedBatch> {
-    let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
-
-    let read_name = String::from_utf8_lossy(&read_set.header);
-    ensure!(!templates.is_empty(), "No template segments found for read: {read_name}");
-
-    // Extract various barcode types as BString
-    let cell_barcode_bs = Extract::join_bytes_with_separator(
-        read_set.cell_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let cell_quals_bs = Extract::join_bytes_with_separator(
-        read_set.cell_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-    let sample_barcode_bs = Extract::join_bytes_with_separator(
-        read_set.sample_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let sample_quals_bs = Extract::join_bytes_with_separator(
-        read_set.sample_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-    let umi_bs = Extract::join_bytes_with_separator(
-        read_set.molecular_barcode_segments().map(|s| s.seq.as_slice()),
-        b'-',
-    );
-    let umi_qual_bs = Extract::join_bytes_with_separator(
-        read_set.molecular_barcode_segments().map(|s| s.quals.as_slice()),
-        b' ',
-    );
-
-    // Extract UMI from read name if requested
-    let (read_name_bytes, umi_from_name) =
-        Extract::extract_read_name_and_umi(&read_set.header, cfg.extract_umis_from_read_names);
-
-    // Prepare final UMI
-    let final_umi_bs: BString = match (umi_bs.is_empty(), &umi_from_name) {
-        (true, Some(from_name)) => BString::from(from_name.as_slice()),
-        (true, None) => BString::default(),
-        (false, Some(from_name)) => {
-            let mut combined = Vec::with_capacity(from_name.len() + 1 + umi_bs.len());
-            combined.extend_from_slice(from_name);
-            combined.push(b'-');
-            combined.extend_from_slice(umi_bs.as_bytes());
-            BString::from(combined)
-        }
-        (false, None) => umi_bs,
-    };
-
-    let num_templates = templates.len();
-    let mut builder = UnmappedBamRecordBuilder::new();
-    let mut data = Vec::new();
-
-    for (index, template) in templates.iter().enumerate() {
-        // Compute flags for unmapped reads
-        let mut flag = flags::UNMAPPED;
-        if num_templates == 2 {
-            flag |= flags::PAIRED | flags::MATE_UNMAPPED;
-            if index == 0 {
-                flag |= flags::FIRST_SEGMENT;
-            } else {
-                flag |= flags::LAST_SEGMENT;
-            }
-        }
-
-        // Set read name (optionally with UMI annotation)
-        let annotated_name: Option<Vec<u8>> = if cfg.annotate_read_names && !final_umi_bs.is_empty()
-        {
-            let mut name = Vec::with_capacity(read_name_bytes.len() + 1 + final_umi_bs.len());
-            name.extend_from_slice(&read_name_bytes);
-            name.push(b'+');
-            name.extend_from_slice(final_umi_bs.as_bytes());
-            Some(name)
-        } else {
-            None
-        };
-        let final_read_name: &[u8] = annotated_name.as_deref().unwrap_or(&read_name_bytes);
-
-        // Build the record - if empty seq, substitute with single N @ Q2
-        if template.seq.is_empty() {
-            builder.build_record(final_read_name, flag, b"N", &[2u8]);
-        } else {
-            let numeric_quals = encoding.to_standard_numeric(&template.quals);
-            builder.build_record(final_read_name, flag, &template.seq, &numeric_quals);
-        }
-
-        // Append tags
-        // Read group
-        builder.append_string_tag(b"RG", cfg.read_group_id.as_bytes());
-
-        // Cell barcode
-        if !cell_barcode_bs.is_empty() {
-            builder.append_string_tag(&cfg.cell_tag, cell_barcode_bs.as_bytes());
-        }
-
-        if !cell_quals_bs.is_empty() {
-            if let Some(ref qt) = cfg.cell_qual_tag {
-                builder.append_string_tag(qt, cell_quals_bs.as_bytes());
-            }
-        }
-
-        // Sample barcode
-        if !sample_barcode_bs.is_empty() {
-            builder.append_string_tag(b"BC", sample_barcode_bs.as_bytes());
-        }
-
-        if cfg.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-            builder.append_string_tag(b"QT", sample_quals_bs.as_bytes());
-        }
-
-        // UMI
-        if !final_umi_bs.is_empty() {
-            builder.append_string_tag(&cfg.umi_tag, final_umi_bs.as_bytes());
-
-            // Single tag for all concatenated UMIs (if specified)
-            if let Some(ref st) = cfg.single_tag {
-                builder.append_string_tag(st, final_umi_bs.as_bytes());
-            }
-
-            // Only add UMI qualities if not extracted from read names
-            if umi_from_name.is_none() && !umi_qual_bs.is_empty() {
-                if let Some(ref qt) = cfg.umi_qual_tag {
-                    builder.append_string_tag(qt, umi_qual_bs.as_bytes());
-                }
-            }
-        }
-
-        builder.write_with_block_size(&mut data);
-        builder.clear();
-    }
-
-    Ok(ExtractedBatch { data, num_records: num_templates as u64 })
 }
 
 impl Command for Extract {
@@ -1242,7 +784,7 @@ impl Command for Extract {
         let mut sample_quals = Vec::new();
         let mut temp_reader =
             SimdFastqReader::with_capacity(open_fastq_reader(&self.inputs[0], 1)?, BUFFER_SIZE);
-        for _i in 0..QUALITY_DETECTION_SAMPLE_SIZE {
+        for _i in 0..extract::QUALITY_DETECTION_SAMPLE_SIZE {
             match temp_reader.next() {
                 Some(Ok(rec)) => sample_quals.push(rec.quality),
                 Some(Err(e)) => return Err(e.into()),
@@ -1340,7 +882,7 @@ fn strip_read_suffix_extract(name: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bstr::BString;
+    use bstr::{BString, ByteSlice};
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::data::field::Value as RecordBufValue;

@@ -1,0 +1,70 @@
+[package]
+name = "fgumi-lib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core library for fgumi UMI processing"
+
+[lib]
+name = "fgumi_lib"
+
+[dependencies]
+anyhow = "1.0.102"
+log = "0"
+thiserror = "2"
+noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
+noodles-csi = "0.54.0"
+clap = { version = "4", features = ["derive"] }
+read-structure = "0.2.0"
+seq_io = "0.3.4"
+bstr = "1.12.1"
+bytes = "1"
+tempfile = "3.3.0"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8.21"
+parking_lot = "0.12"
+libdeflater = "1.22"
+serde = { version = "1.0.228", features = ["derive"] }
+rand = "0.10"
+rand_distr = "0.6"
+memchr = "2"
+ahash = "0.8"
+lru = "0.16.3"
+bytemuck = { version = "1.14", features = ["derive"] }
+bgzf = "0.3.0"
+flate2 = "1.1"
+rayon = "1.10"
+libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
+sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-dna = { workspace = true }
+fgumi-bgzf = { workspace = true }
+fgumi-metrics = { workspace = true }
+fgumi-sam = { workspace = true }
+fgumi-simd-fastq = { workspace = true }
+fgumi-umi = { workspace = true }
+fgumi-consensus = { workspace = true }
+
+[features]
+default = ["simplex", "duplex", "codec"]
+simplex = ["fgumi-consensus/simplex"]
+duplex = ["fgumi-consensus/duplex"]
+codec = ["fgumi-consensus/codec"]
+# Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
+memory-debug = ["dep:libmimalloc-sys", "dep:sysinfo"]
+# Enable compare subcommand with bams and metrics (developer tools)
+compare = []
+# Enable simulate commands for generating synthetic test data
+simulate = []
+# Enable profiling output for adjacency UMI assigner
+profile-adjacency = []
+# Enable slow stress tests for concurrency testing
+stress-tests = []
+
+[dev-dependencies]
+proptest = "1.10"
+rstest = "0"
+fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
