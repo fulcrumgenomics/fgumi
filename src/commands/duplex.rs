@@ -47,6 +47,8 @@ use std::sync::Arc;
 
 use super::command::Command;
 
+use super::common::{EmSeqRef, load_em_seq_reference};
+
 // ============================================================================
 // Types for 7-step pipeline processing
 // ============================================================================
@@ -195,6 +197,16 @@ pub struct Duplex {
     /// Queue memory options.
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
+
+    /// Enable EM-Seq methylation-aware consensus calling.
+    /// When enabled, unconverted C/T counts are tracked at reference cytosine positions
+    /// and MM/ML methylation tags are emitted on consensus reads.
+    #[arg(long = "em-seq", default_value_t = false)]
+    pub em_seq: bool,
+
+    /// Path to the reference FASTA file (required when --em-seq is enabled)
+    #[arg(long = "ref")]
+    pub reference: Option<std::path::PathBuf>,
 }
 
 impl Command for Duplex {
@@ -256,6 +268,9 @@ impl Command for Duplex {
     ///     max_reads_per_strand: None,
     ///     cell_tag: None,
     ///     scheduler_opts: SchedulerOptions::default(),
+    ///     queue_memory: QueueMemoryOptions::default(),
+    ///     em_seq: false,
+    ///     reference: None,
     /// };
     ///
     /// duplex.execute("test")?;
@@ -304,6 +319,9 @@ impl Command for Duplex {
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
 
+        // Load reference for EM-Seq methylation-aware consensus calling
+        let em_seq_ref: EmSeqRef = load_em_seq_reference(self.em_seq, &self.reference, &header)?;
+
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
         let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
         if overlapping_enabled {
@@ -327,6 +345,7 @@ impl Command for Duplex {
                 read_name_prefix.clone(),
                 track_rejects,
                 command_line,
+                em_seq_ref.clone(),
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
             return result;
@@ -370,6 +389,11 @@ impl Command for Duplex {
             self.consensus.error_rate_pre_umi,
             self.consensus.error_rate_post_umi,
         )?;
+
+        // Set reference for EM-Seq if enabled
+        if let Some((ref reference, ref ref_names)) = em_seq_ref {
+            consensus_caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+        }
 
         // Accumulator for overlapping stats from parallel processing
         let mut merged_overlapping_stats = CorrectionStats::new();
@@ -510,6 +534,7 @@ impl Duplex {
     ///
     /// This method is called when `--threads N` is specified with N > 1.
     /// It uses the lock-free 7-step unified pipeline for maximum performance.
+    #[expect(clippy::too_many_arguments, reason = "pipeline setup needs all configuration")]
     fn execute_threads_mode(
         &self,
         num_threads: usize,
@@ -518,6 +543,7 @@ impl Duplex {
         read_name_prefix: String,
         track_rejects: bool,
         command_line: &str,
+        em_seq_ref: EmSeqRef,
     ) -> Result<()> {
         // Create output header (for duplex, output is unmapped like simplex)
         let output_header = create_unmapped_consensus_header(
@@ -620,6 +646,11 @@ impl Duplex {
                 .map_err(|e| {
                     io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
                 })?;
+
+                // Set reference for EM-Seq if enabled
+                if let Some((ref reference, ref ref_names)) = em_seq_ref {
+                    caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+                }
 
                 // Create overlapping caller if enabled
                 let mut overlapping_caller = if overlapping_enabled {
@@ -875,6 +906,8 @@ mod tests {
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            em_seq: false,
+            reference: None,
         }
     }
 

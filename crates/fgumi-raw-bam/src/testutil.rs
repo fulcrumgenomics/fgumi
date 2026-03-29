@@ -81,6 +81,12 @@ impl ParsedBamRecord {
     pub fn get_i16_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<i16>> {
         find_i16_array_tag_in_aux(&self.aux_data, *tag)
     }
+
+    /// Find a B:C (u8 array) tag value by tag name.
+    #[must_use]
+    pub fn get_u8_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+        find_u8_array_tag_in_aux(&self.aux_data, *tag)
+    }
 }
 
 fn unpack_sequence_for_test(packed: &[u8], l_seq: usize) -> Vec<u8> {
@@ -105,6 +111,50 @@ fn find_int_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<i32> {
 
 fn find_float_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<f32> {
     crate::tags::find_float_tag(aux, &tag)
+}
+
+fn find_u8_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
+    let mut i = 0;
+    while i + 3 <= aux.len() {
+        let t = [aux[i], aux[i + 1]];
+        let typ = aux[i + 2];
+        i += 3;
+        match typ {
+            b'B' => {
+                let sub = aux[i];
+                i += 1;
+                let count =
+                    u32::from_le_bytes([aux[i], aux[i + 1], aux[i + 2], aux[i + 3]]) as usize;
+                i += 4;
+                if t == tag && sub == b'C' {
+                    return Some(aux[i..i + count].to_vec());
+                }
+                let elem_size = match sub {
+                    b's' | b'S' => 2,
+                    b'i' | b'I' | b'f' => 4,
+                    _ => 1,
+                };
+                i += count * elem_size;
+            }
+            b'c' | b'C' => {
+                i += 1;
+            }
+            b's' | b'S' => {
+                i += 2;
+            }
+            b'i' | b'I' | b'f' => {
+                i += 4;
+            }
+            b'Z' => {
+                while i < aux.len() && aux[i] != 0 {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    None
 }
 
 fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {
