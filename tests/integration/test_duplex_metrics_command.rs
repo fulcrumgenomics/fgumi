@@ -1,7 +1,8 @@
 //! Integration tests for the duplex-metrics command.
 
 use fgoxide::io::DelimFile;
-use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, FamilySizeMetric, UmiMetric};
+use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, FamilySizeMetric};
+use fgumi_lib::metrics::shared::UmiMetric;
 use fgumi_lib::sam::builder::RecordBuilder;
 use noodles::bam;
 use noodles::sam::Header;

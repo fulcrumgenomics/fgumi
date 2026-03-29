@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::shared::{UmiCountTracker, UmiMetric};
 use crate::{Metric, frac};
 
 /// Metrics quantifying the distribution of different kinds of read family sizes.
@@ -177,52 +178,6 @@ impl Metric for DuplexYieldMetric {
     }
 }
 
-/// Metrics describing observed UMI sequences and their observation frequencies.
-///
-/// UMI sequences may be corrected using information within a double-stranded tag family.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UmiMetric {
-    /// The UMI sequence (possibly corrected)
-    pub umi: String,
-    /// Number of read pairs observing this UMI (after correction)
-    pub raw_observations: usize,
-    /// Subset of raw observations that underwent correction
-    pub raw_observations_with_errors: usize,
-    /// Number of double-stranded tag families observing this UMI
-    pub unique_observations: usize,
-    /// Fraction of all raw observations
-    pub fraction_raw_observations: f64,
-    /// Fraction of all unique observations
-    pub fraction_unique_observations: f64,
-}
-
-impl UmiMetric {
-    /// Creates a new UMI metric
-    #[must_use]
-    pub fn new(umi: String) -> Self {
-        Self {
-            umi,
-            raw_observations: 0,
-            raw_observations_with_errors: 0,
-            unique_observations: 0,
-            fraction_raw_observations: 0.0,
-            fraction_unique_observations: 0.0,
-        }
-    }
-}
-
-impl Default for UmiMetric {
-    fn default() -> Self {
-        Self::new(String::new())
-    }
-}
-
-impl Metric for UmiMetric {
-    fn metric_name() -> &'static str {
-        "UMI"
-    }
-}
-
 /// Metrics describing observed duplex UMI sequences and their frequencies.
 ///
 /// Duplex UMIs are normalized to F1R2 orientation (positive strand first).
@@ -269,44 +224,6 @@ impl Default for DuplexUmiMetric {
 impl Metric for DuplexUmiMetric {
     fn metric_name() -> &'static str {
         "duplex UMI"
-    }
-}
-
-/// Tracks raw, error, and unique UMI observation counts.
-struct UmiCountTracker {
-    /// Maps UMI string to `(raw_count, error_count, unique_count)`.
-    counts: HashMap<String, (usize, usize, usize)>,
-}
-
-impl UmiCountTracker {
-    /// Creates an empty tracker.
-    fn new() -> Self {
-        Self { counts: HashMap::new() }
-    }
-
-    /// Records an observation for a UMI.
-    fn record(&mut self, umi: &str, raw_count: usize, error_count: usize, is_unique: bool) {
-        let entry = self.counts.entry(umi.to_string()).or_insert((0, 0, 0));
-        entry.0 += raw_count;
-        entry.1 += error_count;
-        if is_unique {
-            entry.2 += 1;
-        }
-    }
-
-    /// Total raw observations across all UMIs.
-    fn total_raw(&self) -> usize {
-        self.counts.values().map(|(raw, _, _)| raw).sum()
-    }
-
-    /// Total unique observations across all UMIs.
-    fn total_unique(&self) -> usize {
-        self.counts.values().map(|(_, _, unique)| unique).sum()
-    }
-
-    /// Iterates over all tracked UMIs, yielding `(umi, raw_count, error_count, unique_count)`.
-    fn iter(&self) -> impl Iterator<Item = (&str, usize, usize, usize)> {
-        self.counts.iter().map(|(umi, &(raw, errors, unique))| (umi.as_str(), raw, errors, unique))
     }
 }
 
@@ -505,26 +422,7 @@ impl DuplexMetricsCollector {
     /// Generates UMI metrics
     #[must_use]
     pub fn umi_metrics(&self) -> Vec<UmiMetric> {
-        let total_raw = self.umi_counts.total_raw();
-        let total_unique = self.umi_counts.total_unique();
-
-        let mut metrics: Vec<_> = self
-            .umi_counts
-            .iter()
-            .map(|(umi, raw, errors, unique)| {
-                let mut metric = UmiMetric::new(umi.to_string());
-                metric.raw_observations = raw;
-                metric.raw_observations_with_errors = errors;
-                metric.unique_observations = unique;
-                metric.fraction_raw_observations = frac(raw, total_raw);
-                metric.fraction_unique_observations = frac(unique, total_unique);
-                metric
-            })
-            .collect();
-
-        // Sort by UMI string (matching fgbio's sortBy(_.umi))
-        metrics.sort_by(|a, b| a.umi.cmp(&b.umi));
-        metrics
+        self.umi_counts.to_metrics()
     }
 
     /// Generates duplex UMI metrics
@@ -579,35 +477,6 @@ impl DuplexMetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // =========================================================================
-    // UmiCountTracker tests
-    // =========================================================================
-
-    #[test]
-    fn test_umi_count_tracker_empty() {
-        let tracker = UmiCountTracker::new();
-        assert_eq!(tracker.total_raw(), 0);
-        assert_eq!(tracker.total_unique(), 0);
-        assert_eq!(tracker.iter().count(), 0);
-    }
-
-    #[test]
-    fn test_umi_count_tracker_record_and_iter() {
-        let mut tracker = UmiCountTracker::new();
-        tracker.record("AAAA", 10, 2, true);
-        tracker.record("AAAA", 5, 1, false);
-        tracker.record("CCCC", 8, 0, true);
-
-        assert_eq!(tracker.total_raw(), 23); // 15 + 8
-        assert_eq!(tracker.total_unique(), 2); // 1 + 1
-
-        let mut items: Vec<_> = tracker.iter().collect();
-        items.sort_by(|a, b| a.0.cmp(b.0));
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], ("AAAA", 15, 3, 1));
-        assert_eq!(items[1], ("CCCC", 8, 0, 1));
-    }
 
     // =========================================================================
     // FamilySizeMetric tests
@@ -671,18 +540,6 @@ mod tests {
         assert_eq!(metric.read_pairs, 0);
         assert_eq!(metric.cs_families, 0);
         assert_eq!(metric.ds_duplexes, 0);
-    }
-
-    // =========================================================================
-    // UmiMetric tests
-    // =========================================================================
-
-    #[test]
-    fn test_umi_metric_new() {
-        let metric = UmiMetric::new("ACGT".to_string());
-        assert_eq!(metric.umi, "ACGT");
-        assert_eq!(metric.raw_observations, 0);
-        assert_eq!(metric.unique_observations, 0);
     }
 
     // =========================================================================
@@ -838,20 +695,6 @@ mod tests {
         assert_eq!(metrics[1].ba_size, 2);
         assert_eq!(metrics[2].ab_size, 5);
         assert_eq!(metrics[2].ba_size, 3);
-    }
-
-    #[test]
-    fn test_umi_metrics_sorting() {
-        let mut collector = DuplexMetricsCollector::new(false);
-        collector.record_umi("ZZZZ", 1, 0, true);
-        collector.record_umi("AAAA", 1, 0, true);
-        collector.record_umi("MMMM", 1, 0, true);
-
-        let metrics = collector.umi_metrics();
-        // Should be sorted alphabetically
-        assert_eq!(metrics[0].umi, "AAAA");
-        assert_eq!(metrics[1].umi, "MMMM");
-        assert_eq!(metrics[2].umi, "ZZZZ");
     }
 
     #[test]

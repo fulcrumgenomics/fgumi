@@ -15,6 +15,8 @@ pub mod correct;
 pub mod duplex;
 pub mod group;
 pub mod rejection;
+pub mod shared;
+pub mod simplex;
 pub mod writer;
 
 use serde::{Deserialize, Serialize};
@@ -90,10 +92,12 @@ pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
-    FamilySizeMetric, UmiMetric,
+    FamilySizeMetric,
 };
 pub use group::{FamilySizeMetrics, UmiGroupingMetrics};
 pub use rejection::{RejectionReason, format_count};
+pub use shared::UmiMetric;
+pub use simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector, SimplexYieldMetric};
 pub use writer::{read_metrics, read_metrics_auto, write_metrics};
 
 #[cfg(test)]
