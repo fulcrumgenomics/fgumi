@@ -14,6 +14,7 @@ use fgumi_lib::bam_io::{
 use fgumi_lib::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
 };
+use fgumi_lib::defaults;
 use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
 use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
 use fgumi_lib::overlapping_consensus::{
@@ -190,7 +191,7 @@ pub struct Simplex {
     pub compression: CompressionOptions,
 
     /// The SAM tag containing the unique molecule identifier
-    #[arg(short = 't', long = "tag", default_value = "MI")]
+    #[arg(short = 't', long = "tag", default_value = defaults::MI_TAG)]
     pub tag: String,
 
     /// Minimum number of reads to produce a consensus (required, no default)
@@ -207,7 +208,7 @@ pub struct Simplex {
     pub sort_order: Option<String>,
 
     /// SAM tag containing the cell barcode
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: Option<String>,
 
     /// Scheduler and pipeline statistics options.

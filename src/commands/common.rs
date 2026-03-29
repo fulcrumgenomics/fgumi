@@ -9,6 +9,7 @@ use anyhow::Context;
 use bytesize::ByteSize;
 use clap::Args;
 use fgumi_lib::bam_io::is_stdin_path;
+use fgumi_lib::defaults;
 use fgumi_lib::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use fgumi_lib::validation::validate_file_exists;
 use noodles::sam::Header;
@@ -92,39 +93,39 @@ impl StatsOptions {
 #[derive(Debug, Clone, Args)]
 pub struct ConsensusCallingOptions {
     /// Phred-scaled error rate prior to UMI integration
-    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value_t = defaults::CONSENSUS_ERROR_RATE_PRE_UMI)]
     pub error_rate_pre_umi: u8,
 
     /// Phred-scaled error rate post UMI integration
-    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
+    #[arg(short = '2', long = "error-rate-post-umi", default_value_t = defaults::CONSENSUS_ERROR_RATE_POST_UMI)]
     pub error_rate_post_umi: u8,
 
     /// Minimum base quality in raw reads to use for consensus
-    #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
+    #[arg(short = 'm', long = "min-input-base-quality", default_value_t = defaults::CONSENSUS_MIN_INPUT_BASE_QUALITY)]
     pub min_input_base_quality: u8,
 
     /// Produce per-base tags (cd, ce) in addition to per-read tags
-    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true")]
+    #[arg(short = 'B', long = "output-per-base-tags", default_value_t = defaults::CONSENSUS_OUTPUT_PER_BASE_TAGS)]
     pub output_per_base_tags: bool,
 
     /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
-    #[arg(long = "trim", default_value = "false")]
+    #[arg(long = "trim", default_value_t = defaults::CONSENSUS_TRIM)]
     pub trim: bool,
 
     /// Minimum consensus base quality (output consensus bases below this are masked to N)
-    #[arg(long = "min-consensus-base-quality", default_value = "2")]
+    #[arg(long = "min-consensus-base-quality", default_value_t = defaults::CONSENSUS_MIN_BASE_QUALITY)]
     pub min_consensus_base_quality: u8,
 }
 
 impl Default for ConsensusCallingOptions {
     fn default() -> Self {
         Self {
-            error_rate_pre_umi: 45,
-            error_rate_post_umi: 40,
-            min_input_base_quality: 10,
-            output_per_base_tags: true,
-            trim: false,
-            min_consensus_base_quality: 2,
+            error_rate_pre_umi: defaults::CONSENSUS_ERROR_RATE_PRE_UMI,
+            error_rate_post_umi: defaults::CONSENSUS_ERROR_RATE_POST_UMI,
+            min_input_base_quality: defaults::CONSENSUS_MIN_INPUT_BASE_QUALITY,
+            output_per_base_tags: defaults::CONSENSUS_OUTPUT_PER_BASE_TAGS,
+            trim: defaults::CONSENSUS_TRIM,
+            min_consensus_base_quality: defaults::CONSENSUS_MIN_BASE_QUALITY,
         }
     }
 }
@@ -190,7 +191,7 @@ pub struct ReadGroupOptions {
     pub read_name_prefix: Option<String>,
 
     /// Read group ID for consensus reads
-    #[arg(short = 'R', long = "read-group-id", default_value = "A")]
+    #[arg(short = 'R', long = "read-group-id", default_value = defaults::READ_GROUP_ID)]
     pub read_group_id: String,
 }
 
@@ -206,7 +207,7 @@ impl ReadGroupOptions {
 
 impl Default for ReadGroupOptions {
     fn default() -> Self {
-        Self { read_name_prefix: None, read_group_id: "A".to_string() }
+        Self { read_name_prefix: None, read_group_id: defaults::READ_GROUP_ID.to_string() }
     }
 }
 
@@ -214,13 +215,13 @@ impl Default for ReadGroupOptions {
 #[derive(Debug, Clone, Args)]
 pub struct OverlappingConsensusOptions {
     /// Consensus call overlapping bases in read pairs before UMI consensus calling
-    #[arg(long = "consensus-call-overlapping-bases", default_value = "true")]
+    #[arg(long = "consensus-call-overlapping-bases", default_value_t = defaults::CONSENSUS_CALL_OVERLAPPING_BASES)]
     pub consensus_call_overlapping_bases: bool,
 }
 
 impl Default for OverlappingConsensusOptions {
     fn default() -> Self {
-        Self { consensus_call_overlapping_bases: true }
+        Self { consensus_call_overlapping_bases: defaults::CONSENSUS_CALL_OVERLAPPING_BASES }
     }
 }
 
@@ -284,14 +285,20 @@ pub struct ThreadingOptions {
 /// Options for output compression.
 ///
 /// Controls BGZF compression level for BAM output files.
-#[derive(Debug, Clone, Default, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct CompressionOptions {
     /// Compression level for output BAM (1-12).
     ///
     /// Level 1 is fastest with larger files.
     /// Level 12 produces smallest files but is slowest.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = defaults::COMPRESSION_LEVEL)]
     pub compression_level: u32,
+}
+
+impl Default for CompressionOptions {
+    fn default() -> Self {
+        Self { compression_level: defaults::COMPRESSION_LEVEL }
+    }
 }
 
 /// Options for pipeline scheduler configuration.

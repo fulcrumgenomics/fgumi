@@ -133,8 +133,11 @@ pub use fgumi_bgzf::writer as bgzf_writer;
 pub use fgumi_dna::bitenc;
 pub use fgumi_sam::clipper;
 pub mod consensus;
+pub mod correct;
+pub mod defaults;
 pub use fgumi_dna::dna;
 pub mod errors;
+pub mod extract;
 pub mod fastq;
 pub mod grouper;
 pub mod header;
@@ -172,9 +175,11 @@ pub use umi::assigner;
 
 // Re-export consensus items for backward compatibility
 pub use consensus::caller as consensus_caller;
+#[cfg(feature = "duplex")]
 pub use consensus::duplex_caller as duplex_consensus_caller;
 pub use consensus::filter as consensus_filter;
 pub use consensus::overlapping as overlapping_consensus;
 pub use consensus::simple_umi as simple_umi_consensus;
 pub use consensus::tags as consensus_tags;
+#[cfg(feature = "simplex")]
 pub use consensus::vanilla_caller as vanilla_consensus_caller;

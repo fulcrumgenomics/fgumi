@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-umi", "crates/fgumi-consensus"]
+members = [".", "crates/fgumi-derive", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-lib", "crates/fgumi-pipeline"]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +11,7 @@ license = "MIT"
 
 [workspace.dependencies]
 fgumi-bgzf = { version = "0.1.2", path = "crates/fgumi-bgzf" }
+fgumi-derive = { version = "0.1.2", path = "crates/fgumi-derive" }
 fgumi-consensus = { version = "0.1.2", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.1.2", path = "crates/fgumi-dna" }
 fgumi-metrics = { version = "0.1.2", path = "crates/fgumi-metrics" }
@@ -18,6 +19,8 @@ fgumi-raw-bam = { version = "0.1.2", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.1.2", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.1.2", path = "crates/fgumi-simd-fastq" }
 fgumi-umi = { version = "0.1.2", path = "crates/fgumi-umi" }
+fgumi-lib = { version = "0.1.2", path = "crates/fgumi-lib", default-features = false }
+fgumi-pipeline = { version = "0.1.2", path = "crates/fgumi-pipeline" }
 
 [package]
 name = "fgumi"
@@ -77,6 +80,8 @@ wide = "1.1"
 rand_distr = "0.6"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
+fgumi-derive = { workspace = true }
+fgumi-lib = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
 fgumi-bgzf = { workspace = true }
@@ -85,29 +90,33 @@ fgumi-sam = { workspace = true }
 fgumi-simd-fastq = { workspace = true }
 fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
+fgumi-pipeline = { workspace = true }
+seq_io = "0.3.4"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 
 [features]
 default = ["simplex", "duplex", "codec"]
-simplex = ["fgumi-consensus/simplex"]
-duplex = ["fgumi-consensus/duplex"]
-codec = ["fgumi-consensus/codec"]
+simplex = ["fgumi-lib/simplex", "fgumi-consensus/simplex"]
+duplex = ["fgumi-lib/duplex", "fgumi-consensus/duplex"]
+codec = ["fgumi-lib/codec", "fgumi-consensus/codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
-memory-debug = ["dep:libmimalloc-sys", "dep:sysinfo"]
+memory-debug = ["fgumi-lib/memory-debug", "dep:libmimalloc-sys", "dep:sysinfo"]
 # Enable compare subcommand with bams and metrics (developer tools)
-compare = []
+compare = ["fgumi-lib/compare"]
 # Enable simulate commands for generating synthetic test data
-simulate = []
+simulate = ["fgumi-lib/simulate"]
 # Enable profiling output for adjacency UMI assigner
-profile-adjacency = []
+profile-adjacency = ["fgumi-lib/profile-adjacency"]
 # Enable slow stress tests for concurrency testing
-stress-tests = []
+stress-tests = ["fgumi-lib/stress-tests"]
 
 [dev-dependencies]
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
+which = "7"
 
 [[bench]]
 name = "core_functions"
@@ -124,7 +133,3 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
-
-[lib]
-name = "fgumi_lib"
-path = "src/lib/mod.rs"

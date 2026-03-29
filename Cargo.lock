@@ -189,6 +189,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2",
+]
+
+[[package]]
 name = "bstr"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -296,6 +305,12 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
@@ -523,6 +538,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix",
+ "windows-sys",
+]
+
+[[package]]
 name = "cty"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -542,6 +568,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thousands",
+]
+
+[[package]]
+name = "dispatch2"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
+dependencies = [
+ "bitflags",
+ "block2",
+ "libc",
+ "objc2",
 ]
 
 [[package]]
@@ -582,6 +620,12 @@ dependencies = [
  "log",
  "regex",
 ]
+
+[[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
 
 [[package]]
 name = "env_logger"
@@ -651,14 +695,18 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
  "csv",
+ "ctrlc",
  "dhat",
  "enum_dispatch",
  "env_logger",
  "fgoxide",
  "fgumi-bgzf",
  "fgumi-consensus",
+ "fgumi-derive",
  "fgumi-dna",
+ "fgumi-lib",
  "fgumi-metrics",
+ "fgumi-pipeline",
  "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-simd-fastq",
@@ -683,11 +731,13 @@ dependencies = [
  "rayon",
  "read-structure",
  "rstest",
+ "seq_io",
  "serde",
  "statrs",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
+ "which",
  "wide 1.1.1",
 ]
 
@@ -719,10 +769,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-derive"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "fgumi-dna"
 version = "0.1.2"
 dependencies = [
  "rstest",
+]
+
+[[package]]
+name = "fgumi-lib"
+version = "0.1.2"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "bgzf",
+ "bstr 1.12.1",
+ "bytemuck",
+ "bytes",
+ "clap",
+ "crossbeam-channel",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "fgumi-bgzf",
+ "fgumi-consensus",
+ "fgumi-dna",
+ "fgumi-metrics",
+ "fgumi-raw-bam",
+ "fgumi-sam",
+ "fgumi-simd-fastq",
+ "fgumi-umi",
+ "flate2",
+ "libdeflater",
+ "libmimalloc-sys",
+ "log",
+ "lru",
+ "memchr",
+ "noodles",
+ "noodles-bgzf",
+ "noodles-csi",
+ "parking_lot",
+ "rand 0.10.0",
+ "rand_distr 0.6.0",
+ "rayon",
+ "read-structure",
+ "rstest",
+ "seq_io",
+ "serde",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -735,6 +840,30 @@ dependencies = [
  "noodles",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "fgumi-pipeline"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "crossbeam-queue",
+ "fgumi-bgzf",
+ "fgumi-consensus",
+ "fgumi-derive",
+ "fgumi-lib",
+ "fgumi-raw-bam",
+ "fgumi-sam",
+ "fgumi-umi",
+ "log",
+ "lru",
+ "noodles",
+ "rayon",
+ "rstest",
+ "tempfile",
+ "which",
 ]
 
 [[package]]
@@ -1433,6 +1562,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d6d0705320c1e6ba1d912b5e37cf18071b6c2e9b7fa8215a1e8a7651966f5d3"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "noodles"
 version = "0.106.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1610,6 +1751,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1617,6 +1767,12 @@ checksum = "1c10c2894a6fed806ade6027bcd50662746363a9589d3ec9d9bef30a4e4bc166"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
 
 [[package]]
 name = "objc2-io-kit"
@@ -2689,6 +2845,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix",
+ "winsafe",
+]
+
+[[package]]
 name = "wide"
 version = "0.7.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2866,6 +3034,12 @@ checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"
