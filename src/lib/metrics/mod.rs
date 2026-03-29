@@ -22,6 +22,8 @@ pub use fgumi_metrics::consensus;
 pub use fgumi_metrics::correct;
 pub use fgumi_metrics::duplex;
 pub use fgumi_metrics::group;
+pub use fgumi_metrics::shared;
+pub use fgumi_metrics::simplex;
 pub use fgumi_metrics::writer;
 
 // Re-export commonly used types
@@ -30,7 +32,8 @@ pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
-    FamilySizeMetric, UmiMetric,
+    FamilySizeMetric,
 };
 pub use group::{FamilySizeMetrics, UmiGroupingMetrics};
+pub use shared::UmiMetric;
 pub use writer::{read_metrics, write_metrics};

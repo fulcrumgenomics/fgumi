@@ -29,6 +29,7 @@ use commands::group::GroupReadsByUmi;
 use commands::merge::Merge;
 use commands::review::Review;
 use commands::simplex::Simplex;
+use commands::simplex_metrics::SimplexMetrics;
 #[cfg(feature = "simulate")]
 use commands::simulate::Simulate;
 use commands::sort::Sort;
@@ -109,16 +110,18 @@ enum Subcommand {
     #[command(display_order = 14)]
     DuplexMetrics(DuplexMetrics),
     #[command(display_order = 15)]
+    SimplexMetrics(SimplexMetrics),
+    #[command(display_order = 16)]
     Review(Review),
 
     // Utilities
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Downsample(Downsample),
     #[cfg(feature = "compare")]
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Compare(Compare),
     #[cfg(feature = "simulate")]
-    #[command(display_order = 18)]
+    #[command(display_order = 19)]
     Simulate(Simulate),
 }
 

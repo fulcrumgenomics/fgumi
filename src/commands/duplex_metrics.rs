@@ -9,100 +9,24 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::bam_io::create_bam_reader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
-use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
-use fgumi_lib::template::TemplateIterator;
 use fgumi_lib::umi::extract_mi_base;
-use fgumi_lib::validation::{string_to_tag, validate_file_exists};
+use fgumi_lib::validation::validate_file_exists;
 use log::info;
-use murmur3::murmur3_32;
-use noodles::sam::alignment::record::Cigar;
-use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use super::command::Command;
+use super::shared_metrics::{
+    DOWNSAMPLING_FRACTIONS, TemplateInfo, TemplateMetadata, compute_template_metadata,
+    execute_r_script, is_r_available, parse_intervals, process_templates_from_bam,
+    validate_not_consensus_bam,
+};
 
 /// Embedded R script for PDF plot generation (bundled with binary)
 const R_SCRIPT: &str = include_str!("../../resources/CollectDuplexSeqMetrics.R");
-
-/// Cached R availability check (computed once per process)
-static R_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-/// Genomic interval for filtering
-#[derive(Clone, Debug)]
-struct Interval {
-    ref_name: String,
-    start: i32,
-    end: i32,
-}
-
-/// Read name and template information for downsampling
-#[derive(Clone)]
-struct TemplateInfo {
-    mi: String,
-    rx: String,
-    ref_name: Option<String>,
-    position: Option<i32>,
-    end_position: Option<i32>,
-    /// Hash fraction for deterministic downsampling (computed once per template)
-    hash_fraction: f64,
-}
-
-/// Grouping key matching fgbio's `ReadInfo` structure
-/// Fields are ordered so the earlier-mapping read comes first
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ReadInfoKey {
-    ref_index1: Option<usize>,
-    start1: i32,
-    strand1: bool, // true = reverse
-    ref_index2: Option<usize>,
-    start2: i32,
-    strand2: bool,
-}
-
-/// Computes the unclipped 5' position for a read, matching fgbio's positionOf.
-///
-/// For forward strand reads: unclippedStart = alignmentStart - leading soft clips
-/// For reverse strand reads: unclippedEnd = alignmentEnd + trailing soft clips
-fn unclipped_five_prime_position(record: &RecordBuf) -> Option<i32> {
-    let is_reverse = record.flags().is_reverse_complemented();
-    let cigar = record.cigar();
-
-    if is_reverse {
-        // For reverse strand, 5' is at the end
-        // unclippedEnd = alignmentEnd + trailing soft clips
-        let alignment_end = record.alignment_end().map(|p| usize::from(p) as i32)?;
-
-        // Count trailing soft clips (last element if it's S)
-        let trailing_clips: i32 = cigar
-            .iter()
-            .filter_map(std::result::Result::ok)
-            .last()
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map_or(0, |op| op.len() as i32);
-
-        Some(alignment_end + trailing_clips)
-    } else {
-        // For forward strand, 5' is at the start
-        // unclippedStart = alignmentStart - leading soft clips
-        let alignment_start = record.alignment_start().map(|p| usize::from(p) as i32)?;
-
-        // Count leading soft clips (first element if it's S)
-        let leading_clips: i32 = cigar
-            .iter()
-            .find_map(std::result::Result::ok)
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map_or(0, |op| op.len() as i32);
-
-        Some(alignment_start - leading_clips)
-    }
-}
 
 /// Collects comprehensive QC metrics for duplex sequencing experiments
 #[derive(Parser, Debug)]
@@ -220,23 +144,19 @@ impl Command for DuplexMetrics {
         }
 
         // Check that input is not a consensus BAM
-        self.validate_not_consensus_bam()?;
+        validate_not_consensus_bam(&self.input)?;
 
         // Load intervals if provided
         let intervals = if let Some(intervals_path) = &self.intervals {
             info!("  Loading intervals from: {}", intervals_path.display());
-            let intervals = Self::parse_intervals(intervals_path)?;
+            let intervals = parse_intervals(intervals_path)?;
             info!("  Loaded {} intervals", intervals.len());
             intervals
         } else {
             Vec::new()
         };
 
-        // Downsampling fractions to process
-        let fractions = [
-            0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70,
-            0.75, 0.80, 0.85, 0.90, 0.95, 1.00,
-        ];
+        let fractions = &DOWNSAMPLING_FRACTIONS;
 
         // Create collectors for each fraction (single-pass architecture)
         let mut collectors: Vec<DuplexMetricsCollector> = fractions
@@ -253,11 +173,22 @@ impl Command for DuplexMetrics {
         info!("Processing templates in single pass at {} sampling fractions...", fractions.len());
 
         // Single pass: process templates and update all applicable collectors
-        let (total_template_count, fraction_template_counts) = self.process_templates_single_pass(
+        let (total_template_count, fraction_template_counts) = process_templates_from_bam(
+            &self.input,
             &intervals,
-            &fractions,
-            &mut collectors,
-            &mut umi_consensus_caller,
+            &self.mi_tag,
+            &self.umi_tag,
+            fractions.len(),
+            |group, fraction_counts| {
+                Self::process_coordinate_group(
+                    group,
+                    fractions,
+                    &mut collectors,
+                    &mut umi_consensus_caller,
+                    fraction_counts,
+                    self,
+                );
+            },
         )?;
 
         info!("Processed {total_template_count} templates");
@@ -323,15 +254,19 @@ impl Command for DuplexMetrics {
 
         // Generate PDF plots using R script (optional)
         let pdf_path = format!("{}.duplex_qc.pdf", self.output.display());
-        if Self::is_r_available() {
+        if is_r_available() {
             let description = self.description.as_deref().unwrap_or("Sample");
-            match Self::execute_r_script(
-                &family_size_path,
-                &duplex_family_size_path,
-                &yield_path,
-                &umi_path,
-                &pdf_path,
-                description,
+            match execute_r_script(
+                R_SCRIPT,
+                &[
+                    &family_size_path,
+                    &duplex_family_size_path,
+                    &yield_path,
+                    &umi_path,
+                    &pdf_path,
+                    description,
+                ],
+                "fgumi_CollectDuplexSeqMetrics.R",
             ) {
                 Ok(()) => info!("Generated PDF plots: {pdf_path}"),
                 Err(e) => {
@@ -357,386 +292,6 @@ impl Command for DuplexMetrics {
 }
 
 impl DuplexMetrics {
-    /// Validates that the input BAM is not a consensus BAM.
-    ///
-    /// Consensus BAMs (output from simplex/duplex callers) should not be used with this tool.
-    /// This checks the first valid R1 record and errors if it contains consensus tags.
-    fn validate_not_consensus_bam(&self) -> Result<()> {
-        use fgumi_lib::consensus_tags::is_consensus;
-
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
-
-        // Look at the first valid R1 record
-        for result in reader.record_bufs(&header) {
-            let record = result?;
-
-            // Only check R1 records that are paired, mapped, and primary
-            let flags = record.flags();
-            if !flags.is_segmented()
-                || !flags.is_first_segment()
-                || flags.is_secondary()
-                || flags.is_supplementary()
-                || flags.is_unmapped()
-            {
-                continue;
-            }
-
-            // Check if this is a consensus read
-            if is_consensus(&record) {
-                anyhow::bail!(
-                    "Input BAM file ({}) appears to contain consensus sequences. \
-                    duplex-metrics cannot run on consensus BAMs, and instead requires \
-                    the UMI-grouped BAM generated by group which is run prior to consensus calling.\n\
-                    First R1 record '{}' has consensus SAM tags present.",
-                    self.input.display(),
-                    record.name().map_or_else(
-                        || "<unnamed>".to_string(),
-                        |n| String::from_utf8_lossy(n.as_ref()).to_string()
-                    )
-                );
-            }
-
-            // Only need to check the first valid R1 record
-            break;
-        }
-
-        Ok(())
-    }
-
-    /// Parses an intervals file in BED or Picard interval list format.
-    ///
-    /// Auto-detects the format: if any line starts with `@`, the file is treated as a
-    /// Picard interval list (1-based closed coordinates with a SAM header); otherwise
-    /// it is treated as BED (0-based half-open coordinates).
-    ///
-    /// Intervals are stored internally using BED conventions (0-based half-open).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be read or lines cannot be parsed.
-    fn parse_intervals(path: &PathBuf) -> Result<Vec<Interval>> {
-        use std::fs::File;
-        use std::io::{BufRead, BufReader};
-
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut intervals = Vec::new();
-        let mut is_interval_list = false;
-
-        for line in reader.lines() {
-            let line = line?;
-            let line = line.trim();
-
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Skip SAM header lines (interval list format)
-            if line.starts_with('@') {
-                is_interval_list = true;
-                continue;
-            }
-
-            let mut fields = line.splitn(4, '\t');
-            let ref_name = fields.next().unwrap(); // guaranteed non-empty (line isn't empty)
-            let start_str = fields.next();
-            let end_str = fields.next();
-
-            let (Some(start_str), Some(end_str)) = (start_str, end_str) else {
-                let fmt = if is_interval_list { "interval list" } else { "BED" };
-                anyhow::bail!("Invalid {fmt} line (needs at least 3 fields): {line}");
-            };
-
-            if is_interval_list {
-                // Picard interval list: chr start end strand name (1-based, closed)
-                let start: i32 = start_str
-                    .parse::<i32>()
-                    .map_err(|_| anyhow::anyhow!("Invalid start position: {start_str}"))?
-                    - 1; // Convert 1-based to 0-based
-                let end: i32 = end_str
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("Invalid end position: {end_str}"))?;
-                // end stays the same: 1-based closed end == 0-based half-open end
-                intervals.push(Interval { ref_name: ref_name.to_string(), start, end });
-            } else {
-                // BED format: chr start end [name] [score] [strand] (0-based, half-open)
-                let start: i32 = start_str
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("Invalid start position: {start_str}"))?;
-                let end: i32 = end_str
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("Invalid end position: {end_str}"))?;
-                intervals.push(Interval { ref_name: ref_name.to_string(), start, end });
-            }
-        }
-
-        Ok(intervals)
-    }
-
-    /// Checks if a template's insert overlaps any provided interval.
-    ///
-    /// Determines whether a template's genomic insert coordinates overlap with any
-    /// of the specified intervals. An insert overlaps an interval if any part of it
-    /// (from start to end position) overlaps the interval region. If no intervals are
-    /// provided, all templates are considered to overlap (no filtering).
-    ///
-    /// # Arguments
-    ///
-    /// * `template` - Template information including chromosome and positions
-    /// * `intervals` - Slice of intervals to check for overlap
-    ///
-    /// # Returns
-    ///
-    /// `true` if the template overlaps any interval or if no intervals are provided,
-    /// `false` if the template is unmapped or does not overlap any interval.
-    fn overlaps_intervals(template: &TemplateInfo, intervals: &[Interval]) -> bool {
-        if intervals.is_empty() {
-            return true; // No filtering if no intervals provided
-        }
-
-        if let (Some(ref_name), Some(start), Some(end)) =
-            (&template.ref_name, template.position, template.end_position)
-        {
-            // Intervals are 0-based half-open; template positions are 1-based inclusive.
-            // In 0-based half-open the template is [start-1, end), so the overlap
-            // test is: (start-1) < interval.end && interval.start < end
-            // which simplifies to: start <= interval.end && interval.start < end
-            intervals.iter().any(|interval| {
-                interval.ref_name == *ref_name && start <= interval.end && interval.start < end
-            })
-        } else {
-            false // Unmapped reads or reads without proper coordinates don't overlap any interval
-        }
-    }
-
-    /// Processes templates in a single pass, updating all collectors for applicable fractions.
-    ///
-    /// Implements a single-pass downsampling strategy where each template is hashed to determine
-    /// which downsampling fractions it belongs to. Templates are stored per fraction, then
-    /// analyzed to compute metrics for each fraction independently. This approach enables
-    /// efficient computation of metrics at multiple downsampling levels without re-reading
-    /// the input file.
-    ///
-    /// # Arguments
-    ///
-    /// * `intervals` - Optional intervals for filtering templates
-    /// * `fractions` - Slice of downsampling fractions (e.g., 0.05, 0.10, ..., 1.00)
-    /// * `collectors` - Mutable slice of metrics collectors, one per fraction
-    /// * `umi_consensus_caller` - UMI consensus caller for error correction
-    ///
-    /// # Returns
-    ///
-    /// A tuple of `(total_template_count, per_fraction_template_counts)` where:
-    /// - `total_template_count` is the total number of templates processed
-    /// - `per_fraction_template_counts` is a vector of template counts for each fraction
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - BAM file cannot be read
-    /// - Template processing fails
-    /// - Metrics collection fails
-    fn process_templates_single_pass(
-        &self,
-        intervals: &[Interval],
-        fractions: &[f64],
-        collectors: &mut [DuplexMetricsCollector],
-        umi_consensus_caller: &mut SimpleUmiConsensusCaller,
-    ) -> Result<(usize, Vec<usize>)> {
-        let (mut reader, header) = create_bam_reader(&self.input, 1)?;
-
-        let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-        let template_iter = TemplateIterator::new(record_iter);
-
-        // Streaming approach: process groups as they arrive (assumes consecutive ReadInfo grouping)
-        // This matches fgbio's takeNextGroup behavior
-        let mut current_group: Vec<TemplateInfo> = Vec::new();
-        let mut current_key: Option<ReadInfoKey> = None;
-        let mut template_count = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-        let mut fraction_template_counts: Vec<usize> = vec![0; fractions.len()];
-        let mi_tag = string_to_tag(&self.mi_tag, "MI tag")?;
-        let umi_tag = string_to_tag(&self.umi_tag, "UMI tag")?;
-
-        for template in template_iter {
-            let template = template?;
-            if template.records.len() < 2 {
-                continue;
-            }
-
-            // Find R1 and R2 that pass fgbio's filtering criteria
-            let r1 = template.records.iter().find(|r| {
-                let f = r.flags();
-                f.is_segmented()
-                    && !f.is_unmapped()
-                    && !f.is_mate_unmapped()
-                    && f.is_first_segment()
-                    && !f.is_secondary()
-                    && !f.is_supplementary()
-            });
-            let r2 = template.records.iter().find(|r| {
-                let f = r.flags();
-                f.is_segmented()
-                    && !f.is_unmapped()
-                    && !f.is_mate_unmapped()
-                    && f.is_last_segment()
-                    && !f.is_secondary()
-                    && !f.is_supplementary()
-            });
-
-            let (r1, r2) = match (r1, r2) {
-                (Some(r1), Some(r2)) => (r1, r2),
-                _ => continue,
-            };
-
-            let record = r1; // Use R1 as the primary record for tags
-
-            // Get read name
-            let read_name = record
-                .name()
-                .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
-                .unwrap_or_default();
-
-            // Get MI tag (molecular identifier)
-            let mi =
-                if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-                    record.data().get(&mi_tag)
-                {
-                    String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
-                } else {
-                    continue;
-                };
-
-            // Get UMI tag (raw UMI)
-            let rx =
-                if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-                    record.data().get(&umi_tag)
-                {
-                    String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
-                } else {
-                    continue;
-                };
-
-            // Get reference position and calculate insert coordinates
-            let ref_name = if let Some(ref_id) = record.reference_sequence_id() {
-                header.reference_sequences().get_index(ref_id).map(|(name, _)| name.to_string())
-            } else {
-                None
-            };
-
-            // Calculate insert coordinates and ReadInfo key (matching fgbio)
-            // r1 and r2 were already found above
-            let (position, end_position, read_info_key) = {
-                let r1_ref = r1.reference_sequence_id();
-                let r2_ref = r2.reference_sequence_id();
-
-                if r1_ref == r2_ref && r1_ref.is_some() {
-                    // Get unclipped 5' positions (matching fgbio's positionOf)
-                    let r1_5prime = unclipped_five_prime_position(r1);
-                    let r2_5prime = unclipped_five_prime_position(r2);
-                    let r1_strand = r1.flags().is_reverse_complemented();
-                    let r2_strand = r2.flags().is_reverse_complemented();
-
-                    if let (Some(s1), Some(s2)) = (r1_5prime, r2_5prime) {
-                        // For insert coordinates, use alignment positions
-                        let r1_start = r1.alignment_start().map(|p| usize::from(p) as i32);
-                        let r2_start = r2.alignment_start().map(|p| usize::from(p) as i32);
-                        let r1_end = r1.alignment_end().map(|p| usize::from(p) as i32);
-                        let r2_end = r2.alignment_end().map(|p| usize::from(p) as i32);
-
-                        let (pos, end) = match (r1_start, r2_start, r1_end, r2_end) {
-                            (Some(rs1), Some(rs2), Some(re1), Some(re2)) => {
-                                (rs1.min(rs2), re1.max(re2))
-                            }
-                            (Some(rs1), Some(rs2), _, _) => (rs1.min(rs2), rs1.max(rs2)),
-                            _ => continue,
-                        };
-
-                        // Build ReadInfo key: order by (ref, 5' position) so earlier read is first
-                        // This matches fgbio's ReadInfo ordering
-                        let key = if (r1_ref, s1) <= (r2_ref, s2) {
-                            ReadInfoKey {
-                                ref_index1: r1_ref,
-                                start1: s1,
-                                strand1: r1_strand,
-                                ref_index2: r2_ref,
-                                start2: s2,
-                                strand2: r2_strand,
-                            }
-                        } else {
-                            ReadInfoKey {
-                                ref_index1: r2_ref,
-                                start1: s2,
-                                strand1: r2_strand,
-                                ref_index2: r1_ref,
-                                start2: s1,
-                                strand2: r1_strand,
-                            }
-                        };
-
-                        (pos, end, key)
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            };
-
-            // Compute hash once for this template
-            let hash_fraction = Self::compute_hash_fraction(&read_name);
-
-            let template_info = TemplateInfo {
-                mi,
-                rx,
-                ref_name,
-                position: Some(position),
-                end_position: Some(end_position),
-                hash_fraction,
-            };
-
-            // Check interval overlap
-            if !Self::overlaps_intervals(&template_info, intervals) {
-                continue;
-            }
-
-            template_count += 1;
-            progress.log_if_needed(2); // Each template has R1 and R2
-
-            // Streaming: when ReadInfo key changes, process the accumulated group
-            if current_key.as_ref() != Some(&read_info_key) && !current_group.is_empty() {
-                Self::process_coordinate_group(
-                    &current_group,
-                    fractions,
-                    collectors,
-                    umi_consensus_caller,
-                    &mut fraction_template_counts,
-                    self,
-                );
-                current_group.clear();
-            }
-
-            current_group.push(template_info);
-            current_key = Some(read_info_key);
-        }
-
-        // Process the final group
-        if !current_group.is_empty() {
-            Self::process_coordinate_group(
-                &current_group,
-                fractions,
-                collectors,
-                umi_consensus_caller,
-                &mut fraction_template_counts,
-                self,
-            );
-        }
-
-        progress.log_final();
-        Ok((template_count, fraction_template_counts))
-    }
-
     /// Processes a single coordinate group for all downsampling fractions.
     ///
     /// Optimized using fgbio's approach: filter once per fraction, then groupBy.
@@ -756,26 +311,7 @@ impl DuplexMetrics {
         }
 
         // Pre-compute metadata once for the entire group
-        struct TemplateMetadata<'a> {
-            template: &'a TemplateInfo,
-            base_umi: &'a str,
-            is_a_strand: bool,
-            is_b_strand: bool,
-        }
-
-        let metadata: Vec<TemplateMetadata> = group
-            .iter()
-            .map(|t| {
-                let (base_umi, is_a, is_b) = if t.mi.ends_with("/A") {
-                    (&t.mi[..t.mi.len() - 2], true, false)
-                } else if t.mi.ends_with("/B") {
-                    (&t.mi[..t.mi.len() - 2], false, true)
-                } else {
-                    (t.mi.as_str(), false, false)
-                };
-                TemplateMetadata { template: t, base_umi, is_a_strand: is_a, is_b_strand: is_b }
-            })
-            .collect();
+        let metadata = compute_template_metadata(group);
 
         // For each fraction: filter ONCE, then groupBy (like fgbio)
         for (idx, &fraction) in fractions.iter().enumerate() {
@@ -844,31 +380,6 @@ impl DuplexMetrics {
                 }
             }
         }
-    }
-
-    /// Computes a hash value normalized to the [0, 1] range using Murmur3.
-    ///
-    /// Hashes the read name using the Murmur3 32-bit algorithm with seed 42, then
-    /// normalizes the result to a floating-point value between 0 and 1. This is used
-    /// for deterministic downsampling where reads are assigned to fractions based on
-    /// their hash value. Matches the Scala implementation's hashing approach.
-    ///
-    /// # Arguments
-    ///
-    /// * `read_name` - The read name string to hash
-    ///
-    /// # Returns
-    ///
-    /// A floating-point value in the range [0, 1].
-    fn compute_hash_fraction(read_name: &str) -> f64 {
-        // Use Murmur3 with seed 42 (matching Scala implementation)
-        let hash = murmur3_32(&mut std::io::Cursor::new(read_name.as_bytes()), 42).unwrap_or(0);
-
-        // Scala implementation uses Int (i32), takes absolute value, then normalizes
-        // Convert u32 to i32 first to match Scala's behavior
-        let hash_i32 = hash as i32;
-        let positive_hash = hash_i32.abs() as f64;
-        positive_hash / i32::MAX as f64
     }
 
     /// Generates a yield metric from a collector at a specific downsampling fraction.
@@ -1097,93 +608,18 @@ impl DuplexMetrics {
             collector.record_duplex_umi(&duplex_umi, total_raw, error_count, true);
         }
     }
-
-    /// Checks if R and required packages (ggplot2, scales) are available.
-    /// Result is cached for the lifetime of the process to avoid repeated subprocess spawns.
-    fn is_r_available() -> bool {
-        use std::process::Command;
-
-        *R_AVAILABLE.get_or_init(|| {
-            Command::new("Rscript")
-                .args(["-e", "stopifnot(require(ggplot2)); stopifnot(require(scales))"])
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        })
-    }
-
-    /// Executes the R script to generate PDF plots.
-    ///
-    /// The R script is embedded in the binary at compile time and written to a
-    /// temporary file for execution. This ensures the script is always available
-    /// regardless of working directory or installation location.
-    ///
-    /// # Arguments
-    ///
-    /// * `family_size_path` - Path to family size metrics file
-    /// * `duplex_family_size_path` - Path to duplex family size metrics file
-    /// * `yield_path` - Path to yield metrics file
-    /// * `umi_path` - Path to UMI metrics file
-    /// * `pdf_path` - Path to output PDF file
-    /// * `description` - Sample description for plot titles
-    ///
-    /// # Returns
-    ///
-    /// Returns Ok(()) if successful, or an error if R execution fails
-    fn execute_r_script(
-        family_size_path: &str,
-        duplex_family_size_path: &str,
-        yield_path: &str,
-        umi_path: &str,
-        pdf_path: &str,
-        description: &str,
-    ) -> Result<()> {
-        use std::process::Command;
-
-        // Write embedded R script to temp file
-        let temp_dir = std::env::temp_dir();
-        let r_script_path = temp_dir.join("fgumi_CollectDuplexSeqMetrics.R");
-        std::fs::write(&r_script_path, R_SCRIPT)
-            .context("Failed to write embedded R script to temp file")?;
-
-        info!("Executing R script to generate PDF plots...");
-
-        let output = Command::new("Rscript")
-            .arg(&r_script_path)
-            .arg(family_size_path)
-            .arg(duplex_family_size_path)
-            .arg(yield_path)
-            .arg(umi_path)
-            .arg(pdf_path)
-            .arg(description)
-            .output()
-            .context("Failed to execute Rscript command")?;
-
-        // Clean up temp file (ignore errors)
-        let _ = std::fs::remove_file(&r_script_path);
-
-        if output.status.success() {
-            info!("Successfully generated PDF plots: {pdf_path}");
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "R script execution failed with exit code {:?}. Error: {}",
-                output.status.code(),
-                stderr
-            )
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::shared_metrics::{
+        Interval, TemplateInfo, compute_hash_fraction, overlaps_intervals, parse_intervals,
+    };
     use anyhow::Result;
     use fgoxide::io::DelimFile;
-    use fgumi_lib::metrics::duplex::{
-        DuplexFamilySizeMetric, DuplexUmiMetric, FamilySizeMetric, UmiMetric,
-    };
+    use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, DuplexUmiMetric, FamilySizeMetric};
+    use fgumi_lib::metrics::shared::UmiMetric;
     use fgumi_lib::sam::builder::{RecordBuilder, RecordPairBuilder};
     use noodles::bam;
     use noodles::sam;
@@ -2282,8 +1718,8 @@ mod tests {
     #[test]
     fn test_hash_fraction_deterministic() {
         // Hash should be deterministic for same input
-        let hash1 = DuplexMetrics::compute_hash_fraction("read1");
-        let hash2 = DuplexMetrics::compute_hash_fraction("read1");
+        let hash1 = compute_hash_fraction("read1");
+        let hash2 = compute_hash_fraction("read1");
         assert!((hash1 - hash2).abs() < f64::EPSILON);
 
         // Hash should be in [0, 1] range
@@ -2293,9 +1729,9 @@ mod tests {
     #[test]
     fn test_hash_fraction_different_reads() {
         // Different read names should produce different hashes (usually)
-        let hash1 = DuplexMetrics::compute_hash_fraction("read1");
-        let hash2 = DuplexMetrics::compute_hash_fraction("read2");
-        let hash3 = DuplexMetrics::compute_hash_fraction("read3");
+        let hash1 = compute_hash_fraction("read1");
+        let hash2 = compute_hash_fraction("read2");
+        let hash3 = compute_hash_fraction("read3");
 
         // All should be in valid range
         assert!((0.0..=1.0).contains(&hash1));
@@ -2318,15 +1754,15 @@ mod tests {
             hash_fraction: 0.5,
         };
 
-        assert!(DuplexMetrics::overlaps_intervals(&template, &[]));
+        assert!(overlaps_intervals(&template, &[]));
 
         // Test with matching interval
         let intervals = vec![Interval { ref_name: "chr1".to_string(), start: 900, end: 1050 }];
-        assert!(DuplexMetrics::overlaps_intervals(&template, &intervals));
+        assert!(overlaps_intervals(&template, &intervals));
 
         // Test with non-matching interval
         let intervals = vec![Interval { ref_name: "chr1".to_string(), start: 2000, end: 3000 }];
-        assert!(!DuplexMetrics::overlaps_intervals(&template, &intervals));
+        assert!(!overlaps_intervals(&template, &intervals));
 
         // Test unmapped template
         let unmapped = TemplateInfo {
@@ -2337,7 +1773,7 @@ mod tests {
             end_position: None,
             hash_fraction: 0.5,
         };
-        assert!(!DuplexMetrics::overlaps_intervals(&unmapped, &intervals));
+        assert!(!overlaps_intervals(&unmapped, &intervals));
     }
 
     #[test]
@@ -2345,7 +1781,7 @@ mod tests {
         let dir = TempDir::new()?;
         let path = dir.path().join("intervals.bed");
         std::fs::write(&path, "# comment line\nchr1\t100\t200\nchr2\t300\t400\n")?;
-        let intervals = DuplexMetrics::parse_intervals(&path)?;
+        let intervals = parse_intervals(&path)?;
         assert_eq!(intervals.len(), 2);
         assert_eq!(intervals[0].ref_name, "chr1");
         assert_eq!(intervals[0].start, 100);
@@ -2369,7 +1805,7 @@ mod tests {
              chr1\t101\t200\t+\tinterval1\n\
              chr2\t301\t400\t+\tinterval2\n",
         )?;
-        let intervals = DuplexMetrics::parse_intervals(&path)?;
+        let intervals = parse_intervals(&path)?;
         assert_eq!(intervals.len(), 2);
         // 1-based closed [101, 200] converts to 0-based half-open [100, 200]
         assert_eq!(intervals[0].ref_name, "chr1");
