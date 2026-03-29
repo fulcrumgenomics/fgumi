@@ -59,7 +59,7 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov nextest --features compare,simulate,profile-adjacency --no-tests=pass --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: lcov.info
           fail_ci_if_error: true
