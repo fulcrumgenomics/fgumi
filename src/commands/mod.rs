@@ -68,7 +68,9 @@ pub mod filter;
 pub mod group;
 pub mod merge;
 pub mod review;
+pub mod shared_metrics;
 pub mod simplex;
+pub mod simplex_metrics;
 #[cfg(feature = "simulate")]
 pub mod simulate;
 pub mod sort;
