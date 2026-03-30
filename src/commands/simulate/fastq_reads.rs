@@ -10,13 +10,13 @@ use crossbeam_channel::bounded;
 use fgumi_dna::dna::complement_base;
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::simulate::{FastqWriter, create_rng};
-use log::info;
+use log::{info, warn};
 use noodles::fasta;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -65,6 +65,12 @@ pub struct FastqReads {
     /// This produces reads that will map back to the reference.
     #[arg(short = 'r', long = "reference")]
     pub reference: Option<PathBuf>,
+
+    /// UMI includelist file (one UMI per line).
+    /// When provided, UMIs are sampled from this list instead of generated randomly.
+    /// The includelist also determines UMI length (overriding --umi-length).
+    #[arg(short = 'i', long = "includelist")]
+    pub includelist: Option<PathBuf>,
 
     /// Number of threads for parallel molecule generation
     #[arg(short = 't', long = "threads", default_value = "1")]
@@ -199,6 +205,48 @@ struct GenerationParams {
     duplex: bool,
     min_family_size: usize,
     r2_quality_offset: i8,
+    /// When set, UMIs are sampled from this list instead of generated randomly.
+    includelist: Option<Vec<Vec<u8>>>,
+}
+
+/// Load UMI sequences from an includelist file (one UMI per line).
+fn load_includelist(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open includelist: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut umis: Vec<(usize, Vec<u8>)> = Vec::new(); // (1-based line number, UMI)
+
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("Failed to read line {}", line_num + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let umi = trimmed.as_bytes().to_ascii_uppercase();
+        if !umi.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T')) {
+            bail!("Invalid UMI at line {}: '{}' (only A, C, G, T allowed)", line_num + 1, trimmed,);
+        }
+        umis.push((line_num + 1, umi));
+    }
+
+    if umis.is_empty() {
+        bail!("Includelist is empty: {}", path.display());
+    }
+
+    // Validate all UMIs have the same length
+    let expected_len = umis[0].1.len();
+    for (file_line, umi) in &umis {
+        if umi.len() != expected_len {
+            bail!(
+                "UMI length mismatch at line {}: length {} but expected {} (from first UMI)",
+                file_line,
+                umi.len(),
+                expected_len,
+            );
+        }
+    }
+
+    Ok(umis.into_iter().map(|(_, umi)| umi).collect())
 }
 
 /// Channel capacity for buffering molecule batches between producer and writer threads.
@@ -207,20 +255,58 @@ const CHANNEL_CAPACITY: usize = 1_000;
 
 impl Command for FastqReads {
     fn execute(&self, _command_line: &str) -> Result<()> {
+        let includelist = if let Some(ref path) = self.includelist {
+            let umis = load_includelist(path)?;
+            info!("Loaded {} UMIs from includelist (length={})", umis.len(), umis[0].len());
+            Some(umis)
+        } else {
+            None
+        };
+
+        // Includelist determines UMI length, overriding --umi-length
+        let umi_length = if let Some(ref list) = includelist {
+            let list_len = list[0].len();
+            if list_len > self.common.read_length {
+                bail!(
+                    "Includelist UMI length {} exceeds read length {}",
+                    list_len,
+                    self.common.read_length,
+                );
+            }
+            if self.common.umi_length != list_len {
+                warn!(
+                    "--umi-length {} overridden by includelist UMI length {}",
+                    self.common.umi_length, list_len,
+                );
+            }
+            list_len
+        } else {
+            if self.common.umi_length > self.common.read_length {
+                bail!(
+                    "UMI length {} exceeds read length {}",
+                    self.common.umi_length,
+                    self.common.read_length,
+                );
+            }
+            self.common.umi_length
+        };
+
         info!("Generating FASTQ reads");
         info!("  Output R1: {}", self.r1_output.display());
         info!("  Output R2: {}", self.r2_output.display());
         info!("  Truth: {}", self.truth_output.display());
         info!("  Num molecules: {}", self.common.num_molecules);
         info!("  Read length: {}", self.common.read_length);
-        info!("  UMI length: {}", self.common.umi_length);
+        info!("  UMI length: {}", umi_length);
+        if let Some(ref path) = self.includelist {
+            info!("  Includelist: {}", path.display());
+        }
         info!("  Duplex: {}", self.duplex);
         info!("  Threads: {}", self.threads);
         if let Some(ref path) = self.reference {
             info!("  Reference: {}", path.display());
         }
 
-        // Load reference genome if provided
         let reference = if let Some(ref path) = self.reference {
             Some(Arc::new(ReferenceGenome::load(path)?))
         } else {
@@ -238,11 +324,12 @@ impl Command for FastqReads {
         let insert_model = Arc::new(self.insert_size.to_insert_size_model());
 
         let params = Arc::new(GenerationParams {
-            umi_length: self.common.umi_length,
+            umi_length,
             read_length: self.common.read_length,
             duplex: self.duplex,
             min_family_size: self.family_size.min_family_size,
             r2_quality_offset: self.quality.r2_quality_offset,
+            includelist,
         });
 
         // Generate molecule IDs with seeds for reproducibility
@@ -384,8 +471,17 @@ fn generate_molecule_reads(
 
     // Generate UMIs for this molecule (one for R1, one for R2)
     // For duplex sequencing with paired grouping strategy, B strand needs swapped UMIs
-    let umi_r1 = generate_random_sequence(params.umi_length, &mut rng);
-    let umi_r2 = generate_random_sequence(params.umi_length, &mut rng);
+    let (umi_r1, umi_r2) = if let Some(ref includelist) = params.includelist {
+        // Sample from the includelist
+        let idx_r1 = rng.random_range(0..includelist.len());
+        let idx_r2 = rng.random_range(0..includelist.len());
+        (includelist[idx_r1].clone(), includelist[idx_r2].clone())
+    } else {
+        (
+            generate_random_sequence(params.umi_length, &mut rng),
+            generate_random_sequence(params.umi_length, &mut rng),
+        )
+    };
 
     // Generate family size
     let family_size = family_dist.sample(&mut rng, params.min_family_size);
@@ -821,5 +917,205 @@ mod tests {
 
         let result = pad_sequence(seq, 0, &mut rng);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_load_includelist_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        std::fs::write(&path, "AACAC\nAAGGA\nAATGC\n").unwrap();
+
+        let umis = load_includelist(&path).unwrap();
+        assert_eq!(umis.len(), 3);
+        assert_eq!(umis[0], b"AACAC");
+        assert_eq!(umis[1], b"AAGGA");
+        assert_eq!(umis[2], b"AATGC");
+    }
+
+    #[test]
+    fn test_load_includelist_lowercase_uppercased() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        std::fs::write(&path, "aacac\naagga\n").unwrap();
+
+        let umis = load_includelist(&path).unwrap();
+        assert_eq!(umis[0], b"AACAC");
+        assert_eq!(umis[1], b"AAGGA");
+    }
+
+    #[test]
+    fn test_load_includelist_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        std::fs::write(&path, "AACAC\n\nAAGGA\n  \nAATGC\n").unwrap();
+
+        let umis = load_includelist(&path).unwrap();
+        assert_eq!(umis.len(), 3);
+    }
+
+    #[test]
+    fn test_load_includelist_rejects_invalid_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        std::fs::write(&path, "AACAC\nAANGA\n").unwrap();
+
+        let result = load_includelist(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid UMI"));
+    }
+
+    #[test]
+    fn test_load_includelist_rejects_mismatched_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        std::fs::write(&path, "AACAC\nAAGG\n").unwrap();
+
+        let result = load_includelist(&path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("length mismatch"));
+        // Should report the actual file line number (line 2), not a filtered index
+        assert!(msg.contains("line 2"), "Expected file line number in error: {msg}");
+    }
+
+    #[test]
+    fn test_load_includelist_mismatched_length_reports_correct_line_with_blanks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        // Blank line between valid UMIs; the short UMI is on file line 4
+        std::fs::write(&path, "AACAC\n\nAAGGA\nAAGG\n").unwrap();
+
+        let result = load_includelist(&path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("line 4"), "Expected file line 4 in error: {msg}");
+    }
+
+    #[test]
+    fn test_load_includelist_rejects_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("umis.txt");
+        std::fs::write(&path, "\n\n").unwrap();
+
+        let result = load_includelist(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_execute_rejects_includelist_umi_exceeding_read_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let includelist_path = dir.path().join("umis.txt");
+        std::fs::write(&includelist_path, "AAAAACCCCC\n").unwrap(); // length 10
+
+        let r1 = dir.path().join("r1.fq.gz");
+        let r2 = dir.path().join("r2.fq.gz");
+        let truth = dir.path().join("truth.tsv");
+
+        let cmd = FastqReads::try_parse_from([
+            "fastq-reads",
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+            "--truth",
+            truth.to_str().unwrap(),
+            "-i",
+            includelist_path.to_str().unwrap(),
+            "--read-length",
+            "5", // shorter than UMI
+        ])
+        .unwrap();
+
+        let result = cmd.execute("");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds read length"),
+            "Expected 'exceeds read length' in error: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_execute_rejects_umi_length_exceeding_read_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let r1 = dir.path().join("r1.fq.gz");
+        let r2 = dir.path().join("r2.fq.gz");
+        let truth = dir.path().join("truth.tsv");
+
+        let cmd = FastqReads::try_parse_from([
+            "fastq-reads",
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+            "--truth",
+            truth.to_str().unwrap(),
+            "--umi-length",
+            "100",
+            "--read-length",
+            "50",
+        ])
+        .unwrap();
+
+        let result = cmd.execute("");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds read length"),
+            "Expected 'exceeds read length' in error: {msg}",
+        );
+    }
+
+    #[test]
+    fn test_generate_molecule_reads_with_includelist() {
+        let umis = vec![b"AAAAA".to_vec(), b"CCCCC".to_vec(), b"GGGGG".to_vec()];
+        let params = GenerationParams {
+            umi_length: 5,
+            read_length: 50,
+            duplex: false,
+            min_family_size: 1,
+            r2_quality_offset: 0,
+            includelist: Some(umis.clone()),
+        };
+
+        let quality_model =
+            fgumi_lib::simulate::PositionQualityModel::new(10, 25, 37, 100, 0.08, 2, 2.0);
+        let quality_bias = fgumi_lib::simulate::ReadPairQualityBias::new(0);
+        let family_dist = fgumi_lib::simulate::FamilySizeDistribution::log_normal(3.0, 1.0);
+        let insert_model = fgumi_lib::simulate::InsertSizeModel::new(150.0, 30.0, 50, 500);
+
+        // Generate molecules and verify UMIs come from includelist
+        for seed in 0..20u64 {
+            let records = generate_molecule_reads(
+                0,
+                seed,
+                &params,
+                &quality_model,
+                &quality_bias,
+                &family_dist,
+                &insert_model,
+                None,
+            );
+            for record in &records {
+                // The truth UMI (before errors) should be from the includelist
+                // UMI format is "R1-R2", split and check each half
+                let umi_str = String::from_utf8_lossy(&record.umi);
+                let parts: Vec<&str> = umi_str.split('-').collect();
+                assert_eq!(parts.len(), 2);
+                // Note: the actual read sequences have errors introduced, but the
+                // truth UMI in the record should be from the includelist
+                assert!(
+                    umis.iter().any(|u| u == parts[0].as_bytes()),
+                    "R1 UMI '{}' not in includelist",
+                    parts[0],
+                );
+                assert!(
+                    umis.iter().any(|u| u == parts[1].as_bytes()),
+                    "R2 UMI '{}' not in includelist",
+                    parts[1],
+                );
+            }
+        }
     }
 }
