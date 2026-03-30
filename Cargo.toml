@@ -90,6 +90,7 @@ bytes = { workspace = true }
 bytesize = "2.3"
 clap = { workspace = true, features = ["string"] }
 crc32fast = { workspace = true }
+ctrlc = { version = "3.5.2", features = ["termination"] }
 crossbeam-channel = { workspace = true }
 crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
@@ -156,6 +157,7 @@ rstest = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
+which = { workspace = true }
 
 [[bench]]
 name = "core_functions"
