@@ -10,15 +10,57 @@ repository = "https://github.com/fulcrumgenomics/fgumi"
 license = "MIT"
 
 [workspace.dependencies]
+# Internal crates
 fgumi-bgzf = { version = "0.1.2", path = "crates/fgumi-bgzf" }
 fgumi-consensus = { version = "0.1.2", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.1.2", path = "crates/fgumi-dna" }
+fgumi-lib = { version = "0.1.2", path = "crates/fgumi-lib", default-features = false }
 fgumi-metrics = { version = "0.1.2", path = "crates/fgumi-metrics" }
 fgumi-raw-bam = { version = "0.1.2", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.1.2", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.1.2", path = "crates/fgumi-simd-fastq" }
 fgumi-umi = { version = "0.1.2", path = "crates/fgumi-umi" }
-fgumi-lib = { version = "0.1.2", path = "crates/fgumi-lib", default-features = false }
+
+# Third-party dependencies shared across workspace crates
+ahash = "0.8"
+anyhow = "1.0.102"
+approx = "0.5.1"
+bgzf = "0.3.0"
+bstr = "1.12.1"
+bytemuck = { version = "1.14", features = ["derive"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1.4"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8.21"
+flate2 = "1.1"
+fgoxide = "0.6.0"
+libdeflater = "1.22"
+libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+log = "0"
+lru = "0.16.3"
+memchr = "2"
+noodles = { version = "0.106.0" }
+noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
+noodles-csi = "0.54.0"
+parking_lot = "0.12"
+rand = "0.10"
+rand_distr = "0.6"
+rayon = "1.10"
+read-structure = "0.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+tempfile = "3.3.0"
+thiserror = "2"
+which = "7"
+wide = "1.1"
+seq_io = "0.3.4"
+
+# Shared dev-dependencies
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1.10"
+rstest = "0"
 
 [package]
 name = "fgumi"
@@ -36,48 +78,48 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap = { version = "4", features = ["derive", "string"] }
-log = "0"
-thiserror = "2"
-noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
-noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
-mimalloc = { version = "0.1.48", default-features = false }
-libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
+ahash = { workspace = true }
+anyhow = { workspace = true }
+approx = { workspace = true }
+bgzf = { workspace = true }
+bstr = { workspace = true }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+bytesize = "2.3"
+clap = { workspace = true, features = ["string"] }
+crc32fast = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
+csv = "1.1"
+dhat = { version = "0.3", optional = true }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
-anyhow = "1.0.102"
-read-structure = "0.2.0"
-bstr = "1.12.1"
-bytes = "1"
-fgoxide = "0.6.0"
-tempfile = "3.3.0"
-lru = "0.16.3"
-crc32fast = "1.4"
-crossbeam-channel = "0.5"
-crossbeam-queue = "0.3"
-crossbeam-utils = "0.8.21"
-parking_lot = "0.12"
-libdeflater = "1.22"
-serde = { version = "1.0.228", features = ["derive"] }
-itertools = "0.14.0"
+fgoxide = { workspace = true }
+flate2 = { workspace = true }
 indexmap = "2"
-rand = "0.10"
-csv = "1.1"
-memchr = "2"
+itertools = "0.14.0"
+libdeflater = { workspace = true }
+libmimalloc-sys = { workspace = true, optional = true }
+log = { workspace = true }
+lru = { workspace = true }
+memchr = { workspace = true }
+mimalloc = { version = "0.1.48", default-features = false }
 murmur3 = "0.5"
+noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { workspace = true }
+noodles-csi = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rayon = { workspace = true }
+read-structure = { workspace = true }
+serde = { workspace = true }
 statrs = "0.18"
-bytesize = "2.3"
-sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
-rayon = "1.10"
-approx = "0.5.1"
-ahash = "0.8"
-bytemuck = { version = "1.14", features = ["derive"] }
-noodles-csi = "0.54.0"
-bgzf = "0.3.0"
-wide = "1.1"
-rand_distr = "0.6"
-flate2 = "1.1"
-dhat = { version = "0.3", optional = true }
+sysinfo = { workspace = true, optional = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+wide = { workspace = true }
 fgumi-lib = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
@@ -106,9 +148,9 @@ profile-adjacency = ["fgumi-lib/profile-adjacency"]
 stress-tests = ["fgumi-lib/stress-tests"]
 
 [dev-dependencies]
-rstest = "0"
-proptest = "1.10"
-criterion = { version = "0.8", features = ["html_reports"] }
+rstest = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 
 [[bench]]
@@ -126,4 +168,3 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
-

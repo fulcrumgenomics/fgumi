@@ -10,7 +10,7 @@ license.workspace = true
 [dependencies]
 
 [dev-dependencies]
-rstest = "0"
+rstest = { workspace = true }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
