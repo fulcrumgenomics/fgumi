@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-lib"]
+members = [".", "crates/fgumi-derive", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/fgumi-lib"]
 resolver = "2"
 
 [workspace.package]
@@ -12,6 +12,7 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 fgumi-bgzf = { version = "0.1.2", path = "crates/fgumi-bgzf" }
+fgumi-derive = { version = "0.1.2", path = "crates/fgumi-derive" }
 fgumi-consensus = { version = "0.1.2", path = "crates/fgumi-consensus", default-features = false }
 fgumi-dna = { version = "0.1.2", path = "crates/fgumi-dna" }
 fgumi-lib = { version = "0.1.2", path = "crates/fgumi-lib", default-features = false }
@@ -120,6 +121,7 @@ sysinfo = { workspace = true, optional = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 wide = { workspace = true }
+fgumi-derive = { workspace = true }
 fgumi-lib = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
