@@ -1,0 +1,30 @@
+[package]
+name = "fgumi-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pipeline for fgumi: extract, sort, group, consensus, and filter in one pass"
+
+[dependencies]
+fgumi-lib = { workspace = true }
+fgumi-consensus = { workspace = true }
+fgumi-bgzf = { workspace = true }
+fgumi-sam = { workspace = true }
+fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-umi = { workspace = true }
+fgumi-derive = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["string"] }
+crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
+log = { workspace = true }
+lru = { workspace = true }
+noodles = { workspace = true, features = ["bam", "sam", "bgzf", "core"] }
+rayon = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
+fgumi-raw-bam = { workspace = true, features = ["test-utils"] }

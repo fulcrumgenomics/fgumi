@@ -584,6 +584,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
+
+[[package]]
 name = "env_logger"
 version = "0.11.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -657,9 +663,11 @@ dependencies = [
  "fgoxide",
  "fgumi-bgzf",
  "fgumi-consensus",
+ "fgumi-derive",
  "fgumi-dna",
  "fgumi-lib",
  "fgumi-metrics",
+ "fgumi-pipeline",
  "fgumi-raw-bam",
  "fgumi-sam",
  "fgumi-simd-fastq",
@@ -721,6 +729,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fgumi-derive"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "fgumi-dna"
 version = "0.1.2"
 dependencies = [
@@ -765,6 +784,7 @@ dependencies = [
  "rayon",
  "read-structure",
  "rstest",
+ "seq_io",
  "serde",
  "sysinfo",
  "tempfile",
@@ -781,6 +801,30 @@ dependencies = [
  "noodles",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "fgumi-pipeline"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "crossbeam-queue",
+ "fgumi-bgzf",
+ "fgumi-consensus",
+ "fgumi-derive",
+ "fgumi-lib",
+ "fgumi-raw-bam",
+ "fgumi-sam",
+ "fgumi-umi",
+ "log",
+ "lru",
+ "noodles",
+ "rayon",
+ "rstest",
+ "tempfile",
+ "which",
 ]
 
 [[package]]
@@ -2735,6 +2779,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix",
+ "winsafe",
+]
+
+[[package]]
 name = "wide"
 version = "0.7.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2912,6 +2968,12 @@ checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"
