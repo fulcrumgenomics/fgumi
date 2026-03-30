@@ -35,6 +35,7 @@ rand_distr = { workspace = true }
 rayon = { workspace = true }
 read-structure = { workspace = true }
 serde = { workspace = true }
+seq_io = { workspace = true }
 sysinfo = { workspace = true, optional = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

@@ -29,6 +29,8 @@ use fgumi_lib::validation::{string_to_tag, validate_file_exists};
 use log::info;
 use std::path::PathBuf;
 
+use fgumi_lib::defaults;
+
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 
@@ -133,14 +135,14 @@ pub struct Sort {
     ///
     /// With --memory-per-thread (default), this is multiplied by thread count
     /// (like samtools' -m option). With 8 threads and 768M, total = 6GB.
-    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
+    #[arg(short = 'm', long = "max-memory", default_value = defaults::SORT_MEMORY_LIMIT_DISPLAY, value_parser = parse_memory)]
     pub max_memory: usize,
 
     /// Scale memory limit by thread count (samtools behavior).
     ///
     /// When enabled (default), --max-memory specifies memory per thread.
     /// Total memory = `max_memory` × threads. Disable for fixed total memory.
-    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "memory-per-thread", default_value_t = defaults::SORT_MEMORY_PER_THREAD, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub memory_per_thread: bool,
 
     /// Temporary directory for intermediate files.
@@ -166,7 +168,7 @@ pub struct Sort {
     /// Level 0 disables compression (fastest, uses most disk space).
     /// Level 1 (default) provides fast compression with reasonable space savings.
     /// Higher levels (up to 9) provide better compression but are slower.
-    #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
+    #[arg(long = "temp-compression", default_value_t = defaults::SORT_TEMP_COMPRESSION, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
 
     /// Write BAM index (.bai) alongside output.
@@ -183,7 +185,7 @@ pub struct Sort {
     /// sort key so that templates from different cells at the same locus are
     /// not interleaved. Use the same value as `--cell-tag` in `fgumi group`
     /// and `fgumi dedup`. Only used for template-coordinate sort.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: String,
 }
 
@@ -642,5 +644,18 @@ mod tests {
         assert_eq!(violations, 0);
         assert!(first_violation.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn sort_memory_default_matches_constant() {
+        let parsed = parse_memory(fgumi_lib::defaults::SORT_MEMORY_LIMIT_DISPLAY)
+            .expect("SORT_MEMORY_LIMIT_DISPLAY should be parseable");
+        assert_eq!(
+            parsed,
+            fgumi_lib::defaults::SORT_MEMORY_LIMIT,
+            "SORT_MEMORY_LIMIT_DISPLAY ({}) must parse to SORT_MEMORY_LIMIT ({})",
+            fgumi_lib::defaults::SORT_MEMORY_LIMIT_DISPLAY,
+            fgumi_lib::defaults::SORT_MEMORY_LIMIT,
+        );
     }
 }

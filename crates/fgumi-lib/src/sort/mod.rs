@@ -38,12 +38,13 @@ pub mod radix;
 pub mod raw;
 pub mod raw_bam_reader;
 pub mod read_ahead;
+pub mod sink;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Statistics from a sort operation.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct SortStats {
     /// Total records read from input.
     pub total_records: u64,
@@ -71,7 +72,11 @@ pub use keys::{
     RawSortKey, SortContext, SortKey, SortOrder,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
-pub use raw::{LibraryLookup, RawExternalSorter, extract_template_key_inline};
+pub use raw::{
+    LibraryLookup, RawExternalSorter, SortedChunks, extract_template_key_inline,
+    merge_sorted_chunks_to_sink,
+};
+pub use sink::{BamWriterSink, SortedRecordSink};
 
 #[cfg(test)]
 mod tests {

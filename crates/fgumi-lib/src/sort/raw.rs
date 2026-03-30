@@ -149,6 +149,16 @@ fn make_reader_semaphore(threads: usize) -> Arc<ChunkReaderSemaphore> {
     Arc::new((tx, rx))
 }
 
+/// Estimated bytes per record in the template record buffer.
+///
+/// Includes 48-byte inline header + ~250 bytes average record data (298 bytes data)
+/// plus 56 bytes for the `TemplateKey` ref entry (key + offset + len + pad).
+const TEMPLATE_RECORD_BYTES_ESTIMATE: usize = 354;
+
+/// Fraction of memory budget (as percentage) allocated to raw record data
+/// vs. ref/index overhead. The remaining ~14% covers the per-record ref entries.
+const TEMPLATE_DATA_FRACTION_PERCENT: usize = 86;
+
 // ============================================================================
 // Generic Keyed Temp File I/O (works with any RawSortKey)
 // ============================================================================
@@ -710,7 +720,6 @@ impl RawExternalSorter {
         info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
         info!("Threads: {}", self.threads);
 
-        // Open input BAM with lazy record reading
         let (reader, header) = create_raw_bam_reader(input, self.threads)?;
 
         // Add @PG record if pg_info was provided
@@ -720,7 +729,6 @@ impl RawExternalSorter {
             header
         };
 
-        // Create temp directory
         let temp_dir = self.create_temp_dir()?;
         let temp_path = temp_dir.path();
 
@@ -1326,51 +1334,243 @@ impl RawExternalSorter {
         output: &Path,
         temp_path: &Path,
     ) -> Result<RawSortStats> {
-        let mut stats = RawSortStats::default();
+        let output_header = self.create_output_header(header);
+        let writer = crate::bam_io::create_raw_bam_writer(
+            output,
+            &output_header,
+            self.threads,
+            self.output_compression,
+        )?;
+        let mut sink = super::sink::BamWriterSink::new(writer);
 
-        // Build library lookup ONCE before sorting for O(1) ordinal lookups
+        let stats = self.sort_template_coordinate_to_sink_inner(
+            RawReadAheadReader::new(reader),
+            header,
+            temp_path,
+            &mut sink,
+        )?;
+
+        Ok(stats)
+    }
+
+    /// Sort a BAM file by template-coordinate and emit records to a sink.
+    ///
+    /// Like [`sort_template_coordinate`](Self::sort_template_coordinate) but writes sorted records
+    /// to a [`SortedRecordSink`](super::sink::SortedRecordSink) instead of a BAM file. Each
+    /// record is emitted with its pre-computed [`TemplateKey`] for downstream processing.
+    ///
+    /// Internally delegates to [`sort_accumulate_template`](Self::sort_accumulate_template) +
+    /// [`merge_sorted_chunks_to_sink`] so that callers who need to split the two phases can
+    /// use those methods directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, sorting, or emitting records fails.
+    pub fn sort_template_to_sink(
+        &self,
+        input: &Path,
+        header: &Header,
+        sink: &mut dyn super::sink::SortedRecordSink,
+    ) -> Result<RawSortStats> {
+        let chunks = self.sort_accumulate_template(input, header)?;
+        let stats = chunks.stats.clone();
+        merge_sorted_chunks_to_sink(chunks, sink)?;
+        sink.finish()?;
+        info!("Sort complete: {} records processed", stats.total_records);
+        Ok(stats)
+    }
+
+    /// Sort records from an iterator by template-coordinate and emit to a sink.
+    ///
+    /// Like [`sort_template_to_sink`](Self::sort_template_to_sink) but accepts raw BAM bytes from
+    /// an iterator instead of reading from a file. Used for pipeline integration where
+    /// records come from an upstream stage in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sorting or emitting records fails.
+    pub fn sort_from_iter<I>(
+        &self,
+        records: I,
+        header: &Header,
+        sink: &mut dyn super::sink::SortedRecordSink,
+    ) -> Result<RawSortStats>
+    where
+        I: Iterator<Item = Vec<u8>>,
+    {
+        let temp_dir = self.create_temp_dir()?;
+
+        self.sort_template_coordinate_to_sink_inner(records, header, temp_dir.path(), sink)
+    }
+
+    /// Sort-accumulate phase only: read input BAM, sort chunks to disk/memory.
+    ///
+    /// Performs Phase 1 of the external merge-sort (read, chunk, sort, spill) without
+    /// the K-way merge.  Returns a [`SortedChunks`] that the caller can merge later
+    /// — for example on a separate feeder thread while the calling thread participates
+    /// in downstream work-stealing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or sorting records fails.
+    pub fn sort_accumulate_template(&self, input: &Path, header: &Header) -> Result<SortedChunks> {
+        let (reader, _input_header) = create_raw_bam_reader(input, self.threads)?;
+        let read_ahead = RawReadAheadReader::new(reader);
+        self.sort_accumulate_inner(read_ahead, header)
+    }
+
+    /// Sort-accumulate phase from an iterator of raw BAM record bytes.
+    ///
+    /// Like [`sort_accumulate_template`](Self::sort_accumulate_template) but takes records
+    /// from an iterator instead of reading from a BAM file. Returns sorted chunks for
+    /// later merging via [`merge_sorted_chunks_to_sink`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sorting records fails.
+    pub fn sort_accumulate_from_iter(
+        &self,
+        records: impl Iterator<Item = impl AsRef<[u8]>>,
+        header: &Header,
+    ) -> Result<SortedChunks> {
+        self.sort_accumulate_inner(records, header)
+    }
+
+    /// Shared accumulate logic for both file-based and iterator-based sort-accumulate.
+    ///
+    /// Reads records from the iterator, sorts them into chunks on disk/memory, and
+    /// returns `SortedChunks` without performing the K-way merge phase.
+    fn sort_accumulate_inner(
+        &self,
+        records: impl Iterator<Item = impl AsRef<[u8]>>,
+        header: &Header,
+    ) -> Result<SortedChunks> {
+        let temp_dir = self.create_temp_dir()?;
+        let temp_path = temp_dir.path();
+
         let lib_lookup = LibraryLookup::from_header(header);
-
-        // Estimate capacity accounting for inline headers and cached-key refs
-        // Memory layout per record:
-        //   - data: 48 bytes (inline header) + ~250 bytes (BAM record) = 298 bytes
-        //   - refs: 56 bytes (TemplateKey + u64 offset + u32 len + u32 pad)
-        //   - Total: ~354 bytes per record
-        // The larger refs trade memory for cache locality during sort
-        let bytes_per_record = 354;
-        let estimated_records = self.memory_limit / bytes_per_record;
-        // Allocate ~86% for data, ~14% for refs (48/338 ≈ 14%)
-        let estimated_data_bytes = self.memory_limit * 86 / 100;
+        let estimated_records = self.memory_limit / TEMPLATE_RECORD_BYTES_ESTIMATE;
+        let estimated_data_bytes = self.memory_limit * TEMPLATE_DATA_FRACTION_PERCENT / 100;
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(temp_path);
+        let mut stats = RawSortStats::default();
 
-        let read_ahead = RawReadAheadReader::new(reader);
+        info!("Phase 1 (accumulate): Reading and sorting chunks (inline buffer)...");
 
-        info!("Phase 1: Reading and sorting chunks (inline buffer)...");
-
-        for record in read_ahead {
+        for record in records {
             stats.total_records += 1;
 
-            // Extract template key and push to buffer
             let bam_bytes = record.as_ref();
             let key = extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag.as_ref());
             buffer.push(bam_bytes, key);
 
-            // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
                 let chunk_path = namer.next_chunk_path();
 
-                // Sort in place using parallel sort for large buffers
                 if self.threads > 1 {
                     buffer.par_sort();
                 } else {
                     buffer.sort();
                 }
 
-                // Write keyed chunk preserving sort keys for O(1) merge comparisons
+                let mut keyed_writer = GenericKeyedChunkWriter::<TemplateKey>::create(
+                    &chunk_path,
+                    self.temp_compression,
+                    self.threads,
+                )?;
+                for (key, record) in buffer.iter_sorted_keyed() {
+                    keyed_writer.write_record(&key, record)?;
+                }
+                keyed_writer.finish()?;
+
+                stats.chunks_written += 1;
+                chunk_files.push(chunk_path);
+
+                self.maybe_consolidate_temp_files::<TemplateKey>(&mut chunk_files, &mut namer)?;
+                buffer.clear();
+            }
+        }
+
+        info!("Accumulate phase read {} records total", stats.total_records);
+
+        // Sort the remaining in-memory buffer into memory chunks.
+        let memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>> = if buffer.is_empty() {
+            Vec::new()
+        } else if chunk_files.is_empty() {
+            // All records fit in memory — produce a single memory chunk.
+            if self.threads > 1 {
+                buffer.par_sort();
+            } else {
+                buffer.sort();
+            }
+            let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
+            vec![chunk]
+        } else {
+            // Spill happened — split remaining buffer into sub-array chunks.
+            if self.threads > 1 {
+                buffer.par_sort_into_chunks(self.threads)
+            } else {
+                buffer.sort();
+                let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
+                vec![chunk]
+            }
+        };
+
+        stats.output_records = stats.total_records;
+
+        Ok(SortedChunks { chunk_files, memory_chunks, stats, _temp_dir: temp_dir })
+    }
+
+    /// Core implementation for template-coordinate sort-to-sink.
+    ///
+    /// Both [`sort_template_to_sink`](Self::sort_template_to_sink) and
+    /// [`sort_from_iter`](Self::sort_from_iter) delegate to this method.
+    /// `sort_template_coordinate` also delegates here using a `BamWriterSink`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, sorting, or emitting records fails.
+    fn sort_template_coordinate_to_sink_inner(
+        &self,
+        records: impl Iterator<Item = impl AsRef<[u8]>>,
+        header: &Header,
+        temp_path: &Path,
+        sink: &mut dyn super::sink::SortedRecordSink,
+    ) -> Result<RawSortStats> {
+        let mut stats = RawSortStats::default();
+
+        // Build library lookup ONCE before sorting for O(1) ordinal lookups
+        let lib_lookup = LibraryLookup::from_header(header);
+
+        let estimated_records = self.memory_limit / TEMPLATE_RECORD_BYTES_ESTIMATE;
+        let estimated_data_bytes = self.memory_limit * TEMPLATE_DATA_FRACTION_PERCENT / 100;
+
+        let mut chunk_files: Vec<PathBuf> = Vec::new();
+        let mut buffer =
+            TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
+        let mut namer = ChunkNamer::new(temp_path);
+
+        info!("Phase 1: Reading and sorting chunks (inline buffer)...");
+
+        for record in records {
+            stats.total_records += 1;
+
+            let bam_bytes = record.as_ref();
+            let key = extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag.as_ref());
+            buffer.push(bam_bytes, key);
+
+            if buffer.memory_usage() >= self.memory_limit {
+                let chunk_path = namer.next_chunk_path();
+
+                if self.threads > 1 {
+                    buffer.par_sort();
+                } else {
+                    buffer.sort();
+                }
+
                 let mut keyed_writer = GenericKeyedChunkWriter::<TemplateKey>::create(
                     &chunk_path,
                     self.temp_compression,
@@ -1394,7 +1594,7 @@ impl RawExternalSorter {
         info!("Read {} records total", stats.total_records);
 
         if chunk_files.is_empty() {
-            // All records fit in memory
+            // All records fit in memory — emit directly to sink
             info!("All records fit in memory, performing in-memory sort");
 
             if self.threads > 1 {
@@ -1403,18 +1603,9 @@ impl RawExternalSorter {
                 buffer.sort();
             }
 
-            let output_header = self.create_output_header(header);
-            let mut writer = crate::bam_io::create_raw_bam_writer(
-                output,
-                &output_header,
-                self.threads,
-                self.output_compression,
-            )?;
-
-            for record_bytes in buffer.iter_sorted() {
-                writer.write_raw_record(record_bytes)?;
+            for (key, record_bytes) in buffer.iter_sorted_keyed() {
+                sink.emit(&key, record_bytes.to_vec())?;
             }
-            writer.finish()?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
@@ -1431,175 +1622,18 @@ impl RawExternalSorter {
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
-            // Merge using O(1) key comparisons
-            self.merge_chunks_keyed(&chunk_files, memory_chunks, header, output)?;
+            // Merge using O(1) key comparisons, emitting to sink.
+            // Each memory chunk is a separate sorted source (NOT flattened —
+            // flattening would destroy sub-chunk ordering from par_sort_into_chunks).
+            merge_chunks_keyed_to_sink(&chunk_files, memory_chunks, sink)?;
         }
+
+        sink.finish()?;
 
         stats.output_records = stats.total_records;
         info!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
-    }
-
-    /// Merge keyed chunks using O(1) key comparisons.
-    ///
-    /// This is the fast path for template-coordinate sorting. Instead of parsing
-    /// CIGAR/aux data on every comparison (`O(CIGAR_len` + `aux_scan`)), we compare
-    /// pre-computed 32-byte keys (O(1) - just 4 u64 comparisons).
-    ///
-    /// `memory_chunks` is a list of sorted in-memory sub-arrays, each of which
-    /// becomes a separate merge source. This avoids merging parallel sort
-    /// sub-arrays back into one buffer before the k-way merge.
-    fn merge_chunks_keyed(
-        &self,
-        chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>>,
-        header: &Header,
-        output: &Path,
-    ) -> Result<u64> {
-        /// Source for keyed chunks during merge.
-        enum KeyedChunkSource {
-            /// Disk-based chunk with prefetching reader.
-            Disk(GenericKeyedChunkReader<TemplateKey>),
-            /// In-memory sorted records.
-            Memory { records: Vec<(TemplateKey, Vec<u8>)>, idx: usize },
-        }
-
-        impl KeyedChunkSource {
-            fn next_record(&mut self) -> Option<(TemplateKey, Vec<u8>)> {
-                match self {
-                    KeyedChunkSource::Disk(reader) => reader.next_record(),
-                    KeyedChunkSource::Memory { records, idx } => {
-                        if *idx < records.len() {
-                            // Use replace with zeroed key and empty vec to avoid Default requirement
-                            let dummy = (TemplateKey::zeroed(), Vec::new());
-                            let entry = std::mem::replace(&mut records[*idx], dummy);
-                            *idx += 1;
-                            Some(entry)
-                        } else {
-                            None
-                        }
-                    }
-                }
-            }
-        }
-
-        /// Heap entry for keyed merge - stores pre-computed key for O(1) comparison.
-        struct KeyedHeapEntry {
-            key: TemplateKey,
-            record: Vec<u8>,
-            chunk_idx: usize,
-        }
-
-        // Output buffer to reduce write syscalls - stores raw bytes directly
-        const OUTPUT_BUFFER_SIZE: usize = 2048;
-
-        let num_disk = chunk_files.len();
-        let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
-        info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
-
-        // Create output header with sort order tags
-        let output_header = self.create_output_header(header);
-
-        // Create semaphore to limit concurrent reader I/O threads
-        let sem = make_reader_semaphore(self.threads);
-
-        // Create unified chunk sources
-        let mut sources: Vec<KeyedChunkSource> = Vec::with_capacity(num_disk + num_memory);
-
-        // Add disk-based chunks with keyed readers
-        for path in chunk_files {
-            sources.push(KeyedChunkSource::Disk(GenericKeyedChunkReader::<TemplateKey>::open(
-                path,
-                Some(Arc::clone(&sem)),
-            )?));
-        }
-
-        // Add each non-empty in-memory chunk as a separate merge source
-        for chunk in memory_chunks {
-            if !chunk.is_empty() {
-                sources.push(KeyedChunkSource::Memory { records: chunk, idx: 0 });
-            }
-        }
-
-        // Initialize heap with first record from each chunk
-        let mut heap: Vec<KeyedHeapEntry> = Vec::with_capacity(sources.len());
-        for (chunk_idx, source) in sources.iter_mut().enumerate() {
-            if let Some((key, record)) = source.next_record() {
-                heap.push(KeyedHeapEntry { key, record, chunk_idx });
-            }
-        }
-
-        let mut heap_size = heap.len();
-        if heap_size == 0 {
-            info!("Merge complete: 0 records merged");
-            return Ok(0);
-        }
-
-        // O(1) comparison using pre-computed keys - THIS IS THE KEY OPTIMIZATION
-        // No CIGAR parsing, no aux scanning, just 4 u64 comparisons
-        // Use chunk_idx as tie-breaker for stable merge (preserves input order for equal keys)
-        let lt = |a: &KeyedHeapEntry, b: &KeyedHeapEntry| -> bool {
-            a.key.cmp(&b.key).then_with(|| a.chunk_idx.cmp(&b.chunk_idx)) == Ordering::Greater
-        };
-
-        // Build initial heap
-        heap_make(&mut heap, &lt);
-
-        // Create raw output writer (bypasses noodles Record encoding for speed)
-        let mut writer = crate::bam_io::create_raw_bam_writer(
-            output,
-            &output_header,
-            self.threads,
-            self.output_compression,
-        )?;
-
-        let mut records_merged = 0u64;
-        let mut output_buffer: Vec<Vec<u8>> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
-
-        // Merge loop using fixed-array heap with O(1) comparisons
-        while heap_size > 0 {
-            // Get the minimum record (at heap[0])
-            let chunk_idx = heap[0].chunk_idx;
-            let record_bytes = std::mem::take(&mut heap[0].record);
-
-            // Buffer the raw bytes directly (no Record conversion)
-            output_buffer.push(record_bytes);
-            records_merged += 1;
-
-            // Flush buffer when full
-            if output_buffer.len() >= OUTPUT_BUFFER_SIZE {
-                for rec in output_buffer.drain(..) {
-                    writer.write_raw_record(&rec)?;
-                }
-            }
-
-            // Get next record from the same chunk
-            if let Some((key, next_record)) = sources[chunk_idx].next_record() {
-                // Replace top with new record and sift down
-                heap[0].key = key;
-                heap[0].record = next_record;
-                heap_sift_down(&mut heap, 0, heap_size, &lt);
-            } else {
-                // Chunk exhausted - remove from heap
-                heap_size -= 1;
-                if heap_size > 0 {
-                    // Move last element to top and sift down
-                    heap.swap(0, heap_size);
-                    heap_sift_down(&mut heap, 0, heap_size, &lt);
-                }
-            }
-        }
-
-        // Flush remaining buffered records
-        for rec in output_buffer {
-            writer.write_raw_record(&rec)?;
-        }
-
-        writer.finish()?;
-
-        info!("Merge complete: {records_merged} records merged");
-        Ok(records_merged)
     }
 
     /// Generic merge for keyed chunks using `O(1)` key comparisons.
@@ -1654,7 +1688,6 @@ impl RawExternalSorter {
         let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
         info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
 
-        // Create output header with sort order tags
         let output_header = self.create_output_header(header);
 
         // Create semaphore to limit concurrent reader I/O threads
@@ -1679,7 +1712,6 @@ impl RawExternalSorter {
             }
         }
 
-        // Initialize heap with first record from each chunk
         let mut heap: Vec<GenericKeyedHeapEntry<K>> = Vec::with_capacity(sources.len());
         for (chunk_idx, source) in sources.iter_mut().enumerate() {
             if let Some((key, record)) = source.next_record() {
@@ -1693,16 +1725,13 @@ impl RawExternalSorter {
             return Ok(0);
         }
 
-        // O(1) comparison using pre-computed keys
-        // Use chunk_idx as tie-breaker for stable merge (preserves input order for equal keys)
+        // chunk_idx is the tie-breaker for stable merge (preserves input order for equal keys)
         let lt = |a: &GenericKeyedHeapEntry<K>, b: &GenericKeyedHeapEntry<K>| -> bool {
             a.key.cmp(&b.key).then_with(|| a.chunk_idx.cmp(&b.chunk_idx)) == Ordering::Greater
         };
 
-        // Build initial heap
         heap_make(&mut heap, &lt);
 
-        // Create raw output writer (bypasses noodles Record encoding for speed)
         let mut writer = crate::bam_io::create_raw_bam_writer(
             output,
             &output_header,
@@ -1825,7 +1854,6 @@ impl RawExternalSorter {
             }
         }
 
-        // Initialize heap
         let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(sources.len());
         for (chunk_idx, source) in sources.iter_mut().enumerate() {
             if let Some((key, record)) = source.next_record() {
@@ -1945,6 +1973,106 @@ impl RawExternalSorter {
     fn create_temp_dir(&self) -> Result<TempDir> {
         super::create_temp_dir(self.temp_dir.as_deref())
     }
+}
+
+/// K-way merge of sorted template-coordinate chunks, emitting records to a sink.
+///
+/// Merges pre-sorted disk chunks and an optional in-memory chunk using a min-heap
+/// with O(1) key comparisons (pre-computed 32-byte `TemplateKey`, no CIGAR/aux parsing).
+///
+/// # Errors
+///
+/// Returns an error if reading chunks or emitting records fails.
+fn merge_chunks_keyed_to_sink(
+    chunk_files: &[PathBuf],
+    memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>>,
+    sink: &mut dyn super::sink::SortedRecordSink,
+) -> Result<u64> {
+    use crate::sort::loser_tree::LoserTree;
+
+    /// Source for keyed chunks during merge.
+    enum KeyedChunkSource {
+        /// Disk-based chunk with prefetching reader.
+        Disk(GenericKeyedChunkReader<TemplateKey>),
+        /// In-memory sorted records.
+        Memory { records: Vec<(TemplateKey, Vec<u8>)>, idx: usize },
+    }
+
+    impl KeyedChunkSource {
+        fn next_record(&mut self) -> Option<(TemplateKey, Vec<u8>)> {
+            match self {
+                KeyedChunkSource::Disk(reader) => reader.next_record(),
+                KeyedChunkSource::Memory { records, idx } => {
+                    if *idx < records.len() {
+                        let dummy = (TemplateKey::zeroed(), Vec::new());
+                        let entry = std::mem::replace(&mut records[*idx], dummy);
+                        *idx += 1;
+                        Some(entry)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    let num_disk = chunk_files.len();
+    let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
+    info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
+
+    let mut sources: Vec<KeyedChunkSource> = Vec::with_capacity(num_disk + num_memory);
+    for path in chunk_files {
+        sources.push(KeyedChunkSource::Disk(GenericKeyedChunkReader::<TemplateKey>::open(
+            path, None,
+        )?));
+    }
+    for chunk in memory_chunks {
+        if !chunk.is_empty() {
+            sources.push(KeyedChunkSource::Memory { records: chunk, idx: 0 });
+        }
+    }
+
+    // Initialize LoserTree with first key from each source (stable merge, matching run_merge_loop)
+    let mut initial_keys: Vec<TemplateKey> = Vec::with_capacity(sources.len());
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+    let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
+
+    for (idx, source) in sources.iter_mut().enumerate() {
+        if let Some((key, record)) = source.next_record() {
+            initial_keys.push(key);
+            records.push(record);
+            source_map.push(idx);
+        }
+    }
+
+    if initial_keys.is_empty() {
+        info!("Merge complete: 0 records merged");
+        return Ok(0);
+    }
+
+    let mut tree = LoserTree::new(initial_keys);
+    let mut records_merged = 0u64;
+
+    while tree.winner_is_active() {
+        let winner = tree.winner();
+        let key = tree.winner_key();
+        let record_bytes = std::mem::take(&mut records[winner]);
+
+        sink.emit(key, record_bytes)?;
+        records_merged += 1;
+
+        // Fetch next record from the same source
+        let source_idx = source_map[winner];
+        if let Some((next_key, next_record)) = sources[source_idx].next_record() {
+            records[winner] = next_record;
+            tree.replace_winner(next_key);
+        } else {
+            tree.remove_winner();
+        }
+    }
+
+    info!("Merge complete: {records_merged} records merged");
+    Ok(records_merged)
 }
 
 /// Extract a packed `TemplateKey` directly from BAM record bytes.
@@ -2071,6 +2199,53 @@ pub fn extract_template_key_inline(
 
 // Use shared SortStats from the parent module.
 pub use super::SortStats as RawSortStats;
+
+/// Result of the sort-accumulate phase: sorted chunks ready for K-way merging.
+///
+/// Holds references to sorted disk chunks (temp files) and any remaining in-memory
+/// sorted chunks.  The caller controls when and where the merge happens — e.g. on a
+/// dedicated feeder thread so that the calling thread can participate in work-stealing.
+///
+/// **Important:** The [`TempDir`] is owned here.  Dropping a `SortedChunks` removes
+/// the temporary directory and all spill files.  Keep this value alive until the merge
+/// is complete.
+pub struct SortedChunks {
+    /// Paths to sorted keyed chunk files on disk.
+    pub chunk_files: Vec<PathBuf>,
+    /// Sorted in-memory chunks (from the last partial buffer that didn't spill).
+    /// Each inner `Vec` is independently sorted; the merge treats them as separate sources.
+    pub memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>>,
+    /// Accumulation-phase statistics (total records read, chunks written to disk).
+    pub stats: RawSortStats,
+    /// Temporary directory owning the spill files.  Must outlive the merge phase.
+    _temp_dir: TempDir,
+}
+
+/// Merge pre-sorted chunks into a [`SortedRecordSink`] using K-way merge.
+///
+/// This is a public wrapper around the internal LoserTree-based merge.  It consumes
+/// both disk chunks and in-memory chunks from a [`SortedChunks`], emitting records
+/// in template-coordinate order.
+///
+/// **Note:** This does NOT call [`SortedRecordSink::finish`] on the sink — the caller
+/// is responsible for calling `finish()` after the merge returns.
+///
+/// # Errors
+///
+/// Returns an error if reading chunks or emitting records to the sink fails.
+pub fn merge_sorted_chunks_to_sink(
+    chunks: SortedChunks,
+    sink: &mut dyn super::sink::SortedRecordSink,
+) -> Result<u64> {
+    if chunks.chunk_files.is_empty() && chunks.memory_chunks.is_empty() {
+        return Ok(0);
+    }
+    // Delegate to the existing internal merge function.
+    // Takes ownership of chunks to avoid deep-cloning memory_chunks.
+    // The _temp_dir field is kept alive by the owned SortedChunks until
+    // merge completes, ensuring spill files aren't cleaned up early.
+    merge_chunks_keyed_to_sink(&chunks.chunk_files, chunks.memory_chunks, sink)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2735,6 +2910,165 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // sort_template_to_sink tests
+    // ========================================================================
+
+    use crate::sort::sink::CollectingSink;
+
+    /// Build a minimal unpaired mapped BAM record at (tid, pos) with given name.
+    ///
+    /// The record is unpaired (flag=0) to simplify template-coordinate key comparison:
+    /// tid2/pos2 are set to MAX, so ordering depends only on (tid, pos).
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_unpaired_mapped_bam(tid: i32, pos: i32, name: &[u8]) -> Vec<u8> {
+        let l_read_name = (name.len() + 1) as u8; // +1 for null terminator
+        let mut bam = vec![0u8; 32];
+        // ref_id at offset 0..4
+        bam[0..4].copy_from_slice(&tid.to_le_bytes());
+        // pos at offset 4..8
+        bam[4..8].copy_from_slice(&pos.to_le_bytes());
+        // l_read_name at offset 8
+        bam[8] = l_read_name;
+        // flags at offset 14..16: 0 (unpaired, mapped, forward strand)
+        bam[14..16].copy_from_slice(&0u16.to_le_bytes());
+        // mate_ref_id at offset 20..24: -1 (no mate)
+        bam[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        // mate_pos at offset 24..28: -1 (no mate)
+        bam[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        // read name
+        bam.extend_from_slice(name);
+        bam.push(0); // null terminator
+        bam
+    }
+
+    /// Write raw BAM records to a temporary BAM file and return the path.
+    fn write_temp_bam(header: &Header, records: &[Vec<u8>]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bam_path = dir.path().join("input.bam");
+        let mut writer =
+            crate::bam_io::create_raw_bam_writer(&bam_path, header, 1, 1).expect("create writer");
+        for rec in records {
+            writer.write_raw_record(rec).expect("write record");
+        }
+        writer.finish().expect("finish writer");
+        dir
+    }
+
+    #[test]
+    fn test_sort_template_to_sink_in_memory() {
+        // Create records in reverse position order
+        let rec_c = build_unpaired_mapped_bam(0, 300, b"readC");
+        let rec_a = build_unpaired_mapped_bam(0, 100, b"readA");
+        let rec_b = build_unpaired_mapped_bam(0, 200, b"readB");
+
+        let header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(1000).unwrap(),
+                ),
+            )
+            .build();
+
+        let dir = write_temp_bam(&header, &[rec_c.clone(), rec_a.clone(), rec_b.clone()]);
+        let bam_path = dir.path().join("input.bam");
+
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        let mut sink = CollectingSink::new();
+
+        let stats =
+            sorter.sort_template_to_sink(&bam_path, &header, &mut sink).expect("sort to sink");
+
+        assert_eq!(stats.total_records, 3);
+        assert_eq!(stats.output_records, 3);
+        assert_eq!(sink.records.len(), 3);
+        assert!(sink.finished);
+
+        // Verify records are in sorted order by key
+        for window in sink.records.windows(2) {
+            assert!(window[0].0 <= window[1].0, "records should be in non-decreasing key order");
+        }
+    }
+
+    #[test]
+    fn test_sort_template_to_sink_with_spill() {
+        // Use a very small memory limit to force spilling to disk
+        let header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(10_000).unwrap(),
+                ),
+            )
+            .build();
+
+        // Create enough records to exceed the tiny memory limit
+        let records: Vec<Vec<u8>> = (0..20)
+            .map(|i| build_unpaired_mapped_bam(0, i * 100, format!("read{i:04}").as_bytes()))
+            .collect();
+
+        let dir = write_temp_bam(&header, &records);
+        let bam_path = dir.path().join("input.bam");
+
+        // Set memory limit very low to force chunking (each record is ~40 bytes, limit to ~200)
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).memory_limit(200);
+        let mut sink = CollectingSink::new();
+
+        let stats =
+            sorter.sort_template_to_sink(&bam_path, &header, &mut sink).expect("sort to sink");
+
+        assert_eq!(stats.total_records, 20);
+        assert_eq!(stats.output_records, 20);
+        assert_eq!(sink.records.len(), 20);
+        assert!(sink.finished);
+        assert!(stats.chunks_written > 0, "should have written chunks to disk");
+
+        // Verify sorted order
+        for window in sink.records.windows(2) {
+            assert!(window[0].0 <= window[1].0, "records should be in non-decreasing key order");
+        }
+    }
+
+    // ========================================================================
+    // sort_from_iter tests
+    // ========================================================================
+
+    #[test]
+    fn test_sort_from_iter_in_memory() {
+        let header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(1000).unwrap(),
+                ),
+            )
+            .build();
+
+        // Records in reverse order
+        let records = vec![
+            build_unpaired_mapped_bam(0, 300, b"readC"),
+            build_unpaired_mapped_bam(0, 100, b"readA"),
+            build_unpaired_mapped_bam(0, 200, b"readB"),
+        ];
+
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        let mut sink = CollectingSink::new();
+
+        let stats =
+            sorter.sort_from_iter(records.into_iter(), &header, &mut sink).expect("sort from iter");
+
+        assert_eq!(stats.total_records, 3);
+        assert_eq!(stats.output_records, 3);
+        assert_eq!(sink.records.len(), 3);
+        assert!(sink.finished);
+
+        // Verify sorted order
+        for window in sink.records.windows(2) {
+            assert!(window[0].0 <= window[1].0, "records should be in non-decreasing key order");
+        }
+    }
+
     #[test]
     fn test_merge_bams_template_coordinate_sort() {
         let dir = tempfile::tempdir().unwrap();
@@ -2773,6 +3107,39 @@ mod tests {
         let names = collect_read_names(&merged);
         for w in names.windows(2) {
             assert!(w[0] <= w[1], "queryname sort violated: {:?} > {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn test_sort_from_iter_with_spill() {
+        let header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(10_000).unwrap(),
+                ),
+            )
+            .build();
+
+        let records: Vec<Vec<u8>> = (0..20)
+            .map(|i| build_unpaired_mapped_bam(0, i * 100, format!("read{i:04}").as_bytes()))
+            .collect();
+
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).memory_limit(200);
+        let mut sink = CollectingSink::new();
+
+        let stats =
+            sorter.sort_from_iter(records.into_iter(), &header, &mut sink).expect("sort from iter");
+
+        assert_eq!(stats.total_records, 20);
+        assert_eq!(stats.output_records, 20);
+        assert_eq!(sink.records.len(), 20);
+        assert!(sink.finished);
+        assert!(stats.chunks_written > 0, "should have written chunks to disk");
+
+        // Verify sorted order
+        for window in sink.records.windows(2) {
+            assert!(window[0].0 <= window[1].0, "records should be in non-decreasing key order");
         }
     }
 
@@ -2849,5 +3216,44 @@ mod tests {
         for w in positions.windows(2) {
             assert!(w[0] <= w[1], "coordinate sort violated with k={k}: {:?} > {:?}", w[0], w[1]);
         }
+    }
+
+    #[test]
+    fn test_sort_from_iter_empty() {
+        let header = Header::builder().build();
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        let mut sink = CollectingSink::new();
+
+        let stats = sorter
+            .sort_from_iter(std::iter::empty(), &header, &mut sink)
+            .expect("sort from iter empty");
+
+        assert_eq!(stats.total_records, 0);
+        assert_eq!(stats.output_records, 0);
+        assert!(sink.records.is_empty());
+        assert!(sink.finished);
+    }
+
+    #[test]
+    fn test_sort_from_iter_preserves_record_bytes() {
+        let header = Header::builder()
+            .add_reference_sequence(
+                BString::from("chr1"),
+                Map::<noodles::sam::header::record::value::map::ReferenceSequence>::new(
+                    std::num::NonZeroUsize::new(1000).unwrap(),
+                ),
+            )
+            .build();
+
+        let rec = build_unpaired_mapped_bam(0, 42, b"onlyread");
+        let expected_bytes = rec.clone();
+
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate);
+        let mut sink = CollectingSink::new();
+
+        sorter.sort_from_iter(std::iter::once(rec), &header, &mut sink).expect("sort");
+
+        assert_eq!(sink.records.len(), 1);
+        assert_eq!(sink.records[0].1, expected_bytes, "record bytes should be preserved exactly");
     }
 }

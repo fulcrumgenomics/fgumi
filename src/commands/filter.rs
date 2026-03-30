@@ -38,6 +38,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use fgumi_lib::defaults;
+
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -122,13 +124,13 @@ pub struct Filter {
         short = 'E',
         long = "max-read-error-rate",
         value_delimiter = ',',
-        default_value = "0.025"
+        default_value = defaults::FILTER_MAX_READ_ERROR_RATE
     )]
     pub max_read_error_rate: Vec<f64>,
 
     /// Maximum base error rate across raw reads (0.0-1.0).
     /// For duplex: provide 1-3 values for [duplex, AB consensus, BA consensus]
-    #[arg(short = 'e', long = "max-base-error-rate", value_delimiter = ',', default_value = "0.1")]
+    #[arg(short = 'e', long = "max-base-error-rate", value_delimiter = ',', default_value = defaults::FILTER_MAX_BASE_ERROR_RATE)]
     pub max_base_error_rate: Vec<f64>,
 
     /// Minimum base quality score (after masking)
@@ -143,7 +145,7 @@ pub struct Filter {
     ///
     /// If < 1.0, treated as a fraction of read length (e.g. 0.2 = 20% Ns allowed).
     /// If >= 1.0, treated as an absolute base count (must be integer, e.g. 5 = max 5 Ns).
-    #[arg(short = 'n', long = "max-no-call-fraction", default_value = "0.2")]
+    #[arg(short = 'n', long = "max-no-call-fraction", default_value_t = defaults::FILTER_MAX_NO_CALL_FRACTION)]
     pub max_no_call_fraction: f64,
 
     /// Reverse per-base tags for negative strand reads

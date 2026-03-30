@@ -338,12 +338,6 @@ pub struct FilterMetrics {
 }
 
 impl FilterMetrics {
-    /// Create new empty metrics.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Merge another `FilterMetrics` into this one.
     pub fn merge(&mut self, other: &FilterMetrics) {
         self.total_templates += other.total_templates;
@@ -714,6 +708,319 @@ pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<V
             Template::from_records,
         )
     }
+}
+
+// ============================================================================
+// Shared UMI Grouping Helpers
+// ============================================================================
+
+/// Group consecutive raw BAM records by queryname.
+///
+/// Records within a position group are sorted by template-coordinate key, which
+/// includes a name hash. Records with the same queryname are adjacent but name-hash
+/// collisions are possible, so actual queryname comparison is required.
+#[must_use]
+pub fn group_by_queryname(records: Vec<Vec<u8>>) -> Vec<Vec<Vec<u8>>> {
+    use fgumi_raw_bam::fields::read_name;
+
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut current_group: Vec<Vec<u8>> = Vec::new();
+
+    for rec in records {
+        let name = read_name(&rec);
+        // Compare against the last record in the current group to avoid allocating
+        // a separate name buffer: records are sorted by template-coordinate key, so
+        // same-name records are always adjacent.
+        let current_name_matches = current_group.last().is_some_and(|last| read_name(last) == name);
+        if !current_name_matches && !current_group.is_empty() {
+            groups.push(std::mem::take(&mut current_group));
+        }
+        current_group.push(rec);
+    }
+
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+
+    groups
+}
+
+/// Extract the UMI string from a raw-byte template's primary R1 (or R2 as fallback).
+///
+/// Returns an empty string if the UMI tag is not found, which the assigner
+/// will handle appropriately.
+///
+/// # Errors
+///
+/// Returns an error if the UMI tag value is not valid UTF-8.
+pub fn extract_umi_from_template(
+    template: &crate::template::Template,
+    umi_tag: [u8; 2],
+) -> Result<fgumi_umi::Umi, anyhow::Error> {
+    use fgumi_raw_bam::fields::aux_data_slice;
+    use fgumi_raw_bam::tags::find_string_tag;
+
+    let raw = template.raw_r1().or_else(|| template.raw_r2());
+    let Some(raw) = raw else {
+        return Ok(String::new());
+    };
+
+    let aux = aux_data_slice(raw);
+    match find_string_tag(aux, &umi_tag) {
+        Some(umi_bytes) => {
+            let umi_str = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in UMI tag {umi_tag:?}: {e}"))?;
+            Ok(umi_str.to_owned())
+        }
+        None => Ok(String::new()),
+    }
+}
+
+/// Get the pair orientation from a raw-byte template.
+///
+/// Returns `(r1_positive, r2_positive)` where `true` means the read is on the
+/// forward strand (REVERSE flag not set). If R1 or R2 is absent, the corresponding
+/// value defaults to `true` (forward).
+#[must_use]
+pub fn get_pair_orientation_raw(template: &crate::template::Template) -> (bool, bool) {
+    use fgumi_raw_bam::fields;
+
+    let r1_positive =
+        template.raw_r1().is_none_or(|r| (fields::flags(r) & fields::flags::REVERSE) == 0);
+    let r2_positive =
+        template.raw_r2().is_none_or(|r| (fields::flags(r) & fields::flags::REVERSE) == 0);
+    (r1_positive, r2_positive)
+}
+
+// ============================================================================
+// Template Filtering (shared between standalone group and runall pipeline)
+// ============================================================================
+
+/// Configuration for template filtering during group processing.
+///
+/// Controls which templates are discarded before UMI assignment:
+/// unmapped pairs, low MAPQ, non-PF, and UMI validation.
+#[derive(Clone, Debug)]
+pub struct GroupFilterConfig {
+    /// UMI tag bytes (e.g., `[b'R', b'X']`).
+    pub umi_tag: [u8; 2],
+    /// Minimum mapping quality.
+    pub min_mapq: u8,
+    /// Whether to include non-PF reads.
+    pub include_non_pf: bool,
+    /// Minimum UMI length (`None` to disable).
+    pub min_umi_length: Option<usize>,
+    /// Skip UMI validation (position-only grouping).
+    pub no_umi: bool,
+    /// Whether to allow fully unmapped templates (both reads unmapped).
+    pub allow_unmapped: bool,
+}
+
+impl GroupFilterConfig {
+    /// Create a default config suitable for the runall pipeline.
+    ///
+    /// Uses the given UMI tag, `min_mapq = 1`, no UMI length check, and
+    /// disallows unmapped templates.
+    #[must_use]
+    pub fn with_defaults(umi_tag: [u8; 2]) -> Self {
+        Self {
+            umi_tag,
+            min_mapq: 1,
+            include_non_pf: false,
+            min_umi_length: None,
+            no_umi: false,
+            allow_unmapped: false,
+        }
+    }
+}
+
+/// Filter a template in raw-byte mode based on filtering criteria.
+///
+/// Returns `true` if the template should be kept, `false` if it should be discarded.
+/// Updates `metrics` with the reason for filtering.
+///
+/// Checks performed (in order):
+/// 1. At least one primary read exists.
+/// 2. Both-unmapped check (unless `allow_unmapped`).
+/// 3. QC-fail flag (unless `include_non_pf`).
+/// 4. MAPQ < `min_mapq` on mapped reads.
+/// 5. Mate MAPQ via the `MQ` aux tag.
+/// 6. UMI validation: N-content and minimum length.
+pub fn filter_template_raw(
+    template: &crate::template::Template,
+    config: &GroupFilterConfig,
+    metrics: &mut FilterMetrics,
+) -> bool {
+    let raw_r1 = template.raw_r1().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.raw_r2().filter(|r| r.len() >= fgumi_raw_bam::MIN_BAM_RECORD_LEN);
+
+    metrics.total_templates += 1;
+
+    if raw_r1.is_none() && raw_r2.is_none() {
+        metrics.discarded_poor_alignment += 1;
+        return false;
+    }
+
+    // Check if both reads are unmapped
+    let both_unmapped = raw_r1
+        .is_none_or(|r| (fgumi_raw_bam::flags(r) & fgumi_raw_bam::flags::UNMAPPED) != 0)
+        && raw_r2.is_none_or(|r| (fgumi_raw_bam::flags(r) & fgumi_raw_bam::flags::UNMAPPED) != 0);
+    if both_unmapped && !config.allow_unmapped {
+        metrics.discarded_poor_alignment += 1;
+        return false;
+    }
+
+    // Phase 1: Cheap flag-based checks
+    if !filter_template_raw_flags(raw_r1, raw_r2, config, metrics) {
+        return false;
+    }
+
+    // Phase 2: Tag-based checks (MQ + UMI in one aux scan per read)
+    filter_template_raw_tags(raw_r1, raw_r2, config, metrics)
+}
+
+/// Phase 1 of template filtering: flag-based checks (QC-fail, MAPQ).
+fn filter_template_raw_flags(
+    raw_r1: Option<&[u8]>,
+    raw_r2: Option<&[u8]>,
+    config: &GroupFilterConfig,
+    metrics: &mut FilterMetrics,
+) -> bool {
+    for raw in [raw_r1, raw_r2].into_iter().flatten() {
+        let flg = fgumi_raw_bam::flags(raw);
+
+        if !config.include_non_pf && (flg & fgumi_raw_bam::flags::QC_FAIL) != 0 {
+            metrics.discarded_non_pf += 1;
+            return false;
+        }
+
+        if (flg & fgumi_raw_bam::flags::UNMAPPED) == 0 && fgumi_raw_bam::mapq(raw) < config.min_mapq
+        {
+            metrics.discarded_poor_alignment += 1;
+            return false;
+        }
+    }
+    true
+}
+
+/// Phase 2 of template filtering: single-pass aux tag lookups (MQ + UMI).
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "BAM aux tag parsing: MQ is stored as various integer types but always fits in u8"
+)]
+fn filter_template_raw_tags(
+    raw_r1: Option<&[u8]>,
+    raw_r2: Option<&[u8]>,
+    config: &GroupFilterConfig,
+    metrics: &mut FilterMetrics,
+) -> bool {
+    for raw in [raw_r1, raw_r2].into_iter().flatten() {
+        let flg = fgumi_raw_bam::flags(raw);
+        let aux = fgumi_raw_bam::aux_data_slice(raw);
+        let check_mq = (flg & fgumi_raw_bam::flags::MATE_UNMAPPED) == 0;
+        let check_umi = !config.no_umi;
+
+        let mut found_mq: Option<i64> = None;
+        let mut found_umi: Option<&[u8]> = None;
+        let mut p = 0;
+        while p + 3 <= aux.len() {
+            let t = [aux[p], aux[p + 1]];
+            let val_type = aux[p + 2];
+
+            if check_umi && t == config.umi_tag && val_type == b'Z' {
+                let start = p + 3;
+                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
+                    found_umi = Some(&aux[start..start + end]);
+                    p = start + end + 1;
+                } else {
+                    break;
+                }
+                if !check_mq || found_mq.is_some() {
+                    break;
+                }
+                continue;
+            }
+
+            if check_mq && t == *b"MQ" {
+                // Extract MQ value (common types: C/c/S/s/I/i)
+                found_mq = match val_type {
+                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
+                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
+                    b'S' if p + 5 <= aux.len() => {
+                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
+                    }
+                    b's' if p + 5 <= aux.len() => {
+                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
+                    }
+                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
+                        aux[p + 3],
+                        aux[p + 4],
+                        aux[p + 5],
+                        aux[p + 6],
+                    ]))),
+                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
+                        aux[p + 3],
+                        aux[p + 4],
+                        aux[p + 5],
+                        aux[p + 6],
+                    ]))),
+                    _ => None,
+                };
+            }
+
+            if let Some(size) = fgumi_raw_bam::tag_value_size(val_type, &aux[p + 3..]) {
+                p += 3 + size;
+            } else {
+                break;
+            }
+            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
+                break;
+            }
+        }
+
+        if check_mq {
+            if let Some(mq) = found_mq {
+                if (mq as u8) < config.min_mapq {
+                    metrics.discarded_poor_alignment += 1;
+                    return false;
+                }
+            }
+        }
+
+        // Skip UMI validation in no-umi mode
+        if config.no_umi {
+            continue;
+        }
+
+        if let Some(umi_bytes) = found_umi {
+            match fgumi_umi::validate_umi(umi_bytes) {
+                fgumi_umi::UmiValidation::ContainsN => {
+                    metrics.discarded_ns_in_umi += 1;
+                    return false;
+                }
+                fgumi_umi::UmiValidation::Valid(base_count) => {
+                    if let Some(min_len) = config.min_umi_length {
+                        if base_count < min_len {
+                            metrics.discarded_umi_too_short += 1;
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else {
+            metrics.discarded_poor_alignment += 1;
+            return false;
+        }
+    }
+
+    metrics.accepted_templates += 1;
+    true
 }
 
 // ============================================================================
