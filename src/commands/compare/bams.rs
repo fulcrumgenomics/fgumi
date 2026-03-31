@@ -171,7 +171,7 @@ pub struct CompareBams {
     /// Required for comparing output from consensus commands (simplex/duplex/codec)
     /// when run with --threads, as parallel processing causes non-deterministic ordering.
     /// Only valid with --mode grouping.
-    #[arg(long = "ignore-order", default_value = "false")]
+    #[arg(long = "ignore-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub ignore_order: bool,
 
     /// Initial buffer size for --ignore-order mode (number of records)

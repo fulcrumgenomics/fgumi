@@ -91,7 +91,7 @@ pub struct Review {
     pub sample: Option<String>,
 
     /// Ignore N bases in consensus reads
-    #[arg(short = 'N', long = "ignore-ns", default_value = "false")]
+    #[arg(short = 'N', long = "ignore-ns", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub ignore_ns: bool,
 
     /// Only output detailed information for variants at or below this MAF

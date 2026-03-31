@@ -140,7 +140,7 @@ pub struct Sort {
     ///
     /// When enabled (default), --max-memory specifies memory per thread.
     /// Total memory = `max_memory` × threads. Disable for fixed total memory.
-    #[arg(long = "memory-per-thread", default_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub memory_per_thread: bool,
 
     /// Temporary directory for intermediate files.
@@ -174,7 +174,7 @@ pub struct Sort {
     /// Only valid for coordinate sort. The index file will be written to
     /// `<output>.bai`. Uses single-threaded compression for accurate virtual
     /// position tracking.
-    #[arg(long = "write-index", default_value = "false")]
+    #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub write_index: bool,
 
     /// Cell barcode tag for template-coordinate sort.

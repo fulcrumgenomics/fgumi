@@ -147,7 +147,7 @@ pub struct Filter {
     pub max_no_call_fraction: f64,
 
     /// Reverse per-base tags for negative strand reads
-    #[arg(short = 'R', long = "reverse-per-base-tags", default_value = "false")]
+    #[arg(short = 'R', long = "reverse-per-base-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub reverse_per_base_tags: bool,
 
     /// Threading options for parallel processing
@@ -155,7 +155,7 @@ pub struct Filter {
     pub threading: ThreadingOptions,
 
     /// Filter templates together (all primary reads must pass)
-    #[arg(long = "filter-by-template", default_value = "true")]
+    #[arg(long = "filter-by-template", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub filter_by_template: bool,
 
     /// Optional output BAM file for rejected reads
@@ -167,7 +167,7 @@ pub struct Filter {
     pub stats: Option<PathBuf>,
 
     /// Require single-strand agreement for duplex consensus (mask bases where AB and BA disagree)
-    #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false")]
+    #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub require_single_strand_agreement: bool,
 
     /// Compression options for output BAM.
@@ -3947,5 +3947,44 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[rstest]
+    // --reverse-per-base-tags (default false)
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1"], false)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags", "true"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags", "false"], false)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags=true"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags=false"], false)]
+    fn test_reverse_per_base_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = Filter::try_parse_from(args).unwrap();
+        assert_eq!(cmd.reverse_per_base_tags, expected);
+    }
+
+    #[rstest]
+    // --filter-by-template (default true)
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template", "true"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template", "false"], false)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template=true"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template=false"], false)]
+    fn test_filter_by_template_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = Filter::try_parse_from(args).unwrap();
+        assert_eq!(cmd.filter_by_template, expected);
+    }
+
+    #[rstest]
+    // --require-single-strand-agreement (default false)
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1"], false)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement", "true"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement", "false"], false)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement=true"], true)]
+    #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement=false"], false)]
+    fn test_require_single_strand_agreement_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = Filter::try_parse_from(args).unwrap();
+        assert_eq!(cmd.require_single_strand_agreement, expected);
     }
 }

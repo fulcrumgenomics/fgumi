@@ -65,7 +65,7 @@ done in streaming fashion with, for example:
 The output sort order may be specified with --sort-order. If not given, then the output will be in the same
 order as input.
 
-Any existing NM, UQ and MD tags are repaired (if --regenerate-tags is specified), and mate-pair information is updated.
+Any existing NM, UQ and MD tags are repaired, and mate-pair information is updated.
 
 Three clipping modes are supported:
 1. `soft` - soft-clip the bases and qualities.
@@ -100,21 +100,19 @@ pub struct Clip {
     pub sort_order: Option<String>,
 
     /// Clip overlapping read pairs
-    #[arg(long = "clip-overlapping-reads", default_value = "false")]
+    #[arg(long = "clip-overlapping-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub clip_overlapping_reads: bool,
 
     /// Clip reads that extend past their mate's start position
     #[arg(
         long = "clip-bases-past-mate",
         alias = "clip-extending-past-mate",
-        default_value = "false"
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
     )]
     pub clip_extending_past_mate: bool,
-
-    /// Note: NM/UQ/MD tags are always regenerated after clipping (matching fgbio behavior)
-    /// This flag is kept for backwards compatibility but is ignored
-    #[arg(long = "regenerate-tags", default_value = "true", hide = true)]
-    pub regenerate_tags: bool,
 
     /// Minimum bases to clip from 5' end of R1
     #[arg(long = "read-one-five-prime", default_value = "0")]
@@ -133,11 +131,11 @@ pub struct Clip {
     pub read_two_three_prime: usize,
 
     /// Upgrade existing clipping to the specified clipping mode
-    #[arg(short = 'H', long = "upgrade-clipping", default_value = "false")]
+    #[arg(short = 'H', long = "upgrade-clipping", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub upgrade_clipping: bool,
 
     /// Automatically clip extended attributes that match read length
-    #[arg(short = 'a', long = "auto-clip-attributes", default_value = "false")]
+    #[arg(short = 'a', long = "auto-clip-attributes", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub auto_clip_attributes: bool,
 
     /// Output file for clipping metrics
@@ -210,7 +208,6 @@ impl Command for Clip {
         info!("  Clipping mode: {}", self.clipping_mode);
         info!("  Clip overlapping reads: {}", self.clip_overlapping_reads);
         info!("  Clip extending past mate: {}", self.clip_extending_past_mate);
-        info!("  Regenerate tags: {}", self.regenerate_tags);
         info!("  {}", self.threading.log_message());
 
         let timer = OperationTimer::new("Clipping reads");
@@ -918,7 +915,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true, // Always true to match Scala fgbio
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -936,7 +933,6 @@ mod tests {
         assert_eq!(clip.clipping_mode, "hard");
         assert!(!clip.clip_overlapping_reads);
         assert!(!clip.clip_extending_past_mate);
-        assert!(clip.regenerate_tags); // Always true
     }
 
     #[test]
@@ -950,7 +946,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 5,
             read_one_three_prime: 3,
             read_two_five_prime: 7,
@@ -982,7 +978,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1013,7 +1009,7 @@ mod tests {
             clipping_mode: "soft-with-mask".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1044,7 +1040,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true, // Always true
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1059,7 +1055,6 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert!(clip.regenerate_tags);
         assert_eq!(clip.reference, PathBuf::from("reference.fa"));
         assert!(clip.auto_clip_attributes);
     }
@@ -1075,7 +1070,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 5,
             read_one_three_prime: 5,
             read_two_five_prime: 5,
@@ -1093,7 +1088,6 @@ mod tests {
         // All options enabled
         assert!(clip.clip_overlapping_reads);
         assert!(clip.clip_extending_past_mate);
-        assert!(clip.regenerate_tags);
         assert!(clip.upgrade_clipping);
         assert!(clip.auto_clip_attributes);
         assert!(clip.read_one_five_prime > 0);
@@ -1111,7 +1105,7 @@ mod tests {
             clipping_mode: "soft".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1140,7 +1134,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1169,7 +1163,7 @@ mod tests {
             clipping_mode: "soft".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 10,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1202,7 +1196,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1233,7 +1227,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1264,7 +1258,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1295,7 +1289,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1326,7 +1320,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1359,7 +1353,7 @@ mod tests {
             clipping_mode: "soft-with-mask".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 5,
             read_one_three_prime: 5,
             read_two_five_prime: 5,
@@ -1390,7 +1384,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 50,
             read_one_three_prime: 50,
             read_two_five_prime: 50,
@@ -1423,7 +1417,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 10,
             read_one_three_prime: 10,
             read_two_five_prime: 10,
@@ -1455,7 +1449,7 @@ mod tests {
             clipping_mode: "soft".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1479,7 +1473,7 @@ mod tests {
             clipping_mode: "soft-with-mask".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1503,7 +1497,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1535,7 +1529,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1564,7 +1558,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1583,37 +1577,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clip_regenerate_tags_always_true() {
-        // Test that regenerate_tags is always true to match Scala fgbio behavior
-        let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
-            reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
-            clip_overlapping_reads: false,
-            clip_extending_past_mate: false,
-            regenerate_tags: true,
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        // regenerate_tags should always be true to match fgbio
-        assert!(clip.regenerate_tags);
-    }
-
-    #[test]
     fn test_clip_single_read_end_clipping() {
         let clip = Clip {
             io: BamIoOptions {
@@ -1624,7 +1587,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1657,7 +1620,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1688,7 +1651,7 @@ mod tests {
             clipping_mode: "soft".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1705,37 +1668,6 @@ mod tests {
 
         assert!(clip.clip_overlapping_reads);
         assert!(clip.clip_extending_past_mate);
-    }
-
-    #[test]
-    fn test_clip_no_regenerate_tags_option() {
-        // Test that regenerate_tags is always true (no option to disable)
-        let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
-            reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
-            clip_overlapping_reads: true,
-            clip_extending_past_mate: false,
-            regenerate_tags: true,
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        // regenerate_tags must always be true (unlike Scala which had option to disable)
-        assert!(clip.regenerate_tags);
     }
 
     // Integration tests
@@ -1788,7 +1720,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1835,7 +1767,7 @@ mod tests {
             clipping_mode: "soft".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1881,7 +1813,7 @@ mod tests {
             clipping_mode: "soft-with-mask".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -1927,7 +1859,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 3,
             read_one_three_prime: 2,
             read_two_five_prime: 2,
@@ -1973,7 +1905,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2019,7 +1951,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2066,7 +1998,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2113,7 +2045,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2159,7 +2091,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 3,
             read_one_three_prime: 2,
             read_two_five_prime: 0,
@@ -2206,7 +2138,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2253,7 +2185,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
-            regenerate_tags: true,
+
             read_one_five_prime: 2,
             read_one_three_prime: 2,
             read_two_five_prime: 2,
@@ -2300,7 +2232,7 @@ mod tests {
             clipping_mode: "invalid".to_string(), // Invalid mode
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2345,7 +2277,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2398,7 +2330,7 @@ mod tests {
             clipping_mode: "hard".to_string(),
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime: 0,
             read_one_three_prime: 0,
             read_two_five_prime: 0,
@@ -2462,7 +2394,7 @@ mod tests {
             clipping_mode: "soft".to_string(),
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
-            regenerate_tags: true,
+
             read_one_five_prime,
             read_one_three_prime,
             read_two_five_prime,
