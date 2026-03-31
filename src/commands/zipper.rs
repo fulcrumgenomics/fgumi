@@ -165,14 +165,14 @@ pub struct Zipper {
 
     /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.
     /// Useful when reads were intentionally removed (e.g., by adapter trimming) prior to alignment.
-    #[arg(long = "exclude-missing-reads", default_value = "false")]
+    #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub exclude_missing_reads: bool,
 
     /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
     /// By default, zipper adds a `pa` tag containing the primary alignment's template
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
-    #[arg(long = "skip-pa-tags", default_value = "false")]
+    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub skip_pa_tags: bool,
 }
 
@@ -946,6 +946,7 @@ mod tests {
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+    use rstest::rstest;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -2548,5 +2549,31 @@ mod tests {
         assert!(has_pa_tag, "Supplementary should have pa tag when skip_pa_tags=false");
 
         Ok(())
+    }
+
+    #[rstest]
+    // --exclude-missing-reads (default false)
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads", "true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads", "false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads=true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads=false"], false)]
+    fn test_exclude_missing_reads_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = Zipper::try_parse_from(args).unwrap();
+        assert_eq!(cmd.exclude_missing_reads, expected);
+    }
+
+    #[rstest]
+    // --skip-pa-tags (default false)
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=false"], false)]
+    fn test_skip_pa_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = Zipper::try_parse_from(args).unwrap();
+        assert_eq!(cmd.skip_pa_tags, expected);
     }
 }

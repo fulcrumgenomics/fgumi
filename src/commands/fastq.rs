@@ -73,7 +73,7 @@ pub struct Fastq {
     pub input: PathBuf,
 
     /// Don't append /1 and /2 to read names.
-    #[arg(short = 'n', long = "no-read-suffix", default_value = "false")]
+    #[arg(short = 'n', long = "no-read-suffix", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub no_suffix: bool,
 
     /// Exclude reads with any of these flags present [0x900 = secondary|supplementary].

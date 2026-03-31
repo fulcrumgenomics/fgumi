@@ -100,7 +100,7 @@ pub struct DuplexMetrics {
     pub min_ba_reads: usize,
 
     /// Collect duplex UMI counts (memory intensive)
-    #[arg(long = "duplex-umi-counts", default_value = "false")]
+    #[arg(long = "duplex-umi-counts", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub duplex_umi_counts: bool,
 
     /// Optional intervals file to restrict analysis (BED or Picard interval list format)

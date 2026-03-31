@@ -104,11 +104,11 @@ pub struct ConsensusCallingOptions {
     pub min_input_base_quality: u8,
 
     /// Produce per-base tags (cd, ce) in addition to per-read tags
-    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true")]
+    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub output_per_base_tags: bool,
 
     /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
-    #[arg(long = "trim", default_value = "false")]
+    #[arg(long = "trim", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub trim: bool,
 
     /// Minimum consensus base quality (output consensus bases below this are masked to N)
@@ -214,7 +214,7 @@ impl Default for ReadGroupOptions {
 #[derive(Debug, Clone, Args)]
 pub struct OverlappingConsensusOptions {
     /// Consensus call overlapping bases in read pairs before UMI consensus calling
-    #[arg(long = "consensus-call-overlapping-bases", default_value = "true")]
+    #[arg(long = "consensus-call-overlapping-bases", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub consensus_call_overlapping_bases: bool,
 }
 
@@ -451,7 +451,7 @@ pub struct QueueMemoryOptions {
     /// When true, total memory = queue-memory * threads. For example,
     /// --queue-memory 768 with --threads 16 allocates 12 GB total.
     /// Set to false for a fixed total memory budget regardless of thread count.
-    #[arg(long = "queue-memory-per-thread", default_value = "true")]
+    #[arg(long = "queue-memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub queue_memory_per_thread: bool,
 
     /// DEPRECATED: Use --queue-memory instead. Memory limit for pipeline queues in megabytes.
@@ -1101,5 +1101,73 @@ mod tests {
         assert!(total > 100_000_000); // > 100MB
         assert!(available > 0);
         assert!(available <= total);
+    }
+
+    use clap::Parser;
+
+    /// Test-only wrapper to exercise clap parsing of flattened Args structs.
+    #[derive(Debug, Parser)]
+    #[command(name = "test")]
+    struct TestBoolFlags {
+        #[command(flatten)]
+        consensus: ConsensusCallingOptions,
+        #[command(flatten)]
+        overlapping: OverlappingConsensusOptions,
+        #[command(flatten)]
+        queue_memory: QueueMemoryOptions,
+    }
+
+    use rstest::rstest;
+
+    #[rstest]
+    // --output-per-base-tags (default true)
+    #[case(&["test"], true)]
+    #[case(&["test", "--output-per-base-tags"], true)]
+    #[case(&["test", "--output-per-base-tags", "true"], true)]
+    #[case(&["test", "--output-per-base-tags", "false"], false)]
+    #[case(&["test", "--output-per-base-tags=true"], true)]
+    #[case(&["test", "--output-per-base-tags=false"], false)]
+    fn test_output_per_base_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        assert_eq!(cmd.consensus.output_per_base_tags, expected);
+    }
+
+    #[rstest]
+    // --trim (default false)
+    #[case(&["test"], false)]
+    #[case(&["test", "--trim"], true)]
+    #[case(&["test", "--trim", "true"], true)]
+    #[case(&["test", "--trim", "false"], false)]
+    #[case(&["test", "--trim=true"], true)]
+    #[case(&["test", "--trim=false"], false)]
+    fn test_trim_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        assert_eq!(cmd.consensus.trim, expected);
+    }
+
+    #[rstest]
+    // --consensus-call-overlapping-bases (default true)
+    #[case(&["test"], true)]
+    #[case(&["test", "--consensus-call-overlapping-bases"], true)]
+    #[case(&["test", "--consensus-call-overlapping-bases", "true"], true)]
+    #[case(&["test", "--consensus-call-overlapping-bases", "false"], false)]
+    #[case(&["test", "--consensus-call-overlapping-bases=true"], true)]
+    #[case(&["test", "--consensus-call-overlapping-bases=false"], false)]
+    fn test_overlapping_bases_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        assert_eq!(cmd.overlapping.consensus_call_overlapping_bases, expected);
+    }
+
+    #[rstest]
+    // --queue-memory-per-thread (default true)
+    #[case(&["test"], true)]
+    #[case(&["test", "--queue-memory-per-thread"], true)]
+    #[case(&["test", "--queue-memory-per-thread", "true"], true)]
+    #[case(&["test", "--queue-memory-per-thread", "false"], false)]
+    #[case(&["test", "--queue-memory-per-thread=true"], true)]
+    #[case(&["test", "--queue-memory-per-thread=false"], false)]
+    fn test_queue_memory_per_thread_parsing(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        assert_eq!(cmd.queue_memory.queue_memory_per_thread, expected);
     }
 }

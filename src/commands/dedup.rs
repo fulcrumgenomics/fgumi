@@ -1073,7 +1073,7 @@ pub struct MarkDuplicates {
     pub family_size_histogram: Option<PathBuf>,
 
     /// Remove duplicates instead of just marking them
-    #[arg(short = 'r', long = "remove-duplicates", default_value = "false")]
+    #[arg(short = 'r', long = "remove-duplicates", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub remove_duplicates: bool,
 
     /// The tag containing the raw UMI sequence
@@ -1097,7 +1097,7 @@ pub struct MarkDuplicates {
     pub min_map_q: Option<u8>,
 
     /// Include reads flagged as not passing QC
-    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false")]
+    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub include_non_pf_reads: bool,
 
     /// UMI grouping strategy
