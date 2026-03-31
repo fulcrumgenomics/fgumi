@@ -24,7 +24,17 @@ pub fn raw_records_byte_equal(r1: &[u8], r2: &[u8]) -> bool {
     r1 == r2
 }
 
+/// Offset of the BAM `bin` field in the fixed header.
+const BIN_OFFSET: usize = 10;
+/// Length of the BAM `bin` field (u16).
+const BIN_LEN: usize = 2;
+
 /// Returns `true` if the core fields (everything up to but not including aux data) are identical.
+///
+/// The BAM `bin` field (bytes 10-11) is excluded from comparison because it is a
+/// BAM-specific index optimization that is not part of the SAM data model.  Different
+/// tools may compute different bin values for the same alignment, so it should not
+/// cause records to be reported as differing.
 ///
 /// Returns `false` if either record is too short to determine the aux data offset.
 #[must_use]
@@ -34,9 +44,14 @@ pub fn raw_core_fields_equal(r1: &[u8], r2: &[u8]) -> bool {
     else {
         return false;
     };
-    let core1 = &r1[..off1.min(r1.len())];
-    let core2 = &r2[..off2.min(r2.len())];
-    core1 == core2
+    let end1 = off1.min(r1.len());
+    let end2 = off2.min(r2.len());
+    if end1 != end2 {
+        return false;
+    }
+    // Compare bytes before the bin field, then after, skipping bytes 10-11.
+    r1[..BIN_OFFSET] == r2[..BIN_OFFSET]
+        && r1[BIN_OFFSET + BIN_LEN..end1] == r2[BIN_OFFSET + BIN_LEN..end2]
 }
 
 /// Returns `true` if the aux data regions are byte-identical (order-sensitive).
@@ -220,6 +235,18 @@ mod tests {
         assert!(!raw_core_fields_equal(&short, &rec));
     }
 
+    #[test]
+    fn test_core_equal_different_bin_values() {
+        // The BAM `bin` field (bytes 10-11) is not semantically meaningful and may
+        // differ between tools. Core comparison should ignore it.
+        let mut r1 = base_record(&[]);
+        let mut r2 = base_record(&[]);
+        // Set different bin values
+        r1[10..12].copy_from_slice(&100u16.to_le_bytes());
+        r2[10..12].copy_from_slice(&200u16.to_le_bytes());
+        assert!(raw_core_fields_equal(&r1, &r2));
+    }
+
     // ========================================================================
     // raw_tags_byte_equal tests
     // ========================================================================
@@ -396,6 +423,26 @@ mod tests {
         let rec = base_record(&[]);
         let result = raw_compare_structured(&short, &rec);
         assert!(!result.core_match);
+    }
+
+    #[test]
+    fn test_structured_different_bin_different_tag_order() {
+        // Records with different bin values and different tag order should report:
+        // core_match=true (bin is not semantically meaningful),
+        // tags_match=false (byte order differs), tag_order_match=true (values match)
+        let mut aux1 = make_z_tag(*b"RG", b"s1");
+        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
+        let mut aux2 = make_i_tag(*b"NM", 5);
+        aux2.extend_from_slice(&make_z_tag(*b"RG", b"s1"));
+        let mut r1 = base_record(&aux1);
+        let mut r2 = base_record(&aux2);
+        // Set different bin values
+        r1[10..12].copy_from_slice(&100u16.to_le_bytes());
+        r2[10..12].copy_from_slice(&200u16.to_le_bytes());
+        let result = raw_compare_structured(&r1, &r2);
+        assert!(result.core_match);
+        assert!(!result.tags_match);
+        assert!(result.tag_order_match);
     }
 
     // ========================================================================
