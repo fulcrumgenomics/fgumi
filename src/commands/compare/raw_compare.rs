@@ -88,8 +88,35 @@ fn collect_tag_entries(aux_data: &[u8]) -> Option<Vec<([u8; 2], usize, usize)>> 
     Some(entries)
 }
 
+/// Returns `true` if the given BAM aux type byte is an integer type.
+///
+/// BAM integer types: `c` (i8), `C` (u8), `s` (i16), `S` (u16), `i` (i32), `I` (u32).
+fn is_int_type(t: u8) -> bool {
+    matches!(t, b'c' | b'C' | b's' | b'S' | b'i' | b'I')
+}
+
+/// Decodes a BAM integer tag value to `i64` for semantic comparison.
+///
+/// `type_byte` is the BAM type character and `data` is the value bytes (excluding the type byte).
+/// Returns `None` if the data is too short for the given type.
+fn decode_int_tag(type_byte: u8, data: &[u8]) -> Option<i64> {
+    match type_byte {
+        b'c' => data.first().map(|&b| i64::from(b as i8)),
+        b'C' => data.first().map(|&b| i64::from(b)),
+        b's' => data.get(..2).map(|b| i64::from(i16::from_le_bytes([b[0], b[1]]))),
+        b'S' => data.get(..2).map(|b| i64::from(u16::from_le_bytes([b[0], b[1]]))),
+        b'i' => data.get(..4).map(|b| i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        b'I' => data.get(..4).map(|b| i64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        _ => None,
+    }
+}
+
 /// Returns `true` if the aux data regions contain the same tags with the same values,
 /// regardless of the order in which tags appear.
+///
+/// Integer tag values are compared semantically: if both tags have integer types
+/// (`c`/`C`/`s`/`S`/`i`/`I`) but different encodings (e.g., `C` for u8 vs `s` for i16),
+/// they are decoded to `i64` and compared by value.
 ///
 /// Note: Assumes tag names are unique within each record per the BAM specification.
 /// If duplicate tag names exist, comparison results are undefined.
@@ -114,7 +141,21 @@ pub fn raw_tags_equal_order_independent(r1: &[u8], r2: &[u8]) -> bool {
         let Some(&(_, start2, end2)) = entries2.iter().find(|(t, _, _)| *t == tag1) else {
             return false;
         };
-        if aux1[start1..end1] != aux2[start2..end2] {
+        // Fast path: byte-identical values (includes type byte)
+        if aux1[start1..end1] == aux2[start2..end2] {
+            continue;
+        }
+        // If both are integer types, compare semantically by decoding to i64
+        let type1 = aux1[start1];
+        let type2 = aux2[start2];
+        if is_int_type(type1) && is_int_type(type2) {
+            let data1 = &aux1[start1 + 1..end1];
+            let data2 = &aux2[start2 + 1..end2];
+            match (decode_int_tag(type1, data1), decode_int_tag(type2, data2)) {
+                (Some(v1), Some(v2)) if v1 == v2 => continue,
+                _ => return false,
+            }
+        } else {
             return false;
         }
     }
@@ -158,6 +199,27 @@ mod tests {
     /// Helper to build aux bytes for a C-type (u8) integer tag.
     fn make_c_tag(tag: [u8; 2], value: u8) -> Vec<u8> {
         vec![tag[0], tag[1], b'C', value]
+    }
+
+    /// Helper to build aux bytes for an s-type (i16) integer tag.
+    fn make_s_tag(tag: [u8; 2], value: i16) -> Vec<u8> {
+        let mut aux = vec![tag[0], tag[1], b's'];
+        aux.extend_from_slice(&value.to_le_bytes());
+        aux
+    }
+
+    /// Helper to build aux bytes for an S-type (u16) integer tag.
+    fn make_upper_s_tag(tag: [u8; 2], value: u16) -> Vec<u8> {
+        let mut aux = vec![tag[0], tag[1], b'S'];
+        aux.extend_from_slice(&value.to_le_bytes());
+        aux
+    }
+
+    /// Helper to build aux bytes for an I-type (u32) integer tag.
+    fn make_upper_i_tag(tag: [u8; 2], value: u32) -> Vec<u8> {
+        let mut aux = vec![tag[0], tag[1], b'I'];
+        aux.extend_from_slice(&value.to_le_bytes());
+        aux
     }
 
     /// Helper to build aux bytes for an f-type (f32) float tag.
@@ -488,5 +550,110 @@ mod tests {
         assert_eq!(entries[0].0, *b"XA");
         // The entry should span the entire aux data
         assert_eq!(entries[0].2, aux.len());
+    }
+
+    // ========================================================================
+    // Semantic integer comparison tests
+    // ========================================================================
+
+    #[test]
+    fn test_order_independent_same_value_different_int_types_u8_vs_i16() {
+        // cD tag: u8 (C) value 158 vs i16 (s) value 158
+        // These are semantically equal but have different byte encodings.
+        let r1 = base_record(&make_c_tag(*b"cD", 158));
+        let r2 = base_record(&make_s_tag(*b"cD", 158));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_same_value_different_int_types_u8_vs_i32() {
+        // NM tag: u8 (C) value 42 vs i32 (i) value 42
+        let r1 = base_record(&make_c_tag(*b"NM", 42));
+        let r2 = base_record(&make_i_tag(*b"NM", 42));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_same_value_different_int_types_i16_vs_i32() {
+        // MQ tag: i16 (s) value 300 vs i32 (i) value 300
+        let r1 = base_record(&make_s_tag(*b"MQ", 300));
+        let r2 = base_record(&make_i_tag(*b"MQ", 300));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_same_value_different_int_types_u32_vs_i32() {
+        // NM tag: u32 (I) value 1000 vs i32 (i) value 1000
+        let r1 = base_record(&make_upper_i_tag(*b"NM", 1000));
+        let r2 = base_record(&make_i_tag(*b"NM", 1000));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_same_value_different_int_types_u32_vs_u8() {
+        // NM tag: u32 (I) value 42 vs u8 (C) value 42
+        let r1 = base_record(&make_upper_i_tag(*b"NM", 42));
+        let r2 = base_record(&make_c_tag(*b"NM", 42));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_different_values_different_int_types() {
+        // Same tag name, different int types, different values => should NOT match
+        let r1 = base_record(&make_c_tag(*b"NM", 5));
+        let r2 = base_record(&make_i_tag(*b"NM", 10));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_int_vs_non_int_same_tag_not_equal() {
+        // Same tag name, one is int (C), other is string (Z) => should NOT match
+        let r1 = base_record(&make_c_tag(*b"XY", 65)); // 65 = 'A'
+        let r2 = base_record(&make_z_tag(*b"XY", b"A"));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_structured_semantic_int_tags_match() {
+        // Same value with different int encodings: structured comparison should
+        // report tags_match=false (bytes differ) but tag_order_match=true (semantically equal)
+        let r1 = base_record(&make_c_tag(*b"cD", 158));
+        let r2 = base_record(&make_s_tag(*b"cD", 158));
+        let result = raw_compare_structured(&r1, &r2);
+        assert!(result.core_match);
+        assert!(!result.tags_match); // raw bytes differ
+        assert!(result.tag_order_match); // semantically equal
+    }
+
+    #[test]
+    fn test_order_independent_semantic_int_with_reordered_tags() {
+        // Multiple tags, different order, AND different integer encodings
+        let mut aux1 = make_z_tag(*b"RG", b"grp");
+        aux1.extend_from_slice(&make_c_tag(*b"cD", 200));
+        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
+
+        let mut aux2 = make_i_tag(*b"NM", 5);
+        aux2.extend_from_slice(&make_upper_s_tag(*b"cD", 200));
+        aux2.extend_from_slice(&make_z_tag(*b"RG", b"grp"));
+
+        let r1 = base_record(&aux1);
+        let r2 = base_record(&aux2);
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_negative_value_across_types() {
+        // -100 as i8 (c) vs -100 as i16 (s) => should match
+        let r1 = base_record(&[b'X', b'N', b'c', (-100i8) as u8]);
+        let r2 = base_record(&make_s_tag(*b"XN", -100));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
+    }
+
+    #[test]
+    fn test_order_independent_same_bytes_different_sign_interpretation() {
+        // i8(-1) = 0xFF vs u8(255) = 0xFF => semantically different, should NOT match
+        let r1 = base_record(&[b'X', b'V', b'c', 0xFF]); // -1 as i8
+        let r2 = base_record(&make_c_tag(*b"XV", 255)); // 255 as u8
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 }
