@@ -202,10 +202,6 @@ pub struct Simplex {
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
 
-    /// Sort order for output BAM
-    #[arg(short = 'S', long = "sort-order")]
-    pub sort_order: Option<String>,
-
     /// SAM tag containing the cell barcode
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: Option<String>,
@@ -747,7 +743,6 @@ mod tests {
             tag: "MI".to_string(),
             min_reads: 1,
             max_reads: None,
-            sort_order: None,
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
         }

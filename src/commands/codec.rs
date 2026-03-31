@@ -224,10 +224,6 @@ pub struct Codec {
     #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
     pub cell_tag: Option<String>,
 
-    /// Output sort order (Unsorted, Queryname, Coordinate, Unknown)
-    #[arg(short = 'S', long = "sort-order")]
-    pub sort_order: Option<String>,
-
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -721,7 +717,6 @@ mod tests {
             max_duplex_disagreement_rate: 1.0,
             max_duplex_disagreements: None,
             cell_tag: None,
-            sort_order: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         }
