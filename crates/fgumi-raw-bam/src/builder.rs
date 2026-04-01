@@ -140,7 +140,7 @@ impl UnmappedBamRecordBuilder {
         append_string_tag(&mut self.buf, tag, value);
     }
 
-    /// Append an integer tag using the smallest signed type that fits.
+    /// Append an integer tag using the smallest type that fits the value.
     #[inline]
     pub fn append_int_tag(&mut self, tag: &[u8; 2], value: i32) {
         debug_assert!(self.sealed, "must call build_record before appending tags");

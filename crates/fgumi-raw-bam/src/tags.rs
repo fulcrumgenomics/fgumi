@@ -358,20 +358,29 @@ pub fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8]) {
     record.push(0); // null terminator
 }
 
-/// Append an integer tag using the smallest signed type that fits.
+/// Append an integer tag using the smallest type that fits the value.
+///
+/// For non-negative values, unsigned types are preferred over signed types to minimize the number
+/// of bytes written, matching the behavior of htsjdk and samtools.
 ///
 /// Encodes as:
-/// - `i8` (type `'c'`): if value in `[-128, 127]`
-/// - `i16` (type `'s'`): if value in `[-32768, 32767]`
+/// - `i8`  (type `'c'`): if value in `[-128, 127]`
+/// - `u8`  (type `'C'`): if value in `[128, 255]`
+/// - `i16` (type `'s'`): if value in `[-32768, -129]`
+/// - `u16` (type `'S'`): if value in `[256, 65535]`
 /// - `i32` (type `'i'`): otherwise
-///
-/// This matches the behavior of [`crate::sam::to_smallest_signed_int`].
 pub fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
     record.push(tag[0]);
     record.push(tag[1]);
     if let Ok(v) = i8::try_from(value) {
         record.push(b'c');
         record.push(v.cast_unsigned());
+    } else if let Ok(v) = u8::try_from(value) {
+        record.push(b'C');
+        record.push(v);
+    } else if let Ok(v) = u16::try_from(value) {
+        record.push(b'S');
+        record.extend_from_slice(&v.to_le_bytes());
     } else if let Ok(v) = i16::try_from(value) {
         record.push(b's');
         record.extend_from_slice(&v.to_le_bytes());
@@ -479,7 +488,7 @@ pub fn update_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], new_value: &[u8]) 
 ///
 /// If the existing tag is a 4-byte `i`/`I` type, the value is overwritten in-place.
 /// Otherwise the tag is removed and re-appended using `append_int_tag`
-/// (smallest signed type that fits).
+/// (smallest type that fits).
 pub fn update_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
     let aux_start = aux_data_offset_from_record(record).unwrap_or(record.len());
     if aux_start < record.len() {
@@ -1572,11 +1581,26 @@ mod tests {
     }
 
     #[test]
-    fn test_append_int_tag_i16() {
+    fn test_append_int_tag_u8() {
         let mut rec = Vec::new();
         append_int_tag(&mut rec, b"cD", 200);
-        let v = 200i16.to_le_bytes();
+        assert_eq!(rec, [b'c', b'D', b'C', 200]);
+    }
+
+    #[test]
+    fn test_append_int_tag_negative_i16() {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"cD", -200);
+        let v = (-200i16).to_le_bytes();
         assert_eq!(rec, [b'c', b'D', b's', v[0], v[1]]);
+    }
+
+    #[test]
+    fn test_append_int_tag_u16() {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"cD", 1000);
+        let v = 1000u16.to_le_bytes();
+        assert_eq!(rec, [b'c', b'D', b'S', v[0], v[1]]);
     }
 
     #[test]
@@ -1585,6 +1609,25 @@ mod tests {
         append_int_tag(&mut rec, b"cD", 100_000);
         let v = 100_000i32.to_le_bytes();
         assert_eq!(rec, [b'c', b'D', b'i', v[0], v[1], v[2], v[3]]);
+    }
+
+    #[rstest]
+    #[case::max_i8(127, b'c')]
+    #[case::min_u8(128, b'C')]
+    #[case::max_u8(255, b'C')]
+    #[case::min_u16(256, b'S')]
+    #[case::max_u16(65535, b'S')]
+    #[case::min_i32(65536, b'i')]
+    #[case::max_neg_i8(-128, b'c')]
+    #[case::min_neg_i16(-129, b's')]
+    #[case::min_i16(-32768, b's')]
+    #[case::neg_i32(-32769, b'i')]
+    #[case::i32_min(i32::MIN, b'i')]
+    #[case::i32_max(i32::MAX, b'i')]
+    fn test_append_int_tag_boundaries(#[case] value: i32, #[case] expected_type: u8) {
+        let mut rec = Vec::new();
+        append_int_tag(&mut rec, b"XX", value);
+        assert_eq!(rec[2], expected_type);
     }
 
     // ========================================================================
