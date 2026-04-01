@@ -71,7 +71,7 @@ pub struct Merge {
     pub input_list: Option<PathBuf>,
 
     /// Sort order of the input files.
-    #[arg(long = "order", value_enum, default_value = "template-coordinate")]
+    #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
 
     /// Number of threads for parallel operations.

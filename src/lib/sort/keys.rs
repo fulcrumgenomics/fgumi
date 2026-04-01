@@ -188,11 +188,28 @@ pub trait RawSortKey: Ord + Clone + Send + Sync + Sized {
     /// Fixed-size keys enable O(1) reads from temp files during merge.
     const SERIALIZED_SIZE: Option<usize>;
 
+    /// When `true`, the sort key is embedded in the BAM record bytes at a known
+    /// offset, so temp files store only raw records without a key prefix.
+    /// This saves I/O for variable-length keys (e.g. queryname) by avoiding
+    /// writing the name twice — once as key prefix, once inside the BAM record.
+    const EMBEDDED_IN_RECORD: bool = false;
+
     /// Extract a sort key from raw BAM record bytes.
     ///
     /// This is the hot path during sorting - implementations should minimize
     /// parsing overhead by reading only the fields needed for comparison.
     fn extract(bam: &[u8], ctx: &SortContext) -> Self;
+
+    /// Extract a sort key from raw BAM record bytes without a `SortContext`.
+    ///
+    /// Only valid when `EMBEDDED_IN_RECORD` is `true`. Used during merge to
+    /// reconstruct the key from the record itself, avoiding separate key storage.
+    ///
+    /// Default implementation panics — only override for embedded key types.
+    #[must_use]
+    fn extract_from_record(_bam: &[u8]) -> Self {
+        unimplemented!("extract_from_record only valid when EMBEDDED_IN_RECORD is true")
+    }
 
     /// Serialize the key to a writer for temp file storage.
     ///
@@ -240,24 +257,68 @@ impl SortContext {
     }
 }
 
+/// Queryname comparison strategy.
+///
+/// The SAM spec allows queryname sort with different sub-sort orders
+/// specified via the `SS` header tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuerynameComparator {
+    /// Lexicographic byte ordering (fast, default).
+    ///
+    /// Standard byte-by-byte comparison. This is 8-13x faster than natural
+    /// ordering and sufficient for all downstream tools that require
+    /// queryname-grouped input (e.g., `fgumi zipper`, `fgumi group`).
+    #[default]
+    Lexicographic,
+    /// Natural numeric ordering (samtools-compatible).
+    ///
+    /// Handles embedded numbers naturally: "read2" < "read10".
+    /// Use when output must match `samtools sort -n` ordering.
+    Natural,
+}
+
+impl std::fmt::Display for QuerynameComparator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lexicographic => write!(f, "lexicographic"),
+            Self::Natural => write!(f, "natural"),
+        }
+    }
+}
+
 /// Sort order enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     /// Coordinate sort: tid → pos → reverse strand
     Coordinate,
-    /// Queryname sort: read name with natural ordering
-    Queryname,
+    /// Queryname sort: read name ordering with configurable comparator.
+    Queryname(QuerynameComparator),
     /// Template-coordinate sort: template position for UMI grouping
     TemplateCoordinate,
 }
 
 impl SortOrder {
+    /// Returns true if this is any queryname sort order.
+    #[must_use]
+    pub fn is_queryname(&self) -> bool {
+        matches!(self, Self::Queryname(_))
+    }
+
+    /// Returns the queryname comparator, if this is a queryname sort order.
+    #[must_use]
+    pub fn queryname_comparator(&self) -> Option<QuerynameComparator> {
+        match self {
+            Self::Queryname(cmp) => Some(*cmp),
+            _ => None,
+        }
+    }
+
     /// Get the SAM header sort order tag value.
     #[must_use]
     pub fn header_so_tag(&self) -> &'static str {
         match self {
             Self::Coordinate => "coordinate",
-            Self::Queryname => "queryname",
+            Self::Queryname(_) => "queryname",
             Self::TemplateCoordinate => "unsorted",
         }
     }
@@ -266,7 +327,7 @@ impl SortOrder {
     #[must_use]
     pub fn header_go_tag(&self) -> Option<&'static str> {
         match self {
-            Self::Coordinate | Self::Queryname => None,
+            Self::Coordinate | Self::Queryname(_) => None,
             Self::TemplateCoordinate => Some("query"),
         }
     }
@@ -275,7 +336,9 @@ impl SortOrder {
     #[must_use]
     pub fn header_ss_tag(&self) -> Option<&'static str> {
         match self {
-            Self::Coordinate | Self::Queryname => None,
+            Self::Coordinate => None,
+            Self::Queryname(QuerynameComparator::Lexicographic) => Some("lexicographic"),
+            Self::Queryname(QuerynameComparator::Natural) => Some("natural"),
             Self::TemplateCoordinate => Some("template-coordinate"),
         }
     }
@@ -447,6 +510,7 @@ impl PartialOrd for RawCoordinateKey {
 
 impl RawSortKey for RawCoordinateKey {
     const SERIALIZED_SIZE: Option<usize> = Some(Self::SIZE);
+    const EMBEDDED_IN_RECORD: bool = true;
 
     #[inline]
     fn extract(bam: &[u8], ctx: &SortContext) -> Self {
@@ -458,6 +522,21 @@ impl RawSortKey for RawCoordinateKey {
         // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
         // - tid < 0: unmapped with no reference, sort at end
         if tid < 0 { Self::unmapped() } else { Self::new(tid, pos, reverse, ctx.nref) }
+    }
+
+    #[inline]
+    fn extract_from_record(bam: &[u8]) -> Self {
+        let tid = bam_fields::ref_id(bam);
+        if tid < 0 {
+            return Self::unmapped();
+        }
+        let pos = bam_fields::pos(bam);
+        let reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
+        // During merge we don't have nref, but for mapped records (tid >= 0)
+        // nref is only used for unmapped handling, so any value > tid works.
+        // Use tid+1 as a safe nref since tid is non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        Self::new(tid, pos, reverse, (tid as u32) + 1)
     }
 
     #[inline]
@@ -508,17 +587,40 @@ pub const fn queryname_flag_order(flags: u16) -> u16 {
 ///
 /// Uses natural string ordering where numeric runs are compared numerically.
 /// Example: "read1" < "read2" < "read10" < "read11"
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// Names are stored with a null terminator so that `natural_compare_nul` can
+/// walk raw pointers without per-byte bounds checks, matching the performance
+/// characteristics of samtools' `strnum_cmp`.
+#[derive(Clone, Debug)]
 pub struct QuerynameKey {
-    /// Read name bytes.
-    pub name: Vec<u8>,
+    /// Read name bytes, null-terminated for `natural_compare_nul`.
+    name: Vec<u8>,
     /// Read pair flags for ordering R1 before R2.
-    pub flags: u16,
+    flags: u16,
+}
+
+impl PartialEq for QuerynameKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for QuerynameKey {}
+
+impl QuerynameKey {
+    /// Returns the read name bytes (including the null terminator).
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
 }
 
 impl Ord for QuerynameKey {
+    #[allow(unsafe_code)]
     fn cmp(&self, other: &Self) -> Ordering {
-        natural_compare(&self.name, &other.name).then_with(|| self.flags.cmp(&other.flags))
+        // SAFETY: `name` is always null-terminated (see `from_record`).
+        unsafe { natural_compare_nul(self.name.as_ptr(), other.name.as_ptr()) }
+            .then_with(|| self.flags.cmp(&other.flags))
     }
 }
 
@@ -534,69 +636,124 @@ impl SortKey for QuerynameKey {
     fn build_context(_header: &Header) -> Self::Context {}
 
     fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
-        let name =
-            record.name().map_or_else(Vec::new, |n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
+        let raw = record.name().map_or(&[] as &[u8], |n| <_ as AsRef<[u8]>>::as_ref(n));
+        let mut name = Vec::with_capacity(raw.len() + 1);
+        name.extend_from_slice(raw);
+        name.push(0); // null-terminate for pointer-walking comparison
         let flags = queryname_flag_order(u16::from(record.flags()));
         Ok(Self { name, flags })
     }
 }
 
-/// Natural string comparison that handles numeric runs.
+// Re-export natural comparison functions from fgumi-raw-bam where the unsafe
+// implementations live (the main crate enforces `#![deny(unsafe_code)]`).
+pub use fgumi_raw_bam::sort::{natural_compare, natural_compare_nul};
+
+// ============================================================================
+// Natural Sort Key Normalization
+// ============================================================================
+
+/// Encode a read name into a byte string whose lexicographic (`memcmp`) ordering
+/// matches `natural_compare` ordering for names that differ in numeric magnitude.
 ///
-/// Compares strings such that "read1" < "read2" < "read10".
-fn natural_compare(a: &[u8], b: &[u8]) -> Ordering {
+/// **Encoding:** Walk the name left to right. Text runs are copied verbatim.
+/// Each numeric run is encoded as a length byte (digit count) followed by the
+/// significant digits (leading zeros stripped). The length byte sorts first, so
+/// `"2"` (length=1) sorts before `"10"` (length=2), matching natural ordering.
+///
+/// This produces a compact key (one extra byte per numeric field) that can be
+/// compared with plain byte comparison instead of the expensive `natural_compare`
+/// byte-by-byte scanning with digit detection.
+///
+/// **Leading-zero caveat:** Because leading zeros are stripped, names that differ
+/// only in leading zeros (e.g. `b"01"` vs `b"1"`) normalize to identical bytes.
+/// `natural_compare` distinguishes them via a total-length tiebreaker. Callers
+/// that need a total order must fall back to `natural_compare` when normalized
+/// keys are equal.
+///
+/// **Not used in production.** The sort pipeline uses [`natural_compare_nul`]
+/// (via [`RawQuerynameKey`]) instead. This function is exported for benchmarks
+/// that compare sorting strategies.
+///
+/// # Examples
+///
+/// ```text
+/// "read2"    → [r, e, a, d, 0x01, '2']          (6 bytes)
+/// "read10"   → [r, e, a, d, 0x02, '1', '0']     (7 bytes)
+/// "SRR123.5" → [S, R, R, 0x03, '1', '2', '3', '.', 0x01, '5']
+/// ```
+pub fn normalize_natural_key(name: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
-    let mut j = 0;
-
-    while i < a.len() && j < b.len() {
-        let a_digit = a[i].is_ascii_digit();
-        let b_digit = b[j].is_ascii_digit();
-
-        match (a_digit, b_digit) {
-            (true, true) => {
-                // Both are digits - compare numerically
-                let (a_num, a_end) = parse_number(&a[i..]);
-                let (b_num, b_end) = parse_number(&b[j..]);
-
-                match a_num.cmp(&b_num) {
-                    Ordering::Equal => {
-                        i += a_end;
-                        j += b_end;
-                    }
-                    ord => return ord,
-                }
+    while i < name.len() {
+        if name[i].is_ascii_digit() {
+            // Skip leading zeros (matches samtools natural_compare behavior).
+            while i < name.len() && name[i] == b'0' {
+                i += 1;
             }
-            (true, false) => return Ordering::Less, // Digits before non-digits
-            (false, true) => return Ordering::Greater,
-            (false, false) => {
-                // Both non-digits - compare bytes
-                match a[i].cmp(&b[j]) {
-                    Ordering::Equal => {
-                        i += 1;
-                        j += 1;
-                    }
-                    ord => return ord,
-                }
+            // Count significant digits.
+            let sig_start = i;
+            while i < name.len() && name[i].is_ascii_digit() {
+                i += 1;
             }
+            let sig_len = i - sig_start;
+            if sig_len == 0 {
+                // The run was all zeros — encode as the number 0 (length=1, digit='0').
+                out.push(1);
+                out.push(b'0');
+            } else {
+                // Length byte capped at 255; names with 255+ digit numbers are pathological.
+                #[allow(clippy::cast_possible_truncation)]
+                let len_byte = sig_len.min(255) as u8;
+                out.push(len_byte);
+                out.extend_from_slice(&name[sig_start..sig_start + sig_len.min(255)]);
+            }
+        } else {
+            out.push(name[i]);
+            i += 1;
         }
     }
-
-    // Shorter string sorts first if one is prefix of other
-    a.len().cmp(&b.len())
 }
 
-/// Parse a numeric run from the start of a byte slice.
-/// Returns (number, bytes consumed).
-fn parse_number(bytes: &[u8]) -> (u64, usize) {
-    let mut num: u64 = 0;
-    let mut i = 0;
+// ============================================================================
+// Shared queryname key helpers
+// ============================================================================
 
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        num = num.saturating_mul(10).saturating_add(u64::from(bytes[i] - b'0'));
-        i += 1;
-    }
+/// Extract raw queryname bytes and flag-order value from BAM record bytes.
+///
+/// BAM format offsets: 8 = `l_read_name` (u8), 14-15 = flags (u16), 32+ = name.
+#[inline]
+fn extract_raw_name_and_flags(bam: &[u8]) -> (&[u8], u16) {
+    let name_len = (bam[8] as usize).saturating_sub(1);
+    let name =
+        if name_len > 0 && 32 + name_len <= bam.len() { &bam[32..32 + name_len] } else { &[] };
+    let raw_flags = u16::from_le_bytes([bam[14], bam[15]]);
+    (name, queryname_flag_order(raw_flags))
+}
 
-    (num, i)
+/// Serialize a queryname key as `[name_len: u16][name: bytes][flags: u16]`.
+#[inline]
+fn write_queryname_key<W: Write>(name: &[u8], flags: u16, writer: &mut W) -> std::io::Result<()> {
+    let name_len = u16::try_from(name.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "queryname too long for u16")
+    })?;
+    writer.write_all(&name_len.to_le_bytes())?;
+    writer.write_all(name)?;
+    writer.write_all(&flags.to_le_bytes())
+}
+
+/// Deserialize a queryname key from `[name_len: u16][name: bytes][flags: u16]`.
+#[inline]
+fn read_queryname_key<R: Read>(reader: &mut R) -> std::io::Result<(Vec<u8>, u16)> {
+    let mut len_buf = [0u8; 2];
+    reader.read_exact(&mut len_buf)?;
+    let name_len = u16::from_le_bytes(len_buf) as usize;
+
+    let mut name = vec![0u8; name_len];
+    reader.read_exact(&mut name)?;
+
+    let mut flags_buf = [0u8; 2];
+    reader.read_exact(&mut flags_buf)?;
+    Ok((name, u16::from_le_bytes(flags_buf)))
 }
 
 // ============================================================================
@@ -609,26 +766,60 @@ fn parse_number(bytes: &[u8]) -> (u64, usize) {
 /// Unlike fixed-size keys, serialization size depends on name length.
 ///
 /// Serialization format: `[name_len: u16][name: bytes][flags: u16]`
-#[derive(Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RawQuerynameKey {
-    /// Read name bytes.
-    pub name: Vec<u8>,
+    /// Read name bytes, null-terminated for `natural_compare_nul`.
+    name: Vec<u8>,
     /// Flags for segment ordering (R1 before R2).
-    pub flags: u16,
+    flags: u16,
 }
+
+impl PartialEq for RawQuerynameKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RawQuerynameKey {}
 
 impl RawQuerynameKey {
     /// Create a new queryname key.
+    ///
+    /// The name will be null-terminated for `natural_compare_nul`.
     #[must_use]
-    pub fn new(name: Vec<u8>, flags: u16) -> Self {
+    pub fn new(mut name: Vec<u8>, flags: u16) -> Self {
+        if name.last() != Some(&0) {
+            name.push(0);
+        }
+        Self { name, flags }
+    }
+
+    /// Returns the read name bytes (including the null terminator).
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Extract queryname key from raw BAM record bytes.
+    /// The name is stored with a null terminator for `natural_compare_nul`.
+    #[inline]
+    #[must_use]
+    fn extract_queryname_key(bam: &[u8]) -> Self {
+        let (raw_name, flags) = extract_raw_name_and_flags(bam);
+        let mut name = Vec::with_capacity(raw_name.len() + 1);
+        name.extend_from_slice(raw_name);
+        name.push(0);
         Self { name, flags }
     }
 }
 
 impl Ord for RawQuerynameKey {
     #[inline]
+    #[allow(unsafe_code)]
     fn cmp(&self, other: &Self) -> Ordering {
-        natural_compare(&self.name, &other.name).then_with(|| self.flags.cmp(&other.flags))
+        // SAFETY: `name` is always null-terminated (see `extract_queryname_key` and `new`).
+        unsafe { natural_compare_nul(self.name.as_ptr(), other.name.as_ptr()) }
+            .then_with(|| self.flags.cmp(&other.flags))
     }
 }
 
@@ -641,53 +832,106 @@ impl PartialOrd for RawQuerynameKey {
 
 impl RawSortKey for RawQuerynameKey {
     const SERIALIZED_SIZE: Option<usize> = None; // Variable-length
+    const EMBEDDED_IN_RECORD: bool = true;
 
     #[inline]
     fn extract(bam: &[u8], _ctx: &SortContext) -> Self {
-        // BAM format offsets:
-        // 8: l_read_name (u8)
-        // 14-15: flags (u16)
-        // 32+: read name (null-terminated)
+        Self::extract_queryname_key(bam)
+    }
 
-        let name_len = (bam[8] as usize).saturating_sub(1); // Exclude null terminator
-        let name = if name_len > 0 && 32 + name_len <= bam.len() {
-            bam[32..32 + name_len].to_vec()
-        } else {
-            Vec::new()
-        };
-        let raw_flags = u16::from_le_bytes([bam[14], bam[15]]);
-        let flags = queryname_flag_order(raw_flags);
-
-        Self { name, flags }
+    #[inline]
+    fn extract_from_record(bam: &[u8]) -> Self {
+        Self::extract_queryname_key(bam)
     }
 
     #[inline]
     fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        // Format: [name_len: u16][name: bytes][flags: u16]
-        let name_len = u16::try_from(self.name.len()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "queryname too long for u16")
-        })?;
-        writer.write_all(&name_len.to_le_bytes())?;
-        writer.write_all(&self.name)?;
-        writer.write_all(&self.flags.to_le_bytes())
+        write_queryname_key(&self.name, self.flags, writer)
     }
 
     #[inline]
     fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        // Read name length
-        let mut len_buf = [0u8; 2];
-        reader.read_exact(&mut len_buf)?;
-        let name_len = u16::from_le_bytes(len_buf) as usize;
+        let (name, flags) = read_queryname_key(reader)?;
+        Ok(Self::new(name, flags))
+    }
+}
 
-        // Read name
-        let mut name = vec![0u8; name_len];
-        reader.read_exact(&mut name)?;
+// ============================================================================
+// Raw Queryname Lexicographic Sort Key
+// ============================================================================
 
-        // Read flags
-        let mut flags_buf = [0u8; 2];
-        reader.read_exact(&mut flags_buf)?;
-        let flags = u16::from_le_bytes(flags_buf);
+/// Variable-size queryname sort key using lexicographic (byte) ordering.
+///
+/// This is the fast-path queryname sort key. It compares read names as raw bytes
+/// (standard lexicographic ordering), which is 8-13x faster than natural ordering.
+///
+/// Serialization format: `[name_len: u16][name: bytes][flags: u16]`
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
+pub struct RawQuerynameLexKey {
+    /// Read name bytes.
+    name: Vec<u8>,
+    /// Flags for segment ordering (R1 before R2).
+    flags: u16,
+}
 
+impl RawQuerynameLexKey {
+    /// Create a new lexicographic queryname key.
+    #[must_use]
+    pub fn new(name: Vec<u8>, flags: u16) -> Self {
+        Self { name, flags }
+    }
+
+    /// Returns the read name bytes.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Extract queryname key from raw BAM record bytes.
+    #[inline]
+    #[must_use]
+    fn extract_queryname_key(bam: &[u8]) -> Self {
+        let (raw_name, flags) = extract_raw_name_and_flags(bam);
+        Self { name: raw_name.to_vec(), flags }
+    }
+}
+
+impl Ord for RawQuerynameLexKey {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name.cmp(&other.name).then_with(|| self.flags.cmp(&other.flags))
+    }
+}
+
+impl PartialOrd for RawQuerynameLexKey {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl RawSortKey for RawQuerynameLexKey {
+    const SERIALIZED_SIZE: Option<usize> = None;
+    const EMBEDDED_IN_RECORD: bool = true;
+
+    #[inline]
+    fn extract(bam: &[u8], _ctx: &SortContext) -> Self {
+        Self::extract_queryname_key(bam)
+    }
+
+    #[inline]
+    fn extract_from_record(bam: &[u8]) -> Self {
+        Self::extract_queryname_key(bam)
+    }
+
+    #[inline]
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        write_queryname_key(&self.name, self.flags, writer)
+    }
+
+    #[inline]
+    fn read_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let (name, flags) = read_queryname_key(reader)?;
         Ok(Self { name, flags })
     }
 }
@@ -699,34 +943,6 @@ impl RawSortKey for RawQuerynameKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_natural_compare_basic() {
-        assert_eq!(natural_compare(b"a", b"b"), Ordering::Less);
-        assert_eq!(natural_compare(b"b", b"a"), Ordering::Greater);
-        assert_eq!(natural_compare(b"a", b"a"), Ordering::Equal);
-    }
-
-    #[test]
-    fn test_natural_compare_numeric() {
-        assert_eq!(natural_compare(b"read1", b"read2"), Ordering::Less);
-        assert_eq!(natural_compare(b"read2", b"read10"), Ordering::Less);
-        assert_eq!(natural_compare(b"read10", b"read11"), Ordering::Less);
-        assert_eq!(natural_compare(b"read9", b"read10"), Ordering::Less);
-    }
-
-    #[test]
-    fn test_natural_compare_mixed() {
-        assert_eq!(natural_compare(b"a1b2", b"a1b10"), Ordering::Less);
-        assert_eq!(natural_compare(b"x10y20", b"x10y3"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_natural_compare_empty() {
-        assert_eq!(natural_compare(b"", b""), Ordering::Equal);
-        assert_eq!(natural_compare(b"", b"a"), Ordering::Less);
-        assert_eq!(natural_compare(b"a", b""), Ordering::Greater);
-    }
 
     #[test]
     fn test_coordinate_key_ordering() {
@@ -1199,5 +1415,711 @@ mod tests {
 
         assert_eq!(R1_PRIMARY, 0x4000);
         assert_eq!(R2_PRIMARY, 0x8000);
+    }
+
+    // ========================================================================
+    // Comprehensive natural_compare tests
+    // ========================================================================
+
+    use rstest::rstest;
+
+    // --- Basic string comparison (no digits) ---
+
+    #[rstest]
+    #[case(b"abc", b"abd", Ordering::Less)]
+    #[case(b"abd", b"abc", Ordering::Greater)]
+    #[case(b"abc", b"abc", Ordering::Equal)]
+    #[case(b"ABC", b"abc", Ordering::Less)] // uppercase < lowercase in ASCII
+    #[case(b"z", b"a", Ordering::Greater)]
+    #[case(b"aaa", b"aab", Ordering::Less)]
+    #[case(b"ZZZ", b"aaa", Ordering::Less)] // 'Z' (90) < 'a' (97)
+    fn test_natural_compare_alpha_only(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Empty strings and single characters ---
+
+    #[rstest]
+    #[case(b"", b"", Ordering::Equal)]
+    #[case(b"", b"x", Ordering::Less)]
+    #[case(b"x", b"", Ordering::Greater)]
+    #[case(b"", b"0", Ordering::Less)]
+    #[case(b"0", b"", Ordering::Greater)]
+    #[case(b"a", b"a", Ordering::Equal)]
+    #[case(b"0", b"0", Ordering::Equal)]
+    fn test_natural_compare_empty_and_single(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Prefix relationships ---
+
+    #[rstest]
+    #[case(b"abc", b"abcd", Ordering::Less)]
+    #[case(b"abcd", b"abc", Ordering::Greater)]
+    #[case(b"read", b"read1", Ordering::Less)]
+    #[case(b"read1", b"read", Ordering::Greater)]
+    #[case(b"a1", b"a1b", Ordering::Less)]
+    #[case(b"a1b", b"a1", Ordering::Greater)]
+    fn test_natural_compare_prefix_relationships(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Single-digit numeric comparison ---
+
+    #[rstest]
+    #[case(b"0", b"1", Ordering::Less)]
+    #[case(b"1", b"2", Ordering::Less)]
+    #[case(b"9", b"0", Ordering::Greater)]
+    #[case(b"5", b"5", Ordering::Equal)]
+    fn test_natural_compare_single_digit(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Multi-digit numeric comparison ---
+
+    #[rstest]
+    #[case(b"2", b"10", Ordering::Less)] // numeric: 2 < 10
+    #[case(b"10", b"2", Ordering::Greater)]
+    #[case(b"9", b"10", Ordering::Less)]
+    #[case(b"10", b"9", Ordering::Greater)]
+    #[case(b"10", b"10", Ordering::Equal)]
+    #[case(b"99", b"100", Ordering::Less)]
+    #[case(b"100", b"99", Ordering::Greater)]
+    #[case(b"123", b"456", Ordering::Less)]
+    #[case(b"456", b"123", Ordering::Greater)]
+    #[case(b"999", b"1000", Ordering::Less)]
+    #[case(b"1000", b"999", Ordering::Greater)]
+    fn test_natural_compare_multidigit(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Leading zeros ---
+    // Leading zeros are stripped during numeric comparison, so "01" and "1" have the
+    // same numeric value. However, the implementation uses total string length as the
+    // final tiebreaker (alen.cmp(&blen)), so strings with more leading zeros compare
+    // as greater when the rest of the string is otherwise equal. This differs from
+    // samtools' strnum_cmp which returns Equal for "01" vs "1".
+    //
+    // Within a numeric run, leading zeros are skipped, so numeric magnitude is compared
+    // correctly regardless of leading zeros.
+
+    #[rstest]
+    // Same numeric value but different string lengths due to leading zeros:
+    // the longer string sorts later due to the alen.cmp(&blen) tiebreaker.
+    #[case(b"01", b"1", Ordering::Greater)]
+    #[case(b"1", b"01", Ordering::Less)]
+    #[case(b"001", b"1", Ordering::Greater)]
+    #[case(b"001", b"01", Ordering::Greater)]
+    #[case(b"010", b"10", Ordering::Greater)]
+    #[case(b"0010", b"10", Ordering::Greater)]
+    #[case(b"00", b"0", Ordering::Greater)]
+    #[case(b"000", b"0", Ordering::Greater)]
+    // Different numeric values with leading zeros: magnitude still wins.
+    #[case(b"02", b"1", Ordering::Greater)] // 2 > 1 (and longer)
+    #[case(b"02", b"10", Ordering::Less)] // 2 < 10
+    #[case(b"009", b"10", Ordering::Less)] // 9 < 10
+    #[case(b"0100", b"99", Ordering::Greater)] // 100 > 99
+    fn test_natural_compare_leading_zeros(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Digits sort before non-digits ---
+    // The fgumi implementation has: when one char is a digit and the other is not,
+    // the digit sorts first (Less).
+
+    #[rstest]
+    #[case(b"0", b"a", Ordering::Less)] // digit < non-digit
+    #[case(b"9", b"a", Ordering::Less)]
+    #[case(b"a", b"0", Ordering::Greater)]
+    #[case(b"a", b"9", Ordering::Greater)]
+    #[case(b"1", b"A", Ordering::Less)]
+    #[case(b"1", b"Z", Ordering::Less)]
+    #[case(b"1", b"z", Ordering::Less)]
+    fn test_natural_compare_digits_before_nondigits(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Mixed alphanumeric sequences ---
+
+    #[rstest]
+    #[case(b"a1b2", b"a1b10", Ordering::Less)]
+    #[case(b"a1b10", b"a1b2", Ordering::Greater)]
+    #[case(b"x10y20", b"x10y3", Ordering::Greater)]
+    #[case(b"x10y3", b"x10y20", Ordering::Less)]
+    #[case(b"abc123def", b"abc123deg", Ordering::Less)]
+    #[case(b"abc123def", b"abc124def", Ordering::Less)]
+    #[case(b"abc124def", b"abc123def", Ordering::Greater)]
+    #[case(b"file1part2", b"file1part10", Ordering::Less)]
+    #[case(b"file2part1", b"file10part1", Ordering::Less)]
+    #[case(b"v1.2.3", b"v1.2.10", Ordering::Less)] // version-like strings
+    #[case(b"v1.2.10", b"v1.10.2", Ordering::Less)]
+    fn test_natural_compare_mixed_alphanumeric(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Samtools sort test data: expected queryname ordering ---
+    // From samtools test/sort/name.sort.expected.sam and name2.sort.expected.sam
+
+    #[test]
+    fn test_natural_compare_samtools_name_sort_order() {
+        // From name.sort.expected.sam: r000, r001, r002, r003, r004, u1, x1..x6
+        let names: Vec<&[u8]> = vec![
+            b"r000", b"r001", b"r002", b"r003", b"r004", b"u1", b"x1", b"x2", b"x3", b"x4", b"x5",
+            b"x6",
+        ];
+        for i in 0..names.len() - 1 {
+            assert_eq!(
+                natural_compare(names[i], names[i + 1]),
+                Ordering::Less,
+                "{} should sort before {}",
+                std::str::from_utf8(names[i]).unwrap(),
+                std::str::from_utf8(names[i + 1]).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_natural_compare_samtools_name2_sort_order() {
+        // From name2.sort.expected.sam: consecutive pairs should be in natural order.
+        // Note: x7 < x8 < x9 < x10 < x11 < x12 in natural order.
+        let names: Vec<&[u8]> =
+            vec![b"r005", b"r006", b"r007", b"x7", b"x8", b"x9", b"x10", b"x11", b"x12"];
+        for i in 0..names.len() - 1 {
+            assert_eq!(
+                natural_compare(names[i], names[i + 1]),
+                Ordering::Less,
+                "{} should sort before {}",
+                std::str::from_utf8(names[i]).unwrap(),
+                std::str::from_utf8(names[i + 1]).unwrap(),
+            );
+        }
+    }
+
+    // --- Illumina read names ---
+
+    #[rstest]
+    // Same flowcell, different tiles
+    #[case(
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        b"A00132:53:HFHJKDSXX:1:1102:12345:67890",
+        Ordering::Less
+    )]
+    // Same tile, different X coordinates
+    #[case(
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        b"A00132:53:HFHJKDSXX:1:1101:12346:67890",
+        Ordering::Less
+    )]
+    // Different lanes
+    #[case(
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        b"A00132:53:HFHJKDSXX:2:1101:12345:67890",
+        Ordering::Less
+    )]
+    // Different runs
+    #[case(
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        b"A00132:54:HFHJKDSXX:1:1101:12345:67890",
+        Ordering::Less
+    )]
+    // Same everything
+    #[case(
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        Ordering::Equal
+    )]
+    // Different instruments
+    #[case(
+        b"A00132:53:HFHJKDSXX:1:1101:12345:67890",
+        b"B00132:53:HFHJKDSXX:1:1101:12345:67890",
+        Ordering::Less
+    )]
+    // Numeric tile comparison (1101 vs 2201)
+    #[case(b"INST:1:FLOW:1:1101:1:1", b"INST:1:FLOW:1:2201:1:1", Ordering::Less)]
+    fn test_natural_compare_illumina_names(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- SRR read names ---
+
+    #[rstest]
+    #[case(b"SRR099966.1", b"SRR099966.2", Ordering::Less)]
+    #[case(b"SRR099966.9", b"SRR099966.10", Ordering::Less)]
+    #[case(b"SRR099966.99", b"SRR099966.100", Ordering::Less)]
+    #[case(b"SRR099966.12345", b"SRR099966.12346", Ordering::Less)]
+    #[case(b"SRR099966.12345", b"SRR099966.12345", Ordering::Equal)]
+    #[case(b"SRR099966.12345", b"SRR099967.1", Ordering::Less)] // 6 < 7 in accession
+    #[case(b"SRR1.1", b"SRR2.1", Ordering::Less)]
+    #[case(b"SRR9.1", b"SRR10.1", Ordering::Less)]
+    fn test_natural_compare_srr_names(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Synthetic read names ---
+
+    #[rstest]
+    #[case(b"mol000001_read0001", b"mol000001_read0002", Ordering::Less)]
+    #[case(b"mol000001_read0009", b"mol000001_read0010", Ordering::Less)]
+    #[case(b"mol000001_read0001", b"mol000002_read0001", Ordering::Less)]
+    #[case(b"mol1_read1", b"mol000001_read0001", Ordering::Less)] // same values but shorter string
+    #[case(b"mol1_read1", b"mol1_read2", Ordering::Less)]
+    #[case(b"mol2_read1", b"mol10_read1", Ordering::Less)]
+    fn test_natural_compare_synthetic_names(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Very long numeric runs (test overflow robustness) ---
+    // The algorithm compares digit-by-digit without parsing to integers,
+    // so it should handle arbitrarily long numbers correctly.
+
+    #[test]
+    fn test_natural_compare_long_numeric_runs() {
+        // Numbers larger than u64::MAX (which is 18446744073709551615, 20 digits)
+        let big_a = b"x99999999999999999999999999999999999999"; // 38 digits of 9
+        let big_b = b"x100000000000000000000000000000000000000"; // 1 followed by 38 zeros
+        assert_eq!(natural_compare(big_a, big_b), Ordering::Less);
+
+        // Equal very long numbers
+        let long_num = b"prefix99999999999999999999999999suffix";
+        assert_eq!(natural_compare(long_num, long_num), Ordering::Equal);
+
+        // Different very long numbers of same length
+        let a = b"x99999999999999999999999999999999999998";
+        let b = b"x99999999999999999999999999999999999999";
+        assert_eq!(natural_compare(a, b), Ordering::Less);
+    }
+
+    #[test]
+    fn test_natural_compare_u64_overflow_boundary() {
+        // u64::MAX = 18446744073709551615
+        let u64_max = b"read18446744073709551615";
+        let u64_max_plus_1 = b"read18446744073709551616";
+        assert_eq!(natural_compare(u64_max, u64_max_plus_1), Ordering::Less);
+
+        // Two numbers that would overflow u64 if parsed
+        let huge_a = b"read99999999999999999999"; // 20 digits, all 9s
+        let huge_b = b"read100000000000000000000"; // 21 digits
+        assert_eq!(natural_compare(huge_a, huge_b), Ordering::Less);
+    }
+
+    // --- Property-based comparator invariant tests ---
+
+    proptest::proptest! {
+        #[test]
+        fn test_natural_compare_symmetry(a: Vec<u8>, b: Vec<u8>) {
+            let ab = natural_compare(&a, &b);
+            let ba = natural_compare(&b, &a);
+            proptest::prop_assert_eq!(ab, ba.reverse());
+        }
+
+        #[test]
+        fn test_natural_compare_reflexive(s: Vec<u8>) {
+            proptest::prop_assert_eq!(natural_compare(&s, &s), Ordering::Equal);
+        }
+
+        #[test]
+        fn test_natural_compare_transitivity(
+            mut values in proptest::collection::vec(proptest::collection::vec(0..=255u8, 0..20), 3..10),
+        ) {
+            // Sort values with natural_compare, then verify all pairs are ordered.
+            values.sort_by(|a, b| natural_compare(a, b));
+            for i in 0..values.len() {
+                for j in (i + 1)..values.len() {
+                    let cmp = natural_compare(&values[i], &values[j]);
+                    proptest::prop_assert!(
+                        cmp != Ordering::Greater,
+                        "Transitivity violated: sorted[{}] ({:?}) > sorted[{}] ({:?})",
+                        i, values[i], j, values[j],
+                    );
+                }
+            }
+        }
+    }
+
+    // --- Samtools strnum_cmp edge cases ---
+    // Ported from samtools bam_sort.c strnum_cmp behavior analysis.
+
+    #[test]
+    fn test_natural_compare_leading_zeros_tiebreak_by_length() {
+        // Unlike samtools strnum_cmp which returns Equal for "01" vs "1",
+        // this implementation uses total string length as tiebreaker.
+        // Numerically equal values with different leading zeros compare
+        // by string length (longer = greater).
+        assert_eq!(natural_compare(b"00", b"0"), Ordering::Greater);
+        assert_eq!(natural_compare(b"000", b"00"), Ordering::Greater);
+        assert_eq!(natural_compare(b"0", b"00"), Ordering::Less);
+        assert_eq!(natural_compare(b"01", b"1"), Ordering::Greater);
+        assert_eq!(natural_compare(b"00100", b"100"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_natural_compare_strnum_cmp_compat_numeric_vs_alpha_boundary() {
+        // When one string has a digit and the other a letter at the same position,
+        // in samtools strnum_cmp it compares raw bytes: '0' (48) < 'A' (65) < 'a' (97).
+        // In fgumi, digits explicitly sort before non-digits. Same practical result
+        // for typical chars, but it's a deliberate design choice.
+        assert_eq!(natural_compare(b"a0", b"aa"), Ordering::Less);
+        assert_eq!(natural_compare(b"a9", b"aa"), Ordering::Less);
+        assert_eq!(natural_compare(b"aa", b"a0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_natural_compare_strnum_cmp_compat_numeric_then_string() {
+        // After a numeric run, comparison resumes at the character level.
+        // "a1b" vs "a1c": after matching "a" and "1", compare "b" vs "c"
+        assert_eq!(natural_compare(b"a1b", b"a1c"), Ordering::Less);
+        assert_eq!(natural_compare(b"a10b", b"a10c"), Ordering::Less);
+        assert_eq!(natural_compare(b"a10b", b"a2c"), Ordering::Greater); // 10 > 2
+    }
+
+    #[test]
+    fn test_natural_compare_all_zeros_tiebreak_by_length() {
+        // "0" vs "00" vs "000": numerically equal but differ in string length.
+        // Longer string sorts later due to alen.cmp(&blen) tiebreaker.
+        assert_eq!(natural_compare(b"0", b"00"), Ordering::Less);
+        assert_eq!(natural_compare(b"00", b"000"), Ordering::Less);
+        assert_eq!(natural_compare(b"0", b"000"), Ordering::Less);
+
+        // Embedded zeros in otherwise equal strings: "a0b" (len=3) vs "a00b" (len=4).
+        // The numeric run "0" vs "00" are numerically equal, so comparison continues.
+        // Both then hit "b" which matches, then the longer string wins.
+        assert_eq!(natural_compare(b"a0b", b"a00b"), Ordering::Less);
+        assert_eq!(natural_compare(b"a0b", b"a000b"), Ordering::Less);
+    }
+
+    // --- Digit at end of string vs more characters ---
+
+    #[rstest]
+    #[case(b"read1", b"read1a", Ordering::Less)] // "read1" is prefix of "read1a"
+    #[case(b"read1a", b"read1", Ordering::Greater)]
+    #[case(b"read10", b"read10a", Ordering::Less)]
+    #[case(b"read10a", b"read10", Ordering::Greater)]
+    fn test_natural_compare_numeric_then_suffix(
+        #[case] a: &[u8],
+        #[case] b: &[u8],
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(natural_compare(a, b), expected);
+    }
+
+    // --- Multiple numeric segments with varying widths ---
+
+    #[test]
+    fn test_natural_compare_multiple_numeric_segments() {
+        // Simulating version-like or multi-field names
+        assert_eq!(natural_compare(b"r1.1.1", b"r1.1.2"), Ordering::Less);
+        assert_eq!(natural_compare(b"r1.1.9", b"r1.1.10"), Ordering::Less);
+        assert_eq!(natural_compare(b"r1.9.1", b"r1.10.1"), Ordering::Less);
+        assert_eq!(natural_compare(b"r9.1.1", b"r10.1.1"), Ordering::Less);
+    }
+
+    // --- Consecutive digits without separators ---
+
+    #[test]
+    fn test_natural_compare_adjacent_numeric_runs() {
+        // When digits are separated by non-digit characters, each run is independent.
+        // "a1b2" vs "a1b10": first runs "1"="1", then "2" < "10"
+        assert_eq!(natural_compare(b"a1b2", b"a1b10"), Ordering::Less);
+
+        // But a continuous digit run is one number:
+        // "a12" vs "a9": "12" > "9"
+        assert_eq!(natural_compare(b"a12", b"a9"), Ordering::Greater);
+    }
+
+    // --- Non-ASCII bytes ---
+
+    #[test]
+    fn test_natural_compare_high_bytes() {
+        // Bytes > 127 should still compare correctly by byte value
+        assert_eq!(natural_compare(&[0xFF], &[0xFE]), Ordering::Greater);
+        assert_eq!(natural_compare(&[0x80], &[0x7F]), Ordering::Greater);
+        // Digits still sort before high bytes
+        assert_eq!(natural_compare(b"0", &[0x80]), Ordering::Less);
+    }
+
+    // --- Stress: sorting a realistic set of read names ---
+
+    #[test]
+    fn test_natural_compare_sort_illumina_batch() {
+        let names: Vec<&[u8]> = vec![
+            b"INST:100:FLOW:2:2201:9999:1",
+            b"INST:1:FLOW:1:1101:1:1",
+            b"INST:1:FLOW:1:1101:1:2",
+            b"INST:1:FLOW:1:1101:2:1",
+            b"INST:1:FLOW:1:1102:1:1",
+            b"INST:1:FLOW:2:1101:1:1",
+            b"INST:2:FLOW:1:1101:1:1",
+            b"INST:10:FLOW:1:1101:1:1",
+            b"INST:100:FLOW:1:1101:1:1",
+        ];
+
+        // Clone and sort
+        let mut sorted = names.clone();
+        sorted.sort_by(|a, b| natural_compare(a, b));
+
+        // Expected natural order
+        let expected: Vec<&[u8]> = vec![
+            b"INST:1:FLOW:1:1101:1:1",
+            b"INST:1:FLOW:1:1101:1:2",
+            b"INST:1:FLOW:1:1101:2:1",
+            b"INST:1:FLOW:1:1102:1:1",
+            b"INST:1:FLOW:2:1101:1:1",
+            b"INST:2:FLOW:1:1101:1:1",
+            b"INST:10:FLOW:1:1101:1:1",
+            b"INST:100:FLOW:1:1101:1:1",
+            b"INST:100:FLOW:2:2201:9999:1",
+        ];
+
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn test_natural_compare_sort_mixed_name_formats() {
+        let mut names: Vec<&[u8]> = vec![
+            b"SRR099966.100",
+            b"SRR099966.9",
+            b"SRR099966.10",
+            b"SRR099966.1",
+            b"SRR099966.99",
+            b"SRR099966.2",
+        ];
+
+        names.sort_by(|a, b| natural_compare(a, b));
+
+        let expected: Vec<&[u8]> = vec![
+            b"SRR099966.1",
+            b"SRR099966.2",
+            b"SRR099966.9",
+            b"SRR099966.10",
+            b"SRR099966.99",
+            b"SRR099966.100",
+        ];
+
+        assert_eq!(names, expected);
+    }
+
+    // ========================================================================
+    // QuerynameComparator tests
+    // ========================================================================
+
+    #[test]
+    fn test_queryname_comparator_default_is_lexicographic() {
+        assert_eq!(QuerynameComparator::default(), QuerynameComparator::Lexicographic);
+    }
+
+    #[test]
+    fn test_queryname_comparator_display() {
+        assert_eq!(QuerynameComparator::Lexicographic.to_string(), "lexicographic");
+        assert_eq!(QuerynameComparator::Natural.to_string(), "natural");
+    }
+
+    // ========================================================================
+    // SortOrder with QuerynameComparator tests
+    // ========================================================================
+
+    #[test]
+    fn test_sort_order_is_queryname() {
+        assert!(!SortOrder::Coordinate.is_queryname());
+        assert!(SortOrder::Queryname(QuerynameComparator::Lexicographic).is_queryname());
+        assert!(SortOrder::Queryname(QuerynameComparator::Natural).is_queryname());
+        assert!(!SortOrder::TemplateCoordinate.is_queryname());
+    }
+
+    #[test]
+    fn test_sort_order_queryname_comparator() {
+        assert_eq!(SortOrder::Coordinate.queryname_comparator(), None);
+        assert_eq!(
+            SortOrder::Queryname(QuerynameComparator::Lexicographic).queryname_comparator(),
+            Some(QuerynameComparator::Lexicographic)
+        );
+        assert_eq!(
+            SortOrder::Queryname(QuerynameComparator::Natural).queryname_comparator(),
+            Some(QuerynameComparator::Natural)
+        );
+        assert_eq!(SortOrder::TemplateCoordinate.queryname_comparator(), None);
+    }
+
+    #[test]
+    fn test_sort_order_header_so_tag() {
+        assert_eq!(SortOrder::Coordinate.header_so_tag(), "coordinate");
+        assert_eq!(
+            SortOrder::Queryname(QuerynameComparator::Lexicographic).header_so_tag(),
+            "queryname"
+        );
+        assert_eq!(SortOrder::Queryname(QuerynameComparator::Natural).header_so_tag(), "queryname");
+        assert_eq!(SortOrder::TemplateCoordinate.header_so_tag(), "unsorted");
+    }
+
+    #[test]
+    fn test_sort_order_header_ss_tag() {
+        assert_eq!(SortOrder::Coordinate.header_ss_tag(), None);
+        assert_eq!(
+            SortOrder::Queryname(QuerynameComparator::Lexicographic).header_ss_tag(),
+            Some("lexicographic")
+        );
+        assert_eq!(
+            SortOrder::Queryname(QuerynameComparator::Natural).header_ss_tag(),
+            Some("natural")
+        );
+        assert_eq!(SortOrder::TemplateCoordinate.header_ss_tag(), Some("template-coordinate"));
+    }
+
+    #[test]
+    fn test_sort_order_header_go_tag() {
+        assert_eq!(SortOrder::Coordinate.header_go_tag(), None);
+        assert_eq!(SortOrder::Queryname(QuerynameComparator::Lexicographic).header_go_tag(), None);
+        assert_eq!(SortOrder::TemplateCoordinate.header_go_tag(), Some("query"));
+    }
+
+    // ========================================================================
+    // RawQuerynameLexKey tests
+    // ========================================================================
+
+    #[test]
+    fn test_lex_key_lexicographic_ordering() {
+        // Lexicographic: "read10" < "read2" (because '1' < '2' in ASCII)
+        let k1 = RawQuerynameLexKey::new(b"read10".to_vec(), 0);
+        let k2 = RawQuerynameLexKey::new(b"read2".to_vec(), 0);
+        assert!(k1 < k2, "lexicographic: 'read10' should be < 'read2'");
+    }
+
+    #[test]
+    fn test_natural_key_natural_ordering() {
+        // Natural: "read2" < "read10" (because 2 < 10 numerically)
+        let k1 = RawQuerynameKey::new(b"read2".to_vec(), 0);
+        let k2 = RawQuerynameKey::new(b"read10".to_vec(), 0);
+        assert!(k1 < k2, "natural: 'read2' should be < 'read10'");
+    }
+
+    #[test]
+    fn test_lex_vs_natural_ordering_difference() {
+        // This is the key difference: natural treats "2" < "10", lexicographic treats "10" < "2"
+        let lex_10 = RawQuerynameLexKey::new(b"read10".to_vec(), 0);
+        let lex_2 = RawQuerynameLexKey::new(b"read2".to_vec(), 0);
+        assert!(lex_10 < lex_2, "lexicographic: read10 < read2");
+
+        let nat_2 = RawQuerynameKey::new(b"read2".to_vec(), 0);
+        let nat_10 = RawQuerynameKey::new(b"read10".to_vec(), 0);
+        assert!(nat_2 < nat_10, "natural: read2 < read10");
+    }
+
+    #[test]
+    fn test_lex_key_flag_tiebreak() {
+        let k1 = RawQuerynameLexKey::new(b"readA".to_vec(), 0);
+        let k2 = RawQuerynameLexKey::new(b"readA".to_vec(), 1);
+        assert!(k1 < k2);
+    }
+
+    #[test]
+    fn test_lex_key_empty_names() {
+        let k1 = RawQuerynameLexKey::new(Vec::new(), 0);
+        let k2 = RawQuerynameLexKey::new(b"a".to_vec(), 0);
+        assert!(k1 < k2);
+    }
+
+    #[test]
+    fn test_lex_key_illumina_names() {
+        // Illumina names: lexicographic ordering
+        let mut names: Vec<RawQuerynameLexKey> = vec![
+            RawQuerynameLexKey::new(b"A00132:53:HFHJKDSXX:2:1100:5000:1000".to_vec(), 0),
+            RawQuerynameLexKey::new(b"A00132:53:HFHJKDSXX:1:1100:5000:1000".to_vec(), 0),
+            RawQuerynameLexKey::new(b"A00132:54:HFH2JDSXX:1:1100:5000:1000".to_vec(), 0),
+        ];
+        names.sort();
+        assert_eq!(names[0].name(), b"A00132:53:HFHJKDSXX:1:1100:5000:1000");
+        assert_eq!(names[1].name(), b"A00132:53:HFHJKDSXX:2:1100:5000:1000");
+        assert_eq!(names[2].name(), b"A00132:54:HFH2JDSXX:1:1100:5000:1000");
+    }
+
+    #[test]
+    fn test_lex_key_srr_names_differ_from_natural() {
+        // SRR names: lexicographic puts .100 before .2 (1 < 2 in ASCII)
+        let mut lex_names: Vec<RawQuerynameLexKey> = vec![
+            RawQuerynameLexKey::new(b"SRR099966.100".to_vec(), 0),
+            RawQuerynameLexKey::new(b"SRR099966.2".to_vec(), 0),
+            RawQuerynameLexKey::new(b"SRR099966.10".to_vec(), 0),
+        ];
+        lex_names.sort();
+        assert_eq!(lex_names[0].name(), b"SRR099966.10");
+        assert_eq!(lex_names[1].name(), b"SRR099966.100");
+        assert_eq!(lex_names[2].name(), b"SRR099966.2");
+
+        // Natural puts them in numeric order
+        let mut nat_names: Vec<RawQuerynameKey> = vec![
+            RawQuerynameKey::new(b"SRR099966.100".to_vec(), 0),
+            RawQuerynameKey::new(b"SRR099966.2".to_vec(), 0),
+            RawQuerynameKey::new(b"SRR099966.10".to_vec(), 0),
+        ];
+        nat_names.sort();
+        assert_eq!(nat_names[0].name(), b"SRR099966.2\0");
+        assert_eq!(nat_names[1].name(), b"SRR099966.10\0");
+        assert_eq!(nat_names[2].name(), b"SRR099966.100\0");
+    }
+
+    #[test]
+    fn test_lex_key_serialization_roundtrip() {
+        let key = RawQuerynameLexKey::new(b"test_read".to_vec(), 42);
+        let mut buf = Vec::new();
+        key.write_to(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let restored = RawQuerynameLexKey::read_from(&mut cursor).unwrap();
+        assert_eq!(key, restored);
+    }
+
+    #[test]
+    fn test_lex_key_variable_length() {
+        const { assert!(RawQuerynameLexKey::SERIALIZED_SIZE.is_none()) };
+    }
+
+    #[test]
+    fn test_queryname_keys_embedded_in_record() {
+        const { assert!(RawQuerynameLexKey::EMBEDDED_IN_RECORD) };
+        const { assert!(RawQuerynameKey::EMBEDDED_IN_RECORD) };
+        const { assert!(RawCoordinateKey::EMBEDDED_IN_RECORD) };
     }
 }

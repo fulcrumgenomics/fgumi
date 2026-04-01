@@ -17,4 +17,5 @@ noodles = ["dep:noodles", "dep:anyhow"]
 test-utils = []
 
 [dev-dependencies]
+proptest = "1.10"
 rstest = "0"

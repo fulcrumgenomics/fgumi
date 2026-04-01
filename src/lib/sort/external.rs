@@ -22,16 +22,13 @@ use crate::bam_io::{
     BamReaderAuto, create_bam_reader, create_bam_writer, create_indexing_bam_writer,
     write_bai_index,
 };
-use crate::sort::keys::{CoordinateKey, QuerynameKey, SortKey, SortOrder};
+use crate::sort::keys::{CoordinateKey, QuerynameComparator, QuerynameKey, SortKey, SortOrder};
 use anyhow::{Context, Result};
-use bstr::BString;
 use log::info;
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
-use noodles::sam::header::record::value::Map;
-use noodles::sam::header::record::value::map::header::tag as header_tag;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -128,9 +125,15 @@ impl ExternalSorter {
 
     /// Sort a BAM file.
     ///
+    /// Supports `Coordinate` and `Queryname(Natural)` sort orders only.
+    /// Lexicographic queryname and template-coordinate sorts require
+    /// [`RawExternalSorter`](super::RawExternalSorter), which operates on raw
+    /// BAM bytes for better performance.
+    ///
     /// # Errors
     ///
-    /// Returns an error if reading the input, sorting, or writing the output fails.
+    /// Returns an error if the sort order is unsupported, or if reading the
+    /// input, sorting, or writing the output fails.
     pub fn sort(&self, input: &Path, output: &Path) -> Result<SortStats> {
         info!("Starting sort with order: {:?}", self.sort_order);
         info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
@@ -161,7 +164,13 @@ impl ExternalSorter {
             SortOrder::Coordinate => {
                 self.sort_with_key::<CoordinateKey>(reader, &header, output, temp_path)
             }
-            SortOrder::Queryname => {
+            SortOrder::Queryname(cmp) => {
+                if cmp == QuerynameComparator::Lexicographic {
+                    anyhow::bail!(
+                        "ExternalSorter does not support lexicographic queryname sort; \
+                         use RawExternalSorter"
+                    );
+                }
                 self.sort_with_key::<QuerynameKey>(reader, &header, output, temp_path)
             }
             SortOrder::TemplateCoordinate => {
@@ -517,55 +526,7 @@ impl ExternalSorter {
 
     /// Create output header with appropriate sort order tags.
     fn create_output_header(&self, header: &Header) -> Header {
-        let mut builder = Header::builder();
-
-        // Copy reference sequences
-        for (name, seq) in header.reference_sequences() {
-            builder = builder.add_reference_sequence(name.as_slice(), seq.clone());
-        }
-
-        // Copy read groups
-        for (id, rg) in header.read_groups() {
-            builder = builder.add_read_group(id.as_slice(), rg.clone());
-        }
-
-        // Copy programs
-        for (id, pg) in header.programs().as_ref() {
-            builder = builder.add_program(id.as_slice(), pg.clone());
-        }
-
-        // Copy comments
-        for comment in header.comments() {
-            builder = builder.add_comment(comment.clone());
-        }
-
-        // Set header record with sort order using insert API
-        let hd = match self.sort_order {
-            SortOrder::Coordinate => {
-                Map::<noodles::sam::header::record::value::map::Header>::builder()
-                    .insert(header_tag::SORT_ORDER, BString::from("coordinate"))
-                    .build()
-                    .expect("valid header")
-            }
-            SortOrder::Queryname => {
-                Map::<noodles::sam::header::record::value::map::Header>::builder()
-                    .insert(header_tag::SORT_ORDER, BString::from("queryname"))
-                    .build()
-                    .expect("valid header")
-            }
-            SortOrder::TemplateCoordinate => {
-                // Template-coordinate uses: SO:unsorted, GO:query, SS:template-coordinate
-                Map::<noodles::sam::header::record::value::map::Header>::builder()
-                    .insert(header_tag::SORT_ORDER, BString::from("unsorted"))
-                    .insert(header_tag::GROUP_ORDER, BString::from("query"))
-                    .insert(header_tag::SUBSORT_ORDER, BString::from("template-coordinate"))
-                    .build()
-                    .expect("valid header")
-            }
-        };
-
-        builder = builder.set_header(hd);
-        builder.build()
+        super::create_output_header(self.sort_order, header)
     }
 
     /// Create temporary directory for spill files.
@@ -693,8 +654,8 @@ mod tests {
 
     #[test]
     fn test_sorter_builder_temp_dir() {
-        let sorter =
-            ExternalSorter::new(SortOrder::Queryname).temp_dir(PathBuf::from("/tmp/my_sort"));
+        let sorter = ExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()))
+            .temp_dir(PathBuf::from("/tmp/my_sort"));
         assert_eq!(sorter.temp_dir, Some(PathBuf::from("/tmp/my_sort")));
     }
 
@@ -725,13 +686,18 @@ mod tests {
 
     #[test]
     fn test_create_output_header_queryname() {
-        let sorter = ExternalSorter::new(SortOrder::Queryname);
+        let sorter = ExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()));
         let header = Header::builder().build();
         let output_header = sorter.create_output_header(&header);
 
         let hd = output_header.header().expect("header should have HD record");
-        let so = hd.other_fields().get(b"SO").expect("should have SO tag");
+        let fields = hd.other_fields();
+
+        let so = fields.get(b"SO").expect("should have SO tag");
         assert_eq!(<_ as AsRef<[u8]>>::as_ref(so), b"queryname");
+
+        let ss = fields.get(b"SS").expect("should have SS tag");
+        assert_eq!(<_ as AsRef<[u8]>>::as_ref(ss), b"lexicographic");
     }
 
     #[test]

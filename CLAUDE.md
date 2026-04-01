@@ -122,3 +122,11 @@ Uses `mimalloc` as global allocator for performance.
 ## Unsafe Code
 
 `#![deny(unsafe_code)]` - only standard library unsafe is permitted.
+
+## Benchmarking Notes
+
+### samtools sort orders
+`samtools sort` supports `--template-coordinate` for template-coordinate sorting. When benchmarking sort orders:
+- Coordinate: `samtools sort -@ 4 -m 50M input.bam -o output.bam`
+- Queryname: `samtools sort -n -@ 4 -m 50M input.bam -o output.bam`
+- Template-coordinate: `samtools sort --template-coordinate -@ 4 -m 50M input.bam -o output.bam`

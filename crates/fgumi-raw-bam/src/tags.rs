@@ -261,6 +261,107 @@ pub fn extract_aux_string_tags<'a>(aux_data: &'a [u8], cell_tag: &[u8; 2]) -> Au
     result
 }
 
+/// Result of a single-pass extraction of all tags needed for template-coordinate sorting.
+/// Extracts MI (integer or string), RG, cell barcode, and MC in one scan of aux data.
+pub struct TemplateAuxTags<'a> {
+    /// MI tag value: (`molecular_id`, `is_A_suffix`). Defaults to `(0, true)` if not found.
+    pub mi: (u64, bool),
+    /// RG (read group) tag value.
+    pub rg: Option<&'a [u8]>,
+    /// Cell barcode tag value.
+    pub cell: Option<&'a [u8]>,
+    /// MC (mate CIGAR) tag value.
+    pub mc: Option<&'a str>,
+}
+
+/// Extract MI, RG, cell barcode, and MC tags in a single pass over aux data.
+///
+/// This replaces 4 separate linear scans with one, reducing the cost of aux tag
+/// extraction from O(4n) to O(n) where n is the aux data length.
+#[must_use]
+pub fn extract_template_aux_tags<'a>(
+    bam: &'a [u8],
+    cell_tag: Option<&[u8; 2]>,
+) -> TemplateAuxTags<'a> {
+    let aux_data = aux_data_slice(bam);
+    let mut result = TemplateAuxTags { mi: (0, true), rg: None, cell: None, mc: None };
+    // Bits: 0=MI, 1=RG, 2=cell, 3=MC
+    let target_bits: u8 = if cell_tag.is_some() { 0xF } else { 0b1011 };
+    let mut found = 0u8;
+    let mut p = 0;
+
+    while p + 3 <= aux_data.len() {
+        let t = [aux_data[p], aux_data[p + 1]];
+        let val_type = aux_data[p + 2];
+
+        if t == *b"MI" {
+            if val_type == b'Z' {
+                let start = p + 3;
+                if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
+                    result.mi = parse_mi_bytes(&aux_data[start..start + end]).unwrap_or((0, true));
+                    p = start + end + 1;
+                } else {
+                    break;
+                }
+            } else if let Some(v) = extract_int_value(aux_data, p, val_type) {
+                if v >= 0 {
+                    #[expect(clippy::cast_sign_loss, reason = "guarded by v >= 0")]
+                    {
+                        result.mi = (v as u64, true);
+                    }
+                }
+                if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+                    p += 3 + size;
+                } else {
+                    break;
+                }
+            } else if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+                p += 3 + size;
+            } else {
+                break;
+            }
+            found |= 1;
+            if found & target_bits == target_bits {
+                return result;
+            }
+            continue;
+        }
+
+        if val_type == b'Z' {
+            let start = p + 3;
+            if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
+                let value = &aux_data[start..start + end];
+                if t == *b"RG" {
+                    result.rg = Some(value);
+                    found |= 2;
+                }
+                if cell_tag.is_some_and(|ct| t == *ct) {
+                    result.cell = Some(value);
+                    found |= 4;
+                }
+                if t == *b"MC" {
+                    result.mc = std::str::from_utf8(value).ok();
+                    found |= 8;
+                }
+                if found & target_bits == target_bits {
+                    return result;
+                }
+                p = start + end + 1;
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        if let Some(size) = tag_value_size(val_type, &aux_data[p + 3..]) {
+            p += 3 + size;
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 /// Zero-allocation reference to a B-type array tag in aux data.
 pub struct ArrayTagRef<'a> {
     /// Element bytes (raw, little-endian).
@@ -1958,6 +2059,96 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let offset = rec.len() + 10;
         reverse_complement_string_tag_in_place(&mut rec, offset, b"RX");
+    }
+
+    // ========================================================================
+    // extract_template_aux_tags tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_template_aux_tags_all_found() {
+        // Build a BAM record with MI, RG, CB, and MC tags
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MIZ42\x00");
+        aux.extend_from_slice(b"RGZsample1\x00");
+        aux.extend_from_slice(b"CBZcell99\x00");
+        aux.extend_from_slice(b"MCZ10M5S\x00");
+        let rec = make_bam_bytes(0, 100, 0, b"read1", &[], 4, -1, -1, &aux);
+
+        let result = extract_template_aux_tags(&rec, Some(b"CB"));
+        assert_eq!(result.mi, (42, true));
+        assert_eq!(result.rg, Some(b"sample1".as_ref()));
+        assert_eq!(result.cell, Some(b"cell99".as_ref()));
+        assert_eq!(result.mc, Some("10M5S"));
+    }
+
+    #[test]
+    fn test_extract_template_aux_tags_no_cell_tag() {
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"MIZ7/B\x00");
+        aux.extend_from_slice(b"RGZlib1\x00");
+        aux.extend_from_slice(b"MCZ20M\x00");
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
+
+        let result = extract_template_aux_tags(&rec, None);
+        assert_eq!(result.mi, (7, false));
+        assert_eq!(result.rg, Some(b"lib1".as_ref()));
+        assert!(result.cell.is_none());
+        assert_eq!(result.mc, Some("20M"));
+    }
+
+    #[test]
+    fn test_extract_template_aux_tags_mi_integer_type() {
+        // MI as integer tag (C type = u8)
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&[b'M', b'I', b'C', 99]);
+        aux.extend_from_slice(b"RGZrg0\x00");
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
+
+        let result = extract_template_aux_tags(&rec, None);
+        assert_eq!(result.mi, (99, true));
+        assert_eq!(result.rg, Some(b"rg0".as_ref()));
+    }
+
+    #[test]
+    fn test_extract_template_aux_tags_partial() {
+        // Only RG present
+        let aux = b"RGZsample\x00";
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, aux);
+
+        let result = extract_template_aux_tags(&rec, Some(b"CB"));
+        assert_eq!(result.mi, (0, true)); // default
+        assert_eq!(result.rg, Some(b"sample".as_ref()));
+        assert!(result.cell.is_none());
+        assert!(result.mc.is_none());
+    }
+
+    #[test]
+    fn test_extract_template_aux_tags_empty_aux() {
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+
+        let result = extract_template_aux_tags(&rec, Some(b"CB"));
+        assert_eq!(result.mi, (0, true));
+        assert!(result.rg.is_none());
+        assert!(result.cell.is_none());
+        assert!(result.mc.is_none());
+    }
+
+    #[test]
+    fn test_extract_template_aux_tags_with_non_string_tags() {
+        // Non-string tags interspersed with target tags
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
+        aux.extend_from_slice(b"MIZ100\x00");
+        aux.extend_from_slice(&[b'A', b'S', b'C', 30]); // AS:C:30
+        aux.extend_from_slice(b"RGZlib2\x00");
+        aux.extend_from_slice(b"MCZ5M\x00");
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
+
+        let result = extract_template_aux_tags(&rec, None);
+        assert_eq!(result.mi, (100, true));
+        assert_eq!(result.rg, Some(b"lib2".as_ref()));
+        assert_eq!(result.mc, Some("5M"));
     }
 
     // ========================================================================

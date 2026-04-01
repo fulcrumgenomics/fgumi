@@ -176,7 +176,7 @@ impl<K: Ord> LoserTree<K> {
     /// Whether the tree has no sources.
     ///
     /// Always returns `false` since the constructor requires at least one source.
-    /// Present for clippy's `len_without_is_empty` lint.
+    /// Exists solely to satisfy clippy's `len_without_is_empty` lint.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {

@@ -743,6 +743,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "noodles",
+ "proptest",
  "rstest",
 ]
 
