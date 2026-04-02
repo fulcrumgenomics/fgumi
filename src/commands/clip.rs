@@ -88,8 +88,8 @@ pub struct Clip {
     pub reference: PathBuf,
 
     /// Clipping mode: soft, soft-with-mask, or hard
-    #[arg(short = 'c', long = "clipping-mode", default_value = "hard")]
-    pub clipping_mode: String,
+    #[arg(short = 'c', long = "clipping-mode", default_value_t = ClippingMode::Hard)]
+    pub clipping_mode: ClippingMode,
 
     /// Output sort order (if not specified, output is in same order as input)
     #[arg(
@@ -212,18 +212,7 @@ impl Command for Clip {
 
         let timer = OperationTimer::new("Clipping reads");
 
-        // Parse clipping mode
-        let mode = match self.clipping_mode.as_str() {
-            "soft" => ClippingMode::Soft,
-            "soft-with-mask" => ClippingMode::SoftWithMask,
-            "hard" => ClippingMode::Hard,
-            _ => {
-                anyhow::bail!(
-                    "Invalid clipping mode: {}. Must be soft, soft-with-mask, or hard",
-                    self.clipping_mode
-                );
-            }
-        };
+        let mode = self.clipping_mode;
 
         // Validate clipping parameters
         if self.upgrade_clipping
@@ -649,7 +638,7 @@ impl Clip {
 
         // Configuration for closures
         const BATCH_SIZE: usize = 1000;
-        let clipping_mode = self.clipping_mode.clone();
+        let clipping_mode = self.clipping_mode;
         let auto_clip_attributes = self.auto_clip_attributes;
         let upgrade_clipping = self.upgrade_clipping;
         let clip_overlapping_reads = self.clip_overlapping_reads;
@@ -674,15 +663,10 @@ impl Clip {
         // Process function: clip each template batch
         let process_fn = move |batch: TemplateBatch| -> io::Result<ClipProcessedBatch> {
             // Create per-worker clipper
-            let mode = match clipping_mode.as_str() {
-                "soft" => ClippingMode::Soft,
-                "soft-with-mask" => ClippingMode::SoftWithMask,
-                _ => ClippingMode::Hard,
-            };
             let clipper = if auto_clip_attributes {
-                SamRecordClipper::with_auto_clip(mode, true)
+                SamRecordClipper::with_auto_clip(clipping_mode, true)
             } else {
-                SamRecordClipper::new(mode)
+                SamRecordClipper::new(clipping_mode)
             };
 
             let mut clipped_records = Vec::new();
@@ -912,7 +896,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -930,7 +914,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert_eq!(clip.clipping_mode, "hard");
+        assert_eq!(clip.clipping_mode, ClippingMode::Hard);
         assert!(!clip.clip_overlapping_reads);
         assert!(!clip.clip_extending_past_mate);
     }
@@ -943,7 +927,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -975,7 +959,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -993,7 +977,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert_eq!(clip.clipping_mode, "hard");
+        assert_eq!(clip.clipping_mode, ClippingMode::Hard);
         assert!(clip.clip_overlapping_reads);
         assert!(clip.clip_extending_past_mate);
     }
@@ -1006,7 +990,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft-with-mask".to_string(),
+            clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1024,7 +1008,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert_eq!(clip.clipping_mode, "soft-with-mask");
+        assert_eq!(clip.clipping_mode, ClippingMode::SoftWithMask);
         assert!(clip.upgrade_clipping);
         assert_eq!(clip.metrics, Some(PathBuf::from("metrics.txt")));
     }
@@ -1037,7 +1021,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1067,7 +1051,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -1094,15 +1078,15 @@ mod tests {
     }
 
     #[test]
-    fn test_clipping_mode_string_values() {
-        // Test that clipping_mode strings are validated properly
+    fn test_clipping_mode_enum_values() {
+        // Test that clipping_mode enum variants are set properly
         let soft = Clip {
             io: BamIoOptions {
                 input: PathBuf::from("input.bam"),
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft".to_string(),
+            clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1120,7 +1104,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert_eq!(soft.clipping_mode, "soft");
+        assert_eq!(soft.clipping_mode, ClippingMode::Soft);
     }
 
     #[test]
@@ -1131,7 +1115,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1160,7 +1144,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft".to_string(),
+            clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1193,7 +1177,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1213,7 +1197,7 @@ mod tests {
 
         // upgrade_clipping should upgrade existing soft clips to hard clips
         assert!(clip.upgrade_clipping);
-        assert_eq!(clip.clipping_mode, "hard");
+        assert_eq!(clip.clipping_mode, ClippingMode::Hard);
     }
 
     #[test]
@@ -1224,7 +1208,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: true,
 
@@ -1255,7 +1239,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1286,7 +1270,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -1306,7 +1290,7 @@ mod tests {
 
         // auto_clip_attributes should work with hard clipping
         assert!(clip.auto_clip_attributes);
-        assert_eq!(clip.clipping_mode, "hard");
+        assert_eq!(clip.clipping_mode, ClippingMode::Hard);
     }
 
     #[test]
@@ -1317,7 +1301,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1350,7 +1334,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft-with-mask".to_string(),
+            clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1368,7 +1352,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        assert_eq!(clip.clipping_mode, "soft-with-mask");
+        assert_eq!(clip.clipping_mode, ClippingMode::SoftWithMask);
         assert!(clip.clip_overlapping_reads);
         assert_eq!(clip.read_one_five_prime, 5);
     }
@@ -1381,7 +1365,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1414,7 +1398,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1446,7 +1430,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft".to_string(),
+            clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1470,7 +1454,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft-with-mask".to_string(),
+            clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1494,7 +1478,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1513,9 +1497,9 @@ mod tests {
         };
 
         // Verify all three modes are distinct
-        assert_eq!(soft.clipping_mode, "soft");
-        assert_eq!(soft_mask.clipping_mode, "soft-with-mask");
-        assert_eq!(hard.clipping_mode, "hard");
+        assert_eq!(soft.clipping_mode, ClippingMode::Soft);
+        assert_eq!(soft_mask.clipping_mode, ClippingMode::SoftWithMask);
+        assert_eq!(hard.clipping_mode, ClippingMode::Hard);
     }
 
     #[test]
@@ -1526,7 +1510,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -1555,7 +1539,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -1584,7 +1568,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1617,7 +1601,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1648,7 +1632,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft".to_string(),
+            clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -1717,7 +1701,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1764,7 +1748,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "soft".to_string(),
+            clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1810,7 +1794,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "soft-with-mask".to_string(),
+            clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -1856,7 +1840,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1902,7 +1886,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: true,
 
@@ -1948,7 +1932,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -1995,7 +1979,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -2042,7 +2026,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -2088,7 +2072,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -2135,7 +2119,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -2182,7 +2166,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: true,
 
@@ -2208,51 +2192,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clip_execute_invalid_clipping_mode() {
-        let dir = TempDir::new().unwrap();
-        let ref_path = create_test_reference(&dir);
-        let input_path = dir.path().join("input.bam");
-        let output_path = dir.path().join("output.bam");
-
-        let mut builder = SamBuilder::with_single_ref("chr1", 200);
-        let _ = builder
-            .add_pair()
-            .name("read1")
-            .bases1("ACGTACGTACGTACGTACGT")
-            .contig(0)
-            .start1(10)
-            .start2(30)
-            .build();
-
-        builder.write(&input_path).unwrap();
-
-        let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path },
-            reference: ref_path,
-            clipping_mode: "invalid".to_string(), // Invalid mode
-            clip_overlapping_reads: true,
-            clip_extending_past_mate: false,
-
-            read_one_five_prime: 0,
-            read_one_three_prime: 0,
-            read_two_five_prime: 0,
-            read_two_three_prime: 0,
-            upgrade_clipping: false,
-            auto_clip_attributes: false,
-            metrics: None,
-            sort_order: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        let result = clip.execute("test");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid clipping mode"));
-    }
-
-    #[test]
     fn test_clip_execute_no_clipping_option() {
         let dir = TempDir::new().unwrap();
         let ref_path = create_test_reference(&dir);
@@ -2274,7 +2213,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 
@@ -2327,7 +2266,7 @@ mod tests {
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path.clone() },
             reference: ref_path,
-            clipping_mode: "hard".to_string(),
+            clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
             clip_extending_past_mate: false,
 
@@ -2391,7 +2330,7 @@ mod tests {
                 output: PathBuf::from("output.bam"),
             },
             reference: PathBuf::from("reference.fa"),
-            clipping_mode: "soft".to_string(),
+            clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
             clip_extending_past_mate: false,
 

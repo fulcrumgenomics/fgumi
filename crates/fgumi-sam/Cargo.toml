@@ -11,6 +11,7 @@ license.workspace = true
 noodles = { version = "0.106.0", features = ["bam", "sam", "core"] }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 bstr = "1.12.1"
+clap = { version = "4", features = ["derive"] }
 log = "0"
 anyhow = "1.0"
 fgumi-dna = { workspace = true }
