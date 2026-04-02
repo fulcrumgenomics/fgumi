@@ -160,3 +160,56 @@ fn test_correct_command_with_rejects() {
     assert!(status.success(), "Correct command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 }
+
+/// Test that mixed-length UMI whitelists are accepted and that reads with a UMI length
+/// not present in the whitelist are rejected (`WrongLength`), while reads matching a
+/// whitelist UMI of the correct length are accepted.
+#[test]
+fn test_correct_command_mixed_length_whitelist() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // Whitelist: "AAAAAA" (6-mer) and "CCCCCCC" (7-mer)
+    // six_mer_reads  -> 3 reads with UMI "AAAAAA"  (6-mer, in whitelist) — accepted
+    // seven_mer_reads -> 3 reads with UMI "CCCCCCC" (7-mer, in whitelist) — accepted
+    // eight_mer_reads -> 2 reads with UMI "GGGGGGGG" (8-mer, NOT in whitelist) — rejected (WrongLength)
+    let six_mer_reads = create_umi_family("AAAAAA", 3, "six", "AAAAGGGG", 30);
+    let seven_mer_reads = create_umi_family("CCCCCCC", 3, "seven", "AAAAGGGG", 30);
+    let eight_mer_reads = create_umi_family("GGGGGGGG", 2, "eight", "AAAAGGGG", 30);
+    create_umi_bam(&input_bam, vec![six_mer_reads, seven_mer_reads, eight_mer_reads]);
+    create_whitelist(&whitelist, &["AAAAAA", "CCCCCCC"]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "correct",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--umi-files",
+            whitelist.to_str().unwrap(),
+            "--max-mismatches",
+            "1",
+            "--min-distance",
+            "1",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run correct command");
+
+    assert!(status.success(), "Correct command with mixed-length whitelist failed");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    assert_eq!(reader.records().count(), 6, "Expected 6 accepted reads (3 six-mer + 3 seven-mer)");
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    assert_eq!(reader.records().count(), 2, "Expected 2 rejected reads (8-mer, wrong length)");
+}
