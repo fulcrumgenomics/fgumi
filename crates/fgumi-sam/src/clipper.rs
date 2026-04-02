@@ -46,14 +46,25 @@ macro_rules! slice_array {
 }
 
 /// Modes of clipping that can be applied to reads
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ClippingMode {
     /// Soft clip: convert bases to S operators in CIGAR, keep bases and qualities
     Soft,
     /// Soft clip with masking: convert to S operators and mask bases to N, qualities to min
+    #[value(name = "soft-with-mask")]
     SoftWithMask,
     /// Hard clip: remove bases, qualities, and convert to H operators in CIGAR
     Hard,
+}
+
+impl std::fmt::Display for ClippingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Soft => write!(f, "soft"),
+            Self::SoftWithMask => write!(f, "soft-with-mask"),
+            Self::Hard => write!(f, "hard"),
+        }
+    }
 }
 
 /// Utility for clipping BAM/SAM records in various ways
