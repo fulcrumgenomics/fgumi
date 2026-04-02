@@ -289,6 +289,9 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
 /// Auto-detects BGZF compression via magic bytes.
 pub struct GenericKeyedChunkReader<K: RawSortKey + 'static> {
     receiver: Receiver<Option<(K, Vec<u8>)>>,
+    /// Return channel for empty buffers — the consumer sends its old buffer
+    /// back so the producer can reuse the allocation instead of allocating.
+    buf_return: Sender<Vec<u8>>,
     _handle: JoinHandle<()>,
 }
 
@@ -305,6 +308,7 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     /// Returns an error if the file cannot be opened.
     pub fn open(path: &Path, concurrency_limit: Option<Arc<ChunkReaderSemaphore>>) -> Result<Self> {
         let (tx, rx) = bounded(MERGE_PREFETCH_SIZE);
+        let (buf_tx, buf_rx) = bounded::<Vec<u8>>(MERGE_PREFETCH_SIZE);
         let path = path.to_path_buf();
 
         let handle = thread::spawn(move || {
@@ -336,13 +340,13 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
             // Read using appropriate decoder
             if is_compressed {
                 let bgzf_reader = BgzfReader::new(buf_reader);
-                Self::read_records(bgzf_reader, tx, concurrency_limit);
+                Self::read_records(bgzf_reader, tx, buf_rx, concurrency_limit);
             } else {
-                Self::read_records(buf_reader, tx, concurrency_limit);
+                Self::read_records(buf_reader, tx, buf_rx, concurrency_limit);
             }
         });
 
-        Ok(Self { receiver: rx, _handle: handle })
+        Ok(Self { receiver: rx, buf_return: buf_tx, _handle: handle })
     }
 
     /// Read records from a reader and send them through the channel.
@@ -355,6 +359,7 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
     fn read_records<R: Read>(
         mut reader: R,
         tx: crossbeam_channel::Sender<Option<(K, Vec<u8>)>>,
+        buf_pool: crossbeam_channel::Receiver<Vec<u8>>,
         semaphore: Option<Arc<ChunkReaderSemaphore>>,
     ) {
         const BATCH_SIZE: usize = 64;
@@ -391,7 +396,10 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
 
-                let mut record = vec![0u8; len];
+                // Try to reuse a buffer from the pool; allocate only if empty.
+                let mut record = buf_pool.try_recv().unwrap_or_default();
+                record.clear();
+                record.resize(len, 0);
                 if reader.read_exact(&mut record).is_err() {
                     log::error!("Error reading keyed chunk record");
                     error = true;
@@ -420,10 +428,21 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
         }
     }
 
-    /// Read the next keyed record from the prefetch buffer.
-    pub fn next_record(&mut self) -> Option<(K, Vec<u8>)> {
+    /// Read the next keyed record from the prefetch buffer into `buf`.
+    ///
+    /// On success the record bytes are swapped into `buf` and the sort key is
+    /// returned. The old contents of `buf` are returned to the producer thread
+    /// for reuse, avoiding per-record allocation on the disk path.
+    /// Returns `None` at EOF.
+    pub fn next_record(&mut self, buf: &mut Vec<u8>) -> Option<K> {
         match self.receiver.recv() {
-            Ok(Some(entry)) => Some(entry),
+            Ok(Some((key, mut data))) => {
+                std::mem::swap(buf, &mut data);
+                // Return the old buffer to the producer for reuse.
+                // Ignore errors — producer may have finished.
+                let _ = self.buf_return.try_send(data);
+                Some(key)
+            }
             Ok(None) | Err(_) => None,
         }
     }
@@ -639,7 +658,8 @@ impl RawExternalSorter {
         // Initialize heap with first record from each reader
         let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(readers.len());
         for (reader_idx, reader) in readers.iter_mut().enumerate() {
-            if let Some((key, record)) = reader.next_record() {
+            let mut record = Vec::new();
+            if let Some(key) = reader.next_record(&mut record) {
                 heap.push(HeapEntry { key, record, reader_idx });
             }
         }
@@ -666,14 +686,11 @@ impl RawExternalSorter {
         // Merge loop
         while heap_size > 0 {
             let reader_idx = heap[0].reader_idx;
-            let key = std::mem::take(&mut heap[0].key);
-            let record = std::mem::take(&mut heap[0].record);
 
-            writer.write_record(&key, &record)?;
+            writer.write_record(&heap[0].key, &heap[0].record)?;
 
-            if let Some((next_key, next_record)) = readers[reader_idx].next_record() {
+            if let Some(next_key) = readers[reader_idx].next_record(&mut heap[0].record) {
                 heap[0].key = next_key;
-                heap[0].record = next_record;
                 heap_sift_down(&mut heap, 0, heap_size, &lt);
             } else {
                 heap_size -= 1;
@@ -1466,16 +1483,17 @@ impl RawExternalSorter {
         }
 
         impl KeyedChunkSource {
-            fn next_record(&mut self) -> Option<(TemplateKey, Vec<u8>)> {
+            /// Fill `buf` with the next record's bytes and return the sort key,
+            /// or `None` at EOF.
+            fn next_record(&mut self, buf: &mut Vec<u8>) -> Option<TemplateKey> {
                 match self {
-                    KeyedChunkSource::Disk(reader) => reader.next_record(),
+                    KeyedChunkSource::Disk(reader) => reader.next_record(buf),
                     KeyedChunkSource::Memory { records, idx } => {
                         if *idx < records.len() {
-                            // Use replace with zeroed key and empty vec to avoid Default requirement
-                            let dummy = (TemplateKey::zeroed(), Vec::new());
-                            let entry = std::mem::replace(&mut records[*idx], dummy);
+                            let (key, ref mut data) = records[*idx];
+                            std::mem::swap(buf, data);
                             *idx += 1;
-                            Some(entry)
+                            Some(key)
                         } else {
                             None
                         }
@@ -1490,9 +1508,6 @@ impl RawExternalSorter {
             record: Vec<u8>,
             chunk_idx: usize,
         }
-
-        // Output buffer to reduce write syscalls - stores raw bytes directly
-        const OUTPUT_BUFFER_SIZE: usize = 2048;
 
         let num_disk = chunk_files.len();
         let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
@@ -1525,7 +1540,8 @@ impl RawExternalSorter {
         // Initialize heap with first record from each chunk
         let mut heap: Vec<KeyedHeapEntry> = Vec::with_capacity(sources.len());
         for (chunk_idx, source) in sources.iter_mut().enumerate() {
-            if let Some((key, record)) = source.next_record() {
+            let mut record = Vec::new();
+            if let Some(key) = source.next_record(&mut record) {
                 heap.push(KeyedHeapEntry { key, record, chunk_idx });
             }
         }
@@ -1555,45 +1571,27 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
-        let mut output_buffer: Vec<Vec<u8>> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
 
         // Merge loop using fixed-array heap with O(1) comparisons
         while heap_size > 0 {
-            // Get the minimum record (at heap[0])
             let chunk_idx = heap[0].chunk_idx;
-            let record_bytes = std::mem::take(&mut heap[0].record);
 
-            // Buffer the raw bytes directly (no Record conversion)
-            output_buffer.push(record_bytes);
+            // Write directly from the heap entry's buffer (no intermediate Vec)
+            writer.write_raw_record(&heap[0].record)?;
             records_merged += 1;
 
-            // Flush buffer when full
-            if output_buffer.len() >= OUTPUT_BUFFER_SIZE {
-                for rec in output_buffer.drain(..) {
-                    writer.write_raw_record(&rec)?;
-                }
-            }
-
-            // Get next record from the same chunk
-            if let Some((key, next_record)) = sources[chunk_idx].next_record() {
-                // Replace top with new record and sift down
+            // Refill the heap entry's buffer from the same chunk source
+            if let Some(key) = sources[chunk_idx].next_record(&mut heap[0].record) {
                 heap[0].key = key;
-                heap[0].record = next_record;
                 heap_sift_down(&mut heap, 0, heap_size, &lt);
             } else {
                 // Chunk exhausted - remove from heap
                 heap_size -= 1;
                 if heap_size > 0 {
-                    // Move last element to top and sift down
                     heap.swap(0, heap_size);
                     heap_sift_down(&mut heap, 0, heap_size, &lt);
                 }
             }
-        }
-
-        // Flush remaining buffered records
-        for rec in output_buffer {
-            writer.write_raw_record(&rec)?;
         }
 
         writer.finish()?;
@@ -1623,15 +1621,18 @@ impl RawExternalSorter {
         }
 
         impl<K: RawSortKey + Default + 'static> GenericKeyedChunkSource<K> {
-            fn next_record(&mut self) -> Option<(K, Vec<u8>)> {
+            /// Fill `buf` with the next record's bytes and return the sort key,
+            /// or `None` at EOF.
+            fn next_record(&mut self, buf: &mut Vec<u8>) -> Option<K> {
                 match self {
-                    GenericKeyedChunkSource::Disk(reader) => reader.next_record(),
+                    GenericKeyedChunkSource::Disk(reader) => reader.next_record(buf),
                     GenericKeyedChunkSource::Memory { records, idx } => {
                         if *idx < records.len() {
-                            // Take ownership of the record
-                            let entry = std::mem::take(&mut records[*idx]);
+                            let (ref mut key, ref mut data) = records[*idx];
+                            std::mem::swap(buf, data);
+                            let key = std::mem::take(key);
                             *idx += 1;
-                            Some(entry)
+                            Some(key)
                         } else {
                             None
                         }
@@ -1646,9 +1647,6 @@ impl RawExternalSorter {
             record: Vec<u8>,
             chunk_idx: usize,
         }
-
-        // Output buffer to reduce write syscalls
-        const OUTPUT_BUFFER_SIZE: usize = 2048;
 
         let num_disk = chunk_files.len();
         let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
@@ -1682,7 +1680,8 @@ impl RawExternalSorter {
         // Initialize heap with first record from each chunk
         let mut heap: Vec<GenericKeyedHeapEntry<K>> = Vec::with_capacity(sources.len());
         for (chunk_idx, source) in sources.iter_mut().enumerate() {
-            if let Some((key, record)) = source.next_record() {
+            let mut record = Vec::new();
+            if let Some(key) = source.next_record(&mut record) {
                 heap.push(GenericKeyedHeapEntry { key, record, chunk_idx });
             }
         }
@@ -1711,45 +1710,27 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
-        let mut output_buffer: Vec<Vec<u8>> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
 
         // Merge loop using fixed-array heap with key comparisons
         while heap_size > 0 {
-            // Get the minimum record (at heap[0])
             let chunk_idx = heap[0].chunk_idx;
-            let record_bytes = std::mem::take(&mut heap[0].record);
 
-            // Buffer the raw bytes directly (no Record conversion)
-            output_buffer.push(record_bytes);
+            // Write directly from the heap entry's buffer (no intermediate Vec)
+            writer.write_raw_record(&heap[0].record)?;
             records_merged += 1;
 
-            // Flush buffer when full
-            if output_buffer.len() >= OUTPUT_BUFFER_SIZE {
-                for rec in output_buffer.drain(..) {
-                    writer.write_raw_record(&rec)?;
-                }
-            }
-
-            // Get next record from the same chunk
-            if let Some((key, next_record)) = sources[chunk_idx].next_record() {
-                // Replace top with new record and sift down
+            // Refill the heap entry's buffer from the same chunk source
+            if let Some(key) = sources[chunk_idx].next_record(&mut heap[0].record) {
                 heap[0].key = key;
-                heap[0].record = next_record;
                 heap_sift_down(&mut heap, 0, heap_size, &lt);
             } else {
                 // Chunk exhausted - remove from heap
                 heap_size -= 1;
                 if heap_size > 0 {
-                    // Move last element to top and sift down
                     heap.swap(0, heap_size);
                     heap_sift_down(&mut heap, 0, heap_size, &lt);
                 }
             }
-        }
-
-        // Flush remaining buffered records
-        for rec in output_buffer {
-            writer.write_raw_record(&rec)?;
         }
 
         writer.finish()?;
@@ -1778,14 +1759,18 @@ impl RawExternalSorter {
         }
 
         impl<K: RawSortKey + Default + 'static> KeyedSource<K> {
-            fn next_record(&mut self) -> Option<(K, Vec<u8>)> {
+            /// Fill `buf` with the next record's bytes and return the sort key,
+            /// or `None` at EOF.
+            fn next_record(&mut self, buf: &mut Vec<u8>) -> Option<K> {
                 match self {
-                    KeyedSource::Disk(reader) => reader.next_record(),
+                    KeyedSource::Disk(reader) => reader.next_record(buf),
                     KeyedSource::Memory { records, idx } => {
                         if *idx < records.len() {
-                            let entry = std::mem::take(&mut records[*idx]);
+                            let (ref mut key, ref mut data) = records[*idx];
+                            std::mem::swap(buf, data);
+                            let key = std::mem::take(key);
                             *idx += 1;
-                            Some(entry)
+                            Some(key)
                         } else {
                             None
                         }
@@ -1828,7 +1813,8 @@ impl RawExternalSorter {
         // Initialize heap
         let mut heap: Vec<HeapEntry<K>> = Vec::with_capacity(sources.len());
         for (chunk_idx, source) in sources.iter_mut().enumerate() {
-            if let Some((key, record)) = source.next_record() {
+            let mut record = Vec::new();
+            if let Some(key) = source.next_record(&mut record) {
                 heap.push(HeapEntry { key, record, chunk_idx });
             }
         }
@@ -1866,14 +1852,12 @@ impl RawExternalSorter {
         // for each record, so we write directly
         while heap_size > 0 {
             let chunk_idx = heap[0].chunk_idx;
-            let record_bytes = std::mem::take(&mut heap[0].record);
 
-            writer.write_raw_record(&record_bytes)?;
+            writer.write_raw_record(&heap[0].record)?;
             records_merged += 1;
 
-            if let Some((key, next_record)) = sources[chunk_idx].next_record() {
+            if let Some(key) = sources[chunk_idx].next_record(&mut heap[0].record) {
                 heap[0].key = key;
-                heap[0].record = next_record;
                 heap_sift_down(&mut heap, 0, heap_size, &lt);
             } else {
                 heap_size -= 1;
