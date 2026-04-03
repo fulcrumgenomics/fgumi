@@ -178,7 +178,7 @@ fn make_bgzf_writer(
 /// produces subtly different output that causes read-back failures with
 /// some writer backends (e.g. `MultithreadedWriter`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
+pub(crate) fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
     // BAM magic
     writer.write_all(fgumi_raw_bam::BAM_MAGIC)?;
 
@@ -869,7 +869,7 @@ pub fn is_stdout_path<P: AsRef<Path>>(path: P) -> bool {
 }
 
 /// Open an output writer for a path, supporting stdout via "-" or "/dev/stdout".
-fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
+pub(crate) fn open_output_writer<P: AsRef<Path>>(path: P) -> Result<Box<dyn Write + Send>> {
     let path_ref = path.as_ref();
     if is_stdout_path(path_ref) {
         Ok(Box::new(std::io::stdout()))

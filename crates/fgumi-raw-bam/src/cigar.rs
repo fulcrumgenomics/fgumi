@@ -246,6 +246,33 @@ pub fn unclipped_5prime_from_raw_bam(bam: &[u8]) -> i32 {
     }
 }
 
+/// Compute unclipped 5' position directly from raw BAM bytes (zero allocation).
+///
+/// Like [`unclipped_5prime_from_raw_bam`] but uses pre-extracted `pos` (0-based) and
+/// `is_reverse` flag, avoiding redundant field reads when the caller already has them.
+/// Returns the position in the same basis as the input `pos`.
+#[inline]
+#[must_use]
+pub fn unclipped_5prime_raw(bam: &[u8], pos: i32, is_reverse: bool) -> i32 {
+    let n_cigar_op = n_cigar_op(bam) as usize;
+    if n_cigar_op == 0 {
+        return pos;
+    }
+
+    let l_read_name = l_read_name(bam) as usize;
+    let cigar_start = 32 + l_read_name;
+    let cigar_end = cigar_start + n_cigar_op * 4;
+    if cigar_end > bam.len() {
+        return pos;
+    }
+
+    if is_reverse {
+        unclipped_end_from_raw_cigar(pos, bam, cigar_start, n_cigar_op)
+    } else {
+        unclipped_start_from_raw_cigar(pos, bam, cigar_start, n_cigar_op)
+    }
+}
+
 /// Calculate mate's unclipped 5' coordinate from MC tag.
 ///
 /// For forward strand mate: `unclipped_start`
@@ -1863,5 +1890,48 @@ mod tests {
     fn test_unclipped_other_end_complex() {
         // 10M5S3H: ref=10, trailing=5+3=8, end = 100 + 10 + 8 - 1 = 117
         assert_eq!(unclipped_other_end(100, "10M5S3H"), 117);
+    }
+
+    // ========================================================================
+    // unclipped_5prime_raw tests
+    // ========================================================================
+
+    use rstest::rstest;
+
+    #[rstest]
+    // Forward strand: 5' = start. 5S10M at pos 100 → unclipped start = 100 - 5 = 95
+    #[case(false, &[encode_op(4, 5), encode_op(0, 10)], 100, 95)]
+    // Reverse strand: 5' = end. 10M5S at pos 100 → ref end = 100+10-1=109, unclipped end = 109+5=114
+    #[case(true, &[encode_op(0, 10), encode_op(4, 5)], 100, 114)]
+    // Forward strand: no clipping. 10M at pos 50 → 50
+    #[case(false, &[encode_op(0, 10)], 50, 50)]
+    // Reverse strand: no clipping. 10M at pos 50 → 50+10-1=59
+    #[case(true, &[encode_op(0, 10)], 50, 59)]
+    fn test_unclipped_5prime_raw_basic(
+        #[case] is_reverse: bool,
+        #[case] cigar: &[u32],
+        #[case] pos: i32,
+        #[case] expected: i32,
+    ) {
+        let flags = if is_reverse { flags::REVERSE } else { 0 };
+        let rec = make_bam_bytes(0, pos, flags, b"read", cigar, 15, -1, -1, &[]);
+        assert_eq!(unclipped_5prime_raw(&rec, pos, is_reverse), expected);
+    }
+
+    #[test]
+    fn test_unclipped_5prime_raw_no_cigar() {
+        // n_cigar_op == 0 → returns pos unchanged
+        let rec = make_bam_bytes(0, 100, 0, b"read", &[], 15, -1, -1, &[]);
+        assert_eq!(unclipped_5prime_raw(&rec, 100, false), 100);
+    }
+
+    #[test]
+    fn test_unclipped_5prime_raw_truncated_record() {
+        // Record too short for CIGAR → falls back to returning pos
+        let flags = 0u16;
+        let mut rec = make_bam_bytes(0, 100, flags, b"read", &[encode_op(0, 10)], 10, -1, -1, &[]);
+        // Truncate so cigar_end > bam.len()
+        rec.truncate(36);
+        assert_eq!(unclipped_5prime_raw(&rec, 100, false), 100);
     }
 }

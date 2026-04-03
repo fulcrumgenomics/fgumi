@@ -27,9 +27,9 @@ use std::io::{Read, Write};
 /// ensures pos=0 doesn't collide with unmapped (which uses MAX).
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub struct PackedCoordKey(pub u64);
+pub struct PackedCoordinateKey(pub u64);
 
-impl PackedCoordKey {
+impl PackedCoordinateKey {
     /// Create a packed coordinate key.
     ///
     /// # Arguments
@@ -40,9 +40,11 @@ impl PackedCoordKey {
     #[inline]
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn new(tid: i32, pos: i32, reverse: bool, nref: u32) -> Self {
-        // Map unmapped (tid=-1) to nref for proper sorting (after all mapped)
-        let tid = if tid < 0 { nref } else { tid as u32 };
+    pub fn new(tid: i32, pos: i32, reverse: bool, _nref: u32) -> Self {
+        if tid < 0 {
+            return Self::unmapped();
+        }
+        let tid = tid as u32;
         // Pack: tid in high bits, (pos+1) in middle, reverse in LSB
         // Using pos+1 so that pos=0 doesn't become 0 in the key
         #[allow(clippy::cast_lossless)] // Explicit bit packing requires precise control
@@ -275,7 +277,7 @@ impl RecordBuffer {
         self.refs.iter().map(|r| self.get_record(r))
     }
 
-    /// Get the sorted record references.
+    /// Get the record references.
     #[must_use]
     pub fn refs(&self) -> &[RecordRef] {
         &self.refs
@@ -338,9 +340,9 @@ pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
     // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
     // - tid < 0: unmapped with no reference, sort at end
     if tid < 0 {
-        PackedCoordKey::unmapped().0
+        PackedCoordinateKey::unmapped().0
     } else {
-        PackedCoordKey::new(tid, pos, reverse, nref).0
+        PackedCoordinateKey::new(tid, pos, reverse, nref).0
     }
 }
 
@@ -529,10 +531,12 @@ impl TemplateKey {
 impl RawSortKey for TemplateKey {
     const SERIALIZED_SIZE: Option<usize> = Some(40);
 
+    /// # Panics
+    ///
+    /// Always panics. `TemplateKey` extraction requires a [`LibraryLookup`]
+    /// context not available through the `RawSortKey` trait interface. All
+    /// callers must use `extract_template_key_inline()` instead.
     fn extract(_bam: &[u8], _ctx: &SortContext) -> Self {
-        // TemplateKey extraction requires LibraryLookup context not available through the
-        // RawSortKey trait interface.  All callers use extract_template_key_inline() in raw.rs
-        // instead.  This arm exists only to satisfy the trait obligation.
         unreachable!(
             "TemplateKey::extract() should not be called directly. \
              Use extract_template_key_inline() with LibraryLookup instead."
@@ -577,6 +581,10 @@ pub struct TemplateInlineHeader {
 
 /// Size of `TemplateInlineHeader` in bytes.
 pub const TEMPLATE_HEADER_SIZE: usize = 48; // 5 * 8 (key) + 4 + 4
+const _: () = assert!(
+    std::mem::size_of::<TemplateInlineHeader>() == TEMPLATE_HEADER_SIZE,
+    "TEMPLATE_HEADER_SIZE must match size_of::<TemplateInlineHeader>()"
+);
 
 impl TemplateInlineHeader {
     /// Write header to a byte buffer.
@@ -746,7 +754,7 @@ impl TemplateRecordBuffer {
         self.refs.iter().map(|r| self.get_record(r))
     }
 
-    /// Get the sorted record references.
+    /// Get the record references.
     #[must_use]
     pub fn refs(&self) -> &[TemplateRecordRef] {
         &self.refs
@@ -833,6 +841,9 @@ impl TemplateRecordBuffer {
 // ============================================================================
 // Radix Sort for RecordRef
 // ============================================================================
+
+// NOTE: QuerynameRecordBuffer was removed — it had zero callers and proved to
+// regress when wired in (reconstruct_record allocates per record on write-out).
 
 /// Threshold below which we use insertion sort instead of radix sort.
 const RADIX_THRESHOLD: usize = 256;
@@ -1067,7 +1078,7 @@ pub fn radix_sort_template_refs(refs: &mut [TemplateRecordRef]) {
     let max_primary = refs.iter().map(|r| r.key.primary).max().unwrap_or(0);
     let bytes_needed = bytes_needed_u64(max_primary);
     if bytes_needed > 0 {
-        radix_sort_template_field(refs, &mut aux, |r| r.key.primary, bytes_needed, 0);
+        radix_sort_template_field(refs, &mut aux, |r| r.key.primary, bytes_needed);
     }
 
     // Phase 2: Find equal-primary runs and sub-sort by remaining fields
@@ -1114,7 +1125,7 @@ fn sub_sort_runs<F>(
                 let bytes_needed = bytes_needed_u64(max_val);
                 if bytes_needed > 0 {
                     let run_aux = &mut aux[start..end];
-                    radix_sort_template_field(run, run_aux, next_field, bytes_needed, 0);
+                    radix_sort_template_field(run, run_aux, next_field, bytes_needed);
                 }
 
                 if remaining_fields.len() > 1 {
@@ -1133,7 +1144,6 @@ fn radix_sort_template_field<F>(
     aux: &mut [TemplateRecordRef],
     get_field: F,
     bytes_needed: usize,
-    _field_idx: usize,
 ) where
     F: Fn(&TemplateRecordRef) -> u64,
 {
@@ -1305,16 +1315,25 @@ mod tests {
     #[test]
     fn test_packed_coord_key_ordering() {
         // Lower tid should come first
-        assert!(PackedCoordKey::new(0, 100, false, 10) < PackedCoordKey::new(1, 100, false, 10));
+        assert!(
+            PackedCoordinateKey::new(0, 100, false, 10)
+                < PackedCoordinateKey::new(1, 100, false, 10)
+        );
 
         // Lower pos should come first
-        assert!(PackedCoordKey::new(0, 100, false, 10) < PackedCoordKey::new(0, 200, false, 10));
+        assert!(
+            PackedCoordinateKey::new(0, 100, false, 10)
+                < PackedCoordinateKey::new(0, 200, false, 10)
+        );
 
         // Forward should come before reverse (false < true)
-        assert!(PackedCoordKey::new(0, 100, false, 10) < PackedCoordKey::new(0, 100, true, 10));
+        assert!(
+            PackedCoordinateKey::new(0, 100, false, 10)
+                < PackedCoordinateKey::new(0, 100, true, 10)
+        );
 
         // Unmapped should come last
-        assert!(PackedCoordKey::new(9, 1_000_000, true, 10) < PackedCoordKey::unmapped());
+        assert!(PackedCoordinateKey::new(9, 1_000_000, true, 10) < PackedCoordinateKey::unmapped());
     }
 
     #[test]
@@ -1990,8 +2009,8 @@ mod tests {
                         primary: h,
                         secondary: h.wrapping_mul(6_364_136_223_846_793_005),
                         cb_hash: h.wrapping_mul(2_654_435_761),
-                        tertiary: h.rotate_left(23),
-                        name_hash_upper: h.rotate_right(7),
+                        tertiary: h.wrapping_mul(40503),
+                        name_hash_upper: h.rotate_left(17),
                     };
                     refs.push(make_ref(key, i as u64));
                 }
@@ -2004,7 +2023,8 @@ mod tests {
                 for i in 0..n {
                     prop_assert_eq!(
                         refs[i].key, expected[i].key,
-                        "Mismatch at index {}", i
+                        "Mismatch at index {}: MSD key {:?} != reference {:?}",
+                        i, refs[i].key, expected[i].key
                     );
                 }
             }

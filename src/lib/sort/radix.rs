@@ -10,51 +10,6 @@
 
 use std::cmp::Ordering;
 
-/// Packed coordinate key for radix sorting.
-///
-/// Packs tid (16 bits) + pos (32 bits) + reverse (1 bit) into a u64 for
-/// efficient radix sorting.
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-#[repr(transparent)]
-pub struct PackedCoordinateKey(u64);
-
-impl PackedCoordinateKey {
-    /// Create a new packed coordinate key.
-    ///
-    /// Layout: `[tid:16][pos:32][reverse:1][padding:15]`
-    #[inline]
-    #[must_use]
-    #[allow(clippy::cast_sign_loss)]
-    pub fn new(tid: i32, pos: i32, reverse: bool) -> Self {
-        // Handle unmapped (tid=-1) by mapping to max value
-        let tid_bits = if tid < 0 { 0xFFFF_u64 } else { (tid as u64) & 0xFFFF };
-        let pos_bits = if pos < 0 { 0xFFFF_FFFF_u64 } else { (pos as u64) & 0xFFFF_FFFF };
-        let reverse_bit = u64::from(reverse);
-
-        // Pack: [tid:16][pos:32][reverse:1][padding:15]
-        Self((tid_bits << 48) | (pos_bits << 16) | (reverse_bit << 15))
-    }
-
-    /// Get the raw u64 value for sorting.
-    #[inline]
-    #[must_use]
-    pub fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl PartialOrd for PackedCoordinateKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PackedCoordinateKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
 /// Threshold below which we use insertion sort instead of radix sort.
 const RADIX_THRESHOLD: usize = 256;
 
@@ -157,105 +112,6 @@ fn bytes_needed_u32(val: u32) -> usize {
         return 0;
     }
     ((32 - val.leading_zeros()) as usize).div_ceil(8)
-}
-
-/// Pack coordinate fields for radix sorting (samtools style).
-///
-/// Returns a key suitable for LSD radix sort where:
-/// - Lower bytes contain pos+reverse (sorted first)
-/// - Upper bytes contain tid (sorted last)
-/// - Unmapped reads (tid=-1) map to nref to sort at end
-#[inline]
-#[must_use]
-#[allow(clippy::cast_sign_loss)]
-pub fn pack_coordinate_for_radix(tid: i32, pos: i32, reverse: bool, nref: u32) -> u64 {
-    // Map unmapped (-1) to nref so they sort to the end
-    let tid_val = if tid < 0 { nref } else { tid as u32 };
-
-    // pos shifted left by 1, with reverse bit in LSB
-    // Add 1 to pos so -1 becomes 0 (unmapped positions sort first within unmapped tid)
-    let pos_val = (((pos + 1) as u64) << 1) | u64::from(reverse);
-
-    // Pack: lower 40 bits = pos+reverse, upper 24 bits = tid
-    // This gives us room for pos up to ~500 billion and tid up to 16 million
-    pos_val | (u64::from(tid_val) << 40)
-}
-
-/// Radix sort for packed coordinate keys.
-///
-/// Uses 8-bit radix (256 buckets) with 8 passes for 64-bit keys.
-/// Falls back to insertion sort for small arrays.
-#[allow(clippy::uninit_vec, unsafe_code)]
-pub fn radix_sort_u64<T: Clone>(entries: &mut [(u64, T)]) {
-    if entries.len() < RADIX_THRESHOLD {
-        // Use insertion sort for small arrays
-        insertion_sort_by_key(entries, |(k, _)| *k);
-        return;
-    }
-
-    let n = entries.len();
-
-    // Allocate auxiliary buffer
-    let mut aux: Vec<(u64, T)> = Vec::with_capacity(n);
-    unsafe {
-        aux.set_len(n);
-    }
-
-    let mut src = entries as *mut [(u64, T)];
-    let mut dst = aux.as_mut_slice() as *mut [(u64, T)];
-
-    // 8 passes, one for each byte (LSB first)
-    for pass in 0..8 {
-        let shift = pass * 8;
-
-        let src_slice = unsafe { &*src };
-        let dst_slice = unsafe { &mut *dst };
-
-        // Count occurrences of each byte value
-        let mut counts = [0usize; 256];
-        for (key, _) in src_slice {
-            let byte = ((key >> shift) & 0xFF) as usize;
-            counts[byte] += 1;
-        }
-
-        // Convert to cumulative offsets
-        let mut total = 0;
-        for count in &mut counts {
-            let c = *count;
-            *count = total;
-            total += c;
-        }
-
-        // Scatter elements to destination
-        for item in src_slice {
-            let byte = ((item.0 >> shift) & 0xFF) as usize;
-            let dest_idx = counts[byte];
-            counts[byte] += 1;
-            dst_slice[dest_idx] = item.clone();
-        }
-
-        // Swap src and dst
-        std::mem::swap(&mut src, &mut dst);
-    }
-
-    // After 8 passes (even number), data is back in original buffer
-}
-
-/// Radix sort for packed coordinate keys with associated data.
-#[allow(unsafe_code)]
-pub fn radix_sort_coordinate<T: Clone>(entries: &mut [(PackedCoordinateKey, T)]) {
-    if entries.len() < RADIX_THRESHOLD {
-        insertion_sort_by_key(entries, |(k, _)| k.0);
-        return;
-    }
-
-    // Convert to u64 keys for radix sort
-    // SAFETY: PackedCoordinateKey is #[repr(transparent)] over u64,
-    // so (PackedCoordinateKey, T) has the same layout as (u64, T)
-    let entries_u64: &mut [(u64, T)] =
-        unsafe { std::slice::from_raw_parts_mut(entries.as_mut_ptr().cast(), entries.len()) };
-
-    radix_sort_u64(entries_u64);
 }
 
 // ============================================================================
@@ -438,6 +294,43 @@ where
 mod tests {
     use super::*;
 
+    /// Packed coordinate key for testing radix sort.
+    ///
+    /// Layout: `[tid:16][pos:32][reverse:1][padding:15]`
+    #[derive(Clone, Copy, Eq, PartialEq, Debug)]
+    #[repr(transparent)]
+    struct PackedCoordinateKey(u64);
+
+    impl PackedCoordinateKey {
+        #[allow(clippy::cast_sign_loss)]
+        fn new(tid: i32, pos: i32, reverse: bool) -> Self {
+            let tid_bits = if tid < 0 { 0xFFFF_u64 } else { (tid as u64) & 0xFFFF };
+            let pos_bits = if pos < 0 { 0xFFFF_FFFF_u64 } else { (pos as u64) & 0xFFFF_FFFF };
+            let reverse_bit = u64::from(reverse);
+            Self((tid_bits << 48) | (pos_bits << 16) | (reverse_bit << 15))
+        }
+    }
+
+    impl PartialOrd for PackedCoordinateKey {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for PackedCoordinateKey {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.cmp(&other.0)
+        }
+    }
+
+    /// Pack coordinate fields for radix sorting (samtools style, test-only).
+    #[allow(clippy::cast_sign_loss)]
+    fn pack_coordinate_for_radix(tid: i32, pos: i32, reverse: bool, nref: u32) -> u64 {
+        let tid_val = if tid < 0 { nref } else { tid as u32 };
+        let pos_val = (((pos + 1) as u64) << 1) | u64::from(reverse);
+        pos_val | (u64::from(tid_val) << 40)
+    }
+
     #[test]
     fn test_packed_coordinate_key() {
         let k1 = PackedCoordinateKey::new(0, 100, false);
@@ -459,27 +352,26 @@ mod tests {
     }
 
     #[test]
-    fn test_radix_sort_small() {
+    fn test_insertion_sort_by_key_packed() {
         let mut entries: Vec<(u64, i32)> = vec![(5, 50), (3, 30), (8, 80), (1, 10), (4, 40)];
+        let mut expected = entries.clone();
+        expected.sort_by_key(|(k, _)| *k);
 
-        radix_sort_u64(&mut entries);
+        insertion_sort_by_key(&mut entries, |(k, _)| *k);
 
-        assert_eq!(entries[0], (1, 10));
-        assert_eq!(entries[1], (3, 30));
-        assert_eq!(entries[2], (4, 40));
-        assert_eq!(entries[3], (5, 50));
-        assert_eq!(entries[4], (8, 80));
+        assert_eq!(entries, expected);
     }
 
     #[test]
-    fn test_radix_sort_large() {
+    fn test_radix_sort_coordinate_adaptive_large() {
         let mut entries: Vec<(u64, usize)> = (0..1000).rev().map(|i| (i as u64, i)).collect();
+        let mut expected = entries.clone();
+        expected.sort_by_key(|(k, _)| *k);
 
-        radix_sort_u64(&mut entries);
+        // max_tid=100, max_pos large enough to cover all keys
+        radix_sort_coordinate_adaptive(&mut entries, 100, 1000);
 
-        for (i, (key, _)) in entries.iter().enumerate() {
-            assert_eq!(*key, i as u64);
-        }
+        assert_eq!(entries, expected);
     }
 
     #[test]
