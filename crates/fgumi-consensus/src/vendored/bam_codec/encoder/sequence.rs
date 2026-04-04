@@ -216,22 +216,26 @@ mod tests {
         let mut buf = Vec::new();
 
         // Empty sequence
-        write_sequence_from_slice(&mut buf, 0, b"").unwrap();
+        write_sequence_from_slice(&mut buf, 0, b"")
+            .expect("write_sequence_from_slice should succeed");
         assert!(buf.is_empty());
 
         // Even length (4 bases -> 2 bytes)
         buf.clear();
-        write_sequence_from_slice(&mut buf, 4, b"ACGT").unwrap();
+        write_sequence_from_slice(&mut buf, 4, b"ACGT")
+            .expect("write_sequence_from_slice should succeed");
         assert_eq!(buf, [0x12, 0x48]); // A=1, C=2, G=4, T=8
 
         // Odd length (3 bases -> 2 bytes, last nibble padded)
         buf.clear();
-        write_sequence_from_slice(&mut buf, 3, b"ACG").unwrap();
+        write_sequence_from_slice(&mut buf, 3, b"ACG")
+            .expect("write_sequence_from_slice should succeed");
         assert_eq!(buf, [0x12, 0x40]); // A=1, C=2, G=4, pad=0
 
         // Single base
         buf.clear();
-        write_sequence_from_slice(&mut buf, 1, b"A").unwrap();
+        write_sequence_from_slice(&mut buf, 1, b"A")
+            .expect("write_sequence_from_slice should succeed");
         assert_eq!(buf, [0x10]); // A=1, pad=0
 
         // Length mismatch error
@@ -240,9 +244,11 @@ mod tests {
 
         // Verify matches trait-based version
         buf.clear();
-        write_sequence_from_slice(&mut buf, 4, b"ACGT").unwrap();
+        write_sequence_from_slice(&mut buf, 4, b"ACGT")
+            .expect("write_sequence_from_slice should succeed");
         let mut buf2 = Vec::new();
-        write_sequence(&mut buf2, 4, &SequenceBuf::from(b"ACGT")).unwrap();
+        write_sequence(&mut buf2, 4, &SequenceBuf::from(b"ACGT"))
+            .expect("write_sequence should succeed");
         assert_eq!(buf, buf2);
     }
 }

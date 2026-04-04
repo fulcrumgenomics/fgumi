@@ -1623,7 +1623,11 @@ mod tests {
 
         // Check that CIGAR starts with soft clip
         let cigar = record.cigar();
-        let first_op = cigar.iter().next().unwrap().unwrap();
+        let first_op = cigar
+            .iter()
+            .next()
+            .expect("CIGAR should have at least one op")
+            .expect("failed to parse CIGAR op");
         assert_eq!(first_op.kind(), Kind::SoftClip);
         assert_eq!(first_op.len(), 5);
     }
@@ -1639,7 +1643,7 @@ mod tests {
         // Check that CIGAR ends with soft clip
         let cigar = record.cigar();
         let ops: Vec<_> = cigar.iter().filter_map(Result::ok).collect();
-        let last_op = ops.last().unwrap();
+        let last_op = ops.last().expect("CIGAR should have at least one op");
         assert_eq!(last_op.kind(), Kind::SoftClip);
         assert_eq!(last_op.len(), 5);
     }
@@ -1700,7 +1704,11 @@ mod tests {
 
         // Check that CIGAR starts with hard clip
         let cigar = record.cigar();
-        let first_op = cigar.iter().next().unwrap().unwrap();
+        let first_op = cigar
+            .iter()
+            .next()
+            .expect("CIGAR should have at least one op")
+            .expect("failed to parse CIGAR op");
         assert_eq!(first_op.kind(), Kind::HardClip);
         assert_eq!(first_op.len(), 5);
     }
@@ -1739,7 +1747,9 @@ mod tests {
         assert!(clipped_r2 > 0, "R2 should be clipped");
 
         // Both should clip roughly equal amounts (within a few bases due to rounding)
-        let diff = (i32::try_from(clipped_r1).unwrap() - i32::try_from(clipped_r2).unwrap()).abs();
+        let diff = (i32::try_from(clipped_r1).expect("clipped_r1 should fit in i32")
+            - i32::try_from(clipped_r2).expect("clipped_r2 should fit in i32"))
+        .abs();
         assert!(
             diff <= 2,
             "Clipping should be roughly equal, but got {clipped_r1} vs {clipped_r2}"
@@ -1802,7 +1812,11 @@ mod tests {
 
         // Total soft clip should be 5 + 3 = 8
         let cigar = record.cigar();
-        let first_op = cigar.iter().next().unwrap().unwrap();
+        let first_op = cigar
+            .iter()
+            .next()
+            .expect("CIGAR should have at least one op")
+            .expect("failed to parse CIGAR op");
         assert_eq!(first_op.kind(), Kind::SoftClip);
     }
 
@@ -1829,7 +1843,11 @@ mod tests {
 
         // CIGAR should remain unchanged
         let cigar = record.cigar();
-        let first_op = cigar.iter().next().unwrap().unwrap();
+        let first_op = cigar
+            .iter()
+            .next()
+            .expect("CIGAR should have at least one op")
+            .expect("failed to parse CIGAR op");
         assert_eq!(first_op.kind(), Kind::Match);
     }
 
@@ -1868,7 +1886,7 @@ mod tests {
             .filter(|s| !s.is_empty())
             .zip(mate_cigar_str.chars().filter(|c| c.is_alphabetic()))
             .map(|(len_str, kind_char)| {
-                let len: usize = len_str.parse().unwrap();
+                let len: usize = len_str.parse().expect("failed to parse CIGAR operation length");
                 let kind = match kind_char {
                     'M' => Kind::Match,
                     'I' => Kind::Insertion,
@@ -1890,18 +1908,18 @@ mod tests {
             // tlen = -(this_end - mate_start + 1)
             let this_end = start_pos + ref_len - 1;
             if this_end >= mate_pos {
-                -i32::try_from(this_end - mate_pos + 1).unwrap()
+                -i32::try_from(this_end - mate_pos + 1).expect("template length should fit in i32")
             } else {
-                i32::try_from(mate_pos - this_end - 1).unwrap()
+                i32::try_from(mate_pos - this_end - 1).expect("template length should fit in i32")
             }
         } else {
             // This read is forward, mate is reverse
             // tlen = mate_end - this_start + 1
             let mate_end = mate_pos + mate_ref_len - 1;
             if mate_end >= start_pos {
-                i32::try_from(mate_end - start_pos + 1).unwrap()
+                i32::try_from(mate_end - start_pos + 1).expect("template length should fit in i32")
             } else {
-                -i32::try_from(start_pos - mate_end - 1).unwrap()
+                -i32::try_from(start_pos - mate_end - 1).expect("template length should fit in i32")
             }
         };
 
@@ -2788,7 +2806,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper.upgrade_all_clipping(&mut no_auto).unwrap();
+        let result = clipper
+            .upgrade_all_clipping(&mut no_auto)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 10));
 
         let cigar_str = format_cigar(&no_auto.cigar());
@@ -2808,7 +2828,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper_auto.upgrade_all_clipping(&mut with_auto).unwrap();
+        let result = clipper_auto
+            .upgrade_all_clipping(&mut with_auto)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 10));
 
         let cigar_str = format_cigar(&with_auto.cigar());
@@ -2835,7 +2857,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper.upgrade_all_clipping(&mut no_auto).unwrap();
+        let result = clipper
+            .upgrade_all_clipping(&mut no_auto)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 10));
 
         let cigar_str = format_cigar(&no_auto.cigar());
@@ -2855,7 +2879,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper_auto.upgrade_all_clipping(&mut with_auto).unwrap();
+        let result = clipper_auto
+            .upgrade_all_clipping(&mut with_auto)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 10));
 
         let cigar_str = format_cigar(&with_auto.cigar());
@@ -2883,7 +2909,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper.upgrade_all_clipping(&mut no_soft).unwrap();
+        let result = clipper
+            .upgrade_all_clipping(&mut no_soft)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&no_soft.cigar());
@@ -2896,7 +2924,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper.upgrade_all_clipping(&mut hard_only).unwrap();
+        let result = clipper
+            .upgrade_all_clipping(&mut hard_only)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&hard_only.cigar());
@@ -2918,7 +2948,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper_soft.upgrade_all_clipping(&mut mapped).unwrap();
+        let result = clipper_soft
+            .upgrade_all_clipping(&mut mapped)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         // Test SoftWithMask mode (should not convert)
@@ -2928,7 +2960,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper_mask.upgrade_all_clipping(&mut mapped2).unwrap();
+        let result = clipper_mask
+            .upgrade_all_clipping(&mut mapped2)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         // Test unmapped read (should not convert)
@@ -2939,7 +2973,9 @@ mod tests {
             .data_mut()
             .insert(az_tag, Value::from("12345678901234567890123456789012345678901234567890"));
 
-        let result = clipper_hard.upgrade_all_clipping(&mut unmapped).unwrap();
+        let result = clipper_hard
+            .upgrade_all_clipping(&mut unmapped)
+            .expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
     }
 
@@ -2962,7 +2998,9 @@ mod tests {
         // For FR pair: template length = r2_end - r1_start + 1
         let r2_len = cigar_utils::reference_length(&r2.cigar());
         let r2_end = r2_start + r2_len - 1;
-        let tlen = i32::try_from(r2_end).unwrap() - i32::try_from(r1_start).unwrap() + 1;
+        let tlen = i32::try_from(r2_end).expect("r2_end should fit in i32")
+            - i32::try_from(r1_start).expect("r1_start should fit in i32")
+            + 1;
 
         // Set up FR pair flags
         // R1 is forward strand, R2 is reverse strand (typical FR pair)
@@ -3350,9 +3388,12 @@ mod tests {
         assert!(clipped_r1 > 0 || clipped_r2 > 0);
 
         // After clipping, they should not overlap (abutting is OK)
-        let r1_end_after =
-            usize::from(r1.alignment_start().unwrap()) + cigar_utils::reference_length(&r1.cigar());
-        let r2_start_after = usize::from(r2.alignment_start().unwrap());
+        let r1_end_after = usize::from(
+            r1.alignment_start().expect("r1 should have alignment start after clipping"),
+        ) + cigar_utils::reference_length(&r1.cigar());
+        let r2_start_after = usize::from(
+            r2.alignment_start().expect("r2 should have alignment start after clipping"),
+        );
         assert!(
             r1_end_after <= r2_start_after,
             "After clipping, r1 end ({r1_end_after}) should be at or before r2 start ({r2_start_after})"
@@ -3542,7 +3583,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3557,7 +3599,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3571,7 +3614,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3585,7 +3629,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345"; // 35 bases
         let mut record = create_test_record("5H35M10H", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3600,7 +3645,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345";
         let mut record = create_test_record("5H35M10H", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3614,7 +3660,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345";
         let mut record = create_test_record("5H35M10H", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3631,7 +3678,8 @@ mod tests {
         // Mark as unmapped
         *record.flags_mut() = Flags::UNMAPPED;
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3645,7 +3693,8 @@ mod tests {
         let seq = "1234567890123456789012345678901234567890"; // 40 bases (2H + 5S + 30M + 3S)
         let mut record = create_test_record("2H5S30M3S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 3));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3660,7 +3709,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("5S35M10S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 10));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3674,7 +3724,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("10S40M", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (10, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3688,7 +3739,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("40M10S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 10));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3702,7 +3754,8 @@ mod tests {
         let seq = "123456789012345678901234567890123456789012345"; // 45 bases (5S + 20M + 5I + 10M + 5S)
         let mut record = create_test_record("5S20M5I10M5S", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (5, 5));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3716,7 +3769,8 @@ mod tests {
         let seq = "12345678901234567890123456789012345678901234567890";
         let mut record = create_test_record("50M", seq, 10);
 
-        let result = clipper.upgrade_all_clipping(&mut record).unwrap();
+        let result =
+            clipper.upgrade_all_clipping(&mut record).expect("upgrade_all_clipping should succeed");
         assert_eq!(result, (0, 0));
 
         let cigar_str = format_cigar(&record.cigar());
@@ -3737,9 +3791,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 1);
         assert_eq!(clipped_r2, 1);
-        assert_eq!(r1.alignment_start(), Some(Position::new(2).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(2).expect("position 2 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "99M1S");
-        assert_eq!(r2.alignment_start(), Some(Position::new(2).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(2).expect("position 2 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "1S99M");
     }
 
@@ -3754,9 +3814,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 2);
         assert_eq!(clipped_r2, 2);
-        assert_eq!(r1.alignment_start(), Some(Position::new(3).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(3).expect("position 3 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "98M2S");
-        assert_eq!(r2.alignment_start(), Some(Position::new(3).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(3).expect("position 3 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "2S98M");
     }
 
@@ -3771,9 +3837,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 50); // R1 gets clipped
         assert_eq!(clipped_r2, 0); // R2 already has clipping
-        assert_eq!(r1.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "50M50S");
-        assert_eq!(r2.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "50S50M"); // unchanged
     }
 
@@ -3788,9 +3860,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 40); // 40 bases clipped (insertion doesn't count toward ref)
         assert_eq!(clipped_r2, 0);
-        assert_eq!(r1.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "40M10I10M40S");
-        assert_eq!(r2.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "50S50M"); // unchanged
     }
 
@@ -3805,9 +3883,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 0); // No aligned bases clipped
         assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(r1.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "30M10S10H"); // 10 of 20S hard-clipped
-        assert_eq!(r2.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "10H40M"); // 10S hard-clipped
     }
 
@@ -3822,9 +3906,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 0); // No aligned bases clipped
         assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(r1.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "15M1D15M10S10H");
-        assert_eq!(r2.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "10H15M1D25M");
     }
 
@@ -3839,9 +3929,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 0); // No aligned bases clipped
         assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(r1.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "15M1I15M10S10H");
-        assert_eq!(r2.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "10H15M1I25M");
     }
 
@@ -3856,9 +3952,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 0); // No aligned bases clipped
         assert_eq!(clipped_r2, 0); // No aligned bases clipped
-        assert_eq!(r1.alignment_start(), Some(Position::new(20).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(20).expect("position 20 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "40M10H");
-        assert_eq!(r2.alignment_start(), Some(Position::new(30).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(30).expect("position 30 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "10H10S30M");
     }
 
@@ -3873,9 +3975,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 0);
         assert_eq!(clipped_r2, 0);
-        assert_eq!(r1.alignment_start(), Some(Position::new(1000).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(1000).expect("position 1000 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "100M");
-        assert_eq!(r2.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "100M");
     }
 
@@ -3890,9 +3998,15 @@ mod tests {
 
         assert_eq!(clipped_r1, 0);
         assert_eq!(clipped_r2, 0);
-        assert_eq!(r1.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r1.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r1.cigar()), "40M20I40M");
-        assert_eq!(r2.alignment_start(), Some(Position::new(1).unwrap()));
+        assert_eq!(
+            r2.alignment_start(),
+            Some(Position::new(1).expect("position 1 should be valid"))
+        );
         assert_eq!(format_cigar(&r2.cigar()), "40M20I40M");
     }
 

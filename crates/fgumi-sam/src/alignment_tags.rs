@@ -147,7 +147,7 @@ pub fn regenerate_alignment_tags(
                         uq += u32::from(qual_score);
 
                         // Always push match count (even 0) before mismatch per SAM spec
-                        write!(md_string, "{match_count}").unwrap();
+                        write!(md_string, "{match_count}").expect("write to String is infallible");
                         match_count = 0;
                         // Preserve reference case (matches fgbio behavior)
                         md_string.push(ref_base as char);
@@ -157,7 +157,7 @@ pub fn regenerate_alignment_tags(
                         uq += u32::from(qual_score);
 
                         // Always push match count (even 0) before mismatch per SAM spec
-                        write!(md_string, "{match_count}").unwrap();
+                        write!(md_string, "{match_count}").expect("write to String is infallible");
                         match_count = 0;
                         // Preserve reference case (matches fgbio behavior)
                         md_string.push(ref_base as char);
@@ -186,7 +186,7 @@ pub fn regenerate_alignment_tags(
                 nm += len;
 
                 // Always push match count (even 0) before deletion per SAM spec
-                write!(md_string, "{match_count}").unwrap();
+                write!(md_string, "{match_count}").expect("write to String is infallible");
                 match_count = 0;
 
                 md_string.push('^');
@@ -216,7 +216,7 @@ pub fn regenerate_alignment_tags(
     }
 
     // Add final match count to MD (always, even if 0, per SAM spec)
-    write!(md_string, "{match_count}").unwrap();
+    write!(md_string, "{match_count}").expect("write to String is infallible");
 
     // Update tags
     record.data_mut().insert(nm_tag(), Value::from(nm as i32));
@@ -350,14 +350,14 @@ pub fn regenerate_alignment_tags_raw(
                         // Masked base: count as mismatch
                         nm += 1;
                         uq += u32::from(qual_score);
-                        write!(md_string, "{match_count}").unwrap();
+                        write!(md_string, "{match_count}").expect("write to String is infallible");
                         match_count = 0;
                         md_string.push(ref_base as char);
                     } else if !seq_base.eq_ignore_ascii_case(&ref_base) {
                         // Mismatch
                         nm += 1;
                         uq += u32::from(qual_score);
-                        write!(md_string, "{match_count}").unwrap();
+                        write!(md_string, "{match_count}").expect("write to String is infallible");
                         match_count = 0;
                         md_string.push(ref_base as char);
                     } else {
@@ -381,7 +381,7 @@ pub fn regenerate_alignment_tags_raw(
                     anyhow::bail!("CIGAR deletion references beyond fetched reference span");
                 }
                 nm += op_len as i32;
-                write!(md_string, "{match_count}").unwrap();
+                write!(md_string, "{match_count}").expect("write to String is infallible");
                 match_count = 0;
                 md_string.push('^');
                 let ref_bases = &all_ref_bases[ref_offset..ref_offset + op_len];
@@ -407,7 +407,7 @@ pub fn regenerate_alignment_tags_raw(
     }
 
     // Add final match count
-    write!(md_string, "{match_count}").unwrap();
+    write!(md_string, "{match_count}").expect("write to String is infallible");
 
     // Update tags
     fgumi_raw_bam::update_int_tag(record, b"NM", nm);
@@ -484,7 +484,9 @@ mod tests {
         use std::num::NonZeroUsize;
 
         let mut header_builder = Header::builder();
-        let ref_seq = Map::<ReferenceSequence>::new(NonZeroUsize::new(16).unwrap());
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(16).expect("reference sequence length must be non-zero"),
+        );
         header_builder = header_builder.add_reference_sequence(b"chr1", ref_seq);
         header_builder.build()
     }
@@ -961,7 +963,11 @@ mod tests {
         // Verify raw path produces same results as RecordBuf path
         assert_eq!(nm, Some(1i64), "NM should be 1 (one mismatch)");
         assert_eq!(uq, Some(30i64), "UQ should be 30 (quality at mismatch position)");
-        assert_eq!(md.map(|s| std::str::from_utf8(s).unwrap()), Some("1C2"), "MD should be 1C2");
+        assert_eq!(
+            md.map(|s| std::str::from_utf8(s).expect("MD tag should be valid UTF-8")),
+            Some("1C2"),
+            "MD should be 1C2"
+        );
 
         Ok(())
     }
@@ -988,7 +994,10 @@ mod tests {
 
         assert_eq!(nm, Some(1i64), "NM should be 1 (masked base = mismatch)");
         assert_eq!(uq, Some(0i64), "UQ should be 0 (masked base quality is 0)");
-        assert_eq!(md.map(|s| std::str::from_utf8(s).unwrap()), Some("1C2"));
+        assert_eq!(
+            md.map(|s| std::str::from_utf8(s).expect("MD tag should be valid UTF-8")),
+            Some("1C2")
+        );
 
         Ok(())
     }

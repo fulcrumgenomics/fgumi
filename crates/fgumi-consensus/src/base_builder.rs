@@ -435,7 +435,7 @@ impl ConsensusBaseBuilder {
             return (NO_CALL_BASE, MIN_PHRED);
         }
 
-        let max_idx = max_index.unwrap();
+        let max_idx = max_index.expect("max_index is Some after is_none() check above");
         let consensus_base = DNA_BASES[max_idx];
 
         // Calculate posterior probability

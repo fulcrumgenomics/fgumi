@@ -372,7 +372,7 @@ impl DuplexConsensusCaller {
             );
         }
 
-        let last = *min_reads.last().unwrap();
+        let last = *min_reads.last().expect("expected a last item");
         let min_total_reads = min_reads[0];
         let min_xy_reads = min_reads.get(1).copied().unwrap_or(last);
         let min_yx_reads = min_reads.get(2).copied().unwrap_or(last);
@@ -468,7 +468,9 @@ impl DuplexConsensusCaller {
         let header = noodles::sam::Header::builder()
             .add_reference_sequence(
                 "chr1",
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(1_000_000).unwrap()),
+                Map::<ReferenceSequence>::new(
+                    NonZeroUsize::new(1_000_000).expect("1_000_000 is non-zero"),
+                ),
             )
             .build();
         let raw: Vec<Vec<u8>> = records
@@ -2128,7 +2130,8 @@ mod tests {
     fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
         let header = noodles::sam::Header::default();
         let mut buf = Vec::new();
-        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec).unwrap();
+        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
+            .expect("encode_record_buf should succeed");
         buf
     }
 
@@ -2306,11 +2309,11 @@ mod tests {
         assert!(groups.contains_key("UMI1"));
         assert!(groups.contains_key("UMI2"));
 
-        let (a_reads, b_reads) = groups.get("UMI1").unwrap();
+        let (a_reads, b_reads) = groups.get("UMI1").expect("UMI1 key should be present in groups");
         assert_eq!(a_reads.len(), 2);
         assert_eq!(b_reads.len(), 1);
 
-        let (a_reads, b_reads) = groups.get("UMI2").unwrap();
+        let (a_reads, b_reads) = groups.get("UMI2").expect("UMI2 key should be present in groups");
         assert_eq!(a_reads.len(), 1);
         assert_eq!(b_reads.len(), 0);
 
@@ -4375,7 +4378,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .expect("write_duplex_consensus_record should succeed");
 
         // Verify UNMAPPED flag is set
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -4402,7 +4405,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), None, None);
 
         assert!(result.is_some());
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         assert_eq!(duplex.bases, ab.bases);
         assert_eq!(duplex.quals, ab.quals);
         assert_eq!(duplex.errors, ab.errors);
@@ -4424,7 +4427,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(None, Some(&ba), None);
 
         assert!(result.is_some());
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         assert_eq!(duplex.bases, ba.bases);
         assert_eq!(duplex.quals, ba.quals);
         assert_eq!(duplex.errors, ba.errors);
@@ -4462,7 +4465,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
 
         assert!(result.is_some());
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // Output should be truncated to minimum length (4)
         assert_eq!(duplex.bases.len(), 4);
         assert_eq!(duplex.quals.len(), 4);
@@ -4492,7 +4495,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
 
         assert!(result.is_some());
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // When bases agree, errors are summed: AB.errors + BA.errors
         assert_eq!(duplex.errors[0], 1); // AB=1, BA=0 -> 1
         assert_eq!(duplex.errors[1], 1); // AB=0, BA=1 -> 1
@@ -4524,7 +4527,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
 
         assert!(result.is_some());
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // Position 0: Agreement, base = A
         // Position 1: Disagreement, AB wins (higher qual), base = T
         //   Errors when raw_base == a_base: a_err + (b_dep - b_err) = 2 + (4-1) = 5
@@ -4753,13 +4756,13 @@ mod tests {
             Some(cell_tag),
             Some(cell_barcode),
         )
-        .unwrap();
+        .expect("write_duplex_consensus_record should succeed");
 
         // Check cell barcode tag is present
         let records = ParsedBamRecord::parse_all(&output.data);
         assert_eq!(records.len(), 1);
         let cb = records[0].get_string_tag(b"CB").expect("CB tag should be present");
-        assert_eq!(String::from_utf8(cb).unwrap(), cell_barcode);
+        assert_eq!(String::from_utf8(cb).expect("from_utf8 should succeed"), cell_barcode);
     }
 
     #[test]
@@ -4800,7 +4803,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .expect("write_duplex_consensus_record should succeed");
 
         // Check CB tag is not present
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -4833,7 +4836,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
 
         assert!(result.is_some());
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // AB should be filtered out, so we should only have BA data
         assert_eq!(duplex.bases, ba.bases);
     }
@@ -4925,7 +4928,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .expect("write_duplex_consensus_record should succeed");
 
         let records = ParsedBamRecord::parse_all(&output.data);
         assert_eq!(records.len(), 1);
@@ -5014,7 +5017,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .expect("write_duplex_consensus_record should succeed");
 
         let records = ParsedBamRecord::parse_all(&output.data);
         assert_eq!(records.len(), 1);
@@ -5071,10 +5074,10 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+            .expect("write_duplex_consensus_record should succeed");
             let records = ParsedBamRecord::parse_all(&output.data);
             assert_eq!(records.len(), 1);
-            records.into_iter().next().unwrap()
+            records.into_iter().next().expect("expected another item from iterator")
         };
 
         // R1 read type
@@ -5123,7 +5126,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
         assert!(result.is_some());
 
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // Errors should be sum of AB + BA errors when bases agree
         assert_eq!(duplex.errors[0], 1); // 1 + 0
         assert_eq!(duplex.errors[1], 1); // 0 + 1
@@ -5154,7 +5157,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
         assert!(result.is_some());
 
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // When AB wins: errors = ab_errors + (ba_depth - ba_errors) = 1 + (4 - 0) = 5
         assert_eq!(duplex.bases[0], b'A');
         assert_eq!(duplex.errors[0], 5);
@@ -5184,7 +5187,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
         assert!(result.is_some());
 
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // Equal quality disagreement should result in N with min quality
         assert_eq!(duplex.bases[0], b'N');
         assert_eq!(duplex.quals[0], 2); // MIN_PHRED
@@ -5214,7 +5217,7 @@ mod tests {
         let result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
         assert!(result.is_some());
 
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         // Both positions should be N due to N in one strand
         assert_eq!(duplex.bases[0], b'N');
         assert_eq!(duplex.bases[1], b'N');
@@ -5245,7 +5248,7 @@ mod tests {
         assert!(result.is_some());
 
         // AB should be filtered out due to zero depths, leaving only BA
-        let duplex = result.unwrap();
+        let duplex = result.expect("failed to get duplex");
         assert!(duplex.ba_consensus.is_none()); // Only one strand present
     }
 
@@ -5459,7 +5462,8 @@ mod tests {
 
         let records = vec![a1, a2, b1];
         let (base_mi, a_records, b_records) =
-            DuplexConsensusCaller::partition_records_by_strand(records).unwrap();
+            DuplexConsensusCaller::partition_records_by_strand(records)
+                .expect("partition_records_by_strand should succeed");
 
         assert_eq!(base_mi.as_deref(), Some("UMI1"));
         assert_eq!(a_records.len(), 2);
@@ -5469,7 +5473,8 @@ mod tests {
     #[test]
     fn test_partition_records_by_strand_empty() {
         let (base_mi, a_records, b_records) =
-            DuplexConsensusCaller::partition_records_by_strand(Vec::new()).unwrap();
+            DuplexConsensusCaller::partition_records_by_strand(Vec::new())
+                .expect("partition_records_by_strand should succeed");
 
         assert!(base_mi.is_none());
         assert!(a_records.is_empty());
@@ -5503,7 +5508,8 @@ mod tests {
         );
 
         let (base_mi, a_records, b_records) =
-            DuplexConsensusCaller::partition_records_by_strand(vec![a1]).unwrap();
+            DuplexConsensusCaller::partition_records_by_strand(vec![a1])
+                .expect("partition_records_by_strand should succeed");
 
         assert_eq!(base_mi.as_deref(), Some("UMI1"));
         assert_eq!(a_records.len(), 1);

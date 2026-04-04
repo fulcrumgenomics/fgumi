@@ -55,7 +55,8 @@ pub fn find_record_offsets(data: &[u8]) -> Vec<usize> {
     for block_idx in 0..num_full_blocks {
         let block_start = block_idx * 64;
         // Indexing is safe: block_start + 64 <= num_full_blocks * 64 <= data.len()
-        let block: &[u8; 64] = data[block_start..block_start + 64].try_into().unwrap();
+        let block: &[u8; 64] =
+            data[block_start..block_start + 64].try_into().expect("slice is exactly 64 bytes");
         let newlines = lexer::lex_block(block);
         process_bitmask(newlines, block_start, &mut newline_count, &mut offsets);
     }

@@ -280,9 +280,15 @@ mod tests {
         collector.record_cs_family(10);
 
         let metrics = collector.family_size_metrics();
-        let size_5 = metrics.iter().find(|m| m.family_size == 5).unwrap();
+        let size_5 = metrics
+            .iter()
+            .find(|m| m.family_size == 5)
+            .expect("family_size 5 metric should be present");
         assert_eq!(size_5.cs_count, 2);
-        let size_10 = metrics.iter().find(|m| m.family_size == 10).unwrap();
+        let size_10 = metrics
+            .iter()
+            .find(|m| m.family_size == 10)
+            .expect("family_size 10 metric should be present");
         assert_eq!(size_10.cs_count, 1);
     }
 
@@ -294,7 +300,10 @@ mod tests {
         collector.record_ss_family(3);
 
         let metrics = collector.family_size_metrics();
-        let size_3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        let size_3 = metrics
+            .iter()
+            .find(|m| m.family_size == 3)
+            .expect("family_size 3 metric should be present");
         assert_eq!(size_3.ss_count, 3);
     }
 
@@ -309,17 +318,26 @@ mod tests {
 
         let metrics = collector.family_size_metrics();
 
-        let size_1 = metrics.iter().find(|m| m.family_size == 1).unwrap();
+        let size_1 = metrics
+            .iter()
+            .find(|m| m.family_size == 1)
+            .expect("family_size 1 metric should be present");
         assert_eq!(size_1.ss_count, 2);
         assert!((size_1.ss_fraction - 0.5).abs() < 0.001); // 2/4 = 0.5
         assert!((size_1.ss_fraction_gt_or_eq_size - 1.0).abs() < 0.001); // All >= 1
 
-        let size_2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        let size_2 = metrics
+            .iter()
+            .find(|m| m.family_size == 2)
+            .expect("family_size 2 metric should be present");
         assert_eq!(size_2.ss_count, 1);
         assert!((size_2.ss_fraction - 0.25).abs() < 0.001); // 1/4 = 0.25
         assert!((size_2.ss_fraction_gt_or_eq_size - 0.5).abs() < 0.001); // size 2 + size 3
 
-        let size_3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        let size_3 = metrics
+            .iter()
+            .find(|m| m.family_size == 3)
+            .expect("family_size 3 metric should be present");
         assert_eq!(size_3.ss_count, 1);
         assert!((size_3.ss_fraction - 0.25).abs() < 0.001); // 1/4 = 0.25
         assert!((size_3.ss_fraction_gt_or_eq_size - 0.25).abs() < 0.001); // Only size 3
@@ -346,12 +364,14 @@ mod tests {
         let metrics = collector.umi_metrics();
         assert_eq!(metrics.len(), 2);
 
-        let aaaa = metrics.iter().find(|m| m.umi == "AAAA").unwrap();
+        let aaaa =
+            metrics.iter().find(|m| m.umi == "AAAA").expect("AAAA UMI metric should be present");
         assert_eq!(aaaa.raw_observations, 15); // 10 + 5
         assert_eq!(aaaa.raw_observations_with_errors, 3); // 2 + 1
         assert_eq!(aaaa.unique_observations, 1); // Only one unique
 
-        let cccc = metrics.iter().find(|m| m.umi == "CCCC").unwrap();
+        let cccc =
+            metrics.iter().find(|m| m.umi == "CCCC").expect("CCCC UMI metric should be present");
         assert_eq!(cccc.raw_observations, 8);
         assert_eq!(cccc.unique_observations, 1);
     }

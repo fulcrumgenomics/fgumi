@@ -132,17 +132,20 @@ mod tests {
         let mut buf = Vec::new();
 
         // Valid scores
-        write_quality_scores_from_slice(&mut buf, 4, &[45, 35, 43, 50]).unwrap();
+        write_quality_scores_from_slice(&mut buf, 4, &[45, 35, 43, 50])
+            .expect("write_quality_scores_from_slice should succeed");
         assert_eq!(buf, [45, 35, 43, 50]);
 
         // Empty scores (fill with 0xFF)
         buf.clear();
-        write_quality_scores_from_slice(&mut buf, 3, &[]).unwrap();
+        write_quality_scores_from_slice(&mut buf, 3, &[])
+            .expect("write_quality_scores_from_slice should succeed");
         assert_eq!(buf, [0xff, 0xff, 0xff]);
 
         // Zero base count with empty scores
         buf.clear();
-        write_quality_scores_from_slice(&mut buf, 0, &[]).unwrap();
+        write_quality_scores_from_slice(&mut buf, 0, &[])
+            .expect("write_quality_scores_from_slice should succeed");
         assert!(buf.is_empty());
 
         // Invalid score (> 93)

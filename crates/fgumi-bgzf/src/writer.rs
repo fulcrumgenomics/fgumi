@@ -79,8 +79,8 @@ impl InlineBgzfCompressor {
     pub fn new(compression_level: u32) -> Self {
         let level = u8::try_from(compression_level.clamp(1, 12))
             .expect("value in [1, 12] always fits in u8");
-        let compression_level_obj =
-            CompressionLevel::new(level).unwrap_or_else(|_| CompressionLevel::new(6).unwrap());
+        let compression_level_obj = CompressionLevel::new(level)
+            .unwrap_or_else(|_| CompressionLevel::new(6).expect("compression level 6 is valid"));
         let compressor = BgzfCompressor::new(compression_level_obj);
         Self {
             buffer: Vec::with_capacity(BGZF_MAX_BLOCK_SIZE),
@@ -249,8 +249,8 @@ mod tests {
     fn test_compress_small() {
         let mut compressor = InlineBgzfCompressor::new(6);
 
-        compressor.write_all(b"Hello, BGZF!").unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(b"Hello, BGZF!").expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let blocks = compressor.take_blocks();
         assert_eq!(blocks.len(), 1);
@@ -269,8 +269,8 @@ mod tests {
 
         // Create a max-size block with compressible data
         let data = vec![b'A'; BGZF_MAX_BLOCK_SIZE];
-        compressor.write_all(&data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(&data).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let blocks = compressor.take_blocks();
         assert_eq!(blocks.len(), 1);
@@ -286,8 +286,8 @@ mod tests {
 
         // Write more than one block's worth of data
         let data = vec![b'X'; BGZF_MAX_BLOCK_SIZE + 100];
-        compressor.write_all(&data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(&data).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let blocks = compressor.take_blocks();
         // Should produce 2 blocks: one full, one with remaining 100 bytes
@@ -298,11 +298,11 @@ mod tests {
     fn test_write_blocks_to_single() {
         let mut compressor = InlineBgzfCompressor::new(6);
 
-        compressor.write_all(b"Test data").unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(b"Test data").expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let mut output = Vec::new();
-        compressor.write_blocks_to(&mut output).unwrap();
+        compressor.write_blocks_to(&mut output).expect("writing blocks to output should succeed");
 
         // Should have written something
         assert!(!output.is_empty());
@@ -318,11 +318,11 @@ mod tests {
 
         // Write more than one block's worth
         let data = vec![b'Y'; BGZF_MAX_BLOCK_SIZE + 50];
-        compressor.write_all(&data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(&data).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let mut output = Vec::new();
-        compressor.write_blocks_to(&mut output).unwrap();
+        compressor.write_blocks_to(&mut output).expect("writing blocks to output should succeed");
 
         // Should have written two blocks
         assert!(!output.is_empty());
@@ -341,8 +341,8 @@ mod tests {
 
         // First, use take_blocks
         let mut compressor1 = InlineBgzfCompressor::new(6);
-        compressor1.write_all(test_data).unwrap();
-        compressor1.flush().unwrap();
+        compressor1.write_all(test_data).expect("writing test data should succeed");
+        compressor1.flush().expect("flushing compressor should succeed");
         let blocks = compressor1.take_blocks();
         let mut output1 = Vec::new();
         for block in &blocks {
@@ -351,10 +351,10 @@ mod tests {
 
         // Then, use write_blocks_to
         let mut compressor2 = InlineBgzfCompressor::new(6);
-        compressor2.write_all(test_data).unwrap();
-        compressor2.flush().unwrap();
+        compressor2.write_all(test_data).expect("writing test data should succeed");
+        compressor2.flush().expect("flushing compressor should succeed");
         let mut output2 = Vec::new();
-        compressor2.write_blocks_to(&mut output2).unwrap();
+        compressor2.write_blocks_to(&mut output2).expect("writing blocks to output should succeed");
 
         // Both should produce identical output
         assert_eq!(output1, output2);
@@ -365,10 +365,10 @@ mod tests {
         let mut compressor = InlineBgzfCompressor::new(6);
 
         // Don't write anything, just flush
-        compressor.flush().unwrap();
+        compressor.flush().expect("flushing compressor should succeed");
 
         let mut output = Vec::new();
-        compressor.write_blocks_to(&mut output).unwrap();
+        compressor.write_blocks_to(&mut output).expect("writing blocks to output should succeed");
 
         // Should be empty since no data was written
         assert!(output.is_empty());
@@ -380,8 +380,8 @@ mod tests {
 
         // Write enough data to produce multiple blocks
         let data = vec![b'X'; BGZF_MAX_BLOCK_SIZE + 100];
-        compressor.write_all(&data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(&data).expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let blocks = compressor.take_blocks();
         assert_eq!(blocks.len(), 2);
@@ -389,8 +389,8 @@ mod tests {
         assert_eq!(blocks[1].serial, 1);
 
         // Write another batch — serial should continue from where it left off
-        compressor.write_all(b"more data").unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(b"more data").expect("writing data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
 
         let blocks2 = compressor.take_blocks();
         assert_eq!(blocks2.len(), 1);

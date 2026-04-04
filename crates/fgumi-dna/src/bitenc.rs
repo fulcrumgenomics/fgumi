@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_from_bytes() {
         // Valid sequences
-        let enc = BitEnc::from_bytes(b"ACGT").unwrap();
+        let enc = BitEnc::from_bytes(b"ACGT").expect("encoding ACGT should succeed");
         assert_eq!(enc.len(), 4);
         assert_eq!(enc.bits, 0b11_10_01_00); // T=3, G=2, C=1, A=0
 
@@ -196,28 +196,30 @@ mod tests {
     #[test]
     fn test_hamming_distance() {
         // Identical sequences
-        let seq1 = BitEnc::from_bytes(b"ACGTACGT").unwrap();
-        let seq2 = BitEnc::from_bytes(b"ACGTACGT").unwrap();
+        let seq1 = BitEnc::from_bytes(b"ACGTACGT").expect("encoding ACGTACGT should succeed");
+        let seq2 = BitEnc::from_bytes(b"ACGTACGT").expect("encoding ACGTACGT should succeed");
         assert_eq!(seq1.hamming_distance(&seq2), 0);
 
         // One difference
-        let seq3 = BitEnc::from_bytes(b"ACGTACTT").unwrap();
+        let seq3 = BitEnc::from_bytes(b"ACGTACTT").expect("encoding ACGTACTT should succeed");
         assert_eq!(seq1.hamming_distance(&seq3), 1);
 
         // All different
-        let all_a = BitEnc::from_bytes(b"AAAA").unwrap();
-        let all_t = BitEnc::from_bytes(b"TTTT").unwrap();
+        let all_a = BitEnc::from_bytes(b"AAAA").expect("encoding AAAA should succeed");
+        let all_t = BitEnc::from_bytes(b"TTTT").expect("encoding TTTT should succeed");
         assert_eq!(all_a.hamming_distance(&all_t), 4);
 
         // Typical 18bp UMI
-        let umi1 = BitEnc::from_bytes(b"AACAACACATCTACCTTC").unwrap();
-        let umi2 = BitEnc::from_bytes(b"AACAACACATCTACCTTA").unwrap();
+        let umi1 = BitEnc::from_bytes(b"AACAACACATCTACCTTC")
+            .expect("encoding AACAACACATCTACCTTC should succeed");
+        let umi2 = BitEnc::from_bytes(b"AACAACACATCTACCTTA")
+            .expect("encoding AACAACACATCTACCTTA should succeed");
         assert_eq!(umi1.hamming_distance(&umi2), 1);
     }
 
     #[test]
     fn test_extract_bits() {
-        let enc = BitEnc::from_bytes(b"ACGTACGT").unwrap();
+        let enc = BitEnc::from_bytes(b"ACGTACGT").expect("encoding ACGTACGT should succeed");
 
         // First and last 4 bases are identical (ACGT)
         assert_eq!(enc.extract_bits(0, 4), enc.extract_bits(4, 4));
@@ -235,30 +237,36 @@ mod tests {
     #[test]
     fn test_from_umi_str() {
         // Simple UMI without dash
-        let enc = BitEnc::from_umi_str("ACGT").unwrap();
+        let enc = BitEnc::from_umi_str("ACGT").expect("encoding UMI ACGT should succeed");
         assert_eq!(enc.len(), 4);
-        assert_eq!(enc, BitEnc::from_bytes(b"ACGT").unwrap());
+        assert_eq!(enc, BitEnc::from_bytes(b"ACGT").expect("encoding ACGT should succeed"));
 
         // Paired UMI with dash - dash should be skipped
-        let paired = BitEnc::from_umi_str("ACGT-TGCA").unwrap();
+        let paired =
+            BitEnc::from_umi_str("ACGT-TGCA").expect("encoding UMI ACGT-TGCA should succeed");
         assert_eq!(paired.len(), 8);
-        assert_eq!(paired, BitEnc::from_bytes(b"ACGTTGCA").unwrap());
+        assert_eq!(
+            paired,
+            BitEnc::from_bytes(b"ACGTTGCA").expect("encoding ACGTTGCA should succeed")
+        );
 
         // Real paired UMI from test data
-        let real = BitEnc::from_umi_str("GTCTGAGATC-AATCTTTAAT").unwrap();
+        let real = BitEnc::from_umi_str("GTCTGAGATC-AATCTTTAAT")
+            .expect("encoding UMI GTCTGAGATC-AATCTTTAAT should succeed");
         assert_eq!(real.len(), 20);
 
         // Lowercase works
-        let lower = BitEnc::from_umi_str("acgt-tgca").unwrap();
+        let lower =
+            BitEnc::from_umi_str("acgt-tgca").expect("encoding UMI acgt-tgca should succeed");
         assert_eq!(lower, paired);
 
         // Invalid character (not ACGT, not dash)
         assert!(BitEnc::from_umi_str("ACGT-NGCA").is_none());
 
         // Multiple dashes work
-        let multi = BitEnc::from_umi_str("AC-GT-TG").unwrap();
+        let multi = BitEnc::from_umi_str("AC-GT-TG").expect("encoding UMI AC-GT-TG should succeed");
         assert_eq!(multi.len(), 6);
-        assert_eq!(multi, BitEnc::from_bytes(b"ACGTTG").unwrap());
+        assert_eq!(multi, BitEnc::from_bytes(b"ACGTTG").expect("encoding ACGTTG should succeed"));
     }
 
     #[rstest::rstest]
@@ -267,24 +275,24 @@ mod tests {
     #[case(2, 2)] // G
     #[case(3, 3)] // T
     fn test_base_at(#[case] pos: usize, #[case] expected: u8) {
-        let enc = BitEnc::from_bytes(b"ACGT").unwrap();
+        let enc = BitEnc::from_bytes(b"ACGT").expect("encoding ACGT should succeed");
         assert_eq!(enc.base_at(pos), expected);
     }
 
     #[test]
     fn test_with_base_at() {
-        let enc = BitEnc::from_bytes(b"AAAA").unwrap();
+        let enc = BitEnc::from_bytes(b"AAAA").expect("encoding AAAA should succeed");
 
         // Change position 1 to C
         let modified = enc.with_base_at(1, 1);
-        assert_eq!(modified, BitEnc::from_bytes(b"ACAA").unwrap());
+        assert_eq!(modified, BitEnc::from_bytes(b"ACAA").expect("encoding ACAA should succeed"));
 
         // Change position 3 to T
         let modified2 = enc.with_base_at(3, 3);
-        assert_eq!(modified2, BitEnc::from_bytes(b"AAAT").unwrap());
+        assert_eq!(modified2, BitEnc::from_bytes(b"AAAT").expect("encoding AAAT should succeed"));
 
         // Round-trip: replacing a base with its current value is idempotent
-        let enc2 = BitEnc::from_bytes(b"ACGT").unwrap();
+        let enc2 = BitEnc::from_bytes(b"ACGT").expect("encoding ACGT should succeed");
         for pos in 0..4 {
             let base = enc2.base_at(pos);
             let restored = enc2.with_base_at(pos, base);
@@ -295,13 +303,17 @@ mod tests {
     #[test]
     fn test_paired_umi_hamming() {
         // Two paired UMIs with 1 mismatch
-        let umi1 = BitEnc::from_umi_str("GTCTGAGATC-AATCTTTAAT").unwrap();
-        let umi2 = BitEnc::from_umi_str("GTCTGAGATC-AATCTTTAAC").unwrap(); // T->C at end
+        let umi1 = BitEnc::from_umi_str("GTCTGAGATC-AATCTTTAAT")
+            .expect("encoding UMI GTCTGAGATC-AATCTTTAAT should succeed");
+        let umi2 = BitEnc::from_umi_str("GTCTGAGATC-AATCTTTAAC")
+            .expect("encoding UMI GTCTGAGATC-AATCTTTAAC should succeed"); // T->C at end
         assert_eq!(umi1.hamming_distance(&umi2), 1);
 
         // Two identical paired UMIs
-        let umi3 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC").unwrap();
-        let umi4 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC").unwrap();
+        let umi3 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC")
+            .expect("encoding UMI AAAGCGATGC-CCAGTTAACC should succeed");
+        let umi4 = BitEnc::from_umi_str("AAAGCGATGC-CCAGTTAACC")
+            .expect("encoding UMI AAAGCGATGC-CCAGTTAACC should succeed");
         assert_eq!(umi3.hamming_distance(&umi4), 0);
     }
 }
