@@ -327,25 +327,25 @@ mod tests {
     fn test_parse_nan_string() {
         // "NaN" string should parse to NaN float
         let parsed = parse_value("NaN", Some(6));
-        match parsed {
-            ParsedValue::Float(f) => assert!(f.is_nan()),
-            _ => panic!("Expected Float variant for NaN"),
-        }
+        let ParsedValue::Float(f) = parsed else {
+            unreachable!("Expected Float variant for NaN");
+        };
+        assert!(f.is_nan());
     }
 
     #[test]
     fn test_parse_infinity_string() {
         // "Infinity" and "inf" should parse to infinity
         let parsed = parse_value("Infinity", Some(6));
-        match parsed {
-            ParsedValue::Float(f) => assert!(f.is_infinite() && f.is_sign_positive()),
-            _ => panic!("Expected Float variant for Infinity"),
-        }
+        let ParsedValue::Float(f) = parsed else {
+            unreachable!("Expected Float variant for Infinity");
+        };
+        assert!(f.is_infinite() && f.is_sign_positive());
 
         let parsed = parse_value("inf", Some(6));
-        match parsed {
-            ParsedValue::Float(f) => assert!(f.is_infinite() && f.is_sign_positive()),
-            _ => panic!("Expected Float variant for inf"),
-        }
+        let ParsedValue::Float(f) = parsed else {
+            unreachable!("Expected Float variant for inf");
+        };
+        assert!(f.is_infinite() && f.is_sign_positive());
     }
 }

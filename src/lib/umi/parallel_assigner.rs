@@ -1254,7 +1254,7 @@ mod tests {
         match (&assignments[0], &assignments[1]) {
             (MoleculeId::PairedA(a), MoleculeId::PairedB(b))
             | (MoleculeId::PairedB(a), MoleculeId::PairedA(b)) => assert_eq!(a, b),
-            _ => panic!("Expected PairedA and PairedB, got {assignments:?}"),
+            _ => unreachable!("Expected PairedA and PairedB, got {assignments:?}"),
         }
     }
 
@@ -1272,7 +1272,7 @@ mod tests {
         // All should be same molecule (error corrected)
         let base_id = match &assignments[0] {
             MoleculeId::PairedA(id) | MoleculeId::PairedB(id) => *id,
-            _ => panic!("Expected paired ID"),
+            _ => unreachable!("Expected paired ID"),
         };
 
         for assignment in &assignments {
@@ -1280,7 +1280,7 @@ mod tests {
                 MoleculeId::PairedA(id) | MoleculeId::PairedB(id) => {
                     assert_eq!(*id, base_id);
                 }
-                _ => panic!("Expected paired ID"),
+                _ => unreachable!("Expected paired ID"),
             }
         }
     }

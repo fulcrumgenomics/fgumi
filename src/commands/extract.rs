@@ -897,19 +897,23 @@ impl Extract {
 
         loop {
             let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
+            let mut saw_eof = false;
             for iter in fq_iterators.iter_mut() {
-                if let Some(rec) = iter.next() {
-                    next_read_sets.push(rec);
-                } else {
-                    break;
+                match iter.next() {
+                    Some(Ok(rec)) if !saw_eof => next_read_sets.push(rec),
+                    Some(Ok(_)) => bail!("FASTQ sources out of sync: some ended before others"),
+                    Some(Err(e)) => return Err(e),
+                    None => saw_eof = true,
                 }
             }
 
-            if next_read_sets.is_empty() {
+            if saw_eof {
+                ensure!(
+                    next_read_sets.is_empty(),
+                    "FASTQ sources out of sync: some ended before others"
+                );
                 break;
             }
-
-            ensure!(next_read_sets.len() == fq_iterators.len(), "FASTQ sources out of sync");
 
             //  Validate read names match across all FASTQs
             Self::validate_read_names_match(&next_read_sets)?;
@@ -1037,7 +1041,8 @@ impl Extract {
                         &record.quality,
                         rs,
                         &[], // No skip reasons
-                    );
+                    )
+                    .map_err(std::io::Error::other)?;
                     fastq_sets.push(fastq_set);
                 }
 
@@ -2046,10 +2051,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "had too few bases to demux")]
-    fn test_zero_length_reads_with_fixed_structure_should_panic() {
-        // Test that zero-length reads with fixed-length read structures still panic
-        // (as they should - you can't have 0 bases when 10T are required)
+    fn test_zero_length_reads_with_fixed_structure_errors() {
+        // Test that zero-length reads with fixed-length read structures return an error
+        // (you can't have 0 bases when 10T are required)
         let tmp = TempDir::new().unwrap();
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "", "")]);
         let output = tmp.path().join("output.bam");
@@ -2058,7 +2062,7 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("10T").unwrap(), // Fixed length - should panic
+                ReadStructure::from_str("10T").unwrap(), // Fixed length - should error
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2087,7 +2091,8 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        let err = extract.execute("test").unwrap_err();
+        assert!(err.to_string().contains("had too few bases to demux"));
     }
 
     #[test]
@@ -2784,7 +2789,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "had too few bases to demux")]
     fn test_fail_read_too_short_for_structure() {
         // Test that we fail when a read is not long enough for the read structure
         // Read is 10 bases, but structure requires 8M + 8S = 16 bases minimum
@@ -2823,8 +2827,8 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        // Should panic because read is too short
-        extract.execute("test").unwrap();
+        let err = extract.execute("test").unwrap_err();
+        assert!(err.to_string().contains("had too few bases to demux"));
     }
 
     #[test]

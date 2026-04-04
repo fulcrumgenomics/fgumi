@@ -2236,13 +2236,10 @@ mod tests {
         let assign_tag = Tag::from([b'M', b'I']);
         set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
 
-        let mi_value = record.data().get(&assign_tag);
-        assert!(mi_value.is_some());
-        if let Some(DataValue::String(val)) = mi_value {
-            assert_eq!(AsRef::<[u8]>::as_ref(val), b"42");
-        } else {
-            panic!("MI tag should be a string value");
-        }
+        let Some(DataValue::String(val)) = record.data().get(&assign_tag) else {
+            unreachable!("MI tag should be a string value");
+        };
+        assert_eq!(AsRef::<[u8]>::as_ref(val), b"42");
     }
 
     #[test]
@@ -2265,14 +2262,11 @@ mod tests {
         let assign_tag = Tag::from([b'M', b'I']);
         set_mi_tag_on_record(&mut record, mi, assign_tag, 100);
 
-        let mi_value = record.data().get(&assign_tag);
-        assert!(mi_value.is_some());
-        if let Some(DataValue::String(val)) = mi_value {
-            // 100 (base) + 42 (id) = 142
-            assert_eq!(AsRef::<[u8]>::as_ref(val), b"142");
-        } else {
-            panic!("MI tag should be a string value");
-        }
+        let Some(DataValue::String(val)) = record.data().get(&assign_tag) else {
+            unreachable!("MI tag should be a string value");
+        };
+        // 100 (base) + 42 (id) = 142
+        assert_eq!(AsRef::<[u8]>::as_ref(val), b"142");
     }
 
     // ========================================================================
