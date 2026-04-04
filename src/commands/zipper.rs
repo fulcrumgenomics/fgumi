@@ -1327,7 +1327,10 @@ mod tests {
 
         let names: Vec<String> = records
             .iter()
-            .map(|r| String::from_utf8(r.name().unwrap().as_bytes().to_vec()).unwrap())
+            .map(|r| {
+                String::from_utf8(r.name().expect("record should have a name").as_bytes().to_vec())
+                    .expect("record name should be valid UTF-8")
+            })
             .collect();
 
         assert_eq!(names, vec!["q1", "q2", "q3"]);
@@ -1335,8 +1338,12 @@ mod tests {
         // q2 should be unmapped
         let q2 = records
             .iter()
-            .find(|r| String::from_utf8(r.name().unwrap().as_bytes().to_vec()).unwrap() == "q2")
-            .unwrap();
+            .find(|r| {
+                String::from_utf8(r.name().expect("record should have a name").as_bytes().to_vec())
+                    .expect("record name should be valid UTF-8")
+                    == "q2"
+            })
+            .expect("expected record q2 not found");
         assert!(q2.flags().is_unmapped());
 
         Ok(())
@@ -1382,8 +1389,14 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         // Find R1 and R2
-        let r1 = records.iter().find(|r| r.flags().is_first_segment()).unwrap();
-        let r2 = records.iter().find(|r| !r.flags().is_first_segment()).unwrap();
+        let r1 = records
+            .iter()
+            .find(|r| r.flags().is_first_segment())
+            .expect("expected R1 record not found");
+        let r2 = records
+            .iter()
+            .find(|r| !r.flags().is_first_segment())
+            .expect("expected R2 record not found");
 
         // Check that MQ tags are set
         let r1_mq = r1.data().get(&Tag::new(b'M', b'Q'));
@@ -1443,8 +1456,14 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         // Find R1 and R2 in output
-        let r1 = records.iter().find(|r| r.flags().is_first_segment()).unwrap();
-        let r2 = records.iter().find(|r| !r.flags().is_first_segment()).unwrap();
+        let r1 = records
+            .iter()
+            .find(|r| r.flags().is_first_segment())
+            .expect("expected R1 record not found");
+        let r2 = records
+            .iter()
+            .find(|r| !r.flags().is_first_segment())
+            .expect("expected R2 record not found");
 
         // R1 should NOT have QC_FAIL flag (it passed QC in unmapped)
         assert!(
@@ -2560,7 +2579,7 @@ mod tests {
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads=true"], true)]
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--exclude-missing-reads=false"], false)]
     fn test_exclude_missing_reads_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = Zipper::try_parse_from(args).unwrap();
+        let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.exclude_missing_reads, expected);
     }
 
@@ -2573,7 +2592,7 @@ mod tests {
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=true"], true)]
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=false"], false)]
     fn test_skip_pa_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = Zipper::try_parse_from(args).unwrap();
+        let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.skip_pa_tags, expected);
     }
 }

@@ -933,7 +933,11 @@ mod tests {
             // Check consensus tags are present
             let cd_tag = get_int_tag(record, "cD");
             assert!(cd_tag.is_some(), "cD tag should be present");
-            assert_eq!(cd_tag.unwrap(), 2, "Depth should be 2 (2 reads per UMI)");
+            assert_eq!(
+                cd_tag.expect("cD tag should have a value"),
+                2,
+                "Depth should be 2 (2 reads per UMI)"
+            );
 
             // MI and RX tags should be preserved by the consensus caller
             let mi_tag = get_string_tag(record, "MI");
@@ -993,7 +997,7 @@ mod tests {
             // Check consensus depth tag
             let cd_tag = get_int_tag(record, "cD");
             assert!(cd_tag.is_some(), "cD tag should be present");
-            assert!(cd_tag.unwrap() >= 2, "Depth should be at least 2");
+            assert!(cd_tag.expect("cD tag should have a value") >= 2, "Depth should be at least 2");
 
             assert_eq!(record.sequence().len(), 100, "Sequence length should be 100");
 
@@ -1044,7 +1048,11 @@ mod tests {
 
         // Check consensus depth tag is present (validates we got the group with 3 reads)
         let cd_tag = get_int_tag(&records[0], "cD");
-        assert_eq!(cd_tag.unwrap(), 3, "Depth should be 3 for the passing group");
+        assert_eq!(
+            cd_tag.expect("cD tag should have a value"),
+            3,
+            "Depth should be 3 for the passing group"
+        );
 
         Ok(())
     }
@@ -1079,11 +1087,11 @@ mod tests {
         // Check per-read tags (cD, cM, cE) are present
         let cd_tag = get_int_tag(record, "cD");
         assert!(cd_tag.is_some(), "cD tag should be present");
-        assert_eq!(cd_tag.unwrap(), 5, "Max depth should be 5");
+        assert_eq!(cd_tag.expect("cD tag should have a value"), 5, "Max depth should be 5");
 
         let cm_tag = get_int_tag(record, "cM");
         assert!(cm_tag.is_some(), "cM tag should be present");
-        assert_eq!(cm_tag.unwrap(), 5, "Min depth should be 5");
+        assert_eq!(cm_tag.expect("cM tag should have a value"), 5, "Min depth should be 5");
 
         // Check per-base tags (cd, ce) are present
         let tag_bytes = "cd".as_bytes();
@@ -1166,7 +1174,10 @@ mod tests {
         // Check depth tag shows downsampling was applied (max depth should be 10)
         let cd_tag = get_int_tag(&records[0], "cD");
         assert!(cd_tag.is_some(), "cD tag should be present");
-        assert!(cd_tag.unwrap() <= 10, "Max depth should be <= 10 due to downsampling");
+        assert!(
+            cd_tag.expect("cD tag should have a value") <= 10,
+            "Max depth should be <= 10 due to downsampling"
+        );
 
         Ok(())
     }
@@ -1175,8 +1186,8 @@ mod tests {
     fn test_invalid_tag_length_fails() {
         // Create a dummy BAM file so validation gets to tag check
         let builder = SamBuilder::new_unmapped();
-        let paths = TestPaths::new().unwrap();
-        builder.write(&paths.input).unwrap();
+        let paths = TestPaths::new().expect("failed to create test paths");
+        builder.write(&paths.input).expect("failed to write test BAM");
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), PathBuf::from("out.bam"));
         cmd.tag = "M".to_string(); // Invalid: only 1 character
@@ -1190,8 +1201,8 @@ mod tests {
     fn test_max_reads_less_than_min_reads_fails() {
         // Create a dummy BAM file so validation gets to tag check
         let builder = SamBuilder::new_unmapped();
-        let paths = TestPaths::new().unwrap();
-        builder.write(&paths.input).unwrap();
+        let paths = TestPaths::new().expect("failed to create test paths");
+        builder.write(&paths.input).expect("failed to write test BAM");
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), PathBuf::from("out.bam"));
         cmd.min_reads = 5;

@@ -72,7 +72,8 @@ impl SortOrderArg {
             "template-coordinate" => Ok(Self::TemplateCoordinate),
             other => {
                 if other.starts_with("queryname::") {
-                    let sub = other.strip_prefix("queryname::").unwrap();
+                    let sub =
+                        other.strip_prefix("queryname::").expect("guarded by starts_with check");
                     Err(format!(
                         "unknown queryname sub-sort '{sub}', expected 'lex', 'lexicographic', or 'natural'"
                     ))
@@ -551,7 +552,7 @@ mod tests {
         #[case] expected: Option<[u8; 2]>,
     ) {
         let sort = make_sort(order, cell_tag);
-        assert_eq!(sort.parse_cell_tag().unwrap(), expected);
+        assert_eq!(sort.parse_cell_tag().expect("parse_cell_tag should succeed"), expected);
     }
 
     #[test]
@@ -568,35 +569,62 @@ mod tests {
 
     #[test]
     fn test_parse_memory_megabytes() {
-        assert_eq!(parse_memory("512M").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory("1024M").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory("512M").expect("parse_memory should succeed for 512M"),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory("1024M").expect("parse_memory should succeed for 1024M"),
+            1024 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_parse_memory_gigabytes() {
-        assert_eq!(parse_memory("1G").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory("1G").expect("parse_memory should succeed for 1G"),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory("2G").expect("parse_memory should succeed for 2G"),
+            2 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_parse_memory_kilobytes() {
-        assert_eq!(parse_memory("1024K").unwrap(), 1024 * 1024);
+        assert_eq!(
+            parse_memory("1024K").expect("parse_memory should succeed for 1024K"),
+            1024 * 1024
+        );
     }
 
     #[test]
     fn test_parse_memory_bytes() {
-        assert_eq!(parse_memory("1048576").unwrap(), 1_048_576);
+        assert_eq!(
+            parse_memory("1048576").expect("parse_memory should succeed for bare bytes"),
+            1_048_576
+        );
     }
 
     #[test]
     fn test_parse_memory_lowercase() {
-        assert_eq!(parse_memory("512m").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory("512m").expect("parse_memory should succeed for lowercase 512m"),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory("1g").expect("parse_memory should succeed for lowercase 1g"),
+            1024 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_parse_memory_decimal() {
-        assert_eq!(parse_memory("1.5G").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as usize);
+        assert_eq!(
+            parse_memory("1.5G").expect("parse_memory should succeed for 1.5G"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as usize
+        );
     }
 
     #[test]
@@ -639,9 +667,13 @@ mod tests {
     #[case("queryname::", Err("unknown queryname sub-sort ''"))]
     fn test_parse_sort_order(#[case] input: &str, #[case] expected: Result<SortOrderArg, &str>) {
         match expected {
-            Ok(order) => assert_eq!(SortOrderArg::parse(input).unwrap(), order),
+            Ok(order) => assert_eq!(
+                SortOrderArg::parse(input).expect("parse should succeed for valid sort order"),
+                order
+            ),
             Err(msg) => {
-                let err = SortOrderArg::parse(input).unwrap_err();
+                let err = SortOrderArg::parse(input)
+                    .expect_err("parse should fail for invalid sort order");
                 assert!(err.contains(msg), "expected error containing {msg:?}, got: {err}");
             }
         }
@@ -738,7 +770,8 @@ mod tests {
         assert_eq!(total, 6);
         assert!(violations > 0);
         assert!(first_violation.is_some());
-        let (record_num, name) = first_violation.unwrap();
+        let (record_num, name) =
+            first_violation.expect("first violation should be present for unsorted file");
         assert!(record_num > 1); // violation can't be on first record
         assert!(!name.is_empty());
         Ok(())
@@ -794,7 +827,8 @@ mod tests {
         let sorted_bam = dir.path().join("sorted.bam");
         builder.write_bam(&input_bam)?;
 
-        let order_arg = SortOrderArg::parse(order_str).unwrap();
+        let order_arg =
+            SortOrderArg::parse(order_str).expect("parse should succeed for valid sort order");
         let sort_order: SortOrder = order_arg.into();
 
         let sorter = RawExternalSorter::new(sort_order).threads(1).output_compression(6);

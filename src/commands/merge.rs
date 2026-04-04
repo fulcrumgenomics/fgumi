@@ -280,7 +280,9 @@ mod tests {
         let mut header_builder = Header::builder();
 
         // Add one reference sequence so we can write mapped records
-        let map = Map::<ReferenceSequence>::new(NonZeroUsize::new(200_000_000).unwrap());
+        let map = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(200_000_000).expect("non-zero reference length"),
+        );
         header_builder = header_builder.add_reference_sequence(BString::from("chr1"), map);
 
         for rg_id in rg_ids {
@@ -299,9 +301,9 @@ mod tests {
 
         // Write a minimal BAM with this header (no records needed for header tests)
         let path = dir.join(format!("{name}.bam"));
-        let file = std::fs::File::create(&path).unwrap();
+        let file = std::fs::File::create(&path).expect("failed to create BAM file");
         let mut writer = noodles::bam::io::Writer::new(file);
-        writer.write_header(&header).unwrap();
+        writer.write_header(&header).expect("failed to write BAM header");
         // write EOF
         drop(writer);
         path
@@ -309,10 +311,11 @@ mod tests {
 
     #[test]
     fn test_merge_headers_single_input() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam = write_bam_with_read_groups(dir.path(), "single", &["RG1", "RG2"]);
 
-        let header = merge_headers(std::slice::from_ref(&bam)).unwrap();
+        let header =
+            merge_headers(std::slice::from_ref(&bam)).expect("merge_headers should succeed");
 
         // Should be the same header (same RGs)
         let rg_ids: Vec<String> =
@@ -324,11 +327,11 @@ mod tests {
 
     #[test]
     fn test_merge_headers_combines_read_groups() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam_a = write_bam_with_read_groups(dir.path(), "a", &["RG1"]);
         let bam_b = write_bam_with_read_groups(dir.path(), "b", &["RG2"]);
 
-        let header = merge_headers(&[bam_a, bam_b]).unwrap();
+        let header = merge_headers(&[bam_a, bam_b]).expect("merge_headers should succeed");
 
         let rg_ids: Vec<String> =
             header.read_groups().iter().map(|(id, _)| id.to_string()).collect();
@@ -339,12 +342,12 @@ mod tests {
 
     #[test]
     fn test_merge_headers_deduplicates_read_groups() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         // Both BAMs have RG1, but with different library names
         let bam_a = write_bam_with_read_groups(dir.path(), "a", &["RG1"]);
         let bam_b = write_bam_with_read_groups(dir.path(), "b", &["RG1", "RG2"]);
 
-        let header = merge_headers(&[bam_a, bam_b]).unwrap();
+        let header = merge_headers(&[bam_a, bam_b]).expect("merge_headers should succeed");
 
         let rg_ids: Vec<String> =
             header.read_groups().iter().map(|(id, _)| id.to_string()).collect();
@@ -358,7 +361,7 @@ mod tests {
             .read_groups()
             .iter()
             .find(|(id, _)| <BString as AsRef<[u8]>>::as_ref(id) == b"RG1")
-            .unwrap();
+            .expect("RG1 read group not found in merged header");
         let lib = rg1.other_fields().get(&rg_tag::LIBRARY).map(|v| v.to_string());
         assert_eq!(lib, Some("Lib_RG1".to_string()));
     }
@@ -370,23 +373,25 @@ mod tests {
         let mut header_builder = Header::builder();
 
         for ref_name in ref_names {
-            let map = Map::<ReferenceSequence>::new(NonZeroUsize::new(200_000_000).unwrap());
+            let map = Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(200_000_000).expect("non-zero reference length"),
+            );
             header_builder = header_builder.add_reference_sequence(BString::from(*ref_name), map);
         }
 
         let header = header_builder.build();
 
         let path = dir.join(format!("{name}.bam"));
-        let file = std::fs::File::create(&path).unwrap();
+        let file = std::fs::File::create(&path).expect("failed to create BAM file");
         let mut writer = noodles::bam::io::Writer::new(file);
-        writer.write_header(&header).unwrap();
+        writer.write_header(&header).expect("failed to write BAM header");
         drop(writer);
         path
     }
 
     #[test]
     fn test_merge_headers_rejects_different_ref_count() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam_a = write_bam_with_refs(dir.path(), "a", &["chr1", "chr2"]);
         let bam_b = write_bam_with_refs(dir.path(), "b", &["chr1"]);
 
@@ -398,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_merge_headers_rejects_different_ref_names() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam_a = write_bam_with_refs(dir.path(), "a", &["chr1", "chr2"]);
         let bam_b = write_bam_with_refs(dir.path(), "b", &["chr1", "chrX"]);
 
@@ -410,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_merge_output_aliasing_input() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam = write_bam_with_read_groups(dir.path(), "input", &["RG1"]);
 
         let merge = Merge {
@@ -431,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_merge_empty_bams_produces_output() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let bam_a = write_bam_with_read_groups(dir.path(), "a", &["RG1"]);
         let bam_b = write_bam_with_read_groups(dir.path(), "b", &["RG2"]);
         let output = dir.path().join("merged.bam");
@@ -451,7 +456,7 @@ mod tests {
         assert!(output.exists(), "output BAM was not created");
 
         // Verify the output is a valid BAM by reading its header
-        let (_, header) = create_bam_reader(&output, 1).unwrap();
+        let (_, header) = create_bam_reader(&output, 1).expect("failed to read merged BAM output");
         let rg_ids: Vec<String> =
             header.read_groups().iter().map(|(id, _)| id.to_string()).collect();
         assert_eq!(rg_ids.len(), 2);

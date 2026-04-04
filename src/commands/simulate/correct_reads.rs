@@ -727,7 +727,7 @@ mod tests {
         use crate::commands::command::Command;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("failed to create temp dir");
         let output = dir.path().join("output.bam");
         let includelist = dir.path().join("includelist.txt");
         let truth = dir.path().join("truth.tsv");
