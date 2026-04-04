@@ -1,13 +1,79 @@
 //! Core infrastructure, traits, and shared types for the unified pipeline.
 //!
-//! This module contains:
-//! - Batch buffer types (`RawBlockBatch`, `CompressedBlockBatch`, etc.)
-//! - BGZF compression types
-//! - `PipelineConfig` and `PipelineStats`
-//! - `OutputPipelineState` trait for shared step functions
-//! - `HasCompressor` trait
-//! - `BatchWeight` trait for template-based batching
-//! - Shared step functions (`shared_try_step_compress`, `shared_try_step_write`)
+//! This module defines the trait hierarchy that both BAM and FASTQ pipelines implement,
+//! along with batch types, configuration, statistics, and shared step functions.
+//!
+//! # Trait Overview
+//!
+//! Traits are organized into four categories:
+//!
+//! ## Lifecycle & Monitoring
+//!
+//! | Trait | Purpose | Implement when... |
+//! |-------|---------|-------------------|
+//! | [`PipelineLifecycle`] | Completion checks, error handling, drain mode, validation | Building a new pipeline type |
+//! | [`MonitorableState`] | Deadlock detection via queue snapshots | Your pipeline uses the shared monitor loop |
+//!
+//! ## Pipeline Step State (shared state accessed by workers)
+//!
+//! | Trait | Step | Purpose | Implement when... |
+//! |-------|------|---------|-------------------|
+//! | [`ProcessPipelineState`] | Process (step 4) | Queue access for process step | Your pipeline has a process step |
+//! | [`OutputPipelineState`] | Serialize/Compress/Write (steps 5-7) | Queue access for output steps | Your pipeline writes BAM/BGZF output |
+//! | [`SerializePipelineState`] | Serialize (step 5) | Queue access for serialize step | Your pipeline serializes records |
+//! | [`WritePipelineState`] | Write (step 7) | Reorder buffer, output writer | Your pipeline writes ordered output |
+//!
+//! ## Worker State (per-thread mutable state)
+//!
+//! | Trait | Purpose | Implement when... |
+//! |-------|---------|-------------------|
+//! | [`WorkerStateCommon`] | Check/clear held items to prevent data loss on exit | Always (every worker type) |
+//! | [`HasWorkerCore`] | Access to scheduler and backoff state | Always (every worker type) |
+//! | [`HasCompressor`] | Per-worker BGZF compressor | Your pipeline compresses output |
+//! | [`HasRecycledBuffers`] | Buffer reuse for serialize/compress | Your pipeline serializes output |
+//! | [`HasHeldCompressed`] | Non-blocking compress step | Your pipeline has a compress step |
+//! | [`HasHeldBoundaries`] | Non-blocking boundary-finding step | Your pipeline finds record boundaries |
+//! | [`HasHeldProcessed`] | Non-blocking process step | Your pipeline has a process step |
+//! | [`HasHeldSerialized`] | Non-blocking serialize step | Your pipeline has a serialize step |
+//!
+//! ## Data Measurement
+//!
+//! | Trait | Purpose | Implement when... |
+//! |-------|---------|-------------------|
+//! | [`BatchWeight`] | Batch size for template-based batching thresholds | Your batch type needs weight-based flushing |
+//! | [`MemoryEstimate`] | Heap size for memory-bounded queues | Your type is stored in a memory-tracked queue |
+//!
+//! ## Generic Worker Loop
+//!
+//! | Trait | Purpose | Implement when... |
+//! |-------|---------|-------------------|
+//! | [`StepContext`] | Abstract over BAM/FASTQ differences for `generic_worker_loop` | Adding a new pipeline type that reuses the shared worker loop |
+//!
+//! # Trait Hierarchy
+//!
+//! ```text
+//! PipelineLifecycle
+//!     └── MonitorableState (extends PipelineLifecycle)
+//!
+//! WorkerStateCommon ──┐
+//! HasWorkerCore ──────┤── (both required by StepContext::Worker)
+//!                     │
+//! HasCompressor ──────┤
+//! HasRecycledBuffers ─┤── (combined in shared step function bounds)
+//! HasHeldCompressed ──┤
+//! HasHeldBoundaries ──┤
+//! HasHeldProcessed ───┤
+//! HasHeldSerialized ──┘
+//! ```
+//!
+//! # Shared Step Functions
+//!
+//! The following functions implement pipeline steps generically over the traits above:
+//!
+//! - [`shared_try_step_compress`] — Compress serialized data to BGZF blocks
+//! - [`shared_try_step_process`] — Pop batch, apply processing function, push results
+//! - [`shared_try_step_serialize`] — Serialize records into byte buffers
+//! - [`shared_try_step_write_new`] — Drain queue to reorder buffer, write in order
 
 use crossbeam_queue::ArrayQueue;
 use log::info;
