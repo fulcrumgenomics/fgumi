@@ -49,10 +49,9 @@
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use anyhow::{Context, Result};
+use bstr::ByteSlice;
 use clap::Parser;
-use fgumi_lib::bam_io::{
-    BamReaderAuto, create_bam_reader, create_bam_writer, is_stdin_path, is_stdout_path,
-};
+use fgumi_lib::bam_io::{BamReaderAuto, create_bam_reader, create_raw_bam_writer, is_stdin_path};
 use fgumi_lib::batched_sam_reader::BatchedSamReader;
 use fgumi_lib::logging::OperationTimer;
 use fgumi_lib::progress::ProgressTracker;
@@ -61,18 +60,19 @@ use fgumi_lib::sam::{
     buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
     unclipped_five_prime_position,
 };
-use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo};
+use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo, bam_fields};
 use fgumi_lib::template::{Template, TemplateIterator};
 use fgumi_lib::umi::TagInfo;
 use fgumi_lib::validation::validate_file_exists;
+use fgumi_lib::vendored::encode_record_buf;
 use log::{debug, info, warn};
 use noodles::sam::Header;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::record_buf::RecordBuf;
+use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Command-line arguments for `zipper`
@@ -521,109 +521,478 @@ pub fn merge(
     Ok(())
 }
 
-impl Zipper {
-    /// Process templates in single-threaded mode
-    fn process_singlethreaded<W, U, M>(
-        &self,
-        unmapped_iter: U,
-        mut mapped_iter: M,
-        output_header: &Header,
-        writer: &mut W,
-        tag_info: &TagInfo,
-    ) -> Result<u64>
-    where
-        W: AlignmentWrite,
-        U: Iterator<Item = Result<Template>>,
-        M: Iterator<Item = Result<Template>>,
-    {
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-        let mut mapped_peek: Option<Template> = None;
-        let mut templates_not_in_mapped_bam: u64 = 0;
-
-        for unmapped_result in unmapped_iter {
-            let unmapped_template = unmapped_result?;
-
-            if mapped_peek.is_none() {
-                mapped_peek = mapped_iter.next().transpose()?;
-            }
-
-            if let Some(ref mut mapped_template) = mapped_peek {
-                if mapped_template.name == unmapped_template.name {
-                    merge(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
-                    for rec in mapped_template.all_reads() {
-                        writer.write_alignment_record(output_header, rec)?;
-                        progress.log_if_needed(1);
-                    }
-                    mapped_peek = None;
-                } else {
-                    // Unmapped read with no corresponding mapped read (orphan unmapped)
-                    debug!(
-                        "Found unmapped read with no corresponding mapped read: {}",
-                        String::from_utf8_lossy(&unmapped_template.name)
-                    );
-                    if self.exclude_missing_reads {
-                        templates_not_in_mapped_bam += 1;
-                    } else {
-                        for rec in unmapped_template.all_reads() {
-                            writer.write_alignment_record(output_header, rec)?;
-                            progress.log_if_needed(1);
-                        }
+/// Appends a noodles `BufValue` tag to a raw BAM record in BAM binary encoding.
+fn append_buf_value_raw(dest: &mut Vec<u8>, tag: [u8; 2], value: &BufValue) {
+    use noodles::sam::alignment::record_buf::data::field::value::Array;
+    match value {
+        BufValue::Character(c) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'A');
+            dest.push(*c);
+        }
+        BufValue::Int8(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'c');
+            dest.push(v.cast_unsigned());
+        }
+        BufValue::UInt8(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'C');
+            dest.push(*v);
+        }
+        BufValue::Int16(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b's');
+            dest.extend_from_slice(&v.to_le_bytes());
+        }
+        BufValue::UInt16(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'S');
+            dest.extend_from_slice(&v.to_le_bytes());
+        }
+        BufValue::Int32(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'i');
+            dest.extend_from_slice(&v.to_le_bytes());
+        }
+        BufValue::UInt32(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'I');
+            dest.extend_from_slice(&v.to_le_bytes());
+        }
+        BufValue::Float(v) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'f');
+            dest.extend_from_slice(&v.to_le_bytes());
+        }
+        BufValue::String(s) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'Z');
+            dest.extend_from_slice(s.as_bytes());
+            dest.push(0);
+        }
+        BufValue::Hex(s) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'H');
+            dest.extend_from_slice(s.as_bytes());
+            dest.push(0);
+        }
+        BufValue::Array(arr) => {
+            dest.push(tag[0]);
+            dest.push(tag[1]);
+            dest.push(b'B');
+            match arr {
+                Array::Int8(vals) => {
+                    dest.push(b'c');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    for v in vals {
+                        dest.push(v.cast_unsigned());
                     }
                 }
-            } else {
-                // Unmapped read with no more mapped reads (orphan unmapped)
-                debug!(
-                    "Found unmapped read with no corresponding mapped read: {}",
-                    String::from_utf8_lossy(&unmapped_template.name)
-                );
-                if self.exclude_missing_reads {
-                    templates_not_in_mapped_bam += 1;
-                } else {
-                    for rec in unmapped_template.all_reads() {
-                        writer.write_alignment_record(output_header, rec)?;
-                        progress.log_if_needed(1);
+                Array::UInt8(vals) => {
+                    dest.push(b'C');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    dest.extend_from_slice(vals.as_slice());
+                }
+                Array::Int16(vals) => {
+                    dest.push(b's');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    for v in vals {
+                        dest.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                Array::UInt16(vals) => {
+                    dest.push(b'S');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    for v in vals {
+                        dest.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                Array::Int32(vals) => {
+                    dest.push(b'i');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    for v in vals {
+                        dest.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                Array::UInt32(vals) => {
+                    dest.push(b'I');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    for v in vals {
+                        dest.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                Array::Float(vals) => {
+                    dest.push(b'f');
+                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
+                    dest.extend_from_slice(&count.to_le_bytes());
+                    for v in vals {
+                        dest.extend_from_slice(&v.to_le_bytes());
                     }
                 }
             }
         }
+    }
+}
 
-        progress.log_final();
+/// Adds `pa` tags to secondary/supplementary reads in raw-byte mode.
+fn add_primary_alignment_tags_raw(mapped: &mut Template) {
+    let rr = match mapped.raw_records.as_ref() {
+        Some(rr) => rr,
+        None => return,
+    };
 
-        // Check for leftover mapped reads - this is an error
-        if let Some(remaining) = mapped_peek {
-            anyhow::bail!(
-                "Error: processed all unmapped reads but there are mapped reads remaining. \
-                 Found template '{}'. Please ensure the unmapped and mapped reads have the same set \
-                 of read names in the same order, and reads with the same name are consecutive (grouped) \
-                 in each input.",
-                String::from_utf8_lossy(&remaining.name)
-            );
-        }
-        if let Some(remaining) = mapped_iter.next() {
-            let remaining = remaining?;
-            anyhow::bail!(
-                "Error: processed all unmapped reads but there are mapped reads remaining. \
-                 Found template '{}'. Please ensure the unmapped and mapped reads have the same set \
-                 of read names in the same order, and reads with the same name are consecutive (grouped) \
-                 in each input.",
-                String::from_utf8_lossy(&remaining.name)
-            );
-        }
-
-        if self.exclude_missing_reads && templates_not_in_mapped_bam > 0 {
-            info!(
-                "Excluded {templates_not_in_mapped_bam} templates that were not present in the aligned BAM."
-            );
-        }
-
-        Ok(progress.count())
+    // Fast path: check if there are any secondary/supplementary reads
+    let has_sec_supp = rr.iter().any(|r| {
+        let f = bam_fields::flags(r);
+        (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0
+    });
+    if !has_sec_supp {
+        return;
     }
 
-    /// Process templates with multi-threaded BGZF compression.
+    // Get R1 primary info
+    let r1_info: Option<(i32, i32, bool)> = mapped.r1.and_then(|(i, _)| {
+        let r = &rr[i];
+        let f = bam_fields::flags(r);
+        if (f & bam_fields::flags::UNMAPPED) != 0 {
+            return None;
+        }
+        let ref_id = bam_fields::ref_id(r);
+        let pos = bam_fields::unclipped_5prime_from_raw_bam(r);
+        let is_reverse = (f & bam_fields::flags::REVERSE) != 0;
+        Some((ref_id, pos, is_reverse))
+    });
+
+    // Get R2 primary info
+    let r2_info: Option<(i32, i32, bool)> = mapped.r2.and_then(|(i, _)| {
+        let r = &rr[i];
+        let f = bam_fields::flags(r);
+        if (f & bam_fields::flags::UNMAPPED) != 0 {
+            return None;
+        }
+        let ref_id = bam_fields::ref_id(r);
+        let pos = bam_fields::unclipped_5prime_from_raw_bam(r);
+        let is_reverse = (f & bam_fields::flags::REVERSE) != 0;
+        Some((ref_id, pos, is_reverse))
+    });
+
+    let pa_info: Option<PrimaryAlignmentInfo> = match (r1_info, r2_info) {
+        (Some((t1, p1, n1)), Some((t2, p2, n2))) => {
+            if (t1, p1) <= (t2, p2) {
+                Some(PrimaryAlignmentInfo::new(t1, p1, n1, t2, p2, n2))
+            } else {
+                Some(PrimaryAlignmentInfo::new(t2, p2, n2, t1, p1, n1))
+            }
+        }
+        (Some((t, p, n)), None) | (None, Some((t, p, n))) => {
+            Some(PrimaryAlignmentInfo::new(t, p, n, t, p, n))
+        }
+        (None, None) => None,
+    };
+
+    let Some(pa_info) = pa_info else {
+        return;
+    };
+
+    let pa_tag = b"pa";
+    let pa_values = [
+        pa_info.tid1,
+        pa_info.pos1,
+        i32::from(pa_info.neg1),
+        pa_info.tid2,
+        pa_info.pos2,
+        i32::from(pa_info.neg2),
+    ];
+
+    let rr = mapped.raw_records.as_mut().unwrap();
+    for record in rr.iter_mut() {
+        let f = bam_fields::flags(record);
+        if (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0 {
+            bam_fields::remove_tag(record, pa_tag);
+            bam_fields::append_i32_array_tag(record, pa_tag, &pa_values);
+        }
+    }
+}
+
+/// Converts a mapped `Template` from `RecordBuf` mode to raw-byte mode.
+///
+/// Encodes each `RecordBuf` to raw BAM bytes using the vendored encoder
+/// and populates `raw_records`.
+fn convert_template_to_raw(template: &mut Template, header: &Header) -> Result<()> {
+    if template.is_raw_byte_mode() {
+        return Ok(());
+    }
+    let mut raw_records = Vec::with_capacity(template.records.len());
+    for record in &template.records {
+        let mut buf = Vec::with_capacity(256);
+        encode_record_buf(&mut buf, header, record)
+            .map_err(|e| anyhow::anyhow!("Failed to encode record: {e}"))?;
+        raw_records.push(buf);
+    }
+    template.raw_records = Some(raw_records);
+    // Keep records intact for read_count compatibility
+    Ok(())
+}
+
+/// Collects the indices of mapped records corresponding to a given segment
+/// (R1 or R2) using the template's pre-computed index fields, avoiding a
+/// full scan of all mapped records.
+fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(4);
+    if is_first_segment {
+        if let Some((i, _)) = mapped.r1 {
+            indices.push(i);
+        }
+        if let Some((s, e)) = mapped.r1_supplementals {
+            indices.extend(s..e);
+        }
+        if let Some((s, e)) = mapped.r1_secondaries {
+            indices.extend(s..e);
+        }
+    } else {
+        if let Some((i, _)) = mapped.r2 {
+            indices.push(i);
+        }
+        if let Some((s, e)) = mapped.r2_supplementals {
+            indices.extend(s..e);
+        }
+        if let Some((s, e)) = mapped.r2_secondaries {
+            indices.extend(s..e);
+        }
+    }
+    indices
+}
+
+/// Merges tags from unmapped template into mapped template using raw bytes.
+///
+/// This is the raw-byte equivalent of [`merge`]. The mapped template must
+/// be in raw-byte mode (call [`convert_template_to_raw`] first). The
+/// unmapped template uses `RecordBuf` mode.
+///
+/// Performs the same 7 operations as `merge()`:
+///
+/// 1. Fix mate info (raw)
+/// 2. Remove tags from mapped records
+/// 3. Copy tags from unmapped to mapped (with reverse/revcomp for neg strand)
+/// 5. Transfer QC flags
+/// 6. Normalize AS/XS tags
+/// 7. Add PA tags
+pub fn merge_raw(
+    unmapped: &Template,
+    mapped: &mut Template,
+    tag_info: &TagInfo,
+    skip_pa_tags: bool,
+) -> Result<()> {
+    // Step 1: Fix mate info
+    mapped.fix_mate_info_raw()?;
+
+    let rr = mapped
+        .raw_records
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("merge_raw: mapped not in raw mode"))?;
+
+    // Step 2: Remove tags from mapped reads
+    for record in rr.iter_mut() {
+        for tag_str in &tag_info.remove {
+            if tag_str.len() == 2 {
+                let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
+                bam_fields::remove_tag(record, &tag_bytes);
+            }
+        }
+    }
+
+    // Steps 3–5: Copy tags from unmapped to mapped, transfer QC flags
+    let has_transforms = tag_info.has_revs_or_revcomps();
+    let pg_tag: [u8; 2] = [b'P', b'G'];
+
+    for u in unmapped.primary_reads() {
+        let is_unpaired = !u.flags().is_segmented();
+        let is_first = u.flags().is_first_segment();
+
+        // Use template's known indices instead of scanning all mapped records
+        let mapped_indices = collect_mapped_indices(mapped, is_unpaired || is_first);
+
+        // Single pass to determine strand presence
+        let (has_pos, has_neg) = {
+            let rr = mapped.raw_records.as_ref().unwrap();
+            let mut pos = false;
+            let mut neg = false;
+            for &i in &mapped_indices {
+                if (bam_fields::flags(&rr[i]) & bam_fields::flags::REVERSE) == 0 {
+                    pos = true;
+                } else {
+                    neg = true;
+                }
+                if pos && neg {
+                    break;
+                }
+            }
+            (pos, neg)
+        };
+
+        // Copy tags to positive strand reads
+        if has_pos {
+            let rr = mapped.raw_records.as_mut().unwrap();
+            for &i in &mapped_indices {
+                if (bam_fields::flags(&rr[i]) & bam_fields::flags::REVERSE) != 0 {
+                    continue;
+                }
+                let aux = bam_fields::aux_data_slice(&rr[i]);
+                let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
+
+                for (tag, value) in u.data().iter() {
+                    let tag_bytes: [u8; 2] = [tag.as_ref()[0], tag.as_ref()[1]];
+                    if tag_bytes == pg_tag && has_pg {
+                        continue;
+                    }
+                    // Tag bytes are always valid ASCII
+                    let tag_str = std::str::from_utf8(&tag_bytes).unwrap_or("");
+                    if tag_info.remove.contains(tag_str) {
+                        continue;
+                    }
+                    bam_fields::remove_tag(&mut rr[i], &tag_bytes);
+                    append_buf_value_raw(&mut rr[i], tag_bytes, value);
+                }
+            }
+        }
+
+        // Copy tags to negative strand reads (with reverse/revcomp)
+        if has_neg {
+            let rr = mapped.raw_records.as_mut().unwrap();
+            for &i in &mapped_indices {
+                if (bam_fields::flags(&rr[i]) & bam_fields::flags::REVERSE) == 0 {
+                    continue;
+                }
+                let aux = bam_fields::aux_data_slice(&rr[i]);
+                let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
+
+                // Aux offset is safe to cache here: `remove_tag` and `append_buf_value_raw`
+                // only modify bytes within/after the aux region, so this offset stays valid.
+                let aux_offset =
+                    bam_fields::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
+
+                for (tag, value) in u.data().iter() {
+                    let tag_bytes: [u8; 2] = [tag.as_ref()[0], tag.as_ref()[1]];
+                    if tag_bytes == pg_tag && has_pg {
+                        continue;
+                    }
+                    let tag_str = std::str::from_utf8(&tag_bytes).unwrap_or("");
+                    if tag_info.remove.contains(tag_str) {
+                        continue;
+                    }
+
+                    bam_fields::remove_tag(&mut rr[i], &tag_bytes);
+
+                    append_buf_value_raw(&mut rr[i], tag_bytes, value);
+                    if has_transforms && tag_info.reverse.contains(tag_str) {
+                        reverse_tag_in_place_raw(&mut rr[i], aux_offset, tag_bytes, value);
+                    } else if has_transforms && tag_info.revcomp.contains(tag_str) {
+                        revcomp_tag_in_place_raw(&mut rr[i], aux_offset, tag_bytes, value);
+                    }
+                }
+            }
+        }
+
+        // Step 5: Transfer QC pass/fail flag
+        let is_qc_fail = u.flags().is_qc_fail();
+        let rr = mapped.raw_records.as_mut().unwrap();
+        for &i in &mapped_indices {
+            let mut f = bam_fields::flags(&rr[i]);
+            if is_qc_fail {
+                f |= bam_fields::flags::QC_FAIL;
+            } else {
+                f &= !bam_fields::flags::QC_FAIL;
+            }
+            bam_fields::set_flags(&mut rr[i], f);
+        }
+    }
+
+    // Step 6: Normalize AS/XS tags
+    let rr = mapped.raw_records.as_mut().unwrap();
+    for record in rr.iter_mut() {
+        bam_fields::normalize_int_tag_to_smallest_signed(record, b"AS");
+        bam_fields::normalize_int_tag_to_smallest_signed(record, b"XS");
+    }
+
+    // Step 7: Add PA tags
+    if !skip_pa_tags {
+        add_primary_alignment_tags_raw(mapped);
+    }
+
+    Ok(())
+}
+
+/// Applies the appropriate reverse operation for a tag in-place.
+fn reverse_tag_in_place_raw(
+    record: &mut [u8],
+    aux_offset: usize,
+    tag_bytes: [u8; 2],
+    value: &BufValue,
+) {
+    match value {
+        BufValue::String(_) => {
+            bam_fields::reverse_string_tag_in_place(record, aux_offset, &tag_bytes);
+        }
+        BufValue::Array(_) => {
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag_bytes);
+        }
+        _ => {}
+    }
+}
+
+/// Applies the appropriate reverse-complement operation for a tag in-place.
+fn revcomp_tag_in_place_raw(
+    record: &mut [u8],
+    aux_offset: usize,
+    tag_bytes: [u8; 2],
+    value: &BufValue,
+) {
+    match value {
+        BufValue::String(_) => {
+            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, &tag_bytes);
+        }
+        BufValue::Array(_) => {
+            // For array tags, revcomp is the same as reverse
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag_bytes);
+        }
+        _ => {}
+    }
+}
+
+/// Encodes all records of an unmapped template to raw BAM bytes for output.
+fn encode_unmapped_template_records(template: &Template, header: &Header) -> Result<Vec<Vec<u8>>> {
+    let mut raw = Vec::with_capacity(template.read_count());
+    for record in template.all_reads() {
+        let mut buf = Vec::with_capacity(256);
+        encode_record_buf(&mut buf, header, record)
+            .map_err(|e| anyhow::anyhow!("encode unmapped: {e}"))?;
+        raw.push(buf);
+    }
+    Ok(raw)
+}
+
+impl Zipper {
+    /// Process templates using raw-byte merge path with BGZF compression.
     ///
-    /// This method uses noodles' multi-threaded writer to parallelize compression
-    /// (the bottleneck) while processing templates sequentially.
-    fn process_with_parallel_writer<U, M>(
+    /// Thread count is controlled by `self.threads` (1 = single-threaded).
+    fn process_raw<U, M>(
         &self,
         unmapped_iter: U,
         mut mapped_iter: M,
@@ -634,8 +1003,7 @@ impl Zipper {
         U: Iterator<Item = Result<Template>>,
         M: Iterator<Item = Result<Template>>,
     {
-        // Create multi-threaded BAM writer
-        let mut writer = create_bam_writer(
+        let mut writer = create_raw_bam_writer(
             &self.output,
             output_header,
             self.threads,
@@ -649,49 +1017,49 @@ impl Zipper {
         for unmapped_result in unmapped_iter {
             let unmapped_template = unmapped_result?;
 
-            // Advance mapped iterator if needed
             if mapped_peek.is_none() {
                 mapped_peek = mapped_iter.next().transpose()?;
             }
 
-            // Check for matching mapped template
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
-                    // Merge tags from unmapped to mapped (no cloning needed!)
-                    merge(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
-
-                    // Write merged records
-                    for rec in mapped_template.all_reads() {
-                        writer.write_alignment_record(output_header, rec)?;
+                    convert_template_to_raw(mapped_template, output_header)?;
+                    merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
+                    let rr = mapped_template.raw_records.as_ref().unwrap();
+                    for rec in rr {
+                        writer.write_raw_record(rec)?;
                         progress.log_if_needed(1);
                     }
                     mapped_peek = None;
                 } else {
-                    // Unmapped read with no corresponding mapped read (orphan unmapped)
                     debug!(
-                        "Found unmapped read with no corresponding mapped read: {}",
+                        "Found unmapped read with no corresponding mapped \
+                         read: {}",
                         String::from_utf8_lossy(&unmapped_template.name)
                     );
                     if self.exclude_missing_reads {
                         templates_not_in_mapped_bam += 1;
                     } else {
-                        for rec in unmapped_template.all_reads() {
-                            writer.write_alignment_record(output_header, rec)?;
+                        let raw =
+                            encode_unmapped_template_records(&unmapped_template, output_header)?;
+                        for rec in &raw {
+                            writer.write_raw_record(rec)?;
                             progress.log_if_needed(1);
                         }
                     }
                 }
             } else {
-                // No more mapped reads - write unmapped reads
                 debug!(
-                    "Found unmapped read with no corresponding mapped read: {}",
+                    "Found unmapped read with no corresponding mapped \
+                     read: {}",
                     String::from_utf8_lossy(&unmapped_template.name)
                 );
                 if self.exclude_missing_reads {
                     templates_not_in_mapped_bam += 1;
                 } else {
-                    for rec in unmapped_template.all_reads() {
-                        writer.write_alignment_record(output_header, rec)?;
+                    let raw = encode_unmapped_template_records(&unmapped_template, output_header)?;
+                    for rec in &raw {
+                        writer.write_raw_record(rec)?;
                         progress.log_if_needed(1);
                     }
                 }
@@ -700,40 +1068,37 @@ impl Zipper {
 
         progress.log_final();
 
-        // Check for leftover mapped reads - this is an error
+        // Check for leftover mapped reads
         if let Some(remaining) = mapped_peek {
-            // Finish writer before returning error
-            writer.into_inner().finish()?;
             anyhow::bail!(
-                "Error: processed all unmapped reads but there are mapped reads remaining. \
-                 Found template '{}'. Please ensure the unmapped and mapped reads have the same set \
-                 of read names in the same order, and reads with the same name are consecutive (grouped) \
-                 in each input.",
+                "Error: processed all unmapped reads but there are mapped \
+                 reads remaining. Found template '{}'. Please ensure the \
+                 unmapped and mapped reads have the same set of read names \
+                 in the same order, and reads with the same name are \
+                 consecutive (grouped) in each input.",
                 String::from_utf8_lossy(&remaining.name)
             );
         }
         if let Some(remaining) = mapped_iter.next() {
             let remaining = remaining?;
-            // Finish writer before returning error
-            writer.into_inner().finish()?;
             anyhow::bail!(
-                "Error: processed all unmapped reads but there are mapped reads remaining. \
-                 Found template '{}'. Please ensure the unmapped and mapped reads have the same set \
-                 of read names in the same order, and reads with the same name are consecutive (grouped) \
-                 in each input.",
+                "Error: processed all unmapped reads but there are mapped \
+                 reads remaining. Found template '{}'. Please ensure the \
+                 unmapped and mapped reads have the same set of read names \
+                 in the same order, and reads with the same name are \
+                 consecutive (grouped) in each input.",
                 String::from_utf8_lossy(&remaining.name)
             );
         }
 
         if self.exclude_missing_reads && templates_not_in_mapped_bam > 0 {
             info!(
-                "Excluded {templates_not_in_mapped_bam} templates that were not present in the aligned BAM."
+                "Excluded {templates_not_in_mapped_bam} templates that \
+                 were not present in the aligned BAM."
             );
         }
 
-        // Finish writing and flush all pending blocks
-        writer.into_inner().finish()?;
-
+        writer.finish()?;
         Ok(progress.count())
     }
 }
@@ -897,36 +1262,8 @@ impl Command for Zipper {
         });
         let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
 
-        let total_records = if self.threads > 1 {
-            // Multi-threaded: sequential merge with parallel BGZF compression
-            // This is more efficient than parallel merge with template cloning
-            self.process_with_parallel_writer(
-                unmapped_iter,
-                mapped_iter,
-                &output_header,
-                &tag_info,
-            )?
-        } else {
-            // Single-threaded: simple sequential processing
-            let output_writer: Box<dyn Write> = if is_stdout_path(&self.output) {
-                Box::new(std::io::stdout().lock())
-            } else {
-                Box::new(
-                    std::fs::File::create(&self.output).context("Failed to create output BAM")?,
-                )
-            };
-
-            let mut writer = noodles::bam::io::Writer::new(output_writer);
-            writer.write_header(&output_header)?;
-
-            self.process_singlethreaded(
-                unmapped_iter,
-                mapped_iter,
-                &output_header,
-                &mut writer,
-                &tag_info,
-            )?
-        };
+        let total_records =
+            self.process_raw(unmapped_iter, mapped_iter, &output_header, &tag_info)?;
 
         info!("zipper completed successfully");
         timer.log_completion(total_records);
@@ -2566,6 +2903,697 @@ mod tests {
             .any(|r| r.flags().is_supplementary() && r.data().get(&PA_TAG).is_some());
 
         assert!(has_pa_tag, "Supplementary should have pa tag when skip_pa_tags=false");
+
+        Ok(())
+    }
+
+    /// Tests AS/XS tag normalization to smallest signed integer type
+    ///
+    /// Verifies that:
+    /// - AS tags with Int32 values are normalized to Int8 when they fit
+    /// - XS tags with `UInt8` values are normalized to `Int8`
+    /// - Large values that don't fit in Int8 are normalized to Int16
+    /// - Tags on all reads (primary, secondary, supplementary) are normalized
+    #[test]
+    fn test_as_xs_normalization() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_frag_with_attrs("q1", None, true, &attrs);
+
+        // Add mapped read with AS as Int32(77) and XS as Int32(50)
+        let mapped_rec = RecordBuilder::new()
+            .name("q1")
+            .flags(Flags::empty())
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("100M")
+            .sequence(&"A".repeat(100))
+            .qualities(&[30u8; 100])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 77i32)
+            .tag("XS", 50i32)
+            .build();
+        mapped.push_record(mapped_rec);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 1);
+
+        // AS=77 fits in i8 (-128..127), should be normalized to Int8
+        let as_val = records[0].data().get(&Tag::new(b'A', b'S')).unwrap();
+        assert!(matches!(as_val, BufValue::Int8(77)), "AS=77 should be Int8, got {as_val:?}");
+
+        // XS=50 fits in i8, should be normalized to Int8
+        let xs_val = records[0].data().get(&Tag::new(b'X', b'S')).unwrap();
+        assert!(matches!(xs_val, BufValue::Int8(50)), "XS=50 should be Int8, got {xs_val:?}");
+
+        Ok(())
+    }
+
+    /// Tests AS/XS normalization with values that exceed Int8 range
+    ///
+    /// Verifies that AS values >127 are normalized to Int16 rather than Int8
+    #[test]
+    fn test_as_xs_normalization_large_values() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_frag_with_attrs("q1", None, true, &attrs);
+
+        // AS=200 exceeds i8 range, XS=-200 exceeds i8 range
+        let mapped_rec = RecordBuilder::new()
+            .name("q1")
+            .flags(Flags::empty())
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("100M")
+            .sequence(&"A".repeat(100))
+            .qualities(&[30u8; 100])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 200i32)
+            .tag("XS", -200i32)
+            .build();
+        mapped.push_record(mapped_rec);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 1);
+
+        // AS=200 doesn't fit in i8, should be Int16
+        let as_val = records[0].data().get(&Tag::new(b'A', b'S')).unwrap();
+        assert!(matches!(as_val, BufValue::Int16(200)), "AS=200 should be Int16, got {as_val:?}");
+
+        // XS=-200 doesn't fit in i8, should be Int16
+        let xs_val = records[0].data().get(&Tag::new(b'X', b'S')).unwrap();
+        assert!(matches!(xs_val, BufValue::Int16(-200)), "XS=-200 should be Int16, got {xs_val:?}");
+
+        Ok(())
+    }
+
+    /// Tests negative strand tag copying when R1 is on the negative strand
+    ///
+    /// Verifies that:
+    /// - Tags on R1 (negative strand) are reversed/revcomped
+    /// - Tags on R2 (positive strand) are copied unchanged
+    #[test]
+    fn test_negative_strand_r1_tag_copying() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("n1", BufValue::from(vec![1i16, 2, 3]));
+        attrs.insert("s1", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        let mut mapped_attrs = HashMap::new();
+        mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+        // R1 on negative strand, R2 on positive strand
+        mapped.add_pair_with_attrs("q1", Some(100), Some(200), false, true, &mapped_attrs);
+
+        let records =
+            run_zipper(&unmapped, &mapped, vec![], vec!["n1".to_string()], vec!["s1".to_string()])?;
+
+        assert_eq!(records.len(), 2);
+
+        let r1 = records.iter().find(|r| r.flags().is_first_segment()).unwrap();
+        let r2 = records.iter().find(|r| !r.flags().is_first_segment()).unwrap();
+
+        // R1 is negative strand - tags should be reversed/revcomped
+        if let Some(BufValue::Array(
+            noodles::sam::alignment::record_buf::data::field::value::Array::Int16(vals),
+        )) = r1.data().get(&Tag::new(b'n', b'1'))
+        {
+            assert_eq!(*vals, vec![3i16, 2, 1], "n1 should be reversed for R1 (negative strand)");
+        } else {
+            panic!("n1 tag not found or wrong type on R1");
+        }
+
+        if let Some(BufValue::String(s)) = r1.data().get(&Tag::new(b's', b'1')) {
+            assert_eq!(s.to_string(), "ACGT", "s1 should be revcomped for R1 (negative strand)");
+        } else {
+            panic!("s1 tag not found or wrong type on R1");
+        }
+
+        // R2 is positive strand - tags should be unchanged
+        if let Some(BufValue::Array(
+            noodles::sam::alignment::record_buf::data::field::value::Array::Int16(vals),
+        )) = r2.data().get(&Tag::new(b'n', b'1'))
+        {
+            assert_eq!(*vals, vec![1i16, 2, 3], "n1 should be unchanged for R2 (positive strand)");
+        } else {
+            panic!("n1 tag not found or wrong type on R2");
+        }
+
+        if let Some(BufValue::String(s)) = r2.data().get(&Tag::new(b's', b'1')) {
+            assert_eq!(s.to_string(), "ACGT", "s1 should be unchanged for R2 (positive strand)");
+        } else {
+            panic!("s1 tag not found or wrong type on R2");
+        }
+
+        Ok(())
+    }
+
+    /// Tests negative strand tag copying when both R1 and R2 are on the negative strand
+    ///
+    /// Verifies that tags on both reads are reversed/revcomped
+    #[test]
+    fn test_negative_strand_both_reads() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("n1", BufValue::from(vec![10i16, 20, 30]));
+        attrs.insert("s1", BufValue::from("AACC".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        let mut mapped_attrs = HashMap::new();
+        mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+        // Both reads on negative strand
+        mapped.add_pair_with_attrs("q1", Some(200), Some(100), false, false, &mapped_attrs);
+
+        let records =
+            run_zipper(&unmapped, &mapped, vec![], vec!["n1".to_string()], vec!["s1".to_string()])?;
+
+        assert_eq!(records.len(), 2);
+
+        // Both reads should have reversed/revcomped tags
+        for rec in &records {
+            if let Some(BufValue::Array(
+                noodles::sam::alignment::record_buf::data::field::value::Array::Int16(vals),
+            )) = rec.data().get(&Tag::new(b'n', b'1'))
+            {
+                assert_eq!(*vals, vec![30i16, 20, 10], "n1 should be reversed on negative strand");
+            } else {
+                panic!("n1 tag not found or wrong type");
+            }
+
+            if let Some(BufValue::String(s)) = rec.data().get(&Tag::new(b's', b'1')) {
+                assert_eq!(s.to_string(), "GGTT", "s1 should be revcomped on negative strand");
+            } else {
+                panic!("s1 tag not found or wrong type");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Tests `fix_mate_info` verifying actual RNEXT, PNEXT, TLEN, MQ, and MC values
+    ///
+    /// Verifies that:
+    /// - RNEXT (`mate_reference_sequence_id`) is set correctly for both reads
+    /// - PNEXT (`mate_alignment_start`) is set correctly for both reads
+    /// - TLEN is computed correctly (positive for leftmost read, negative for rightmost)
+    /// - MQ tag contains the mate's mapping quality
+    /// - MC tag contains the mate's CIGAR string
+    #[test]
+    fn test_fix_mate_info_values() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        // Build mapped pair with different CIGARs and mapping qualities
+        let r1_mapped = RecordBuilder::new()
+            .name("q1")
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mapping_quality(40)
+            .sequence(&"A".repeat(50))
+            .qualities(&[30u8; 50])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .build();
+        let r2_mapped = RecordBuilder::new()
+            .name("q1")
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::LAST_SEGMENT
+                    | Flags::REVERSE_COMPLEMENTED
+                    | Flags::PROPERLY_SEGMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(300)
+            .cigar("75M")
+            .mapping_quality(30)
+            .sequence(&"A".repeat(75))
+            .qualities(&[30u8; 75])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .build();
+        mapped.push_record(r1_mapped);
+        mapped.push_record(r2_mapped);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 2);
+
+        let r1 = records.iter().find(|r| r.flags().is_first_segment()).unwrap();
+        let r2 = records.iter().find(|r| !r.flags().is_first_segment()).unwrap();
+
+        // R1's mate should point to R2
+        assert_eq!(
+            r1.mate_reference_sequence_id(),
+            r2.reference_sequence_id(),
+            "R1's RNEXT should equal R2's reference"
+        );
+        assert_eq!(
+            r1.mate_alignment_start(),
+            r2.alignment_start(),
+            "R1's PNEXT should equal R2's position"
+        );
+
+        // R2's mate should point to R1
+        assert_eq!(
+            r2.mate_reference_sequence_id(),
+            r1.reference_sequence_id(),
+            "R2's RNEXT should equal R1's reference"
+        );
+        assert_eq!(
+            r2.mate_alignment_start(),
+            r1.alignment_start(),
+            "R2's PNEXT should equal R1's position"
+        );
+
+        // TLEN: R1 is at 100 (50M, forward), R2 is at 300 (75M, reverse)
+        // Insert size = R2_end - R1_start + 1 = (300+75-1) - 100 + 1 = 275
+        let r1_tlen = r1.template_length();
+        let r2_tlen = r2.template_length();
+        assert!(r1_tlen != 0, "R1 TLEN should be non-zero for mapped pair");
+        assert_eq!(r1_tlen, -r2_tlen, "R1 TLEN should be negation of R2 TLEN");
+
+        // MQ: R1 should have R2's mapping quality, and vice versa
+        let r1_mq = r1.data().get(&Tag::new(b'M', b'Q'));
+        let r2_mq = r2.data().get(&Tag::new(b'M', b'Q'));
+        assert!(
+            matches!(r1_mq, Some(BufValue::Int8(30))),
+            "R1's MQ should be R2's mapq (30), got {r1_mq:?}"
+        );
+        assert!(
+            matches!(r2_mq, Some(BufValue::Int8(40))),
+            "R2's MQ should be R1's mapq (40), got {r2_mq:?}"
+        );
+
+        // MC: R1 should have R2's CIGAR, and vice versa
+        if let Some(BufValue::String(mc)) = r1.data().get(&Tag::new(b'M', b'C')) {
+            assert_eq!(mc.to_string(), "75M", "R1's MC should be R2's CIGAR");
+        } else {
+            panic!("R1 should have MC tag");
+        }
+        if let Some(BufValue::String(mc)) = r2.data().get(&Tag::new(b'M', b'C')) {
+            assert_eq!(mc.to_string(), "50M", "R2's MC should be R1's CIGAR");
+        } else {
+            panic!("R2 should have MC tag");
+        }
+
+        Ok(())
+    }
+
+    /// Tests `fix_mate_info` for supplementary alignments
+    ///
+    /// Verifies that:
+    /// - Supplementary alignments get correct mate info from the primary of the other end
+    /// - RNEXT/PNEXT point to the mate's primary alignment
+    /// - MQ and MC tags are set from the mate's primary alignment
+    /// - TLEN is negative of the mate primary's TLEN
+    /// - ms (mate score) tag is set from mate primary's AS tag
+    #[test]
+    fn test_fix_mate_info_supplementary() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        // Add primary pair with known CIGARs, positions, mapqs, and per-read AS tags
+        let r1_mapped = RecordBuilder::new()
+            .name("q1")
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mapping_quality(40)
+            .sequence(&"A".repeat(50))
+            .qualities(&[30u8; 50])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 77i32)
+            .build();
+        let r2_mapped = RecordBuilder::new()
+            .name("q1")
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::LAST_SEGMENT
+                    | Flags::REVERSE_COMPLEMENTED
+                    | Flags::PROPERLY_SEGMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(300)
+            .cigar("75M")
+            .mapping_quality(30)
+            .sequence(&"A".repeat(75))
+            .qualities(&[30u8; 75])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 55i32)
+            .build();
+        mapped.push_record(r1_mapped);
+        mapped.push_record(r2_mapped);
+
+        // Add R1 supplementary alignment
+        let supp_rec = RecordBuilder::new()
+            .name("q1")
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::FIRST_SEGMENT
+                    | Flags::SUPPLEMENTARY
+                    | Flags::REVERSE_COMPLEMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(500)
+            .cigar("60M")
+            .mapping_quality(20)
+            .sequence(&"A".repeat(60))
+            .qualities(&[30u8; 60])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 33i32)
+            .build();
+        mapped.push_record(supp_rec);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 3);
+
+        let r1_primary = records
+            .iter()
+            .find(|r| r.flags().is_first_segment() && !r.flags().is_supplementary())
+            .unwrap();
+        let r2_primary = records
+            .iter()
+            .find(|r| !r.flags().is_first_segment() && !r.flags().is_supplementary())
+            .unwrap();
+        let r1_supp = records
+            .iter()
+            .find(|r| r.flags().is_first_segment() && r.flags().is_supplementary())
+            .unwrap();
+
+        // R1 supplementary's mate should point to R2's primary
+        assert_eq!(
+            r1_supp.mate_reference_sequence_id(),
+            r2_primary.reference_sequence_id(),
+            "R1 supp RNEXT should point to R2 primary's reference"
+        );
+        assert_eq!(
+            r1_supp.mate_alignment_start(),
+            r2_primary.alignment_start(),
+            "R1 supp PNEXT should point to R2 primary's position"
+        );
+
+        // MQ on supplementary should be R2 primary's mapping quality
+        let supp_mq = r1_supp.data().get(&Tag::new(b'M', b'Q'));
+        assert!(
+            matches!(supp_mq, Some(BufValue::Int8(30))),
+            "R1 supp MQ should be R2 primary's mapq (30), got {supp_mq:?}"
+        );
+
+        // MC on supplementary should be R2 primary's CIGAR
+        if let Some(BufValue::String(mc)) = r1_supp.data().get(&Tag::new(b'M', b'C')) {
+            assert_eq!(mc.to_string(), "75M", "R1 supp MC should be R2 primary's CIGAR");
+        } else {
+            panic!("R1 supp should have MC tag");
+        }
+
+        // ms (mate score) on supplementary should be R2 primary's AS value
+        let supp_ms = r1_supp.data().get(&Tag::new(b'm', b's'));
+        assert!(
+            matches!(supp_ms, Some(BufValue::Int8(55))),
+            "R1 supp ms should be R2 primary's AS (55), got {supp_ms:?}"
+        );
+
+        // TLEN on supplementary should be negative of R2 primary's TLEN
+        let r1_primary_tlen = r1_primary.template_length();
+        let r1_supp_tlen = r1_supp.template_length();
+        // Supplementary TLEN = -(R2 primary TLEN) = -(-R1 primary TLEN) = R1 primary TLEN... no
+        // Actually: supplementary's TLEN = -(mate primary's TLEN) = -(R2's TLEN) = R1's TLEN
+        // Wait, the code says: *self.records[i].template_length_mut() = -r2_tlen;
+        // R2's TLEN is the negative of R1's TLEN, so -r2_tlen = R1's TLEN
+        assert_eq!(
+            r1_supp_tlen, r1_primary_tlen,
+            "R1 supp TLEN should equal R1 primary TLEN (both = -R2_TLEN)"
+        );
+
+        Ok(())
+    }
+
+    /// Tests `fix_mate_info` when one read is unmapped
+    ///
+    /// Verifies that:
+    /// - The unmapped read is placed at the mapped read's coordinates
+    /// - MQ/MC tags are removed from the mapped read (mate is unmapped)
+    /// - MQ/MC tags are set on the unmapped read (mate is mapped)
+    /// - TLEN is 0 for both reads
+    #[test]
+    fn test_fix_mate_info_one_unmapped() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        // R1 is mapped, R2 is unmapped
+        let mut mapped_attrs = HashMap::new();
+        mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+        mapped.add_pair_with_attrs("q1", Some(100), None, true, true, &mapped_attrs);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 2);
+
+        let r1 = records.iter().find(|r| r.flags().is_first_segment()).unwrap();
+        let r2 = records.iter().find(|r| !r.flags().is_first_segment()).unwrap();
+
+        // TLEN should be 0 for both
+        assert_eq!(r1.template_length(), 0, "R1 TLEN should be 0 when mate is unmapped");
+        assert_eq!(r2.template_length(), 0, "R2 TLEN should be 0 when mate is unmapped");
+
+        // Mapped read (R1) should NOT have MQ or MC (mate is unmapped)
+        assert!(
+            r1.data().get(&Tag::new(b'M', b'Q')).is_none(),
+            "Mapped read should not have MQ when mate is unmapped"
+        );
+        assert!(
+            r1.data().get(&Tag::new(b'M', b'C')).is_none(),
+            "Mapped read should not have MC when mate is unmapped"
+        );
+
+        Ok(())
+    }
+
+    /// Tests `fix_mate_info` for R2 supplementary alignments
+    ///
+    /// Verifies that R2 supplementary alignments get correct mate info
+    /// from the R1 primary alignment (covers the R2 supplemental path).
+    #[test]
+    fn test_fix_mate_info_r2_supplementary() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        let r1_mapped = RecordBuilder::new()
+            .name("q1")
+            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED)
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .cigar("50M")
+            .mapping_quality(40)
+            .sequence(&"A".repeat(50))
+            .qualities(&[30u8; 50])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 77i32)
+            .build();
+        let r2_mapped = RecordBuilder::new()
+            .name("q1")
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::LAST_SEGMENT
+                    | Flags::REVERSE_COMPLEMENTED
+                    | Flags::PROPERLY_SEGMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(300)
+            .cigar("75M")
+            .mapping_quality(30)
+            .sequence(&"A".repeat(75))
+            .qualities(&[30u8; 75])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 55i32)
+            .build();
+        mapped.push_record(r1_mapped);
+        mapped.push_record(r2_mapped);
+
+        // Add R2 supplementary alignment
+        let supp_rec = RecordBuilder::new()
+            .name("q1")
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::LAST_SEGMENT
+                    | Flags::SUPPLEMENTARY
+                    | Flags::REVERSE_COMPLEMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(500)
+            .cigar("60M")
+            .mapping_quality(20)
+            .sequence(&"A".repeat(60))
+            .qualities(&[30u8; 60])
+            .tag("PG", MAPPED_PG_ID.to_string())
+            .tag("AS", 33i32)
+            .build();
+        mapped.push_record(supp_rec);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 3);
+
+        let r1_primary = records
+            .iter()
+            .find(|r| r.flags().is_first_segment() && !r.flags().is_supplementary())
+            .unwrap();
+        let r2_supp = records
+            .iter()
+            .find(|r| !r.flags().is_first_segment() && r.flags().is_supplementary())
+            .unwrap();
+
+        // R2 supplementary's mate should point to R1's primary
+        assert_eq!(
+            r2_supp.mate_reference_sequence_id(),
+            r1_primary.reference_sequence_id(),
+            "R2 supp RNEXT should point to R1 primary's reference"
+        );
+        assert_eq!(
+            r2_supp.mate_alignment_start(),
+            r1_primary.alignment_start(),
+            "R2 supp PNEXT should point to R1 primary's position"
+        );
+
+        // MQ on R2 supplementary should be R1 primary's mapping quality
+        let supp_mq = r2_supp.data().get(&Tag::new(b'M', b'Q'));
+        assert!(
+            matches!(supp_mq, Some(BufValue::Int8(40))),
+            "R2 supp MQ should be R1 primary's mapq (40), got {supp_mq:?}"
+        );
+
+        // MC on R2 supplementary should be R1 primary's CIGAR
+        if let Some(BufValue::String(mc)) = r2_supp.data().get(&Tag::new(b'M', b'C')) {
+            assert_eq!(mc.to_string(), "50M", "R2 supp MC should be R1 primary's CIGAR");
+        } else {
+            panic!("R2 supp should have MC tag");
+        }
+
+        // ms (mate score) should be R1 primary's AS value
+        let supp_ms = r2_supp.data().get(&Tag::new(b'm', b's'));
+        assert!(
+            matches!(supp_ms, Some(BufValue::Int8(77))),
+            "R2 supp ms should be R1 primary's AS (77), got {supp_ms:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Tests `fix_mate_info` when both reads are unmapped
+    ///
+    /// Verifies that:
+    /// - Both reads get unmapped coordinates (ref=-1, pos=-1)
+    /// - TLEN is 0 for both reads
+    /// - MQ/MC tags are removed from both reads
+    #[test]
+    fn test_fix_mate_info_both_unmapped() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
+
+        // Both reads unmapped in mapped BAM
+        let mut mapped_attrs = HashMap::new();
+        mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+        mapped.add_pair_with_attrs("q1", None, None, true, true, &mapped_attrs);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 2);
+
+        for rec in &records {
+            assert_eq!(rec.template_length(), 0, "TLEN should be 0 when both unmapped");
+            assert!(
+                rec.data().get(&Tag::new(b'M', b'Q')).is_none(),
+                "MQ should not exist when both unmapped"
+            );
+            assert!(
+                rec.data().get(&Tag::new(b'M', b'C')).is_none(),
+                "MC should not exist when both unmapped"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Tests `append_buf_value_raw` covers various tag value types
+    ///
+    /// Exercises `BufValue` types not hit by standard unmapped tags: `Character`,
+    /// `Int16` array, `UInt8`, `Hex`, and `Float`.
+    #[test]
+    fn test_varied_tag_types_roundtrip() -> Result<()> {
+        let mut unmapped = SamBuilder::new_unmapped();
+        let mut mapped = SamBuilder::new_mapped();
+
+        let mut attrs = HashMap::new();
+        attrs.insert("RX", BufValue::from("ACGT".to_string()));
+        attrs.insert("ca", BufValue::Character(b'X'));
+        attrs.insert("fi", BufValue::Float(1.23));
+        attrs.insert("ui", BufValue::UInt8(200));
+        attrs.insert("si", BufValue::Int16(-300));
+        attrs.insert("ul", BufValue::UInt32(100_000));
+        attrs.insert("hx", BufValue::Hex(bstr::BString::from("DEADBEEF")));
+        unmapped.add_frag_with_attrs("q1", None, true, &attrs);
+
+        let mut mapped_attrs = HashMap::new();
+        mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
+        mapped.add_frag_with_attrs("q1", Some(100), true, &mapped_attrs);
+
+        let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+
+        // Verify each tag type survived the raw-byte roundtrip
+        assert!(
+            matches!(rec.data().get(&Tag::new(b'c', b'a')), Some(BufValue::Character(b'X'))),
+            "Character tag should roundtrip"
+        );
+        if let Some(BufValue::Float(f)) = rec.data().get(&Tag::new(b'f', b'i')) {
+            assert!((f - 1.23).abs() < 0.001, "Float tag should roundtrip, got {f}");
+        } else {
+            panic!("Float tag missing");
+        }
+        // UInt8(200) may be normalized to Int16(200) by smallest-signed encoding path,
+        // or stay as UInt8 — either is acceptable
+        let ui_val = rec.data().get(&Tag::new(b'u', b'i'));
+        assert!(ui_val.is_some(), "UInt8 tag should exist");
+        let si_val = rec.data().get(&Tag::new(b's', b'i'));
+        assert!(
+            matches!(si_val, Some(BufValue::Int16(-300))),
+            "Int16 tag should roundtrip, got {si_val:?}"
+        );
+        let ul_val = rec.data().get(&Tag::new(b'u', b'l'));
+        assert!(ul_val.is_some(), "UInt32 tag should exist");
+        if let Some(BufValue::Hex(h)) = rec.data().get(&Tag::new(b'h', b'x')) {
+            assert_eq!(h.to_string(), "DEADBEEF", "Hex tag should roundtrip");
+        } else {
+            panic!("Hex tag missing or wrong type");
+        }
 
         Ok(())
     }

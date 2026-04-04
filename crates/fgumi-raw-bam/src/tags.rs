@@ -688,6 +688,99 @@ pub fn reverse_complement_string_tag_in_place(record: &mut [u8], aux_offset: usi
     }
 }
 
+/// Append an `i32` array (`B:i`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 'i', count_u32_le, values_i32_le...]`
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`.
+pub fn append_i32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i32]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b'i');
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
+    for &v in values {
+        record.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Normalize an integer tag to the smallest signed type that fits its value.
+///
+/// If the tag exists and is an integer type, it is re-encoded using
+/// [`append_signed_int_tag`] semantics (signed types only: i8 → i16 → i32).
+/// No-op if the tag is not found or is not an integer type.
+pub fn normalize_int_tag_to_smallest_signed(record: &mut Vec<u8>, tag: &[u8; 2]) {
+    let Some(aux_start) = aux_data_offset_from_record(record) else {
+        return;
+    };
+    if aux_start >= record.len() {
+        return;
+    }
+    let aux_data = &record[aux_start..];
+    let Some(value) = find_int_tag(aux_data, tag) else {
+        return;
+    };
+    let Ok(value_i32) = i32::try_from(value) else {
+        return;
+    };
+    // Remove and re-append with smallest *signed* encoding
+    // (i8 -> i16 -> i32, matching fgbio's to_smallest_signed_int)
+    remove_tag(record, tag);
+    append_signed_int_tag(record, tag, value_i32);
+}
+
+/// Append an integer tag using the smallest *signed* type that fits.
+///
+/// Unlike [`append_int_tag`] (which prefers unsigned types), this uses only
+/// signed types: `i8` (type `'c'`) -> `i16` (type `'s'`) -> `i32` (type `'i'`).
+/// This matches fgbio's `to_smallest_signed_int` encoding.
+pub fn append_signed_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    if let Ok(v) = i8::try_from(value) {
+        record.push(b'c');
+        record.push(v.cast_unsigned());
+    } else if let Ok(v) = i16::try_from(value) {
+        record.push(b's');
+        record.extend_from_slice(&v.to_le_bytes());
+    } else {
+        record.push(b'i');
+        record.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Copy auxiliary tags from source aux data to a destination record, skipping specified tags.
+///
+/// Iterates all tags in `src_aux` and appends each tag entry (tag + type + value bytes)
+/// to `dest`, unless the tag's two-byte key is in `skip_tags`.
+pub fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[&[u8; 2]]) {
+    let mut offset = 0;
+    while offset + 3 <= src_aux.len() {
+        let tag_key = [src_aux[offset], src_aux[offset + 1]];
+        let val_type = src_aux[offset + 2];
+        let value_start = offset + 3;
+
+        let Some(value_size) = tag_value_size(val_type, &src_aux[value_start..]) else {
+            break;
+        };
+        let entry_end = value_start + value_size;
+        if entry_end > src_aux.len() {
+            break;
+        }
+
+        // Copy unless this tag should be skipped
+        if !skip_tags.iter().any(|t| **t == tag_key) {
+            dest.extend_from_slice(&src_aux[offset..entry_end]);
+        }
+
+        offset = entry_end;
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::identity_op)]
 mod tests {
@@ -2185,5 +2278,145 @@ mod tests {
 
         // But find_tag_type correctly finds it
         assert!(find_tag_type(&aux, &pa_tag_bytes).is_some());
+    }
+
+    // ========================================================================
+    // append_i32_array_tag tests
+    // ========================================================================
+
+    #[test]
+    fn test_append_i32_array_tag() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        let values = [1i32, -200, 300_000];
+        append_i32_array_tag(&mut rec, b"pa", &values);
+
+        let aux = aux_data_slice(&rec);
+        let tag_type = find_tag_type(aux, b"pa");
+        assert_eq!(tag_type, Some(b'B'));
+
+        // Verify the array contents
+        let arr = find_array_tag(aux, b"pa").unwrap();
+        assert_eq!(arr.count, 3);
+        assert_eq!(arr.elem_type, b'i');
+    }
+
+    #[test]
+    fn test_append_i32_array_tag_empty() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        append_i32_array_tag(&mut rec, b"pa", &[]);
+
+        let aux = aux_data_slice(&rec);
+        let arr = find_array_tag(aux, b"pa").unwrap();
+        assert_eq!(arr.count, 0);
+    }
+
+    // ========================================================================
+    // normalize_int_tag_to_smallest_signed tests
+    // ========================================================================
+
+    #[test]
+    fn test_normalize_int_tag_i32_to_i8() {
+        // AS:i:77 (stored as i32) should normalize to AS:c:77 (i8)
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"ASi");
+        aux.extend_from_slice(&77i32.to_le_bytes());
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
+
+        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+
+        let aux_data = aux_data_slice(&rec);
+        let (_, val_type) = find_tag_position(aux_data, *b"AS").unwrap();
+        assert_eq!(val_type, b'c', "77 should fit in i8 (type 'c')");
+        assert_eq!(find_int_tag(aux_data, b"AS"), Some(77));
+    }
+
+    #[test]
+    fn test_normalize_int_tag_i32_to_i16() {
+        // AS:i:200 (stored as i32) should normalize to AS:s:200 (i16, signed-only encoding)
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"ASi");
+        aux.extend_from_slice(&200i32.to_le_bytes());
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
+
+        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+
+        let aux_data = aux_data_slice(&rec);
+        let (_, val_type) = find_tag_position(aux_data, *b"AS").unwrap();
+        assert_eq!(val_type, b's', "200 should be i16 (type 's') with signed-only encoding");
+        assert_eq!(find_int_tag(aux_data, b"AS"), Some(200));
+    }
+
+    #[test]
+    fn test_normalize_int_tag_preserves_large_value() {
+        // AS:i:100000 should remain i32
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"ASi");
+        aux.extend_from_slice(&100_000i32.to_le_bytes());
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
+
+        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+
+        let aux_data = aux_data_slice(&rec);
+        let (_, val_type) = find_tag_position(aux_data, *b"AS").unwrap();
+        assert_eq!(val_type, b'i', "100000 requires i32 (type 'i')");
+        assert_eq!(find_int_tag(aux_data, b"AS"), Some(100_000));
+    }
+
+    #[test]
+    fn test_normalize_int_tag_missing_is_noop() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        let original = rec.clone();
+        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+        assert_eq!(rec, original);
+    }
+
+    // ========================================================================
+    // copy_aux_tags tests
+    // ========================================================================
+
+    #[test]
+    fn test_copy_aux_tags_all() {
+        // Source has RX:Z:ACGT and NM:C:5
+        let mut src_aux = Vec::new();
+        src_aux.extend_from_slice(b"RXZ\x41\x43\x47\x54\x00"); // RX:Z:ACGT
+        src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
+
+        let mut dest = Vec::new();
+        copy_aux_tags(&src_aux, &mut dest, &[]);
+
+        assert_eq!(dest, src_aux, "All tags should be copied when no skip list");
+    }
+
+    #[test]
+    fn test_copy_aux_tags_with_skip() {
+        // Source has RX:Z:ACGT and NM:C:5
+        let mut src_aux = Vec::new();
+        src_aux.extend_from_slice(b"RXZ\x41\x43\x47\x54\x00"); // RX:Z:ACGT
+        src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
+
+        let mut dest = Vec::new();
+        copy_aux_tags(&src_aux, &mut dest, &[b"NM"]);
+
+        // Only RX should be copied
+        assert_eq!(dest, b"RXZ\x41\x43\x47\x54\x00");
+    }
+
+    #[test]
+    fn test_copy_aux_tags_skip_all() {
+        let mut src_aux = Vec::new();
+        src_aux.extend_from_slice(b"RXZ\x41\x43\x47\x54\x00");
+        src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]);
+
+        let mut dest = Vec::new();
+        copy_aux_tags(&src_aux, &mut dest, &[b"RX", b"NM"]);
+
+        assert!(dest.is_empty(), "All tags skipped should produce empty dest");
+    }
+
+    #[test]
+    fn test_copy_aux_tags_empty_source() {
+        let mut dest = Vec::new();
+        copy_aux_tags(&[], &mut dest, &[]);
+        assert!(dest.is_empty());
     }
 }

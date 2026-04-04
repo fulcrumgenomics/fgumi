@@ -1012,6 +1012,282 @@ impl Template {
         Ok(())
     }
 
+    /// Fixes mate information for paired-end reads, operating on raw BAM bytes.
+    ///
+    /// This is the raw-byte equivalent of [`fix_mate_info`]. It modifies
+    /// `self.raw_records` in place, setting RNEXT, PNEXT, TLEN, mate flags,
+    /// MQ, MC, and ms tags for primary pairs and supplementary alignments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `raw_records` is `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal index invariants are violated (should not happen
+    /// with well-formed templates).
+    #[allow(clippy::too_many_lines)]
+    pub fn fix_mate_info_raw(&mut self) -> Result<()> {
+        use crate::sort::bam_fields;
+
+        let rr = self
+            .raw_records
+            .as_mut()
+            .ok_or_else(|| anyhow!("fix_mate_info_raw requires raw-byte mode"))?;
+
+        if rr.is_empty() {
+            return Ok(());
+        }
+
+        // Fix mate info for primary R1/R2 pair
+        if let (Some((r1_i, _)), Some((r2_i, _))) = (self.r1, self.r2) {
+            let r1_is_unmapped = (bam_fields::flags(&rr[r1_i]) & bam_fields::flags::UNMAPPED) != 0;
+            let r2_is_unmapped = (bam_fields::flags(&rr[r2_i]) & bam_fields::flags::UNMAPPED) != 0;
+
+            // Get alignment scores for mate score tags
+            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), b"AS");
+            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), b"AS");
+
+            if !r1_is_unmapped && !r2_is_unmapped {
+                // Case 1: Both mapped
+                self.set_mate_info_both_mapped_raw(r1_i, r2_i);
+            } else if r1_is_unmapped && r2_is_unmapped {
+                // Case 2: Both unmapped
+                self.set_mate_info_both_unmapped_raw(r1_i, r2_i);
+            } else {
+                // Case 3: One mapped, one unmapped
+                self.set_mate_info_one_unmapped_raw(r1_i, r2_i, r1_is_unmapped);
+            }
+
+            // Set mate score tags (ms) in all cases
+            let rr = self.raw_records.as_mut().unwrap();
+            if let Some(as_value) = r2_as {
+                if let Ok(v) = i32::try_from(as_value) {
+                    bam_fields::remove_tag(&mut rr[r1_i], b"ms");
+                    bam_fields::append_signed_int_tag(&mut rr[r1_i], b"ms", v);
+                }
+            }
+            if let Some(as_value) = r1_as {
+                if let Ok(v) = i32::try_from(as_value) {
+                    bam_fields::remove_tag(&mut rr[r2_i], b"ms");
+                    bam_fields::append_signed_int_tag(&mut rr[r2_i], b"ms", v);
+                }
+            }
+        }
+
+        // Fix mate info for R1 supplementals (mate is primary R2)
+        if let Some((r2_i, _)) = self.r2 {
+            let rr = self.raw_records.as_ref().unwrap();
+            let r2_ref_id = bam_fields::ref_id(&rr[r2_i]);
+            let r2_pos = bam_fields::pos(&rr[r2_i]);
+            let r2_flags = bam_fields::flags(&rr[r2_i]);
+            let r2_is_reverse = (r2_flags & bam_fields::flags::REVERSE) != 0;
+            let r2_is_unmapped = (r2_flags & bam_fields::flags::UNMAPPED) != 0;
+            let r2_tlen = bam_fields::template_length(&rr[r2_i]);
+            let r2_mapq = bam_fields::mapq(&rr[r2_i]);
+            let r2_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r2_i]);
+            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), b"AS");
+
+            if let Some((start, end)) = self.r1_supplementals {
+                let rr = self.raw_records.as_mut().unwrap();
+                for rec in &mut rr[start..end] {
+                    bam_fields::set_mate_ref_id(rec, r2_ref_id);
+                    bam_fields::set_mate_pos(rec, r2_pos);
+                    set_mate_flags_raw(rec, r2_is_reverse, r2_is_unmapped);
+                    bam_fields::set_template_length(rec, -r2_tlen);
+
+                    let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
+                    bam_fields::update_int_tag(rec, b"MQ", mq_val);
+
+                    if !r2_cigar_str.is_empty() && r2_cigar_str != "*" && !r2_is_unmapped {
+                        bam_fields::update_string_tag(rec, b"MC", r2_cigar_str.as_bytes());
+                    } else {
+                        bam_fields::remove_tag(rec, b"MC");
+                    }
+
+                    if let Some(as_value) = r2_as {
+                        if let Ok(v) = i32::try_from(as_value) {
+                            bam_fields::remove_tag(rec, b"ms");
+                            bam_fields::append_signed_int_tag(rec, b"ms", v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fix mate info for R2 supplementals (mate is primary R1)
+        if let Some((r1_i, _)) = self.r1 {
+            let rr = self.raw_records.as_ref().unwrap();
+            let r1_ref_id = bam_fields::ref_id(&rr[r1_i]);
+            let r1_pos = bam_fields::pos(&rr[r1_i]);
+            let r1_flags = bam_fields::flags(&rr[r1_i]);
+            let r1_is_reverse = (r1_flags & bam_fields::flags::REVERSE) != 0;
+            let r1_is_unmapped = (r1_flags & bam_fields::flags::UNMAPPED) != 0;
+            let r1_tlen = bam_fields::template_length(&rr[r1_i]);
+            let r1_mapq = bam_fields::mapq(&rr[r1_i]);
+            let r1_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r1_i]);
+            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), b"AS");
+
+            if let Some((start, end)) = self.r2_supplementals {
+                let rr = self.raw_records.as_mut().unwrap();
+                for rec in &mut rr[start..end] {
+                    bam_fields::set_mate_ref_id(rec, r1_ref_id);
+                    bam_fields::set_mate_pos(rec, r1_pos);
+                    set_mate_flags_raw(rec, r1_is_reverse, r1_is_unmapped);
+                    bam_fields::set_template_length(rec, -r1_tlen);
+
+                    let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
+                    bam_fields::update_int_tag(rec, b"MQ", mq_val);
+
+                    if !r1_cigar_str.is_empty() && r1_cigar_str != "*" && !r1_is_unmapped {
+                        bam_fields::update_string_tag(rec, b"MC", r1_cigar_str.as_bytes());
+                    } else {
+                        bam_fields::remove_tag(rec, b"MC");
+                    }
+
+                    if let Some(as_value) = r1_as {
+                        if let Ok(v) = i32::try_from(as_value) {
+                            bam_fields::remove_tag(rec, b"ms");
+                            bam_fields::append_signed_int_tag(rec, b"ms", v);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Raw-byte: both reads mapped. Sets mate info, TLEN, MQ, MC.
+    fn set_mate_info_both_mapped_raw(&mut self, r1_i: usize, r2_i: usize) {
+        use crate::sort::bam_fields;
+
+        let rr = self.raw_records.as_ref().unwrap();
+
+        // Get R2's info for R1
+        let r2_ref_id = bam_fields::ref_id(&rr[r2_i]);
+        let r2_pos = bam_fields::pos(&rr[r2_i]);
+        let r2_is_reverse = (bam_fields::flags(&rr[r2_i]) & bam_fields::flags::REVERSE) != 0;
+        let r2_mapq = bam_fields::mapq(&rr[r2_i]);
+        let r2_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r2_i]);
+
+        // Get R1's info for R2
+        let r1_ref_id = bam_fields::ref_id(&rr[r1_i]);
+        let r1_pos = bam_fields::pos(&rr[r1_i]);
+        let r1_is_reverse = (bam_fields::flags(&rr[r1_i]) & bam_fields::flags::REVERSE) != 0;
+        let r1_mapq = bam_fields::mapq(&rr[r1_i]);
+        let r1_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r1_i]);
+
+        // Compute insert size before mutating
+        let insert_size = compute_insert_size_raw(&rr[r1_i], &rr[r2_i]);
+
+        let rr = self.raw_records.as_mut().unwrap();
+
+        // Set mate info on R1 from R2
+        bam_fields::set_mate_ref_id(&mut rr[r1_i], r2_ref_id);
+        bam_fields::set_mate_pos(&mut rr[r1_i], r2_pos);
+        set_mate_flags_raw(&mut rr[r1_i], r2_is_reverse, false);
+        let r2_mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
+        bam_fields::update_int_tag(&mut rr[r1_i], b"MQ", r2_mq_val);
+        if !r2_cigar_str.is_empty() && r2_cigar_str != "*" {
+            bam_fields::update_string_tag(&mut rr[r1_i], b"MC", r2_cigar_str.as_bytes());
+        } else {
+            bam_fields::remove_tag(&mut rr[r1_i], b"MC");
+        }
+
+        // Set mate info on R2 from R1
+        bam_fields::set_mate_ref_id(&mut rr[r2_i], r1_ref_id);
+        bam_fields::set_mate_pos(&mut rr[r2_i], r1_pos);
+        set_mate_flags_raw(&mut rr[r2_i], r1_is_reverse, false);
+        let r1_mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
+        bam_fields::update_int_tag(&mut rr[r2_i], b"MQ", r1_mq_val);
+        if !r1_cigar_str.is_empty() && r1_cigar_str != "*" {
+            bam_fields::update_string_tag(&mut rr[r2_i], b"MC", r1_cigar_str.as_bytes());
+        } else {
+            bam_fields::remove_tag(&mut rr[r2_i], b"MC");
+        }
+
+        // Set insert size
+        bam_fields::set_template_length(&mut rr[r1_i], insert_size);
+        bam_fields::set_template_length(&mut rr[r2_i], -insert_size);
+    }
+
+    /// Raw-byte: both reads unmapped. Clears ref/pos, removes MQ/MC, TLEN=0.
+    fn set_mate_info_both_unmapped_raw(&mut self, r1_i: usize, r2_i: usize) {
+        use crate::sort::bam_fields;
+
+        let rr = self.raw_records.as_ref().unwrap();
+        let r1_is_reverse = (bam_fields::flags(&rr[r1_i]) & bam_fields::flags::REVERSE) != 0;
+        let r2_is_reverse = (bam_fields::flags(&rr[r2_i]) & bam_fields::flags::REVERSE) != 0;
+
+        let rr = self.raw_records.as_mut().unwrap();
+
+        // R1: set to unmapped coordinates
+        bam_fields::set_ref_id(&mut rr[r1_i], -1);
+        bam_fields::set_pos(&mut rr[r1_i], -1);
+        bam_fields::set_mate_ref_id(&mut rr[r1_i], -1);
+        bam_fields::set_mate_pos(&mut rr[r1_i], -1);
+        set_mate_flags_raw(&mut rr[r1_i], r2_is_reverse, true);
+        bam_fields::remove_tag(&mut rr[r1_i], b"MQ");
+        bam_fields::remove_tag(&mut rr[r1_i], b"MC");
+        bam_fields::set_template_length(&mut rr[r1_i], 0);
+
+        // R2: set to unmapped coordinates
+        bam_fields::set_ref_id(&mut rr[r2_i], -1);
+        bam_fields::set_pos(&mut rr[r2_i], -1);
+        bam_fields::set_mate_ref_id(&mut rr[r2_i], -1);
+        bam_fields::set_mate_pos(&mut rr[r2_i], -1);
+        set_mate_flags_raw(&mut rr[r2_i], r1_is_reverse, true);
+        bam_fields::remove_tag(&mut rr[r2_i], b"MQ");
+        bam_fields::remove_tag(&mut rr[r2_i], b"MC");
+        bam_fields::set_template_length(&mut rr[r2_i], 0);
+    }
+
+    /// Raw-byte: one mapped, one unmapped. Places unmapped at mapped coords.
+    fn set_mate_info_one_unmapped_raw(&mut self, r1_i: usize, r2_i: usize, r1_is_unmapped: bool) {
+        use crate::sort::bam_fields;
+
+        let (mapped_i, unmapped_i) = if r1_is_unmapped { (r2_i, r1_i) } else { (r1_i, r2_i) };
+
+        let rr = self.raw_records.as_ref().unwrap();
+        let mapped_ref_id = bam_fields::ref_id(&rr[mapped_i]);
+        let mapped_pos = bam_fields::pos(&rr[mapped_i]);
+        let mapped_flags = bam_fields::flags(&rr[mapped_i]);
+        let mapped_is_reverse = (mapped_flags & bam_fields::flags::REVERSE) != 0;
+        let mapped_mapq = bam_fields::mapq(&rr[mapped_i]);
+        let mapped_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[mapped_i]);
+
+        let unmapped_is_reverse =
+            (bam_fields::flags(&rr[unmapped_i]) & bam_fields::flags::REVERSE) != 0;
+
+        let rr = self.raw_records.as_mut().unwrap();
+
+        // Place unmapped read at mapped read's coordinates
+        bam_fields::set_ref_id(&mut rr[unmapped_i], mapped_ref_id);
+        bam_fields::set_pos(&mut rr[unmapped_i], mapped_pos);
+
+        // Set mate info on mapped read (mate is unmapped)
+        bam_fields::set_mate_ref_id(&mut rr[mapped_i], mapped_ref_id);
+        bam_fields::set_mate_pos(&mut rr[mapped_i], mapped_pos);
+        set_mate_flags_raw(&mut rr[mapped_i], unmapped_is_reverse, true);
+        bam_fields::remove_tag(&mut rr[mapped_i], b"MQ");
+        bam_fields::remove_tag(&mut rr[mapped_i], b"MC");
+        bam_fields::set_template_length(&mut rr[mapped_i], 0);
+
+        // Set mate info on unmapped read (mate is mapped)
+        bam_fields::set_mate_ref_id(&mut rr[unmapped_i], mapped_ref_id);
+        bam_fields::set_mate_pos(&mut rr[unmapped_i], mapped_pos);
+        set_mate_flags_raw(&mut rr[unmapped_i], mapped_is_reverse, false);
+        let mq_val = if mapped_mapq == 255 { 255 } else { i32::from(mapped_mapq) };
+        bam_fields::update_int_tag(&mut rr[unmapped_i], b"MQ", mq_val);
+        if !mapped_cigar_str.is_empty() && mapped_cigar_str != "*" {
+            bam_fields::update_string_tag(&mut rr[unmapped_i], b"MC", mapped_cigar_str.as_bytes());
+        } else {
+            bam_fields::remove_tag(&mut rr[unmapped_i], b"MC");
+        }
+        bam_fields::set_template_length(&mut rr[unmapped_i], 0);
+    }
+
     /// Sets mate information when both reads are mapped.
     /// Following htsjdk's SamPairUtil.setMateInfo case 1.
     fn set_mate_info_both_mapped(
@@ -1208,6 +1484,59 @@ fn alignment_length(cigar: &noodles::sam::alignment::record_buf::Cigar) -> i32 {
         }
     }
     len
+}
+
+/// Sets mate flags (`MATE_REVERSE`, `MATE_UNMAPPED`) on a raw BAM record.
+fn set_mate_flags_raw(record: &mut [u8], mate_is_reverse: bool, mate_is_unmapped: bool) {
+    use crate::sort::bam_fields;
+    let mut f = bam_fields::flags(record);
+    f &= !bam_fields::flags::MATE_REVERSE;
+    if mate_is_reverse {
+        f |= bam_fields::flags::MATE_REVERSE;
+    }
+    f &= !bam_fields::flags::MATE_UNMAPPED;
+    if mate_is_unmapped {
+        f |= bam_fields::flags::MATE_UNMAPPED;
+    }
+    bam_fields::set_flags(record, f);
+}
+
+/// Computes insert size (TLEN) from two raw BAM records.
+///
+/// Same algorithm as `compute_insert_size` but on raw bytes.
+/// Uses 0-based pos from BAM; converts to 1-based for the calculation.
+fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
+    use crate::sort::bam_fields;
+
+    let f1 = bam_fields::flags(rec1);
+    let f2 = bam_fields::flags(rec2);
+
+    // If either read is unmapped, return 0
+    if (f1 & bam_fields::flags::UNMAPPED) != 0 || (f2 & bam_fields::flags::UNMAPPED) != 0 {
+        return 0;
+    }
+
+    // If reads are on different references, return 0
+    if bam_fields::ref_id(rec1) != bam_fields::ref_id(rec2) {
+        return 0;
+    }
+
+    // pos is 0-based in BAM; convert to 1-based for the calculation
+    let pos1 = bam_fields::pos(rec1) + 1;
+    let pos2 = bam_fields::pos(rec2) + 1;
+
+    // alignment end (1-based inclusive) = pos_1based + ref_len - 1
+    let ref_len1 = bam_fields::reference_length_from_raw_bam(rec1);
+    let ref_len2 = bam_fields::reference_length_from_raw_bam(rec2);
+    let end1 = pos1 + ref_len1 - 1;
+    let end2 = pos2 + ref_len2 - 1;
+
+    // 5' position: forward=start, reverse=end
+    let first_5prime = if (f1 & bam_fields::flags::REVERSE) != 0 { end1 } else { pos1 };
+    let second_5prime = if (f2 & bam_fields::flags::REVERSE) != 0 { end2 } else { pos2 };
+
+    let adjustment = if second_5prime >= first_5prime { 1 } else { -1 };
+    second_5prime - first_5prime + adjustment
 }
 
 /// Determines the pair orientation for a paired read.
