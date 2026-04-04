@@ -450,7 +450,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let result = RawBamRecordReader::new(io::Cursor::new(compressed));
-        let Err(err) = result else { panic!("Expected error for invalid magic") };
+        let Err(err) = result else { unreachable!("Expected error for invalid magic") };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("Not a BAM file"), "Unexpected error message: {err}");
     }
@@ -465,7 +465,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let result = RawBamRecordReader::new(io::Cursor::new(compressed));
-        let Err(err) = result else { panic!("Expected error for empty input") };
+        let Err(err) = result else { unreachable!("Expected error for empty input") };
         assert!(
             err.to_string().contains("File too small")
                 || err.to_string().contains("Not a BAM file"),

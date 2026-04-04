@@ -814,11 +814,10 @@ mod tests {
         let action = check_deadlock_and_restore(&state, &snapshot);
 
         // Should have doubled the limit
-        if let DeadlockAction::Recovered(new_limit) = action {
-            assert_eq!(new_limit, original_limit * 2);
-        } else {
-            panic!("Expected Recovered action, got {action:?}");
-        }
+        let DeadlockAction::Recovered(new_limit) = action else {
+            unreachable!("Expected Recovered action, got {action:?}");
+        };
+        assert_eq!(new_limit, original_limit * 2);
     }
 
     #[test]
@@ -854,11 +853,10 @@ mod tests {
         let action = check_deadlock_and_restore(&state, &snapshot);
 
         // Should unbind (0 = unlimited)
-        if let DeadlockAction::Recovered(new_limit) = action {
-            assert_eq!(new_limit, 0);
-        } else {
-            panic!("Expected Recovered action, got {action:?}");
-        }
+        let DeadlockAction::Recovered(new_limit) = action else {
+            unreachable!("Expected Recovered action, got {action:?}");
+        };
+        assert_eq!(new_limit, 0);
     }
 
     #[test]

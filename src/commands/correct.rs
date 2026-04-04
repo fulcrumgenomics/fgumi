@@ -632,29 +632,39 @@ impl CorrectUmis {
     }
 
     /// Extract and validate UMI from raw-byte records in a template.
+    ///
+    /// Returns `Ok(None)` if no records have a UMI, including when any record is
+    /// truncated (< 32 bytes), which is treated as missing UMI data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Records have different UMIs
+    /// - Some records have UMIs and others don't
+    /// - UMI tag has non-string type
     fn extract_and_validate_template_umi_raw(
         raw_records: &[Vec<u8>],
         umi_tag: [u8; 2],
-    ) -> Option<String> {
+    ) -> anyhow::Result<Option<String>> {
         use fgumi_lib::sort::bam_fields;
 
         if raw_records.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Guard against truncated records
         if raw_records.iter().any(|r| r.len() < 32) {
-            return None;
+            return Ok(None);
         }
 
         let first_aux = bam_fields::aux_data_slice(&raw_records[0]);
         // Work with &[u8] slices to avoid per-record String allocation
         let first_umi_bytes = bam_fields::find_string_tag(first_aux, &umi_tag);
 
-        // If tag exists but is not a Z-type string, panic (matching RecordBuf behavior)
+        // If tag exists but is not a Z-type string, return an error
         if first_umi_bytes.is_none() {
             if let Some(tag_type) = bam_fields::find_tag_type(first_aux, &umi_tag) {
-                panic!(
+                anyhow::bail!(
                     "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
                     std::str::from_utf8(&umi_tag).unwrap_or("??"),
                     tag_type as char,
@@ -668,21 +678,21 @@ impl CorrectUmis {
 
             match (first_umi_bytes, current_umi_bytes) {
                 (Some(first), Some(current)) if first != current => {
-                    panic!(
+                    anyhow::bail!(
                         "Template has mismatched UMIs: first={:?}, current={:?}",
                         String::from_utf8_lossy(first),
                         String::from_utf8_lossy(current)
                     );
                 }
                 (Some(_), None) | (None, Some(_)) => {
-                    panic!("Template has inconsistent UMI presence across records");
+                    anyhow::bail!("Template has inconsistent UMI presence across records");
                 }
                 _ => {}
             }
         }
 
         // Only allocate String once at the end
-        first_umi_bytes.map(|b| String::from_utf8_lossy(b).into_owned())
+        Ok(first_umi_bytes.map(|b| String::from_utf8_lossy(b).into_owned()))
     }
 
     /// Apply UMI correction to a raw BAM record.
@@ -844,7 +854,8 @@ impl CorrectUmis {
                         let umi_opt = Self::extract_and_validate_template_umi_raw(
                             &raw_records,
                             umi_tag_bytes,
-                        );
+                        )
+                        .map_err(io::Error::other)?;
 
                         match umi_opt {
                             None => {
@@ -1180,8 +1191,10 @@ impl CorrectUmis {
                 total_templates += 1;
 
                 // Template-level UMI correction
-                let umi_opt =
-                    CorrectUmis::extract_and_validate_template_umi_raw(&raw_records, umi_tag_bytes);
+                let umi_opt = CorrectUmis::extract_and_validate_template_umi_raw(
+                    &raw_records,
+                    umi_tag_bytes,
+                )?;
 
                 match umi_opt {
                     None => {
@@ -3054,7 +3067,8 @@ mod tests {
                 | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
-        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[raw], [b'R', b'X']);
+        let result =
+            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], [b'R', b'X']).unwrap();
         assert_eq!(result, Some("AAAAAA".to_string()));
     }
 
@@ -3072,13 +3086,13 @@ mod tests {
                 | fgumi_lib::sort::bam_fields::flags::LAST_SEGMENT,
             b"ACGTAC",
         );
-        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X']);
+        let result =
+            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X']).unwrap();
         assert_eq!(result, Some("ACGTAC".to_string()));
     }
 
     #[test]
-    #[should_panic(expected = "mismatched UMIs")]
-    fn test_extract_and_validate_template_umi_raw_mismatch_panics() {
+    fn test_extract_and_validate_template_umi_raw_mismatch_errors() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
             fgumi_lib::sort::bam_fields::flags::PAIRED
@@ -3091,12 +3105,14 @@ mod tests {
                 | fgumi_lib::sort::bam_fields::flags::LAST_SEGMENT,
             b"CCCCCC",
         );
-        let _ = CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X']);
+        let err = CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X'])
+            .unwrap_err();
+        assert!(err.to_string().contains("mismatched UMIs"));
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_raw_empty() {
-        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[], [b'R', b'X']);
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[], [b'R', b'X']).unwrap();
         assert!(result.is_none());
     }
 
@@ -3112,7 +3128,8 @@ mod tests {
         );
         raw[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         raw[32..36].copy_from_slice(b"rea\0");
-        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[raw], [b'R', b'X']);
+        let result =
+            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], [b'R', b'X']).unwrap();
         assert!(result.is_none());
     }
 

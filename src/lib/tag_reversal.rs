@@ -204,12 +204,11 @@ mod tests {
         assert!(reversed);
 
         let tag = Tag::from([b'a', b'q']);
-        if let Some(Value::String(s)) = record.data().get(&tag) {
-            let bytes: Vec<u8> = s.iter().copied().collect();
-            assert_eq!(bytes, b"GHII");
-        } else {
-            panic!("Expected aq tag to be present as String");
-        }
+        let Some(Value::String(s)) = record.data().get(&tag) else {
+            unreachable!("Expected aq tag to be present as String");
+        };
+        let bytes: Vec<u8> = s.iter().copied().collect();
+        assert_eq!(bytes, b"GHII");
     }
 
     #[test]

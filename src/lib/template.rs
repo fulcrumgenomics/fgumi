@@ -3294,20 +3294,18 @@ mod tests {
         // R1's MC should be R2's CIGAR
         let r1_mc = template.records[0].data().get(&mc_tag);
         assert!(r1_mc.is_some(), "R1 should have MC tag");
-        if let Some(BufValue::String(mc)) = r1_mc {
-            assert_eq!(&mc[..], b"25M5I20M", "R1 MC should be R2's CIGAR");
-        } else {
-            panic!("MC tag should be a string");
-        }
+        let Some(BufValue::String(mc)) = r1_mc else {
+            unreachable!("MC tag should be a string");
+        };
+        assert_eq!(&mc[..], b"25M5I20M", "R1 MC should be R2's CIGAR");
 
         // R2's MC should be R1's CIGAR
         let r2_mc = template.records[1].data().get(&mc_tag);
         assert!(r2_mc.is_some(), "R2 should have MC tag");
-        if let Some(BufValue::String(mc)) = r2_mc {
-            assert_eq!(&mc[..], b"50M", "R2 MC should be R1's CIGAR");
-        } else {
-            panic!("MC tag should be a string");
-        }
+        let Some(BufValue::String(mc)) = r2_mc else {
+            unreachable!("MC tag should be a string");
+        };
+        assert_eq!(&mc[..], b"50M", "R2 MC should be R1's CIGAR");
 
         Ok(())
     }

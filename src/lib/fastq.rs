@@ -220,31 +220,31 @@ impl FastqSet {
     /// If the read doesn't have enough bases and `TooFewBases` is in `skip_reasons`,
     /// returns a `FastqSet` with `skip_reason` set.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the read has too few bases and `TooFewBases` is not in `skip_reasons`.
-    #[must_use]
+    /// Returns an error if the read has too few bases and `TooFewBases` is not in
+    /// `skip_reasons`, or if base/quality extraction fails for any segment.
     pub fn from_record_with_structure(
         header: &[u8],
         sequence: &[u8],
         quality: &[u8],
         read_structure: &ReadStructure,
         skip_reasons: &[SkipReason],
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let mut segments = Vec::with_capacity(read_structure.number_of_segments());
 
         // Check minimum length required by the read structure
         let min_len: usize = read_structure.iter().map(|s| s.length().unwrap_or(0)).sum();
         if sequence.len() < min_len {
             if skip_reasons.contains(&SkipReason::TooFewBases) {
-                return Self {
+                return Ok(Self {
                     header: header.to_vec(),
                     segments: vec![],
                     skip_reason: Some(SkipReason::TooFewBases),
-                };
+                });
             }
             let read_name_str = String::from_utf8_lossy(header);
-            panic!(
+            anyhow::bail!(
                 "Read {} had too few bases to demux {} vs. {} needed in read structure {}.",
                 read_name_str,
                 sequence.len(),
@@ -256,9 +256,9 @@ impl FastqSet {
         // Extract segments according to the read structure
         for (segment_index, read_segment) in read_structure.iter().enumerate() {
             let (seq, quals) =
-                read_segment.extract_bases_and_quals(sequence, quality).unwrap_or_else(|e| {
+                read_segment.extract_bases_and_quals(sequence, quality).map_err(|e| {
                     let read_name_str = String::from_utf8_lossy(header);
-                    panic!(
+                    anyhow::anyhow!(
                         "Error extracting bases (len: {}) or quals (len: {}) for the {}th \
                          segment ({}) in read structure ({}) from record {}; {}",
                         sequence.len(),
@@ -268,8 +268,8 @@ impl FastqSet {
                         read_structure,
                         read_name_str,
                         e
-                    );
-                });
+                    )
+                })?;
 
             segments.push(FastqSegment {
                 seq: seq.to_vec(),
@@ -278,7 +278,7 @@ impl FastqSet {
             });
         }
 
-        Self { header: header.to_vec(), segments, skip_reason: None }
+        Ok(Self { header: header.to_vec(), segments, skip_reason: None })
     }
 }
 
@@ -316,14 +316,14 @@ pub struct ReadSetIterator {
 }
 
 impl Iterator for ReadSetIterator {
-    type Item = FastqSet;
+    type Item = anyhow::Result<FastqSet>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let rec = self.source.next()?;
         let record = match rec {
             Ok(record) => record,
             Err(e) => {
-                panic!("Error parsing FASTQ record: {e}");
+                return Some(Err(anyhow::Error::from(e).context("Error parsing FASTQ record")));
             }
         };
         Some(FastqSet::from_record_with_structure(
@@ -556,7 +556,7 @@ mod tests {
         let result = iterator.next();
         assert!(result.is_some());
 
-        let fastq_set = result.unwrap();
+        let fastq_set = result.unwrap().unwrap();
         assert_eq!(fastq_set.header, b"read1");
         assert_eq!(fastq_set.segments.len(), 2);
         assert!(fastq_set.skip_reason.is_none());
@@ -590,15 +590,14 @@ mod tests {
         let result = iterator.next();
         assert!(result.is_some());
 
-        let fastq_set = result.unwrap();
+        let fastq_set = result.unwrap().unwrap();
         assert_eq!(fastq_set.header, b"read1");
         assert!(fastq_set.segments.is_empty());
         assert_eq!(fastq_set.skip_reason, Some(SkipReason::TooFewBases));
     }
 
     #[test]
-    #[should_panic(expected = "too few bases")]
-    fn test_read_set_iterator_panic_on_too_few_bases_without_skip() {
+    fn test_read_set_iterator_error_on_too_few_bases_without_skip() {
         use std::io::Cursor;
 
         // Create a FASTQ record that's too short
@@ -610,8 +609,11 @@ mod tests {
         let read_structure = ReadStructure::from_str("4M6T").unwrap();
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
-        // This should panic because TooFewBases is not in skip_reasons
-        let _ = iterator.next();
+        // This should return an error because TooFewBases is not in skip_reasons
+        let result = iterator.next();
+        assert!(result.is_some());
+        let err = result.unwrap().unwrap_err();
+        assert!(err.to_string().contains("too few bases"));
     }
 
     #[test]
@@ -626,13 +628,13 @@ mod tests {
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
         // First record
-        let first = iterator.next().unwrap();
+        let first = iterator.next().unwrap().unwrap();
         assert_eq!(first.header, b"read1");
         assert_eq!(first.segments[0].seq, b"ACGT");
         assert_eq!(first.segments[1].seq, b"AAAA");
 
         // Second record
-        let second = iterator.next().unwrap();
+        let second = iterator.next().unwrap().unwrap();
         assert_eq!(second.header, b"read2");
         assert_eq!(second.segments[0].seq, b"TGCA");
         assert_eq!(second.segments[1].seq, b"TTTT");
@@ -654,7 +656,7 @@ mod tests {
         let read_structure = ReadStructure::from_str("4M+T").unwrap();
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
-        let result = iterator.next().unwrap();
+        let result = iterator.next().unwrap().unwrap();
         assert_eq!(result.segments.len(), 2);
 
         // Fixed molecular barcode segment
