@@ -1139,7 +1139,7 @@ mod tests {
         ];
         let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 3);
 
@@ -1158,15 +1158,15 @@ mod tests {
         ];
         let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 2);
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 3);
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "2");
         assert_eq!(result.1.len(), 1);
 
@@ -1184,11 +1184,11 @@ mod tests {
         ];
         let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 2); // Skipped record without MI
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 1);
 
@@ -1205,12 +1205,12 @@ mod tests {
         let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
         // First group before error
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 1);
 
         // Error
-        let result = iter.next().unwrap();
+        let result = iter.next().expect("iterator should yield item");
         assert!(result.is_err());
 
         // Iterator should be done after error
@@ -1226,7 +1226,7 @@ mod tests {
         let records: Vec<Result<RecordBuf>> = vec![Ok(record1), Ok(record2)];
         let mut iter = MiGroupIterator::new(records.into_iter(), "RX");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "ACGT");
         assert_eq!(result.1.len(), 2);
 
@@ -1257,12 +1257,12 @@ mod tests {
         });
 
         // First group: base MI "1" with 4 reads (2 /A + 2 /B)
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 4);
 
         // Second group: base MI "2" with 2 reads (1 /A + 1 /B)
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "2");
         assert_eq!(result.1.len(), 2);
 
@@ -1289,7 +1289,7 @@ mod tests {
             extract_mi_base(mi).to_string()
         });
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 3);
 
@@ -1308,12 +1308,12 @@ mod tests {
         });
 
         // First group before error
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 1);
 
         // Error
-        let result = iter.next().unwrap();
+        let result = iter.next().expect("iterator should yield item");
         assert!(result.is_err());
 
         // Iterator should be done after error
@@ -1332,7 +1332,7 @@ mod tests {
             MiGroupIteratorWithTransform::new(records.into_iter(), "MI", str::to_uppercase);
 
         // All should be grouped together since they uppercase to "ABC"
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "ABC");
         assert_eq!(result.1.len(), 3);
 
@@ -1452,7 +1452,7 @@ mod tests {
         ];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 3);
 
@@ -1471,15 +1471,15 @@ mod tests {
         ];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 2);
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 3);
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "2");
         assert_eq!(result.1.len(), 1);
 
@@ -1497,11 +1497,11 @@ mod tests {
         ];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 2); // Skipped records without MI
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 1);
 
@@ -1518,12 +1518,12 @@ mod tests {
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
 
         // First group before error
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
         assert_eq!(result.1.len(), 1);
 
         // Error should be returned after flushing the pending group
-        let err = iter.next().unwrap();
+        let err = iter.next().expect("iterator should yield item");
         assert!(err.is_err());
 
         assert!(iter.next().is_none());
@@ -1536,7 +1536,7 @@ mod tests {
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
 
         // Error should be returned directly
-        let result = iter.next().unwrap();
+        let result = iter.next().expect("iterator should yield item");
         assert!(result.is_err());
 
         // Iterator should be done after error
@@ -1549,7 +1549,7 @@ mod tests {
             vec![Ok(make_raw_bam_with_tag("RX", "ACGT")), Ok(make_raw_bam_with_tag("RX", "ACGT"))];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "RX");
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "ACGT");
         assert_eq!(result.1.len(), 2);
 
@@ -1580,12 +1580,12 @@ mod tests {
         });
 
         // First group: base MI "1" with 4 reads
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 4);
 
         // Second group: base MI "2" with 2 reads
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "2");
         assert_eq!(result.1.len(), 2);
 
@@ -1699,12 +1699,12 @@ mod tests {
             RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some([b'C', b'B']));
 
         // First group: MI=1, CB=ACGT
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1\tACGT");
         assert_eq!(result.1.len(), 2);
 
         // Second group: MI=1, CB=TGCA
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1\tTGCA");
         assert_eq!(result.1.len(), 2);
 
@@ -1720,7 +1720,7 @@ mod tests {
         ];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(None);
 
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
         assert_eq!(result.1.len(), 2); // Both records in same group
 
@@ -1739,12 +1739,12 @@ mod tests {
             RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some([b'C', b'B']));
 
         // First group: MI=1, no CB (key = "1\t")
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1\t");
         assert_eq!(result.1.len(), 2);
 
         // Second group: MI=1, CB=ACGT (key = "1\tACGT")
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1\tACGT");
         assert_eq!(result.1.len(), 1);
 
@@ -1767,12 +1767,12 @@ mod tests {
 
         // All three have base MI "1", but different cells
         // First group: base MI=1, CB=ACGT (2 records: 1/A and 1/B)
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1\tACGT");
         assert_eq!(result.1.len(), 2);
 
         // Second group: base MI=1, CB=TGCA
-        let result = iter.next().unwrap().unwrap();
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1\tTGCA");
         assert_eq!(result.1.len(), 1);
 
@@ -1814,12 +1814,13 @@ mod tests {
             make_raw_decoded_record("MI", "0"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         // Only 1 MI group so far, batch_size=10, no complete batch yet
         assert!(batches.is_empty());
         assert!(grouper.has_pending());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "0");
         assert_eq!(final_batch.groups[0].records.len(), 3);
@@ -1838,10 +1839,11 @@ mod tests {
             make_raw_decoded_record("MI", "2"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty()); // 3 groups < batch_size 10
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 3);
         assert_eq!(final_batch.groups[0].mi, "0");
         assert_eq!(final_batch.groups[0].records.len(), 2);
@@ -1863,7 +1865,7 @@ mod tests {
             make_raw_decoded_record("MI", "4"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         // 5 MI values => 4 completed groups (0,1,2,3) while "4" is still current
         // batch_size=2 => 2 batches of 2 groups each
         assert_eq!(batches.len(), 2);
@@ -1877,7 +1879,8 @@ mod tests {
         // "4" is still pending
         assert!(grouper.has_pending());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "4");
     }
@@ -1892,11 +1895,12 @@ mod tests {
             make_raw_decoded_record("MI", "0"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
 
         // Records without MI are now grouped under "" (matching MiGrouper behavior)
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 3);
         assert_eq!(final_batch.groups[0].mi, "0");
         assert_eq!(final_batch.groups[0].records.len(), 1);
@@ -1920,7 +1924,7 @@ mod tests {
         let mut grouper = RawMiGrouper::new("MI", 10);
         assert!(!grouper.has_pending());
 
-        let final_batch = grouper.finish().unwrap();
+        let final_batch = grouper.finish().expect("finish should succeed");
         assert!(final_batch.is_none());
     }
 
@@ -1929,12 +1933,12 @@ mod tests {
         let mut grouper = RawMiGrouper::new("MI", 10);
 
         let records = vec![make_raw_decoded_record("MI", "0")];
-        grouper.add_records(records).unwrap();
+        grouper.add_records(records).expect("add_records should succeed");
 
-        let batch1 = grouper.finish().unwrap();
+        let batch1 = grouper.finish().expect("finish should succeed");
         assert!(batch1.is_some());
 
-        let batch2 = grouper.finish().unwrap();
+        let batch2 = grouper.finish().expect("finish should succeed");
         assert!(batch2.is_none());
     }
 
@@ -1947,12 +1951,12 @@ mod tests {
 
         // After adding records, current_mi is set
         let records = vec![make_raw_decoded_record("MI", "0")];
-        grouper.add_records(records).unwrap();
+        grouper.add_records(records).expect("add_records should succeed");
         assert!(grouper.has_pending());
 
         // After adding a different MI, first group moves to pending_groups
         let records = vec![make_raw_decoded_record("MI", "1")];
-        grouper.add_records(records).unwrap();
+        grouper.add_records(records).expect("add_records should succeed");
         assert!(grouper.has_pending());
     }
 
@@ -1991,10 +1995,11 @@ mod tests {
             DecodedRecord::from_raw_bytes(rec_b, key),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         // Secondary was filtered out, and 1/A and 1/B transform to "1"
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "1");
@@ -2022,11 +2027,12 @@ mod tests {
             make_decoded_record_for_mi_grouper("0"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
         assert!(grouper.has_pending());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "0");
         assert_eq!(final_batch.groups[0].records.len(), 3);
@@ -2045,10 +2051,11 @@ mod tests {
             make_decoded_record_for_mi_grouper("2"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 3);
         assert_eq!(final_batch.groups[0].mi, "0");
         assert_eq!(final_batch.groups[0].records.len(), 2);
@@ -2070,7 +2077,7 @@ mod tests {
             make_decoded_record_for_mi_grouper("4"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].groups.len(), 2);
         assert_eq!(batches[0].groups[0].mi, "0");
@@ -2081,7 +2088,8 @@ mod tests {
 
         assert!(grouper.has_pending());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "4");
     }
@@ -2100,7 +2108,7 @@ mod tests {
         let mut grouper = MiGrouper::new("MI", 10);
         assert!(!grouper.has_pending());
 
-        let final_batch = grouper.finish().unwrap();
+        let final_batch = grouper.finish().expect("finish should succeed");
         assert!(final_batch.is_none());
     }
 
@@ -2109,12 +2117,12 @@ mod tests {
         let mut grouper = MiGrouper::new("MI", 10);
 
         let records = vec![make_decoded_record_for_mi_grouper("0")];
-        grouper.add_records(records).unwrap();
+        grouper.add_records(records).expect("add_records should succeed");
 
-        let batch1 = grouper.finish().unwrap();
+        let batch1 = grouper.finish().expect("finish should succeed");
         assert!(batch1.is_some());
 
-        let batch2 = grouper.finish().unwrap();
+        let batch2 = grouper.finish().expect("finish should succeed");
         assert!(batch2.is_none());
     }
 
@@ -2133,10 +2141,11 @@ mod tests {
             make_decoded_record_for_mi_grouper("2/A"),
         ];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
 
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 2);
         assert_eq!(final_batch.groups[0].mi, "1");
         assert_eq!(final_batch.groups[0].records.len(), 2);
@@ -2151,11 +2160,11 @@ mod tests {
         assert!(!grouper.has_pending());
 
         let records = vec![make_decoded_record_for_mi_grouper("0")];
-        grouper.add_records(records).unwrap();
+        grouper.add_records(records).expect("add_records should succeed");
         assert!(grouper.has_pending());
 
         let records = vec![make_decoded_record_for_mi_grouper("1")];
-        grouper.add_records(records).unwrap();
+        grouper.add_records(records).expect("add_records should succeed");
         assert!(grouper.has_pending());
     }
 
@@ -2167,11 +2176,12 @@ mod tests {
         let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
         let records = vec![DecodedRecord::new(record, key)];
 
-        let batches = grouper.add_records(records).unwrap();
+        let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
 
         // Record without MI tag gets default empty string as MI value
-        let final_batch = grouper.finish().unwrap().unwrap();
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "");
         assert_eq!(final_batch.groups[0].records.len(), 1);

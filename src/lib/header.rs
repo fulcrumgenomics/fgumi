@@ -182,7 +182,10 @@ mod tests {
     fn test_get_last_program_id_single() {
         let mut header = Header::default();
         let pg = Map::<Program>::default();
-        header.programs_mut().add(BString::from("bwa"), pg).unwrap();
+        header
+            .programs_mut()
+            .add(BString::from("bwa"), pg)
+            .expect("adding program to header should succeed");
         assert_eq!(get_last_program_id(&header), Some("bwa".to_string()));
     }
 
@@ -192,12 +195,20 @@ mod tests {
 
         // Add first program
         let pg1 = Map::<Program>::default();
-        header.programs_mut().add(BString::from("bwa"), pg1).unwrap();
+        header
+            .programs_mut()
+            .add(BString::from("bwa"), pg1)
+            .expect("adding program to header should succeed");
 
         // Add second program that references the first
-        let pg2 =
-            Map::<Program>::builder().insert(tag::PREVIOUS_PROGRAM_ID, "bwa").build().unwrap();
-        header.programs_mut().add(BString::from("samtools"), pg2).unwrap();
+        let pg2 = Map::<Program>::builder()
+            .insert(tag::PREVIOUS_PROGRAM_ID, "bwa")
+            .build()
+            .expect("build should succeed");
+        header
+            .programs_mut()
+            .add(BString::from("samtools"), pg2)
+            .expect("adding program to header should succeed");
 
         // The last program should be samtools (not referenced by anyone)
         assert_eq!(get_last_program_id(&header), Some("samtools".to_string()));
@@ -213,7 +224,10 @@ mod tests {
     fn test_make_unique_program_id_with_collision() {
         let mut header = Header::default();
         let pg = Map::<Program>::default();
-        header.programs_mut().add(BString::from("fgumi"), pg).unwrap();
+        header
+            .programs_mut()
+            .add(BString::from("fgumi"), pg)
+            .expect("adding program to header should succeed");
 
         assert_eq!(make_unique_program_id(&header, "fgumi"), "fgumi.1");
     }
@@ -223,10 +237,16 @@ mod tests {
         let mut header = Header::default();
 
         let pg1 = Map::<Program>::default();
-        header.programs_mut().add(BString::from("fgumi"), pg1).unwrap();
+        header
+            .programs_mut()
+            .add(BString::from("fgumi"), pg1)
+            .expect("adding program to header should succeed");
 
         let pg2 = Map::<Program>::default();
-        header.programs_mut().add(BString::from("fgumi.1"), pg2).unwrap();
+        header
+            .programs_mut()
+            .add(BString::from("fgumi.1"), pg2)
+            .expect("adding program to header should succeed");
 
         assert_eq!(make_unique_program_id(&header, "fgumi"), "fgumi.2");
     }
@@ -234,13 +254,15 @@ mod tests {
     #[test]
     fn test_add_pg_record_empty_header() {
         let header = Header::default();
-        let result = add_pg_record(header, "1.0.0", "fgumi test").unwrap();
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi test").expect("add_pg_record should succeed");
         let programs = result.programs();
         assert_eq!(programs.as_ref().len(), 1);
         assert!(programs.as_ref().contains_key(b"fgumi".as_slice()));
 
         // Verify the program has expected fields
-        let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
+        let pg =
+            programs.as_ref().get(b"fgumi".as_slice()).expect("expected key should be present");
         assert_eq!(
             pg.other_fields().get(&tag::NAME).map(std::convert::AsRef::as_ref),
             Some(b"fgumi".as_slice())
@@ -260,15 +282,20 @@ mod tests {
     fn test_add_pg_record_with_existing_fgumi() {
         let mut header = Header::default();
         let pg = Map::<Program>::default();
-        header.programs_mut().add(BString::from("fgumi"), pg).unwrap();
+        header
+            .programs_mut()
+            .add(BString::from("fgumi"), pg)
+            .expect("adding program to header should succeed");
 
-        let result = add_pg_record(header, "1.0.0", "fgumi test2").unwrap();
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi test2").expect("add_pg_record should succeed");
         let programs = result.programs();
         assert_eq!(programs.as_ref().len(), 2);
         assert!(programs.as_ref().contains_key(b"fgumi.1".as_slice()));
 
         // Verify PP chaining
-        let pg = programs.as_ref().get(b"fgumi.1".as_slice()).unwrap();
+        let pg =
+            programs.as_ref().get(b"fgumi.1".as_slice()).expect("expected key should be present");
         assert_eq!(
             pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"fgumi".as_slice())
@@ -284,14 +311,19 @@ mod tests {
             .insert(tag::NAME, "bwa")
             .insert(tag::VERSION, "0.7.17")
             .build()
-            .unwrap();
-        header.programs_mut().add(BString::from("bwa"), bwa_pg).unwrap();
+            .expect("building program map should succeed");
+        header
+            .programs_mut()
+            .add(BString::from("bwa"), bwa_pg)
+            .expect("adding program to header should succeed");
 
-        let result = add_pg_record(header, "1.0.0", "fgumi group -i in.bam").unwrap();
+        let result = add_pg_record(header, "1.0.0", "fgumi group -i in.bam")
+            .expect("add_pg_record should succeed");
         let programs = result.programs();
 
         // fgumi should chain to bwa
-        let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
+        let pg =
+            programs.as_ref().get(b"fgumi".as_slice()).expect("expected key should be present");
         assert_eq!(
             pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"bwa".as_slice())
@@ -301,13 +333,15 @@ mod tests {
     #[test]
     fn test_add_pg_to_builder() {
         let builder = Header::builder();
-        let builder = add_pg_to_builder(builder, "1.0.0", "fgumi extract").unwrap();
+        let builder = add_pg_to_builder(builder, "1.0.0", "fgumi extract")
+            .expect("add_pg_to_builder should succeed");
         let header = builder.build();
 
         let programs = header.programs();
         assert_eq!(programs.as_ref().len(), 1);
 
-        let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
+        let pg =
+            programs.as_ref().get(b"fgumi".as_slice()).expect("expected key should be present");
         assert_eq!(
             pg.other_fields().get(&tag::NAME).map(std::convert::AsRef::as_ref),
             Some(b"fgumi".as_slice())
@@ -318,7 +352,7 @@ mod tests {
     #[test]
     fn test_add_pg_record_empty_command_line() {
         let header = Header::default();
-        let result = add_pg_record(header, "1.0.0", "").unwrap();
+        let result = add_pg_record(header, "1.0.0", "").expect("add_pg_record should succeed");
         let programs = result.programs();
         assert_eq!(programs.as_ref().len(), 1);
         assert!(programs.as_ref().contains_key(b"fgumi".as_slice()));
@@ -329,14 +363,16 @@ mod tests {
         use crate::bam_io::create_bam_writer;
         use tempfile::TempDir;
 
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("creating temp file/dir should succeed");
         let output_path = dir.path().join("test.bam");
 
         let header = Header::default();
-        let result = add_pg_record(header, "1.0.0", "fgumi test").unwrap();
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi test").expect("add_pg_record should succeed");
 
         // Try to write the header to a BAM file
-        let _writer = create_bam_writer(&output_path, &result, 1, 6).unwrap();
+        let _writer = create_bam_writer(&output_path, &result, 1, 6)
+            .expect("creating BAM writer should succeed");
     }
 
     #[test]
@@ -349,20 +385,23 @@ mod tests {
         let header = Header::builder().add_program("SamBuilder", pg_map).build();
 
         // Now add our fgumi @PG record
-        let result = add_pg_record(header, "1.0.0", "fgumi test").unwrap();
+        let result =
+            add_pg_record(header, "1.0.0", "fgumi test").expect("add_pg_record should succeed");
         let programs = result.programs();
         assert_eq!(programs.as_ref().len(), 2);
 
         // fgumi should chain to SamBuilder
-        let pg = programs.as_ref().get(b"fgumi".as_slice()).unwrap();
+        let pg =
+            programs.as_ref().get(b"fgumi".as_slice()).expect("expected key should be present");
         assert_eq!(
             pg.other_fields().get(&tag::PREVIOUS_PROGRAM_ID).map(std::convert::AsRef::as_ref),
             Some(b"SamBuilder".as_slice())
         );
 
         // Try to write to BAM
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("creating temp file/dir should succeed");
         let output_path = dir.path().join("test.bam");
-        let _writer = create_bam_writer(&output_path, &result, 1, 6).unwrap();
+        let _writer = create_bam_writer(&output_path, &result, 1, 6)
+            .expect("creating BAM writer should succeed");
     }
 }

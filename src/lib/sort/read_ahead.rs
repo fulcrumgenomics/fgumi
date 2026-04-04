@@ -357,19 +357,21 @@ mod tests {
             Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero"));
         let header = Header::builder().add_reference_sequence("chr1", ref_seq).build();
 
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = NamedTempFile::new().expect("creating temp file/dir should succeed");
         let path = tmp.path().to_path_buf();
 
         {
-            let file = std::fs::File::create(&path).unwrap();
+            let file = std::fs::File::create(&path).expect("creating file should succeed");
             let mut writer = noodles::bam::io::Writer::new(file);
-            writer.write_header(&header).unwrap();
+            writer.write_header(&header).expect("writing header should succeed");
 
             for i in 0..num_records {
                 let name = format!("read{i}");
                 let record =
                     RecordBuf::builder().set_name(&*name).set_flags(Flags::UNMAPPED).build();
-                writer.write_alignment_record(&header, &record).unwrap();
+                writer
+                    .write_alignment_record(&header, &record)
+                    .expect("writing alignment record should succeed");
             }
         }
 
@@ -379,7 +381,8 @@ mod tests {
     #[test]
     fn test_read_ahead_reader_empty_bam() {
         let (tmp, _header) = create_test_bam_file(0);
-        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         assert!(ra.next_record().is_none(), "Empty BAM should yield no records");
@@ -388,7 +391,8 @@ mod tests {
     #[test]
     fn test_read_ahead_reader_single_record() {
         let (tmp, _header) = create_test_bam_file(1);
-        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         assert!(ra.next_record().is_some(), "Should yield exactly one record");
@@ -399,7 +403,8 @@ mod tests {
     fn test_read_ahead_reader_multiple_records() {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
-        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         let mut count = 0;
@@ -413,7 +418,8 @@ mod tests {
     fn test_read_ahead_reader_iterator() {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
-        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let ra = ReadAheadReader::new(reader);
         let records: Vec<Record> = ra.collect();
@@ -424,7 +430,8 @@ mod tests {
     fn test_read_ahead_reader_with_buffer_size() {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
-        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         // Use a small buffer size (4) to exercise partial-batch logic
         let ra = ReadAheadReader::with_buffer_size(reader, 4);
@@ -438,7 +445,8 @@ mod tests {
         // when we drop the reader. This verifies the Drop impl does not deadlock.
         let num = 5000;
         let (tmp, _header) = create_test_bam_file(num);
-        let (reader, _header) = create_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         // Read only a few records
@@ -454,7 +462,8 @@ mod tests {
     #[test]
     fn test_raw_read_ahead_empty() {
         let (tmp, _header) = create_test_bam_file(0);
-        let (reader, _header) = create_raw_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = RawReadAheadReader::new(reader);
         assert!(ra.next_record().is_none(), "Empty BAM should yield no raw records");
@@ -464,7 +473,8 @@ mod tests {
     fn test_raw_read_ahead_multiple() {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
-        let (reader, _header) = create_raw_bam_reader(tmp.path(), 1).unwrap();
+        let (reader, _header) =
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let ra = RawReadAheadReader::new(reader);
         let records: Vec<RawRecord> = ra.collect();

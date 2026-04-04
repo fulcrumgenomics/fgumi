@@ -203,8 +203,8 @@ mod tests {
         let samples: Vec<usize> = (0..1000).map(|_| model.sample(&mut rng)).collect();
 
         // Check that we have variation
-        let min = *samples.iter().min().unwrap();
-        let max = *samples.iter().max().unwrap();
+        let min = *samples.iter().min().expect("samples should not be empty");
+        let max = *samples.iter().max().expect("samples should not be empty");
         assert!(max - min > 200, "Expected high variance but got narrow range");
     }
 

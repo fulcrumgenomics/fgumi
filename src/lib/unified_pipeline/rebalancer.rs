@@ -349,13 +349,34 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn test_parse_memory_limit() {
-        assert_eq!(parse_memory_limit("4GB").unwrap(), 4 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("4G").unwrap(), 4 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("512MB").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("512M").unwrap(), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("1gb").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("  2GB  ").unwrap(), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("1.5GB").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_memory_limit("4GB").expect("parsing \"4GB\" should succeed"),
+            4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit("4G").expect("parsing \"4G\" should succeed"),
+            4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit("512MB").expect("parsing \"512MB\" should succeed"),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit("512M").expect("parsing \"512M\" should succeed"),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit("1gb").expect("parsing \"1gb\" should succeed"),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit("  2GB  ").expect("parsing \"  2GB  \" should succeed"),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit("1.5GB").expect("parsing \"1.5GB\" should succeed"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
     }
 
     #[test]

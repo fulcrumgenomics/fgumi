@@ -130,7 +130,8 @@ mod tests {
         let tag = Tag::from([b'c', b'd']);
         record.data_mut().insert(tag, Value::from(vec![1u16, 2, 3]));
 
-        let reversed = reverse_per_base_tags(&mut record).unwrap();
+        let reversed =
+            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
         assert!(!reversed); // Should not reverse for positive strand
 
         if let Some(Value::Array(Array::UInt16(arr))) = record.data().get(&tag) {
@@ -145,7 +146,8 @@ mod tests {
         let tag = Tag::from([b'c', b'd']);
         record.data_mut().insert(tag, Value::from(vec![1u16, 2, 3]));
 
-        let reversed = reverse_per_base_tags(&mut record).unwrap();
+        let reversed =
+            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
         assert!(reversed); // Should reverse for negative strand
 
         if let Some(Value::Array(Array::UInt16(arr))) = record.data().get(&tag) {
@@ -161,7 +163,8 @@ mod tests {
             .tag("ac", "ACGT")
             .build();
 
-        let reversed = reverse_per_base_tags(&mut record).unwrap();
+        let reversed =
+            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
         assert!(reversed);
 
         let tag = Tag::from([b'a', b'c']);
@@ -200,7 +203,8 @@ mod tests {
             .tag("aq", "IIHG")
             .build();
 
-        let reversed = reverse_per_base_tags(&mut record).unwrap();
+        let reversed =
+            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
         assert!(reversed);
 
         let tag = Tag::from([b'a', b'q']);
@@ -226,9 +230,10 @@ mod tests {
 
         let header = Header::default();
         let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf).unwrap();
+        encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
 
-        let result = reverse_per_base_tags_raw(&mut raw).unwrap();
+        let result =
+            reverse_per_base_tags_raw(&mut raw).expect("reverse_per_base_tags_raw should succeed");
         assert!(result);
 
         let aux = bam_fields::aux_data_slice(&raw);
@@ -254,11 +259,11 @@ mod tests {
         let record_buf = RecordBuilder::new().sequence("ACGT").build();
         let header = Header::default();
         let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf).unwrap();
+        encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
 
         let result = reverse_per_base_tags_raw(&mut raw);
         assert!(result.is_ok());
-        assert!(!result.unwrap()); // positive strand => false
+        assert!(!result.expect("result should be Ok")); // positive strand => false
     }
 
     #[test]
@@ -274,11 +279,11 @@ mod tests {
 
         let header = Header::default();
         let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf).unwrap();
+        encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
 
         let result = reverse_per_base_tags_raw(&mut raw);
         assert!(result.is_ok());
-        assert!(result.unwrap()); // negative strand => true
+        assert!(result.expect("result should be Ok")); // negative strand => true
 
         // Verify the cd tag was reversed: find it in the raw record's aux data
         let aux = bam_fields::aux_data_slice(&raw);

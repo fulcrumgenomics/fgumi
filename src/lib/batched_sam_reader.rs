@@ -299,7 +299,7 @@ mod tests {
         let cursor = Cursor::new(data.as_bytes().to_vec());
 
         let mut reader = BatchedSamReader::new(cursor, 1000);
-        assert!(reader.fill_buffer().unwrap());
+        assert!(reader.fill_buffer().expect("fill_buffer should succeed"));
         assert!(!reader.buffer().is_empty());
     }
 
@@ -315,7 +315,7 @@ mod tests {
         let cursor = Cursor::new(data.as_bytes().to_vec());
         let mut reader = BatchedSamReader::new(cursor, 500);
 
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
 
         let mut batches = 0;
         let mut records = 0;
@@ -362,7 +362,7 @@ mod tests {
         // Manually set small initial buffer for testing
         reader.set_buffer(vec![0u8; 1024]); // 1KB initial
 
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
         let initial_capacity = reader.capacity();
 
         // Parse until we hit a batch boundary that triggers growth
@@ -373,7 +373,7 @@ mod tests {
                 if reader.record_parsed(seq_len, line_end + 1) {
                     grew = true;
                 }
-            } else if !reader.fill_buffer().unwrap() {
+            } else if !reader.fill_buffer().expect("fill_buffer should succeed") {
                 break;
             }
         }
@@ -405,7 +405,7 @@ mod tests {
         // Small initial buffer
         reader.set_buffer(vec![0u8; 4096]);
 
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
 
         let mut max_capacity = reader.capacity();
 
@@ -423,7 +423,7 @@ mod tests {
 
                 // Verify never shrinks
                 assert!(reader.capacity() >= max_capacity);
-            } else if !reader.fill_buffer().unwrap() {
+            } else if !reader.fill_buffer().expect("fill_buffer should succeed") {
                 break;
             }
         }
@@ -472,7 +472,7 @@ mod tests {
         reader.set_buffer(vec![0u8; 1024]); // Small buffer
 
         // First fill gets partial line
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
 
         // Should not find complete line yet if buffer is small enough
         // After second fill, should have complete line
@@ -482,7 +482,7 @@ mod tests {
                 found_complete = true;
                 break;
             }
-            if !reader.fill_buffer().unwrap() {
+            if !reader.fill_buffer().expect("fill_buffer should succeed") {
                 break;
             }
         }
@@ -505,11 +505,11 @@ mod tests {
         reader.set_buffer(vec![0u8; 512]);
         let initial = reader.capacity();
 
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
 
         // Don't parse anything - just refill
         // Second fill should trigger proactive growth if data > 50% of buffer
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
 
         // Buffer should have grown proactively
         assert!(
@@ -526,7 +526,7 @@ mod tests {
         let mut reader = BatchedSamReader::new(cursor, 1000);
 
         // Should return false (no data)
-        assert!(!reader.fill_buffer().unwrap());
+        assert!(!reader.fill_buffer().expect("fill_buffer should succeed"));
         assert!(reader.buffer().is_empty());
     }
 
@@ -540,7 +540,7 @@ mod tests {
         let cursor = Cursor::new(data.as_bytes().to_vec());
         let mut reader = BatchedSamReader::new(cursor, 1000);
 
-        reader.fill_buffer().unwrap();
+        reader.fill_buffer().expect("fill_buffer should succeed");
 
         let mut alignment_records = 0;
 
@@ -575,7 +575,7 @@ mod tests {
         let mut reader = BatchedSamReader::new(cursor, 1000);
         let mut buf = vec![0u8; 1024];
 
-        let n = reader.read(&mut buf).unwrap();
+        let n = reader.read(&mut buf).expect("read should succeed");
         assert_eq!(n, 13);
         assert_eq!(&buf[..n], b"Hello, World!");
     }
@@ -589,11 +589,11 @@ mod tests {
 
         // Read lines using BufRead
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        reader.read_line(&mut line).expect("read_line should succeed");
         assert_eq!(line, "Line 1\n");
 
         line.clear();
-        reader.read_line(&mut line).unwrap();
+        reader.read_line(&mut line).expect("read_line should succeed");
         assert_eq!(line, "Line 2\n");
     }
 
@@ -605,14 +605,14 @@ mod tests {
         let mut reader = BatchedSamReader::new(cursor, 1000);
 
         // Fill buffer
-        let buf = reader.fill_buf().unwrap();
+        let buf = reader.fill_buf().expect("fill_buf should succeed");
         assert_eq!(buf, b"ABCDEFGHIJ");
 
         // Consume 5 bytes
         reader.consume(5);
 
         // Remaining should be FGHIJ
-        let buf = reader.fill_buf().unwrap();
+        let buf = reader.fill_buf().expect("fill_buf should succeed");
         assert_eq!(buf, b"FGHIJ");
     }
 
@@ -626,7 +626,7 @@ mod tests {
         reader.set_buffer(vec![0u8; 64 * 1024]); // 64KB buffer
 
         let mut buf = vec![0u8; 64 * 1024];
-        let _ = reader.read(&mut buf).unwrap();
+        let _ = reader.read(&mut buf).expect("read should succeed");
 
         // Should have grown to 128KB (doubled)
         assert_eq!(reader.capacity(), 128 * 1024);
@@ -642,7 +642,7 @@ mod tests {
         reader.set_buffer(vec![0u8; 64 * 1024]); // 64KB buffer
 
         let mut buf = vec![0u8; 64 * 1024];
-        let _ = reader.read(&mut buf).unwrap();
+        let _ = reader.read(&mut buf).expect("read should succeed");
 
         // Should NOT have grown
         assert_eq!(reader.capacity(), 64 * 1024);
@@ -656,7 +656,7 @@ mod tests {
         let mut reader = BatchedSamReader::new(cursor, 1000);
         let mut buf = vec![0u8; 1024];
 
-        let n = reader.read(&mut buf).unwrap();
+        let n = reader.read(&mut buf).expect("read should succeed");
         assert_eq!(n, 0);
     }
 }

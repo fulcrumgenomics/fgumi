@@ -735,18 +735,18 @@ mod tests {
         let rg1 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("libA"))
             .build()
-            .unwrap();
+            .expect("building read group with library should succeed");
         header = header.add_read_group(BString::from("RG1"), rg1);
 
         // Second read group with library "libB"
         let rg2 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("libB"))
             .build()
-            .unwrap();
+            .expect("building read group with library should succeed");
         header = header.add_read_group(BString::from("RG2"), rg2);
 
         // Third read group with no library (should default to "unknown")
-        let rg3 = Map::<ReadGroup>::builder().build().unwrap();
+        let rg3 = Map::<ReadGroup>::builder().build().expect("build should succeed");
         header = header.add_read_group(BString::from("RG3"), rg3);
 
         let header = header.build();
@@ -829,7 +829,8 @@ mod tests {
             // Forward strand with 5S at start: alignment_start=100, CIGAR=5S50M
             // unclipped_start = 100 - 5 = 95
             let record = build_record(100, "5S50M", false);
-            let pos = get_unclipped_position(&record).unwrap();
+            let pos =
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
             assert_eq!(pos, 95);
         }
 
@@ -838,7 +839,8 @@ mod tests {
             // Forward strand with 10H at start: alignment_start=100, CIGAR=10H50M
             // unclipped_start = 100 - 10 = 90
             let record = build_record(100, "10H50M", false);
-            let pos = get_unclipped_position(&record).unwrap();
+            let pos =
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
             assert_eq!(pos, 90);
         }
 
@@ -847,7 +849,8 @@ mod tests {
             // Forward strand with 10H5S at start: alignment_start=100, CIGAR=10H5S50M
             // unclipped_start = 100 - 10 - 5 = 85
             let record = build_record(100, "10H5S50M", false);
-            let pos = get_unclipped_position(&record).unwrap();
+            let pos =
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
             assert_eq!(pos, 85);
         }
 
@@ -857,7 +860,8 @@ mod tests {
             // alignment_end = 100 + 50 - 1 = 149
             // unclipped_end = 149 + 5 = 154
             let record = build_record(100, "50M5S", true);
-            let pos = get_unclipped_position(&record).unwrap();
+            let pos =
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
             assert_eq!(pos, 154);
         }
 
@@ -867,7 +871,8 @@ mod tests {
             // alignment_end = 100 + 50 - 1 = 149
             // unclipped_end = 149 + 10 = 159
             let record = build_record(100, "50M10H", true);
-            let pos = get_unclipped_position(&record).unwrap();
+            let pos =
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
             assert_eq!(pos, 159);
         }
 
@@ -877,7 +882,8 @@ mod tests {
             // alignment_end = 100 + 50 - 1 = 149
             // unclipped_end = 149 + 5 + 10 = 164
             let record = build_record(100, "50M5S10H", true);
-            let pos = get_unclipped_position(&record).unwrap();
+            let pos =
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
             assert_eq!(pos, 164);
         }
 
@@ -886,17 +892,28 @@ mod tests {
             // No clipping: alignment_start=100, CIGAR=50M
             // Forward: unclipped_start = 100
             let forward_record = build_record(100, "50M", false);
-            assert_eq!(get_unclipped_position(&forward_record).unwrap(), 100);
+            assert_eq!(
+                get_unclipped_position(&forward_record)
+                    .expect("get_unclipped_position should succeed"),
+                100
+            );
 
             // Reverse: unclipped_end = 100 + 50 - 1 = 149
             let reverse_record = build_record(100, "50M", true);
-            assert_eq!(get_unclipped_position(&reverse_record).unwrap(), 149);
+            assert_eq!(
+                get_unclipped_position(&reverse_record)
+                    .expect("get_unclipped_position should succeed"),
+                149
+            );
         }
 
         #[test]
         fn test_unmapped_read() {
             let record = RecordBuilder::new().sequence("ACGT").unmapped(true).build();
-            assert_eq!(get_unclipped_position(&record).unwrap(), 0);
+            assert_eq!(
+                get_unclipped_position(&record).expect("get_unclipped_position should succeed"),
+                0
+            );
         }
 
         #[test]
@@ -906,7 +923,11 @@ mod tests {
             // Leading clips = 5H + 3S = 8
             // unclipped_start = 100 - 8 = 92
             let forward_record = build_record(100, "5H3S10M2I5M3D10M4S6H", false);
-            assert_eq!(get_unclipped_position(&forward_record).unwrap(), 92);
+            assert_eq!(
+                get_unclipped_position(&forward_record)
+                    .expect("get_unclipped_position should succeed"),
+                92
+            );
 
             // Reverse strand: same CIGAR
             // alignment_span = 10 + 5 + 3 + 10 = 28 (M + D consume reference)
@@ -914,7 +935,11 @@ mod tests {
             // Trailing clips = 4S + 6H = 10
             // unclipped_end = 127 + 10 = 137
             let reverse_record = build_record(100, "5H3S10M2I5M3D10M4S6H", true);
-            assert_eq!(get_unclipped_position(&reverse_record).unwrap(), 137);
+            assert_eq!(
+                get_unclipped_position(&reverse_record)
+                    .expect("get_unclipped_position should succeed"),
+                137
+            );
         }
     }
 }

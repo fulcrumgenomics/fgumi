@@ -417,22 +417,30 @@ mod tests {
 
     #[test]
     fn test_nonexistent_sequence() {
-        let fasta = create_default_test_fasta().unwrap();
-        let reader = ReferenceReader::new(fasta.path()).unwrap();
+        let fasta = create_default_test_fasta().expect("creating test FASTA should succeed");
+        let reader =
+            ReferenceReader::new(fasta.path()).expect("creating reference reader should succeed");
 
-        let result =
-            reader.fetch("chr999", Position::try_from(1).unwrap(), Position::try_from(4).unwrap());
+        let result = reader.fetch(
+            "chr999",
+            Position::try_from(1).expect("position conversion should succeed"),
+            Position::try_from(4).expect("position conversion should succeed"),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_out_of_bounds() {
-        let fasta = create_default_test_fasta().unwrap();
-        let reader = ReferenceReader::new(fasta.path()).unwrap();
+        let fasta = create_default_test_fasta().expect("creating test FASTA should succeed");
+        let reader =
+            ReferenceReader::new(fasta.path()).expect("creating reference reader should succeed");
 
         // chr1 is only 12 bases long
-        let result =
-            reader.fetch("chr1", Position::try_from(1).unwrap(), Position::try_from(100).unwrap());
+        let result = reader.fetch(
+            "chr1",
+            Position::try_from(1).expect("position conversion should succeed"),
+            Position::try_from(100).expect("position conversion should succeed"),
+        );
         assert!(result.is_err());
     }
 
@@ -694,7 +702,7 @@ mod tests {
 
         let found = find_dict_path(&fasta_path);
         assert!(found.is_some());
-        assert_eq!(found.unwrap(), dict_path);
+        assert_eq!(found.expect("should find dictionary path"), dict_path);
 
         Ok(())
     }
@@ -712,7 +720,7 @@ mod tests {
 
         let found = find_dict_path(&fasta_path);
         assert!(found.is_some());
-        assert_eq!(found.unwrap(), dict_path);
+        assert_eq!(found.expect("should find dictionary path"), dict_path);
 
         Ok(())
     }
@@ -733,7 +741,7 @@ mod tests {
         let found = find_dict_path(&fasta_path);
         assert!(found.is_some());
         // Should find ref.dict first (fgbio/HTSJDK convention)
-        assert_eq!(found.unwrap(), dict_replacing);
+        assert_eq!(found.expect("should find dictionary path"), dict_replacing);
 
         Ok(())
     }
@@ -741,11 +749,11 @@ mod tests {
     #[test]
     fn test_find_dict_path_not_found() {
         // When no dict file exists, return None
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = tempfile::tempdir().expect("creating temp file/dir should succeed");
         let fasta_path = temp_dir.path().join("ref.fa");
 
         // Create only the FASTA file, no dict
-        std::fs::write(&fasta_path, "").unwrap();
+        std::fs::write(&fasta_path, "").expect("writing file should succeed");
 
         let found = find_dict_path(&fasta_path);
         assert!(found.is_none());
@@ -763,7 +771,7 @@ mod tests {
 
         let found = find_dict_path(&fasta_path);
         assert!(found.is_some());
-        assert_eq!(found.unwrap(), dict_path);
+        assert_eq!(found.expect("should find dictionary path"), dict_path);
 
         Ok(())
     }
@@ -780,7 +788,7 @@ mod tests {
 
         let found = find_dict_path(&fasta_path);
         assert!(found.is_some());
-        assert_eq!(found.unwrap(), dict_path);
+        assert_eq!(found.expect("should find dictionary path"), dict_path);
 
         Ok(())
     }

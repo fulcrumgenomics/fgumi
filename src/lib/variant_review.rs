@@ -317,7 +317,9 @@ mod tests {
         Header::builder()
             .add_reference_sequence(
                 BString::from("chr1"),
-                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(1000).unwrap()),
+                Map::<ReferenceSequence>::new(
+                    NonZeroUsize::try_from(1000).expect("non-zero value 1000"),
+                ),
             )
             .build()
     }
