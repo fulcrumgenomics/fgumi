@@ -2595,8 +2595,10 @@ mod tests {
         assert_eq!(b_mis.len(), 1, "Group B should have 1 unique MI");
 
         // The prefix (before '/') should be the same for both groups
-        let a_prefix = a_mis[0].split('/').next().expect("MI tag should contain '/' separator");
-        let b_prefix = b_mis[0].split('/').next().expect("MI tag should contain '/' separator");
+        let a_prefix =
+            a_mis[0].split('/').next().expect("split always yields at least one element");
+        let b_prefix =
+            b_mis[0].split('/').next().expect("split always yields at least one element");
         assert_eq!(a_prefix, b_prefix, "Both groups should have same MI prefix");
 
         // But the full MI (including suffix) should be different

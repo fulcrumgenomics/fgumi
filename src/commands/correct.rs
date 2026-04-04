@@ -1235,7 +1235,7 @@ impl CorrectUmis {
                     writer_threads,
                     self.compression.compression_level,
                 )?
-                .expect("rejects path is Some");
+                .expect("create_optional_bam_writer returns Some when given Some path");
 
                 // Ensure we never mix RecordBuf and raw rejects in the same run
                 debug_assert!(

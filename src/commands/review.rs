@@ -1139,33 +1139,33 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 .add_reference_sequence(
                     BString::from("chr1"),
                     Map::<ReferenceSequence>::new(
-                        NonZeroUsize::try_from(100).expect("non-zero value required"),
+                        NonZeroUsize::try_from(100).expect("100 is non-zero"),
                     ),
                 )
                 .add_reference_sequence(
                     BString::from("chr2"),
                     Map::<ReferenceSequence>::new(
-                        NonZeroUsize::try_from(100).expect("non-zero value required"),
+                        NonZeroUsize::try_from(100).expect("100 is non-zero"),
                     ),
                 )
                 .build();
 
             // Parse and set the sort order in the header line
             let header_str = "@HD\tVN:1.6\tSO:coordinate\n";
-            let parsed_header: Header = header_str.parse().expect("valid parse input");
+            let parsed_header: Header = header_str.parse().expect("valid SAM header string");
             if let Some(hd) = parsed_header.header() {
                 header = Header::builder()
                     .set_header(hd.clone())
                     .add_reference_sequence(
                         BString::from("chr1"),
                         Map::<ReferenceSequence>::new(
-                            NonZeroUsize::try_from(100).expect("non-zero value required"),
+                            NonZeroUsize::try_from(100).expect("100 is non-zero"),
                         ),
                     )
                     .add_reference_sequence(
                         BString::from("chr2"),
                         Map::<ReferenceSequence>::new(
-                            NonZeroUsize::try_from(100).expect("non-zero value required"),
+                            NonZeroUsize::try_from(100).expect("100 is non-zero"),
                         ),
                     )
                     .build();
