@@ -179,8 +179,8 @@ pub fn make_bam_bytes(
     mate_pos: i32,
     aux_data: &[u8],
 ) -> Vec<u8> {
-    let l_read_name = u8::try_from(name.len() + 1).unwrap(); // +1 for null terminator
-    let n_cigar_op = u16::try_from(cigar_ops.len()).unwrap();
+    let l_read_name = u8::try_from(name.len() + 1).expect("name length + 1 must fit in u8"); // +1 for null terminator
+    let n_cigar_op = u16::try_from(cigar_ops.len()).expect("cigar_ops length must fit in u16");
     let seq_bytes = seq_len.div_ceil(2);
     let total =
         32 + l_read_name as usize + cigar_ops.len() * 4 + seq_bytes + seq_len + aux_data.len();
@@ -194,7 +194,8 @@ pub fn make_bam_bytes(
     buf[10..12].copy_from_slice(&0u16.to_le_bytes()); // bin
     buf[12..14].copy_from_slice(&n_cigar_op.to_le_bytes());
     buf[14..16].copy_from_slice(&flag.to_le_bytes());
-    buf[16..20].copy_from_slice(&u32::try_from(seq_len).unwrap().to_le_bytes());
+    buf[16..20]
+        .copy_from_slice(&u32::try_from(seq_len).expect("seq_len must fit in u32").to_le_bytes());
     buf[20..24].copy_from_slice(&mate_tid.to_le_bytes());
     buf[24..28].copy_from_slice(&mate_pos.to_le_bytes());
     buf[28..32].copy_from_slice(&0i32.to_le_bytes()); // tlen
@@ -248,7 +249,7 @@ pub fn make_bam_bytes_with_tlen(
 /// Panics if `len` exceeds `u32::MAX`.
 #[must_use]
 pub fn encode_op(op_type: u32, len: usize) -> u32 {
-    (u32::try_from(len).unwrap() << 4) | op_type
+    (u32::try_from(len).expect("CIGAR op length must fit in u32") << 4) | op_type
 }
 
 /// Helper: build raw aux bytes for a B-type array tag.
@@ -266,7 +267,12 @@ pub fn make_b_array_tag(tag: [u8; 2], elem_type: u8, count: u32, elements: &[u8]
 #[must_use]
 pub fn make_b_int_array_tag(tag: [u8; 2], values: &[i32]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    make_b_array_tag(tag, b'i', u32::try_from(values.len()).unwrap(), &bytes)
+    make_b_array_tag(
+        tag,
+        b'i',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        &bytes,
+    )
 }
 
 /// # Panics
@@ -275,7 +281,12 @@ pub fn make_b_int_array_tag(tag: [u8; 2], values: &[i32]) -> Vec<u8> {
 #[must_use]
 pub fn make_b_float_array_tag(tag: [u8; 2], values: &[f32]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    make_b_array_tag(tag, b'f', u32::try_from(values.len()).unwrap(), &bytes)
+    make_b_array_tag(
+        tag,
+        b'f',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        &bytes,
+    )
 }
 
 /// # Panics
@@ -283,7 +294,12 @@ pub fn make_b_float_array_tag(tag: [u8; 2], values: &[f32]) -> Vec<u8> {
 /// Panics if `values` length exceeds `u32::MAX`.
 #[must_use]
 pub fn make_b_uint8_array_tag(tag: [u8; 2], values: &[u8]) -> Vec<u8> {
-    make_b_array_tag(tag, b'C', u32::try_from(values.len()).unwrap(), values)
+    make_b_array_tag(
+        tag,
+        b'C',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        values,
+    )
 }
 
 /// # Panics
@@ -292,7 +308,12 @@ pub fn make_b_uint8_array_tag(tag: [u8; 2], values: &[u8]) -> Vec<u8> {
 #[must_use]
 pub fn make_b_int8_array_tag(tag: [u8; 2], values: &[i8]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().map(|&v| v.cast_unsigned()).collect();
-    make_b_array_tag(tag, b'c', u32::try_from(values.len()).unwrap(), &bytes)
+    make_b_array_tag(
+        tag,
+        b'c',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        &bytes,
+    )
 }
 
 /// # Panics
@@ -301,7 +322,12 @@ pub fn make_b_int8_array_tag(tag: [u8; 2], values: &[i8]) -> Vec<u8> {
 #[must_use]
 pub fn make_b_int16_array_tag(tag: [u8; 2], values: &[i16]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    make_b_array_tag(tag, b's', u32::try_from(values.len()).unwrap(), &bytes)
+    make_b_array_tag(
+        tag,
+        b's',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        &bytes,
+    )
 }
 
 /// # Panics
@@ -310,7 +336,12 @@ pub fn make_b_int16_array_tag(tag: [u8; 2], values: &[i16]) -> Vec<u8> {
 #[must_use]
 pub fn make_b_uint16_array_tag(tag: [u8; 2], values: &[u16]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    make_b_array_tag(tag, b'S', u32::try_from(values.len()).unwrap(), &bytes)
+    make_b_array_tag(
+        tag,
+        b'S',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        &bytes,
+    )
 }
 
 /// # Panics
@@ -319,5 +350,10 @@ pub fn make_b_uint16_array_tag(tag: [u8; 2], values: &[u16]) -> Vec<u8> {
 #[must_use]
 pub fn make_b_uint32_array_tag(tag: [u8; 2], values: &[u32]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    make_b_array_tag(tag, b'I', u32::try_from(values.len()).unwrap(), &bytes)
+    make_b_array_tag(
+        tag,
+        b'I',
+        u32::try_from(values.len()).expect("array length must fit in u32"),
+        &bytes,
+    )
 }

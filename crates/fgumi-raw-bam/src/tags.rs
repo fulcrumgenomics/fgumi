@@ -1260,7 +1260,7 @@ mod tests {
         let val: f32 = 1.234;
         let mut aux = vec![b'X', b'F', b'f'];
         aux.extend_from_slice(&val.to_le_bytes());
-        let result = find_float_tag(&aux, b"XF").unwrap();
+        let result = find_float_tag(&aux, b"XF").expect("XF float tag should be found");
         assert!((result - val).abs() < 0.001);
     }
 
@@ -1542,7 +1542,8 @@ mod tests {
         append_string_tag(&mut rec, b"MI", b"12345");
         assert_eq!(rec.len(), orig_len + 2 + 1 + 5 + 1); // tag(2) + type(1) + value(5) + NUL(1)
         // Verify we can find it back
-        let aux_start = aux_data_offset_from_record(&rec).unwrap();
+        let aux_start = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         assert_eq!(find_string_tag(&rec[aux_start..], b"MI"), Some(b"12345".as_ref()));
     }
 
@@ -1577,7 +1578,8 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
         remove_tag(&mut rec, b"BB");
         // AA and CC should still be findable
-        let aux_start = aux_data_offset_from_record(&rec).unwrap();
+        let aux_start = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         assert_eq!(find_uint8_tag(&rec[aux_start..], b"AA"), Some(1));
         assert_eq!(find_uint8_tag(&rec[aux_start..], b"CC"), Some(2));
         assert!(find_string_tag(&rec[aux_start..], b"BB").is_none());
@@ -1650,7 +1652,8 @@ mod tests {
         aux.extend_from_slice(&[b'C', b'C', b'C', 2]); // CC:C:2
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
         update_string_tag(&mut rec, b"RX", b"newval");
-        let aux_start = aux_data_offset_from_record(&rec).unwrap();
+        let aux_start = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         assert_eq!(find_uint8_tag(&rec[aux_start..], b"AA"), Some(1));
         assert_eq!(find_string_tag(&rec[aux_start..], b"RX"), Some(b"newval".as_ref()));
         assert_eq!(find_uint8_tag(&rec[aux_start..], b"CC"), Some(2));
@@ -1791,7 +1794,7 @@ mod tests {
     #[test]
     fn test_find_array_tag_int_array() {
         let aux = make_b_int_array_tag(*b"cd", &[10, 20, 30]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(tag_ref.elem_type, b'i');
         assert_eq!(tag_ref.count, 3);
         assert_eq!(tag_ref.elem_size, 4);
@@ -1801,7 +1804,7 @@ mod tests {
     #[test]
     fn test_find_array_tag_uint8_array() {
         let aux = make_b_uint8_array_tag(*b"XC", &[1, 2, 3, 4]);
-        let tag_ref = find_array_tag(&aux, b"XC").unwrap();
+        let tag_ref = find_array_tag(&aux, b"XC").expect("XC array tag should be found");
         assert_eq!(tag_ref.elem_type, b'C');
         assert_eq!(tag_ref.count, 4);
         assert_eq!(tag_ref.elem_size, 1);
@@ -1825,7 +1828,7 @@ mod tests {
         let mut aux = Vec::new();
         aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
         aux.extend_from_slice(&make_b_int16_array_tag(*b"cd", &[10, 20]));
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(tag_ref.elem_type, b's');
         assert_eq!(tag_ref.count, 2);
     }
@@ -1837,7 +1840,7 @@ mod tests {
     #[test]
     fn test_array_tag_element_u16_uint8() {
         let aux = make_b_uint8_array_tag(*b"cd", &[10, 200, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 10);
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 200);
         assert_eq!(array_tag_element_u16(&tag_ref, 2), 0);
@@ -1846,7 +1849,7 @@ mod tests {
     #[test]
     fn test_array_tag_element_u16_uint16() {
         let aux = make_b_uint16_array_tag(*b"cd", &[100, 60000, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 100);
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 60000);
         assert_eq!(array_tag_element_u16(&tag_ref, 2), 0);
@@ -1855,7 +1858,7 @@ mod tests {
     #[test]
     fn test_array_tag_element_u16_int16_clamped() {
         let aux = make_b_int16_array_tag(*b"cd", &[-5, 100, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         // Negative values clamped to 0
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 0);
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 100);
@@ -1864,7 +1867,7 @@ mod tests {
     #[test]
     fn test_array_tag_element_u16_int8_clamped() {
         let aux = make_b_int8_array_tag(*b"cd", &[-1, 42, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 0); // clamped
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 42);
     }
@@ -1872,7 +1875,7 @@ mod tests {
     #[test]
     fn test_array_tag_element_u16_out_of_bounds() {
         let aux = make_b_uint8_array_tag(*b"cd", &[10]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 0); // out of bounds
     }
 
@@ -1880,7 +1883,7 @@ mod tests {
     fn test_array_tag_element_u16_unsupported_type() {
         // i32 array: not directly supported by array_tag_element_u16
         let aux = make_b_int_array_tag(*b"cd", &[42]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 0); // unsupported returns 0
     }
 
@@ -1891,7 +1894,7 @@ mod tests {
     #[test]
     fn test_array_tag_to_vec_u16() {
         let aux = make_b_uint8_array_tag(*b"cd", &[10, 20, 30]);
-        let tag_ref = find_array_tag(&aux, b"cd").unwrap();
+        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
         assert_eq!(array_tag_to_vec_u16(&tag_ref), vec![10u16, 20, 30]);
     }
 
@@ -1938,9 +1941,11 @@ mod tests {
         let mut aux = Vec::new();
         aux.extend_from_slice(&make_b_int16_array_tag(*b"cd", &[10, 20, 30]));
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
-        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd").unwrap();
+        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd")
+            .expect("cd array tag should be found in record");
         let values: Vec<i16> = (0..tag_ref.count)
             .map(|i| {
                 let off = i * tag_ref.elem_size;
@@ -1955,16 +1960,19 @@ mod tests {
         let mut aux = Vec::new();
         aux.extend_from_slice(&make_b_uint8_array_tag(*b"cd", &[1, 2, 3, 4]));
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
-        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd").unwrap();
+        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd")
+            .expect("cd array tag should be found in record");
         assert_eq!(tag_ref.data, &[4, 3, 2, 1]);
     }
 
     #[test]
     fn test_reverse_array_tag_in_place_not_found() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         // Should be a no-op
         reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
     }
@@ -1985,7 +1993,8 @@ mod tests {
     fn test_reverse_string_tag_in_place() {
         let aux = b"RXZhello\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
         assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"olleh".as_ref()));
     }
@@ -1994,7 +2003,8 @@ mod tests {
     fn test_reverse_string_tag_in_place_single_char() {
         let aux = b"RXZa\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
         assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"a".as_ref()));
     }
@@ -2002,7 +2012,8 @@ mod tests {
     #[test]
     fn test_reverse_string_tag_in_place_not_found() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         // No-op
         reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
     }
@@ -2022,7 +2033,8 @@ mod tests {
     fn test_reverse_complement_string_tag_in_place() {
         let aux = b"RXZACGT\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
         assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACGT".as_ref()));
     }
@@ -2031,7 +2043,8 @@ mod tests {
     fn test_reverse_complement_string_tag_in_place_lowercase() {
         let aux = b"RXZacgt\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
         // lowercase a->T, c->G, g->C, t->A, reversed: ACGT
         assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACGT".as_ref()));
@@ -2041,7 +2054,8 @@ mod tests {
     fn test_reverse_complement_string_tag_in_place_with_n() {
         let aux = b"RXZANGT\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
         // ANGT -> reverse TGNA -> complement ACNT
         assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACNT".as_ref()));
@@ -2050,7 +2064,8 @@ mod tests {
     #[test]
     fn test_reverse_complement_string_tag_in_place_not_found() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        let aux_offset = aux_data_offset_from_record(&rec).unwrap();
+        let aux_offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
     }
 

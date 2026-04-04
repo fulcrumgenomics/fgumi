@@ -1431,7 +1431,8 @@ impl CodecConsensusCaller {
         let mut header = noodles::sam::Header::default();
         // Add reference sequences so records with reference_sequence_id encode correctly
         for name in &["chr1", "chr2", "chr3"] {
-            let rs = Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).unwrap());
+            let rs =
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero"));
             header.reference_sequences_mut().insert(bstr::BString::from(*name), rs);
         }
 
@@ -1599,7 +1600,8 @@ mod tests {
         let options = CodecConsensusOptions::default();
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let output = caller.consensus_reads_from_sam_records(Vec::new()).unwrap();
+        let output =
+            caller.consensus_reads_from_sam_records(Vec::new()).expect("failed to get output");
         assert_eq!(output.count, 0);
         assert_eq!(caller.stats.total_input_reads, 0);
     }
@@ -1927,7 +1929,7 @@ mod tests {
         for read in &filtered {
             let cigar = read.cigar();
             assert_eq!(cigar.as_ref().len(), 3, "Expected 3-op cigar (3M1D1M)");
-            let ops: Vec<_> = cigar.iter().map(|r| r.unwrap()).collect();
+            let ops: Vec<_> = cigar.iter().map(|r| r.expect("failed to get ops")).collect();
             assert_eq!(ops[0].kind(), Kind::Match);
             assert_eq!(ops[0].len(), 3);
             assert_eq!(ops[1].kind(), Kind::Deletion);
@@ -2021,7 +2023,7 @@ mod tests {
         // Without reversal, Group B would win
         for read in &filtered {
             let cigar = read.cigar();
-            let ops: Vec<_> = cigar.iter().map(|r| r.unwrap()).collect();
+            let ops: Vec<_> = cigar.iter().map(|r| r.expect("failed to get ops")).collect();
             assert_eq!(ops.len(), 3, "Expected 3-op cigar");
             // The original CIGAR should be 3M1I2M (Group A)
             assert_eq!(ops[0].kind(), Kind::Match);
@@ -2240,7 +2242,9 @@ mod tests {
             true,  // R2 reverse
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
@@ -2283,7 +2287,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
@@ -2319,7 +2325,9 @@ mod tests {
             false, // R2 forward
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0, "Should not emit consensus for RF pair");
     }
@@ -2350,7 +2358,9 @@ mod tests {
             true,
         );
 
-        let output = caller2.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller2
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0, "Should not emit consensus with insufficient reads");
 
@@ -2377,7 +2387,9 @@ mod tests {
             true,
         );
 
-        let output = caller1.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller1
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 1, "Should emit consensus with minReadsPerStrand=1");
     }
@@ -2409,7 +2421,9 @@ mod tests {
             true,
         );
 
-        let output = caller20.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller20
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
         assert_eq!(
             output.count, 1,
             "Should emit consensus with minDuplexLength=20 and 20bp overlap"
@@ -2438,7 +2452,9 @@ mod tests {
             true,
         );
 
-        let output = caller21.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller21
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
         assert_eq!(
             output.count, 0,
             "Should not emit consensus with minDuplexLength=21 and 20bp overlap"
@@ -2474,7 +2490,9 @@ mod tests {
         let r2 = &mut reads[1];
         *r2.flags_mut() = r2.flags() | Flags::UNMAPPED;
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0, "Should not emit consensus when mate is unmapped");
     }
@@ -2511,7 +2529,9 @@ mod tests {
             true,  // R2 reverse
         );
 
-        let output_fwd = caller_fwd.consensus_reads_from_sam_records(reads_fwd).unwrap();
+        let output_fwd = caller_fwd
+            .consensus_reads_from_sam_records(reads_fwd)
+            .expect("consensus_reads_from_sam_records should succeed");
         assert_eq!(output_fwd.count, 1, "Should produce one consensus read");
 
         let records_fwd = ParsedBamRecord::parse_all(&output_fwd.data);
@@ -2559,7 +2579,9 @@ mod tests {
             true,
         );
 
-        let output = caller_permissive.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller_permissive
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
         assert_eq!(output.count, 1, "Should emit consensus with permissive settings");
 
         // Now test with strict disagreement limits - should fail because
@@ -2624,7 +2646,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
@@ -2668,7 +2692,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
@@ -2712,7 +2738,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         // Should produce consensus
         assert_eq!(output.count, 1, "Should produce one consensus read");
@@ -2754,7 +2782,9 @@ mod tests {
         // Update mate's reference for consistency
         *reads[1].mate_reference_sequence_id_mut() = Some(2);
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         // Should not emit consensus for chimeric pairs
         assert_eq!(
@@ -2792,7 +2822,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         // fgbio rejects this because R1's end lands in an indel in R2
         // fgumi now implements this check and should also reject
@@ -2831,7 +2863,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
@@ -2883,7 +2917,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 1, "Should produce one consensus read");
 
@@ -3843,7 +3879,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0);
         assert!(
@@ -3880,7 +3918,9 @@ mod tests {
             true,
         );
 
-        let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+        let output = caller
+            .consensus_reads_from_sam_records(reads)
+            .expect("consensus_reads_from_sam_records should succeed");
 
         assert_eq!(output.count, 0);
         // Rejected reads should be tracked

@@ -1292,8 +1292,7 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         }
         let tag_key = [tag_bytes[0], tag_bytes[1]];
 
-        // Safe to unwrap: records.is_empty() is checked above
-        let first_raw = records.first().unwrap();
+        let first_raw = records.first().expect("records is non-empty (checked above)");
         let read_name_bytes = bam_fields::read_name(first_raw);
         let read_name = String::from_utf8_lossy(read_name_bytes);
 
@@ -1381,7 +1380,8 @@ mod tests {
     fn encode_to_raw(rec: &RecordBuf) -> Vec<u8> {
         let header = test_header();
         let mut buf = Vec::new();
-        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec).unwrap();
+        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
+            .expect("encode_record_buf should succeed");
         buf
     }
 
@@ -1582,7 +1582,8 @@ mod tests {
         let read2 = create_test_read("r2", b"ACGT", b"####", false, false);
         let read3 = create_test_read("r3", b"ACGT", b"####", false, false);
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -1592,7 +1593,7 @@ mod tests {
         assert_eq!(consensus.bases, b"ACGT");
 
         // Check tags
-        assert_eq!(consensus.get_int_tag(b"cD").unwrap(), 3);
+        assert_eq!(consensus.get_int_tag(b"cD").expect("get_int_tag should succeed"), 3);
     }
 
     #[test]
@@ -1604,7 +1605,8 @@ mod tests {
         let read1 = create_test_read("r1", b"ACGT", b"####", false, false);
         let read2 = create_test_read("r2", b"ACGT", b"####", false, false);
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 0);
     }
@@ -1893,7 +1895,8 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -1928,7 +1931,8 @@ mod tests {
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
         let read3 = create_consensus_test_read("r3", b"GATTTCA", &quals, "UMI1"); // T instead of A at pos 4
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -1966,7 +1970,8 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals7, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTAC", &quals6, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2000,7 +2005,8 @@ mod tests {
         let read1 = create_consensus_test_read("r1", &[b'A'; 10], &quals10, "UMI1");
         let read2 = create_consensus_test_read("r2", &[b'A'; 20], &quals20, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2034,7 +2040,8 @@ mod tests {
         let quals: Vec<u8> = vec![10, 10, 10, 10, 10, 10, 5];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2065,7 +2072,8 @@ mod tests {
         let quals = vec![10u8; 7];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2099,7 +2107,8 @@ mod tests {
         let quals = vec![10u8; 7];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2131,7 +2140,8 @@ mod tests {
         let quals = vec![10u8; 7];
         let read = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2165,7 +2175,8 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals_low, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals_high, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2204,8 +2215,8 @@ mod tests {
         bases4[5] = b'C';
         let read4 = create_consensus_test_read("r4", &bases4, &quals, "UMI1");
 
-        let output =
-            consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2215,13 +2226,21 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'A'; 10]);
 
         // cD (max depth) should be 4
-        assert_eq!(consensus.get_int_tag(b"cD").unwrap(), 4, "cD should be 4");
+        assert_eq!(
+            consensus.get_int_tag(b"cD").expect("get_int_tag should succeed"),
+            4,
+            "cD should be 4"
+        );
 
         // cM (min depth) should be 4
-        assert_eq!(consensus.get_int_tag(b"cM").unwrap(), 4, "cM should be 4");
+        assert_eq!(
+            consensus.get_int_tag(b"cM").expect("get_int_tag should succeed"),
+            4,
+            "cM should be 4"
+        );
 
         // cE (error rate) should be 1/40 = 0.025 (1 error in 40 bases)
-        let error_rate = consensus.get_float_tag(b"cE").unwrap();
+        let error_rate = consensus.get_float_tag(b"cE").expect("get_float_tag should succeed");
         assert!((error_rate - 0.025).abs() < 0.01, "cE should be ~0.025, got {error_rate}");
 
         // Check per-base depth tag (cd)
@@ -2272,8 +2291,8 @@ mod tests {
         let read3 = create_consensus_test_read("r3", b"GATGACAG", &quals, "UMI1"); // G at pos 3
         let read4 = create_consensus_test_read("r4", b"GATTACAG", &quals, "UMI1"); // T at pos 3
 
-        let output =
-            consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2320,8 +2339,8 @@ mod tests {
         let read3 = create_consensus_test_read("r3", b"GATTACA", &quals_low, "UMI1");
         let read4 = create_consensus_test_read("r4", b"CTAATGT", &quals_high, "UMI1");
 
-        let output =
-            consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3, read4])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2361,7 +2380,8 @@ mod tests {
         let read1 = create_consensus_test_read("r1", &[b'A'; 10], &quals, "UMI1");
         let read2 = create_consensus_test_read("r2", &[b'A'; 10], &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -2403,7 +2423,7 @@ mod tests {
             if c.is_ascii_digit() {
                 num_str.push(c);
             } else {
-                let len: usize = num_str.parse().unwrap();
+                let len: usize = num_str.parse().expect("failed to parse value");
                 num_str.clear();
 
                 let kind = match c {
@@ -2648,7 +2668,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         // fgbio expected: baseString="NANANANANA", quals=[2,30,2,21,2,20,2,30,2,30]
         assert_eq!(
             sr.bases, b"NANANANANA",
@@ -2684,7 +2704,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         // fgbio expected: baseString="AAAAAA", quals=[30,30,30,30,30,30]
         assert_eq!(sr.bases, b"AAAAAA", "Trailing low-quality bases should be trimmed");
         assert_eq!(sr.quals, vec![30, 30, 30, 30, 30, 30], "Qualities should match");
@@ -2713,7 +2733,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         // fgbio expected: baseString="AAAAAA", quals=[30,30,30,30,30,30]
         assert_eq!(sr.bases, b"AAAAAA", "Trailing Ns should be trimmed");
         assert_eq!(sr.quals, vec![30, 30, 30, 30, 30, 30], "Qualities should match");
@@ -2744,7 +2764,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         // After RC: bases become TTTTTTNNNN, then trailing Ns trimmed → TTTTTT
         // fgbio expected: baseString="TTTTTT", quals=[30,30,30,30,30,30], cigar="5M1D1M"
         assert_eq!(sr.bases, b"TTTTTT", "Should be reverse complemented with trailing Ns trimmed");
@@ -2814,7 +2834,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         // fgbio expected: baseString="A"*50, cigar="50M"
         assert_eq!(sr.bases.len(), 50, "Should not be trimmed for non-FR pair");
     }
@@ -2851,7 +2871,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         // fgbio expected: baseString="A"*100, cigar="40M20I40M"
         assert_eq!(sr.bases.len(), 100, "Should not be trimmed when insertions are present");
     }
@@ -2892,7 +2912,7 @@ mod tests {
 
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some());
-        assert_eq!(source.unwrap().bases.len(), 50);
+        assert_eq!(source.expect("source should be Some/Ok").bases.len(), 50);
     }
 
     /// Test mate overlap trimming when read actually extends past mate
@@ -2931,7 +2951,7 @@ mod tests {
 
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some());
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
         assert_eq!(sr.bases.len(), 30, "Should be trimmed to 30 bases");
     }
 
@@ -3044,7 +3064,7 @@ mod tests {
 
         let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
-        let sr1 = source_r1.unwrap();
+        let sr1 = source_r1.expect("failed to get sr1");
 
         // fgbio expected: "A"*10 + "C"*30 (last 10 G's trimmed)
         assert_eq!(sr1.bases.len(), 40, "R1 should be trimmed to 40 bases");
@@ -3076,7 +3096,7 @@ mod tests {
 
         let source_r2 = caller.create_source_read(&encode_to_raw(&r2), 0, clip_r2);
         assert!(source_r2.is_some(), "R2 should produce SourceRead");
-        let sr2 = source_r2.unwrap();
+        let sr2 = source_r2.expect("failed to get sr2");
 
         // After RC: GGGGGGGGGCCCCC...CCCCCCAAAAAAAAA → reversed
         // Then first 10 bases clipped
@@ -3117,7 +3137,7 @@ mod tests {
 
         let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
-        let sr1 = source_r1.unwrap();
+        let sr1 = source_r1.expect("failed to get sr1");
 
         // fgbio expected: all 142 bases remain (reverse complemented to T's)
         // CIGAR reversed: 23S72M47S
@@ -3158,7 +3178,7 @@ mod tests {
 
         let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
-        let sr1 = source_r1.unwrap();
+        let sr1 = source_r1.expect("failed to get sr1");
 
         // fgbio expected: all 142 bases remain
         assert_eq!(sr1.bases.len(), 142, "R1 should not be trimmed for +/- pair");
@@ -3204,7 +3224,7 @@ mod tests {
 
         let source_r1 = caller.create_source_read(&encode_to_raw(&r1), 0, clip_r1);
         assert!(source_r1.is_some(), "R1 should produce SourceRead");
-        let sr1 = source_r1.unwrap();
+        let sr1 = source_r1.expect("failed to get sr1");
 
         // fgbio expected: all 50 bases minus 2 at end = 48 bases
         // Actually fgbio says "A"*2 + "C"*46 which is all 50 bases
@@ -3256,7 +3276,8 @@ mod tests {
         let read1 = create_consensus_test_read("r1", b"GATTACA", &quals, "UMI1");
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -3300,7 +3321,8 @@ mod tests {
         let read2 = create_consensus_test_read("r2", b"GATTACA", &quals, "UMI1");
         let read3 = create_consensus_test_read("r3", b"GATTTCA", &quals, "UMI1"); // disagreement at pos 4
 
-        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3])
+            .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 1);
         let records = ParsedBamRecord::parse_all(&output.data);
@@ -3675,7 +3697,7 @@ mod tests {
             .set_sequence(Sequence::from(bases.to_vec()))
             .set_quality_scores(QualityScores::from(quals))
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_alignment_start(Position::try_from(1).expect("failed to set alignment_start"))
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, bases.len())]))
             .set_flags(NoodlesFlags::empty())
             .build();
@@ -3696,7 +3718,7 @@ mod tests {
         let source = caller.to_source_read_from_record(&rec, 0); // 0 is original_idx
 
         assert!(source.is_some(), "Should produce a source read");
-        let sr = source.unwrap();
+        let sr = source.expect("failed to get sr");
 
         // After quality trimming (phred-style), should be trimmed to first 3 bases
         assert_eq!(sr.bases.len(), 3, "Should be trimmed to 3 bases");
@@ -3719,7 +3741,7 @@ mod tests {
             .set_sequence(Sequence::from(bases.to_vec()))
             // Note: NOT setting quality_scores leaves them empty/missing
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_alignment_start(Position::try_from(1).expect("failed to set alignment_start"))
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, bases.len())]))
             .set_flags(NoodlesFlags::empty())
             .build();
@@ -3811,7 +3833,7 @@ mod tests {
             .set_sequence(Sequence::from(bases.clone()))
             .set_quality_scores(QualityScores::from(quals.clone()))
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_alignment_start(Position::try_from(1).expect("failed to set alignment_start"))
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 10)]))
             .set_flags(NoodlesFlags::empty())
             .build();
@@ -3824,7 +3846,7 @@ mod tests {
             .set_sequence(Sequence::from(bases.clone()))
             .set_quality_scores(QualityScores::from(quals.clone()))
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_alignment_start(Position::try_from(1).expect("failed to set alignment_start"))
             .set_cigar(Cigar::from(vec![
                 Op::new(Kind::Match, 5),
                 Op::new(Kind::Deletion, 5),
@@ -3841,7 +3863,7 @@ mod tests {
             .set_sequence(Sequence::from(bases.clone()))
             .set_quality_scores(QualityScores::from(quals.clone()))
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_alignment_start(Position::try_from(1).expect("failed to set alignment_start"))
             .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 10)]))
             .set_flags(NoodlesFlags::empty())
             .build();
@@ -3854,7 +3876,7 @@ mod tests {
             .set_sequence(Sequence::from(bases.clone()))
             .set_quality_scores(QualityScores::from(quals.clone()))
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_alignment_start(Position::try_from(1).expect("failed to set alignment_start"))
             .set_cigar(Cigar::from(vec![
                 Op::new(Kind::Match, 4),
                 Op::new(Kind::Insertion, 2),
@@ -4031,11 +4053,13 @@ mod tests {
             VanillaUmiConsensusCaller::new("test".to_string(), "A".to_string(), options);
 
         // Process first UMI group (2 reads -> 2 consensus reads: R1 and R2)
-        let output1 = consensus_reads_from_records(&mut caller, vec![r1_umi1, r2_umi1]).unwrap();
+        let output1 = consensus_reads_from_records(&mut caller, vec![r1_umi1, r2_umi1])
+            .expect("consensus_reads_from_records should succeed");
         assert_eq!(output1.count, 2, "Should produce 2 consensus reads (R1 and R2)");
 
         // Process second UMI group (2 reads -> 2 consensus reads: R1 and R2)
-        let output2 = consensus_reads_from_records(&mut caller, vec![r1_umi2, r2_umi2]).unwrap();
+        let output2 = consensus_reads_from_records(&mut caller, vec![r1_umi2, r2_umi2])
+            .expect("consensus_reads_from_records should succeed");
         assert_eq!(output2.count, 2, "Should produce 2 consensus reads (R1 and R2)");
 
         // Check statistics
@@ -4162,7 +4186,7 @@ mod tests {
 
         let output =
             consensus_reads_from_records(&mut caller, vec![r1_a, r1_b, r1_c, r2_a, r2_b, r2_c])
-                .unwrap();
+                .expect("consensus_reads_from_records should succeed");
 
         // No consensus should be produced (R1 built one but it's orphaned)
         assert_eq!(output.count, 0, "Orphan R1 consensus should be discarded");
@@ -4308,7 +4332,7 @@ mod tests {
 
         let output =
             consensus_reads_from_records(&mut caller, vec![r1_a, r1_b, r1_c, r2_a, r2_b, r2_c])
-                .unwrap();
+                .expect("consensus_reads_from_records should succeed");
 
         assert_eq!(output.count, 0, "Orphan R2 consensus should be discarded");
 

@@ -1274,7 +1274,7 @@ mod tests {
         assert!(config.single_strand_thresholds.is_some());
         assert!(config.duplex_thresholds.is_some());
 
-        let thresh = config.single_strand_thresholds.unwrap();
+        let thresh = config.single_strand_thresholds.expect("failed to get thresh");
         assert_eq!(thresh.min_reads, 3);
         assert!((thresh.max_read_error_rate - 0.1).abs() < f64::EPSILON);
         assert!((thresh.max_base_error_rate - 0.2).abs() < f64::EPSILON);
@@ -1291,11 +1291,11 @@ mod tests {
         assert!(config.ba_thresholds.is_some());
         assert!(config.single_strand_thresholds.is_some());
 
-        let duplex = config.duplex_thresholds.unwrap();
+        let duplex = config.duplex_thresholds.expect("failed to get duplex");
         assert_eq!(duplex.min_reads, 5);
         assert!((duplex.max_read_error_rate - 0.05).abs() < f64::EPSILON);
 
-        let ab = config.ab_thresholds.unwrap();
+        let ab = config.ab_thresholds.expect("failed to get ab");
         assert_eq!(ab.min_reads, 3);
         assert!((ab.max_read_error_rate - 0.1).abs() < f64::EPSILON);
     }
@@ -1313,9 +1313,9 @@ mod tests {
             0.1,
         );
 
-        let cc = config.duplex_thresholds.unwrap();
-        let ab = config.ab_thresholds.unwrap();
-        let ba = config.ba_thresholds.unwrap();
+        let cc = config.duplex_thresholds.expect("failed to get cc");
+        let ab = config.ab_thresholds.expect("failed to get ab");
+        let ba = config.ba_thresholds.expect("failed to get ba");
 
         assert_eq!(cc.min_reads, 10);
         assert_eq!(ab.min_reads, 5);
@@ -1332,7 +1332,7 @@ mod tests {
         let config = FilterConfig::for_single_strand(thresholds.clone(), Some(13), None, 0.1);
 
         // All threshold types should use the same values
-        let ss = config.single_strand_thresholds.unwrap();
+        let ss = config.single_strand_thresholds.expect("failed to get ss");
         assert_eq!(ss.min_reads, 3);
         assert!((ss.max_read_error_rate - 0.1).abs() < f64::EPSILON);
         assert!((ss.max_base_error_rate - 0.2).abs() < f64::EPSILON);
@@ -1353,9 +1353,9 @@ mod tests {
         let config =
             FilterConfig::for_duplex(duplex_thresholds, strand_thresholds, Some(13), None, 0.1);
 
-        let cc = config.duplex_thresholds.unwrap();
-        let ab = config.ab_thresholds.unwrap();
-        let ba = config.ba_thresholds.unwrap();
+        let cc = config.duplex_thresholds.expect("failed to get cc");
+        let ab = config.ab_thresholds.expect("failed to get ab");
+        let ba = config.ba_thresholds.expect("failed to get ba");
 
         assert_eq!(cc.min_reads, 10);
         assert_eq!(ab.min_reads, 5);
@@ -1377,9 +1377,9 @@ mod tests {
         let config =
             FilterConfig::for_duplex_asymmetric(duplex, ab, ba, Some(13), Some(20.0), 0.15);
 
-        let cc = config.duplex_thresholds.unwrap();
-        let ab_t = config.ab_thresholds.unwrap();
-        let ba_t = config.ba_thresholds.unwrap();
+        let cc = config.duplex_thresholds.expect("failed to get cc");
+        let ab_t = config.ab_thresholds.expect("failed to get ab_t");
+        let ba_t = config.ba_thresholds.expect("failed to get ba_t");
 
         assert_eq!(cc.min_reads, 10);
         assert_eq!(ab_t.min_reads, 5);
@@ -1516,7 +1516,7 @@ mod tests {
         let tag = Tag::from([b'c', b'D']);
         record.data_mut().insert(tag, Value::UInt8(5));
 
-        let result = filter_read(&record, &thresholds).unwrap();
+        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::Pass);
     }
 
@@ -1531,7 +1531,7 @@ mod tests {
         let tag = Tag::from([b'c', b'D']);
         record.data_mut().insert(tag, Value::UInt8(5));
 
-        let result = filter_read(&record, &thresholds).unwrap();
+        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::InsufficientReads);
     }
 
@@ -1627,8 +1627,8 @@ mod tests {
         let ba_thresholds =
             FilterThresholds { min_reads: 2, max_read_error_rate: 0.15, max_base_error_rate: 0.25 };
 
-        let result =
-            filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds).unwrap();
+        let result = filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds)
+            .expect("filter_duplex_read should succeed");
         assert_eq!(result, FilterResult::Pass);
     }
 
@@ -1653,8 +1653,8 @@ mod tests {
         let ba_thresholds =
             FilterThresholds { min_reads: 2, max_read_error_rate: 0.15, max_base_error_rate: 0.25 };
 
-        let result =
-            filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds).unwrap();
+        let result = filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds)
+            .expect("filter_duplex_read should succeed");
         assert_eq!(result, FilterResult::InsufficientReads);
     }
 
@@ -1679,8 +1679,8 @@ mod tests {
         let ba_thresholds =
             FilterThresholds { min_reads: 2, max_read_error_rate: 0.15, max_base_error_rate: 0.25 };
 
-        let result =
-            filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds).unwrap();
+        let result = filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds)
+            .expect("filter_duplex_read should succeed");
         assert_eq!(result, FilterResult::InsufficientReads);
     }
 
@@ -1705,8 +1705,8 @@ mod tests {
         let ba_thresholds =
             FilterThresholds { min_reads: 2, max_read_error_rate: 0.15, max_base_error_rate: 0.25 };
 
-        let result =
-            filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds).unwrap();
+        let result = filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds)
+            .expect("filter_duplex_read should succeed");
         // Should fail on consensus check, not get to AB/BA checks
         assert_eq!(result, FilterResult::InsufficientReads);
     }
@@ -1730,8 +1730,8 @@ mod tests {
         let ba_thresholds =
             FilterThresholds { min_reads: 2, max_read_error_rate: 0.15, max_base_error_rate: 0.25 };
 
-        let result =
-            filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds).unwrap();
+        let result = filter_duplex_read(&record, &cc_thresholds, &ab_thresholds, &ba_thresholds)
+            .expect("filter_duplex_read should succeed");
         // Should fail because BA has 0 reads (< ba_min_reads = 2)
         assert_eq!(result, FilterResult::InsufficientReads);
     }
@@ -1808,7 +1808,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // All bases should pass - no Ns
         let seq = record.sequence();
@@ -1842,7 +1842,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Position 2 should be masked
         let seq = record.sequence();
@@ -1876,7 +1876,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Positions 3,4 should be masked
         let seq = record.sequence();
@@ -1911,7 +1911,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Position 5 should be masked
         let seq = record.sequence();
@@ -1946,7 +1946,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Positions 6,7 should be masked
         let seq = record.sequence();
@@ -1987,7 +1987,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Position 1 should be masked
         let seq = record.sequence();
@@ -2028,7 +2028,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Position 0 should be masked
         let seq = record.sequence();
@@ -2077,7 +2077,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Positions 0,1,2 should be masked
         let seq = record.sequence();
@@ -2119,7 +2119,7 @@ mod tests {
             Some(13),
             true,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // All bases agree - no masking
         let seq = record.sequence();
@@ -2159,7 +2159,7 @@ mod tests {
             Some(13),
             true,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Positions 2,5,7 should be masked due to disagreement
         let seq = record.sequence();
@@ -2200,7 +2200,7 @@ mod tests {
             Some(13),
             false,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // No masking due to disagreement when disabled
         let seq = record.sequence();
@@ -2248,7 +2248,7 @@ mod tests {
             Some(13),
             true,
         )
-        .unwrap();
+        .expect("mask_duplex_bases should succeed");
 
         // Positions 0 (depth), 3 (disagreement), 5 (disagreement) should be masked
         let seq = record.sequence();
@@ -2285,7 +2285,7 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 1.0, max_base_error_rate: 1.0 };
 
-        mask_bases(&mut record, &thresholds, Some(10)).unwrap();
+        mask_bases(&mut record, &thresholds, Some(10)).expect("mask_bases should succeed");
 
         // Positions 0 and 2 should be masked to N with quality=2
         let seq: Vec<u8> = record.sequence().iter().collect();

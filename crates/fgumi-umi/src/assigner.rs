@@ -696,8 +696,12 @@ pub fn matches_within_threshold(a: &str, b: &str, max_mismatches: usize) -> bool
     for i in 0..chunks {
         let offset = i * 8;
         // Safe: we know offset + 8 <= len because i < chunks = len / 8
-        let a_chunk = u64::from_ne_bytes(a_bytes[offset..offset + 8].try_into().unwrap());
-        let b_chunk = u64::from_ne_bytes(b_bytes[offset..offset + 8].try_into().unwrap());
+        let a_chunk = u64::from_ne_bytes(
+            a_bytes[offset..offset + 8].try_into().expect("slice is exactly 8 bytes"),
+        );
+        let b_chunk = u64::from_ne_bytes(
+            b_bytes[offset..offset + 8].try_into().expect("slice is exactly 8 bytes"),
+        );
         let diff = a_chunk ^ b_chunk;
         if diff != 0 {
             // Count differing bytes in this chunk
@@ -2297,7 +2301,11 @@ mod tests {
         let result = PairedUmiAssigner::split(umi);
         if should_succeed {
             assert!(result.is_ok(), "Failed for: {description}");
-            assert_eq!(result.unwrap(), expected.unwrap(), "Failed for: {description}");
+            assert_eq!(
+                result.expect("split should succeed"),
+                expected.expect("expected value should be Some"),
+                "Failed for: {description}"
+            );
         } else {
             assert!(result.is_err(), "Should have failed for: {description}");
         }
@@ -2311,7 +2319,11 @@ mod tests {
     fn test_paired_reverse(#[case] input: &str, #[case] expected: &str, #[case] description: &str) {
         let result = PairedUmiAssigner::reverse(input);
         assert!(result.is_ok(), "Failed for: {description}");
-        assert_eq!(result.unwrap(), expected, "Failed for: {description}");
+        assert_eq!(
+            result.expect("operation should succeed"),
+            expected,
+            "Failed for: {description}"
+        );
     }
 
     #[rstest]
@@ -2327,7 +2339,11 @@ mod tests {
     ) {
         let result = PairedUmiAssigner::canonicalize_paired(input);
         assert!(result.is_ok(), "Failed for: {description}");
-        assert_eq!(result.unwrap(), expected, "Failed for: {description}");
+        assert_eq!(
+            result.expect("operation should succeed"),
+            expected,
+            "Failed for: {description}"
+        );
     }
 
     #[test]
@@ -2421,7 +2437,9 @@ mod tests {
         let map = build_assignment_map(&umis, &assignments);
 
         // Helper to extract base ID (before /A or /B suffix)
-        let get_base_id = |umi: &str| -> String { map.get(umi).unwrap().base_id_string() };
+        let get_base_id = |umi: &str| -> String {
+            map.get(umi).expect("UMI should have an assignment").base_id_string()
+        };
 
         // All three should have the same base ID
         // Root captures intermediate (1 edit), intermediate captures target (1 edit via backward search)
@@ -2539,25 +2557,25 @@ mod tests {
         /// Property: Paired UMI reverse is reversible
         #[test]
         fn prop_paired_reverse_is_reversible(umi in paired_umi_strategy()) {
-            let reversed = PairedUmiAssigner::reverse(&umi).unwrap();
-            let double_reversed = PairedUmiAssigner::reverse(&reversed).unwrap();
+            let reversed = PairedUmiAssigner::reverse(&umi).expect("reversing paired UMI should succeed");
+            let double_reversed = PairedUmiAssigner::reverse(&reversed).expect("reversing reversed UMI should succeed");
             assert_eq!(umi, double_reversed, "Reversing twice should return original");
         }
 
         /// Property: Paired UMI canonicalize is idempotent
         #[test]
         fn prop_paired_canonicalize_is_idempotent(umi in paired_umi_strategy()) {
-            let canonical1 = PairedUmiAssigner::canonicalize_paired(&umi).unwrap();
-            let canonical2 = PairedUmiAssigner::canonicalize_paired(&canonical1).unwrap();
+            let canonical1 = PairedUmiAssigner::canonicalize_paired(&umi).expect("canonicalizing UMI should succeed");
+            let canonical2 = PairedUmiAssigner::canonicalize_paired(&canonical1).expect("re-canonicalizing UMI should be idempotent");
             assert_eq!(canonical1, canonical2, "Canonicalizing twice should give same result");
         }
 
         /// Property: Paired UMI and its reverse have same canonical form
         #[test]
         fn prop_paired_canonicalize_matches_reverse(umi in paired_umi_strategy()) {
-            let reversed = PairedUmiAssigner::reverse(&umi).unwrap();
-            let canonical_forward = PairedUmiAssigner::canonicalize_paired(&umi).unwrap();
-            let canonical_reverse = PairedUmiAssigner::canonicalize_paired(&reversed).unwrap();
+            let reversed = PairedUmiAssigner::reverse(&umi).expect("reversing paired UMI should succeed");
+            let canonical_forward = PairedUmiAssigner::canonicalize_paired(&umi).expect("canonicalizing forward UMI should succeed");
+            let canonical_reverse = PairedUmiAssigner::canonicalize_paired(&reversed).expect("canonicalizing reversed UMI should succeed");
             assert_eq!(
                 canonical_forward,
                 canonical_reverse,

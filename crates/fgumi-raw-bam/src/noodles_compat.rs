@@ -221,7 +221,8 @@ mod tests {
         builder.append_string_tag(b"MI", b"1");
         let raw = builder.as_bytes().to_vec();
 
-        let bufs = raw_records_to_record_bufs(&[raw]).unwrap();
+        let bufs = raw_records_to_record_bufs(&[raw])
+            .expect("converting single raw record to RecordBuf should succeed");
         assert_eq!(bufs.len(), 1);
         assert_eq!(bufs[0].name().map(std::convert::AsRef::as_ref), Some(b"read1".as_ref()));
     }
@@ -236,7 +237,8 @@ mod tests {
             records.push(builder.as_bytes().to_vec());
         }
 
-        let bufs = raw_records_to_record_bufs(&records).unwrap();
+        let bufs = raw_records_to_record_bufs(&records)
+            .expect("converting multiple raw records to RecordBufs should succeed");
         assert_eq!(bufs.len(), 3);
         for (i, buf) in bufs.iter().enumerate() {
             let expected = format!("read{i}");
@@ -246,7 +248,8 @@ mod tests {
 
     #[test]
     fn test_raw_records_to_record_bufs_empty() {
-        let bufs = raw_records_to_record_bufs(&[]).unwrap();
+        let bufs =
+            raw_records_to_record_bufs(&[]).expect("converting empty record list should succeed");
         assert!(bufs.is_empty());
     }
 }

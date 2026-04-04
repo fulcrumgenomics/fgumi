@@ -72,9 +72,15 @@ impl MoleculeId {
         buf.clear();
         match self {
             MoleculeId::None => {}
-            MoleculeId::Single(id) => write!(buf, "{}", base + id).unwrap(),
-            MoleculeId::PairedA(id) => write!(buf, "{}/A", base + id).unwrap(),
-            MoleculeId::PairedB(id) => write!(buf, "{}/B", base + id).unwrap(),
+            MoleculeId::Single(id) => {
+                write!(buf, "{}", base + id).expect("write to String is infallible");
+            }
+            MoleculeId::PairedA(id) => {
+                write!(buf, "{}/A", base + id).expect("write to String is infallible");
+            }
+            MoleculeId::PairedB(id) => {
+                write!(buf, "{}/B", base + id).expect("write to String is infallible");
+            }
         }
         buf.as_bytes()
     }

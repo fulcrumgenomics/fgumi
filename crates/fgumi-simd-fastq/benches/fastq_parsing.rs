@@ -91,7 +91,7 @@ fn bench_find_record_offsets(c: &mut Criterion) {
     // Benchmark with real FASTQ data if available
     let real_fastq_path = "/Volumes/scratch-00001/work/rebgzf_test.fastq";
     if std::path::Path::new(real_fastq_path).exists() {
-        let data = std::fs::read(real_fastq_path).unwrap();
+        let data = std::fs::read(real_fastq_path).expect("failed to read real FASTQ file");
         let data_size = data.len();
         group.throughput(Throughput::Bytes(data_size as u64));
 
@@ -146,7 +146,7 @@ fn bench_record_parsing(c: &mut Criterion) {
                     let reader = SimdFastqReader::new(Cursor::new(data));
                     let mut count = 0;
                     for result in reader {
-                        let rec = result.unwrap();
+                        let rec = result.expect("FASTQ record should parse successfully");
                         std::hint::black_box(&rec.name);
                         std::hint::black_box(&rec.sequence);
                         std::hint::black_box(&rec.quality);
@@ -166,7 +166,7 @@ fn bench_record_parsing(c: &mut Criterion) {
                     let reader = SeqIoReader::new(Cursor::new(data));
                     let mut count = 0;
                     for result in reader.into_records() {
-                        let rec = result.unwrap();
+                        let rec = result.expect("seq_io FASTQ record should parse successfully");
                         // Access fields to prevent dead-code elimination
                         std::hint::black_box(rec.head());
                         std::hint::black_box(rec.seq());

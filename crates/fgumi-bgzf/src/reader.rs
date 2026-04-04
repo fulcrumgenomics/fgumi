@@ -494,13 +494,18 @@ mod tests {
         let mut reader = Cursor::new(data);
         let result = read_raw_block(&mut reader);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid BGZF magic"));
+        assert!(
+            result
+                .expect_err("should fail with invalid BGZF magic")
+                .to_string()
+                .contains("Invalid BGZF magic")
+        );
     }
 
     #[test]
     fn test_read_eof() {
         let mut reader = Cursor::new(Vec::<u8>::new());
-        let result = read_raw_block(&mut reader).unwrap();
+        let result = read_raw_block(&mut reader).expect("reading raw BGZF block should succeed");
         assert!(result.is_none());
     }
 
@@ -508,7 +513,8 @@ mod tests {
     fn test_decompress_eof_block() {
         let block = RawBgzfBlock { data: BGZF_EOF.to_vec() };
         let mut decompressor = Decompressor::new();
-        let result = decompress_block(&block, &mut decompressor).unwrap();
+        let result = decompress_block(&block, &mut decompressor)
+            .expect("decompressing block should succeed");
         assert!(result.is_empty());
     }
 
@@ -517,7 +523,8 @@ mod tests {
         let block = RawBgzfBlock { data: BGZF_EOF.to_vec() };
         let mut decompressor = Decompressor::new();
         let mut output = Vec::new();
-        decompress_block_into(&block, &mut decompressor, &mut output).unwrap();
+        decompress_block_into(&block, &mut decompressor, &mut output)
+            .expect("decompressing block into buffer should succeed");
         assert!(output.is_empty());
     }
 
@@ -528,8 +535,8 @@ mod tests {
 
         let original_data = b"Hello, BGZF world!";
         let mut compressor = InlineBgzfCompressor::new(6);
-        compressor.write_all(original_data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(original_data).expect("writing original data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
         let blocks = compressor.take_blocks();
         assert_eq!(blocks.len(), 1);
 
@@ -538,7 +545,8 @@ mod tests {
 
         // Start with existing data in the buffer
         let mut output = vec![1, 2, 3];
-        decompress_block_into(&block, &mut decompressor, &mut output).unwrap();
+        decompress_block_into(&block, &mut decompressor, &mut output)
+            .expect("decompressing block into buffer should succeed");
 
         // Should have preserved existing data and appended decompressed data
         assert_eq!(&output[0..3], &[1, 2, 3]);
@@ -552,19 +560,21 @@ mod tests {
 
         let original_data = b"Test data for equivalence check";
         let mut compressor = InlineBgzfCompressor::new(6);
-        compressor.write_all(original_data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(original_data).expect("writing original data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
         let blocks = compressor.take_blocks();
 
         let block = RawBgzfBlock { data: blocks[0].data.clone() };
         let mut decompressor = Decompressor::new();
 
         // Decompress using original function
-        let result1 = decompress_block(&block, &mut decompressor).unwrap();
+        let result1 = decompress_block(&block, &mut decompressor)
+            .expect("decompressing block should succeed");
 
         // Decompress using new function
         let mut result2 = Vec::new();
-        decompress_block_into(&block, &mut decompressor, &mut result2).unwrap();
+        decompress_block_into(&block, &mut decompressor, &mut result2)
+            .expect("decompressing block into result2 should succeed");
 
         // Should produce identical results
         assert_eq!(result1, result2);
@@ -578,8 +588,8 @@ mod tests {
 
         let original_data = b"Test data for truncation check";
         let mut compressor = InlineBgzfCompressor::new(6);
-        compressor.write_all(original_data).unwrap();
-        compressor.flush().unwrap();
+        compressor.write_all(original_data).expect("writing original data should succeed");
+        compressor.flush().expect("flushing compressor should succeed");
         let blocks = compressor.take_blocks();
         let block = RawBgzfBlock { data: blocks[0].data.clone() };
 

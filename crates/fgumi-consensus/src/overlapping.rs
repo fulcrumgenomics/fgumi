@@ -937,7 +937,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Check that qualities were summed (30 + 20 = 50)
@@ -955,7 +955,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Check that max quality was used (max(30, 20) = 30)
@@ -973,7 +973,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Check that qualities were unchanged
@@ -991,7 +991,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Higher quality base (A from r1) should be chosen, qual = 30 - 20 = 10
@@ -1011,7 +1011,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both bases should be masked to N with quality 2
@@ -1031,7 +1031,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Only lower quality base (r2) should be masked
@@ -1051,7 +1051,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[30, 30, 30, 30], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Only lower quality base (r1) should be masked
@@ -1069,7 +1069,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[30, 30, 30, 30], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both should be masked when qualities are equal (matches fgbio)
@@ -1089,7 +1089,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[30, 30, 30, 30], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both should be masked when qualities are equal (matches fgbio)
@@ -1110,7 +1110,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 200, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(!result); // No overlap processed
     }
 
@@ -1125,7 +1125,7 @@ mod tests {
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
         *r1.flags_mut() = Flags::UNMAPPED;
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(!result); // Unmapped reads not processed
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[50, 50, 50, 50], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[50, 50, 50, 50], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Quality should be capped at 93 (not 100)
@@ -1158,7 +1158,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // NOTE: The overlap calculation uses alignment_end() which returns the position
@@ -1184,7 +1184,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"TGCA", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // All overlapping bases disagree
@@ -1203,7 +1203,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        caller.call(&mut r1, &mut r2).unwrap();
+        caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(caller.stats().overlapping_bases > 0);
 
         caller.reset_stats();
@@ -1227,7 +1227,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GTAC", &[20, 20, 20, 20], 102, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
 
         // Overlap should be detected at positions 102-103 (2 bases)
         assert!(result);
@@ -1252,7 +1252,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Overlapping bases should be detected (may not be exactly 4 due to boundary handling)
@@ -1288,7 +1288,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACTTGG", &[30, 30, 30, 30, 30, 30], 100, "2M2I2M");
         let mut r2 = create_test_record(b"ACGG", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         // Should process the matching regions
         assert!(result);
     }
@@ -1304,7 +1304,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGG", &[30, 30, 30, 30], 100, "2M2D2M");
         let mut r2 = create_test_record(b"ACTTGG", &[20, 20, 20, 20, 20, 20], 100, "6M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         // Should process overlapping matches
         assert!(result);
     }
@@ -1324,7 +1324,7 @@ mod tests {
         let mut r1 = create_test_record(b"NNACGT", &[2, 2, 30, 30, 30, 30], 100, "2S4M");
         let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
 
         // The merge iteration properly handles this case:
         // R1 iterator yields: (2, 100), (3, 101), (4, 102), (5, 103) - skips soft clips
@@ -1354,7 +1354,7 @@ mod tests {
         let mut r1 = create_test_record(b"NNNACG", &[2, 2, 2, 30, 30, 30], 100, "3S3M");
         let mut r2 = create_test_record(b"NACG", &[2, 20, 20, 20], 100, "1S3M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // R1 yields: (3, 100), (4, 101), (5, 102)
@@ -1376,7 +1376,7 @@ mod tests {
         let mut r1 = create_test_record(b"NACG", &[2, 30, 30, 30], 100, "1S3M");
         let mut r2 = create_test_record(b"NACG", &[2, 20, 20, 20], 100, "1S3M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both have 3 aligned bases at ref 100-102
@@ -1395,7 +1395,7 @@ mod tests {
         let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut r2 = create_test_record(b"GCTA", &[29, 29, 29, 29], 100, "4M");
 
-        let result = caller.call(&mut r1, &mut r2).unwrap();
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Quality difference is 1, but should be at least 2
@@ -1519,7 +1519,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Check that qualities were summed (30 + 20 = 50)
@@ -1538,7 +1538,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Max quality used (max(30, 20) = 30)
@@ -1557,7 +1557,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Qualities unchanged
@@ -1576,7 +1576,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Higher quality base (A from r1) chosen, qual = 30 - 20 = 10
@@ -1599,7 +1599,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Both bases masked to N with quality 2
@@ -1622,7 +1622,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Only lower quality base (r2) masked
@@ -1645,7 +1645,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[30, 30, 30, 30], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Only lower quality base (r1) masked
@@ -1666,7 +1666,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[30, 30, 30, 30], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Both masked when qualities are equal
@@ -1689,7 +1689,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[30, 30, 30, 30], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Both masked when qualities are equal
@@ -1713,7 +1713,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 200, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(!result);
     }
 
@@ -1737,7 +1737,7 @@ mod tests {
         );
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(!result);
     }
 
@@ -1753,7 +1753,7 @@ mod tests {
         let mut r1 = make_raw_bam(b"rea", 0, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
         let mut r2 = make_raw_bam(b"rea", 0, 1, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(!result);
     }
 
@@ -1768,7 +1768,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[50, 50, 50, 50], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[50, 50, 50, 50], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Quality capped at 93
@@ -1786,7 +1786,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         assert!(caller.stats().overlapping_bases > 0);
@@ -1806,7 +1806,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"TGCA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         assert!(caller.stats().overlapping_bases > 0);
@@ -1827,7 +1827,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GTAC", &[20, 20, 20, 20], 102, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
         assert_eq!(caller.stats().overlapping_bases, 2);
         assert_eq!(caller.stats().bases_agreeing, 2); // GT == GT
@@ -1850,7 +1850,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"NNACGT", &[2, 2, 30, 30, 30, 30], 100, &r1_cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &r2_cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
         assert_eq!(caller.stats().overlapping_bases, 4);
         assert_eq!(caller.stats().bases_agreeing, 4); // ACGT == ACGT
@@ -1875,7 +1875,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACTTGG", &[30, 30, 30, 30, 30, 30], 100, &r1_cigar);
         let mut r2 = create_raw_test_record(b"ACGG", &[20, 20, 20, 20], 100, &r2_cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
     }
 
@@ -1892,7 +1892,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGG", &[30, 30, 30, 30], 100, &r1_cigar);
         let mut r2 = create_raw_test_record(b"ACTTGG", &[20, 20, 20, 20, 20, 20], 100, &r2_cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
     }
 
@@ -1907,7 +1907,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[29, 29, 29, 29], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).unwrap();
+        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
         assert!(result);
 
         // Quality difference is 1, but minimum is 2
@@ -1930,13 +1930,13 @@ mod tests {
         // RecordBuf path
         let mut rb_r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut rb_r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-        caller_buf.call(&mut rb_r1, &mut rb_r2).unwrap();
+        caller_buf.call(&mut rb_r1, &mut rb_r2).expect("call should succeed");
 
         // Raw path
         let cigar = [cigar_op(4, 0)];
         let mut raw_r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut raw_r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
-        caller_raw.call_raw(&mut raw_r1, &mut raw_r2).unwrap();
+        caller_raw.call_raw(&mut raw_r1, &mut raw_r2).expect("call_raw should succeed");
 
         // Compare results
         assert_eq!(rb_r1.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r1));
@@ -1961,13 +1961,13 @@ mod tests {
         // RecordBuf path
         let mut rb_r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
         let mut rb_r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
-        caller_buf.call(&mut rb_r1, &mut rb_r2).unwrap();
+        caller_buf.call(&mut rb_r1, &mut rb_r2).expect("call should succeed");
 
         // Raw path
         let cigar = [cigar_op(4, 0)];
         let mut raw_r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut raw_r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
-        caller_raw.call_raw(&mut raw_r1, &mut raw_r2).unwrap();
+        caller_raw.call_raw(&mut raw_r1, &mut raw_r2).expect("call_raw should succeed");
 
         // Compare sequences
         let buf_r1_seq: Vec<u8> = rb_r1.sequence().as_ref().to_vec();
@@ -2007,7 +2007,8 @@ mod tests {
         let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
         let mut records = vec![r1, r2];
-        apply_overlapping_consensus_raw(&mut records, &mut caller).unwrap();
+        apply_overlapping_consensus_raw(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus_raw should succeed");
 
         // Check that qualities were summed (30 + 20 = 50)
         assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[0])[0], 50);
@@ -2031,7 +2032,8 @@ mod tests {
         let r2 = make_raw_bam(b"reb", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
         let mut records = vec![r1, r2];
-        apply_overlapping_consensus_raw(&mut records, &mut caller).unwrap();
+        apply_overlapping_consensus_raw(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus_raw should succeed");
 
         // Qualities unchanged because no matching pair
         assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[0])[0], 30);
@@ -2055,7 +2057,8 @@ mod tests {
 
         // R2 at index 0, R1 at index 1
         let mut records = vec![r2, r1];
-        apply_overlapping_consensus_raw(&mut records, &mut caller).unwrap();
+        apply_overlapping_consensus_raw(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus_raw should succeed");
 
         // Both should have been consensus-called
         assert!(caller.stats().overlapping_bases > 0);
@@ -2184,7 +2187,8 @@ mod tests {
         let r2 = create_test_record(b"ACGTACGT", &[20; 8], 104, "8M");
 
         // Collect positions from the noodles-based iterator
-        let noodles_iter = ReadMateAndRefPosIterator::new(&r1, &r2).unwrap();
+        let noodles_iter = ReadMateAndRefPosIterator::new(&r1, &r2)
+            .expect("ReadMateAndRefPosIterator::new should succeed");
         let noodles_positions: Vec<_> = noodles_iter.collect();
 
         // Build raw BAM bytes for the same records
@@ -2215,7 +2219,8 @@ mod tests {
         let r1 = create_test_record(b"ACGTACGT", &[30; 8], 100, "4M2D4M");
         let r2 = create_test_record(b"TTTT", &[20; 4], 106, "4M");
 
-        let iter = ReadMateAndRefPosIterator::new(&r1, &r2).unwrap();
+        let iter = ReadMateAndRefPosIterator::new(&r1, &r2)
+            .expect("ReadMateAndRefPosIterator::new should succeed");
         let positions: Vec<_> = iter.collect();
 
         // Overlap region: 106-109 (4 ref positions)

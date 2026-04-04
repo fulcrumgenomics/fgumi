@@ -624,12 +624,12 @@ mod tests {
 
     fn create_header_with_so(sort_order: &str) -> Header {
         let header_str = format!("@HD\tVN:1.6\tSO:{sort_order}\n");
-        header_str.parse().unwrap()
+        header_str.parse().expect("failed to parse SAM header with sort order")
     }
 
     fn create_header_without_so() -> Header {
         let header_str = "@HD\tVN:1.6\n";
-        header_str.parse().unwrap()
+        header_str.parse().expect("failed to parse SAM header without sort order")
     }
 
     fn create_empty_header() -> Header {
@@ -685,13 +685,13 @@ mod tests {
         use std::fmt::Write;
         let mut header_str = format!("@HD\tVN:1.6\tSO:{so}");
         if let Some(go_val) = go {
-            write!(header_str, "\tGO:{go_val}").unwrap();
+            write!(header_str, "\tGO:{go_val}").expect("failed to write GO tag to header string");
         }
         if let Some(ss_val) = ss {
-            write!(header_str, "\tSS:{ss_val}").unwrap();
+            write!(header_str, "\tSS:{ss_val}").expect("failed to write SS tag to header string");
         }
         header_str.push('\n');
-        header_str.parse().unwrap()
+        header_str.parse().expect("failed to parse template-coordinate SAM header")
     }
 
     #[test]

@@ -734,7 +734,7 @@ mod tests {
         let rg = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("MyLibrary"))
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let header = HeaderBuilder::default().add_read_group(BString::from("RG1"), rg).build();
 
         let prefix = make_prefix_from_header(&header);
@@ -749,7 +749,7 @@ mod tests {
         use noodles::sam::header::record::value::Map;
         use noodles::sam::header::record::value::map::ReadGroup;
 
-        let rg = Map::<ReadGroup>::builder().build().unwrap();
+        let rg = Map::<ReadGroup>::builder().build().expect("build should succeed");
         let header = HeaderBuilder::default().add_read_group(BString::from("RG1"), rg).build();
 
         let prefix = make_prefix_from_header(&header);
@@ -768,11 +768,11 @@ mod tests {
         let rg1 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("LibB"))
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let rg2 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("LibA"))
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let header = HeaderBuilder::default()
             .add_read_group(BString::from("RG1"), rg1)
             .add_read_group(BString::from("RG2"), rg2)
@@ -795,11 +795,11 @@ mod tests {
         let rg1 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("SameLib"))
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let rg2 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, String::from("SameLib"))
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let header = HeaderBuilder::default()
             .add_read_group(BString::from("RG1"), rg1)
             .add_read_group(BString::from("RG2"), rg2)
@@ -833,10 +833,14 @@ mod tests {
         let lib_a = "A".repeat(100);
         let lib_b = "B".repeat(99);
 
-        let rg1 =
-            Map::<ReadGroup>::builder().insert(rg_tag::LIBRARY, lib_a.clone()).build().unwrap();
-        let rg2 =
-            Map::<ReadGroup>::builder().insert(rg_tag::LIBRARY, lib_b.clone()).build().unwrap();
+        let rg1 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, lib_a.clone())
+            .build()
+            .expect("build should succeed");
+        let rg2 = Map::<ReadGroup>::builder()
+            .insert(rg_tag::LIBRARY, lib_b.clone())
+            .build()
+            .expect("build should succeed");
         let header = HeaderBuilder::default()
             .add_read_group(BString::from("RG1"), rg1)
             .add_read_group(BString::from("RG2"), rg2)
@@ -863,11 +867,11 @@ mod tests {
         let rg1 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, long_lib_a.clone())
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let rg2 = Map::<ReadGroup>::builder()
             .insert(rg_tag::LIBRARY, long_lib_b.clone())
             .build()
-            .unwrap();
+            .expect("failed to build ReadGroup");
         let header = HeaderBuilder::default()
             .add_read_group(BString::from("RG1"), rg1)
             .add_read_group(BString::from("RG2"), rg2)

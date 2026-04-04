@@ -216,14 +216,16 @@ mod tests {
         let metrics = tracker.to_metrics();
         assert_eq!(metrics.len(), 2);
 
-        let aaaa = metrics.iter().find(|m| m.umi == "AAAA").unwrap();
+        let aaaa =
+            metrics.iter().find(|m| m.umi == "AAAA").expect("AAAA UMI metric should be present");
         assert_eq!(aaaa.raw_observations, 15);
         assert_eq!(aaaa.raw_observations_with_errors, 3);
         assert_eq!(aaaa.unique_observations, 1);
         assert!((aaaa.fraction_raw_observations - 15.0 / 23.0).abs() < f64::EPSILON);
         assert!((aaaa.fraction_unique_observations - 0.5).abs() < f64::EPSILON);
 
-        let cccc = metrics.iter().find(|m| m.umi == "CCCC").unwrap();
+        let cccc =
+            metrics.iter().find(|m| m.umi == "CCCC").expect("CCCC UMI metric should be present");
         assert_eq!(cccc.raw_observations, 8);
         assert_eq!(cccc.unique_observations, 1);
         assert!((cccc.fraction_raw_observations - 8.0 / 23.0).abs() < f64::EPSILON);

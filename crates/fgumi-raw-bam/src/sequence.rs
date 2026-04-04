@@ -384,7 +384,7 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rd", &[], 4, -1, -1, &[]);
         let quals = quality_scores_slice_mut(&mut rec);
         for (i, q) in quals.iter_mut().enumerate() {
-            *q = u8::try_from(i * 10).unwrap();
+            *q = u8::try_from(i * 10).expect("quality index * 10 fits in u8");
         }
         assert_eq!(quality_scores_slice(&rec), &[0, 10, 20, 30]);
     }

@@ -247,7 +247,8 @@ mod tests {
         let mut reader = &data[..];
         let mut record = RawRecord::new();
 
-        let n = read_raw_record(&mut reader, &mut record).unwrap();
+        let n = read_raw_record(&mut reader, &mut record)
+            .expect("reading valid 8-byte record should succeed");
         assert_eq!(n, 8);
         assert_eq!(record.as_ref(), &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
@@ -258,7 +259,8 @@ mod tests {
         let mut reader = data;
         let mut record = RawRecord::new();
 
-        let n = read_raw_record(&mut reader, &mut record).unwrap();
+        let n = read_raw_record(&mut reader, &mut record)
+            .expect("reading from empty input should return Ok(0)");
         assert_eq!(n, 0);
     }
 
@@ -296,15 +298,18 @@ mod tests {
         let mut reader = &data[..];
         let mut record = RawRecord::new();
 
-        let n = read_raw_record(&mut reader, &mut record).unwrap();
+        let n =
+            read_raw_record(&mut reader, &mut record).expect("reading first record should succeed");
         assert_eq!(n, 4);
         assert_eq!(record.as_ref(), &[1, 2, 3, 4]);
 
-        let n = read_raw_record(&mut reader, &mut record).unwrap();
+        let n = read_raw_record(&mut reader, &mut record)
+            .expect("reading second record should succeed");
         assert_eq!(n, 2);
         assert_eq!(record.as_ref(), &[5, 6]);
 
-        let n = read_raw_record(&mut reader, &mut record).unwrap();
+        let n =
+            read_raw_record(&mut reader, &mut record).expect("reading at EOF should return Ok(0)");
         assert_eq!(n, 0); // EOF
     }
 }

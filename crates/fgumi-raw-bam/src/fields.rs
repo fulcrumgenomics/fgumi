@@ -590,7 +590,8 @@ mod tests {
     #[test]
     fn test_aux_data_offset_from_record_basic() {
         let rec = make_bam_bytes(0, 0, 0, b"rd", &[encode_op(0, 4)], 4, -1, -1, &[]);
-        let offset = aux_data_offset_from_record(&rec).unwrap();
+        let offset = aux_data_offset_from_record(&rec)
+            .expect("record should have valid header for aux offset");
         // 32 + l_read_name(3) + cigar(4) + seq_bytes(2) + qual(4) = 45
         assert_eq!(offset, 32 + 3 + 4 + 2 + 4);
     }
@@ -613,7 +614,8 @@ mod tests {
         // Modify l_seq to unreasonably large value -- offset will exceed record length
         bam[16..20].copy_from_slice(&1000u32.to_le_bytes());
 
-        let offset = aux_data_offset_from_record(&bam).unwrap();
+        let offset = aux_data_offset_from_record(&bam)
+            .expect("record should have valid header for aux offset");
         assert!(offset > bam.len());
 
         // aux_data_slice returns empty instead of panicking

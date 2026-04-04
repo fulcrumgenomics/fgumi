@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(find_int_tag(aux, b"cM"), Some(3));
 
         // Verify float tag
-        let ce = find_float_tag(aux, b"cE").unwrap();
+        let ce = find_float_tag(aux, b"cE").expect("cE float tag should be present");
         assert!((ce - 0.05).abs() < 1e-7);
     }
 
@@ -397,7 +397,8 @@ mod tests {
         builder.append_phred33_string_tag(b"aq", &[0, 10, 30, 40]);
         let bytes = builder.as_bytes();
         let parsed = ParsedBamRecord::from_bytes(bytes);
-        let aq = parsed.get_string_tag(b"aq").unwrap();
+        let aq =
+            parsed.get_string_tag(b"aq").expect("aq string tag should be present in parsed record");
         assert_eq!(aq, b"!+?I");
     }
 
@@ -428,11 +429,14 @@ mod tests {
         );
         assert_eq!(rec.bases, b"ACGTNN");
         assert_eq!(rec.quals, vec![30, 25, 20, 15, 10, 5]);
-        assert_eq!(rec.get_string_tag(b"RG").unwrap(), b"sample1");
-        assert_eq!(rec.get_int_tag(b"cD").unwrap(), 5);
-        let ce = rec.get_float_tag(b"cE").unwrap();
+        assert_eq!(rec.get_string_tag(b"RG").expect("RG tag should be present"), b"sample1");
+        assert_eq!(rec.get_int_tag(b"cD").expect("cD tag should be present"), 5);
+        let ce = rec.get_float_tag(b"cE").expect("cE float tag should be present");
         assert!((ce - 0.01).abs() < 0.001);
-        assert_eq!(rec.get_i16_array_tag(b"cd").unwrap(), vec![3, 4, 5, 3, 2, 1]);
+        assert_eq!(
+            rec.get_i16_array_tag(b"cd").expect("cd i16 array tag should be present"),
+            vec![3, 4, 5, 3, 2, 1]
+        );
     }
 
     // ========================================================================
@@ -509,9 +513,15 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name, b"r1");
         assert_eq!(records[0].bases, b"ACGT");
-        assert_eq!(records[0].get_string_tag(b"MI").unwrap(), b"1");
+        assert_eq!(
+            records[0].get_string_tag(b"MI").expect("MI tag should be present on record 0"),
+            b"1"
+        );
         assert_eq!(records[1].name, b"r2");
         assert_eq!(records[1].bases, b"TGCA");
-        assert_eq!(records[1].get_string_tag(b"MI").unwrap(), b"2");
+        assert_eq!(
+            records[1].get_string_tag(b"MI").expect("MI tag should be present on record 1"),
+            b"2"
+        );
     }
 }

@@ -491,35 +491,47 @@ mod tests {
         // Should have core metrics
         let raw_reads = kv_metrics.iter().find(|m| m.key == "raw_reads_considered");
         assert!(raw_reads.is_some());
-        assert_eq!(raw_reads.unwrap().value, "1000");
-        assert_eq!(raw_reads.unwrap().description, "Total raw reads considered from input file");
+        assert_eq!(raw_reads.expect("raw_reads_considered metric should be present").value, "1000");
+        assert_eq!(
+            raw_reads.expect("raw_reads_considered metric should be present").description,
+            "Total raw reads considered from input file"
+        );
 
         let rejected = kv_metrics.iter().find(|m| m.key == "raw_reads_rejected");
         assert!(rejected.is_some());
-        assert_eq!(rejected.unwrap().value, "100");
+        assert_eq!(rejected.expect("raw_reads_rejected metric should be present").value, "100");
 
         let used = kv_metrics.iter().find(|m| m.key == "raw_reads_used");
         assert!(used.is_some());
-        assert_eq!(used.unwrap().value, "900");
+        assert_eq!(used.expect("raw_reads_used metric should be present").value, "900");
 
         let frac = kv_metrics.iter().find(|m| m.key == "frac_raw_reads_used");
         assert!(frac.is_some());
-        assert_eq!(frac.unwrap().value, "0.900000");
+        assert_eq!(frac.expect("frac_raw_reads_used metric should be present").value, "0.900000");
 
         let consensus = kv_metrics.iter().find(|m| m.key == "consensus_reads_emitted");
         assert!(consensus.is_some());
-        assert_eq!(consensus.unwrap().value, "450");
+        assert_eq!(
+            consensus.expect("consensus_reads_emitted metric should be present").value,
+            "450"
+        );
 
         // Should have rejection reasons
         let insuff =
             kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_insufficient_support");
         assert!(insuff.is_some());
-        assert_eq!(insuff.unwrap().value, "50");
+        assert_eq!(
+            insuff.expect("insufficient_support rejection metric should be present").value,
+            "50"
+        );
 
         let minority =
             kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_minority_alignment");
         assert!(minority.is_some());
-        assert_eq!(minority.unwrap().value, "50");
+        assert_eq!(
+            minority.expect("minority_alignment rejection metric should be present").value,
+            "50"
+        );
     }
 
     #[test]
@@ -530,7 +542,7 @@ mod tests {
         // frac_raw_reads_used should be 0.0 when total_input_reads is 0
         let frac = kv_metrics.iter().find(|m| m.key == "frac_raw_reads_used");
         assert!(frac.is_some());
-        assert_eq!(frac.unwrap().value, "0.000000");
+        assert_eq!(frac.expect("frac_raw_reads_used metric should be present").value, "0.000000");
     }
 
     #[test]
@@ -544,7 +556,7 @@ mod tests {
         // Should have low_base_quality since it's non-zero
         let lbq = kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_low_base_quality");
         assert!(lbq.is_some());
-        assert_eq!(lbq.unwrap().value, "5");
+        assert_eq!(lbq.expect("low_base_quality rejection metric should be present").value, "5");
 
         // Should NOT have excessive_n_bases since it's zero
         let en = kv_metrics.iter().find(|m| m.key == "raw_reads_rejected_for_excessive_n_bases");

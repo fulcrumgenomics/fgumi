@@ -150,13 +150,17 @@ impl SamBuilder {
         // Add reference sequences (chr1-22, X, Y, M)
         for i in 1..=22 {
             let name = format!("chr{i}");
-            let map =
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(DEFAULT_REFERENCE_LENGTH).unwrap());
+            let map = Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(DEFAULT_REFERENCE_LENGTH)
+                    .expect("DEFAULT_REFERENCE_LENGTH is non-zero"),
+            );
             header = header.add_reference_sequence(BString::from(name), map);
         }
         for chr in ["chrX", "chrY", "chrM"] {
-            let map =
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(DEFAULT_REFERENCE_LENGTH).unwrap());
+            let map = Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(DEFAULT_REFERENCE_LENGTH)
+                    .expect("DEFAULT_REFERENCE_LENGTH is non-zero"),
+            );
             header = header.add_reference_sequence(BString::from(chr), map);
         }
 
@@ -214,7 +218,9 @@ impl SamBuilder {
     pub fn with_single_ref(ref_name: &str, ref_length: usize) -> Self {
         let mut header = Header::builder();
 
-        let map = Map::<ReferenceSequence>::new(NonZeroUsize::new(ref_length).unwrap());
+        let map = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(ref_length).expect("ref_length must be non-zero"),
+        );
         header = header.add_reference_sequence(BString::from(ref_name), map);
 
         // Add read group
@@ -257,7 +263,7 @@ impl SamBuilder {
             let idx = usize::try_from(hasher.finish() % 4).expect("modulo 4 always fits in usize");
             result.push(bases[idx]);
         }
-        String::from_utf8(result).unwrap()
+        String::from_utf8(result).expect("ACGT bytes are valid UTF-8")
     }
 
     /// Returns a reference to the accumulated records.
@@ -572,18 +578,23 @@ impl<'a> PairBuilder<'a> {
 
         if !unmapped1 {
             *first_read.reference_sequence_id_mut() = Some(self.contig);
-            *first_read.alignment_start_mut() =
-                Some(Position::try_from(self.start1.unwrap()).unwrap());
+            *first_read.alignment_start_mut() = Some(
+                Position::try_from(self.start1.expect("start1 must be set when read is mapped"))
+                    .expect("start1 must be a valid position"),
+            );
             *first_read.cigar_mut() = parse_cigar(&cigar1).into_iter().collect();
             *first_read.mapping_quality_mut() = Some(
-                noodles::sam::alignment::record::MappingQuality::try_from(self.mapq1).unwrap(),
+                noodles::sam::alignment::record::MappingQuality::try_from(self.mapq1)
+                    .expect("mapq1 must be a valid mapping quality"),
             );
         }
 
         if !unmapped2 {
             *first_read.mate_reference_sequence_id_mut() = Some(contig2);
-            *first_read.mate_alignment_start_mut() =
-                Some(Position::try_from(self.start2.unwrap()).unwrap());
+            *first_read.mate_alignment_start_mut() = Some(
+                Position::try_from(self.start2.expect("start2 must be set when mate is mapped"))
+                    .expect("start2 must be a valid position"),
+            );
         }
 
         // Add read group tag
@@ -621,18 +632,23 @@ impl<'a> PairBuilder<'a> {
 
         if !unmapped2 {
             *second_read.reference_sequence_id_mut() = Some(contig2);
-            *second_read.alignment_start_mut() =
-                Some(Position::try_from(self.start2.unwrap()).unwrap());
+            *second_read.alignment_start_mut() = Some(
+                Position::try_from(self.start2.expect("start2 must be set when read is mapped"))
+                    .expect("start2 must be a valid position"),
+            );
             *second_read.cigar_mut() = parse_cigar(&cigar2).into_iter().collect();
             *second_read.mapping_quality_mut() = Some(
-                noodles::sam::alignment::record::MappingQuality::try_from(self.mapq2).unwrap(),
+                noodles::sam::alignment::record::MappingQuality::try_from(self.mapq2)
+                    .expect("mapq2 must be a valid mapping quality"),
             );
         }
 
         if !unmapped1 {
             *second_read.mate_reference_sequence_id_mut() = Some(self.contig);
-            *second_read.mate_alignment_start_mut() =
-                Some(Position::try_from(self.start1.unwrap()).unwrap());
+            *second_read.mate_alignment_start_mut() = Some(
+                Position::try_from(self.start1.expect("start1 must be set when mate is mapped"))
+                    .expect("start1 must be a valid position"),
+            );
         }
 
         // Add read group tag
@@ -648,8 +664,12 @@ impl<'a> PairBuilder<'a> {
 
         // Calculate template length if both mapped to same contig
         if !unmapped1 && !unmapped2 && self.contig == contig2 {
-            let pos1 = i32::try_from(self.start1.unwrap()).expect("start1 fits in i32");
-            let pos2 = i32::try_from(self.start2.unwrap()).expect("start2 fits in i32");
+            let pos1 =
+                i32::try_from(self.start1.expect("start1 must be set when both reads are mapped"))
+                    .expect("start1 fits in i32");
+            let pos2 =
+                i32::try_from(self.start2.expect("start2 must be set when both reads are mapped"))
+                    .expect("start2 fits in i32");
             let end1 = pos1
                 + i32::try_from(cigar_ref_len(&cigar1)).expect("cigar1 ref len fits in i32")
                 - 1;
@@ -801,10 +821,15 @@ impl<'a> FragBuilder<'a> {
 
         if !unmapped {
             *rec.reference_sequence_id_mut() = Some(self.contig);
-            *rec.alignment_start_mut() = Some(Position::try_from(self.start.unwrap()).unwrap());
+            *rec.alignment_start_mut() = Some(
+                Position::try_from(self.start.expect("start must be set when read is mapped"))
+                    .expect("start must be a valid position"),
+            );
             *rec.cigar_mut() = parse_cigar(&cigar).into_iter().collect();
-            *rec.mapping_quality_mut() =
-                Some(noodles::sam::alignment::record::MappingQuality::try_from(self.mapq).unwrap());
+            *rec.mapping_quality_mut() = Some(
+                noodles::sam::alignment::record::MappingQuality::try_from(self.mapq)
+                    .expect("mapq must be a valid mapping quality"),
+            );
         }
 
         // Add read group tag
@@ -973,7 +998,9 @@ pub fn create_ref_dict(
     let dict_path = dir.path().join("ref.dict");
     let mut header = Header::builder();
 
-    let map = Map::<ReferenceSequence>::new(NonZeroUsize::new(ref_length).unwrap());
+    let map = Map::<ReferenceSequence>::new(
+        NonZeroUsize::new(ref_length).expect("ref_length must be non-zero"),
+    );
     header = header.add_reference_sequence(BString::from(ref_name), map);
 
     let header = header.build();
@@ -1343,8 +1370,9 @@ impl RecordBuilder {
             (Some(cigar), true) => {
                 // CIGAR provided, no sequence: generate sequence from CIGAR
                 let seq_len = cigar_seq_len(&cigar);
-                let generated_seq: String =
-                    (0..seq_len).map(|i| "ACGT".chars().nth(i % 4).unwrap()).collect();
+                let generated_seq: String = (0..seq_len)
+                    .map(|i| "ACGT".chars().nth(i % 4).expect("i % 4 is always in 0..4"))
+                    .collect();
                 (cigar, generated_seq.into_bytes())
             }
             (Some(cigar), false) => (cigar, self.sequence),
@@ -1610,7 +1638,7 @@ impl RecordPairBuilder {
         if r1_mapped {
             r1_builder = r1_builder
                 .reference_sequence_id(self.reference_sequence_id)
-                .alignment_start(self.r1_start.unwrap())
+                .alignment_start(self.r1_start.expect("r1_start must be set when r1 is mapped"))
                 .cigar(&r1_cigar)
                 .mapping_quality(self.mapping_quality);
         } else {
@@ -1618,9 +1646,9 @@ impl RecordPairBuilder {
         }
 
         if r2_mapped {
-            r1_builder = r1_builder
-                .mate_reference_sequence_id(r2_ref_id)
-                .mate_alignment_start(self.r2_start.unwrap());
+            r1_builder = r1_builder.mate_reference_sequence_id(r2_ref_id).mate_alignment_start(
+                self.r2_start.expect("r2_start must be set when r2 is mapped"),
+            );
         } else {
             r1_builder = r1_builder.mate_unmapped(true);
         }
@@ -1647,7 +1675,7 @@ impl RecordPairBuilder {
         if r2_mapped {
             r2_builder = r2_builder
                 .reference_sequence_id(r2_ref_id)
-                .alignment_start(self.r2_start.unwrap())
+                .alignment_start(self.r2_start.expect("r2_start must be set when r2 is mapped"))
                 .cigar(&r2_cigar)
                 .mapping_quality(self.mapping_quality);
         } else {
@@ -1657,7 +1685,9 @@ impl RecordPairBuilder {
         if r1_mapped {
             r2_builder = r2_builder
                 .mate_reference_sequence_id(self.reference_sequence_id)
-                .mate_alignment_start(self.r1_start.unwrap());
+                .mate_alignment_start(
+                    self.r1_start.expect("r1_start must be set when r1 is mapped"),
+                );
         } else {
             r2_builder = r2_builder.mate_unmapped(true);
         }
@@ -1680,14 +1710,13 @@ impl RecordPairBuilder {
         let mut second_read = r2_builder.build();
 
         if r1_mapped && r2_mapped && self.reference_sequence_id == r2_ref_id {
-            let pos1 = i32::try_from(self.r1_start.unwrap()).expect("r1_start fits in i32");
-            let pos2 = i32::try_from(self.r2_start.unwrap()).expect("r2_start fits in i32");
-            let end1 = pos1
-                + i32::try_from(cigar_ref_len(&r1_cigar)).expect("r1 cigar ref len fits in i32")
-                - 1;
-            let end2 = pos2
-                + i32::try_from(cigar_ref_len(&r2_cigar)).expect("r2 cigar ref len fits in i32")
-                - 1;
+            // r1/r2_start are guaranteed Some by r1/r2_mapped guards above
+            let pos1 = i32::try_from(self.r1_start.expect("r1_mapped")).expect("start fits i32");
+            let pos2 = i32::try_from(self.r2_start.expect("r2_mapped")).expect("start fits i32");
+            let end1 =
+                pos1 + i32::try_from(cigar_ref_len(&r1_cigar)).expect("cigar len fits i32") - 1;
+            let end2 =
+                pos2 + i32::try_from(cigar_ref_len(&r2_cigar)).expect("cigar len fits i32") - 1;
 
             let (left, right) = if pos1 <= pos2 { (pos1, end2) } else { (pos2, end1) };
             let tlen = right - left + 1;
@@ -1945,7 +1974,10 @@ mod tests {
 
         assert!(!rec.flags().is_unmapped());
         assert_eq!(rec.reference_sequence_id(), Some(0));
-        assert_eq!(rec.alignment_start(), Some(Position::try_from(100).unwrap()));
+        assert_eq!(
+            rec.alignment_start(),
+            Some(Position::try_from(100).expect("position 100 should be valid"))
+        );
     }
 
     #[test]
@@ -1975,8 +2007,14 @@ mod tests {
 
         assert!(!read_one.flags().is_unmapped());
         assert!(!read_two.flags().is_unmapped());
-        assert_eq!(read_one.alignment_start(), Some(Position::try_from(100).unwrap()));
-        assert_eq!(read_two.alignment_start(), Some(Position::try_from(200).unwrap()));
+        assert_eq!(
+            read_one.alignment_start(),
+            Some(Position::try_from(100).expect("position 100 should be valid"))
+        );
+        assert_eq!(
+            read_two.alignment_start(),
+            Some(Position::try_from(200).expect("position 200 should be valid"))
+        );
     }
 
     #[test]
@@ -2007,7 +2045,7 @@ mod tests {
         let mut builder = SamBuilder::new();
         let _ = builder.add_frag().name("read1").bases("ACGT").contig(0).start(100).build();
 
-        let temp = builder.to_temp_file().unwrap();
+        let temp = builder.to_temp_file().expect("failed to write SamBuilder to temp file");
         assert!(temp.path().exists());
     }
 
@@ -2147,7 +2185,10 @@ mod tests {
             .build();
 
         assert_eq!(record.reference_sequence_id(), Some(0));
-        assert_eq!(record.alignment_start(), Some(Position::try_from(100).unwrap()));
+        assert_eq!(
+            record.alignment_start(),
+            Some(Position::try_from(100).expect("position 100 should be valid"))
+        );
     }
 
     #[test]
@@ -2238,7 +2279,8 @@ mod tests {
         let record = RecordBuilder::new().sequence("ACGTACGT").build();
 
         // CIGAR should be auto-generated as 8M when sequence is set
-        let ops: Vec<_> = record.cigar().iter().map(|r| r.unwrap()).collect();
+        let ops: Vec<_> =
+            record.cigar().iter().map(|r| r.expect("failed to parse CIGAR op")).collect();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].kind(), Kind::Match);
         assert_eq!(ops[0].len(), 8);
@@ -2248,7 +2290,8 @@ mod tests {
     fn test_record_builder_explicit_cigar_overrides_auto() {
         let record = RecordBuilder::new().sequence("ACGTACGT").cigar("4M2I2M").build();
 
-        let ops: Vec<_> = record.cigar().iter().map(|r| r.unwrap()).collect();
+        let ops: Vec<_> =
+            record.cigar().iter().map(|r| r.expect("failed to parse CIGAR op")).collect();
         assert_eq!(ops.len(), 3);
         assert_eq!(ops[0].kind(), Kind::Match);
         assert_eq!(ops[0].len(), 4);
@@ -2698,11 +2741,13 @@ mod generator_tests {
 
     #[test]
     fn test_create_test_fasta() {
-        let fasta = create_test_fasta(&[("chr1", "ACGT"), ("chr2", "GGGG")]).unwrap();
+        let fasta = create_test_fasta(&[("chr1", "ACGT"), ("chr2", "GGGG")])
+            .expect("failed to create test FASTA file");
         assert!(fasta.path().exists());
 
         // Read the file and verify contents
-        let contents = std::fs::read_to_string(fasta.path()).unwrap();
+        let contents =
+            std::fs::read_to_string(fasta.path()).expect("failed to read test FASTA file");
         assert!(contents.contains(">chr1"));
         assert!(contents.contains("ACGT"));
         assert!(contents.contains(">chr2"));
@@ -2711,10 +2756,11 @@ mod generator_tests {
 
     #[test]
     fn test_create_default_test_fasta() {
-        let fasta = create_default_test_fasta().unwrap();
+        let fasta = create_default_test_fasta().expect("failed to create default test FASTA file");
         assert!(fasta.path().exists());
 
-        let contents = std::fs::read_to_string(fasta.path()).unwrap();
+        let contents =
+            std::fs::read_to_string(fasta.path()).expect("failed to read default test FASTA file");
         assert!(contents.contains(">chr1"));
         assert!(contents.contains("ACGTACGTACGT"));
         assert!(contents.contains(">chr2"));

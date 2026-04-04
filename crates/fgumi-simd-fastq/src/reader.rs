@@ -181,7 +181,10 @@ mod tests {
         let data = b"@r1\nACGT\n+\nIIII\n";
         let mut reader = SimdFastqReader::new(Cursor::new(&data[..]));
 
-        let rec = reader.next().unwrap().unwrap();
+        let rec = reader
+            .next()
+            .expect("reader should yield a record")
+            .expect("record should parse successfully");
         assert_eq!(rec.name, b"r1");
         assert_eq!(rec.sequence, b"ACGT");
         assert_eq!(rec.quality, b"IIII");
@@ -194,10 +197,16 @@ mod tests {
         let data = b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ\n";
         let mut reader = SimdFastqReader::new(Cursor::new(&data[..]));
 
-        let rec1 = reader.next().unwrap().unwrap();
+        let rec1 = reader
+            .next()
+            .expect("reader should yield a record")
+            .expect("record should parse successfully");
         assert_eq!(rec1.name, b"r1");
 
-        let rec2 = reader.next().unwrap().unwrap();
+        let rec2 = reader
+            .next()
+            .expect("reader should yield a record")
+            .expect("record should parse successfully");
         assert_eq!(rec2.name, b"r2");
 
         assert!(reader.next().is_none());
@@ -209,11 +218,17 @@ mod tests {
         let data = b"@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ\n";
         let mut reader = SimdFastqReader::with_capacity(Cursor::new(&data[..]), 20);
 
-        let rec1 = reader.next().unwrap().unwrap();
+        let rec1 = reader
+            .next()
+            .expect("reader should yield a record")
+            .expect("record should parse successfully");
         assert_eq!(rec1.name, b"r1");
         assert_eq!(rec1.sequence, b"ACGT");
 
-        let rec2 = reader.next().unwrap().unwrap();
+        let rec2 = reader
+            .next()
+            .expect("reader should yield a record")
+            .expect("record should parse successfully");
         assert_eq!(rec2.name, b"r2");
         assert_eq!(rec2.sequence, b"TTTT");
 
@@ -234,7 +249,10 @@ mod tests {
         let data = format!("@longread\n{seq}\n+\n{qual}\n");
         let mut reader = SimdFastqReader::with_capacity(Cursor::new(data.as_bytes()), 256);
 
-        let rec = reader.next().unwrap().unwrap();
+        let rec = reader
+            .next()
+            .expect("reader should yield a record")
+            .expect("record should parse successfully");
         assert_eq!(rec.name, b"longread");
         assert_eq!(rec.sequence.len(), 500);
         assert_eq!(rec.quality.len(), 500);
