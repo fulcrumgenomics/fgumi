@@ -11,7 +11,7 @@ license.workspace = true
 
 [dev-dependencies]
 rstest = "0"
-proptest = "1.10"
+proptest = "1.11"
 criterion = { version = "0.8", features = ["html_reports"] }
 memchr = "2"
 seq_io = "0.3.4"
