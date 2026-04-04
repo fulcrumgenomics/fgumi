@@ -151,7 +151,11 @@ impl<T> ReorderBuffer<T> {
         }
 
         // Pop the front item
-        let (item, size) = self.buffer.pop_front().unwrap().unwrap();
+        let (item, size) = self
+            .buffer
+            .pop_front()
+            .expect("buffer must be non-empty when can_pop is true")
+            .expect("front slot must be Some when can_pop is true");
         self.next_seq += 1;
         self.count -= 1;
         self.heap_bytes = self.heap_bytes.saturating_sub(size as u64);
@@ -437,12 +441,12 @@ mod tests {
         assert_eq!(buffer.len(), 3);
 
         // Pop and verify memory decreases
-        let (val, size) = buffer.try_pop_next_with_size().unwrap();
+        let (val, size) = buffer.try_pop_next_with_size().expect("queue should have next element");
         assert_eq!(val, 100);
         assert_eq!(size, 1000);
         assert_eq!(buffer.heap_bytes(), 5000);
 
-        let (val, size) = buffer.try_pop_next_with_size().unwrap();
+        let (val, size) = buffer.try_pop_next_with_size().expect("queue should have next element");
         assert_eq!(val, 200);
         assert_eq!(size, 2000);
         assert_eq!(buffer.heap_bytes(), 3000);

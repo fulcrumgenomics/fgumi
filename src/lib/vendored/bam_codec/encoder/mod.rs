@@ -367,11 +367,13 @@ mod tests {
         let header = sam::Header::builder()
             .add_reference_sequence(
                 "sq0",
-                Map::<ReferenceSequence>::new(const { NonZero::new(8).unwrap() }),
+                Map::<ReferenceSequence>::new(const { NonZero::new(8).expect("non-zero value 8") }),
             )
             .add_reference_sequence(
                 "sq1",
-                Map::<ReferenceSequence>::new(const { NonZero::new(13).unwrap() }),
+                Map::<ReferenceSequence>::new(
+                    const { NonZero::new(13).expect("non-zero value 13") },
+                ),
             )
             .build();
 
@@ -435,7 +437,9 @@ mod tests {
         let header = sam::Header::builder()
             .add_reference_sequence(
                 "sq0",
-                Map::<ReferenceSequence>::new(const { NonZero::new(131_072).unwrap() }),
+                Map::<ReferenceSequence>::new(
+                    const { NonZero::new(131_072).expect("non-zero value 131_072") },
+                ),
             )
             .build();
 

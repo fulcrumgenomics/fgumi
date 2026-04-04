@@ -815,24 +815,24 @@ mod tests {
 
     #[test]
     fn test_generate_neighbors() {
-        let umi = BitEnc::from_bytes(b"AA").unwrap();
+        let umi = BitEnc::from_bytes(b"AA").expect("valid DNA sequence");
         let neighbors: Vec<_> = generate_neighbors(&umi).collect();
 
         // 2 positions × 3 alternatives = 6 neighbors
         assert_eq!(neighbors.len(), 6);
 
         // Check specific neighbors
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"CA").unwrap()));
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"GA").unwrap()));
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"TA").unwrap()));
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"AC").unwrap()));
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"AG").unwrap()));
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"AT").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"CA").expect("valid DNA sequence")));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"GA").expect("valid DNA sequence")));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"TA").expect("valid DNA sequence")));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"AC").expect("valid DNA sequence")));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"AG").expect("valid DNA sequence")));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"AT").expect("valid DNA sequence")));
     }
 
     #[test]
     fn test_generate_neighbors_k2() {
-        let umi = BitEnc::from_bytes(b"AA").unwrap();
+        let umi = BitEnc::from_bytes(b"AA").expect("valid DNA sequence");
         let neighbors = generate_neighbors_k(&umi, 2);
 
         // Should include: original, all 1-edit, all 2-edit neighbors
@@ -845,11 +845,11 @@ mod tests {
         assert!(neighbors.contains(&umi));
 
         // Should include 1-edit neighbors
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"CA").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"CA").expect("valid DNA sequence")));
 
         // Should include 2-edit neighbors
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"CC").unwrap()));
-        assert!(neighbors.contains(&BitEnc::from_bytes(b"TT").unwrap()));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"CC").expect("valid DNA sequence")));
+        assert!(neighbors.contains(&BitEnc::from_bytes(b"TT").expect("valid DNA sequence")));
     }
 
     // ==================== Edge Discovery Tests ====================
@@ -857,9 +857,9 @@ mod tests {
     #[test]
     fn test_discover_edges_parallel_k1() {
         let umis = vec![
-            (BitEnc::from_bytes(b"AAAA").unwrap(), 10),
-            (BitEnc::from_bytes(b"AAAT").unwrap(), 5), // 1 edit from AAAA
-            (BitEnc::from_bytes(b"TTTT").unwrap(), 3), // 4 edits from AAAA
+            (BitEnc::from_bytes(b"AAAA").expect("valid DNA sequence"), 10),
+            (BitEnc::from_bytes(b"AAAT").expect("valid DNA sequence"), 5), // 1 edit from AAAA
+            (BitEnc::from_bytes(b"TTTT").expect("valid DNA sequence"), 3), // 4 edits from AAAA
         ];
 
         let edges = discover_edges_parallel_k1(&umis);
@@ -872,9 +872,9 @@ mod tests {
     #[test]
     fn test_discover_edges_parallel_k2() {
         let umis = vec![
-            (BitEnc::from_bytes(b"AAAA").unwrap(), 10),
-            (BitEnc::from_bytes(b"AATT").unwrap(), 5), // 2 edits from AAAA
-            (BitEnc::from_bytes(b"TTTT").unwrap(), 3), // 4 edits from AAAA, 2 from AATT
+            (BitEnc::from_bytes(b"AAAA").expect("valid DNA sequence"), 10),
+            (BitEnc::from_bytes(b"AATT").expect("valid DNA sequence"), 5), // 2 edits from AAAA
+            (BitEnc::from_bytes(b"TTTT").expect("valid DNA sequence"), 3), // 4 edits from AAAA, 2 from AATT
         ];
 
         let edges = discover_edges_parallel_k(&umis, 2);
@@ -889,9 +889,9 @@ mod tests {
     fn test_discover_edges_parallel_chain() {
         // Test A-B-C chain where A~B and B~C
         let umis = vec![
-            (BitEnc::from_bytes(b"AAAA").unwrap(), 10),
-            (BitEnc::from_bytes(b"AAAT").unwrap(), 5), // 1 edit from AAAA
-            (BitEnc::from_bytes(b"AATT").unwrap(), 3), // 1 edit from AAAT, 2 from AAAA
+            (BitEnc::from_bytes(b"AAAA").expect("valid DNA sequence"), 10),
+            (BitEnc::from_bytes(b"AAAT").expect("valid DNA sequence"), 5), // 1 edit from AAAA
+            (BitEnc::from_bytes(b"AATT").expect("valid DNA sequence"), 3), // 1 edit from AAAT, 2 from AAAA
         ];
 
         let edges = discover_edges_parallel_k1(&umis);

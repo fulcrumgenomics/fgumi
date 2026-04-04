@@ -280,7 +280,9 @@ pub trait Scheduler: Send {
 
         // TN-1 → last exclusive step (if more than one)
         if thread_id == num_threads - 1 && exclusive.len() > 1 {
-            return Some(*exclusive.last().unwrap());
+            return Some(
+                *exclusive.last().expect("exclusive is non-empty because len > 1 was checked"),
+            );
         }
 
         // Interior exclusive steps: assign from both ends

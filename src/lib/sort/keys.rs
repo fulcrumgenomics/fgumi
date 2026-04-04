@@ -969,7 +969,7 @@ mod tests {
         let parsed = PrimaryAlignmentInfo::from_tag_value(&value);
 
         assert!(parsed.is_some());
-        let parsed = parsed.unwrap();
+        let parsed = parsed.expect("parsing should succeed");
         assert_eq!(parsed.tid1, 5);
         assert_eq!(parsed.pos1, 1000);
         assert!(!parsed.neg1);
@@ -994,7 +994,7 @@ mod tests {
 
         let result = PrimaryAlignmentInfo::from_record(&record);
         assert!(result.is_some());
-        let result = result.unwrap();
+        let result = result.expect("result should be Ok");
         assert_eq!(result.tid1, 0);
         assert_eq!(result.pos1, 100);
         assert!(!result.neg1);
@@ -1030,7 +1030,7 @@ mod tests {
 
         let result = PrimaryAlignmentInfo::from_tag_value(&value);
         assert!(result.is_some());
-        let info = result.unwrap();
+        let info = result.expect("result should be Ok");
         assert_eq!(info.tid1, 5);
         assert_eq!(info.pos1, 1000);
         assert!(!info.neg1);
@@ -1063,7 +1063,7 @@ mod tests {
 
         let result = PrimaryAlignmentInfo::from_tag_value(&value);
         assert!(result.is_some());
-        let info = result.unwrap();
+        let info = result.expect("result should be Ok");
         assert_eq!(info.tid1, 5);
         assert_eq!(info.pos1, 1000);
     }
@@ -1154,7 +1154,7 @@ mod tests {
         // Verify negative positions survive roundtrip
         let info = PrimaryAlignmentInfo::new(0, -10, false, 0, -5, true);
         let value = info.to_tag_value();
-        let parsed = PrimaryAlignmentInfo::from_tag_value(&value).unwrap();
+        let parsed = PrimaryAlignmentInfo::from_tag_value(&value).expect("parsing should succeed");
 
         assert_eq!(parsed.tid1, 0);
         assert_eq!(parsed.pos1, -10);
@@ -1604,8 +1604,8 @@ mod tests {
                 natural_compare(names[i], names[i + 1]),
                 Ordering::Less,
                 "{} should sort before {}",
-                std::str::from_utf8(names[i]).unwrap(),
-                std::str::from_utf8(names[i + 1]).unwrap(),
+                std::str::from_utf8(names[i]).expect("should be valid UTF-8"),
+                std::str::from_utf8(names[i + 1]).expect("should be valid UTF-8"),
             );
         }
     }
@@ -1621,8 +1621,8 @@ mod tests {
                 natural_compare(names[i], names[i + 1]),
                 Ordering::Less,
                 "{} should sort before {}",
-                std::str::from_utf8(names[i]).unwrap(),
-                std::str::from_utf8(names[i + 1]).unwrap(),
+                std::str::from_utf8(names[i]).expect("should be valid UTF-8"),
+                std::str::from_utf8(names[i + 1]).expect("should be valid UTF-8"),
             );
         }
     }
@@ -2104,10 +2104,11 @@ mod tests {
     fn test_lex_key_serialization_roundtrip() {
         let key = RawQuerynameLexKey::new(b"test_read".to_vec(), 42);
         let mut buf = Vec::new();
-        key.write_to(&mut buf).unwrap();
+        key.write_to(&mut buf).expect("write_to should succeed");
 
         let mut cursor = std::io::Cursor::new(&buf);
-        let restored = RawQuerynameLexKey::read_from(&mut cursor).unwrap();
+        let restored =
+            RawQuerynameLexKey::read_from(&mut cursor).expect("read_from should succeed");
         assert_eq!(key, restored);
     }
 

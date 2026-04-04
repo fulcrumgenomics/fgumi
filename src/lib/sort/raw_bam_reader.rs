@@ -405,8 +405,8 @@ mod tests {
         let mut compressed = Vec::new();
         {
             let mut writer = noodles_bgzf::io::Writer::new(&mut compressed);
-            writer.write_all(&raw_bam).unwrap();
-            writer.finish().unwrap();
+            writer.write_all(&raw_bam).expect("failed to write raw BAM data to BGZF");
+            writer.finish().expect("failed to finish BGZF writer");
         }
         compressed
     }
@@ -446,8 +446,8 @@ mod tests {
         let mut compressed = Vec::new();
         {
             let mut writer = noodles_bgzf::io::Writer::new(&mut compressed);
-            writer.write_all(b"NOT_BAM!").unwrap();
-            writer.finish().unwrap();
+            writer.write_all(b"NOT_BAM!").expect("failed to write non-BAM data to BGZF");
+            writer.finish().expect("failed to finish BGZF writer for invalid magic test");
         }
         let result = RawBamRecordReader::new(io::Cursor::new(compressed));
         let Err(err) = result else { panic!("Expected error for invalid magic") };
@@ -462,7 +462,7 @@ mod tests {
         {
             let writer = noodles_bgzf::io::Writer::new(&mut compressed);
             // Write nothing, just finish to produce the EOF block
-            writer.finish().unwrap();
+            writer.finish().expect("failed to finish BGZF writer for empty input test");
         }
         let result = RawBamRecordReader::new(io::Cursor::new(compressed));
         let Err(err) = result else { panic!("Expected error for empty input") };
@@ -478,15 +478,18 @@ mod tests {
         let header_text = "@HD\tVN:1.6\n";
         let refs = vec![("chr1", 1000u32), ("chr2", 2000u32)];
         let data = build_test_bam(header_text, &refs, &[]);
-        let mut reader = RawBamRecordReader::new(io::Cursor::new(data)).unwrap();
-        let header_bytes = reader.skip_header().unwrap();
+        let mut reader = RawBamRecordReader::new(io::Cursor::new(data))
+            .expect("failed to create reader for valid BAM");
+        let header_bytes = reader.skip_header().expect("failed to skip BAM header");
 
         // The header_bytes should contain l_text + header_text + n_ref + ref data
         // Verify we can parse it back
         assert!(!header_bytes.is_empty());
 
         // First 4 bytes: l_text
-        let l_text = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()) as usize;
+        let l_text = u32::from_le_bytes(
+            header_bytes[0..4].try_into().expect("header_bytes too short for l_text"),
+        ) as usize;
         assert_eq!(l_text, header_text.len());
 
         // Then header text
@@ -495,15 +498,18 @@ mod tests {
 
         // Then n_ref
         let offset = 4 + l_text;
-        let n_ref = u32::from_le_bytes(header_bytes[offset..offset + 4].try_into().unwrap());
+        let n_ref = u32::from_le_bytes(
+            header_bytes[offset..offset + 4].try_into().expect("header_bytes too short for n_ref"),
+        );
         assert_eq!(n_ref, 2);
     }
 
     #[test]
     fn test_skip_header_twice_errors() {
         let data = build_test_bam("@HD\tVN:1.6\n", &[], &[]);
-        let mut reader = RawBamRecordReader::new(io::Cursor::new(data)).unwrap();
-        reader.skip_header().unwrap();
+        let mut reader = RawBamRecordReader::new(io::Cursor::new(data))
+            .expect("failed to create reader for skip_header test");
+        reader.skip_header().expect("first skip_header should succeed");
         let result = reader.skip_header();
         assert!(result.is_err());
         assert!(
@@ -515,7 +521,8 @@ mod tests {
     #[test]
     fn test_next_record_without_skip_header_errors() {
         let data = build_test_bam("@HD\tVN:1.6\n", &[], &[]);
-        let mut reader = RawBamRecordReader::new(io::Cursor::new(data)).unwrap();
+        let mut reader = RawBamRecordReader::new(io::Cursor::new(data))
+            .expect("failed to create reader for next_record test");
         let result = reader.next_record();
         assert!(result.is_err());
         assert!(
@@ -528,16 +535,17 @@ mod tests {
     fn test_read_single_record() {
         let rec = make_minimal_record(b"R");
         let data = build_test_bam("@HD\tVN:1.6\n", &[], std::slice::from_ref(&rec));
-        let mut reader = RawBamRecordReader::new(io::Cursor::new(data)).unwrap();
-        reader.skip_header().unwrap();
+        let mut reader = RawBamRecordReader::new(io::Cursor::new(data))
+            .expect("failed to create reader for single record test");
+        reader.skip_header().expect("failed to skip header");
 
-        let record = reader.next_record().unwrap();
+        let record = reader.next_record().expect("failed to read first record");
         assert!(record.is_some(), "Expected one record");
-        let record = record.unwrap();
+        let record = record.expect("record should be Some");
         assert_eq!(record, rec, "Record bytes should match");
 
         // No more records
-        let eof = reader.next_record().unwrap();
+        let eof = reader.next_record().expect("failed to read at EOF");
         assert!(eof.is_none(), "Expected EOF after single record");
     }
 
@@ -548,18 +556,19 @@ mod tests {
         let rec_c = make_minimal_record(b"C");
         let data =
             build_test_bam("@HD\tVN:1.6\n", &[], &[rec_a.clone(), rec_b.clone(), rec_c.clone()]);
-        let mut reader = RawBamRecordReader::new(io::Cursor::new(data)).unwrap();
-        reader.skip_header().unwrap();
+        let mut reader = RawBamRecordReader::new(io::Cursor::new(data))
+            .expect("failed to create reader for multiple records test");
+        reader.skip_header().expect("failed to skip header");
 
-        let r1 = reader.next_record().unwrap().expect("record 1");
-        let r2 = reader.next_record().unwrap().expect("record 2");
-        let r3 = reader.next_record().unwrap().expect("record 3");
+        let r1 = reader.next_record().expect("failed to read record 1").expect("record 1");
+        let r2 = reader.next_record().expect("failed to read record 2").expect("record 2");
+        let r3 = reader.next_record().expect("failed to read record 3").expect("record 3");
 
         assert_eq!(r1, rec_a);
         assert_eq!(r2, rec_b);
         assert_eq!(r3, rec_c);
 
-        assert!(reader.next_record().unwrap().is_none(), "Expected EOF");
+        assert!(reader.next_record().expect("failed to read at EOF").is_none(), "Expected EOF");
     }
 
     #[test]
@@ -567,10 +576,12 @@ mod tests {
         let rec_a = make_minimal_record(b"X");
         let rec_b = make_minimal_record(b"Y");
         let data = build_test_bam("@HD\tVN:1.6\n", &[], &[rec_a.clone(), rec_b.clone()]);
-        let mut reader = RawBamRecordReader::new(io::Cursor::new(data)).unwrap();
-        reader.skip_header().unwrap();
+        let mut reader = RawBamRecordReader::new(io::Cursor::new(data))
+            .expect("failed to create reader for iterator test");
+        reader.skip_header().expect("failed to skip header");
 
-        let records: Vec<Vec<u8>> = reader.map(|r| r.unwrap()).collect();
+        let records: Vec<Vec<u8>> =
+            reader.map(|r| r.expect("failed to read record via iterator")).collect();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], rec_a);
         assert_eq!(records[1], rec_b);
@@ -583,46 +594,58 @@ mod tests {
         let rec_c = make_minimal_record(b"C");
         let data =
             build_test_bam("@HD\tVN:1.6\n", &[], &[rec_a.clone(), rec_b.clone(), rec_c.clone()]);
-        let mut reader = BatchedRawBamReader::new(io::Cursor::new(data), 2).unwrap();
-        reader.skip_header().unwrap();
+        let mut reader = BatchedRawBamReader::new(io::Cursor::new(data), 2)
+            .expect("failed to create batched reader");
+        reader.skip_header().expect("failed to skip header");
 
         // First batch: 2 records
-        let batch1 = reader.next_batch().unwrap().expect("batch 1");
+        let batch1 = reader.next_batch().expect("failed to read batch 1").expect("batch 1");
         assert_eq!(batch1.len(), 2);
         assert_eq!(batch1[0], rec_a);
         assert_eq!(batch1[1], rec_b);
 
         // Second batch: 1 record (remainder)
-        let batch2 = reader.next_batch().unwrap().expect("batch 2");
+        let batch2 = reader.next_batch().expect("failed to read batch 2").expect("batch 2");
         assert_eq!(batch2.len(), 1);
         assert_eq!(batch2[0], rec_c);
 
         // No more batches
-        assert!(reader.next_batch().unwrap().is_none(), "Expected no more batches");
+        assert!(
+            reader.next_batch().expect("failed to read at end of batches").is_none(),
+            "Expected no more batches"
+        );
     }
 
     #[test]
     fn test_from_buf_reader() {
         let data = build_test_bam("@HD\tVN:1.6\n", &[("chr1", 500)], &[]);
         let buf_reader = BufReader::new(io::Cursor::new(data));
-        let mut reader = RawBamRecordReader::from_buf_reader(buf_reader).unwrap();
-        let header_bytes = reader.skip_header().unwrap();
+        let mut reader = RawBamRecordReader::from_buf_reader(buf_reader)
+            .expect("failed to create reader from BufReader");
+        let header_bytes = reader.skip_header().expect("failed to skip header");
         assert!(!header_bytes.is_empty());
 
         // Verify no records
-        assert!(reader.next_record().unwrap().is_none());
+        assert!(reader.next_record().expect("failed to read at EOF").is_none());
     }
 
     #[test]
     fn test_batched_reader_eof() {
         let data = build_test_bam("@HD\tVN:1.6\n", &[], &[]);
-        let mut reader = BatchedRawBamReader::new(io::Cursor::new(data), 10).unwrap();
-        reader.skip_header().unwrap();
+        let mut reader = BatchedRawBamReader::new(io::Cursor::new(data), 10)
+            .expect("failed to create batched reader for empty BAM");
+        reader.skip_header().expect("failed to skip header");
 
         // No records, should return None immediately
-        assert!(reader.next_batch().unwrap().is_none(), "Expected None for empty BAM");
+        assert!(
+            reader.next_batch().expect("failed to read first batch").is_none(),
+            "Expected None for empty BAM"
+        );
 
         // Calling again should still return None
-        assert!(reader.next_batch().unwrap().is_none(), "Expected None on repeated call");
+        assert!(
+            reader.next_batch().expect("failed to read second batch").is_none(),
+            "Expected None on repeated call"
+        );
     }
 }

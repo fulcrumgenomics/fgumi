@@ -290,8 +290,9 @@ mod tests {
 
     #[test]
     fn test_validate_file_exists_valid() {
-        let temp_file = NamedTempFile::new().unwrap();
-        validate_file_exists(temp_file.path(), "Test file").unwrap();
+        let temp_file = NamedTempFile::new().expect("creating temp file/dir should succeed");
+        validate_file_exists(temp_file.path(), "Test file")
+            .expect("file validation should succeed");
     }
 
     #[test]
@@ -305,18 +306,18 @@ mod tests {
 
     #[test]
     fn test_validate_files_exist_all_valid() {
-        let temp1 = NamedTempFile::new().unwrap();
-        let temp2 = NamedTempFile::new().unwrap();
+        let temp1 = NamedTempFile::new().expect("creating temp file/dir should succeed");
+        let temp2 = NamedTempFile::new().expect("creating temp file/dir should succeed");
 
         let files =
             vec![(temp1.path().to_path_buf(), "File 1"), (temp2.path().to_path_buf(), "File 2")];
 
-        validate_files_exist(&files).unwrap();
+        validate_files_exist(&files).expect("file validation should succeed");
     }
 
     #[test]
     fn test_validate_files_exist_one_invalid() {
-        let temp1 = NamedTempFile::new().unwrap();
+        let temp1 = NamedTempFile::new().expect("creating temp file/dir should succeed");
 
         let files = vec![
             (temp1.path().to_path_buf(), "File 1"),
@@ -345,7 +346,11 @@ mod tests {
         let result = validate_tag(input, "test tag");
         if should_succeed {
             assert!(result.is_ok(), "Failed for: {description}");
-            assert_eq!(result.unwrap(), expected.unwrap(), "Failed for: {description}");
+            assert_eq!(
+                result.expect("result should be Ok"),
+                expected.expect("result should be Ok"),
+                "Failed for: {description}"
+            );
         } else {
             assert!(result.is_err(), "Should have failed for: {description}");
             let err_msg = result.unwrap_err().to_string();
@@ -373,7 +378,7 @@ mod tests {
     fn test_optional_string_to_tag_some_valid() -> Result<()> {
         let tag = optional_string_to_tag(Some("CB"), "cell tag")?;
         assert!(tag.is_some());
-        assert_eq!(tag.unwrap(), Tag::from([b'C', b'B']));
+        assert_eq!(tag.expect("tag should be valid"), Tag::from([b'C', b'B']));
         Ok(())
     }
 

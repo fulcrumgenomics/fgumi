@@ -165,7 +165,7 @@ pub(crate) fn make_reader_semaphore(threads: usize) -> Arc<ChunkReaderSemaphore>
     let limit = threads.max(1);
     let (tx, rx) = bounded(limit);
     for _ in 0..limit {
-        tx.send(()).unwrap();
+        tx.send(()).expect("semaphore channel must not be disconnected during initialization");
     }
     Arc::new((tx, rx))
 }
@@ -269,8 +269,9 @@ impl<K: RawSortKey> GenericKeyedChunkWriter<K> {
         } else {
             // Single-threaded BGZF with specified compression level
             #[allow(clippy::cast_possible_truncation)]
-            let level = CompressionLevel::new(compression_level as u8)
-                .unwrap_or_else(|| CompressionLevel::new(6).unwrap());
+            let level = CompressionLevel::new(compression_level as u8).unwrap_or_else(|| {
+                CompressionLevel::new(6).expect("compression level 6 is always valid")
+            });
             let writer = noodles_bgzf::io::writer::Builder::default()
                 .set_compression_level(level)
                 .build_from_writer(buf);
@@ -2011,7 +2012,7 @@ mod tests {
         let lookup = LibraryLookup::from_header(&header);
         assert_eq!(lookup.rg_to_ordinal.len(), 1);
         // LibA is the only library, so it gets ordinal 1 (0 is reserved for empty/unknown)
-        assert_eq!(*lookup.rg_to_ordinal.get(b"rg1".as_slice()).unwrap(), 1);
+        assert_eq!(*lookup.rg_to_ordinal.get(b"rg1".as_slice()).expect("unexpected failure"), 1);
     }
 
     #[test]
@@ -2039,9 +2040,12 @@ mod tests {
         assert_eq!(lookup.rg_to_ordinal.len(), 3);
 
         // Libraries sorted alphabetically: LibA=1, LibB=2, LibC=3
-        assert_eq!(*lookup.rg_to_ordinal.get(b"rg2".as_slice()).unwrap(), 1); // LibA
-        assert_eq!(*lookup.rg_to_ordinal.get(b"rg3".as_slice()).unwrap(), 2); // LibB
-        assert_eq!(*lookup.rg_to_ordinal.get(b"rg1".as_slice()).unwrap(), 3); // LibC
+        let rg2 = *lookup.rg_to_ordinal.get(b"rg2".as_slice()).expect("rg2");
+        let rg3 = *lookup.rg_to_ordinal.get(b"rg3".as_slice()).expect("rg3");
+        let rg1 = *lookup.rg_to_ordinal.get(b"rg1".as_slice()).expect("rg1");
+        assert_eq!(rg2, 1); // LibA
+        assert_eq!(rg3, 2); // LibB
+        assert_eq!(rg1, 3); // LibC
     }
 
     #[test]
@@ -2359,7 +2363,7 @@ mod tests {
     /// Count records in a BAM file by reading with the raw BAM reader.
     fn count_bam_records(path: &std::path::Path) -> u64 {
         use crate::sort::read_ahead::RawReadAheadReader;
-        let (reader, _) = create_raw_bam_reader(path, 1).unwrap();
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader).count() as u64
     }
 
@@ -2391,10 +2395,10 @@ mod tests {
                 .build();
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let input = dir.path().join("input.bam");
         let output = dir.path().join("output.bam");
-        builder.write_bam(&input).unwrap();
+        builder.write_bam(&input).expect("failed to write BAM");
 
         // Tiny memory limit forces many chunks; low max_temp_files triggers consolidation
         let stats = RawExternalSorter::new(sort_order)
@@ -2404,7 +2408,7 @@ mod tests {
             .output_compression(0)
             .write_index(write_index)
             .sort(&input, &output)
-            .unwrap();
+            .expect("unexpected failure");
 
         assert!(
             stats.chunks_written >= 5,
@@ -2438,10 +2442,10 @@ mod tests {
                 .build();
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let input = dir.path().join("input.bam");
         let output = dir.path().join("output.bam");
-        builder.write_bam(&input).unwrap();
+        builder.write_bam(&input).expect("failed to write BAM");
 
         // Small memory limit + many records = guaranteed spill to multiple chunks
         // (no consolidation, so the semaphore must cap concurrent readers)
@@ -2452,7 +2456,7 @@ mod tests {
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output)
-            .unwrap();
+            .expect("unexpected failure");
 
         assert!(
             stats.chunks_written >= 2,
@@ -2489,11 +2493,11 @@ mod tests {
                 .build();
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let input = dir.path().join("input.bam");
         let output_st = dir.path().join("output_1t.bam");
         let output_mt = dir.path().join("output_2t.bam");
-        builder.write_bam(&input).unwrap();
+        builder.write_bam(&input).expect("failed to write BAM");
 
         // Sort single-threaded
         RawExternalSorter::new(sort_order)
@@ -2502,7 +2506,7 @@ mod tests {
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_st)
-            .unwrap();
+            .expect("unexpected failure");
 
         // Sort multi-threaded (exercises par_sort_into_chunks / par_chunks_mut)
         RawExternalSorter::new(sort_order)
@@ -2511,7 +2515,7 @@ mod tests {
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_mt)
-            .unwrap();
+            .expect("unexpected failure");
 
         let names_st = collect_read_names(&output_st);
         let names_mt = collect_read_names(&output_mt);
@@ -2544,10 +2548,10 @@ mod tests {
                 .build();
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let input = dir.path().join("input.bam");
         let output = dir.path().join("output.bam");
-        builder.write_bam(&input).unwrap();
+        builder.write_bam(&input).expect("failed to write BAM");
 
         // Large memory limit so everything stays in memory (no spill chunks).
         RawExternalSorter::new(sort_order)
@@ -2555,7 +2559,7 @@ mod tests {
             .threads(2)
             .output_compression(0)
             .sort(&input, &output)
-            .unwrap();
+            .expect("unexpected failure");
 
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
@@ -2590,19 +2594,22 @@ mod tests {
         }
         let unsorted = dir.join(format!("{prefix}_unsorted.bam"));
         let sorted = dir.join(format!("{prefix}_sorted.bam"));
-        builder.write_bam(&unsorted).unwrap();
-        RawExternalSorter::new(sort_order).output_compression(0).sort(&unsorted, &sorted).unwrap();
+        builder.write_bam(&unsorted).expect("failed to write BAM");
+        RawExternalSorter::new(sort_order)
+            .output_compression(0)
+            .sort(&unsorted, &sorted)
+            .expect("sort should succeed");
         (sorted, names)
     }
 
     /// Collect all read names from a BAM file as strings.
     fn collect_read_names(path: &Path) -> Vec<String> {
         use crate::sort::read_ahead::RawReadAheadReader;
-        let (reader, _) = create_raw_bam_reader(path, 1).unwrap();
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader)
             .map(|rec| {
                 let name_bytes = fgumi_raw_bam::fields::read_name(rec.as_ref());
-                String::from_utf8(name_bytes.to_vec()).unwrap()
+                String::from_utf8(name_bytes.to_vec()).expect("read name should be valid UTF-8")
             })
             .collect()
     }
@@ -2610,7 +2617,7 @@ mod tests {
     /// Collect (`ref_id`, pos) tuples for every record in a BAM.
     fn collect_positions(path: &Path) -> Vec<(i32, i32)> {
         use crate::sort::read_ahead::RawReadAheadReader;
-        let (reader, _) = create_raw_bam_reader(path, 1).unwrap();
+        let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader)
             .map(|rec| {
                 let bytes = rec.as_ref();
@@ -2626,7 +2633,7 @@ mod tests {
 
     #[test]
     fn test_merge_bams_coordinate_sort() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, SortOrder::Coordinate);
         let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, SortOrder::Coordinate);
 
@@ -2635,7 +2642,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Coordinate)
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .unwrap();
+            .expect("unexpected failure");
 
         // 10 pairs * 2 records * 2 inputs = 40
         assert_eq!(count, 40);
@@ -2650,7 +2657,7 @@ mod tests {
 
     #[test]
     fn test_merge_bams_template_coordinate_sort() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, SortOrder::TemplateCoordinate);
         let (bam_b, _) =
             create_sorted_bam(dir.path(), "b", 10, 10_000, SortOrder::TemplateCoordinate);
@@ -2660,7 +2667,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::TemplateCoordinate)
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .unwrap();
+            .expect("unexpected failure");
 
         assert_eq!(count, 40);
         assert_eq!(count_bam_records(&merged), 40);
@@ -2668,7 +2675,7 @@ mod tests {
 
     #[test]
     fn test_merge_bams_queryname_sort() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let (bam_a, _) = create_sorted_bam(
             dir.path(),
             "a",
@@ -2689,7 +2696,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()))
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .unwrap();
+            .expect("unexpected failure");
 
         assert_eq!(count, 40);
         assert_eq!(count_bam_records(&merged), 40);
@@ -2703,7 +2710,7 @@ mod tests {
 
     #[test]
     fn test_merge_bams_single_input() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let (bam_a, _) = create_sorted_bam(dir.path(), "a", 15, 0, SortOrder::Coordinate);
 
         let merged = dir.path().join("merged.bam");
@@ -2711,7 +2718,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Coordinate)
             .output_compression(0)
             .merge_bams(&[bam_a], &header, &merged)
-            .unwrap();
+            .expect("unexpected failure");
 
         // 15 pairs * 2 = 30
         assert_eq!(count, 30);
@@ -2720,7 +2727,7 @@ mod tests {
 
     #[test]
     fn test_merge_bams_preserves_all_records() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let (bam_a, names_a) = create_sorted_bam(
             dir.path(),
             "a",
@@ -2741,7 +2748,7 @@ mod tests {
         RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()))
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .unwrap();
+            .expect("unexpected failure");
 
         let merged_names: std::collections::HashSet<String> =
             collect_read_names(&merged).into_iter().collect();
@@ -2754,7 +2761,7 @@ mod tests {
 
     #[test]
     fn test_merge_bams_many_inputs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
         let k = 8;
         let pairs_per_input = 5;
         let mut inputs = Vec::with_capacity(k);
@@ -2775,7 +2782,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Coordinate)
             .output_compression(0)
             .merge_bams(&inputs, &header, &merged)
-            .unwrap();
+            .expect("unexpected failure");
 
         let expected = (k * pairs_per_input * 2) as u64; // 8 * 5 * 2 = 80
         assert_eq!(count, expected);

@@ -330,7 +330,7 @@ mod tests {
         let samples: Vec<usize> = (0..1000).map(|_| dist.sample(&mut rng, 1)).collect();
 
         // With high variance, we should see a range of sizes
-        let max = *samples.iter().max().unwrap();
+        let max = *samples.iter().max().expect("samples should not be empty");
         assert!(max > 10, "Expected some large family sizes with high variance");
     }
 
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_empirical_empty_file() {
-        let temp = NamedTempFile::new().unwrap();
+        let temp = NamedTempFile::new().expect("creating temp file/dir should succeed");
 
         let result = FamilySizeDistribution::from_histogram(temp.path());
         assert!(result.is_err());
@@ -447,8 +447,8 @@ mod tests {
 
     #[test]
     fn test_empirical_header_only() {
-        let mut temp = NamedTempFile::new().unwrap();
-        writeln!(temp, "family_size\tcount").unwrap();
+        let mut temp = NamedTempFile::new().expect("creating temp file/dir should succeed");
+        writeln!(temp, "family_size\tcount").expect("writeln should succeed");
 
         let result = FamilySizeDistribution::from_histogram(temp.path());
         assert!(result.is_err());

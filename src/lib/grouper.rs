@@ -1021,8 +1021,15 @@ impl FastqGrouper {
             // Validate names match and get base_name (in block so names is dropped before pop)
             let base_name = {
                 // Peek at the first record from each stream
-                let names: Vec<_> =
-                    self.pending_records.iter().map(|q| &q.front().unwrap().name).collect();
+                let names: Vec<_> = self
+                    .pending_records
+                    .iter()
+                    .map(|q| {
+                        &q.front()
+                            .expect("pending queue must be non-empty inside all-non-empty loop")
+                            .name
+                    })
+                    .collect();
 
                 // Copy base_name immediately
                 let base_name = strip_read_suffix(names[0]).to_vec();
@@ -1047,8 +1054,14 @@ impl FastqGrouper {
             };
 
             // Pop records from all streams
-            let records: Vec<_> =
-                self.pending_records.iter_mut().map(|q| q.pop_front().unwrap()).collect();
+            let records: Vec<_> = self
+                .pending_records
+                .iter_mut()
+                .map(|q| {
+                    q.pop_front()
+                        .expect("pending queue must be non-empty inside all-non-empty loop")
+                })
+                .collect();
 
             templates.push(FastqTemplate { name: base_name, records });
         }
@@ -1112,7 +1125,7 @@ mod tests {
         let mut grouper = SingleRecordGrouper::new();
         assert!(!grouper.has_pending());
 
-        let result = grouper.finish().unwrap();
+        let result = grouper.finish().expect("finish should succeed");
         assert!(result.is_none());
     }
 
@@ -1121,7 +1134,7 @@ mod tests {
         let mut grouper = SingleRawRecordGrouper::new();
         assert!(!grouper.has_pending());
 
-        let result = grouper.finish().unwrap();
+        let result = grouper.finish().expect("finish should succeed");
         assert!(result.is_none());
     }
 
@@ -1137,7 +1150,7 @@ mod tests {
             DecodedRecord::from_raw_bytes(raw2.clone(), GroupKey::default()),
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0], raw1);
         assert_eq!(groups[1], raw2);
@@ -1160,7 +1173,8 @@ mod tests {
     #[test]
     fn test_parse_single_fastq_record() {
         let data = b"@read1\nACGT\n+\nIIII\n";
-        let (record, consumed) = parse_single_fastq_record(data).unwrap();
+        let (record, consumed) =
+            parse_single_fastq_record(data).expect("parse single FASTQ record");
         assert_eq!(record.name, b"read1");
         assert_eq!(record.sequence, b"ACGT");
         assert_eq!(record.quality, b"IIII");
@@ -1170,7 +1184,7 @@ mod tests {
     #[test]
     fn test_parse_fastq_records_multiple() {
         let data = b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nJJJJ\n";
-        let (records, leftover) = parse_fastq_records(data).unwrap();
+        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name, b"read1");
         assert_eq!(records[1].name, b"read2");
@@ -1180,7 +1194,7 @@ mod tests {
     #[test]
     fn test_parse_fastq_incomplete_record() {
         let data = b"@read1\nACGT\n+\n";
-        let (records, leftover) = parse_fastq_records(data).unwrap();
+        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
         assert!(records.is_empty());
         assert_eq!(leftover, data);
     }
@@ -1188,7 +1202,7 @@ mod tests {
     #[test]
     fn test_parse_fastq_with_leftover() {
         let data = b"@read1\nACGT\n+\nIIII\n@read2\nTG";
-        let (records, leftover) = parse_fastq_records(data).unwrap();
+        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, b"read1");
         assert_eq!(leftover, b"@read2\nTG");
@@ -1209,11 +1223,16 @@ mod tests {
         let mut grouper = FastqGrouper::new(2);
 
         // Add R1 record
-        grouper.add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n").unwrap();
+        grouper
+            .add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n")
+            .expect("add_bytes_for_stream failed");
         // Add R2 record
-        grouper.add_bytes_for_stream(1, b"@read1/2\nTGCA\n+\nJJJJ\n").unwrap();
+        grouper
+            .add_bytes_for_stream(1, b"@read1/2\nTGCA\n+\nJJJJ\n")
+            .expect("add_bytes_for_stream failed");
 
-        let templates = grouper.drain_complete_templates().unwrap();
+        let templates =
+            grouper.drain_complete_templates().expect("drain_complete_templates failed");
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].name, b"read1");
         assert_eq!(templates[0].records.len(), 2);
@@ -1228,13 +1247,14 @@ mod tests {
         // Add multiple R1 records
         grouper
             .add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n@read2/1\nAAAA\n+\nIIII\n")
-            .unwrap();
+            .expect("unexpected failure");
         // Add multiple R2 records
         grouper
             .add_bytes_for_stream(1, b"@read1/2\nTGCA\n+\nJJJJ\n@read2/2\nTTTT\n+\nJJJJ\n")
-            .unwrap();
+            .expect("unexpected failure");
 
-        let templates = grouper.drain_complete_templates().unwrap();
+        let templates =
+            grouper.drain_complete_templates().expect("drain_complete_templates failed");
         assert_eq!(templates.len(), 2);
         assert_eq!(templates[0].name, b"read1");
         assert_eq!(templates[1].name, b"read2");
@@ -1245,24 +1265,30 @@ mod tests {
         let mut grouper = FastqGrouper::new(2);
 
         // Add R1 record only
-        grouper.add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n").unwrap();
+        grouper
+            .add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n")
+            .expect("add_bytes_for_stream failed");
 
         // No complete templates yet
-        let templates = grouper.drain_complete_templates().unwrap();
+        let templates =
+            grouper.drain_complete_templates().expect("drain_complete_templates failed");
         assert!(templates.is_empty());
         assert!(grouper.has_pending());
 
         // Now add R2 record
-        grouper.add_bytes_for_stream(1, b"@read1/2\nTGCA\n+\nJJJJ\n").unwrap();
+        grouper
+            .add_bytes_for_stream(1, b"@read1/2\nTGCA\n+\nJJJJ\n")
+            .expect("add_bytes_for_stream failed");
 
-        let templates = grouper.drain_complete_templates().unwrap();
+        let templates =
+            grouper.drain_complete_templates().expect("drain_complete_templates failed");
         assert_eq!(templates.len(), 1);
     }
 
     #[test]
     fn test_fastq_grouper_finish_empty() {
         let mut grouper = FastqGrouper::new(2);
-        let result = grouper.finish().unwrap();
+        let result = grouper.finish().expect("finish should succeed");
         assert!(result.is_none());
     }
 
@@ -1271,8 +1297,12 @@ mod tests {
         let mut grouper = FastqGrouper::new(2);
 
         // Add mismatched records
-        grouper.add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n").unwrap();
-        grouper.add_bytes_for_stream(1, b"@read2/2\nTGCA\n+\nJJJJ\n").unwrap();
+        grouper
+            .add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n")
+            .expect("add_bytes_for_stream failed");
+        grouper
+            .add_bytes_for_stream(1, b"@read2/2\nTGCA\n+\nJJJJ\n")
+            .expect("add_bytes_for_stream failed");
 
         let result = grouper.drain_complete_templates();
         assert!(result.is_err());
@@ -1325,7 +1355,7 @@ mod tests {
     fn test_record_position_grouper_empty() {
         let mut grouper = RecordPositionGrouper::new();
         assert!(!grouper.has_pending());
-        let result = grouper.finish().unwrap();
+        let result = grouper.finish().expect("finish should succeed");
         assert!(result.is_none());
     }
 
@@ -1335,11 +1365,12 @@ mod tests {
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
         let decoded = make_decoded(key, false, false, None);
 
-        let groups = grouper.add_records(vec![decoded]).unwrap();
+        let groups = grouper.add_records(vec![decoded]).expect("add_records should succeed");
         assert!(groups.is_empty()); // Not emitted yet
         assert!(grouper.has_pending());
 
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 1);
         assert_eq!(final_group.group_key.ref_id1, 0);
         assert_eq!(final_group.group_key.pos1, 100);
@@ -1358,10 +1389,11 @@ mod tests {
             make_decoded(key3, true, true, Some("4M")),
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         assert!(groups.is_empty()); // All same position — not emitted yet
 
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 3);
     }
 
@@ -1378,7 +1410,7 @@ mod tests {
             make_decoded(key_pos3, false, false, None),
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         // First two positions emitted when boundary detected
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].group_key.pos1, 100);
@@ -1387,7 +1419,8 @@ mod tests {
         assert_eq!(groups[1].records.len(), 1);
 
         // Third position still pending
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.group_key.pos1, 300);
     }
 
@@ -1401,10 +1434,11 @@ mod tests {
             make_secondary_decoded(11111), // Should be skipped
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         assert!(groups.is_empty());
 
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 1); // Only primary kept
     }
 
@@ -1423,10 +1457,11 @@ mod tests {
             make_decoded(r2_key, true, false, Some("4M")),
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         assert!(groups.is_empty()); // Same position — all in one group
 
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 2);
     }
 
@@ -1452,12 +1487,13 @@ mod tests {
             make_decoded(key6, false, false, None),
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].records.len(), 3);
         assert_eq!(groups[1].records.len(), 2);
 
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 1);
     }
 
@@ -1503,11 +1539,12 @@ mod tests {
         // Verify position keys differ (this is the bug scenario)
         assert_ne!(r1_key.position_key(), r2_key.position_key());
 
-        let groups = grouper.add_records(vec![r1, r2]).unwrap();
+        let groups = grouper.add_records(vec![r1, r2]).expect("add_records should succeed");
         // Both should be in the same group — no emission yet
         assert!(groups.is_empty());
 
-        let final_group = grouper.finish().unwrap().expect("should emit final group");
+        let final_group =
+            grouper.finish().expect("finish should succeed").expect("should emit final group");
         assert_eq!(final_group.records.len(), 2, "R1 and R2 should be in the same group");
         assert_eq!(final_group.group_key.ref_id1, 5, "Group key should use R1's position");
     }
@@ -1525,7 +1562,7 @@ mod tests {
             make_decoded(r2_key, false, false, None),
         ];
 
-        let groups = grouper.add_records(records).unwrap();
+        let groups = grouper.add_records(records).expect("add_records should succeed");
         // Position boundary with different name_hash → group emitted
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].records.len(), 1);
@@ -1602,7 +1639,7 @@ mod tests {
 
     #[test]
     fn test_build_templates_empty() {
-        let result = build_templates_from_records(vec![]).unwrap();
+        let result = build_templates_from_records(vec![]).expect("build templates from records");
         assert!(result.is_empty());
     }
 
@@ -1622,7 +1659,8 @@ mod tests {
             .build();
         let decoded = DecodedRecord::new(record, key);
 
-        let templates = build_templates_from_records(vec![decoded]).unwrap();
+        let templates =
+            build_templates_from_records(vec![decoded]).expect("build templates from records");
         assert_eq!(templates.len(), 1);
     }
 
@@ -1659,7 +1697,8 @@ mod tests {
             r2_key,
         );
 
-        let templates = build_templates_from_records(vec![r1, r2]).unwrap();
+        let templates =
+            build_templates_from_records(vec![r1, r2]).expect("build templates from records");
         assert_eq!(templates.len(), 1);
     }
 
@@ -1706,7 +1745,8 @@ mod tests {
             ),
         ];
 
-        let templates = build_templates_from_records(records).unwrap();
+        let templates =
+            build_templates_from_records(records).expect("build templates from records");
         assert_eq!(templates.len(), 3);
     }
 
@@ -1729,7 +1769,8 @@ mod tests {
         );
         let decoded = DecodedRecord::from_raw_bytes(raw, key);
 
-        let templates = build_templates_from_records(vec![decoded]).unwrap();
+        let templates =
+            build_templates_from_records(vec![decoded]).expect("build templates from records");
         assert_eq!(templates.len(), 1);
     }
 
@@ -1769,7 +1810,8 @@ mod tests {
         let records =
             vec![DecodedRecord::from_raw_bytes(r1, key1), DecodedRecord::from_raw_bytes(r2, key2)];
 
-        let templates = build_templates_from_records(records).unwrap();
+        let templates =
+            build_templates_from_records(records).expect("build templates from records");
         assert_eq!(templates.len(), 1);
     }
 

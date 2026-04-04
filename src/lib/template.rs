@@ -177,7 +177,7 @@ impl Builder {
             } else if self.r1.is_some() {
                 return Err(anyhow!(
                     "Multiple non-secondary, non-supplemental R1 records for read '{:?}'",
-                    self.name.as_ref().unwrap()
+                    self.name.as_ref().expect("name must be set before adding duplicate R1")
                 ));
             } else {
                 self.r1 = Some(record);
@@ -189,7 +189,7 @@ impl Builder {
         } else if self.r2.is_some() {
             return Err(anyhow!(
                 "Multiple non-secondary, non-supplemental R2 records for read '{:?}'",
-                self.name.as_ref().unwrap()
+                self.name.as_ref().expect("name must be set before adding duplicate R2")
             ));
         } else {
             self.r2 = Some(record);
@@ -1579,7 +1579,7 @@ mod tests {
 
     fn create_test_record(name: &[u8], flags: u16) -> RecordBuf {
         RecordBuilder::new()
-            .name(std::str::from_utf8(name).unwrap())
+            .name(std::str::from_utf8(name).expect("read name should be valid UTF-8"))
             .flags(Flags::from(flags))
             .build()
     }
@@ -1649,7 +1649,7 @@ mod tests {
         let mut builder = Builder::new();
         let r1 = create_test_record(b"read1", 0);
         let r2 = create_test_record(b"read2", 0);
-        builder.push(r1).unwrap();
+        builder.push(r1).expect("failed to push record to builder");
         let result = builder.push(r2);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("mismatch"));
@@ -1660,7 +1660,7 @@ mod tests {
         let mut builder = Builder::new();
         let r1a = create_test_record(b"read1", 0);
         let r1b = create_test_record(b"read1", 0);
-        builder.push(r1a).unwrap();
+        builder.push(r1a).expect("failed to push record to builder");
         let result = builder.push(r1b);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Multiple non-secondary"));
@@ -1671,7 +1671,7 @@ mod tests {
         let mut builder = Builder::new();
         let r2a = create_test_record(b"read1", FLAG_PAIRED | FLAG_READ2);
         let r2b = create_test_record(b"read1", FLAG_PAIRED | FLAG_READ2);
-        builder.push(r2a).unwrap();
+        builder.push(r2a).expect("failed to push record to builder");
         let result = builder.push(r2b);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Multiple non-secondary"));
@@ -1741,8 +1741,8 @@ mod tests {
         assert!(r2.is_some());
 
         // Verify the records have the expected flags
-        let r1 = r1.unwrap();
-        let r2 = r2.unwrap();
+        let r1 = r1.expect("unexpected failure");
+        let r2 = r2.expect("unexpected failure");
         assert!(r1.flags().is_first_segment());
         assert!(r2.flags().is_last_segment());
 
@@ -1813,7 +1813,7 @@ mod tests {
     fn test_cigar_to_string() {
         use noodles::sam::alignment::record_buf::Cigar;
         let cigar = Cigar::default();
-        assert_eq!(cigar_to_string(&cigar).unwrap(), "*");
+        assert_eq!(cigar_to_string(&cigar).expect("unexpected failure"), "*");
     }
 
     #[test]
@@ -1821,7 +1821,7 @@ mod tests {
         let ops =
             vec![Op::new(Kind::Match, 10), Op::new(Kind::Deletion, 2), Op::new(Kind::Match, 5)];
         let cigar = CigarBuf::from(ops);
-        let result = cigar_to_string(&cigar).unwrap();
+        let result = cigar_to_string(&cigar).expect("unexpected failure");
         assert_eq!(result, "10M2D5M");
     }
 
@@ -1965,7 +1965,7 @@ mod tests {
         let is_paired = (flags & FLAG_PAIRED) != 0;
 
         let mut builder = RecordBuilder::new()
-            .name(std::str::from_utf8(name).unwrap())
+            .name(std::str::from_utf8(name).expect("read name should be valid UTF-8"))
             .sequence(&"A".repeat(100))
             .qualities(&[30u8; 100])
             .cigar("100M")
@@ -2009,12 +2009,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value (44)
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.unwrap()), Some(44));
+        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(44));
 
         // R2 should have ms tag with R1's AS value (55)
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.unwrap()), Some(55));
+        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(55));
 
         Ok(())
     }
@@ -2041,12 +2041,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value (88)
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.unwrap()), Some(88));
+        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(88));
 
         // R2 should have ms tag with R1's AS value (77)
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.unwrap()), Some(77));
+        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(77));
 
         Ok(())
     }
@@ -2073,12 +2073,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value (2000)
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.unwrap()), Some(2000));
+        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(2000));
 
         // R2 should have ms tag with R1's AS value (1000)
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.unwrap()), Some(1000));
+        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(1000));
 
         Ok(())
     }
@@ -2105,12 +2105,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.unwrap()), Some(200_000));
+        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(200_000));
 
         // R2 should have ms tag with R1's AS value
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.unwrap()), Some(100_000));
+        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(100_000));
 
         Ok(())
     }
@@ -2164,7 +2164,7 @@ mod tests {
         // R1 supplementary should have ms tag with R2's AS value (44)
         let r1_supp_ms = template.records[2].data().get(&ms_tag);
         assert!(r1_supp_ms.is_some(), "R1 supplementary should have ms tag");
-        assert_eq!(extract_int_value(r1_supp_ms.unwrap()), Some(44));
+        assert_eq!(extract_int_value(r1_supp_ms.expect("unexpected failure")), Some(44));
 
         Ok(())
     }
@@ -2500,7 +2500,7 @@ mod tests {
         let is_paired = (flags & FLAG_PAIRED) != 0;
 
         let mut builder = RecordBuilder::new()
-            .name(std::str::from_utf8(name).unwrap())
+            .name(std::str::from_utf8(name).expect("read name should be valid UTF-8"))
             .sequence(&"A".repeat(100))
             .qualities(&[30u8; 100])
             .cigar("100M")
@@ -2948,7 +2948,7 @@ mod tests {
         let is_paired = (flags & FLAG_PAIRED) != 0;
 
         let mut builder = RecordBuilder::new()
-            .name(std::str::from_utf8(name).unwrap())
+            .name(std::str::from_utf8(name).expect("read name should be valid UTF-8"))
             .sequence(&"A".repeat(read_length))
             .qualities(&vec![30u8; read_length])
             .cigar(&format!("{read_length}M"))
@@ -3717,7 +3717,7 @@ mod tests {
     #[test]
     fn test_from_raw_records_creates_raw_mode_template() {
         let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw]).expect("unexpected failure");
 
         // Verify it's in raw-byte mode
         assert!(template.is_raw_byte_mode());
@@ -3731,7 +3731,7 @@ mod tests {
     fn test_r1_accessor_returns_none_in_raw_mode() {
         // After fix: calling r1() on a raw-mode Template returns None instead of panicking
         let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw]).expect("unexpected failure");
 
         // r1() should return None in raw mode (use raw_r1() instead)
         assert!(template.r1().is_none());
@@ -3744,7 +3744,7 @@ mod tests {
         // After fix: calling r2() on a raw-mode Template returns None instead of panicking
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        let template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
 
         assert!(template.is_raw_byte_mode());
 
@@ -3763,13 +3763,14 @@ mod tests {
         // R1 first, R2 second — fast path with no swap
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        let template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
 
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
         assert!(template.raw_r2().is_some());
         // Verify R1 is at index 0 (has FIRST_SEGMENT flag)
-        let r1_flags = crate::sort::bam_fields::flags(template.raw_r1().unwrap());
+        let raw_r1 = template.raw_r1().expect("raw_r1 should be present");
+        let r1_flags = crate::sort::bam_fields::flags(raw_r1);
         assert_ne!(r1_flags & FLAG_READ1, 0);
     }
 
@@ -3778,13 +3779,15 @@ mod tests {
         // R2 first, R1 second — fast path should swap them
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r2, r1]).unwrap();
+        let template = Template::from_raw_records(vec![r2, r1]).expect("from_raw_records");
 
         assert!(template.is_raw_byte_mode());
         // After swap, R1 should be at index 0
-        let r1_flags = crate::sort::bam_fields::flags(template.raw_r1().unwrap());
+        let raw_r1 = template.raw_r1().expect("raw_r1 should be present");
+        let r1_flags = crate::sort::bam_fields::flags(raw_r1);
         assert_ne!(r1_flags & FLAG_READ1, 0);
-        let r2_flags = crate::sort::bam_fields::flags(template.raw_r2().unwrap());
+        let raw_r2 = template.raw_r2().expect("raw_r2 should be present");
+        let r2_flags = crate::sort::bam_fields::flags(raw_r2);
         assert_ne!(r2_flags & FLAG_READ2, 0);
     }
 
@@ -3805,7 +3808,7 @@ mod tests {
             b"read1",
             FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SECONDARY,
         );
-        let template = Template::from_raw_records(vec![r1, sec]).unwrap();
+        let template = Template::from_raw_records(vec![r1, sec]).expect("unexpected failure");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
     }
@@ -3819,7 +3822,8 @@ mod tests {
             FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SUPPLEMENTARY,
         );
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r1_supp, r2]).unwrap();
+        let template =
+            Template::from_raw_records(vec![r1, r1_supp, r2]).expect("value should be present");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
         assert!(template.raw_r2().is_some());
@@ -3829,7 +3833,7 @@ mod tests {
     fn test_from_raw_records_single_unpaired() {
         // Single unpaired record — should be treated as R1
         let r = make_minimal_raw_bam(b"read1", 0); // no PAIRED flag
-        let template = Template::from_raw_records(vec![r]).unwrap();
+        let template = Template::from_raw_records(vec![r]).expect("unexpected failure");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
         assert!(template.raw_r2().is_none());
@@ -3858,9 +3862,9 @@ mod tests {
     fn test_from_raw_records_all_raw_records_mut() {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let mut template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        let mut template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
         // Should be able to get mutable access
-        let recs = template.all_raw_records_mut().unwrap();
+        let recs = template.all_raw_records_mut().expect("unexpected failure");
         assert_eq!(recs.len(), 2);
     }
 
@@ -3868,8 +3872,8 @@ mod tests {
     fn test_from_raw_records_into_raw_records() {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
-        let recs = template.into_raw_records().unwrap();
+        let template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
+        let recs = template.into_raw_records().expect("unexpected failure");
         assert_eq!(recs.len(), 2);
     }
 

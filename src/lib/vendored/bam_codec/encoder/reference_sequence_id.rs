@@ -83,7 +83,7 @@ mod tests {
         let header = sam::Header::builder()
             .add_reference_sequence(
                 "sq0",
-                Map::<ReferenceSequence>::new(const { NonZero::new(8).unwrap() }),
+                Map::<ReferenceSequence>::new(const { NonZero::new(8).expect("non-zero value 8") }),
             )
             .build();
         let reference_sequence_id = Some(0);

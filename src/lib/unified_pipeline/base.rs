@@ -2922,7 +2922,7 @@ pub struct PipelineStats {
 fn new_atomic_array<const N: usize>() -> Box<[AtomicU64; N]> {
     // Create a Vec and convert to boxed slice, then try_into boxed array
     let v: Vec<AtomicU64> = (0..N).map(|_| AtomicU64::new(0)).collect();
-    v.into_boxed_slice().try_into().unwrap()
+    v.into_boxed_slice().try_into().expect("Vec length matches const N")
 }
 
 /// Helper to create a boxed 2D array of `AtomicU64` initialized to zero.
@@ -2931,14 +2931,14 @@ fn new_atomic_array<const N: usize>() -> Box<[AtomicU64; N]> {
 fn new_atomic_2d_array<const R: usize, const C: usize>() -> Box<[[AtomicU64; C]; R]> {
     let v: Vec<[AtomicU64; C]> =
         (0..R).map(|_| std::array::from_fn(|_| AtomicU64::new(0))).collect();
-    v.into_boxed_slice().try_into().unwrap()
+    v.into_boxed_slice().try_into().expect("Vec length matches const R")
 }
 
 /// Helper to create a boxed array of `AtomicU8` initialized to a value.
 #[allow(clippy::unnecessary_box_returns)]
 fn new_atomic_u8_array<const N: usize>(init: u8) -> Box<[AtomicU8; N]> {
     let v: Vec<AtomicU8> = (0..N).map(|_| AtomicU8::new(init)).collect();
-    v.into_boxed_slice().try_into().unwrap()
+    v.into_boxed_slice().try_into().expect("Vec length matches const N")
 }
 
 impl Default for PipelineStats {
@@ -3288,8 +3288,8 @@ impl PipelineStats {
         use std::fmt::Write;
 
         let mut s = String::new();
-        writeln!(s, "Pipeline Statistics:").unwrap();
-        writeln!(s).unwrap();
+        writeln!(s, "Pipeline Statistics:").expect("write to String");
+        writeln!(s).expect("write to String");
 
         // Helper to format step stats
         #[allow(clippy::uninlined_format_args)]
@@ -3306,7 +3306,7 @@ impl PipelineStats {
             }
         };
 
-        writeln!(s, "Step Timing:").unwrap();
+        writeln!(s, "Step Timing:").expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3316,7 +3316,7 @@ impl PipelineStats {
                 self.step_read_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3326,7 +3326,7 @@ impl PipelineStats {
                 self.step_decompress_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3336,7 +3336,7 @@ impl PipelineStats {
                 self.step_find_boundaries_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3346,7 +3346,7 @@ impl PipelineStats {
                 self.step_decode_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3356,7 +3356,7 @@ impl PipelineStats {
                 self.step_group_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3366,7 +3366,7 @@ impl PipelineStats {
                 self.step_process_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3376,7 +3376,7 @@ impl PipelineStats {
                 self.step_serialize_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3386,7 +3386,7 @@ impl PipelineStats {
                 self.step_compress_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "{}",
@@ -3396,59 +3396,71 @@ impl PipelineStats {
                 self.step_write_count.load(Ordering::Relaxed)
             )
         )
-        .unwrap();
+        .expect("write to String");
 
-        writeln!(s).unwrap();
-        writeln!(s, "Contention:").unwrap();
+        writeln!(s).expect("write to String");
+        writeln!(s, "Contention:").expect("write to String");
         writeln!(
             s,
             "  Read lock:     {:>10} failed attempts",
             self.read_contention.load(Ordering::Relaxed)
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "  Boundary lock: {:>10} failed attempts",
             self.boundary_contention.load(Ordering::Relaxed)
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "  Group lock:    {:>10} failed attempts",
             self.group_contention.load(Ordering::Relaxed)
         )
-        .unwrap();
+        .expect("write to String");
         writeln!(
             s,
             "  Write lock:    {:>10} failed attempts",
             self.write_contention.load(Ordering::Relaxed)
         )
-        .unwrap();
+        .expect("write to String");
 
-        writeln!(s).unwrap();
-        writeln!(s, "Queue Empty Polls:").unwrap();
-        writeln!(s, "  Q1 (raw):        {:>10}", self.q1_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q2 (decomp):     {:>10}", self.q2_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q2b (boundary):  {:>10}", self.q2b_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q3 (decoded):    {:>10}", self.q3_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q4 (groups):     {:>10}", self.q4_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q5 (processed):  {:>10}", self.q5_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q6 (serialized): {:>10}", self.q6_empty.load(Ordering::Relaxed)).unwrap();
-        writeln!(s, "  Q7 (compressed): {:>10}", self.q7_empty.load(Ordering::Relaxed)).unwrap();
+        writeln!(s).expect("write to String");
+        writeln!(s, "Queue Empty Polls:").expect("write to String");
+        writeln!(s, "  Q1 (raw):        {:>10}", self.q1_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q2 (decomp):     {:>10}", self.q2_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q2b (boundary):  {:>10}", self.q2b_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q3 (decoded):    {:>10}", self.q3_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q4 (groups):     {:>10}", self.q4_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q5 (processed):  {:>10}", self.q5_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q6 (serialized): {:>10}", self.q6_empty.load(Ordering::Relaxed))
+            .expect("write to String");
+        writeln!(s, "  Q7 (compressed): {:>10}", self.q7_empty.load(Ordering::Relaxed))
+            .expect("write to String");
 
-        writeln!(s).unwrap();
-        writeln!(s, "Idle Yields: {:>10}", self.idle_yields.load(Ordering::Relaxed)).unwrap();
+        writeln!(s).expect("write to String");
+        writeln!(s, "Idle Yields: {:>10}", self.idle_yields.load(Ordering::Relaxed))
+            .expect("write to String");
 
         // NEW: Wait time for exclusive steps
         let boundary_wait = self.boundary_wait_ns.load(Ordering::Relaxed);
         let group_wait = self.group_wait_ns.load(Ordering::Relaxed);
         let write_wait = self.write_wait_ns.load(Ordering::Relaxed);
         if boundary_wait > 0 || group_wait > 0 || write_wait > 0 {
-            writeln!(s).unwrap();
-            writeln!(s, "Lock Wait Time:").unwrap();
-            writeln!(s, "  Boundary lock: {:>10.1}ms", boundary_wait as f64 / 1_000_000.0).unwrap();
-            writeln!(s, "  Group lock:    {:>10.1}ms", group_wait as f64 / 1_000_000.0).unwrap();
-            writeln!(s, "  Write lock:    {:>10.1}ms", write_wait as f64 / 1_000_000.0).unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Lock Wait Time:").expect("write to String");
+            writeln!(s, "  Boundary lock: {:>10.1}ms", boundary_wait as f64 / 1_000_000.0)
+                .expect("write to String");
+            writeln!(s, "  Group lock:    {:>10.1}ms", group_wait as f64 / 1_000_000.0)
+                .expect("write to String");
+            writeln!(s, "  Write lock:    {:>10.1}ms", write_wait as f64 / 1_000_000.0)
+                .expect("write to String");
         }
 
         // NEW: Batch size statistics
@@ -3459,69 +3471,69 @@ impl PipelineStats {
             let batch_max = self.batch_size_max.load(Ordering::Relaxed);
             let batch_avg = batch_sum as f64 / batch_count as f64;
 
-            writeln!(s).unwrap();
-            writeln!(s, "Batch Size (records per batch):").unwrap();
-            writeln!(s, "  Count:   {batch_count:>10}").unwrap();
-            writeln!(s, "  Min:     {batch_min:>10}").unwrap();
-            writeln!(s, "  Max:     {batch_max:>10}").unwrap();
-            writeln!(s, "  Average: {batch_avg:>10.1}").unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Batch Size (records per batch):").expect("write to String");
+            writeln!(s, "  Count:   {batch_count:>10}").expect("write to String");
+            writeln!(s, "  Min:     {batch_min:>10}").expect("write to String");
+            writeln!(s, "  Max:     {batch_max:>10}").expect("write to String");
+            writeln!(s, "  Average: {batch_avg:>10.1}").expect("write to String");
         }
 
         // NEW: Per-thread work distribution
         let num_threads = self.num_threads.load(Ordering::Relaxed) as usize;
         if num_threads > 0 {
-            writeln!(s).unwrap();
-            writeln!(s, "Per-Thread Work Distribution:").unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Per-Thread Work Distribution:").expect("write to String");
 
             // Step names for the header
             let step_names = ["Rd", "Dc", "Fb", "De", "Gr", "Pr", "Se", "Co", "Wr"];
 
             // Header
-            write!(s, "  Thread ").unwrap();
+            write!(s, "  Thread ").expect("write to String");
             for name in &step_names {
-                write!(s, " {name:>6}").unwrap();
+                write!(s, " {name:>6}").expect("write to String");
             }
-            writeln!(s, "    Idle ms").unwrap();
+            writeln!(s, "    Idle ms").expect("write to String");
 
             // Per-thread rows
             for tid in 0..num_threads.min(MAX_THREADS) {
-                write!(s, "  T{tid:<5} ").unwrap();
+                write!(s, "  T{tid:<5} ").expect("write to String");
                 for step_idx in 0..NUM_STEPS {
                     let count = self.per_thread_step_counts[tid][step_idx].load(Ordering::Relaxed);
-                    write!(s, " {count:>6}").unwrap();
+                    write!(s, " {count:>6}").expect("write to String");
                 }
                 let idle_ns = self.per_thread_idle_ns[tid].load(Ordering::Relaxed);
-                writeln!(s, " {:>10.1}", idle_ns as f64 / 1_000_000.0).unwrap();
+                writeln!(s, " {:>10.1}", idle_ns as f64 / 1_000_000.0).expect("write to String");
             }
 
             // Total row
-            write!(s, "  Total  ").unwrap();
+            write!(s, "  Total  ").expect("write to String");
             for step_idx in 0..NUM_STEPS {
                 let mut total = 0u64;
                 for tid in 0..num_threads.min(MAX_THREADS) {
                     total += self.per_thread_step_counts[tid][step_idx].load(Ordering::Relaxed);
                 }
-                write!(s, " {total:>6}").unwrap();
+                write!(s, " {total:>6}").expect("write to String");
             }
             let total_idle: u64 = (0..num_threads.min(MAX_THREADS))
                 .map(|tid| self.per_thread_idle_ns[tid].load(Ordering::Relaxed))
                 .sum();
-            writeln!(s, " {:>10.1}", total_idle as f64 / 1_000_000.0).unwrap();
+            writeln!(s, " {:>10.1}", total_idle as f64 / 1_000_000.0).expect("write to String");
 
             // Per-thread attempt statistics (shows success rate)
-            writeln!(s).unwrap();
-            writeln!(s, "Per-Thread Attempt Success Rate:").unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Per-Thread Attempt Success Rate:").expect("write to String");
 
             // Header
-            write!(s, "  Thread ").unwrap();
+            write!(s, "  Thread ").expect("write to String");
             for name in &step_names {
-                write!(s, " {name:>6}").unwrap();
+                write!(s, " {name:>6}").expect("write to String");
             }
-            writeln!(s, "   Total%").unwrap();
+            writeln!(s, "   Total%").expect("write to String");
 
             // Per-thread rows with success rates
             for tid in 0..num_threads.min(MAX_THREADS) {
-                write!(s, "  T{tid:<5} ").unwrap();
+                write!(s, "  T{tid:<5} ").expect("write to String");
                 let mut thread_attempts = 0u64;
                 let mut thread_successes = 0u64;
                 for step_idx in 0..NUM_STEPS {
@@ -3532,17 +3544,17 @@ impl PipelineStats {
                     thread_attempts += attempts;
                     thread_successes += successes;
                     if attempts == 0 {
-                        write!(s, "   -  ").unwrap();
+                        write!(s, "   -  ").expect("write to String");
                     } else {
                         let rate = (successes as f64 / attempts as f64) * 100.0;
-                        write!(s, " {rate:>5.0}%").unwrap();
+                        write!(s, " {rate:>5.0}%").expect("write to String");
                     }
                 }
                 if thread_attempts == 0 {
-                    writeln!(s, "      -").unwrap();
+                    writeln!(s, "      -").expect("write to String");
                 } else {
                     let total_rate = (thread_successes as f64 / thread_attempts as f64) * 100.0;
-                    writeln!(s, "  {total_rate:>5.1}%").unwrap();
+                    writeln!(s, "  {total_rate:>5.1}%").expect("write to String");
                 }
             }
         }
@@ -3568,8 +3580,8 @@ impl PipelineStats {
             + self.write_contention.load(Ordering::Relaxed);
 
         if total_work_ns > 0 {
-            writeln!(s).unwrap();
-            writeln!(s, "Thread Utilization:").unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Thread Utilization:").expect("write to String");
 
             let work_ms = total_work_ns as f64 / 1_000_000.0;
             let idle_ms = total_idle_ns as f64 / 1_000_000.0;
@@ -3577,10 +3589,11 @@ impl PipelineStats {
 
             if total_thread_ms > 0.0 {
                 let utilization = (work_ms / total_thread_ms) * 100.0;
-                writeln!(s, "  Work time:       {work_ms:>10.1}ms").unwrap();
-                writeln!(s, "  Idle time:       {idle_ms:>10.1}ms").unwrap();
-                writeln!(s, "  Utilization:     {utilization:>10.1}%").unwrap();
-                writeln!(s, "  Contention attempts: {total_contention:>7}").unwrap();
+                writeln!(s, "  Work time:       {work_ms:>10.1}ms").expect("write to String");
+                writeln!(s, "  Idle time:       {idle_ms:>10.1}ms").expect("write to String");
+                writeln!(s, "  Utilization:     {utilization:>10.1}%").expect("write to String");
+                writeln!(s, "  Contention attempts: {total_contention:>7}")
+                    .expect("write to String");
             }
         }
 
@@ -3596,8 +3609,8 @@ impl PipelineStats {
 
         // Only show throughput section if we have data
         if bytes_read > 0 || bytes_written > 0 {
-            writeln!(s).unwrap();
-            writeln!(s, "Throughput:").unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Throughput:").expect("write to String");
 
             // Helper function to format bytes nicely
             let format_bytes = |bytes: u64| -> String {
@@ -3635,7 +3648,7 @@ impl PipelineStats {
                     read_ms,
                     read_mb_s
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Decompress throughput (input → output with expansion ratio)
@@ -3654,7 +3667,7 @@ impl PipelineStats {
                     out_mb_s,
                     expansion
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Decode throughput (records per second)
@@ -3668,7 +3681,7 @@ impl PipelineStats {
                     format_count(records_decoded),
                     format_count(records_per_s as u64)
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Group throughput (records in → groups out)
@@ -3685,7 +3698,7 @@ impl PipelineStats {
                     format_count(records_in_per_s as u64),
                     format_count(groups_out_per_s as u64)
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Process throughput (groups per second)
@@ -3699,7 +3712,7 @@ impl PipelineStats {
                     format_count(groups_produced),
                     format_count(groups_per_s as u64)
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Serialize throughput
@@ -3713,7 +3726,7 @@ impl PipelineStats {
                     format_bytes(serialized_bytes),
                     mb_per_s
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Compress throughput (input → output with compression ratio)
@@ -3732,7 +3745,7 @@ impl PipelineStats {
                     out_mb_s,
                     compression
                 )
-                .unwrap();
+                .expect("write to String");
             }
 
             // Write throughput
@@ -3747,21 +3760,21 @@ impl PipelineStats {
                     write_ms,
                     write_mb_s
                 )
-                .unwrap();
+                .expect("write to String");
             }
         }
 
         // Queue sample summary if we have any
         let samples = self.queue_samples.lock();
         if !samples.is_empty() {
-            writeln!(s).unwrap();
+            writeln!(s).expect("write to String");
             writeln!(s, "Queue Size Timeline ({} samples at ~100ms intervals):", samples.len())
-                .unwrap();
+                .expect("write to String");
             writeln!(
                 s,
                 "  Time   Q1   Q2  Q2b   Q3   Q4   Q5   Q6   Q7 | R2  R3  R7 |  R3_MB  Threads"
             )
-            .unwrap();
+            .expect("write to String");
 
             // Show all samples
             for sample in samples.iter() {
@@ -3783,7 +3796,7 @@ impl PipelineStats {
                     sample.reorder_sizes[2],
                     r3_mb,
                 )
-                .unwrap();
+                .expect("write to String");
                 // Show thread activity as compact string
                 for &step_idx in &sample.thread_steps {
                     if step_idx < NUM_STEPS as u8 {
@@ -3799,12 +3812,12 @@ impl PipelineStats {
                             8 => "W",
                             _ => "?",
                         };
-                        write!(s, "{short}").unwrap();
+                        write!(s, "{short}").expect("write to String");
                     } else {
-                        write!(s, ".").unwrap();
+                        write!(s, ".").expect("write to String");
                     }
                 }
-                writeln!(s).unwrap();
+                writeln!(s).expect("write to String");
             }
 
             // Summary of peak reorder buffer usage
@@ -3812,9 +3825,9 @@ impl PipelineStats {
             let peak_r3_bytes =
                 samples.iter().map(|s| s.reorder_memory_bytes[1]).max().unwrap_or(0);
             let peak_r3_mb = peak_r3_bytes as f64 / 1_048_576.0;
-            writeln!(s).unwrap();
+            writeln!(s).expect("write to String");
             writeln!(s, "Peak Q3 Reorder Buffer: {peak_r3_items} items, {peak_r3_mb:.1} MB")
-                .unwrap();
+                .expect("write to String");
         }
 
         // Memory limiting statistics
@@ -3822,14 +3835,16 @@ impl PipelineStats {
         let peak_memory = self.peak_memory_bytes.load(Ordering::Relaxed);
 
         if group_rejects > 0 || peak_memory > 0 {
-            writeln!(s).unwrap();
-            writeln!(s, "Memory Limiting:").unwrap();
+            writeln!(s).expect("write to String");
+            writeln!(s, "Memory Limiting:").expect("write to String");
             if group_rejects > 0 {
-                writeln!(s, "  Group rejects (memory): {group_rejects:>10}").unwrap();
+                writeln!(s, "  Group rejects (memory): {group_rejects:>10}")
+                    .expect("write to String");
             }
             if peak_memory > 0 {
                 let peak_mb = peak_memory as f64 / 1_048_576.0;
-                writeln!(s, "  Peak memory usage:      {peak_mb:>10.1} MB").unwrap();
+                writeln!(s, "  Peak memory usage:      {peak_mb:>10.1} MB")
+                    .expect("write to String");
             }
         }
 
@@ -5780,7 +5795,7 @@ mod tests {
         assert!(queues.has_error());
         let err = queues.take_error();
         assert!(err.is_some());
-        assert_eq!(err.unwrap().to_string(), "test error");
+        assert_eq!(err.expect("error was set above").to_string(), "test error");
     }
 
     #[test]

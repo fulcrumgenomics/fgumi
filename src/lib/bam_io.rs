@@ -354,7 +354,10 @@ pub struct IndexingBamWriter {
 impl IndexingBamWriter {
     /// Create a new indexing BAM writer.
     fn new(inner: MultithreadedWriter<File>, num_refs: usize) -> Self {
-        let block_info_rx = inner.block_info_receiver().unwrap().clone();
+        let block_info_rx = inner
+            .block_info_receiver()
+            .expect("block_info_receiver must be available for IndexingBamWriter")
+            .clone();
         Self {
             current_block_number: inner.current_block_number(),
             current_block_offset: inner.buffer_offset(),
@@ -1318,7 +1321,7 @@ mod tests {
         let mut chained = ChainedReader::new(buffer, remaining);
 
         let mut result = Vec::new();
-        chained.read_to_end(&mut result).unwrap();
+        chained.read_to_end(&mut result).expect("read_to_end should succeed");
 
         assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
@@ -1330,7 +1333,7 @@ mod tests {
         let mut chained = ChainedReader::new(buffer, remaining);
 
         let mut result = Vec::new();
-        chained.read_to_end(&mut result).unwrap();
+        chained.read_to_end(&mut result).expect("read_to_end should succeed");
 
         assert_eq!(result, vec![1, 2, 3]);
     }
@@ -1342,7 +1345,7 @@ mod tests {
         let mut chained = ChainedReader::new(buffer, remaining);
 
         let mut result = Vec::new();
-        chained.read_to_end(&mut result).unwrap();
+        chained.read_to_end(&mut result).expect("read_to_end should succeed");
 
         assert_eq!(result, vec![1, 2, 3]);
     }
@@ -1419,7 +1422,7 @@ mod tests {
         assert!(writer.is_ok());
 
         // Just finish without writing records
-        let writer = writer.unwrap();
+        let writer = writer.expect("creating writer should succeed");
         let index = writer.finish();
         assert!(index.is_ok());
 
@@ -1556,7 +1559,7 @@ mod tests {
         let header = Header::default();
         let result = create_indexing_bam_writer("-", &header, 6, 2);
         assert!(result.is_err());
-        let err = result.err().unwrap();
+        let err = result.err().expect("result should be Ok");
         assert!(err.to_string().contains("stdout"));
     }
 }

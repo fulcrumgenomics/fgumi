@@ -522,9 +522,20 @@ mod tests {
     #[test]
     fn test_skip_reason_from_str_valid() {
         // Test various valid forms
-        assert_eq!(SkipReason::from_str("too few bases").unwrap(), SkipReason::TooFewBases);
-        assert_eq!(SkipReason::from_str("too-few-bases").unwrap(), SkipReason::TooFewBases);
-        assert_eq!(SkipReason::from_str("toofewbases").unwrap(), SkipReason::TooFewBases);
+        assert_eq!(
+            SkipReason::from_str("too few bases")
+                .expect("parsing \"too few bases\" should succeed"),
+            SkipReason::TooFewBases
+        );
+        assert_eq!(
+            SkipReason::from_str("too-few-bases")
+                .expect("parsing \"too-few-bases\" should succeed"),
+            SkipReason::TooFewBases
+        );
+        assert_eq!(
+            SkipReason::from_str("toofewbases").expect("parsing \"toofewbases\" should succeed"),
+            SkipReason::TooFewBases
+        );
     }
 
     #[test]
@@ -550,13 +561,14 @@ mod tests {
         let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // Simple read structure: 4M (molecular barcode) + 4T (template)
-        let read_structure = ReadStructure::from_str("4M4T").unwrap();
+        let read_structure =
+            ReadStructure::from_str("4M4T").expect("parsing \"4M4T\" should succeed");
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
         let result = iterator.next();
         assert!(result.is_some());
 
-        let fastq_set = result.unwrap();
+        let fastq_set = result.expect("result should be Ok");
         assert_eq!(fastq_set.header, b"read1");
         assert_eq!(fastq_set.segments.len(), 2);
         assert!(fastq_set.skip_reason.is_none());
@@ -583,14 +595,15 @@ mod tests {
         let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // Read structure requires 10 bases total
-        let read_structure = ReadStructure::from_str("4M6T").unwrap();
+        let read_structure =
+            ReadStructure::from_str("4M6T").expect("parsing \"4M6T\" should succeed");
         let mut iterator =
             ReadSetIterator::new(read_structure, reader, vec![SkipReason::TooFewBases]);
 
         let result = iterator.next();
         assert!(result.is_some());
 
-        let fastq_set = result.unwrap();
+        let fastq_set = result.expect("result should be Ok");
         assert_eq!(fastq_set.header, b"read1");
         assert!(fastq_set.segments.is_empty());
         assert_eq!(fastq_set.skip_reason, Some(SkipReason::TooFewBases));
@@ -607,7 +620,8 @@ mod tests {
         let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // Read structure requires 10 bases total
-        let read_structure = ReadStructure::from_str("4M6T").unwrap();
+        let read_structure =
+            ReadStructure::from_str("4M6T").expect("parsing \"4M6T\" should succeed");
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
         // This should panic because TooFewBases is not in skip_reasons
@@ -622,17 +636,18 @@ mod tests {
         let cursor = Cursor::new(fastq_data.to_vec());
         let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
-        let read_structure = ReadStructure::from_str("4M4T").unwrap();
+        let read_structure =
+            ReadStructure::from_str("4M4T").expect("parsing \"4M4T\" should succeed");
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
         // First record
-        let first = iterator.next().unwrap();
+        let first = iterator.next().expect("iterator should have next element");
         assert_eq!(first.header, b"read1");
         assert_eq!(first.segments[0].seq, b"ACGT");
         assert_eq!(first.segments[1].seq, b"AAAA");
 
         // Second record
-        let second = iterator.next().unwrap();
+        let second = iterator.next().expect("iterator should have next element");
         assert_eq!(second.header, b"read2");
         assert_eq!(second.segments[0].seq, b"TGCA");
         assert_eq!(second.segments[1].seq, b"TTTT");
@@ -651,10 +666,11 @@ mod tests {
         let reader = SimdFastqReader::new(Box::new(cursor) as Box<dyn BufRead + Send>);
 
         // 4M + variable T (remaining bases go to template)
-        let read_structure = ReadStructure::from_str("4M+T").unwrap();
+        let read_structure =
+            ReadStructure::from_str("4M+T").expect("parsing \"4M+T\" should succeed");
         let mut iterator = ReadSetIterator::new(read_structure, reader, vec![]);
 
-        let result = iterator.next().unwrap();
+        let result = iterator.next().expect("iterator should have next element");
         assert_eq!(result.segments.len(), 2);
 
         // Fixed molecular barcode segment

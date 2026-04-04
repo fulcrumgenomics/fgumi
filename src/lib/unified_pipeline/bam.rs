@@ -4470,7 +4470,10 @@ mod tests {
         // Verify the secondary serialize function works
         let test_data = vec![1u8, 2, 3, 4];
         let mut buf = Vec::new();
-        let count = (fns.secondary_serialize_fn.as_ref().unwrap())(&test_data, &mut buf).unwrap();
+        let count = (fns.secondary_serialize_fn.as_ref().expect("serialize should succeed"))(
+            &test_data, &mut buf,
+        )
+        .expect("serialize should succeed");
         assert_eq!(count, 1);
         assert_eq!(buf, vec![1, 2, 3, 4]);
     }
