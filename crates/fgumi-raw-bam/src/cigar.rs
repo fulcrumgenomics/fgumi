@@ -49,6 +49,34 @@ pub fn get_cigar_ops(bam: &[u8]) -> Vec<u32> {
     cigar_bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
+/// CIGAR operation type to SAM character mapping.
+const CIGAR_OP_CHARS: [u8; 9] = [b'M', b'I', b'D', b'N', b'S', b'H', b'P', b'=', b'X'];
+
+/// Formats CIGAR operations from a raw BAM record as a SAM-style CIGAR string.
+///
+/// Returns an empty string if the record has no CIGAR operations, or `"*"` is not used
+/// (callers should check `n_cigar_op == 0` separately if they need `"*"`).
+///
+/// # Panics
+///
+/// Panics if a CIGAR operation has an invalid type (>= 9).
+#[must_use]
+pub fn cigar_to_string_from_raw(bam: &[u8]) -> String {
+    let ops = get_cigar_ops(bam);
+    if ops.is_empty() {
+        return String::new();
+    }
+    let mut result = String::with_capacity(ops.len() * 4);
+    for &op in &ops {
+        let op_len = op >> 4;
+        let op_type = (op & 0xF) as usize;
+        assert!(op_type < CIGAR_OP_CHARS.len(), "invalid CIGAR op type: {op_type}");
+        result.push_str(&op_len.to_string());
+        result.push(CIGAR_OP_CHARS[op_type] as char);
+    }
+    result
+}
+
 /// Calculate reference-consuming length from CIGAR operations.
 ///
 /// This is the sum of M/D/N/=/X operations, which represents how many
@@ -1933,5 +1961,28 @@ mod tests {
         // Truncate so cigar_end > bam.len()
         rec.truncate(36);
         assert_eq!(unclipped_5prime_raw(&rec, 100, false), 100);
+    }
+
+    // ========================================================================
+    // cigar_to_string_from_raw tests
+    // ========================================================================
+
+    #[test]
+    fn test_cigar_to_string_simple() {
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[encode_op(0, 100)], 100, -1, -1, &[]);
+        assert_eq!(cigar_to_string_from_raw(&rec), "100M");
+    }
+
+    #[test]
+    fn test_cigar_to_string_complex() {
+        let ops = [encode_op(4, 5), encode_op(0, 50), encode_op(1, 3), encode_op(0, 42)];
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &ops, 100, -1, -1, &[]);
+        assert_eq!(cigar_to_string_from_raw(&rec), "5S50M3I42M");
+    }
+
+    #[test]
+    fn test_cigar_to_string_no_cigar() {
+        let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(cigar_to_string_from_raw(&rec), "");
     }
 }

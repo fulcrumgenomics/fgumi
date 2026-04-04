@@ -193,6 +193,42 @@ pub fn set_flags(bam: &mut [u8], new_flags: u16) {
     bam[14..16].copy_from_slice(&new_flags.to_le_bytes());
 }
 
+/// Set the mapping quality in a BAM record.
+#[inline]
+pub fn set_mapq(bam: &mut [u8], new_mapq: u8) {
+    bam[9] = new_mapq;
+}
+
+/// Set the mate reference sequence ID in a BAM record.
+#[inline]
+pub fn set_mate_ref_id(bam: &mut [u8], val: i32) {
+    bam[20..24].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Set the mate 0-based position in a BAM record.
+#[inline]
+pub fn set_mate_pos(bam: &mut [u8], val: i32) {
+    bam[24..28].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Set the template length (TLEN) in a BAM record.
+#[inline]
+pub fn set_template_length(bam: &mut [u8], val: i32) {
+    bam[28..32].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Set the reference sequence ID in a BAM record.
+#[inline]
+pub fn set_ref_id(bam: &mut [u8], val: i32) {
+    bam[0..4].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Set the 0-based leftmost position in a BAM record.
+#[inline]
+pub fn set_pos(bam: &mut [u8], val: i32) {
+    bam[4..8].copy_from_slice(&val.to_le_bytes());
+}
+
 /// Calculate the offset to auxiliary data in a BAM record.
 ///
 /// `aux_offset = 32 + l_read_name + n_cigar_op*4 + (l_seq+1)/2 + l_seq`
@@ -840,5 +876,57 @@ mod tests {
         assert!(fields.flags.mate_unmapped());
         assert!(fields.flags.paired());
         assert_eq!(fields.name, b"rd");
+    }
+
+    // ========================================================================
+    // Field setter tests
+    // ========================================================================
+
+    #[test]
+    fn test_set_mapq_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(mapq(&rec), 0);
+        set_mapq(&mut rec, 42);
+        assert_eq!(mapq(&rec), 42);
+    }
+
+    #[test]
+    fn test_set_mate_ref_id_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(mate_ref_id(&rec), -1);
+        set_mate_ref_id(&mut rec, 5);
+        assert_eq!(mate_ref_id(&rec), 5);
+    }
+
+    #[test]
+    fn test_set_mate_pos_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(mate_pos(&rec), -1);
+        set_mate_pos(&mut rec, 12345);
+        assert_eq!(mate_pos(&rec), 12345);
+    }
+
+    #[test]
+    fn test_set_template_length_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(template_length(&rec), 0);
+        set_template_length(&mut rec, -300);
+        assert_eq!(template_length(&rec), -300);
+    }
+
+    #[test]
+    fn test_set_ref_id_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(ref_id(&rec), 0);
+        set_ref_id(&mut rec, 3);
+        assert_eq!(ref_id(&rec), 3);
+    }
+
+    #[test]
+    fn test_set_pos_roundtrip() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
+        assert_eq!(pos(&rec), 0);
+        set_pos(&mut rec, 9999);
+        assert_eq!(pos(&rec), 9999);
     }
 }
