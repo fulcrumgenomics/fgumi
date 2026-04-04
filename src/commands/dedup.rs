@@ -25,7 +25,6 @@ use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
@@ -48,6 +47,7 @@ use noodles::sam::Header;
 use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
@@ -1232,7 +1232,8 @@ impl Command for MarkDuplicates {
         };
 
         // Shared state for collecting metrics
-        let collected_metrics: Arc<SegQueue<CollectedDedupMetrics>> = Arc::new(SegQueue::new());
+        let collected_metrics: Arc<Mutex<CollectedDedupMetrics>> =
+            Arc::new(Mutex::new(CollectedDedupMetrics::default()));
 
         // Clone values needed by closures
         let strategy = effective_strategy;
@@ -1284,17 +1285,19 @@ impl Command for MarkDuplicates {
                     no_umi,
                 )
             },
-            // Serialize function (serial, ordered)
+            // Serialize function (parallel, output ordered by serial numbers)
             move |processed: ProcessedDedupGroup,
                   header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
                 // Collect metrics
-                let metrics = CollectedDedupMetrics {
-                    dedup_metrics: processed.dedup_metrics.clone(),
-                    family_sizes: processed.family_sizes.clone(),
-                };
-                collected_metrics_clone.push(metrics);
+                {
+                    let mut agg = collected_metrics_clone.lock();
+                    agg.dedup_metrics.merge(&processed.dedup_metrics);
+                    for (size, count) in &processed.family_sizes {
+                        *agg.family_sizes.entry(*size).or_insert(0) += count;
+                    }
+                }
 
                 let input_record_count = processed.input_record_count;
 
@@ -1375,15 +1378,11 @@ impl Command for MarkDuplicates {
         )?;
 
         // Aggregate metrics
-        let mut final_metrics = DedupMetrics::default();
-        let mut final_family_sizes: AHashMap<usize, u64> = AHashMap::new();
-
-        while let Some(m) = collected_metrics.pop() {
-            final_metrics.merge(&m.dedup_metrics);
-            for (size, count) in m.family_sizes {
-                *final_family_sizes.entry(size).or_insert(0) += count;
-            }
-        }
+        let aggregated = Arc::try_unwrap(collected_metrics)
+            .expect("bug: metrics Arc still shared after pipeline join")
+            .into_inner();
+        let final_metrics = aggregated.dedup_metrics;
+        let final_family_sizes = aggregated.family_sizes;
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
@@ -3079,5 +3078,183 @@ mod tests {
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
         assert!(filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
+    }
+
+    // ========================================================================
+    // End-to-end regression test: large position group with --no-umi
+    // ========================================================================
+
+    /// Regression test for OOM with large position groups in `--no-umi` mode.
+    ///
+    /// WES data can have extreme depth pileups at capture targets, creating positions
+    /// with thousands of reads. With `--no-umi` (identity strategy), ALL reads at the
+    /// same position form ONE group. This test exercises a 5,000-template position
+    /// group to verify the pipeline completes without unbounded memory growth.
+    #[test]
+    fn test_dedup_no_umi_large_position_group() {
+        use noodles::bam;
+        use noodles::sam::Header;
+        use noodles::sam::alignment::io::Write as AlignmentWrite;
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::RecordBuf;
+        use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
+        use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
+        use noodles::sam::header::record::value::{
+            Map, map::Header as HeaderRecord, map::ReferenceSequence,
+        };
+        use std::collections::HashSet;
+        use std::num::NonZeroUsize;
+
+        const NUM_TEMPLATES: usize = 5_000;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let input_bam = temp_dir.path().join("input.bam");
+        let output_bam = temp_dir.path().join("output.bam");
+
+        // Build a template-coordinate sorted header with one reference.
+        let header = {
+            let mut builder = HeaderRecordMap::<HeaderRecord>::builder();
+            for (tag_bytes, value) in
+                [(*b"SO", "unsorted"), (*b"GO", "query"), (*b"SS", "template-coordinate")]
+            {
+                let HeaderTag::Other(tag) = HeaderTag::from(tag_bytes) else { unreachable!() };
+                builder = builder.insert(tag, value);
+            }
+            Header::builder()
+                .set_header(builder.build().expect("valid header map"))
+                .add_reference_sequence(
+                    BString::from("chr1"),
+                    Map::<ReferenceSequence>::new(
+                        NonZeroUsize::new(10_000).expect("non-zero length"),
+                    ),
+                )
+                .build()
+        };
+
+        // Write 5,000 paired-end templates all at position 100 with no UMI tag.
+        // Template-coordinate sort groups by position then name, so we write
+        // R1 and R2 together for each template in name-sorted order.
+        {
+            let mut writer =
+                bam::io::Writer::new(std::fs::File::create(&input_bam).expect("create input BAM"));
+            writer.write_header(&header).expect("write header");
+
+            for i in 0..NUM_TEMPLATES {
+                let name = format!("read_{i:05}");
+
+                let r1 = RecordBuilder::new()
+                    .name(&name)
+                    .sequence("ACGTACGT")
+                    .qualities(&[30; 8])
+                    .paired(true)
+                    .first_segment(true)
+                    .properly_paired(true)
+                    .reference_sequence_id(0)
+                    .alignment_start(100)
+                    .mapping_quality(60)
+                    .cigar("8M")
+                    .mate_reference_sequence_id(0)
+                    .mate_alignment_start(200)
+                    .template_length(108)
+                    .tag("MC", "8M")
+                    .build();
+
+                let r2 = RecordBuilder::new()
+                    .name(&name)
+                    .sequence("ACGTACGT")
+                    .qualities(&[30; 8])
+                    .paired(true)
+                    .first_segment(false)
+                    .properly_paired(true)
+                    .reverse_complement(true)
+                    .reference_sequence_id(0)
+                    .alignment_start(200)
+                    .mapping_quality(60)
+                    .cigar("8M")
+                    .mate_reference_sequence_id(0)
+                    .mate_alignment_start(100)
+                    .template_length(-108)
+                    .tag("MC", "8M")
+                    .build();
+
+                writer.write_alignment_record(&header, &r1).expect("write R1");
+                writer.write_alignment_record(&header, &r2).expect("write R2");
+            }
+            writer.try_finish().expect("finish BAM");
+        }
+
+        // Run dedup with --no-umi via MarkDuplicates::execute().
+        let cmd = MarkDuplicates::try_parse_from([
+            "dedup",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--no-umi",
+            "--compression-level",
+            "1",
+        ])
+        .expect("failed to parse dedup args");
+        cmd.execute("test").expect("dedup --no-umi should succeed with large position group");
+
+        assert!(output_bam.exists(), "output BAM should be created");
+
+        // Read back the output and verify duplicate marking and MI tags.
+        let mut reader =
+            bam::io::Reader::new(std::fs::File::open(&output_bam).expect("open output BAM"));
+        let out_header = reader.read_header().expect("read output header");
+
+        let mut total_records = 0usize;
+        let mut duplicate_records = 0usize;
+        let mut non_duplicate_records = 0usize;
+        let mut mi_values = HashSet::new();
+        let mut mi_count = 0usize;
+        let mut non_dup_names = HashSet::new();
+
+        let mi_tag = Tag::from([b'M', b'I']);
+
+        for result in reader.record_bufs(&out_header) {
+            let record: RecordBuf = result.expect("read record");
+            total_records += 1;
+
+            let is_dup = record.flags().is_duplicate();
+            if is_dup {
+                duplicate_records += 1;
+            } else {
+                non_duplicate_records += 1;
+                if let Some(name) = record.name() {
+                    non_dup_names.insert(name.to_owned());
+                }
+            }
+
+            // Collect MI tag values.
+            if let Some(DataValue::String(mi)) = record.data().get(&mi_tag) {
+                mi_values.insert(mi.to_owned());
+                mi_count += 1;
+            }
+        }
+
+        // All 10,000 records (5,000 pairs) should be present.
+        assert_eq!(total_records, NUM_TEMPLATES * 2, "all records should be present in output");
+
+        // Exactly one template (2 records) should NOT be marked as duplicate.
+        assert_eq!(
+            non_duplicate_records, 2,
+            "exactly one pair should be non-duplicate (the best-scoring template)"
+        );
+        assert_eq!(
+            duplicate_records,
+            (NUM_TEMPLATES - 1) * 2,
+            "all other pairs should be marked as duplicates"
+        );
+
+        // The two non-duplicate records should share the same read name.
+        assert_eq!(non_dup_names.len(), 1, "non-duplicate records should be from one template");
+
+        // Every record should have an MI tag.
+        assert_eq!(mi_count, NUM_TEMPLATES * 2, "all records should have an MI tag");
+
+        // All templates should share the same MI value (one group in identity strategy).
+        assert_eq!(mi_values.len(), 1, "all records should share a single MI tag value");
     }
 }

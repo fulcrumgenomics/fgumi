@@ -1857,7 +1857,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
         self.processed_heap_bytes.load(Ordering::Acquire) >= Q5_BACKPRESSURE_THRESHOLD_BYTES
     }
 
-    /// Check if pipeline is in drain mode (bypasses memory backpressure).
+    /// Check if pipeline is in drain mode.
     #[must_use]
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Relaxed)
@@ -1868,10 +1868,14 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
         self.draining.store(value, Ordering::Relaxed);
     }
 
-    /// Check backpressure for Process step (queue full OR memory high, unless draining).
+    /// Check backpressure for Process step (queue full OR memory high).
+    ///
+    /// Memory backpressure is always enforced (including during draining) to prevent
+    /// OOM.  The slot-based `is_full()` check is sufficient to guarantee forward
+    /// progress: Serialize drains Q5 -> slots free -> Process resumes.
     #[must_use]
     pub fn should_apply_process_backpressure(&self) -> bool {
-        self.processed.is_full() || (!self.is_draining() && self.is_processed_memory_high())
+        self.processed.is_full() || self.is_processed_memory_high()
     }
 
     // ========== Queue Depths ==========
@@ -2130,10 +2134,7 @@ pub trait PipelineLifecycle {
     /// Set an error on the pipeline.
     fn set_error(&self, error: io::Error);
 
-    /// Check if the pipeline is in drain mode.
-    ///
-    /// When draining, memory-based backpressure is bypassed to prevent
-    /// deadlock during pipeline completion.
+    /// Check if the pipeline is in drain mode (input exhausted, completing remaining work).
     fn is_draining(&self) -> bool;
 
     /// Set the draining flag.
@@ -4786,15 +4787,16 @@ pub trait ProcessPipelineState<G, P>: Send + Sync {
     fn set_error(&self, e: io::Error);
 
     /// Check if backpressure should be applied before processing new work.
-    /// Returns true if queue is full OR memory is high (unless draining).
-    /// Default: just checks queue capacity (backwards compatible).
+    /// Returns true if queue is full OR memory is high.
+    /// Default: just checks queue capacity for backwards compatibility.
     fn should_apply_process_backpressure(&self) -> bool {
         self.process_output_is_full()
     }
 
-    /// Check if pipeline is in draining mode (completing after input exhausted).
-    /// When draining, memory backpressure is bypassed to prevent deadlock.
-    /// Default: false (backwards compatible).
+    /// Check if the pipeline is in drain mode (input exhausted, completing remaining work).
+    /// Used by the Read step to manage input backpressure; not consulted by
+    /// `should_apply_process_backpressure`.
+    /// Default: false for backwards compatibility.
     fn is_draining(&self) -> bool {
         false
     }
