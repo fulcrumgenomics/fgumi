@@ -1247,11 +1247,11 @@ mod tests {
         // Add multiple R1 records
         grouper
             .add_bytes_for_stream(0, b"@read1/1\nACGT\n+\nIIII\n@read2/1\nAAAA\n+\nIIII\n")
-            .expect("unexpected failure");
+            .expect("add_bytes_for_stream should succeed for R1");
         // Add multiple R2 records
         grouper
             .add_bytes_for_stream(1, b"@read1/2\nTGCA\n+\nJJJJ\n@read2/2\nTTTT\n+\nJJJJ\n")
-            .expect("unexpected failure");
+            .expect("add_bytes_for_stream should succeed for R2");
 
         let templates =
             grouper.drain_complete_templates().expect("drain_complete_templates failed");

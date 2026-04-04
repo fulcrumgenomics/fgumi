@@ -1741,8 +1741,8 @@ mod tests {
         assert!(r2.is_some());
 
         // Verify the records have the expected flags
-        let r1 = r1.expect("unexpected failure");
-        let r2 = r2.expect("unexpected failure");
+        let r1 = r1.expect("R1 record should be present");
+        let r2 = r2.expect("R2 record should be present");
         assert!(r1.flags().is_first_segment());
         assert!(r2.flags().is_last_segment());
 
@@ -1813,7 +1813,7 @@ mod tests {
     fn test_cigar_to_string() {
         use noodles::sam::alignment::record_buf::Cigar;
         let cigar = Cigar::default();
-        assert_eq!(cigar_to_string(&cigar).expect("unexpected failure"), "*");
+        assert_eq!(cigar_to_string(&cigar).expect("cigar_to_string should succeed"), "*");
     }
 
     #[test]
@@ -1821,7 +1821,7 @@ mod tests {
         let ops =
             vec![Op::new(Kind::Match, 10), Op::new(Kind::Deletion, 2), Op::new(Kind::Match, 5)];
         let cigar = CigarBuf::from(ops);
-        let result = cigar_to_string(&cigar).expect("unexpected failure");
+        let result = cigar_to_string(&cigar).expect("cigar_to_string should succeed");
         assert_eq!(result, "10M2D5M");
     }
 
@@ -2009,12 +2009,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value (44)
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(44));
+        assert_eq!(extract_int_value(r1_ms.expect("R1 ms tag should be present")), Some(44));
 
         // R2 should have ms tag with R1's AS value (55)
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(55));
+        assert_eq!(extract_int_value(r2_ms.expect("R2 ms tag should be present")), Some(55));
 
         Ok(())
     }
@@ -2041,12 +2041,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value (88)
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(88));
+        assert_eq!(extract_int_value(r1_ms.expect("R1 ms tag should be present")), Some(88));
 
         // R2 should have ms tag with R1's AS value (77)
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(77));
+        assert_eq!(extract_int_value(r2_ms.expect("R2 ms tag should be present")), Some(77));
 
         Ok(())
     }
@@ -2073,12 +2073,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value (2000)
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(2000));
+        assert_eq!(extract_int_value(r1_ms.expect("R1 ms tag should be present")), Some(2000));
 
         // R2 should have ms tag with R1's AS value (1000)
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(1000));
+        assert_eq!(extract_int_value(r2_ms.expect("R2 ms tag should be present")), Some(1000));
 
         Ok(())
     }
@@ -2105,12 +2105,12 @@ mod tests {
         // R1 should have ms tag with R2's AS value
         let r1_ms = template.records[0].data().get(&ms_tag);
         assert!(r1_ms.is_some(), "R1 should have ms tag");
-        assert_eq!(extract_int_value(r1_ms.expect("unexpected failure")), Some(200_000));
+        assert_eq!(extract_int_value(r1_ms.expect("R1 ms tag should be present")), Some(200_000));
 
         // R2 should have ms tag with R1's AS value
         let r2_ms = template.records[1].data().get(&ms_tag);
         assert!(r2_ms.is_some(), "R2 should have ms tag");
-        assert_eq!(extract_int_value(r2_ms.expect("unexpected failure")), Some(100_000));
+        assert_eq!(extract_int_value(r2_ms.expect("R2 ms tag should be present")), Some(100_000));
 
         Ok(())
     }
@@ -2164,7 +2164,10 @@ mod tests {
         // R1 supplementary should have ms tag with R2's AS value (44)
         let r1_supp_ms = template.records[2].data().get(&ms_tag);
         assert!(r1_supp_ms.is_some(), "R1 supplementary should have ms tag");
-        assert_eq!(extract_int_value(r1_supp_ms.expect("unexpected failure")), Some(44));
+        assert_eq!(
+            extract_int_value(r1_supp_ms.expect("R1 supplementary ms tag should be present")),
+            Some(44)
+        );
 
         Ok(())
     }
@@ -3717,7 +3720,8 @@ mod tests {
     #[test]
     fn test_from_raw_records_creates_raw_mode_template() {
         let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let template = Template::from_raw_records(vec![raw]).expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![raw]).expect("from_raw_records should succeed");
 
         // Verify it's in raw-byte mode
         assert!(template.is_raw_byte_mode());
@@ -3731,7 +3735,8 @@ mod tests {
     fn test_r1_accessor_returns_none_in_raw_mode() {
         // After fix: calling r1() on a raw-mode Template returns None instead of panicking
         let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let template = Template::from_raw_records(vec![raw]).expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![raw]).expect("from_raw_records should succeed");
 
         // r1() should return None in raw mode (use raw_r1() instead)
         assert!(template.r1().is_none());
@@ -3744,7 +3749,8 @@ mod tests {
         // After fix: calling r2() on a raw-mode Template returns None instead of panicking
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
 
         assert!(template.is_raw_byte_mode());
 
@@ -3763,7 +3769,8 @@ mod tests {
         // R1 first, R2 second — fast path with no swap
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
 
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
@@ -3808,7 +3815,8 @@ mod tests {
             b"read1",
             FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SECONDARY,
         );
-        let template = Template::from_raw_records(vec![r1, sec]).expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![r1, sec]).expect("from_raw_records should succeed");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
     }
@@ -3833,7 +3841,8 @@ mod tests {
     fn test_from_raw_records_single_unpaired() {
         // Single unpaired record — should be treated as R1
         let r = make_minimal_raw_bam(b"read1", 0); // no PAIRED flag
-        let template = Template::from_raw_records(vec![r]).expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![r]).expect("from_raw_records should succeed");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
         assert!(template.raw_r2().is_none());
@@ -3862,9 +3871,10 @@ mod tests {
     fn test_from_raw_records_all_raw_records_mut() {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let mut template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
+        let mut template =
+            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
         // Should be able to get mutable access
-        let recs = template.all_raw_records_mut().expect("unexpected failure");
+        let recs = template.all_raw_records_mut().expect("all_raw_records_mut should succeed");
         assert_eq!(recs.len(), 2);
     }
 
@@ -3872,8 +3882,9 @@ mod tests {
     fn test_from_raw_records_into_raw_records() {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r1, r2]).expect("unexpected failure");
-        let recs = template.into_raw_records().expect("unexpected failure");
+        let template =
+            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
+        let recs = template.into_raw_records().expect("into_raw_records should succeed");
         assert_eq!(recs.len(), 2);
     }
 

@@ -1559,7 +1559,7 @@ mod tests {
         let header = Header::default();
         let result = create_indexing_bam_writer("-", &header, 6, 2);
         assert!(result.is_err());
-        let err = result.err().expect("result should be Ok");
+        let err = result.err().expect("result should be Err");
         assert!(err.to_string().contains("stdout"));
     }
 }

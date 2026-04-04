@@ -2012,7 +2012,10 @@ mod tests {
         let lookup = LibraryLookup::from_header(&header);
         assert_eq!(lookup.rg_to_ordinal.len(), 1);
         // LibA is the only library, so it gets ordinal 1 (0 is reserved for empty/unknown)
-        assert_eq!(*lookup.rg_to_ordinal.get(b"rg1".as_slice()).expect("unexpected failure"), 1);
+        assert_eq!(
+            *lookup.rg_to_ordinal.get(b"rg1".as_slice()).expect("rg1 should be in ordinal map"),
+            1
+        );
     }
 
     #[test]
@@ -2408,7 +2411,7 @@ mod tests {
             .output_compression(0)
             .write_index(write_index)
             .sort(&input, &output)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         assert!(
             stats.chunks_written >= 5,
@@ -2456,7 +2459,7 @@ mod tests {
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         assert!(
             stats.chunks_written >= 2,
@@ -2506,7 +2509,7 @@ mod tests {
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_st)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         // Sort multi-threaded (exercises par_sort_into_chunks / par_chunks_mut)
         RawExternalSorter::new(sort_order)
@@ -2515,7 +2518,7 @@ mod tests {
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_mt)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         let names_st = collect_read_names(&output_st);
         let names_mt = collect_read_names(&output_mt);
@@ -2559,7 +2562,7 @@ mod tests {
             .threads(2)
             .output_compression(0)
             .sort(&input, &output)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         let expected = (num_pairs * 2) as u64;
         let observed = count_bam_records(&output);
@@ -2642,7 +2645,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Coordinate)
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         // 10 pairs * 2 records * 2 inputs = 40
         assert_eq!(count, 40);
@@ -2667,7 +2670,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::TemplateCoordinate)
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         assert_eq!(count, 40);
         assert_eq!(count_bam_records(&merged), 40);
@@ -2696,7 +2699,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()))
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         assert_eq!(count, 40);
         assert_eq!(count_bam_records(&merged), 40);
@@ -2718,7 +2721,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Coordinate)
             .output_compression(0)
             .merge_bams(&[bam_a], &header, &merged)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         // 15 pairs * 2 = 30
         assert_eq!(count, 30);
@@ -2748,7 +2751,7 @@ mod tests {
         RawExternalSorter::new(SortOrder::Queryname(QuerynameComparator::default()))
             .output_compression(0)
             .merge_bams(&[bam_a, bam_b], &header, &merged)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         let merged_names: std::collections::HashSet<String> =
             collect_read_names(&merged).into_iter().collect();
@@ -2782,7 +2785,7 @@ mod tests {
         let count = RawExternalSorter::new(SortOrder::Coordinate)
             .output_compression(0)
             .merge_bams(&inputs, &header, &merged)
-            .expect("unexpected failure");
+            .expect("sort should succeed");
 
         let expected = (k * pairs_per_input * 2) as u64; // 8 * 5 * 2 = 80
         assert_eq!(count, expected);

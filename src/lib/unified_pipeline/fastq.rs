@@ -3776,7 +3776,7 @@ mod tests {
             data: b"data1".to_vec(),
             offsets: Some(vec![0, 5]),
         });
-        let chunks = pair.try_pop_complete(false).expect("unexpected failure");
+        let chunks = pair.try_pop_complete(false).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
         assert!(pair.is_empty());
     }
@@ -3808,14 +3808,14 @@ mod tests {
         });
 
         // Batch 0: complete
-        let chunks = pair.try_pop_complete(false).expect("unexpected failure");
+        let chunks = pair.try_pop_complete(false).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
 
         // Batch 1: only stream 0 — not complete without all_arrived
         assert!(pair.try_pop_complete(false).is_none());
 
         // With all_arrived, batch 1 emits with just stream 0
-        let chunks = pair.try_pop_complete(true).expect("unexpected failure");
+        let chunks = pair.try_pop_complete(true).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream_idx, 0);
         assert!(pair.is_empty());
@@ -3851,7 +3851,7 @@ mod tests {
         // Simulate: batches_read=2 (still reading), chunks_paired=2.
         // all_arrived = read_done(false) && ... → false.
         let all_arrived = false;
-        let chunks = pair.try_pop_complete(all_arrived).expect("unexpected failure");
+        let chunks = pair.try_pop_complete(all_arrived).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
 
         // Insert batch 1 from stream 0 only (stream 1 hit EOF earlier).
@@ -3870,7 +3870,7 @@ mod tests {
         // Simulate: chunks_paired catches up to 3.
         // all_arrived = read_done(true) && 3 == 3 → true.
         let all_arrived = true;
-        let chunks = pair.try_pop_complete(all_arrived).expect("unexpected failure");
+        let chunks = pair.try_pop_complete(all_arrived).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream_idx, 0);
         assert!(pair.is_empty());
