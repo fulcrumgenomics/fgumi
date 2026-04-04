@@ -359,7 +359,10 @@ mod tests {
         let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
         let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
 
-        assert!(compress_pos.unwrap() < serialize_pos.unwrap());
+        assert!(
+            compress_pos.expect("compress position should be Some")
+                < serialize_pos.expect("serialize position should be Some")
+        );
     }
 
     #[test]
@@ -378,7 +381,10 @@ mod tests {
         let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
         let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
 
-        assert!(serialize_pos.unwrap() < compress_pos.unwrap());
+        assert!(
+            serialize_pos.expect("serialize position should be Some")
+                < compress_pos.expect("compress position should be Some")
+        );
     }
 
     #[rstest]
@@ -441,7 +447,8 @@ mod tests {
         let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
         let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
         assert!(
-            compress_pos.unwrap() < serialize_pos.unwrap(),
+            compress_pos.expect("compress position should be Some")
+                < serialize_pos.expect("serialize position should be Some"),
             "Compress-preferred thread should try Compress before Serialize"
         );
     }
@@ -463,7 +470,10 @@ mod tests {
 
         let compress_pos = priorities.iter().position(|&s| s == PipelineStep::Compress);
         let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
-        assert!(compress_pos.unwrap() < serialize_pos.unwrap());
+        assert!(
+            compress_pos.expect("compress position should be Some")
+                < serialize_pos.expect("serialize position should be Some")
+        );
     }
 
     #[test]
@@ -482,6 +492,9 @@ mod tests {
 
         // Process should be early in the priority list (after exclusive role if any)
         let process_pos = priorities.iter().position(|&s| s == PipelineStep::Process);
-        assert!(process_pos.unwrap() <= 2, "Process should be prioritized when memory is high");
+        assert!(
+            process_pos.expect("process position should be Some") <= 2,
+            "Process should be prioritized when memory is high"
+        );
     }
 }

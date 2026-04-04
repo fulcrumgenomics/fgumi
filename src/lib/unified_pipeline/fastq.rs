@@ -142,7 +142,10 @@ impl PairState {
             return None;
         }
 
-        let slots = self.pending.remove(&self.next_emit).unwrap();
+        let slots = self
+            .pending
+            .remove(&self.next_emit)
+            .expect("next_emit key must exist in pending map after get() succeeded");
         self.next_emit += 1;
         Some(slots.into_iter().flatten().collect())
     }
@@ -1979,7 +1982,7 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
                 .map(|c| FastqStreamBoundaries {
                     stream_idx: c.stream_idx,
                     data: c.data,
-                    offsets: c.offsets.unwrap(),
+                    offsets: c.offsets.expect("gzip chunks must have pre-computed offsets"),
                 })
                 .collect();
             align_stream_records(streams, serial)
@@ -2171,7 +2174,7 @@ fn create_templates_from_streams(
         0 => Ok(Vec::new()),
         1 => {
             // Single-end: each record becomes its own template
-            let records = streams.pop().unwrap().records;
+            let records = streams.pop().expect("streams is non-empty in single-end branch").records;
             Ok(records
                 .into_iter()
                 .map(|r| {
@@ -2186,8 +2189,8 @@ fn create_templates_from_streams(
             // always R2, regardless of the order produced by find_boundaries().
             streams.sort_by_key(|s| s.stream_idx);
             let mut drain = streams.into_iter();
-            let r1_records = drain.next().unwrap().records;
-            let r2_records = drain.next().unwrap().records;
+            let r1_records = drain.next().expect("sorted streams must have R1 at index 0").records;
+            let r2_records = drain.next().expect("sorted streams must have R2 at index 1").records;
 
             // Validate batch sizes match
             if r1_records.len() != r2_records.len() {
@@ -3022,7 +3025,7 @@ mod tests {
         ];
 
         let mut reader = Cursor::new(bgzf_empty_block);
-        let blocks = read_raw_blocks(&mut reader, 10).unwrap();
+        let blocks = read_raw_blocks(&mut reader, 10).expect("failed to read raw blocks");
 
         // Should read 0 blocks (EOF blocks are skipped by read_raw_blocks)
         assert_eq!(blocks.len(), 0);
@@ -3065,8 +3068,8 @@ mod tests {
             }
         });
 
-        producer.join().unwrap();
-        consumer.join().unwrap();
+        producer.join().expect("thread should not panic");
+        consumer.join().expect("thread should not panic");
 
         let pushed_count = items_pushed.load(Ordering::Relaxed);
         let received_count = items_received.load(Ordering::Relaxed);
@@ -3110,14 +3113,16 @@ mod tests {
         };
 
         // Step 1: Find boundaries
-        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+        let boundary_batch =
+            FastqFormat::find_boundaries(&boundary_state, batch).expect("find_boundaries failed");
         assert_eq!(boundary_batch.streams.len(), 2);
         // Each stream should have 2 complete records (offsets at 0, 19, 38)
         assert_eq!(boundary_batch.streams[0].offsets.len(), 3);
         assert_eq!(boundary_batch.streams[1].offsets.len(), 3);
 
         // Step 2: Parse records
-        let parsed_batch = FastqFormat::parse_records(boundary_batch).unwrap();
+        let parsed_batch =
+            FastqFormat::parse_records(boundary_batch).expect("parse_records failed");
         assert_eq!(parsed_batch.streams.len(), 2);
         assert_eq!(parsed_batch.streams[0].stream_idx, 0);
         assert_eq!(parsed_batch.streams[1].stream_idx, 1);
@@ -3146,7 +3151,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        let boundary_batch1 =
+            FastqFormat::find_boundaries(&boundary_state, batch1).expect("find_boundaries failed");
         assert_eq!(boundary_batch1.streams[0].offsets.len(), 2); // One complete record
         assert!(!boundary_state.stream_states[0].lock().leftover.is_empty()); // Leftover from incomplete
 
@@ -3156,14 +3162,15 @@ mod tests {
             serial: 1,
         };
 
-        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+        let boundary_batch2 =
+            FastqFormat::find_boundaries(&boundary_state, batch2).expect("find_boundaries failed");
         // Leftover + new data should form complete record
         assert!(boundary_batch2.streams[0].offsets.len() >= 2);
         assert!(boundary_state.stream_states[0].lock().leftover.is_empty()); // No more leftover
 
         // Parse both batches
-        let parsed1 = FastqFormat::parse_records(boundary_batch1).unwrap();
-        let parsed2 = FastqFormat::parse_records(boundary_batch2).unwrap();
+        let parsed1 = FastqFormat::parse_records(boundary_batch1).expect("parse_records failed");
+        let parsed2 = FastqFormat::parse_records(boundary_batch2).expect("parse_records failed");
 
         assert_eq!(parsed1.streams[0].records.len(), 1);
         assert_eq!(parsed1.streams[0].records[0].name, b"read1");
@@ -3199,7 +3206,8 @@ mod tests {
                         };
 
                         // Parse the batch
-                        let parsed = FastqFormat::parse_records(boundary_batch).unwrap();
+                        let parsed = FastqFormat::parse_records(boundary_batch)
+                            .expect("parse_records failed");
                         assert_eq!(parsed.streams[0].stream_idx, 0);
                         assert_eq!(parsed.streams[0].records.len(), 1);
                         assert_eq!(
@@ -3245,7 +3253,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+        let boundary_batch =
+            FastqFormat::find_boundaries(&boundary_state, batch).expect("find_boundaries failed");
 
         // Both streams should have exactly 2 records (the minimum)
         assert_eq!(boundary_batch.streams.len(), 2);
@@ -3292,7 +3301,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        let boundary_batch1 =
+            FastqFormat::find_boundaries(&boundary_state, batch1).expect("find_boundaries failed");
         assert_eq!(boundary_batch1.streams[0].offsets.len() - 1, 2); // 2 records from stream 0
         assert_eq!(boundary_batch1.streams[1].offsets.len() - 1, 2); // 2 records from stream 1
 
@@ -3309,7 +3319,8 @@ mod tests {
             serial: 1,
         };
 
-        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+        let boundary_batch2 =
+            FastqFormat::find_boundaries(&boundary_state, batch2).expect("find_boundaries failed");
 
         // Stream 0: leftover(r3) + new(r4) = 2 records
         // Stream 1: 2 new records (r3, r4)
@@ -3326,7 +3337,7 @@ mod tests {
         );
 
         // Parse and verify record names
-        let parsed = FastqFormat::parse_records(boundary_batch2).unwrap();
+        let parsed = FastqFormat::parse_records(boundary_batch2).expect("parse_records failed");
         assert_eq!(
             parsed.streams[0].records[0].name, b"r3",
             "First record should be r3 from leftover"
@@ -3352,7 +3363,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        let boundary_batch1 =
+            FastqFormat::find_boundaries(&boundary_state, batch1).expect("find_boundaries failed");
         // Both aligned to 1 record
         assert_eq!(boundary_batch1.streams[0].offsets.len() - 1, 1);
         assert_eq!(boundary_batch1.streams[1].offsets.len() - 1, 1);
@@ -3369,14 +3381,17 @@ mod tests {
             serial: 1,
         };
 
-        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+        let boundary_batch2 =
+            FastqFormat::find_boundaries(&boundary_state, batch2).expect("find_boundaries failed");
 
         // Both streams should be present (stream 0 from leftover, stream 1 from new chunk)
         assert_eq!(boundary_batch2.streams.len(), 2, "Both streams should be present");
 
         // Find stream 0 and stream 1 in the result (order may vary)
-        let stream0 = boundary_batch2.streams.iter().find(|s| s.stream_idx == 0).unwrap();
-        let stream1 = boundary_batch2.streams.iter().find(|s| s.stream_idx == 1).unwrap();
+        let stream0 =
+            boundary_batch2.streams.iter().find(|s| s.stream_idx == 0).expect("stream not found");
+        let stream1 =
+            boundary_batch2.streams.iter().find(|s| s.stream_idx == 1).expect("stream not found");
 
         assert_eq!(stream0.offsets.len() - 1, 1, "Stream 0 should have 1 record from leftover");
         assert_eq!(stream1.offsets.len() - 1, 1, "Stream 1 should have 1 record");
@@ -3407,7 +3422,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+        let boundary_batch =
+            FastqFormat::find_boundaries(&boundary_state, batch).expect("find_boundaries failed");
 
         // Both streams should have 2 records
         assert_eq!(boundary_batch.streams[0].offsets.len() - 1, 2);
@@ -3431,7 +3447,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch = FastqFormat::find_boundaries(&boundary_state, batch).unwrap();
+        let boundary_batch =
+            FastqFormat::find_boundaries(&boundary_state, batch).expect("find_boundaries failed");
 
         // All 3 records should be present (no alignment needed for single stream)
         assert_eq!(boundary_batch.streams[0].offsets.len() - 1, 3);
@@ -3455,7 +3472,8 @@ mod tests {
             serial: 0,
         };
 
-        let _ = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        let _ =
+            FastqFormat::find_boundaries(&boundary_state, batch1).expect("find_boundaries failed");
 
         // Verify stream 0 has leftover
         assert!(!boundary_state.stream_states[0].lock().leftover.is_empty());
@@ -3469,7 +3487,8 @@ mod tests {
             serial: 1,
         };
 
-        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+        let boundary_batch2 =
+            FastqFormat::find_boundaries(&boundary_state, batch2).expect("find_boundaries failed");
 
         // Both streams should be present
         assert_eq!(boundary_batch2.streams.len(), 2);
@@ -3502,7 +3521,7 @@ mod tests {
             serial: 42,
         };
 
-        let parsed = FastqFormat::parse_records(boundary_batch).unwrap();
+        let parsed = FastqFormat::parse_records(boundary_batch).expect("parse_records failed");
         assert_eq!(parsed.serial, 42);
         assert_eq!(parsed.streams.len(), 2);
         // stream_idx must be preserved, not assumed from position
@@ -3545,7 +3564,8 @@ mod tests {
             },
         ];
 
-        let templates = create_templates_from_streams(streams).unwrap();
+        let templates =
+            create_templates_from_streams(streams).expect("create templates from streams");
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].records.len(), 2);
@@ -3582,7 +3602,8 @@ mod tests {
             },
         ];
 
-        let templates = create_templates_from_streams(streams).unwrap();
+        let templates =
+            create_templates_from_streams(streams).expect("create templates from streams");
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].records[0].sequence, b"ACGT", "R1 should be first");
@@ -3613,7 +3634,8 @@ mod tests {
             serial: 0,
         };
 
-        let boundary_batch1 = FastqFormat::find_boundaries(&boundary_state, batch1).unwrap();
+        let boundary_batch1 =
+            FastqFormat::find_boundaries(&boundary_state, batch1).expect("find_boundaries failed");
         // Both aligned to 1 record; stream 0 has leftover
         assert_eq!(boundary_batch1.streams[0].offsets.len() - 1, 1);
         assert_eq!(boundary_batch1.streams[1].offsets.len() - 1, 1);
@@ -3629,7 +3651,8 @@ mod tests {
             serial: 1,
         };
 
-        let boundary_batch2 = FastqFormat::find_boundaries(&boundary_state, batch2).unwrap();
+        let boundary_batch2 =
+            FastqFormat::find_boundaries(&boundary_state, batch2).expect("find_boundaries failed");
         assert_eq!(boundary_batch2.streams.len(), 2);
 
         // The order of streams in boundary_batch2 may be [stream_idx=1, stream_idx=0]
@@ -3638,13 +3661,14 @@ mod tests {
         let second_stream_idx = boundary_batch2.streams[1].stream_idx;
 
         // Parse records — stream_idx must be preserved
-        let parsed = FastqFormat::parse_records(boundary_batch2).unwrap();
+        let parsed = FastqFormat::parse_records(boundary_batch2).expect("parse_records failed");
         assert_eq!(parsed.streams[0].stream_idx, first_stream_idx);
         assert_eq!(parsed.streams[1].stream_idx, second_stream_idx);
 
         // Create templates — must produce correct R1/R2 ordering regardless
         // of the stream order in the Vec
-        let templates = create_templates_from_streams(parsed.streams).unwrap();
+        let templates =
+            create_templates_from_streams(parsed.streams).expect("create templates from streams");
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].name, b"read2");
         assert_eq!(templates[0].records.len(), 2);
@@ -3684,7 +3708,8 @@ mod tests {
         let data = make_fastq_records(&[("r1", "ACGT"), ("r2", "TGCA"), ("r3", "AAAA")]);
         let mut cursor = Cursor::new(data);
 
-        let (buf, offsets, at_eof) = read_n_fastq_records(&mut cursor, 2).unwrap();
+        let (buf, offsets, at_eof) =
+            read_n_fastq_records(&mut cursor, 2).expect("read N FASTQ records");
 
         assert_eq!(offsets.len(), 3); // 2 records + initial 0
         assert!(!at_eof);
@@ -3702,7 +3727,8 @@ mod tests {
         let data = make_fastq_records(&[("r1", "ACGT")]);
         let mut cursor = Cursor::new(data);
 
-        let (_, offsets, at_eof) = read_n_fastq_records(&mut cursor, 5).unwrap();
+        let (_, offsets, at_eof) =
+            read_n_fastq_records(&mut cursor, 5).expect("read N FASTQ records");
 
         // Only 1 record available, requested 5
         assert_eq!(offsets.len(), 2); // 1 record
@@ -3713,7 +3739,8 @@ mod tests {
     fn test_read_n_fastq_records_empty_input() {
         let mut cursor = Cursor::new(Vec::<u8>::new());
 
-        let (_, offsets, at_eof) = read_n_fastq_records(&mut cursor, 5).unwrap();
+        let (_, offsets, at_eof) =
+            read_n_fastq_records(&mut cursor, 5).expect("read N FASTQ records");
 
         assert_eq!(offsets.len(), 1); // Just the initial 0
         assert!(at_eof);
@@ -3748,7 +3775,7 @@ mod tests {
             data: b"data1".to_vec(),
             offsets: Some(vec![0, 5]),
         });
-        let chunks = pair.try_pop_complete(false).unwrap();
+        let chunks = pair.try_pop_complete(false).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
         assert!(pair.is_empty());
     }
@@ -3780,14 +3807,14 @@ mod tests {
         });
 
         // Batch 0: complete
-        let chunks = pair.try_pop_complete(false).unwrap();
+        let chunks = pair.try_pop_complete(false).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
 
         // Batch 1: only stream 0 — not complete without all_arrived
         assert!(pair.try_pop_complete(false).is_none());
 
         // With all_arrived, batch 1 emits with just stream 0
-        let chunks = pair.try_pop_complete(true).unwrap();
+        let chunks = pair.try_pop_complete(true).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream_idx, 0);
         assert!(pair.is_empty());
@@ -3823,7 +3850,7 @@ mod tests {
         // Simulate: batches_read=2 (still reading), chunks_paired=2.
         // all_arrived = read_done(false) && ... → false.
         let all_arrived = false;
-        let chunks = pair.try_pop_complete(all_arrived).unwrap();
+        let chunks = pair.try_pop_complete(all_arrived).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 2);
 
         // Insert batch 1 from stream 0 only (stream 1 hit EOF earlier).
@@ -3842,7 +3869,7 @@ mod tests {
         // Simulate: chunks_paired catches up to 3.
         // all_arrived = read_done(true) && 3 == 3 → true.
         let all_arrived = true;
-        let chunks = pair.try_pop_complete(all_arrived).unwrap();
+        let chunks = pair.try_pop_complete(all_arrived).expect("try_pop_complete should succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].stream_idx, 0);
         assert!(pair.is_empty());

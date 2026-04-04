@@ -385,7 +385,8 @@ pub struct Builder {
 impl Default for Builder {
     fn default() -> Self {
         Self {
-            compression_level: CompressionLevel::new(6).unwrap(),
+            compression_level: CompressionLevel::new(6)
+                .expect("compression level 6 is always valid"),
             worker_count: NonZero::<usize>::MIN,
             blocksize: BGZF_BLOCK_SIZE,
         }
@@ -530,26 +531,35 @@ mod tests {
 
     #[test]
     fn test_new_and_finish() {
-        let mut writer = MultithreadedWriter::new(Vec::new(), CompressionLevel::new(6).unwrap());
+        let mut writer = MultithreadedWriter::new(
+            Vec::new(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
+        );
         let result = writer.finish();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_roundtrip() {
-        let mut writer = MultithreadedWriter::new(Vec::new(), CompressionLevel::new(6).unwrap());
-        writer.write_all(b"hello world").unwrap();
-        let data = writer.finish().unwrap();
+        let mut writer = MultithreadedWriter::new(
+            Vec::new(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
+        );
+        writer.write_all(b"hello world").expect("write_all should succeed");
+        let data = writer.finish().expect("finish should succeed");
 
         let mut reader = Reader::new(&data[..]);
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).unwrap();
+        reader.read_to_end(&mut buf).expect("read_to_end should succeed");
         assert_eq!(buf, b"hello world");
     }
 
     #[test]
     fn test_position_tracking_initial() {
-        let writer = MultithreadedWriter::new(Vec::new(), CompressionLevel::new(6).unwrap());
+        let writer = MultithreadedWriter::new(
+            Vec::new(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
+        );
         assert_eq!(writer.position(), 0);
         assert_eq!(writer.current_block_number(), 0);
         assert_eq!(writer.blocks_written(), 0);
@@ -558,34 +568,40 @@ mod tests {
 
     #[test]
     fn test_position_tracking_after_writes() {
-        let mut writer = MultithreadedWriter::new(Vec::new(), CompressionLevel::new(6).unwrap());
+        let mut writer = MultithreadedWriter::new(
+            Vec::new(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
+        );
 
-        writer.write_all(b"hello").unwrap();
+        writer.write_all(b"hello").expect("write_all should succeed");
         assert_eq!(writer.buffer_offset(), 5);
 
-        writer.flush().unwrap();
+        writer.flush().expect("flush should succeed");
         assert_eq!(writer.current_block_number(), 1);
         assert_eq!(writer.buffer_offset(), 0);
 
-        writer.finish().unwrap();
+        writer.finish().expect("finish should succeed");
     }
 
     #[test]
     fn test_block_info_notifications() {
         let mut writer = MultithreadedWriter::with_worker_count(
-            NonZero::new(2).unwrap(),
+            NonZero::new(2).expect("non-zero value 2"),
             Vec::new(),
-            CompressionLevel::new(6).unwrap(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
         );
 
-        let rx = writer.block_info_receiver().unwrap().clone();
+        let rx = writer
+            .block_info_receiver()
+            .expect("block_info_receiver should return a receiver")
+            .clone();
 
-        writer.write_all(b"block1").unwrap();
-        writer.flush().unwrap();
-        writer.write_all(b"block2").unwrap();
-        writer.flush().unwrap();
+        writer.write_all(b"block1").expect("write_all should succeed");
+        writer.flush().expect("flush should succeed");
+        writer.write_all(b"block2").expect("write_all should succeed");
+        writer.flush().expect("flush should succeed");
 
-        writer.finish().unwrap();
+        writer.finish().expect("finish should succeed");
 
         let infos: Vec<_> = rx.try_iter().collect();
         assert_eq!(infos.len(), 2);
@@ -598,21 +614,21 @@ mod tests {
     fn test_multiple_workers() {
         for worker_count in [1, 2, 4] {
             let mut writer = MultithreadedWriter::with_worker_count(
-                NonZero::new(worker_count).unwrap(),
+                NonZero::new(worker_count).expect("worker_count is non-zero"),
                 Vec::new(),
-                CompressionLevel::new(6).unwrap(),
+                CompressionLevel::new(6).expect("valid compression level 6"),
             );
 
             for i in 0..20 {
-                writer.write_all(format!("block{i}").as_bytes()).unwrap();
-                writer.flush().unwrap();
+                writer.write_all(format!("block{i}").as_bytes()).expect("write_all should succeed");
+                writer.flush().expect("flush should succeed");
             }
 
-            let data = writer.finish().unwrap();
+            let data = writer.finish().expect("finish should succeed");
 
             let mut reader = Reader::new(&data[..]);
             let mut buf = String::new();
-            reader.read_to_string(&mut buf).unwrap();
+            reader.read_to_string(&mut buf).expect("read_to_string should succeed");
 
             for i in 0..20 {
                 assert!(buf.contains(&format!("block{i}")));
@@ -623,28 +639,31 @@ mod tests {
     #[test]
     fn test_large_data() {
         let mut writer = MultithreadedWriter::with_worker_count(
-            NonZero::new(4).unwrap(),
+            NonZero::new(4).expect("non-zero value 4"),
             Vec::new(),
-            CompressionLevel::new(6).unwrap(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
         );
 
         let large_data = vec![b'A'; BGZF_BLOCK_SIZE * 5];
-        writer.write_all(&large_data).unwrap();
+        writer.write_all(&large_data).expect("write_all should succeed");
 
-        let compressed = writer.finish().unwrap();
+        let compressed = writer.finish().expect("finish should succeed");
 
         let mut reader = Reader::new(&compressed[..]);
         let mut decompressed = Vec::new();
-        reader.read_to_end(&mut decompressed).unwrap();
+        reader.read_to_end(&mut decompressed).expect("read_to_end should succeed");
 
         assert_eq!(decompressed, large_data);
     }
 
     #[test]
     fn test_eof_marker() {
-        let mut writer = MultithreadedWriter::new(Vec::new(), CompressionLevel::new(6).unwrap());
-        writer.write_all(b"test").unwrap();
-        let data = writer.finish().unwrap();
+        let mut writer = MultithreadedWriter::new(
+            Vec::new(),
+            CompressionLevel::new(6).expect("valid compression level 6"),
+        );
+        writer.write_all(b"test").expect("write_all should succeed");
+        let data = writer.finish().expect("finish should succeed");
 
         assert!(data.ends_with(BGZF_EOF));
     }
@@ -652,8 +671,8 @@ mod tests {
     #[test]
     fn test_builder() {
         let writer = Builder::default()
-            .set_compression_level(CompressionLevel::new(9).unwrap())
-            .set_worker_count(NonZero::new(4).unwrap())
+            .set_compression_level(CompressionLevel::new(9).expect("valid compression level 9"))
+            .set_worker_count(NonZero::new(4).expect("non-zero value 4"))
             .set_blocksize(32768)
             .build_from_writer(Vec::new());
 

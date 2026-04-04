@@ -248,11 +248,11 @@ mod tests {
         assert!(queue.insert(1, 150, 10).is_ok());
 
         // Pop in order
-        let (val, _) = queue.try_pop_next().unwrap();
+        let (val, _) = queue.try_pop_next().expect("queue should have next element");
         assert_eq!(val, 100);
-        let (val, _) = queue.try_pop_next().unwrap();
+        let (val, _) = queue.try_pop_next().expect("queue should have next element");
         assert_eq!(val, 150);
-        let (val, _) = queue.try_pop_next().unwrap();
+        let (val, _) = queue.try_pop_next().expect("queue should have next element");
         assert_eq!(val, 200);
 
         assert!(queue.try_pop_next().is_none());

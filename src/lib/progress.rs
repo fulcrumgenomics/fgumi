@@ -365,7 +365,7 @@ mod tests {
         }
 
         for handle in handles {
-            handle.join().unwrap();
+            handle.join().expect("thread should join successfully");
         }
 
         // Total should be 1000

@@ -148,15 +148,15 @@ mod tests {
 
     #[test]
     fn test_create_temp_dir_default() {
-        let dir = create_temp_dir(None).unwrap();
+        let dir = create_temp_dir(None).expect("creating temp dir should succeed");
         assert!(dir.path().exists());
     }
 
     #[test]
     fn test_create_temp_dir_with_base() {
-        let base = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().expect("creating temp file/dir should succeed");
         let subdir = base.path().join("sort_spill");
-        let dir = create_temp_dir(Some(&subdir)).unwrap();
+        let dir = create_temp_dir(Some(&subdir)).expect("creating temp dir should succeed");
         assert!(dir.path().exists());
         assert!(dir.path().starts_with(&subdir));
     }

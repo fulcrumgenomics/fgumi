@@ -119,7 +119,8 @@ impl PositionQualityModel {
         };
 
         // Add Gaussian noise
-        let noise_dist = Normal::new(0.0, self.noise_stddev).unwrap();
+        let noise_dist = Normal::new(0.0, self.noise_stddev)
+            .expect("Normal::new must succeed with finite mean=0.0 and non-negative stddev");
         let noisy = base_q + noise_dist.sample(rng);
 
         // Clamp to valid range [min_quality, 41]
@@ -385,8 +386,8 @@ mod tests {
         let samples: Vec<u8> = (0..1000).map(|_| model.quality_at(50, &mut rng)).collect();
 
         // With high noise, we should see variation
-        let min = *samples.iter().min().unwrap();
-        let max = *samples.iter().max().unwrap();
+        let min = *samples.iter().min().expect("samples should not be empty");
+        let max = *samples.iter().max().expect("samples should not be empty");
         assert!(max - min > 5, "Expected variation with high noise");
     }
 

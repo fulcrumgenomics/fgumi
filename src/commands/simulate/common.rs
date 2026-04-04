@@ -48,13 +48,22 @@ pub struct QualityArgs {
     #[arg(long = "decay-rate", default_value = "0.08")]
     pub decay_rate: f64,
 
-    /// Standard deviation of quality noise
-    #[arg(long = "quality-noise", default_value = "2.0")]
+    /// Standard deviation of quality noise (must be finite and >= 0)
+    #[arg(long = "quality-noise", default_value = "2.0", value_parser = parse_noise_stddev)]
     pub quality_noise: f64,
 
     /// Quality offset for R2 reads (typically negative)
     #[arg(long = "r2-quality-offset", default_value = "-2", allow_hyphen_values = true)]
     pub r2_quality_offset: i8,
+}
+
+/// Parse and validate a noise standard deviation value for quality score simulation.
+fn parse_noise_stddev(s: &str) -> Result<f64, String> {
+    let val: f64 = s.parse().map_err(|e| format!("invalid float: {e}"))?;
+    if !val.is_finite() || val < 0.0 {
+        return Err(format!("quality-noise must be finite and >= 0.0, got {val}"));
+    }
+    Ok(val)
 }
 
 impl QualityArgs {
@@ -602,6 +611,25 @@ mod tests {
         let (a, b) = model.split_reads(1, &mut rng);
         assert_eq!(a + b, 1);
         assert!(a <= 1 && b <= 1);
+    }
+
+    #[rstest]
+    #[case("0.0", 0.0)]
+    #[case("2.5", 2.5)]
+    #[case("100.0", 100.0)]
+    fn test_parse_noise_stddev_accepts_valid(#[case] input: &str, #[case] expected: f64) {
+        let parsed = parse_noise_stddev(input).expect("valid noise stddev should parse");
+        assert!((parsed - expected).abs() < f64::EPSILON);
+    }
+
+    #[rstest]
+    #[case("-0.1")]
+    #[case("NaN")]
+    #[case("inf")]
+    #[case("-inf")]
+    #[case("abc")]
+    fn test_parse_noise_stddev_rejects_invalid(#[case] input: &str) {
+        assert!(parse_noise_stddev(input).is_err(), "input should be rejected: {input}");
     }
 
     #[test]

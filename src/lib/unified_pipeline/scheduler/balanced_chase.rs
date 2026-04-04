@@ -252,8 +252,8 @@ mod tests {
         let serialize_pos = priorities.iter().position(|&s| s == PipelineStep::Serialize);
 
         // Both should be in top 3
-        assert!(compress_pos.unwrap() < 3);
-        assert!(serialize_pos.unwrap() < 3);
+        assert!(compress_pos.expect("compress position should be Some") < 3);
+        assert!(serialize_pos.expect("serialize position should be Some") < 3);
     }
 
     #[test]

@@ -131,7 +131,10 @@ mod tests {
 
         // Unexplored steps should come first (infinite UCB)
         // Read should be later since it's well-explored
-        let read_pos = priorities.iter().position(|&s| s == PipelineStep::Read).unwrap();
+        let read_pos = priorities
+            .iter()
+            .position(|&s| s == PipelineStep::Read)
+            .expect("PipelineStep::Read should be present in priorities");
         assert!(read_pos > 0, "Well-explored Read should not be first");
     }
 

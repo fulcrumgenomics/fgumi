@@ -398,9 +398,9 @@ mod tests {
         heap.push(Reverse(MergeEntry { key: 2, record: Record::default(), chunk_idx: 2 }));
 
         // Should come out in ascending order: 1, 2, 3
-        assert_eq!(heap.pop().unwrap().0.key, 1);
-        assert_eq!(heap.pop().unwrap().0.key, 2);
-        assert_eq!(heap.pop().unwrap().0.key, 3);
+        assert_eq!(heap.pop().expect("heap should have elements").0.key, 1);
+        assert_eq!(heap.pop().expect("heap should have elements").0.key, 2);
+        assert_eq!(heap.pop().expect("heap should have elements").0.key, 3);
         assert!(heap.is_empty());
     }
 
