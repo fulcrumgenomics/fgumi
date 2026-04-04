@@ -802,10 +802,7 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         self.output.is_processed_memory_high()
     }
 
-    /// Check if pipeline is in drain mode (bypasses memory backpressure).
-    ///
-    /// When draining, memory-based backpressure is bypassed to prevent deadlock
-    /// during pipeline completion. Queue-full checks still apply.
+    /// Check if the pipeline is in drain mode (input exhausted, completing remaining work).
     #[must_use]
     pub fn is_draining(&self) -> bool {
         self.output.is_draining()
@@ -2590,9 +2587,11 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
 
     // =========================================================================
     // Priority 2: Check if output queue has space (count and memory)
-    // When draining, bypass memory backpressure to prevent deadlock
+    // Memory backpressure is always enforced (including during draining) to
+    // prevent OOM.  The slot-based is_full() check is sufficient to guarantee
+    // forward progress: Serialize drains Q5 → slots free → Process resumes.
     // =========================================================================
-    if state.output.processed.is_full() || (!state.is_draining() && state.is_q5_memory_high()) {
+    if state.output.processed.is_full() || state.is_q5_memory_high() {
         return false;
     }
 
@@ -2605,8 +2604,7 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
 
     for _ in 0..MAX_BATCHES {
         // Check output space (count and memory) before each batch
-        // When draining, bypass memory backpressure to prevent deadlock
-        if state.output.processed.is_full() || (!state.is_draining() && state.is_q5_memory_high()) {
+        if state.output.processed.is_full() || state.is_q5_memory_high() {
             break;
         }
 
