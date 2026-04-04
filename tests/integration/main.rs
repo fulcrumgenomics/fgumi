@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Integration tests for fgumi library.
 //!
 //! These tests validate end-to-end workflows that span multiple modules,
@@ -16,6 +18,8 @@ mod test_dedup_command;
 mod test_downsample_command;
 mod test_duplex_command;
 mod test_duplex_metrics_command;
+#[cfg(all(feature = "compare", feature = "simulate"))]
+mod test_e2e_regression;
 mod test_error_paths;
 mod test_extract_command;
 mod test_fastq_command;
