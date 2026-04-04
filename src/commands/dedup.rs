@@ -1464,7 +1464,7 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
             .build();
 
-        Template::from_records(vec![record]).unwrap()
+        Template::from_records(vec![record]).expect("test template construction should not fail")
     }
 
     #[test]
@@ -1504,7 +1504,7 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .build();
 
-        Template::from_records(vec![r1, r2]).unwrap()
+        Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
     }
 
     #[test]
@@ -1835,7 +1835,7 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
             .tag("RX", umi.to_string())
             .build();
-        Template::from_records(vec![record]).unwrap()
+        Template::from_records(vec![record]).expect("test template construction should not fail")
     }
 
     #[test]
@@ -1895,7 +1895,8 @@ mod tests {
             .mapping_quality(30)
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
             .build();
-        let template = Template::from_records(vec![record]).unwrap();
+        let template = Template::from_records(vec![record])
+            .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
@@ -1917,7 +1918,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::QC_FAIL)
             .tag("RX", "ACGTACGT".to_string())
             .build();
-        let template = Template::from_records(vec![record]).unwrap();
+        let template = Template::from_records(vec![record])
+            .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_non_pf, 1);
@@ -1940,7 +1942,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::QC_FAIL)
             .tag("RX", "ACGTACGT".to_string())
             .build();
-        let template = Template::from_records(vec![record]).unwrap();
+        let template = Template::from_records(vec![record])
+            .expect("test template construction should not fail");
 
         assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
@@ -1958,7 +1961,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::UNMAPPED)
             .tag("RX", "ACGTACGT".to_string())
             .build();
-        let template = Template::from_records(vec![record]).unwrap();
+        let template = Template::from_records(vec![record])
+            .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
@@ -1982,14 +1986,16 @@ mod tests {
     #[test]
     fn test_umi_for_read_identity_uppercase() {
         let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
-        let result = umi_for_read("ACGTACGT", true, assigner.as_ref()).unwrap();
+        let result =
+            umi_for_read("ACGTACGT", true, assigner.as_ref()).expect("valid UMI should not fail");
         assert_eq!(result, "ACGTACGT");
     }
 
     #[test]
     fn test_umi_for_read_identity_lowercase_gets_uppercased() {
         let assigner = Strategy::Identity.new_assigner_full(0, 1, 100);
-        let result = umi_for_read("acgtacgt", true, assigner.as_ref()).unwrap();
+        let result = umi_for_read("acgtacgt", true, assigner.as_ref())
+            .expect("valid lowercase UMI should not fail");
         assert_eq!(result, "ACGTACGT");
     }
 
@@ -1997,7 +2003,8 @@ mod tests {
     fn test_umi_for_read_paired_r1_earlier() {
         let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
         // With max_mismatches=1, prefix_len=2, so lower_prefix="aa", higher_prefix="bb"
-        let result = umi_for_read("ACGT-TGCA", true, assigner.as_ref()).unwrap();
+        let result = umi_for_read("ACGT-TGCA", true, assigner.as_ref())
+            .expect("valid paired UMI should not fail");
         // is_r1_earlier=true => lower_prefix:parts[0]-higher_prefix:parts[1]
         assert_eq!(result, "aa:ACGT-bb:TGCA");
     }
@@ -2006,7 +2013,8 @@ mod tests {
     fn test_umi_for_read_paired_r2_earlier() {
         let assigner = Strategy::Paired.new_assigner_full(1, 1, 100);
         // With max_mismatches=1, prefix_len=2, so lower_prefix="aa", higher_prefix="bb"
-        let result = umi_for_read("ACGT-TGCA", false, assigner.as_ref()).unwrap();
+        let result = umi_for_read("ACGT-TGCA", false, assigner.as_ref())
+            .expect("valid paired UMI should not fail");
         // is_r1_earlier=false => higher_prefix:parts[0]-lower_prefix:parts[1]
         assert_eq!(result, "bb:ACGT-aa:TGCA");
     }
@@ -2017,7 +2025,10 @@ mod tests {
         let result = umi_for_read("ACGTACGT", true, assigner.as_ref());
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("did not contain 2 segments"),
+            result
+                .expect_err("should fail for missing dash")
+                .to_string()
+                .contains("did not contain 2 segments"),
             "Error message should mention missing segments"
         );
     }
@@ -2051,7 +2062,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .tag("RX", "ACGT-TGCA".to_string())
             .build();
-        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
         assert!(r1_positive);
         assert!(r2_positive);
@@ -2082,7 +2094,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .tag("RX", "ACGT-TGCA".to_string())
             .build();
-        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
         assert!(!r1_positive);
         assert!(r2_positive);
@@ -2113,7 +2126,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
             .tag("RX", "ACGT-TGCA".to_string())
             .build();
-        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
         assert!(!r1_positive);
         assert!(!r2_positive);
@@ -2144,7 +2158,7 @@ mod tests {
             .cigar("4M")
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .build();
-        assert!(is_r1_genomically_earlier(&r1, &r2).unwrap());
+        assert!(is_r1_genomically_earlier(&r1, &r2).expect("mapped records should have positions"));
     }
 
     #[test]
@@ -2168,7 +2182,9 @@ mod tests {
             .cigar("4M")
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .build();
-        assert!(!is_r1_genomically_earlier(&r1, &r2).unwrap());
+        assert!(
+            !is_r1_genomically_earlier(&r1, &r2).expect("mapped records should have positions")
+        );
     }
 
     #[test]
@@ -2192,7 +2208,7 @@ mod tests {
             .cigar("4M")
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .build();
-        assert!(is_r1_genomically_earlier(&r1, &r2).unwrap());
+        assert!(is_r1_genomically_earlier(&r1, &r2).expect("mapped records should have positions"));
     }
 
     // ========================================================================
@@ -2202,14 +2218,16 @@ mod tests {
     #[test]
     fn test_truncate_umis_no_min_length() {
         let umis = vec!["ACGTACGT".to_string(), "TGCATGCA".to_string()];
-        let result = truncate_umis(umis.clone(), None).unwrap();
+        let result = truncate_umis(umis.clone(), None)
+            .expect("truncation with no min length should not fail");
         assert_eq!(result, umis);
     }
 
     #[test]
     fn test_truncate_umis_truncates() {
         let umis = vec!["ACGTACGT".to_string(), "TGCATGCA".to_string()];
-        let result = truncate_umis(umis, Some(4)).unwrap();
+        let result =
+            truncate_umis(umis, Some(4)).expect("truncation of 8-base UMIs to 4 should not fail");
         assert_eq!(result, vec!["ACGT".to_string(), "TGCA".to_string()]);
     }
 
@@ -2219,7 +2237,10 @@ mod tests {
         let result = truncate_umis(umis, Some(4));
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("shorter than expected"),
+            result
+                .expect_err("should fail for too-short UMI")
+                .to_string()
+                .contains("shorter than expected"),
             "Error message should mention UMI being too short"
         );
     }
@@ -2308,7 +2329,7 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .tag("RX", umi.to_string())
             .build();
-        Template::from_records(vec![r1, r2]).unwrap()
+        Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
     }
 
     #[test]
@@ -2358,7 +2379,8 @@ mod tests {
             .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
             .tag("RX", "ACNTACGT".to_string())
             .build();
-        let template = Template::from_records(vec![r1, r2]).unwrap();
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
 
         assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_ns_in_umi, 1);
@@ -2496,7 +2518,8 @@ mod tests {
         // (rejected as poor alignment due to missing UMI tag).
 
         let raw = make_raw_bam_record_truncated_aux();
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -2539,7 +2562,8 @@ mod tests {
         rec.extend_from_slice(b"MQc"); // tag=MQ, type=c (signed byte)
         rec.push(10); // MAPQ = 10 (< min_mapq of 20)
 
-        let template = Template::from_raw_records(vec![rec]).unwrap();
+        let template = Template::from_raw_records(vec![rec])
+            .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -2634,7 +2658,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         assert_eq!(score_template_raw(&template), 60);
     }
 
@@ -2650,7 +2675,8 @@ mod tests {
             &[10, 10, 10, 10],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         assert_eq!(score_template_raw(&template), 40);
     }
 
@@ -2675,7 +2701,8 @@ mod tests {
             &[10, 10, 10, 10],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![r1, r2]).unwrap();
+        let template = Template::from_raw_records(vec![r1, r2])
+            .expect("test template construction should not fail");
         assert_eq!(score_template_raw(&template), 100);
     }
 
@@ -2694,7 +2721,8 @@ mod tests {
                 qualities,
                 b"ACGT",
             );
-            Template::from_raw_records(vec![raw]).unwrap()
+            Template::from_raw_records(vec![raw])
+                .expect("test template construction should not fail")
         };
         assert_eq!(score_template(&template_rb), score_template(&template_raw));
     }
@@ -2715,7 +2743,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -2740,7 +2769,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -2766,7 +2796,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -2791,7 +2822,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -2816,7 +2848,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -2840,7 +2873,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -2920,7 +2954,8 @@ mod tests {
             .mapping_quality(30)
             .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
             .build();
-        let template = Template::from_records(vec![record]).unwrap();
+        let template = Template::from_records(vec![record])
+            .expect("test template construction should not fail");
 
         // In no_umi mode, templates without UMI tags should be accepted
         assert!(filter_template(&template, &config, &mut metrics));
@@ -3012,7 +3047,8 @@ mod tests {
             4,
             &[20, 20, 20, 20],
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -3039,7 +3075,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -3066,7 +3103,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,

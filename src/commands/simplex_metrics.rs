@@ -161,7 +161,8 @@ impl Command for SimplexMetrics {
         }
 
         // Use the 100% fraction collector for main metrics
-        let main_collector = collectors.pop().unwrap(); // Last one is 100%
+        let main_collector =
+            collectors.pop().expect("collectors is non-empty (always includes 100% fraction)");
 
         // Generate and write metrics
         info!("Writing metrics...");
@@ -369,11 +370,15 @@ mod tests {
         let mut builder = sam::Header::builder();
         builder = builder.add_reference_sequence(
             bstr::BString::from("chr1"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(248_956_422).expect("non-zero chromosome length"),
+            ),
         );
         builder = builder.add_reference_sequence(
             bstr::BString::from("chr2"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(242_193_529).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(242_193_529).expect("non-zero chromosome length"),
+            ),
         );
         builder.build()
     }
@@ -499,17 +504,26 @@ mod tests {
             DelimFile::default().read_tsv(&family_size_path)?;
 
         // Size 1: 1 CS family (group 2), 2 SS families (MI 2/A, MI 3/A)
-        let size_1 = metrics.iter().find(|m| m.family_size == 1).unwrap();
+        let size_1 = metrics
+            .iter()
+            .find(|m| m.family_size == 1)
+            .expect("expected family size 1 metric not found");
         assert_eq!(size_1.cs_count, 1);
         assert_eq!(size_1.ss_count, 2);
 
         // Size 2: 0 CS, 1 SS (MI 1/A from group 1)
-        let size_2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        let size_2 = metrics
+            .iter()
+            .find(|m| m.family_size == 2)
+            .expect("expected family size 2 metric not found");
         assert_eq!(size_2.cs_count, 0);
         assert_eq!(size_2.ss_count, 1);
 
         // Size 3: 1 CS (group 1), 0 SS
-        let size_3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        let size_3 = metrics
+            .iter()
+            .find(|m| m.family_size == 3)
+            .expect("expected family size 3 metric not found");
         assert_eq!(size_3.cs_count, 1);
         assert_eq!(size_3.ss_count, 0);
 

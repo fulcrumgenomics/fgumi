@@ -182,7 +182,10 @@ mod tests {
             for (tag, value) in tags {
                 rg_builder = rg_builder.insert(tag, value.to_string());
             }
-            builder = builder.add_read_group(BString::from(id), rg_builder.build().unwrap());
+            builder = builder.add_read_group(
+                BString::from(id),
+                rg_builder.build().expect("failed to build read group"),
+            );
         }
         builder.build()
     }
@@ -291,30 +294,45 @@ mod tests {
             "Read group",
             "fgumi simplex",
         )
-        .unwrap();
+        .expect("create_unmapped_consensus_header should succeed");
 
         let read_groups = output_header.read_groups();
         assert_eq!(read_groups.len(), 1);
         let rg = read_groups.get(&BString::from("consensus")).expect("consensus RG not found");
 
         // SM: both have SampleA -> deduplicated
-        assert_eq!(rg.other_fields().get(&rg_tag::SAMPLE).unwrap().to_string(), "SampleA");
+        assert_eq!(
+            rg.other_fields().get(&rg_tag::SAMPLE).expect("SM tag not found").to_string(),
+            "SampleA"
+        );
         // LB: LibA and LibB -> comma-joined
-        assert_eq!(rg.other_fields().get(&rg_tag::LIBRARY).unwrap().to_string(), "LibA,LibB");
+        assert_eq!(
+            rg.other_fields().get(&rg_tag::LIBRARY).expect("LB tag not found").to_string(),
+            "LibA,LibB"
+        );
         // PL: illumina and ILLUMINA -> uppercased and deduped
-        assert_eq!(rg.other_fields().get(&rg_tag::PLATFORM).unwrap().to_string(), "ILLUMINA");
+        assert_eq!(
+            rg.other_fields().get(&rg_tag::PLATFORM).expect("PL tag not found").to_string(),
+            "ILLUMINA"
+        );
         // PU: two distinct values
         assert_eq!(
-            rg.other_fields().get(&rg_tag::PLATFORM_UNIT).unwrap().to_string(),
+            rg.other_fields().get(&rg_tag::PLATFORM_UNIT).expect("PU tag not found").to_string(),
             "FlowcellA.1,FlowcellB.2",
         );
         // CN: both CenterX -> deduplicated
         assert_eq!(
-            rg.other_fields().get(&rg_tag::SEQUENCING_CENTER).unwrap().to_string(),
+            rg.other_fields()
+                .get(&rg_tag::SEQUENCING_CENTER)
+                .expect("CN tag not found")
+                .to_string(),
             "CenterX",
         );
         // DS: two distinct descriptions
-        assert_eq!(rg.other_fields().get(&rg_tag::DESCRIPTION).unwrap().to_string(), "Run 1,Run 2",);
+        assert_eq!(
+            rg.other_fields().get(&rg_tag::DESCRIPTION).expect("DS tag not found").to_string(),
+            "Run 1,Run 2",
+        );
     }
 
     #[test]
@@ -323,7 +341,7 @@ mod tests {
 
         let output_header =
             create_unmapped_consensus_header(&input_header, "A", "Read group", "fgumi simplex")
-                .unwrap();
+                .expect("create_unmapped_consensus_header should succeed");
 
         let read_groups = output_header.read_groups();
         assert_eq!(read_groups.len(), 1);

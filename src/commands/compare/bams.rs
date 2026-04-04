@@ -1012,8 +1012,8 @@ impl CompareBams {
             }
 
             // Compare batches in parallel
-            let batch1 = pending_batch1.take().unwrap();
-            let batch2 = pending_batch2.take().unwrap();
+            let batch1 = pending_batch1.take().expect("guarded by (Some, Some) match above");
+            let batch2 = pending_batch2.take().expect("guarded by (Some, Some) match above");
 
             // Handle unequal batch sizes
             let min_len = batch1.len().min(batch2.len());
@@ -1199,8 +1199,8 @@ impl CompareBams {
                 (Some(_), Some(_)) => {}
             }
 
-            let batch1 = pending_batch1.take().unwrap();
-            let batch2 = pending_batch2.take().unwrap();
+            let batch1 = pending_batch1.take().expect("guarded by (Some, Some) match above");
+            let batch2 = pending_batch2.take().expect("guarded by (Some, Some) match above");
 
             let min_len = batch1.len().min(batch2.len());
             let (cmp_batch1, remainder1) = batch1.split_at(min_len);
@@ -1465,8 +1465,8 @@ impl CompareBams {
                 (Some(_), Some(_)) => {}
             }
 
-            let batch1 = pending_batch1.take().unwrap();
-            let batch2 = pending_batch2.take().unwrap();
+            let batch1 = pending_batch1.take().expect("guarded by (Some, Some) match above");
+            let batch2 = pending_batch2.take().expect("guarded by (Some, Some) match above");
 
             let min_len = batch1.len().min(batch2.len());
             let (cmp_batch1, remainder1) = batch1.split_at(min_len);

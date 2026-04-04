@@ -1899,17 +1899,21 @@ mod tests {
             .insert(go_tag, "query")
             .insert(ss_tag, "template-coordinate")
             .build()
-            .unwrap();
+            .expect("valid header record");
         builder = builder.set_header(map);
 
         // FIX: Use NonZeroUsize instead of Position
         builder = builder.add_reference_sequence(
             BString::from("chr1"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(248_956_422).expect("non-zero chr1 length"),
+            ),
         );
         builder = builder.add_reference_sequence(
             BString::from("chr2"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(242_193_529).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(242_193_529).expect("non-zero chr2 length"),
+            ),
         );
 
         builder.build()
@@ -2591,8 +2595,8 @@ mod tests {
         assert_eq!(b_mis.len(), 1, "Group B should have 1 unique MI");
 
         // The prefix (before '/') should be the same for both groups
-        let a_prefix = a_mis[0].split('/').next().unwrap();
-        let b_prefix = b_mis[0].split('/').next().unwrap();
+        let a_prefix = a_mis[0].split('/').next().expect("MI tag should contain '/' separator");
+        let b_prefix = b_mis[0].split('/').next().expect("MI tag should contain '/' separator");
         assert_eq!(a_prefix, b_prefix, "Both groups should have same MI prefix");
 
         // But the full MI (including suffix) should be different
@@ -2901,8 +2905,9 @@ mod tests {
         let mut groups: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for record in &output_records {
-            let mi = get_string_tag(record, "MI").unwrap();
-            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
+            let mi = get_string_tag(record, "MI").expect("record should have MI tag");
+            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
+                .to_string();
             groups.entry(mi).or_default().push(name);
         }
 
@@ -4068,7 +4073,8 @@ mod tests {
 
         // Verify the output contains only reads from the "good" template
         for record in &output_records {
-            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
+            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
+                .to_string();
             assert_eq!(
                 name, "good",
                 "Only 'good' reads should remain, but found read with name: {name}"
@@ -4211,7 +4217,8 @@ mod tests {
         let mut mi_by_name: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for record in &output_records {
-            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
+            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
+                .to_string();
             if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi)) =
                 record.data().get(&mi_tag)
             {
@@ -4267,7 +4274,8 @@ mod tests {
         let mut mi_by_name: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for record in &output_records {
-            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
+            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
+                .to_string();
             if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi)) =
                 record.data().get(&mi_tag)
             {
@@ -4526,7 +4534,8 @@ mod tests {
             30,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -4550,7 +4559,8 @@ mod tests {
             10,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -4575,7 +4585,8 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4599,7 +4610,8 @@ mod tests {
             30,
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4623,7 +4635,8 @@ mod tests {
             30,
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4646,7 +4659,8 @@ mod tests {
             0,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw]).unwrap();
+        let template = Template::from_raw_records(vec![raw])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4694,7 +4708,8 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![supp]).unwrap();
+        let template = Template::from_raw_records(vec![supp])
+            .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4725,14 +4740,18 @@ mod tests {
         // Add header with queryname sort order
         let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
 
-        let map =
-            HeaderRecordMap::<HeaderRecord>::builder().insert(so_tag, "queryname").build().unwrap();
+        let map = HeaderRecordMap::<HeaderRecord>::builder()
+            .insert(so_tag, "queryname")
+            .build()
+            .expect("valid header record");
         builder = builder.set_header(map);
 
         // Add reference sequences (even though reads are unmapped, header needs refs)
         builder = builder.add_reference_sequence(
             BString::from("chr1"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(248_956_422).expect("non-zero chr1 length"),
+            ),
         );
 
         builder.build()

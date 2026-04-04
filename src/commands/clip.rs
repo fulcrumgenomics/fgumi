@@ -1664,10 +1664,11 @@ mod tests {
         let ref_path = dir.path().join("ref.fa");
         // Create a 200bp reference to accommodate read positions + padding
         let ref_content = ">chr1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
-        std::fs::write(&ref_path, ref_content).unwrap();
+        std::fs::write(&ref_path, ref_content).expect("failed to write reference FASTA");
         // Also create index (200bp)
         let fai_content = "chr1\t200\t6\t200\t201\n";
-        std::fs::write(dir.path().join("ref.fa.fai"), fai_content).unwrap();
+        std::fs::write(dir.path().join("ref.fa.fai"), fai_content)
+            .expect("failed to write FASTA index");
         ref_path
     }
 
@@ -2193,7 +2194,7 @@ mod tests {
 
     #[test]
     fn test_clip_execute_no_clipping_option() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = create_test_reference(&dir);
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
@@ -2208,7 +2209,7 @@ mod tests {
             .start2(30)
             .build();
 
-        builder.write(&input_path).unwrap();
+        builder.write(&input_path).expect("failed to write test BAM");
 
         let clip = Clip {
             io: BamIoOptions { input: input_path, output: output_path },
@@ -2369,7 +2370,8 @@ mod tests {
             .mapping_quality(60)
             .build();
 
-        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics)).unwrap();
+        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics))
+            .expect("clip_fragment should succeed");
 
         // Fragment metrics should be updated
         assert_eq!(metrics.fragment.reads, 1);
@@ -2400,7 +2402,8 @@ mod tests {
             .mapping_quality(60)
             .build();
 
-        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics)).unwrap();
+        clip.clip_fragment(&clipper, &mut record, Some(&mut metrics))
+            .expect("clip_fragment should succeed");
 
         assert_eq!(metrics.fragment.reads, 1);
         assert_eq!(metrics.fragment.bases, 12);
@@ -2451,8 +2454,9 @@ mod tests {
             .template_length(-120)
             .build();
 
-        let (overlap, extend) =
-            clip.clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics)).unwrap();
+        let (overlap, extend) = clip
+            .clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics))
+            .expect("clip_pair should succeed");
 
         assert!(!overlap, "no overlapping clipping expected");
         assert!(!extend, "no extending clipping expected");
@@ -2513,8 +2517,9 @@ mod tests {
             .template_length(-120)
             .build();
 
-        let (overlap, extend) =
-            clip.clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics)).unwrap();
+        let (overlap, extend) = clip
+            .clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics))
+            .expect("clip_pair should succeed");
 
         assert!(!overlap);
         assert!(!extend);

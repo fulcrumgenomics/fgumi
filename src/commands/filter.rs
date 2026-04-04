@@ -1262,10 +1262,11 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 1, max_read_error_rate: 1.0, max_base_error_rate: 1.0 };
 
-        mask_bases(&mut record, &thresholds, Some(20)).unwrap();
+        mask_bases(&mut record, &thresholds, Some(20)).expect("mask_bases should succeed");
 
         // Bases 0 and 2 have quality < 20, should be masked to N
-        let seq = std::str::from_utf8(record.sequence().as_ref()).unwrap();
+        let seq = std::str::from_utf8(record.sequence().as_ref())
+            .expect("sequence should be valid UTF-8");
         assert_eq!(seq, "NCNT");
 
         // Quality scores for masked bases should be 2 (Phred MIN_VALUE, matching fgbio)
@@ -1290,10 +1291,11 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 1.0, max_base_error_rate: 1.0 };
 
-        mask_bases(&mut record, &thresholds, Some(10)).unwrap();
+        mask_bases(&mut record, &thresholds, Some(10)).expect("mask_bases should succeed");
 
         // Bases with depth < 5 should be masked to N
-        let seq = std::str::from_utf8(record.sequence().as_ref()).unwrap();
+        let seq = std::str::from_utf8(record.sequence().as_ref())
+            .expect("sequence should be valid UTF-8");
         assert_eq!(seq, "NCNT");
     }
 
@@ -1317,11 +1319,12 @@ mod tests {
             max_base_error_rate: 0.2, // 20% threshold
         };
 
-        mask_bases(&mut record, &thresholds, Some(10)).unwrap();
+        mask_bases(&mut record, &thresholds, Some(10)).expect("mask_bases should succeed");
 
         // Base 1 has 3/10 = 30% > 20%, should be masked
         // Base 2 has 2/10 = 20% = 20%, NOT masked (needs to be strictly greater)
-        let seq = std::str::from_utf8(record.sequence().as_ref()).unwrap();
+        let seq = std::str::from_utf8(record.sequence().as_ref())
+            .expect("sequence should be valid UTF-8");
         assert_eq!(seq, "ANGT");
     }
 
@@ -1342,7 +1345,7 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).unwrap();
+        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::Pass);
     }
 
@@ -1363,7 +1366,7 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).unwrap();
+        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::InsufficientReads);
     }
 
@@ -1384,7 +1387,7 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).unwrap();
+        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::ExcessiveErrorRate);
     }
 
@@ -1399,7 +1402,7 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).unwrap();
+        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::Pass);
     }
 
@@ -1557,7 +1560,7 @@ mod tests {
         };
 
         assert!(filter.rejects.is_some());
-        assert_eq!(filter.rejects.unwrap(), PathBuf::from("rejects.bam"));
+        assert_eq!(filter.rejects.expect("rejects should be set"), PathBuf::from("rejects.bam"));
     }
 
     #[test]
@@ -1587,7 +1590,7 @@ mod tests {
         };
 
         assert!(filter.stats.is_some());
-        assert_eq!(filter.stats.unwrap(), PathBuf::from("stats.txt"));
+        assert_eq!(filter.stats.expect("stats should be set"), PathBuf::from("stats.txt"));
     }
 
     #[test]
@@ -1988,11 +1991,11 @@ mod tests {
     /// Creates a test reference FASTA file with chr1 sequence of all A's
     fn create_test_reference(dir: &TempDir) -> PathBuf {
         let ref_path = dir.path().join("ref.fa");
-        let mut file = std::fs::File::create(&ref_path).unwrap();
-        writeln!(file, ">chr1").unwrap();
+        let mut file = std::fs::File::create(&ref_path).expect("failed to create reference file");
+        writeln!(file, ">chr1").expect("failed to write FASTA header");
         // Create 1000bp reference of all A's
-        writeln!(file, "{}", "A".repeat(1000)).unwrap();
-        file.flush().unwrap();
+        writeln!(file, "{}", "A".repeat(1000)).expect("failed to write FASTA sequence");
+        file.flush().expect("failed to flush reference file");
         ref_path
     }
 
@@ -3958,7 +3961,7 @@ mod tests {
     #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags=true"], true)]
     #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--reverse-per-base-tags=false"], false)]
     fn test_reverse_per_base_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = Filter::try_parse_from(args).unwrap();
+        let cmd = Filter::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.reverse_per_base_tags, expected);
     }
 
@@ -3971,7 +3974,7 @@ mod tests {
     #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template=true"], true)]
     #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--filter-by-template=false"], false)]
     fn test_filter_by_template_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = Filter::try_parse_from(args).unwrap();
+        let cmd = Filter::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.filter_by_template, expected);
     }
 
@@ -3984,7 +3987,7 @@ mod tests {
     #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement=true"], true)]
     #[case(&["filter", "-i", "in.bam", "-o", "out.bam", "-M", "1", "--require-single-strand-agreement=false"], false)]
     fn test_require_single_strand_agreement_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = Filter::try_parse_from(args).unwrap();
+        let cmd = Filter::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.require_single_strand_agreement, expected);
     }
 }

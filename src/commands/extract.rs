@@ -1360,12 +1360,12 @@ mod tests {
     /// Path to the created FASTQ file
     fn create_fastq(dir: &TempDir, name: &str, records: &[(&str, &str, &str)]) -> PathBuf {
         let path = dir.path().join(name);
-        let mut file = File::create(&path).unwrap();
+        let mut file = File::create(&path).expect("failed to create file");
         for (name, seq, qual) in records {
-            writeln!(file, "@{name}").unwrap();
-            writeln!(file, "{seq}").unwrap();
-            writeln!(file, "+").unwrap();
-            writeln!(file, "{qual}").unwrap();
+            writeln!(file, "@{name}").expect("failed to write line");
+            writeln!(file, "{seq}").expect("failed to write line");
+            writeln!(file, "+").expect("failed to write line");
+            writeln!(file, "{qual}").expect("failed to write line");
         }
         path
     }
@@ -1378,11 +1378,11 @@ mod tests {
     /// # Returns
     /// Vector of all BAM records in the file
     fn read_bam_records(path: &PathBuf) -> Vec<RecordBuf> {
-        let (mut reader, header) = create_bam_reader(path, 1).unwrap();
+        let (mut reader, header) = create_bam_reader(path, 1).expect("failed to create BAM reader");
 
         let mut records = Vec::new();
         for result in reader.record_bufs(&header) {
-            records.push(result.unwrap());
+            records.push(result.expect("failed to read BAM record"));
         }
         records
     }
@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_single_fastq_no_read_structure() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -1445,7 +1445,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1465,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_paired_end_no_read_structures() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -1501,7 +1501,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1525,7 +1525,7 @@ mod tests {
 
     #[test]
     fn test_paired_end_ignore_umi_qual_tag_when_no_umis() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -1561,7 +1561,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn test_paired_end_with_inline_umi() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -1581,8 +1581,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("4M+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
+                ReadStructure::from_str("4M+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -1611,7 +1611,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1631,7 +1631,7 @@ mod tests {
 
     #[test]
     fn test_paired_end_with_inline_umi_keep_qualities() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -1640,8 +1640,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("4M+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
+                ReadStructure::from_str("4M+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: Some("QX".to_string()),
@@ -1670,7 +1670,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_complex_read_structures_multiple_segments() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAACCCTTTAAAAA", "==============")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "GGGTTTAAACCCCC", "##############")]);
         let output = tmp.path().join("output.bam");
@@ -1692,8 +1692,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("3B3M3B5T").unwrap(),
-                ReadStructure::from_str("3B3M3B5T").unwrap(),
+                ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
+                ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -1722,7 +1722,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn test_complex_read_structures_with_umi_qualities() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAACCCTTTAAAAA", "===III========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "GGGTTTAAACCCCC", "###JJJ########")]);
         let output = tmp.path().join("output.bam");
@@ -1751,8 +1751,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("3B3M3B5T").unwrap(),
-                ReadStructure::from_str("3B3M3B5T").unwrap(),
+                ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
+                ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: Some("QX".to_string()),
@@ -1781,7 +1781,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[test]
     fn test_four_fastqs() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let r3 = create_fastq(&tmp, "r3.fq", &[("q1", "ACGT", "????")]);
@@ -1805,10 +1805,10 @@ mod tests {
             inputs: vec![r1, r2, r3, r4],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
-                ReadStructure::from_str("4B").unwrap(),
-                ReadStructure::from_str("4M").unwrap(),
+                ReadStructure::from_str("+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
+                ReadStructure::from_str("4B").expect("valid read structure"),
+                ReadStructure::from_str("4M").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -1837,7 +1837,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1857,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_four_fastqs_with_umi_qualities() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let r3 = create_fastq(&tmp, "r3.fq", &[("q1", "ACGT", "????")]);
@@ -1868,10 +1868,10 @@ mod tests {
             inputs: vec![r1, r2, r3, r4],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
-                ReadStructure::from_str("4B").unwrap(),
-                ReadStructure::from_str("4M").unwrap(),
+                ReadStructure::from_str("+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
+                ReadStructure::from_str("4B").expect("valid read structure"),
+                ReadStructure::from_str("4M").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: Some("QX".to_string()),
@@ -1900,7 +1900,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -1913,14 +1913,14 @@ mod tests {
 
     #[test]
     fn test_header_metadata() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let output = tmp.path().join("output.bam");
 
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("10T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("10T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -1948,9 +1948,9 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
-        let (_reader, header) = create_bam_reader(&output, 1).unwrap();
+        let (_reader, header) = create_bam_reader(&output, 1).expect("failed to create BAM reader");
 
         // Check comments
         let comments: Vec<String> =
@@ -1972,7 +1972,7 @@ mod tests {
     fn test_zero_length_reads() {
         // Test that zero-length reads are handled gracefully with variable-length read structures
         // (matching Scala/fgbio behavior where empty reads become "N" @ Q2)
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -1989,8 +1989,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("+T").unwrap(), // Variable length to allow zero-length
-                ReadStructure::from_str("+T").unwrap(),
+                ReadStructure::from_str("+T").expect("valid read structure"), // Variable length to allow zero-length
+                ReadStructure::from_str("+T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2019,7 +2019,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         // Verify the output BAM was created and contains records
         let records = read_bam_records(&output);
@@ -2050,7 +2050,7 @@ mod tests {
     fn test_zero_length_reads_with_fixed_structure_should_panic() {
         // Test that zero-length reads with fixed-length read structures still panic
         // (as they should - you can't have 0 bases when 10T are required)
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "", "")]);
         let output = tmp.path().join("output.bam");
 
@@ -2058,7 +2058,7 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("10T").unwrap(), // Fixed length - should panic
+                ReadStructure::from_str("10T").expect("valid read structure"), // Fixed length - should panic
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2087,12 +2087,12 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     fn test_extract_sample_barcode_qualities() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -2108,7 +2108,9 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1.clone()],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("3B3M3B+T").unwrap()],
+            read_structures: vec![
+                ReadStructure::from_str("3B3M3B+T").expect("valid read structure"),
+            ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2136,7 +2138,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 3);
@@ -2153,7 +2155,9 @@ mod tests {
         let extract2 = Extract {
             inputs: vec![r1],
             output: output2.clone(),
-            read_structures: vec![ReadStructure::from_str("3B3M3B+T").unwrap()],
+            read_structures: vec![
+                ReadStructure::from_str("3B3M3B+T").expect("valid read structure"),
+            ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2181,7 +2185,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract2.execute("test").unwrap();
+        extract2.execute("test").expect("execute should succeed");
 
         let recs2 = read_bam_records(&output2);
         assert_eq!(recs2.len(), 3);
@@ -2192,7 +2196,7 @@ mod tests {
 
     #[test]
     fn test_extract_umis_from_read_names() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -2235,7 +2239,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 3);
@@ -2246,7 +2250,7 @@ mod tests {
 
     #[test]
     fn test_extract_umis_from_read_names_and_sequences() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -2260,7 +2264,9 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("2M1S2M+T").unwrap()],
+            read_structures: vec![
+                ReadStructure::from_str("2M1S2M+T").expect("valid read structure"),
+            ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2288,7 +2294,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -2298,7 +2304,7 @@ mod tests {
 
     #[test]
     fn test_extract_cell_barcodes() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -2312,7 +2318,9 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("2C1S2C+T").unwrap()],
+            read_structures: vec![
+                ReadStructure::from_str("2C1S2C+T").expect("valid read structure"),
+            ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2340,7 +2348,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -2353,7 +2361,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Read names do not match")]
     fn test_fail_mismatched_read_names() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("x1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -2389,13 +2397,13 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     #[should_panic(expected = "out of sync")]
     fn test_fail_mismatched_read_counts() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -2435,13 +2443,13 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     #[should_panic(expected = "must be supplied the same number of times")]
     fn test_fail_mismatched_inputs_and_read_structures() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let output = tmp.path().join("output.bam");
 
@@ -2449,8 +2457,8 @@ mod tests {
             inputs: vec![r1],
             output,
             read_structures: vec![
-                ReadStructure::from_str("+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
+                ReadStructure::from_str("+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2479,12 +2487,12 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     fn test_annotate_read_names_with_umis() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -2493,8 +2501,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("4M+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
+                ReadStructure::from_str("4M+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2523,7 +2531,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -2540,7 +2548,7 @@ mod tests {
 
     #[test]
     fn test_annotate_read_names_no_umis() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let output = tmp.path().join("output.bam");
 
@@ -2575,7 +2583,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 1);
@@ -2587,7 +2595,7 @@ mod tests {
 
     #[test]
     fn test_single_tag() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAACCCTTTAAAAA", "==============")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "GGGTTTAAACCCCC", "##############")]);
         let output = tmp.path().join("output.bam");
@@ -2596,8 +2604,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("3B3M3B5T").unwrap(),
-                ReadStructure::from_str("3B3M3B5T").unwrap(),
+                ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
+                ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2626,7 +2634,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -2644,14 +2652,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Single tag must be exactly 2 characters")]
     fn test_single_tag_invalid_length() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
         let output = tmp.path().join("output.bam");
 
         let extract = Extract {
             inputs: vec![r1],
             output,
-            read_structures: vec![ReadStructure::from_str("4M+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("4M+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2679,20 +2687,20 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     #[should_panic(expected = "Single tag cannot be the same as umi-tag")]
     fn test_single_tag_same_as_umi_tag() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
         let output = tmp.path().join("output.bam");
 
         let extract = Extract {
             inputs: vec![r1],
             output,
-            read_structures: vec![ReadStructure::from_str("4M+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("4M+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2720,12 +2728,12 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     fn test_combined_annotate_read_names_and_single_tag() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "CCCCCCCCCC", "##########")]);
         let output = tmp.path().join("output.bam");
@@ -2734,8 +2742,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("4M+T").unwrap(),
-                ReadStructure::from_str("+T").unwrap(),
+                ReadStructure::from_str("4M+T").expect("valid read structure"),
+                ReadStructure::from_str("+T").expect("valid read structure"),
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -2764,7 +2772,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 2);
@@ -2788,14 +2796,14 @@ mod tests {
     fn test_fail_read_too_short_for_structure() {
         // Test that we fail when a read is not long enough for the read structure
         // Read is 10 bases, but structure requires 8M + 8S = 16 bases minimum
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAAAAAAA", "==========")]);
         let output = tmp.path().join("output.bam");
 
         let extract = Extract {
             inputs: vec![r1],
             output,
-            read_structures: vec![ReadStructure::from_str("8M8S+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("8M8S+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2824,13 +2832,13 @@ mod tests {
         };
 
         // Should panic because read is too short
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
     }
 
     #[test]
     fn test_variable_length_reads_with_plus() {
         // Test that the '+' operator in read structures handles variable-length reads
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -2845,7 +2853,9 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("4M4B4S+T").unwrap()],
+            read_structures: vec![
+                ReadStructure::from_str("4M4B4S+T").expect("valid read structure"),
+            ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -2873,7 +2883,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let recs = read_bam_records(&output);
         assert_eq!(recs.len(), 3);
@@ -2904,7 +2914,8 @@ mod tests {
             vec![40u8, 50, 60, 70, 80, 90], // Medium to high quality
         ];
 
-        let encoding = QualityEncoding::detect(&records).unwrap();
+        let encoding =
+            QualityEncoding::detect(&records).expect("quality encoding detection should succeed");
         assert_eq!(encoding, QualityEncoding::Standard);
     }
 
@@ -2918,7 +2929,8 @@ mod tests {
             vec![70u8, 80, 90, 100, 110], // Higher quality scores
         ];
 
-        let encoding = QualityEncoding::detect(&records).unwrap();
+        let encoding =
+            QualityEncoding::detect(&records).expect("quality encoding detection should succeed");
         assert_eq!(encoding, QualityEncoding::Illumina);
     }
 
@@ -2931,7 +2943,8 @@ mod tests {
             vec![64u8, 65, 66, 67, 69], // High quality, narrow range
         ];
 
-        let encoding = QualityEncoding::detect(&records).unwrap();
+        let encoding =
+            QualityEncoding::detect(&records).expect("quality encoding detection should succeed");
         // Should be Standard because range is too narrow for typical Phred+64
         assert_eq!(encoding, QualityEncoding::Standard);
     }
@@ -2941,7 +2954,8 @@ mod tests {
         // Test that all empty reads default to Standard encoding
         let records = vec![vec![], vec![], vec![]];
 
-        let encoding = QualityEncoding::detect(&records).unwrap();
+        let encoding =
+            QualityEncoding::detect(&records).expect("quality encoding detection should succeed");
         assert_eq!(encoding, QualityEncoding::Standard);
     }
 
@@ -2955,7 +2969,8 @@ mod tests {
             vec![45u8, 55, 65], // Valid Phred+33
         ];
 
-        let encoding = QualityEncoding::detect(&records).unwrap();
+        let encoding =
+            QualityEncoding::detect(&records).expect("quality encoding detection should succeed");
         assert_eq!(encoding, QualityEncoding::Standard);
     }
 
@@ -3002,7 +3017,8 @@ mod tests {
             vec![60u8, 61, 62],         // Also ambiguous
         ];
 
-        let encoding = QualityEncoding::detect(&records).unwrap();
+        let encoding =
+            QualityEncoding::detect(&records).expect("quality encoding detection should succeed");
         // Should default to Standard (Phred+33) as it's more common
         assert_eq!(encoding, QualityEncoding::Standard);
     }
@@ -3037,7 +3053,7 @@ mod tests {
     #[test]
     fn test_zero_length_reads_integration_with_quality_detection() {
         // Integration test: verify zero-length reads work correctly with quality detection
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(
             &tmp,
             "r1.fq",
@@ -3052,7 +3068,7 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -3081,7 +3097,7 @@ mod tests {
         };
 
         // Should succeed without panicking
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let records = read_bam_records(&output);
         assert_eq!(records.len(), 3);
@@ -3100,7 +3116,7 @@ mod tests {
     #[test]
     fn test_phred64_fastq_end_to_end() {
         // End-to-end test with actual Phred+64 encoded FASTQ
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
 
         // Create FASTQ with Phred+64 quality scores
         // ASCII 64 = Q0, ASCII 70 = Q6, ASCII 80 = Q16, etc.
@@ -3117,7 +3133,7 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -3145,7 +3161,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let records = read_bam_records(&output);
         assert_eq!(records.len(), 2);
@@ -3161,7 +3177,7 @@ mod tests {
     #[test]
     fn test_paired_end_with_different_read_structures() {
         // Test paired-end with different read structures for R1 and R2
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
 
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAATTTTCCCCGGGG", "IIIIIIIIIIIIIIII")]);
         let r2 = create_fastq(&tmp, "r2.fq", &[("q1", "TTTTGGGG", "IIIIIIII")]);
@@ -3171,8 +3187,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![
-                ReadStructure::from_str("4M4S+T").unwrap(), // R1: 4M UMI, 4S skip, rest template
-                ReadStructure::from_str("4M+T").unwrap(),   // R2: 4M UMI, rest template
+                ReadStructure::from_str("4M4S+T").expect("valid read structure"), // R1: 4M UMI, 4S skip, rest template
+                ReadStructure::from_str("4M+T").expect("valid read structure"), // R2: 4M UMI, rest template
             ],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
@@ -3201,7 +3217,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let records = read_bam_records(&output);
         assert_eq!(records.len(), 2); // R1 and R2
@@ -3214,8 +3230,8 @@ mod tests {
 
         // Both should have same UMI: AAAA-TTTT
         let rx_tag = noodles::sam::alignment::record::data::field::Tag::from([b'R', b'X']);
-        let r1_umi = records[0].data().get(&rx_tag).unwrap();
-        let r2_umi = records[1].data().get(&rx_tag).unwrap();
+        let r1_umi = records[0].data().get(&rx_tag).expect("expected tag not found");
+        let r2_umi = records[1].data().get(&rx_tag).expect("expected tag not found");
 
         if let noodles::sam::alignment::record_buf::data::field::Value::String(s) = r1_umi {
             assert_eq!(<bstr::BString as AsRef<[u8]>>::as_ref(s), b"AAAA-TTTT");
@@ -3228,7 +3244,7 @@ mod tests {
     #[test]
     fn test_multithreaded_extraction() {
         // Test that multi-threaded extraction works correctly
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
 
         let r1 = create_fastq(
             &tmp,
@@ -3244,7 +3260,7 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("5M+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("5M+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -3272,7 +3288,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let records = read_bam_records(&output);
         assert_eq!(records.len(), 3);
@@ -3287,7 +3303,7 @@ mod tests {
     fn test_multithreaded_extraction_preserves_order() {
         // Test that multi-threaded extraction preserves input order
         // This is critical for downstream tools that expect ordered output
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
 
         // Create 100 reads with sequential names for easy order verification
         let reads: Vec<(&str, &str, &str)> = (0..100)
@@ -3307,7 +3323,7 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("5M+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("5M+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),
@@ -3335,7 +3351,7 @@ mod tests {
             queue_memory: QueueMemoryOptions::default(),
         };
 
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let records = read_bam_records(&output);
         assert_eq!(records.len(), 100);
@@ -3356,7 +3372,7 @@ mod tests {
     #[test]
     fn test_sample_barcode_with_quality_tags_specified() {
         // Test that extract works with barcode and quality tag parameters
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
 
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "AAAAACGTACGT", "IIIIIIIIIIII")]);
         let output = tmp.path().join("output.bam");
@@ -3364,7 +3380,7 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("5B+T").unwrap()], // 5B for barcode
+            read_structures: vec![ReadStructure::from_str("5B+T").expect("valid read structure")], // 5B for barcode
             umi_tag: "RX".to_string(),
             umi_qual_tag: Some("QX".to_string()),
             cell_tag: "CB".to_string(),
@@ -3393,7 +3409,7 @@ mod tests {
         };
 
         // Should succeed with all quality tag parameters specified
-        extract.execute("test").unwrap();
+        extract.execute("test").expect("execute should succeed");
 
         let records = read_bam_records(&output);
         assert_eq!(records.len(), 1);
@@ -3451,7 +3467,7 @@ mod tests {
         for record in &records {
             let mapq = record.mapping_quality();
             assert!(mapq.is_some(), "Mapping quality should be set (not None/255)");
-            let mapq_value: u8 = mapq.unwrap().into();
+            let mapq_value: u8 = mapq.expect("mapping quality should be set").into();
             assert_eq!(mapq_value, 0, "Mapping quality should be 0 for unmapped reads");
         }
 
@@ -3461,16 +3477,17 @@ mod tests {
     #[test]
     fn test_compression_format_detection_plain() {
         // Create a plain FASTQ file (not compressed)
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let plain_path = tmp.path().join("test.fq");
-        let mut file = File::create(&plain_path).unwrap();
+        let mut file = File::create(&plain_path).expect("failed to create file");
         use std::io::Write;
-        writeln!(file, "@read1").unwrap();
-        writeln!(file, "ACGT").unwrap();
-        writeln!(file, "+").unwrap();
-        writeln!(file, "IIII").unwrap();
+        writeln!(file, "@read1").expect("failed to write line");
+        writeln!(file, "ACGT").expect("failed to write line");
+        writeln!(file, "+").expect("failed to write line");
+        writeln!(file, "IIII").expect("failed to write line");
 
-        let format = detect_compression_format(&plain_path).unwrap();
+        let format = detect_compression_format(&plain_path)
+            .expect("compression format detection should succeed");
         assert_eq!(format, CompressionFormat::Plain);
     }
 
@@ -3481,19 +3498,20 @@ mod tests {
         use std::io::Write;
 
         // Create a gzip-compressed FASTQ file
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let gz_path = tmp.path().join("test.fq.gz");
 
         // Use flate2 to create a proper gzip file
-        let file = File::create(&gz_path).unwrap();
+        let file = File::create(&gz_path).expect("failed to create file");
         let mut encoder = GzEncoder::new(file, Compression::default());
-        writeln!(encoder, "@read1").unwrap();
-        writeln!(encoder, "ACGT").unwrap();
-        writeln!(encoder, "+").unwrap();
-        writeln!(encoder, "IIII").unwrap();
-        encoder.finish().unwrap();
+        writeln!(encoder, "@read1").expect("failed to write line");
+        writeln!(encoder, "ACGT").expect("failed to write line");
+        writeln!(encoder, "+").expect("failed to write line");
+        writeln!(encoder, "IIII").expect("failed to write line");
+        encoder.finish().expect("failed to finish gzip encoding");
 
-        let format = detect_compression_format(&gz_path).unwrap();
+        let format = detect_compression_format(&gz_path)
+            .expect("compression format detection should succeed");
         assert_eq!(format, CompressionFormat::Gzip);
     }
 
@@ -3503,18 +3521,19 @@ mod tests {
         use std::io::Write;
 
         // Create a BGZF-compressed file using noodles
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("failed to create temp dir");
         let bgzf_path = tmp.path().join("test.fq.bgz");
 
-        let file = File::create(&bgzf_path).unwrap();
+        let file = File::create(&bgzf_path).expect("failed to create file");
         let mut writer = BgzfWriter::new(file);
-        writeln!(writer, "@read1").unwrap();
-        writeln!(writer, "ACGT").unwrap();
-        writeln!(writer, "+").unwrap();
-        writeln!(writer, "IIII").unwrap();
-        writer.finish().unwrap();
+        writeln!(writer, "@read1").expect("failed to write line");
+        writeln!(writer, "ACGT").expect("failed to write line");
+        writeln!(writer, "+").expect("failed to write line");
+        writeln!(writer, "IIII").expect("failed to write line");
+        writer.finish().expect("failed to finish BGZF writing");
 
-        let format = detect_compression_format(&bgzf_path).unwrap();
+        let format = detect_compression_format(&bgzf_path)
+            .expect("compression format detection should succeed");
         assert_eq!(format, CompressionFormat::Bgzf);
     }
 
@@ -3542,7 +3561,7 @@ mod tests {
         let extract = Extract {
             inputs: vec![r1],
             output: output.clone(),
-            read_structures: vec![ReadStructure::from_str("5M+T").unwrap()],
+            read_structures: vec![ReadStructure::from_str("5M+T").expect("valid read structure")],
             umi_tag: "RX".to_string(),
             umi_qual_tag: None,
             cell_tag: "CB".to_string(),

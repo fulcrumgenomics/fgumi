@@ -280,17 +280,17 @@ mod tests {
 
     #[test]
     fn test_parse_flags_decimal() {
-        assert_eq!(parse_flags("2304").unwrap(), 2304);
-        assert_eq!(parse_flags("0").unwrap(), 0);
-        assert_eq!(parse_flags("65535").unwrap(), 65535);
+        assert_eq!(parse_flags("2304").expect("parse decimal '2304' should succeed"), 2304);
+        assert_eq!(parse_flags("0").expect("parse decimal '0' should succeed"), 0);
+        assert_eq!(parse_flags("65535").expect("parse decimal '65535' should succeed"), 65535);
     }
 
     #[test]
     fn test_parse_flags_hex() {
-        assert_eq!(parse_flags("0x900").unwrap(), 0x900);
-        assert_eq!(parse_flags("0X900").unwrap(), 0x900);
-        assert_eq!(parse_flags("0xff").unwrap(), 0xff);
-        assert_eq!(parse_flags("0xFFFF").unwrap(), 0xFFFF);
+        assert_eq!(parse_flags("0x900").expect("parse hex '0x900' should succeed"), 0x900);
+        assert_eq!(parse_flags("0X900").expect("parse hex '0X900' should succeed"), 0x900);
+        assert_eq!(parse_flags("0xff").expect("parse hex '0xff' should succeed"), 0xff);
+        assert_eq!(parse_flags("0xFFFF").expect("parse hex '0xFFFF' should succeed"), 0xFFFF);
     }
 
     #[test]
@@ -340,21 +340,25 @@ mod tests {
     fn test_write_reverse_complement_bytes() {
         let mut output = Vec::new();
         // ACGT reversed = TGCA, complemented = ACGT
-        write_reverse_complement_bytes(&mut output, b"ACGT").unwrap();
+        write_reverse_complement_bytes(&mut output, b"ACGT")
+            .expect("write_reverse_complement_bytes should succeed");
         assert_eq!(output, b"ACGT");
 
         output.clear();
-        write_reverse_complement_bytes(&mut output, b"AAAA").unwrap();
+        write_reverse_complement_bytes(&mut output, b"AAAA")
+            .expect("write_reverse_complement_bytes should succeed");
         assert_eq!(output, b"TTTT");
 
         output.clear();
         // ATCG reversed = GCTA, complemented = CGAT
-        write_reverse_complement_bytes(&mut output, b"ATCG").unwrap();
+        write_reverse_complement_bytes(&mut output, b"ATCG")
+            .expect("write_reverse_complement_bytes should succeed");
         assert_eq!(output, b"CGAT");
 
         output.clear();
         // Test with N
-        write_reverse_complement_bytes(&mut output, b"ANCG").unwrap();
+        write_reverse_complement_bytes(&mut output, b"ANCG")
+            .expect("write_reverse_complement_bytes should succeed");
         assert_eq!(output, b"CGNT");
     }
 
@@ -363,14 +367,15 @@ mod tests {
         let mut output = Vec::new();
         // Quality 0 -> ASCII 33 ('!')
         // Quality 30 -> ASCII 63 ('?')
-        write_quality_bytes(&mut output, &[0, 30, 40]).unwrap();
+        write_quality_bytes(&mut output, &[0, 30, 40]).expect("write_quality_bytes should succeed");
         assert_eq!(output, vec![33, 63, 73]);
     }
 
     #[test]
     fn test_write_reversed_quality_bytes() {
         let mut output = Vec::new();
-        write_reversed_quality_bytes(&mut output, &[0, 30, 40]).unwrap();
+        write_reversed_quality_bytes(&mut output, &[0, 30, 40])
+            .expect("write_reversed_quality_bytes should succeed");
         // Reversed: [40, 30, 0] -> [73, 63, 33]
         assert_eq!(output, vec![73, 63, 33]);
     }
@@ -379,12 +384,13 @@ mod tests {
     fn test_quality_encoding_edge_cases() {
         let mut output = Vec::new();
         // Test max valid quality (93)
-        write_quality_bytes(&mut output, &[93]).unwrap();
+        write_quality_bytes(&mut output, &[93]).expect("write_quality_bytes should succeed");
         assert_eq!(output, vec![126]); // '~'
 
         output.clear();
         // Test overflow clamping (94+ should clamp to 126)
-        write_quality_bytes(&mut output, &[94, 100, 255]).unwrap();
+        write_quality_bytes(&mut output, &[94, 100, 255])
+            .expect("write_quality_bytes should succeed");
         assert_eq!(output, vec![126, 126, 126]);
     }
 }

@@ -286,8 +286,8 @@ where
         let mi = match self.records.peek() {
             Some(Ok(record)) => get_mi_tag(record)?,
             Some(Err(_)) => {
-                // Consume the error
-                return Err(self.records.next().unwrap().unwrap_err());
+                // Consume the error — next() is Some because peek() was Some(Err(_))
+                return Err(self.records.next().expect("peek() returned Some").unwrap_err());
             }
             None => return Ok(None),
         };
@@ -302,12 +302,12 @@ where
                     if record_mi != mi {
                         break;
                     }
-                    // Consume the record
-                    family.push(self.records.next().unwrap()?);
+                    // Consume the record — next() is Some because peek() was Some
+                    family.push(self.records.next().expect("peek() returned Some")?);
                 }
                 Err(_) => {
-                    // Consume and return the error
-                    return Err(self.records.next().unwrap().unwrap_err());
+                    // Consume and return the error — next() is Some because peek() was Some(Err(_))
+                    return Err(self.records.next().expect("peek() returned Some").unwrap_err());
                 }
             }
         }
@@ -363,14 +363,14 @@ mod tests {
     #[test]
     fn test_get_mi_tag_string() {
         let record = create_test_record("read1", "12345");
-        let mi = get_mi_tag(&record).unwrap();
+        let mi = get_mi_tag(&record).expect("get_mi_tag should succeed for string MI");
         assert_eq!(mi, "12345");
     }
 
     #[test]
     fn test_get_mi_tag_integer() {
         let record = create_test_record_int_mi("read1", 42);
-        let mi = get_mi_tag(&record).unwrap();
+        let mi = get_mi_tag(&record).expect("get_mi_tag should succeed for integer MI");
         assert_eq!(mi, "42");
     }
 
@@ -392,11 +392,12 @@ mod tests {
 
         let mut iter = FamilyIterator::new(records.into_iter());
 
-        let family1 = iter.next_family().unwrap().unwrap();
+        let family1 =
+            iter.next_family().expect("next_family should succeed").expect("expected a family");
         assert_eq!(family1.0, "100");
         assert_eq!(family1.1.len(), 3);
 
-        let family2 = iter.next_family().unwrap();
+        let family2 = iter.next_family().expect("next_family should succeed");
         assert!(family2.is_none());
     }
 
@@ -413,19 +414,22 @@ mod tests {
 
         let mut iter = FamilyIterator::new(records.into_iter());
 
-        let family1 = iter.next_family().unwrap().unwrap();
+        let family1 =
+            iter.next_family().expect("next_family should succeed").expect("expected family 1");
         assert_eq!(family1.0, "100");
         assert_eq!(family1.1.len(), 2);
 
-        let family2 = iter.next_family().unwrap().unwrap();
+        let family2 =
+            iter.next_family().expect("next_family should succeed").expect("expected family 2");
         assert_eq!(family2.0, "200");
         assert_eq!(family2.1.len(), 3);
 
-        let family3 = iter.next_family().unwrap().unwrap();
+        let family3 =
+            iter.next_family().expect("next_family should succeed").expect("expected family 3");
         assert_eq!(family3.0, "300");
         assert_eq!(family3.1.len(), 1);
 
-        let family4 = iter.next_family().unwrap();
+        let family4 = iter.next_family().expect("next_family should succeed");
         assert!(family4.is_none());
     }
 
@@ -434,7 +438,7 @@ mod tests {
         let records: Vec<Result<RecordBuf>> = vec![];
         let mut iter = FamilyIterator::new(records.into_iter());
 
-        let family = iter.next_family().unwrap();
+        let family = iter.next_family().expect("next_family should succeed");
         assert!(family.is_none());
     }
 
@@ -505,10 +509,12 @@ mod tests {
         hist.insert(2, 20);
         hist.insert(5, 5);
 
-        let temp_file = NamedTempFile::new().unwrap();
-        write_histogram(&hist, &temp_file.path().to_path_buf()).unwrap();
+        let temp_file = NamedTempFile::new().expect("failed to create temp file");
+        write_histogram(&hist, &temp_file.path().to_path_buf())
+            .expect("write_histogram should succeed");
 
-        let contents = std::fs::read_to_string(temp_file.path()).unwrap();
+        let contents =
+            std::fs::read_to_string(temp_file.path()).expect("failed to read histogram file");
         assert!(contents.contains("family_size\tcount"));
         assert!(contents.contains("1\t10"));
         assert!(contents.contains("2\t20"));

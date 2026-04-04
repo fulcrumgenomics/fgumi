@@ -921,11 +921,11 @@ mod tests {
 
     #[test]
     fn test_load_includelist_valid() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
-        std::fs::write(&path, "AACAC\nAAGGA\nAATGC\n").unwrap();
+        std::fs::write(&path, "AACAC\nAAGGA\nAATGC\n").expect("failed to write file");
 
-        let umis = load_includelist(&path).unwrap();
+        let umis = load_includelist(&path).expect("failed to load includelist");
         assert_eq!(umis.len(), 3);
         assert_eq!(umis[0], b"AACAC");
         assert_eq!(umis[1], b"AAGGA");
@@ -934,30 +934,30 @@ mod tests {
 
     #[test]
     fn test_load_includelist_lowercase_uppercased() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
-        std::fs::write(&path, "aacac\naagga\n").unwrap();
+        std::fs::write(&path, "aacac\naagga\n").expect("failed to write file");
 
-        let umis = load_includelist(&path).unwrap();
+        let umis = load_includelist(&path).expect("failed to load includelist");
         assert_eq!(umis[0], b"AACAC");
         assert_eq!(umis[1], b"AAGGA");
     }
 
     #[test]
     fn test_load_includelist_skips_blank_lines() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
-        std::fs::write(&path, "AACAC\n\nAAGGA\n  \nAATGC\n").unwrap();
+        std::fs::write(&path, "AACAC\n\nAAGGA\n  \nAATGC\n").expect("failed to write file");
 
-        let umis = load_includelist(&path).unwrap();
+        let umis = load_includelist(&path).expect("failed to load includelist");
         assert_eq!(umis.len(), 3);
     }
 
     #[test]
     fn test_load_includelist_rejects_invalid_bases() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
-        std::fs::write(&path, "AACAC\nAANGA\n").unwrap();
+        std::fs::write(&path, "AACAC\nAANGA\n").expect("failed to write file");
 
         let result = load_includelist(&path);
         assert!(result.is_err());
@@ -966,9 +966,9 @@ mod tests {
 
     #[test]
     fn test_load_includelist_rejects_mismatched_lengths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
-        std::fs::write(&path, "AACAC\nAAGG\n").unwrap();
+        std::fs::write(&path, "AACAC\nAAGG\n").expect("failed to write file");
 
         let result = load_includelist(&path);
         assert!(result.is_err());
@@ -980,10 +980,10 @@ mod tests {
 
     #[test]
     fn test_load_includelist_mismatched_length_reports_correct_line_with_blanks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
         // Blank line between valid UMIs; the short UMI is on file line 4
-        std::fs::write(&path, "AACAC\n\nAAGGA\nAAGG\n").unwrap();
+        std::fs::write(&path, "AACAC\n\nAAGGA\nAAGG\n").expect("failed to write file");
 
         let result = load_includelist(&path);
         assert!(result.is_err());
@@ -993,9 +993,9 @@ mod tests {
 
     #[test]
     fn test_load_includelist_rejects_empty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("umis.txt");
-        std::fs::write(&path, "\n\n").unwrap();
+        std::fs::write(&path, "\n\n").expect("failed to write file");
 
         let result = load_includelist(&path);
         assert!(result.is_err());
@@ -1004,9 +1004,9 @@ mod tests {
 
     #[test]
     fn test_execute_rejects_includelist_umi_exceeding_read_length() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let includelist_path = dir.path().join("umis.txt");
-        std::fs::write(&includelist_path, "AAAAACCCCC\n").unwrap(); // length 10
+        std::fs::write(&includelist_path, "AAAAACCCCC\n").expect("failed to write file"); // length 10
 
         let r1 = dir.path().join("r1.fq.gz");
         let r2 = dir.path().join("r2.fq.gz");
@@ -1015,17 +1015,17 @@ mod tests {
         let cmd = FastqReads::try_parse_from([
             "fastq-reads",
             "-1",
-            r1.to_str().unwrap(),
+            r1.to_str().expect("path should be valid UTF-8"),
             "-2",
-            r2.to_str().unwrap(),
+            r2.to_str().expect("path should be valid UTF-8"),
             "--truth",
-            truth.to_str().unwrap(),
+            truth.to_str().expect("path should be valid UTF-8"),
             "-i",
-            includelist_path.to_str().unwrap(),
+            includelist_path.to_str().expect("path should be valid UTF-8"),
             "--read-length",
             "5", // shorter than UMI
         ])
-        .unwrap();
+        .expect("valid CLI arguments");
 
         let result = cmd.execute("");
         assert!(result.is_err());
@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_execute_rejects_umi_length_exceeding_read_length() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
         let r1 = dir.path().join("r1.fq.gz");
         let r2 = dir.path().join("r2.fq.gz");
         let truth = dir.path().join("truth.tsv");
@@ -1046,17 +1046,17 @@ mod tests {
         let cmd = FastqReads::try_parse_from([
             "fastq-reads",
             "-1",
-            r1.to_str().unwrap(),
+            r1.to_str().expect("path should be valid UTF-8"),
             "-2",
-            r2.to_str().unwrap(),
+            r2.to_str().expect("path should be valid UTF-8"),
             "--truth",
-            truth.to_str().unwrap(),
+            truth.to_str().expect("path should be valid UTF-8"),
             "--umi-length",
             "100",
             "--read-length",
             "50",
         ])
-        .unwrap();
+        .expect("valid CLI arguments");
 
         let result = cmd.execute("");
         assert!(result.is_err());
