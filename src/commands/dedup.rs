@@ -25,7 +25,6 @@ use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
@@ -48,6 +47,7 @@ use noodles::sam::Header;
 use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::command::Command;
@@ -1232,7 +1232,8 @@ impl Command for MarkDuplicates {
         };
 
         // Shared state for collecting metrics
-        let collected_metrics: Arc<SegQueue<CollectedDedupMetrics>> = Arc::new(SegQueue::new());
+        let collected_metrics: Arc<Mutex<CollectedDedupMetrics>> =
+            Arc::new(Mutex::new(CollectedDedupMetrics::default()));
 
         // Clone values needed by closures
         let strategy = effective_strategy;
@@ -1284,17 +1285,19 @@ impl Command for MarkDuplicates {
                     no_umi,
                 )
             },
-            // Serialize function (serial, ordered)
+            // Serialize function (parallel, output ordered by serial numbers)
             move |processed: ProcessedDedupGroup,
                   header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
                 // Collect metrics
-                let metrics = CollectedDedupMetrics {
-                    dedup_metrics: processed.dedup_metrics.clone(),
-                    family_sizes: processed.family_sizes.clone(),
-                };
-                collected_metrics_clone.push(metrics);
+                {
+                    let mut agg = collected_metrics_clone.lock();
+                    agg.dedup_metrics.merge(&processed.dedup_metrics);
+                    for (size, count) in &processed.family_sizes {
+                        *agg.family_sizes.entry(*size).or_insert(0) += count;
+                    }
+                }
 
                 let input_record_count = processed.input_record_count;
 
@@ -1375,15 +1378,11 @@ impl Command for MarkDuplicates {
         )?;
 
         // Aggregate metrics
-        let mut final_metrics = DedupMetrics::default();
-        let mut final_family_sizes: AHashMap<usize, u64> = AHashMap::new();
-
-        while let Some(m) = collected_metrics.pop() {
-            final_metrics.merge(&m.dedup_metrics);
-            for (size, count) in m.family_sizes {
-                *final_family_sizes.entry(size).or_insert(0) += count;
-            }
-        }
+        let aggregated = Arc::try_unwrap(collected_metrics)
+            .expect("bug: metrics Arc still shared after pipeline join")
+            .into_inner();
+        let final_metrics = aggregated.dedup_metrics;
+        let final_family_sizes = aggregated.family_sizes;
 
         // Write metrics file
         if let Some(metrics_path) = &self.metrics {
