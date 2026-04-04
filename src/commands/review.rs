@@ -915,7 +915,11 @@ impl Review {
         if let Some(offset) = self.calculate_read_offset(record, ref_pos)? {
             let sequence = record.sequence();
             if offset < sequence.len() {
-                return Ok(Some(sequence.get(offset).unwrap()));
+                return Ok(Some(
+                    sequence
+                        .get(offset)
+                        .expect("offset already bounds-checked against sequence length"),
+                ));
             }
         }
         Ok(None)
@@ -962,7 +966,9 @@ impl Review {
         if let Some(offset) = read_offset {
             let sequence = record.sequence();
             if offset < sequence.len() {
-                let base = sequence.get(offset).unwrap();
+                let base = sequence
+                    .get(offset)
+                    .expect("offset already bounds-checked against sequence length");
                 let base_char = (base as char).to_ascii_uppercase();
 
                 // Check if base differs from reference
@@ -1109,17 +1115,17 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 >chr2\n\
 CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n";
 
-            std::fs::write(&ref_path, fasta_content).unwrap();
+            std::fs::write(&ref_path, fasta_content).expect("failed to write file");
 
             // Create FAI
             let fai_content = b"chr1\t100\t6\t100\t101\nchr2\t100\t114\t100\t101\n";
-            std::fs::write(&fai_path, fai_content).unwrap();
+            std::fs::write(&fai_path, fai_content).expect("failed to write file");
 
             // Create dictionary
             let dict_content = b"@HD\tVN:1.5\tSO:unsorted\n\
 @SQ\tSN:chr1\tLN:100\n\
 @SQ\tSN:chr2\tLN:100\n";
-            std::fs::write(&dict_path, dict_content).unwrap();
+            std::fs::write(&dict_path, dict_content).expect("failed to write file");
 
             ref_path
         }
@@ -1132,27 +1138,35 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             let mut header = Header::builder()
                 .add_reference_sequence(
                     BString::from("chr1"),
-                    Map::<ReferenceSequence>::new(NonZeroUsize::try_from(100).unwrap()),
+                    Map::<ReferenceSequence>::new(
+                        NonZeroUsize::try_from(100).expect("non-zero value required"),
+                    ),
                 )
                 .add_reference_sequence(
                     BString::from("chr2"),
-                    Map::<ReferenceSequence>::new(NonZeroUsize::try_from(100).unwrap()),
+                    Map::<ReferenceSequence>::new(
+                        NonZeroUsize::try_from(100).expect("non-zero value required"),
+                    ),
                 )
                 .build();
 
             // Parse and set the sort order in the header line
             let header_str = "@HD\tVN:1.6\tSO:coordinate\n";
-            let parsed_header: Header = header_str.parse().unwrap();
+            let parsed_header: Header = header_str.parse().expect("valid parse input");
             if let Some(hd) = parsed_header.header() {
                 header = Header::builder()
                     .set_header(hd.clone())
                     .add_reference_sequence(
                         BString::from("chr1"),
-                        Map::<ReferenceSequence>::new(NonZeroUsize::try_from(100).unwrap()),
+                        Map::<ReferenceSequence>::new(
+                            NonZeroUsize::try_from(100).expect("non-zero value required"),
+                        ),
                     )
                     .add_reference_sequence(
                         BString::from("chr2"),
-                        Map::<ReferenceSequence>::new(NonZeroUsize::try_from(100).unwrap()),
+                        Map::<ReferenceSequence>::new(
+                            NonZeroUsize::try_from(100).expect("non-zero value required"),
+                        ),
                     )
                     .build();
             }
@@ -1218,50 +1232,53 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             let header = create_test_header();
 
             // Create raw BAM
-            let mut raw_writer = bam::io::Writer::new(std::fs::File::create(&raw_path).unwrap());
-            raw_writer.write_header(&header).unwrap();
+            let mut raw_writer = bam::io::Writer::new(
+                std::fs::File::create(&raw_path).expect("failed to create file"),
+            );
+            raw_writer.write_header(&header).expect("failed to write BAM header");
 
             // Create consensus BAM
-            let mut con_writer =
-                bam::io::Writer::new(std::fs::File::create(&consensus_path).unwrap());
-            con_writer.write_header(&header).unwrap();
+            let mut con_writer = bam::io::Writer::new(
+                std::fs::File::create(&consensus_path).expect("failed to create file"),
+            );
+            con_writer.write_header(&header).expect("failed to write BAM header");
 
             // Add reads with variant at chr1:10 (A->T)
             let (r1, r2) =
                 create_read_pair("A1", 0, 6, 50, b"AAAATAAAAA", b"AAAAAAAAAA", "A", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("A2", 0, 6, 50, b"AAAATAAAAG", b"AAAAAAAAAA", "A", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) = create_read_pair("A", 0, 6, 50, b"AAAATAAAAN", b"AAAAAAAAAA", "A", None);
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // Add reads at chr1:20 (A->C)
             let (r1, r2) =
                 create_read_pair("B1", 0, 16, 50, b"AAAACAAAAA", b"AAAAAAAAAA", "B", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("B", 0, 16, 50, b"AAAACAAAAA", b"AAAAAAAAAA", "B", None);
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // Reference read at chr1:20
             let (r1, r2) =
                 create_read_pair("C1", 0, 17, 50, b"AAAAAAAAAA", b"AAAAAAAAAA", "C", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("C", 0, 17, 50, b"AAAAAAAAAA", b"AAAAAAAAAA", "C", None);
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // Reads at chr1:30 with various edge cases
             // D: spanning deletion
@@ -1275,46 +1292,46 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 "D",
                 Some("4M4D6M"),
             );
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("D", 0, 25, 60, b"AAAAAAAAAA", b"AAAAAAAAAA", "D", Some("4M4D6M"));
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // E: no-call (N)
             let (r1, r2) =
                 create_read_pair("E1", 0, 26, 60, b"AAAANAAAAA", b"AAAAAAAAAA", "E", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("E", 0, 26, 60, b"AAAANAAAAA", b"AAAAAAAAAA", "E", None);
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // F: variant allele (G)
             let (r1, r2) =
                 create_read_pair("F1", 0, 27, 60, b"AAAGAAAAAA", b"AAAAAAAAAA", "F", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("F", 0, 27, 60, b"AAAGAAAAAA", b"AAAAAAAAAA", "F", None);
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // Reads at chr2:20 where both ends overlap variant
             let (r1, r2) =
                 create_read_pair("H1", 1, 15, 19, b"CCCCCTCCCC", b"CTCCCCCCCC", "H", None);
-            raw_writer.write_alignment_record(&header, &r1).unwrap();
-            raw_writer.write_alignment_record(&header, &r2).unwrap();
+            raw_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            raw_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             let (r1, r2) =
                 create_read_pair("H", 1, 15, 19, b"CCCCCTCCCC", b"CTCCCCCCCC", "H", None);
-            con_writer.write_alignment_record(&header, &r1).unwrap();
-            con_writer.write_alignment_record(&header, &r2).unwrap();
+            con_writer.write_alignment_record(&header, &r1).expect("failed to write BAM record");
+            con_writer.write_alignment_record(&header, &r2).expect("failed to write BAM record");
 
             // Close writers to flush data
             drop(raw_writer);
@@ -1325,17 +1342,19 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
 
             // Index raw BAM
             let raw_index_path = raw_path.with_extension("bam.bai");
-            let raw_index = bam::fs::index(&raw_path).unwrap();
-            let mut raw_index_writer =
-                bai::io::Writer::new(std::fs::File::create(&raw_index_path).unwrap());
-            raw_index_writer.write_index(&raw_index).unwrap();
+            let raw_index = bam::fs::index(&raw_path).expect("failed to index BAM file");
+            let mut raw_index_writer = bai::io::Writer::new(
+                std::fs::File::create(&raw_index_path).expect("failed to create file"),
+            );
+            raw_index_writer.write_index(&raw_index).expect("failed to write BAM index");
 
             // Index consensus BAM
             let consensus_index_path = consensus_path.with_extension("bam.bai");
-            let con_index = bam::fs::index(&consensus_path).unwrap();
-            let mut con_index_writer =
-                bai::io::Writer::new(std::fs::File::create(&consensus_index_path).unwrap());
-            con_index_writer.write_index(&con_index).unwrap();
+            let con_index = bam::fs::index(&consensus_path).expect("failed to index BAM file");
+            let mut con_index_writer = bai::io::Writer::new(
+                std::fs::File::create(&consensus_index_path).expect("failed to create file"),
+            );
+            con_index_writer.write_index(&con_index).expect("failed to write BAM index");
 
             (raw_path, consensus_path)
         }
@@ -1354,7 +1373,7 @@ chr1\t10\t.\tA\tT\t.\tPASS\t.\tGT:AF\t0/1:0.01\n\
 chr1\t20\t.\tA\tC\t.\tPASS\t.\tGT:AF\t0/1:0.01\n\
 chr1\t30\t.\tA\tG\t.\tPASS\t.\tGT:AF\t0/1:0.01\n\
 chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
-            std::fs::write(&vcf_path, vcf_content).unwrap();
+            std::fs::write(&vcf_path, vcf_content).expect("failed to write file");
             vcf_path
         }
 
@@ -1365,7 +1384,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
 ##contig=<ID=chr1,length=100>\n\
 ##contig=<ID=chr2,length=100>\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ttumor\n";
-            std::fs::write(&vcf_path, vcf_content).unwrap();
+            std::fs::write(&vcf_path, vcf_content).expect("failed to write file");
             vcf_path
         }
 
@@ -1375,7 +1394,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             let interval_content = b"@HD\tVN:1.5\tSO:unsorted\n\
 @SQ\tSN:chr1\tLN:100\n\
 @SQ\tSN:chr2\tLN:100\n";
-            std::fs::write(&interval_path, interval_content).unwrap();
+            std::fs::write(&interval_path, interval_content).expect("failed to write file");
             interval_path
         }
     }
@@ -1493,7 +1512,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
     fn test_empty_vcf_produces_empty_outputs() {
         use noodles::bam;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_empty_vcf(&temp_dir);
@@ -1510,7 +1529,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         // Verify output files exist
         let con_out = output_path.with_extension("consensus.bam");
@@ -1522,24 +1541,36 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         assert!(txt_out.exists());
 
         // Verify BAMs are empty
-        let mut con_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&con_out).unwrap();
-        let con_header = con_reader.read_header().unwrap();
+        let mut con_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&con_out)
+            .expect("failed to open indexed BAM");
+        let con_header = con_reader.read_header().expect("failed to read BAM header");
         let mut con_record = noodles::sam::alignment::RecordBuf::default();
-        assert_eq!(con_reader.read_record_buf(&con_header, &mut con_record).unwrap(), 0);
+        assert_eq!(
+            con_reader
+                .read_record_buf(&con_header, &mut con_record)
+                .expect("failed to read BAM record"),
+            0
+        );
 
-        let mut raw_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&raw_out).unwrap();
-        let raw_header = raw_reader.read_header().unwrap();
+        let mut raw_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&raw_out)
+            .expect("failed to open indexed BAM");
+        let raw_header = raw_reader.read_header().expect("failed to read BAM header");
         let mut raw_record = noodles::sam::alignment::RecordBuf::default();
-        assert_eq!(raw_reader.read_record_buf(&raw_header, &mut raw_record).unwrap(), 0);
+        assert_eq!(
+            raw_reader
+                .read_record_buf(&raw_header, &mut raw_record)
+                .expect("failed to read BAM record"),
+            0
+        );
     }
 
     #[test]
     fn test_empty_interval_list_produces_empty_outputs() {
         use noodles::bam;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let interval_path = test_utils::create_empty_interval_list(&temp_dir);
@@ -1556,7 +1587,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         // Verify output files exist and are empty
         let con_out = output_path.with_extension("consensus.bam");
@@ -1566,18 +1597,24 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         assert!(raw_out.exists());
 
         // Verify BAMs are empty
-        let mut con_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&con_out).unwrap();
-        let con_header = con_reader.read_header().unwrap();
+        let mut con_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&con_out)
+            .expect("failed to open indexed BAM");
+        let con_header = con_reader.read_header().expect("failed to read BAM header");
         let mut con_record = noodles::sam::alignment::RecordBuf::default();
-        assert_eq!(con_reader.read_record_buf(&con_header, &mut con_record).unwrap(), 0);
+        assert_eq!(
+            con_reader
+                .read_record_buf(&con_header, &mut con_record)
+                .expect("failed to read BAM record"),
+            0
+        );
     }
 
     #[test]
     fn test_extracts_correct_reads_for_variants() {
         use noodles::bam;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_test_vcf(&temp_dir);
@@ -1594,7 +1631,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         // Verify output files exist
         let con_out = output_path.with_extension("consensus.bam");
@@ -1606,14 +1643,22 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         assert!(txt_out.exists());
 
         // Read consensus BAM and verify read names
-        let mut con_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&con_out).unwrap();
-        let con_header = con_reader.read_header().unwrap();
+        let mut con_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&con_out)
+            .expect("failed to open indexed BAM");
+        let con_header = con_reader.read_header().expect("failed to read BAM header");
 
         let mut consensus_reads = Vec::new();
         let mut con_record = noodles::sam::alignment::RecordBuf::default();
-        while con_reader.read_record_buf(&con_header, &mut con_record).unwrap() > 0 {
-            let name = String::from_utf8_lossy(con_record.name().unwrap().as_ref()).to_string();
+        while con_reader
+            .read_record_buf(&con_header, &mut con_record)
+            .expect("failed to read BAM record")
+            > 0
+        {
+            let name = String::from_utf8_lossy(
+                con_record.name().expect("record should have name").as_ref(),
+            )
+            .to_string();
             consensus_reads.push(name);
         }
 
@@ -1626,14 +1671,22 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
         assert!(consensus_reads.contains(&"H".to_string()));
 
         // Read raw BAM and verify read names
-        let mut raw_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&raw_out).unwrap();
-        let raw_header = raw_reader.read_header().unwrap();
+        let mut raw_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&raw_out)
+            .expect("failed to open indexed BAM");
+        let raw_header = raw_reader.read_header().expect("failed to read BAM header");
 
         let mut raw_reads = Vec::new();
         let mut raw_record = noodles::sam::alignment::RecordBuf::default();
-        while raw_reader.read_record_buf(&raw_header, &mut raw_record).unwrap() > 0 {
-            let name = String::from_utf8_lossy(raw_record.name().unwrap().as_ref()).to_string();
+        while raw_reader
+            .read_record_buf(&raw_header, &mut raw_record)
+            .expect("failed to read BAM record")
+            > 0
+        {
+            let name = String::from_utf8_lossy(
+                raw_record.name().expect("record should have name").as_ref(),
+            )
+            .to_string();
             raw_reads.push(name);
         }
 
@@ -1650,7 +1703,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
     fn test_review_tsv_contains_correct_information() {
         use std::io::BufRead;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_test_vcf(&temp_dir);
@@ -1667,15 +1720,15 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         let txt_out = output_path.with_extension("txt");
         assert!(txt_out.exists());
 
         // Read TSV and verify it has content
-        let file = std::fs::File::open(&txt_out).unwrap();
+        let file = std::fs::File::open(&txt_out).expect("failed to open file");
         let reader = std::io::BufReader::new(file);
-        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        let lines: Vec<String> = reader.lines().map(|l| l.expect("failed to read line")).collect();
 
         // Should have header plus data rows
         assert!(lines.len() > 1, "TSV should have header and data rows");
@@ -1693,7 +1746,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
     fn test_spanning_deletions_handled_correctly() {
         use noodles::bam;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_test_vcf(&temp_dir);
@@ -1710,18 +1763,26 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         // Read consensus BAM - should include D (spanning deletion)
         let con_out = output_path.with_extension("consensus.bam");
-        let mut con_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&con_out).unwrap();
-        let con_header = con_reader.read_header().unwrap();
+        let mut con_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&con_out)
+            .expect("failed to open indexed BAM");
+        let con_header = con_reader.read_header().expect("failed to read BAM header");
 
         let mut consensus_reads = Vec::new();
         let mut con_record = noodles::sam::alignment::RecordBuf::default();
-        while con_reader.read_record_buf(&con_header, &mut con_record).unwrap() > 0 {
-            let name = String::from_utf8_lossy(con_record.name().unwrap().as_ref()).to_string();
+        while con_reader
+            .read_record_buf(&con_header, &mut con_record)
+            .expect("failed to read BAM record")
+            > 0
+        {
+            let name = String::from_utf8_lossy(
+                con_record.name().expect("record should have name").as_ref(),
+            )
+            .to_string();
             consensus_reads.push(name);
         }
 
@@ -1731,7 +1792,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
 
     #[test]
     fn test_no_calls_handled_correctly() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_test_vcf(&temp_dir);
@@ -1748,11 +1809,11 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         // Read TSV and verify N bases are included
         let txt_out = output_path.with_extension("txt");
-        let content = std::fs::read_to_string(&txt_out).unwrap();
+        let content = std::fs::read_to_string(&txt_out).expect("failed to read file");
 
         // Should find E consensus read with N base
         assert!(content.contains("E/"), "Should contain consensus read E");
@@ -1770,10 +1831,10 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review2.execute("test").unwrap();
+        review2.execute("test").expect("execute should succeed");
 
         let txt_out2 = output_path2.with_extension("txt");
-        let content2 = std::fs::read_to_string(&txt_out2).unwrap();
+        let content2 = std::fs::read_to_string(&txt_out2).expect("failed to read file");
 
         // E should not be in the TSV (N bases ignored)
         let lines: Vec<&str> = content2.lines().collect();
@@ -1785,7 +1846,7 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
     fn test_both_ends_overlapping_variant() {
         use noodles::bam;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = test_utils::create_test_reference(&temp_dir);
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_test_vcf(&temp_dir);
@@ -1802,18 +1863,26 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
             maf: 0.05,
         };
 
-        review.execute("test").unwrap();
+        review.execute("test").expect("execute should succeed");
 
         // Read consensus BAM - should include both H/1 and H/2
         let con_out = output_path.with_extension("consensus.bam");
-        let mut con_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&con_out).unwrap();
-        let con_header = con_reader.read_header().unwrap();
+        let mut con_reader = bam::io::indexed_reader::Builder::default()
+            .build_from_path(&con_out)
+            .expect("failed to open indexed BAM");
+        let con_header = con_reader.read_header().expect("failed to read BAM header");
 
         let mut h_reads = 0;
         let mut con_record = noodles::sam::alignment::RecordBuf::default();
-        while con_reader.read_record_buf(&con_header, &mut con_record).unwrap() > 0 {
-            let name = String::from_utf8_lossy(con_record.name().unwrap().as_ref()).to_string();
+        while con_reader
+            .read_record_buf(&con_header, &mut con_record)
+            .expect("failed to read BAM record")
+            > 0
+        {
+            let name = String::from_utf8_lossy(
+                con_record.name().expect("record should have name").as_ref(),
+            )
+            .to_string();
             if name == "H" {
                 h_reads += 1;
             }
@@ -1825,12 +1894,12 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
 
     #[test]
     fn test_missing_fasta_index_fails() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = temp_dir.path().join("ref.fa");
 
         // Create FASTA without .fai
         let fasta_content = b">chr1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
-        std::fs::write(&ref_path, fasta_content).unwrap();
+        std::fs::write(&ref_path, fasta_content).expect("failed to write file");
 
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_empty_vcf(&temp_dir);
@@ -1854,16 +1923,16 @@ chr2\t20\t.\tC\tT\t.\tPASS\t.\tGT:AD\t0/1:100,2\n";
 
     #[test]
     fn test_missing_fasta_dict_fails() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
         let ref_path = temp_dir.path().join("ref.fa");
         let fai_path = temp_dir.path().join("ref.fa.fai");
 
         // Create FASTA with .fai but without .dict
         let fasta_content = b">chr1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
-        std::fs::write(&ref_path, fasta_content).unwrap();
+        std::fs::write(&ref_path, fasta_content).expect("failed to write file");
 
         let fai_content = b"chr1\t100\t6\t100\t101\n";
-        std::fs::write(&fai_path, fai_content).unwrap();
+        std::fs::write(&fai_path, fai_content).expect("failed to write file");
 
         let (raw_path, consensus_path) = test_utils::create_test_bams(&temp_dir);
         let vcf_path = test_utils::create_empty_vcf(&temp_dir);

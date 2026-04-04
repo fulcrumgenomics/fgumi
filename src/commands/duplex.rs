@@ -891,7 +891,9 @@ mod tests {
             .add_program("fgumi", Map::<Program>::default())
             .add_reference_sequence(
                 "chr1",
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
+                Map::<ReferenceSequence>::new(
+                    NonZeroUsize::new(248_956_422).expect("non-zero chromosome length"),
+                ),
             );
 
         builder.build()
@@ -1164,7 +1166,7 @@ mod tests {
         for record in &output_records {
             let mi = get_string_tag(record, "MI");
             assert!(mi.is_some(), "MI tag should be present");
-            let mi = mi.unwrap();
+            let mi = mi.expect("MI tag should have a value");
             assert_eq!(mi, "1", "MI tag should be '1' without /A or /B suffix");
         }
 

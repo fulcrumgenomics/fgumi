@@ -870,7 +870,9 @@ mod tests {
             .build();
 
         // Add reference sequence
-        let rs = Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).unwrap());
+        let rs = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(1000).expect("non-zero chromosome length"),
+        );
         header.reference_sequences_mut().insert(bstr::BString::from("chr1"), rs);
 
         // Add read group

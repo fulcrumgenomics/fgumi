@@ -378,7 +378,8 @@ mod tests {
             min_family_size: 1,
         };
 
-        let dist = args.to_family_size_distribution().unwrap();
+        let dist =
+            args.to_family_size_distribution().expect("lognormal distribution should be created");
         let mut rng = create_rng(Some(42));
         let size = dist.sample(&mut rng, 1);
         assert!(size >= 1);
@@ -395,7 +396,8 @@ mod tests {
             min_family_size: 1,
         };
 
-        let dist = args.to_family_size_distribution().unwrap();
+        let dist =
+            args.to_family_size_distribution().expect("negbin distribution should be created");
         let mut rng = create_rng(Some(42));
         let size = dist.sample(&mut rng, 1);
         assert!(size >= 1);
@@ -556,7 +558,9 @@ mod tests {
             min_family_size: 5, // High minimum
         };
 
-        let dist = args.to_family_size_distribution().unwrap();
+        let dist = args
+            .to_family_size_distribution()
+            .expect("lognormal distribution with high min should be created");
         let mut rng = create_rng(Some(42));
 
         for _ in 0..100 {
@@ -648,7 +652,9 @@ mod tests {
         };
 
         // Should not panic
-        let _ = args_lower.to_family_size_distribution().unwrap();
+        let _ = args_lower
+            .to_family_size_distribution()
+            .expect("lowercase distribution name should be accepted");
     }
 
     #[rstest]

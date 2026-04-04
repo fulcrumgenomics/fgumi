@@ -914,19 +914,43 @@ mod tests {
 
     #[test]
     fn test_parse_memory_size_plain_numbers() {
-        assert_eq!(parse_memory_size("768").unwrap(), 768 * 1024 * 1024);
-        assert_eq!(parse_memory_size("1").unwrap(), 1024 * 1024);
-        assert_eq!(parse_memory_size("4096").unwrap(), 4096 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_size("768").expect("parse '768' should succeed"),
+            768 * 1024 * 1024
+        );
+        assert_eq!(parse_memory_size("1").expect("parse '1' should succeed"), 1024 * 1024);
+        assert_eq!(
+            parse_memory_size("4096").expect("parse '4096' should succeed"),
+            4096 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_parse_memory_size_human_readable() {
-        assert_eq!(parse_memory_size("2GB").unwrap(), 2 * 1000 * 1000 * 1000);
-        assert_eq!(parse_memory_size("2G").unwrap(), 2 * 1000 * 1000 * 1000);
-        assert_eq!(parse_memory_size("1024MB").unwrap(), 1024 * 1000 * 1000);
-        assert_eq!(parse_memory_size("1024M").unwrap(), 1024 * 1000 * 1000);
-        assert_eq!(parse_memory_size("1GiB").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_size("512MiB").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_size("2GB").expect("parse '2GB' should succeed"),
+            2 * 1000 * 1000 * 1000
+        );
+        assert_eq!(
+            parse_memory_size("2G").expect("parse '2G' should succeed"),
+            2 * 1000 * 1000 * 1000
+        );
+        assert_eq!(
+            parse_memory_size("1024MB").expect("parse '1024MB' should succeed"),
+            1024 * 1000 * 1000
+        );
+        assert_eq!(
+            parse_memory_size("1024M").expect("parse '1024M' should succeed"),
+            1024 * 1000 * 1000
+        );
+        assert_eq!(
+            parse_memory_size("1GiB").expect("parse '1GiB' should succeed"),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_size("512MiB").expect("parse '512MiB' should succeed"),
+            512 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -974,8 +998,14 @@ mod tests {
     #[test]
     fn test_parse_memory_size_whitespace_handling() {
         // Trimmed input should work
-        assert_eq!(parse_memory_size("  768  ").unwrap(), 768 * 1024 * 1024);
-        assert_eq!(parse_memory_size("\t1GB\n").unwrap(), 1000 * 1000 * 1000);
+        assert_eq!(
+            parse_memory_size("  768  ").expect("parse trimmed '768' should succeed"),
+            768 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_size("\t1GB\n").expect("parse trimmed '1GB' should succeed"),
+            1000 * 1000 * 1000
+        );
     }
 
     #[test]
@@ -996,7 +1026,9 @@ mod tests {
         };
 
         // 100MB × 4 threads = 400MB
-        let result = opts.compute_memory_limit(4).unwrap();
+        let result = opts
+            .compute_memory_limit(4)
+            .expect("compute_memory_limit should succeed for 100MB x 4 threads");
         assert_eq!(result, 100 * 1024 * 1024 * 4);
 
         // Fixed memory (no scaling)
@@ -1005,7 +1037,9 @@ mod tests {
             queue_memory_per_thread: false,
             queue_memory_limit_mb: None,
         };
-        let result_fixed = opts_fixed.compute_memory_limit(8).unwrap();
+        let result_fixed = opts_fixed
+            .compute_memory_limit(8)
+            .expect("compute_memory_limit should succeed for fixed 200MB");
         assert_eq!(result_fixed, 200 * 1024 * 1024); // Should not scale
     }
 
@@ -1061,7 +1095,9 @@ mod tests {
             queue_memory_limit_mb: Some(2048),
         };
 
-        let result = legacy_opts.compute_memory_limit(4).unwrap();
+        let result = legacy_opts
+            .compute_memory_limit(4)
+            .expect("compute_memory_limit should succeed for legacy migration");
         assert_eq!(result, 2048 * 1024 * 1024); // Should use legacy value, no scaling
     }
 
@@ -1073,7 +1109,9 @@ mod tests {
             queue_memory_limit_mb: None,
         };
 
-        let result = opts.compute_memory_limit(4).unwrap();
+        let result = opts
+            .compute_memory_limit(4)
+            .expect("compute_memory_limit should succeed for 2GB fixed");
         assert_eq!(result, 2 * 1000 * 1000 * 1000); // 2GB in bytes
     }
 
@@ -1128,7 +1166,7 @@ mod tests {
     #[case(&["test", "--output-per-base-tags=true"], true)]
     #[case(&["test", "--output-per-base-tags=false"], false)]
     fn test_output_per_base_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.consensus.output_per_base_tags, expected);
     }
 
@@ -1141,7 +1179,7 @@ mod tests {
     #[case(&["test", "--trim=true"], true)]
     #[case(&["test", "--trim=false"], false)]
     fn test_trim_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.consensus.trim, expected);
     }
 
@@ -1154,7 +1192,7 @@ mod tests {
     #[case(&["test", "--consensus-call-overlapping-bases=true"], true)]
     #[case(&["test", "--consensus-call-overlapping-bases=false"], false)]
     fn test_overlapping_bases_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.overlapping.consensus_call_overlapping_bases, expected);
     }
 
@@ -1167,7 +1205,7 @@ mod tests {
     #[case(&["test", "--queue-memory-per-thread=true"], true)]
     #[case(&["test", "--queue-memory-per-thread=false"], false)]
     fn test_queue_memory_per_thread_parsing(#[case] args: &[&str], #[case] expected: bool) {
-        let cmd = TestBoolFlags::try_parse_from(args).unwrap();
+        let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.queue_memory.queue_memory_per_thread, expected);
     }
 }

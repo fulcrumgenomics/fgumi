@@ -827,7 +827,9 @@ impl CorrectUmis {
             CACHE.with(|cache_cell| {
                 let mut cache_ref = cache_cell.borrow_mut();
                 if cache_ref.is_none() && cache_size > 0 {
-                    *cache_ref = Some(LruCache::new(NonZero::new(cache_size).unwrap()));
+                    *cache_ref = Some(LruCache::new(
+                        NonZero::new(cache_size).expect("cache_size > 0 checked above"),
+                    ));
                 }
 
                 let mut kept_raw_records = Vec::new();
@@ -1127,7 +1129,9 @@ impl CorrectUmis {
 
         // LRU cache (single thread, no thread_local needed)
         let mut cache: Option<LruCache<Vec<u8>, UmiMatch>> = if self.cache_size > 0 {
-            Some(LruCache::new(NonZero::new(self.cache_size).unwrap()))
+            Some(LruCache::new(
+                NonZero::new(self.cache_size).expect("cache_size > 0 checked above"),
+            ))
         } else {
             None
         };
@@ -1200,7 +1204,11 @@ impl CorrectUmis {
                     None => {
                         // No UMI in any record - reject all records
                         missing_umis += num_records;
-                        umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches += num_records;
+                        umi_metrics
+                            .get_mut(&unmatched_umi)
+                            .expect("unmatched_umi key initialized in metrics map")
+                            .total_matches += num_records;
+
                         if track_rejects {
                             if let Some(rw) = reject_writer.as_mut() {
                                 for raw in raw_records.drain(..) {
@@ -1225,7 +1233,9 @@ impl CorrectUmis {
                             // Update metrics for matched UMIs (count per-read, not per-template)
                             for m in &correction.matches {
                                 if m.matched {
-                                    let entry = umi_metrics.get_mut(&m.umi).unwrap();
+                                    let entry = umi_metrics.get_mut(&m.umi).expect(
+                                        "UMI key initialized in metrics map from allowed UMIs",
+                                    );
                                     entry.total_matches += num_records;
                                     match m.mismatches {
                                         0 => entry.perfect_matches += num_records,
@@ -1253,8 +1263,10 @@ impl CorrectUmis {
                                 RejectionReason::Mismatched => mismatched += num_records,
                                 RejectionReason::None => {}
                             }
-                            umi_metrics.get_mut(&unmatched_umi).unwrap().total_matches +=
-                                num_records;
+                            umi_metrics
+                                .get_mut(&unmatched_umi)
+                                .expect("unmatched_umi key initialized in metrics map")
+                                .total_matches += num_records;
 
                             if track_rejects {
                                 if let Some(rw) = reject_writer.as_mut() {
@@ -1714,7 +1726,7 @@ mod tests {
             .add_reference_sequence(
                 "chr1",
                 Map::<sam::header::record::value::map::ReferenceSequence>::new(
-                    std::num::NonZero::new(1000).unwrap(),
+                    std::num::NonZero::new(1000).expect("non-zero reference length"),
                 ),
             )
             .build();
@@ -1809,8 +1821,8 @@ mod tests {
 
     #[test]
     fn test_validation_different_length_umis() {
-        let temp_input = NamedTempFile::new().unwrap();
-        let temp_output = NamedTempFile::new().unwrap();
+        let temp_input = NamedTempFile::new().expect("failed to create temp file");
+        let temp_output = NamedTempFile::new().expect("failed to create temp file");
 
         let corrector = CorrectUmis {
             io: BamIoOptions {
@@ -1929,7 +1941,8 @@ mod tests {
 
         // Check metrics
         let metrics_data = UmiCorrectionMetrics::read_metrics(&metrics)?;
-        let aaaaaa = metrics_data.iter().find(|m| m.umi == "AAAAAA").unwrap();
+        let aaaaaa =
+            metrics_data.iter().find(|m| m.umi == "AAAAAA").expect("AAAAAA metric not found");
         assert_eq!(aaaaaa.total_matches, 5);
         assert_eq!(aaaaaa.perfect_matches, 2);
         assert_eq!(aaaaaa.one_mismatch_matches, 1);
@@ -2807,7 +2820,7 @@ mod tests {
         let unmatched = metrics_data.iter().find(|m| m.umi == "NNNNNN");
         assert!(unmatched.is_some(), "Unmatched UMI row (NNNNNN) not found in metrics");
 
-        let unmatched = unmatched.unwrap();
+        let unmatched = unmatched.expect("unmatched UMI row (NNNNNN) should be present");
         // 3 uncorrectable reads: q2, q4, q5
         assert_eq!(
             unmatched.total_matches, 3,
@@ -2879,13 +2892,16 @@ mod tests {
         );
 
         // Verify counts
-        let cccccc = metrics_data.iter().find(|m| m.umi == "CCCCCC").unwrap();
+        let cccccc =
+            metrics_data.iter().find(|m| m.umi == "CCCCCC").expect("CCCCCC metric not found");
         assert_eq!(cccccc.total_matches, 0, "CCCCCC should have 0 total_matches");
 
-        let gggggg = metrics_data.iter().find(|m| m.umi == "GGGGGG").unwrap();
+        let gggggg =
+            metrics_data.iter().find(|m| m.umi == "GGGGGG").expect("GGGGGG metric not found");
         assert_eq!(gggggg.total_matches, 0, "GGGGGG should have 0 total_matches");
 
-        let aaaaaa = metrics_data.iter().find(|m| m.umi == "AAAAAA").unwrap();
+        let aaaaaa =
+            metrics_data.iter().find(|m| m.umi == "AAAAAA").expect("AAAAAA metric not found");
         assert_eq!(aaaaaa.total_matches, 2, "AAAAAA should have 2 total_matches");
 
         Ok(())
@@ -2943,18 +2959,23 @@ mod tests {
         assert_eq!(metrics_data.len(), 3, "Expected 3 UMI rows in metrics");
 
         // Verify unmatched row
-        let unmatched = metrics_data.iter().find(|m| m.umi == "NNNNNN").unwrap();
+        let unmatched = metrics_data
+            .iter()
+            .find(|m| m.umi == "NNNNNN")
+            .expect("unmatched UMI row (NNNNNN) not found");
         // 20 uncorrectable reads (i % 5 == 3 or 4, so 10 + 10 = 20)
         assert_eq!(unmatched.total_matches, 20, "Unmatched row should have 20 total_matches");
 
         // Verify matched UMIs
-        let aaaaaa = metrics_data.iter().find(|m| m.umi == "AAAAAA").unwrap();
+        let aaaaaa =
+            metrics_data.iter().find(|m| m.umi == "AAAAAA").expect("AAAAAA metric not found");
         // i % 5 == 0: 10 perfect, i % 5 == 2: 10 with 1 mismatch = 20 total
         assert_eq!(aaaaaa.total_matches, 20, "AAAAAA should have 20 total_matches");
         assert_eq!(aaaaaa.perfect_matches, 10);
         assert_eq!(aaaaaa.one_mismatch_matches, 10);
 
-        let cccccc = metrics_data.iter().find(|m| m.umi == "CCCCCC").unwrap();
+        let cccccc =
+            metrics_data.iter().find(|m| m.umi == "CCCCCC").expect("CCCCCC metric not found");
         assert_eq!(cccccc.total_matches, 10, "CCCCCC should have 10 total_matches");
         assert_eq!(cccccc.perfect_matches, 10);
 

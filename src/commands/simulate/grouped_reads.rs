@@ -155,7 +155,7 @@ impl Command for GroupedReads {
             .insert(go_tag, "query")
             .insert(ss_tag, "template-coordinate")
             .build()
-            .unwrap();
+            .expect("header map with valid SO/GO/SS tags");
         header = header.set_header(header_map);
 
         let length = NonZeroUsize::try_from(ref_length).expect("Reference length must be > 0");
@@ -839,8 +839,14 @@ mod tests {
         );
 
         // Position should be 1-based in BAM
-        assert_eq!(record.alignment_start().unwrap().get(), 1001);
-        assert_eq!(record.mate_alignment_start().unwrap().get(), 1101);
+        assert_eq!(
+            record.alignment_start().expect("record should have alignment start").get(),
+            1001
+        );
+        assert_eq!(
+            record.mate_alignment_start().expect("record should have mate alignment start").get(),
+            1101
+        );
         assert_eq!(record.template_length(), 200);
     }
 
@@ -853,7 +859,10 @@ mod tests {
             let record = build_record(
                 "read", seq, &quals, 0, 100, mapq, true, false, 200, 100, "AAA", "0", "4M", mapq,
             );
-            assert_eq!(record.mapping_quality().unwrap().get(), mapq);
+            assert_eq!(
+                record.mapping_quality().expect("record should have mapping quality").get(),
+                mapq
+            );
         }
     }
 

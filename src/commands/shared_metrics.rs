@@ -184,7 +184,7 @@ pub fn parse_intervals(path: &Path) -> Result<Vec<Interval>> {
         }
 
         let mut fields = line.splitn(4, '\t');
-        let ref_name = fields.next().unwrap(); // guaranteed non-empty (line isn't empty)
+        let ref_name = fields.next().expect("splitn always yields at least one element");
         let start_str = fields.next();
         let end_str = fields.next();
 

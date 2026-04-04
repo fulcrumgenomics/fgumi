@@ -513,14 +513,16 @@ mod tests {
 
     #[test]
     fn test_collect_entries_empty() {
-        let entries = collect_tag_entries(&[]).unwrap();
+        let entries =
+            collect_tag_entries(&[]).expect("collect_tag_entries should succeed for empty input");
         assert!(entries.is_empty());
     }
 
     #[test]
     fn test_collect_entries_single_int() {
         let aux = make_i_tag(*b"NM", 42);
-        let entries = collect_tag_entries(&aux).unwrap();
+        let entries = collect_tag_entries(&aux)
+            .expect("collect_tag_entries should succeed for single int tag");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, *b"NM");
     }
@@ -529,7 +531,8 @@ mod tests {
     fn test_collect_entries_multiple() {
         let mut aux = make_z_tag(*b"RG", b"grp");
         aux.extend_from_slice(&make_i_tag(*b"NM", 5));
-        let entries = collect_tag_entries(&aux).unwrap();
+        let entries = collect_tag_entries(&aux)
+            .expect("collect_tag_entries should succeed for multiple tags");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, *b"RG");
         assert_eq!(entries[1].0, *b"NM");
@@ -545,7 +548,8 @@ mod tests {
     #[test]
     fn test_collect_entries_b_array_tag() {
         let aux = fgumi_raw_bam::testutil::make_b_int_array_tag(*b"XA", &[1, 2, 3]);
-        let entries = collect_tag_entries(&aux).unwrap();
+        let entries =
+            collect_tag_entries(&aux).expect("collect_tag_entries should succeed for B-array tag");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, *b"XA");
         // The entry should span the entire aux data

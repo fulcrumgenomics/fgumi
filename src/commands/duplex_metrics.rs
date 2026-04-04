@@ -203,7 +203,8 @@ impl Command for DuplexMetrics {
         }
 
         // Use the 100% fraction collector for main metrics
-        let main_collector = collectors.pop().unwrap(); // Last one is 100%
+        let main_collector =
+            collectors.pop().expect("collectors is non-empty (always includes 100% fraction)");
 
         // Generate and write metrics
         info!("Writing metrics...");
@@ -638,11 +639,15 @@ mod tests {
 
         builder = builder.add_reference_sequence(
             bstr::BString::from("chr1"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(248_956_422).expect("non-zero chromosome length"),
+            ),
         );
         builder = builder.add_reference_sequence(
             bstr::BString::from("chr2"),
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(242_193_529).unwrap()),
+            Map::<ReferenceSequence>::new(
+                NonZeroUsize::new(242_193_529).expect("non-zero chromosome length"),
+            ),
         );
 
         builder.build()
@@ -1602,7 +1607,9 @@ mod tests {
         let header = noodles::sam::Header::builder()
             .add_reference_sequence(
                 "chr1",
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).unwrap()),
+                Map::<ReferenceSequence>::new(
+                    NonZeroUsize::new(1000).expect("non-zero chromosome length"),
+                ),
             )
             .build();
 
