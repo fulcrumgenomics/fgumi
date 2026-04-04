@@ -94,7 +94,7 @@ pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
 };
-pub use group::{FamilySizeMetrics, UmiGroupingMetrics};
+pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 pub use rejection::{RejectionReason, format_count};
 pub use shared::UmiMetric;
 pub use simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector, SimplexYieldMetric};
