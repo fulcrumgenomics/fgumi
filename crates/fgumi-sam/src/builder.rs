@@ -1711,12 +1711,13 @@ impl RecordPairBuilder {
 
         if r1_mapped && r2_mapped && self.reference_sequence_id == r2_ref_id {
             // r1/r2_start are guaranteed Some by r1/r2_mapped guards above
-            let pos1 = i32::try_from(self.r1_start.expect("r1_mapped")).expect("start fits i32");
-            let pos2 = i32::try_from(self.r2_start.expect("r2_mapped")).expect("start fits i32");
-            let end1 =
-                pos1 + i32::try_from(cigar_ref_len(&r1_cigar)).expect("cigar len fits i32") - 1;
-            let end2 =
-                pos2 + i32::try_from(cigar_ref_len(&r2_cigar)).expect("cigar len fits i32") - 1;
+            let r1 = self.r1_start.expect("r1_start must be set when both reads are mapped");
+            let r2 = self.r2_start.expect("r2_start must be set when both reads are mapped");
+            let pos1 = i32::try_from(r1).expect("r1_start fits in i32");
+            let pos2 = i32::try_from(r2).expect("r2_start fits in i32");
+            let r1_ref = i32::try_from(cigar_ref_len(&r1_cigar)).expect("r1 cigar len fits in i32");
+            let r2_ref = i32::try_from(cigar_ref_len(&r2_cigar)).expect("r2 cigar len fits in i32");
+            let (end1, end2) = (pos1 + r1_ref - 1, pos2 + r2_ref - 1);
 
             let (left, right) = if pos1 <= pos2 { (pos1, end2) } else { (pos2, end1) };
             let tlen = right - left + 1;

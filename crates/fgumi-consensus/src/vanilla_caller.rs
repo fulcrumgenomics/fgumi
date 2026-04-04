@@ -1371,8 +1371,9 @@ mod tests {
         use noodles::sam::header::record::value::Map;
         use noodles::sam::header::record::value::map::ReferenceSequence;
         use std::num::NonZeroUsize;
-        let ref_seq =
-            Map::<ReferenceSequence>::new(NonZeroUsize::new(1_000_000).expect("non-zero"));
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(1_000_000).expect("1_000_000 is non-zero"),
+        );
         noodles::sam::Header::builder().add_reference_sequence("chr1", ref_seq).build()
     }
 
@@ -2668,7 +2669,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         // fgbio expected: baseString="NANANANANA", quals=[2,30,2,21,2,20,2,30,2,30]
         assert_eq!(
             sr.bases, b"NANANANANA",
@@ -2704,7 +2705,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         // fgbio expected: baseString="AAAAAA", quals=[30,30,30,30,30,30]
         assert_eq!(sr.bases, b"AAAAAA", "Trailing low-quality bases should be trimmed");
         assert_eq!(sr.quals, vec![30, 30, 30, 30, 30, 30], "Qualities should match");
@@ -2733,7 +2734,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         // fgbio expected: baseString="AAAAAA", quals=[30,30,30,30,30,30]
         assert_eq!(sr.bases, b"AAAAAA", "Trailing Ns should be trimmed");
         assert_eq!(sr.quals, vec![30, 30, 30, 30, 30, 30], "Qualities should match");
@@ -2764,7 +2765,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&record), 0, 0);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         // After RC: bases become TTTTTTNNNN, then trailing Ns trimmed → TTTTTT
         // fgbio expected: baseString="TTTTTT", quals=[30,30,30,30,30,30], cigar="5M1D1M"
         assert_eq!(sr.bases, b"TTTTTT", "Should be reverse complemented with trailing Ns trimmed");
@@ -2834,7 +2835,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         // fgbio expected: baseString="A"*50, cigar="50M"
         assert_eq!(sr.bases.len(), 50, "Should not be trimmed for non-FR pair");
     }
@@ -2871,7 +2872,7 @@ mod tests {
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some(), "Should produce a SourceRead");
 
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         // fgbio expected: baseString="A"*100, cigar="40M20I40M"
         assert_eq!(sr.bases.len(), 100, "Should not be trimmed when insertions are present");
     }
@@ -2912,7 +2913,7 @@ mod tests {
 
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some());
-        assert_eq!(source.expect("source should be Some/Ok").bases.len(), 50);
+        assert_eq!(source.expect("source should be Some").bases.len(), 50);
     }
 
     /// Test mate overlap trimming when read actually extends past mate
@@ -2951,7 +2952,7 @@ mod tests {
 
         let source = caller.create_source_read(&encode_to_raw(&r1), 0, clip);
         assert!(source.is_some());
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
         assert_eq!(sr.bases.len(), 30, "Should be trimmed to 30 bases");
     }
 
@@ -3718,7 +3719,7 @@ mod tests {
         let source = caller.to_source_read_from_record(&rec, 0); // 0 is original_idx
 
         assert!(source.is_some(), "Should produce a source read");
-        let sr = source.expect("failed to get sr");
+        let sr = source.expect("source read should be Some");
 
         // After quality trimming (phred-style), should be trimmed to first 3 bases
         assert_eq!(sr.bases.len(), 3, "Should be trimmed to 3 bases");

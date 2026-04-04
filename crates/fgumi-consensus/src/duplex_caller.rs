@@ -469,7 +469,7 @@ impl DuplexConsensusCaller {
             .add_reference_sequence(
                 "chr1",
                 Map::<ReferenceSequence>::new(
-                    NonZeroUsize::new(1_000_000).expect("NonZeroUsize::new should succeed"),
+                    NonZeroUsize::new(1_000_000).expect("1_000_000 is non-zero"),
                 ),
             )
             .build();
@@ -2309,11 +2309,11 @@ mod tests {
         assert!(groups.contains_key("UMI1"));
         assert!(groups.contains_key("UMI2"));
 
-        let (a_reads, b_reads) = groups.get("UMI1").expect("expected item at index");
+        let (a_reads, b_reads) = groups.get("UMI1").expect("UMI1 key should be present in groups");
         assert_eq!(a_reads.len(), 2);
         assert_eq!(b_reads.len(), 1);
 
-        let (a_reads, b_reads) = groups.get("UMI2").expect("expected item at index");
+        let (a_reads, b_reads) = groups.get("UMI2").expect("UMI2 key should be present in groups");
         assert_eq!(a_reads.len(), 1);
         assert_eq!(b_reads.len(), 0);
 
