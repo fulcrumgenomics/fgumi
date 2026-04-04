@@ -78,6 +78,31 @@
 //!
 //! When modifying either implementation, ensure the pattern stays in sync.
 //! The `HasHeldBoundaries` trait in `base.rs` documents the interface.
+//!
+//! # Adding a New Pipeline Type
+//!
+//! To add a new pipeline (e.g., for a new input format):
+//!
+//! 1. **Define your pipeline state struct** implementing:
+//!    - [`PipelineLifecycle`] — completion, error, drain mode, validation
+//!    - [`MonitorableState`] — if using the shared monitor loop
+//!    - [`OutputPipelineState`] — if writing BAM/BGZF output
+//!    - [`ProcessPipelineState`] — for the process step
+//!    - [`SerializePipelineState`] — for the serialize step
+//!    - [`WritePipelineState`] — for the write step
+//!
+//! 2. **Define your worker state struct** implementing:
+//!    - [`WorkerStateCommon`] + [`HasWorkerCore`] — required for all workers
+//!    - `HasHeld*` traits — one per non-blocking step your pipeline uses
+//!    - [`HasCompressor`] + [`HasRecycledBuffers`] — if writing compressed output
+//!
+//! 3. **Implement [`StepContext`]** to plug into `generic_worker_loop`, or write
+//!    a custom worker loop.
+//!
+//! 4. **Reuse shared step functions** (`shared_try_step_compress`, etc.) where
+//!    possible — they handle non-blocking held-item logic correctly.
+//!
+//! See `bam.rs` and `fastq.rs` for complete examples of this pattern.
 
 mod bam;
 mod base;
