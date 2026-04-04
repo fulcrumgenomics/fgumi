@@ -1039,7 +1039,7 @@ impl CorrectUmis {
                     writer_threads,
                     self.compression.compression_level,
                 )?
-                .expect("rejects path is Some");
+                .expect("create_optional_bam_writer returns Some when given Some path");
 
                 for raw in &all_raw_rejects {
                     use std::io::Write;
