@@ -524,6 +524,38 @@ pub fn read_tc_template_coordinate(aux_data: &[u8]) -> Option<[i32; 6]> {
     Some(out)
 }
 
+/// Read the `pa` primary-alignment tag from aux data.
+///
+/// An upstream tool (e.g. an adapter trimmer) may stamp the primary alignment's
+/// 5' and 3' positions of a single-end read onto the read as a 6-element `B:i`
+/// array `[tid1, pos1, neg1, tid2, pos2, neg2]`, where the first triple is the 5'
+/// end and the second triple is the 3' end. `fgumi group` uses this to group
+/// single-end reads by both ends: when the tag's 5' end matches the read's own
+/// 5' position, the 3' end (`pos2`) becomes a second grouping coordinate.
+///
+/// The layout mirrors the `tc` template-coordinate tag (see
+/// [`read_tc_template_coordinate`]); only the tag name differs.
+///
+/// Returns `None` when the tag is absent or is not a 6-element `B:i` array.
+#[must_use]
+pub fn read_pa_primary_alignment(aux_data: &[u8]) -> Option<[i32; 6]> {
+    let arr = find_array_tag(aux_data, [b'p', b'a'])?;
+    if arr.elem_type != b'i' || arr.count != 6 {
+        return None;
+    }
+    let mut out = [0i32; 6];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let off = i * 4;
+        *slot = i32::from_le_bytes([
+            arr.data[off],
+            arr.data[off + 1],
+            arr.data[off + 2],
+            arr.data[off + 3],
+        ]);
+    }
+    Some(out)
+}
+
 /// Zero-copy typed BAM aux tag value.
 ///
 /// Borrows directly into the raw record bytes — no allocation, no decode beyond the tag header.
@@ -1985,6 +2017,30 @@ mod tests {
     use crate::testutil::*;
     use fgumi_tag::SamTag;
     use rstest::rstest;
+
+    // ========================================================================
+    // read_pa_primary_alignment tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_pa_primary_alignment_valid() {
+        // A well-formed 6-element B:i pa tag is parsed into its six fields.
+        let aux = make_b_int_array_tag(*b"pa", &[0, 100, 0, 3, 149, 1]);
+        assert_eq!(read_pa_primary_alignment(&aux), Some([0, 100, 0, 3, 149, 1]));
+    }
+
+    #[test]
+    fn test_read_pa_primary_alignment_absent() {
+        // No pa tag present → None.
+        assert_eq!(read_pa_primary_alignment(&[]), None);
+    }
+
+    #[test]
+    fn test_read_pa_primary_alignment_wrong_arity() {
+        // A pa tag that is not a 6-element array is rejected.
+        let aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        assert_eq!(read_pa_primary_alignment(&aux), None);
+    }
 
     // ========================================================================
     // find_mi_tag tests

@@ -409,6 +409,47 @@ pub fn decode_records(
     Ok(records)
 }
 
+/// Compute the group key for a single-end (unpaired) primary read from raw aux data.
+///
+/// If a `pa` (primary-alignment) tag is present and its 5' end matches this read's own
+/// 5' position, the tag's 3' end (`pos2`) becomes a second grouping coordinate, so
+/// single-end reads that share a 5' start but differ at the 3' end are grouped apart.
+/// This is enabled when an upstream tool (e.g. adapter trimming) has stamped the `pa`
+/// tag. A mismatched 5' end means the tag does not describe this read, so it is ignored
+/// and grouping falls back to the 5' position only.
+fn single_end_group_key(
+    aux_data: &[u8],
+    own_ref_id: i32,
+    own_pos: i32,
+    strand: u8,
+    library_idx: u16,
+    cell_hash: u64,
+    name_hash: u64,
+) -> super::base::GroupKey {
+    use super::base::GroupKey;
+
+    if let Some([pa_tid1, pa_pos1, pa_neg1, pa_tid2, pa_pos2, pa_neg2]) =
+        fgumi_raw_bam::read_pa_primary_alignment(aux_data)
+    {
+        let pa_five_prime_matches =
+            pa_tid1 == own_ref_id && pa_pos1 == own_pos && u8::from(pa_neg1 != 0) == strand;
+        if pa_five_prime_matches {
+            return GroupKey::paired(
+                own_ref_id,
+                own_pos,
+                strand,
+                pa_tid2,
+                pa_pos2,
+                u8::from(pa_neg2 != 0),
+                library_idx,
+                cell_hash,
+                name_hash,
+            );
+        }
+    }
+    GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash)
+}
+
 /// Compute a `GroupKey` directly from raw BAM bytes, matching `compute_group_key()` exactly.
 ///
 /// Uses 1-based coordinate helpers to produce identical keys to the noodles path.
@@ -517,10 +558,18 @@ pub fn compute_group_key_from_raw(
     // Check if paired
     let is_paired = (flg & fgumi_raw_bam::flags::PAIRED) != 0;
     if !is_paired {
-        return (
-            GroupKey::single(own_ref_id, own_pos, strand, library_idx, cell_hash, name_hash),
-            umi_position,
+        // Single-end reads group by 5' position, plus the `pa` tag's 3' end when present
+        // (see `single_end_group_key`).
+        let key = single_end_group_key(
+            aux_data,
+            own_ref_id,
+            own_pos,
+            strand,
+            library_idx,
+            cell_hash,
+            name_hash,
         );
+        return (key, umi_position);
     }
 
     // Mate info — guard against MATE_UNMAPPED (matching noodles path)
@@ -3491,8 +3540,10 @@ where
         }
     }
 
-    // Finish grouper - process any remaining partial group
-    if let Some(final_group) = grouper.finish()? {
+    // Finish grouper - process any remaining partial groups
+    // The grouper may have multiple remaining groups when templates at EOF have different
+    // position keys (e.g., single-end reads with pa tag producing different 3' positions).
+    while let Some(final_group) = grouper.finish()? {
         // Step 6: Process
         let processed = (fns.process_fn)(final_group)?;
 

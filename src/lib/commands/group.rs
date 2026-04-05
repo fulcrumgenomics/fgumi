@@ -1482,8 +1482,10 @@ impl GroupReadsByUmi {
             progress.log_if_needed(1);
         }
 
-        // Finish grouper - emit final group
-        if let Some(final_group) = grouper.finish()? {
+        // Finish grouper - emit final groups
+        // The grouper may have multiple remaining groups when templates at EOF have different
+        // position keys (e.g., single-end reads with pa tag producing different 3' positions).
+        while let Some(final_group) = grouper.finish()? {
             Self::process_and_write_position_group(
                 final_group,
                 filter_config,
@@ -6672,6 +6674,147 @@ mod tests {
             msg.contains("fgumi sort"),
             "error should point at `fgumi sort` as the remediation: {msg}",
         );
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Tests for pa tag single-end grouping
+    // ========================================================================
+
+    /// Build a mapped, forward-strand single-end read as a raw BAM record.
+    ///
+    /// `pos_1based` is the 1-based alignment start; the record is written with an
+    /// `{mlen}M` CIGAR and no clipping, so its unclipped 5' position equals
+    /// `pos_1based`. When `pa` is `Some([tid1, pos1, neg1, tid2, pos2, neg2])`, a
+    /// 6-element `B:i` `pa` primary-alignment tag is appended.
+    fn build_single_end_with_pa(
+        name: &str,
+        ref_id: i32,
+        pos_1based: i32,
+        mlen: usize,
+        umi: &str,
+        pa: Option<[i32; 6]>,
+    ) -> fgumi_raw_bam::RawRecord {
+        let seq = vec![b'A'; mlen];
+        let quals = vec![30u8; mlen];
+        let cigar = encode_op(0, mlen); // {mlen}M, forward strand, no clipping
+
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(0) // mapped, forward strand, single-end (unpaired)
+            .ref_id(ref_id)
+            .pos(pos_1based - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals);
+        b.add_string_tag(SamTag::RX, umi.as_bytes());
+        if let Some(pa) = pa {
+            b.add_array_i32(*b"pa", &pa);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn test_single_end_with_pa_tag_separate_groups() -> Result<()> {
+        // When single-end reads at the same 5' position carry pa tags with different
+        // 3' positions (pos2), they must be placed in separate groups.
+        //
+        // Both reads: 5' = (tid=0, pos=100, fwd); the pa tag's 5' matches, and its 3'
+        // differs (149 vs 199), so grouping keys on both ends.
+        let r1 =
+            build_single_end_with_pa("read_a", 0, 100, 50, "AAAAAA", Some([0, 100, 0, 0, 149, 0]));
+        let r2 =
+            build_single_end_with_pa("read_b", 0, 100, 100, "AAAAAA", Some([0, 100, 0, 0, 199, 0]));
+
+        let input = create_test_bam(vec![r1, r2])?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have both records");
+
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(
+            unique_groups, 2,
+            "Different pa tag 3' positions should produce separate groups"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_end_without_pa_tag_same_group() -> Result<()> {
+        // Without pa tags, single-end reads of different lengths at the same 5' position
+        // should be in the same group (default behavior, groups by 5' only).
+        let r1 = build_single_end_with_pa("read_a", 0, 100, 50, "AAAAAA", None);
+        let r2 = build_single_end_with_pa("read_b", 0, 100, 100, "AAAAAA", None);
+
+        let input = create_test_bam(vec![r1, r2])?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have both records");
+
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "Same position should be in same group without pa tag");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_end_with_mismatched_pa_tag_same_group() -> Result<()> {
+        // When the pa tag's 5' position doesn't match the read's actual 5' position,
+        // the pa tag is ignored and grouping falls back to 5' only.
+        //
+        // Both reads sit at 5' = (tid=0, pos=100, fwd) but their pa tags claim a 5'
+        // position of 999, which does not describe the read, so the tag is dropped.
+        let r1 =
+            build_single_end_with_pa("read_a", 0, 100, 50, "AAAAAA", Some([0, 999, 0, 0, 149, 0]));
+        let r2 =
+            build_single_end_with_pa("read_b", 0, 100, 100, "AAAAAA", Some([0, 999, 0, 0, 199, 0]));
+
+        let input = create_test_bam(vec![r1, r2])?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have both records");
+
+        let unique_groups = count_unique_mi_tags(&output_records);
+        assert_eq!(unique_groups, 1, "Mismatched pa tag should be ignored, same group by 5'");
 
         Ok(())
     }
