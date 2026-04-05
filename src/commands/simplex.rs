@@ -46,7 +46,7 @@ use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
 };
 
-use super::common::{EmSeqRef, load_em_seq_reference};
+use super::common::{MethylationRef, load_methylation_reference};
 
 // ============================================================================
 // Types for 7-step pipeline processing
@@ -216,13 +216,14 @@ pub struct Simplex {
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
 
-    /// Enable EM-Seq methylation-aware consensus calling.
-    /// When enabled, unconverted C/T counts are tracked at reference cytosine positions
-    /// and MM/ML methylation tags are emitted on consensus reads.
-    #[arg(long = "em-seq", default_value_t = false, requires = "reference")]
-    pub em_seq: bool,
+    /// Methylation-aware consensus calling mode.
+    /// When set, C→T conversions at reference cytosine positions are tracked as
+    /// methylation events and MM/ML methylation tags are emitted on consensus reads.
+    /// Requires --ref.
+    #[arg(long = "methylation-mode", value_enum)]
+    pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
 
-    /// Path to the reference FASTA file (required when --em-seq is enabled)
+    /// Path to the reference FASTA file (required when --methylation-mode is set)
     #[arg(long = "ref")]
     pub reference: Option<std::path::PathBuf>,
 }
@@ -278,8 +279,10 @@ impl Command for Simplex {
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
 
-        // Load reference for EM-Seq methylation-aware consensus calling
-        let em_seq_ref: EmSeqRef = load_em_seq_reference(self.em_seq, &self.reference, &header)?;
+        let methylation_mode =
+            crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+        let methylation_ref: MethylationRef =
+            load_methylation_reference(methylation_mode, &self.reference, &header)?;
 
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
         let overlapping_enabled = self.overlapping.is_enabled();
@@ -304,7 +307,8 @@ impl Command for Simplex {
                 output_header.clone(),
                 read_name_prefix.clone(),
                 track_rejects,
-                em_seq_ref.clone(),
+                methylation_ref.clone(),
+                methylation_mode,
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
             return result;
@@ -345,7 +349,7 @@ impl Command for Simplex {
             trim: self.consensus.trim,
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
             cell_tag,
-            em_seq: self.em_seq,
+            methylation_mode,
         };
 
         // Create a single-threaded caller for stats collection
@@ -356,8 +360,8 @@ impl Command for Simplex {
             track_rejects,
         );
 
-        // Set reference for EM-Seq if enabled
-        if let Some((ref reference, ref ref_names)) = em_seq_ref {
+        // Set reference for methylation-aware consensus if enabled
+        if let Some((ref reference, ref ref_names)) = methylation_ref {
             caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
         }
 
@@ -483,7 +487,8 @@ impl Simplex {
         output_header: Header,
         read_name_prefix: String,
         track_rejects: bool,
-        em_seq_ref: EmSeqRef,
+        methylation_ref: MethylationRef,
+        methylation_mode: fgumi_consensus::MethylationMode,
     ) -> Result<()> {
         // Configure pipeline
         let mut pipeline_config = build_pipeline_config(
@@ -525,7 +530,7 @@ impl Simplex {
             trim,
             min_consensus_base_quality,
             cell_tag,
-            em_seq: self.em_seq,
+            methylation_mode,
         };
 
         // Clone input_header before pipeline (needed for rejects writing)
@@ -561,8 +566,8 @@ impl Simplex {
                     track_rejects,
                 );
 
-                // Set reference for EM-Seq if enabled
-                if let Some((ref reference, ref ref_names)) = em_seq_ref {
+                // Set reference for methylation-aware consensus if enabled
+                if let Some((ref reference, ref ref_names)) = methylation_ref {
                     caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
                 }
 
@@ -775,7 +780,7 @@ mod tests {
             max_reads: None,
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
-            em_seq: false,
+            methylation_mode: None,
             reference: None,
         }
     }
@@ -1678,7 +1683,7 @@ mod tests {
         builder.write(&paths.input)?;
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
-        cmd.em_seq = true;
+        cmd.methylation_mode = Some(crate::commands::common::MethylationModeArg::EmSeq);
         cmd.reference = Some(ref_fasta.path().to_path_buf());
         cmd.threading = threading;
         cmd.execute("test")?;

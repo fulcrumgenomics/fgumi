@@ -17,26 +17,67 @@ use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 
-/// EM-Seq reference pair: reference base provider + contig name mapping.
-pub type EmSeqRef = Option<(
+/// CLI argument value for `--methylation-mode`.
+///
+/// Maps to [`fgumi_consensus::MethylationMode`] variants (excluding `Disabled`,
+/// which is represented by the absence of the flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MethylationModeArg {
+    /// EM-Seq (enzymatic methyl-seq): unmethylated C is converted to T.
+    /// C in read at ref-C = methylated (protected); T = unmethylated (converted).
+    #[value(name = "em-seq")]
+    EmSeq,
+    /// TAPs/Illumina 5-base: methylated C is converted to T.
+    /// C in read at ref-C = unmethylated (not a target); T = methylated (converted).
+    #[value(name = "taps")]
+    Taps,
+}
+
+impl From<MethylationModeArg> for fgumi_consensus::MethylationMode {
+    fn from(arg: MethylationModeArg) -> Self {
+        match arg {
+            MethylationModeArg::EmSeq => Self::EmSeq,
+            MethylationModeArg::Taps => Self::Taps,
+        }
+    }
+}
+
+/// Resolves an optional `--methylation-mode` CLI arg to a [`MethylationMode`].
+///
+/// Returns `Disabled` when `None` (flag not provided).
+///
+/// [`MethylationMode`]: fgumi_consensus::MethylationMode
+pub fn resolve_methylation_mode(
+    arg: Option<MethylationModeArg>,
+) -> fgumi_consensus::MethylationMode {
+    arg.map_or(fgumi_consensus::MethylationMode::Disabled, Into::into)
+}
+
+/// Methylation reference pair: reference base provider + contig name mapping.
+pub type MethylationRef = Option<(
     Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
     Arc<Vec<String>>,
 )>;
 
-/// Loads the reference FASTA and builds contig name mapping for EM-Seq mode.
+/// Loads the reference FASTA and builds contig name mapping for methylation-aware modes.
 ///
-/// Returns `None` if `em_seq` is false. Errors if `em_seq` is true but `reference` is `None`.
-pub fn load_em_seq_reference(
-    em_seq: bool,
+/// Returns `None` if methylation mode is disabled. Errors if enabled but `reference` is `None`.
+pub fn load_methylation_reference(
+    methylation_mode: fgumi_consensus::MethylationMode,
     reference: &Option<PathBuf>,
     header: &Header,
-) -> anyhow::Result<EmSeqRef> {
-    if !em_seq {
+) -> anyhow::Result<MethylationRef> {
+    if !methylation_mode.is_enabled() {
         return Ok(None);
     }
+    let mode_name = match methylation_mode {
+        fgumi_consensus::MethylationMode::EmSeq => "EM-Seq",
+        fgumi_consensus::MethylationMode::Taps => "TAPs",
+        fgumi_consensus::MethylationMode::Disabled => unreachable!(),
+    };
     let ref_path = reference
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--ref is required when --em-seq is enabled"))?;
+        .ok_or_else(|| anyhow::anyhow!("--ref is required when --methylation-mode is set"))?;
     let ref_timer = OperationTimer::new("Loading reference FASTA");
     let reference = Arc::new(fgumi_lib::reference::ReferenceReader::new(ref_path)?);
     ref_timer.log_completion(0);
@@ -55,7 +96,7 @@ pub fn load_em_seq_reference(
         );
     }
 
-    info!("EM-Seq mode enabled with {} reference contigs", ref_names.len());
+    info!("{mode_name} mode enabled with {} reference contigs", ref_names.len());
     Ok(Some((reference, Arc::new(ref_names))))
 }
 

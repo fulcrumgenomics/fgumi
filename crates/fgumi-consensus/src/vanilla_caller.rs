@@ -171,7 +171,7 @@ pub struct VanillaConsensusRead {
     /// Optional source reads used for consensus (kept for tag preservation)
     pub(crate) source_reads: Option<Vec<SourceRead>>,
 
-    /// Methylation annotation (only populated when `em_seq` is enabled)
+    /// Methylation annotation (only populated when methylation mode is enabled)
     pub methylation: Option<crate::methylation::MethylationAnnotation>,
 }
 
@@ -316,10 +316,10 @@ pub struct VanillaUmiConsensusOptions {
     /// Optional cell barcode tag to preserve (e.g., "CB", "XX")
     pub cell_tag: Option<noodles::sam::alignment::record::data::field::Tag>,
 
-    /// Whether to perform methylation-aware consensus calling for EM-Seq data.
-    /// When true, C→T conversions at reference cytosine positions are treated as
-    /// bisulfite/enzymatic conversion rather than errors, and MM/ML tags are emitted.
-    pub em_seq: bool,
+    /// Methylation mode for consensus calling (`Disabled`, `EmSeq`, or `Taps`).
+    /// When enabled, C→T conversions at reference cytosine positions are tracked
+    /// and MM/ML methylation tags are emitted on consensus reads.
+    pub methylation_mode: crate::MethylationMode,
 }
 
 impl Default for VanillaUmiConsensusOptions {
@@ -336,7 +336,7 @@ impl Default for VanillaUmiConsensusOptions {
             trim: false,
             min_consensus_base_quality: 40, // Match fgbio default
             cell_tag: None,
-            em_seq: false,
+            methylation_mode: crate::MethylationMode::Disabled,
         }
     }
 }
@@ -631,10 +631,10 @@ impl VanillaUmiConsensusCaller {
             return Ok(None);
         }
 
-        // For EM-seq: annotate methylation first (counts conversions), then normalize
+        // For EM-seq/TAPs: annotate methylation first (counts conversions), then normalize
         // source read bases before consensus scoring so that C↔T / G↔A conversion
         // events at ref-C positions don't inflate error counts or depress quality.
-        let (methylation, source_reads) = if self.options.em_seq {
+        let (methylation, source_reads) = if self.options.methylation_mode.is_enabled() {
             let (annot, normalized) = self.annotate_and_normalize(source_reads);
             (annot, normalized)
         } else {
@@ -1209,9 +1209,8 @@ impl VanillaUmiConsensusCaller {
             Vec::new()
         };
 
-        // For EM-seq: annotate methylation first, then normalize source read bases
-        // before consensus scoring so conversion events don't inflate errors.
-        let (methylation, filtered_source_reads) = if self.options.em_seq {
+        // Apply methylation annotation if methylation mode is enabled
+        let (methylation, filtered_source_reads) = if self.options.methylation_mode.is_enabled() {
             let (annot, normalized) = self.annotate_and_normalize(filtered_source_reads);
             (annot, normalized)
         } else {
@@ -1433,14 +1432,19 @@ impl VanillaUmiConsensusCaller {
             self.bam_builder.append_string_tag(b"RX", consensus_umi.as_bytes());
         }
 
-        // Methylation tags (EM-Seq)
+        // Methylation tags (EM-Seq/TAPs)
         if let Some(annot) = methylation {
             // Determine strand for MM tag format
             let is_top = original_raws
                 .first()
                 .is_none_or(|raw| crate::methylation::is_top_strand(fgumi_raw_bam::flags(raw)));
 
-            if let Some((mm, ml)) = crate::methylation::build_mm_ml_tags(bases, annot, is_top) {
+            if let Some((mm, ml)) = crate::methylation::build_mm_ml_tags(
+                bases,
+                annot,
+                is_top,
+                self.options.methylation_mode,
+            ) {
                 self.bam_builder.append_string_tag(b"MM", mm.as_bytes());
                 self.bam_builder.append_u8_array_tag(b"ML", &ml);
             }
@@ -4559,22 +4563,28 @@ mod tests {
 
     use crate::methylation::tests::TestRef;
 
-    /// Creates a caller configured for EM-Seq with a test reference.
-    fn create_em_seq_caller(ref_seq: &[u8]) -> VanillaUmiConsensusCaller {
+    /// Creates a caller configured for the given methylation mode with a test reference.
+    fn create_methylation_caller(
+        ref_seq: &[u8],
+        mode: crate::MethylationMode,
+    ) -> VanillaUmiConsensusCaller {
         let options = VanillaUmiConsensusOptions {
             min_reads: 1,
             min_consensus_base_quality: 0,
-            em_seq: true,
+            methylation_mode: mode,
             ..Default::default()
         };
         let mut caller =
             VanillaUmiConsensusCaller::new("consensus".to_string(), "A".to_string(), options);
-
-        // Set up reference: contig "chr1" with the given sequence
         let reference = std::sync::Arc::new(TestRef::new(&[("chr1", ref_seq)]));
         let ref_names = std::sync::Arc::new(vec!["chr1".to_string()]);
         caller.set_reference(reference, ref_names);
         caller
+    }
+
+    /// Convenience wrapper for EM-Seq caller.
+    fn create_em_seq_caller(ref_seq: &[u8]) -> VanillaUmiConsensusCaller {
+        create_methylation_caller(ref_seq, crate::MethylationMode::EmSeq)
     }
 
     /// Test: All reads show C at ref-C → methylated, consensus=C, MM tag indicates methylation.
@@ -4727,7 +4737,7 @@ mod tests {
         let options = VanillaUmiConsensusOptions {
             min_reads: 1,
             min_consensus_base_quality: 0,
-            em_seq: false,
+            methylation_mode: crate::MethylationMode::Disabled,
             ..Default::default()
         };
         let mut caller =
@@ -4742,7 +4752,7 @@ mod tests {
         let records = ParsedBamRecord::parse_all(&output.data);
         let consensus = &records[0];
 
-        // Without em_seq, consensus should just be T (no reference correction)
+        // Without methylation mode, consensus should just be T (no reference correction)
         assert_eq!(consensus.bases, vec![b'T'; 10]);
 
         // No methylation tags
@@ -4750,5 +4760,153 @@ mod tests {
         assert!(consensus.get_u8_array_tag(b"ML").is_none());
         assert!(consensus.get_i16_array_tag(b"cu").is_none());
         assert!(consensus.get_i16_array_tag(b"ct").is_none());
+    }
+
+    // ========================================================================
+    // TAPs methylation-aware consensus tests
+    // ========================================================================
+
+    /// Convenience wrapper for TAPs caller.
+    fn create_taps_caller(ref_seq: &[u8]) -> VanillaUmiConsensusCaller {
+        create_methylation_caller(ref_seq, crate::MethylationMode::Taps)
+    }
+
+    /// TAPs: All reads show C at ref-C → unmethylated. MM prob should be 0.
+    #[test]
+    fn test_simplex_taps_all_unmethylated() {
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(b"CCCCCCCCCC");
+        let mut caller = create_taps_caller(&ref_seq);
+
+        let quals = vec![30u8; 10];
+        let read1 = create_consensus_test_read("r1", &[b'C'; 10], &quals, "UMI1");
+        let read2 = create_consensus_test_read("r2", &[b'C'; 10], &quals, "UMI1");
+        let read3 = create_consensus_test_read("r3", &[b'C'; 10], &quals, "UMI1");
+
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+
+        // Consensus bases should be C (unmethylated in TAPs = unconverted)
+        assert_eq!(consensus.bases, vec![b'C'; 10]);
+
+        let mm = consensus.get_string_tag(b"MM").expect("MM tag should be present");
+        assert!(mm.starts_with(b"C+m"), "MM should start with C+m");
+
+        // In TAPs: all C (unconverted) means 0 converted → methylation prob = 0/3 = 0
+        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        for &p in &ml {
+            assert_eq!(p, 0, "Expected methylation probability 0 for fully unmethylated TAPs");
+        }
+
+        // cu (unconverted) = 3, ct (converted) = 0
+        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        assert_eq!(cu, vec![3i16; 10]);
+        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        assert_eq!(ct, vec![0i16; 10]);
+    }
+
+    /// TAPs: All reads show T at ref-C → methylated. MM prob should be 255.
+    /// Note: consensus base stays as T (not restored to C) since methylation
+    /// evidence is preserved in cu/ct/MM/ML tags, and downstream alignment
+    /// needs to see the converted base.
+    #[test]
+    fn test_simplex_taps_all_methylated() {
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(b"CCCCCCCCCC");
+        let mut caller = create_taps_caller(&ref_seq);
+
+        let quals = vec![30u8; 10];
+        let read1 = create_consensus_test_read("r1", &[b'T'; 10], &quals, "UMI1");
+        let read2 = create_consensus_test_read("r2", &[b'T'; 10], &quals, "UMI1");
+        let read3 = create_consensus_test_read("r3", &[b'T'; 10], &quals, "UMI1");
+
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+
+        // Consensus base stays as T — not restored to C
+        assert_eq!(consensus.bases, vec![b'T'; 10]);
+
+        // MM tag should NOT be present — consensus base is T, not C, so no C+m entries
+        assert!(
+            consensus.get_string_tag(b"MM").is_none(),
+            "MM tag should be absent when consensus is T"
+        );
+
+        // cu/ct tags should still be present with correct counts
+        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        assert_eq!(cu, vec![0i16; 10]);
+        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        assert_eq!(ct, vec![3i16; 10]);
+    }
+
+    /// TAPs: Mixed — 2 reads T (methylated), 1 read C (unmethylated). Prob = 2/3 ≈ 170.
+    /// Consensus base is C (majority of reads that count toward consensus).
+    #[test]
+    fn test_simplex_taps_mixed_methylation() {
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(b"CCCCCCCCCC");
+        let mut caller = create_taps_caller(&ref_seq);
+
+        let quals = vec![30u8; 10];
+        let read1 = create_consensus_test_read("r1", &[b'C'; 10], &quals, "UMI1");
+        let read2 = create_consensus_test_read("r2", &[b'C'; 10], &quals, "UMI1");
+        let read3 = create_consensus_test_read("r3", &[b'T'; 10], &quals, "UMI1");
+
+        let output = consensus_reads_from_records(&mut caller, vec![read1, read2, read3]).unwrap();
+        assert_eq!(output.count, 1);
+        let records = ParsedBamRecord::parse_all(&output.data);
+        let consensus = &records[0];
+
+        // Consensus base is C (2 C vs 1 T)
+        assert_eq!(consensus.bases, vec![b'C'; 10]);
+
+        // TAPs: prob = converted/total = 1/3 * 255 = 85
+        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        for &p in &ml {
+            assert_eq!(p, 85, "Expected ~85 for 1/3 methylation ratio in TAPs");
+        }
+
+        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        assert_eq!(cu, vec![2i16; 10]);
+        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        assert_eq!(ct, vec![1i16; 10]);
+    }
+
+    /// TAPs: contrast with EM-seq for the same input data.
+    /// Same reads (2C + 1T) give OPPOSITE probabilities.
+    #[test]
+    fn test_taps_vs_emseq_inverted_probabilities() {
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(b"CCCCCCCCCC");
+
+        // EM-seq: 2C + 1T → prob = unconverted/total = 2/3*255 = 170
+        let mut em_caller = create_em_seq_caller(&ref_seq);
+        let quals = vec![30u8; 10];
+        let r1 = create_consensus_test_read("r1", &[b'C'; 10], &quals, "UMI1");
+        let r2 = create_consensus_test_read("r2", &[b'C'; 10], &quals, "UMI1");
+        let r3 = create_consensus_test_read("r3", &[b'T'; 10], &quals, "UMI1");
+        let em_output = consensus_reads_from_records(&mut em_caller, vec![r1, r2, r3]).unwrap();
+        let em_records = ParsedBamRecord::parse_all(&em_output.data);
+        let em_ml = em_records[0].get_u8_array_tag(b"ML").unwrap();
+
+        // TAPs: 2C + 1T → prob = converted/total = 1/3*255 = 85
+        let mut taps_caller = create_taps_caller(&ref_seq);
+        let r1 = create_consensus_test_read("r1", &[b'C'; 10], &quals, "UMI1");
+        let r2 = create_consensus_test_read("r2", &[b'C'; 10], &quals, "UMI1");
+        let r3 = create_consensus_test_read("r3", &[b'T'; 10], &quals, "UMI1");
+        let taps_output = consensus_reads_from_records(&mut taps_caller, vec![r1, r2, r3]).unwrap();
+        let taps_records = ParsedBamRecord::parse_all(&taps_output.data);
+        let taps_ml = taps_records[0].get_u8_array_tag(b"ML").unwrap();
+
+        // EM-seq: 170, TAPs: 85 — they sum to 255
+        for (&em_p, &taps_p) in em_ml.iter().zip(taps_ml.iter()) {
+            assert_eq!(em_p, 170);
+            assert_eq!(taps_p, 85);
+            assert_eq!(u16::from(em_p) + u16::from(taps_p), 255);
+        }
     }
 }
