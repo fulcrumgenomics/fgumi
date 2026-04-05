@@ -75,6 +75,7 @@ struct CollectedMetrics {
 
 /// Configuration for template filtering during group processing.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct GroupFilterConfig {
     /// UMI tag bytes (e.g., [b'R', b'X']).
     umi_tag: [u8; 2],
@@ -88,6 +89,8 @@ struct GroupFilterConfig {
     no_umi: bool,
     /// Whether to allow fully unmapped templates (both reads unmapped).
     allow_unmapped: bool,
+    /// Whether to truncate UMIs longer than `min_umi_length` down to `min_umi_length` before grouping.
+    truncate: bool,
 }
 
 /// Filter a template based on filtering criteria.
@@ -484,6 +487,7 @@ fn assign_umi_groups_impl(
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
     no_umi: bool,
+    truncate: bool,
 ) -> Result<()> {
     // Determine orientation getter based on mode
     let raw_mode = templates.first().is_some_and(Template::is_raw_byte_mode);
@@ -513,6 +517,7 @@ fn assign_umi_groups_impl(
                 raw_tag,
                 min_umi_length,
                 no_umi,
+                truncate,
             )?;
         }
     } else {
@@ -525,10 +530,71 @@ fn assign_umi_groups_impl(
             raw_tag,
             min_umi_length,
             no_umi,
+            truncate,
         )?;
     }
 
     Ok(())
+}
+
+/// Assign UMI groups, grouping by length-shape so only same-length UMIs compete.
+///
+/// For non-paired assigners, the length-shape key is the ordered list of segment lengths
+/// (e.g., for "ACGT-TTT" the key is [4, 3]).
+///
+/// For `PairedUmiAssigner` only, UMIs are formatted as "aaa:XXXX-bbb:YYYY" where the
+/// prefix length is `paired.lower_read_umi_prefix().len()`. The grouping key is the
+/// pair of (`shorter_len`, `longer_len`) with prefix+colon stripped.
+///
+/// Returns a `Vec<MoleculeId>` indexed the same as the input `umis` slice.
+pub(crate) fn assign_by_length_shape(
+    umis: &[String],
+    assigner: &dyn UmiAssigner,
+) -> Vec<MoleculeId> {
+    if umis.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = vec![MoleculeId::None; umis.len()];
+
+    if let Some(paired) = assigner.as_any().downcast_ref::<PairedUmiAssigner>() {
+        let prefix_len = paired.lower_read_umi_prefix().len();
+        let colon_overhead = prefix_len + 1; // prefix + ':'
+
+        let mut groups: std::collections::HashMap<(usize, usize), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, umi) in umis.iter().enumerate() {
+            let segs: Vec<&str> = umi.split('-').collect();
+            let mut lens: Vec<usize> =
+                segs.iter().map(|s| s.len().saturating_sub(colon_overhead)).collect();
+            lens.sort_unstable();
+            let key = (lens.first().copied().unwrap_or(0), lens.last().copied().unwrap_or(0));
+            groups.entry(key).or_default().push(i);
+        }
+        for indices in groups.values() {
+            let sub_umis: Vec<String> = indices.iter().map(|&i| umis[i].clone()).collect();
+            let sub_assignments = assigner.assign(&sub_umis);
+            for (j, &i) in indices.iter().enumerate() {
+                result[i] = sub_assignments[j];
+            }
+        }
+    } else {
+        let mut groups: std::collections::HashMap<Vec<usize>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, umi) in umis.iter().enumerate() {
+            let key: Vec<usize> = umi.split('-').map(str::len).collect();
+            groups.entry(key).or_default().push(i);
+        }
+        for indices in groups.values() {
+            let sub_umis: Vec<String> = indices.iter().map(|&i| umis[i].clone()).collect();
+            let sub_assignments = assigner.assign(&sub_umis);
+            for (j, &i) in indices.iter().enumerate() {
+                result[i] = sub_assignments[j];
+            }
+        }
+    }
+
+    result
 }
 
 /// Assign UMI groups to a subset of templates (static implementation).
@@ -542,6 +608,7 @@ fn assign_umi_groups_for_indices_impl(
     raw_tag: [u8; 2],
     min_umi_length: Option<usize>,
     no_umi: bool,
+    truncate: bool,
 ) -> Result<()> {
     if indices.is_empty() {
         return Ok(());
@@ -619,11 +686,15 @@ fn assign_umi_groups_for_indices_impl(
         umis.push(processed_umi);
     }
 
-    // Truncate UMIs if needed (skip in no-umi mode)
-    let truncated_umis = if no_umi { umis } else { truncate_umis_impl(umis, min_umi_length)? };
-
-    // Assign UMI groups - returns Vec<MoleculeId> indexed by input position
-    let assignments = assigner.assign(&truncated_umis);
+    // Assign UMI groups
+    let assignments = if no_umi {
+        assigner.assign(&umis)
+    } else if truncate {
+        let truncated = truncate_umis_impl(umis, min_umi_length)?;
+        assigner.assign(&truncated)
+    } else {
+        assign_by_length_shape(&umis, assigner)
+    };
 
     // Store MoleculeId enum in Template.mi field
     // The actual MI tag string is set during serialization with global offset
@@ -707,11 +778,11 @@ Grouping of UMIs is performed by one of four strategies:
 Strategies edit, adjacency, and paired make use of the --edits parameter to control the matching of
 non-identical UMIs.
 
-By default, all UMIs must be the same length. If --min-umi-length=len is specified then reads that
-have a UMI shorter than len will be discarded, and when comparing UMIs of different lengths, the first
-len bases will be compared, where len is the length of the shortest UMI. The UMI length is the number
-of [ACGT] bases in the UMI (i.e. does not count dashes and other non-ACGT characters). This option is
-not implemented for reads with UMI pairs (i.e. using the paired assigner).
+UMIs may have different lengths; only UMIs of the same length-shape will be compared. If
+--min-umi-length=len is specified, reads with a UMI shorter than len will be discarded. To also
+truncate UMIs longer than len down to len before grouping, specify --truncate. The UMI length is
+the number of [ACGT] bases in the UMI (i.e. does not count dashes and other non-ACGT characters).
+Truncating is not supported with the paired assigner.
 
 Note: the --min-map-q parameter defaults to 0 in duplicate marking mode and 1 otherwise, and is
 directly settable on the command line.
@@ -730,6 +801,7 @@ Threads are allocated based on the command's workload profile to optimize perfor
 Example: --threads 8 spawns exactly 8 threads (2 reader, 4 workers, 2 writer)
 "#
 )]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GroupReadsByUmi {
     /// Input and output BAM files
     #[command(flatten)]
@@ -803,6 +875,14 @@ pub struct GroupReadsByUmi {
     /// The minimum UMI length
     #[arg(short = 'l', long = "min-umi-length")]
     pub min_umi_length: Option<usize>,
+
+    /// Whether to truncate UMIs longer than `--min-umi-length` down to that length before grouping.
+    ///
+    /// Requires `--min-umi-length` to be set. Not supported with `--strategy paired`.
+    /// Without this flag, UMIs of different lengths at the same position are grouped
+    /// separately — only UMIs of the same length compete.
+    #[arg(short = 'r', long = "truncate")]
+    pub truncate: bool,
 
     /// Threading options for parallel processing.
     #[command(flatten)]
@@ -897,8 +977,13 @@ impl Command for GroupReadsByUmi {
     #[allow(clippy::too_many_lines)]
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate inputs
-        if self.min_umi_length.is_some() && matches!(self.strategy, Strategy::Paired) {
-            bail!("Paired strategy cannot be used with --min-umi-length");
+        if self.truncate && self.min_umi_length.is_none() {
+            bail!(
+                "Cannot truncate UMIs unless a minimum UMI length is specified (--min-umi-length)"
+            );
+        }
+        if self.truncate && matches!(self.strategy, Strategy::Paired) {
+            bail!("Paired strategy cannot be used with --truncate");
         }
 
         // Validate --no-umi is not used with paired strategy
@@ -1031,6 +1116,7 @@ impl Command for GroupReadsByUmi {
             min_umi_length: self.min_umi_length,
             no_umi: self.no_umi,
             allow_unmapped: self.allow_unmapped,
+            truncate: self.truncate,
         };
 
         // ============================================================
@@ -1291,6 +1377,7 @@ impl Command for GroupReadsByUmi {
                     raw_tag,
                     filter_config.min_umi_length,
                     no_umi,
+                    filter_config.truncate,
                 ) {
                     log::warn!("UMI assignment failed, returning empty group: {e}");
                     #[cfg(feature = "memory-debug")]
@@ -1721,6 +1808,7 @@ impl GroupReadsByUmi {
             raw_tag,
             filter_config.min_umi_length,
             filter_config.no_umi,
+            filter_config.truncate,
         ) {
             // Log error but continue processing
             log::warn!("Failed to assign UMI groups: {e}");
@@ -1908,6 +1996,7 @@ mod tests {
             strategy,
             edits,
             min_umi_length: None,
+            truncate: false,
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             index_threshold: 100,
@@ -2217,6 +2306,27 @@ mod tests {
         let umis = vec!["AAAAAA".to_string(), "AAAA".to_string()];
         let result = truncate_umis_impl(umis, tool.min_umi_length);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_truncate_requires_min_umi_length() {
+        let tool = GroupReadsByUmi {
+            truncate: true,
+            min_umi_length: None,
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+        assert!(tool.execute("test").is_err(), "truncate without min_umi_length should error");
+    }
+
+    #[test]
+    fn test_truncate_with_paired_strategy_errors() {
+        let tool = GroupReadsByUmi {
+            truncate: true,
+            min_umi_length: Some(5),
+            strategy: Strategy::Paired,
+            ..test_group_cmd(Strategy::Paired, 1)
+        };
+        assert!(tool.execute("test").is_err(), "truncate + paired should error");
     }
 
     // ========================================================================
@@ -2816,6 +2926,7 @@ mod tests {
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
             min_umi_length: Some(5),
+            truncate: true,
             ..test_group_cmd(Strategy::Edit, 0)
         };
 
@@ -2829,6 +2940,23 @@ mod tests {
         assert_eq!(unique_groups, 1, "Should have 1 group after truncation");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_assign_by_length_shape_groups_separately() {
+        // 5-mers and 6-mers at the same position should produce different MoleculeIds
+        let assigner = Strategy::Identity.new_assigner_full(0, 1, 0);
+        let umis: Vec<String> = vec![
+            "AAAAA".to_string(),
+            "AAAAA".to_string(),
+            "AAAAAA".to_string(),
+            "AAAAAA".to_string(),
+        ];
+        let result = assign_by_length_shape(&umis, assigner.as_ref());
+        // First two should share a group, last two should share a different group
+        assert_eq!(result[0], result[1], "5-mers should be in same group");
+        assert_eq!(result[2], result[3], "6-mers should be in same group");
+        assert_ne!(result[0], result[2], "5-mer and 6-mer groups should differ");
     }
 
     #[test]
@@ -4855,6 +4983,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         assert!(filter_template_raw(&template, &config, &mut metrics));
@@ -4880,6 +5009,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
@@ -4906,6 +5036,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
@@ -4931,6 +5062,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
@@ -4956,6 +5088,7 @@ mod tests {
             min_umi_length: Some(6),
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
@@ -4980,6 +5113,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
@@ -5029,6 +5163,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
         let mut metrics = FilterMetrics::new();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
@@ -5109,6 +5244,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: true,
+            truncate: false,
         };
 
         let mut metrics = FilterMetrics::new();
@@ -5133,6 +5269,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
             allow_unmapped: false,
+            truncate: false,
         };
 
         let mut metrics = FilterMetrics::new();
