@@ -122,6 +122,38 @@ The simplex-metrics output files include:
 Yield metrics are computed at multiple subsampling fractions (5%, 10%, …, 100%), allowing you to
 assess how yield scales with sequencing depth without re-running the full pipeline.
 
+## Reading Metrics Files
+
+### Python
+
+```python
+import pandas as pd
+
+# Read horizontal TSV (dedup, codec, duplex-metrics, group)
+dedup_metrics = pd.read_csv("dedup_metrics.txt", sep="\t")
+
+# Read vertical KV format (simplex, duplex)
+consensus_stats = pd.read_csv("simplex_stats.txt", sep="\t")
+# Access metrics by key:
+# consensus_stats[consensus_stats["key"] == "consensus_reads_emitted"]["value"]
+
+# Read filter stats (no header)
+filter_stats = pd.read_csv("filter_stats.txt", sep="\t", header=None, names=["key", "value"])
+```
+
+### R
+
+```r
+# Read horizontal TSV
+dedup_metrics <- read.table("dedup_metrics.txt", header=TRUE, sep="\t")
+
+# Read vertical KV format
+consensus_stats <- read.table("simplex_stats.txt", header=TRUE, sep="\t")
+
+# Read filter stats (no header)
+filter_stats <- read.table("filter_stats.txt", header=FALSE, sep="\t", col.names=c("key", "value"))
+```
+
 ## Comparing Metrics
 
 Use `fgumi compare metrics` to compare metrics files between runs:

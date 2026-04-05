@@ -61,10 +61,10 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 ## Resources
 
 * [Documentation](https://docs.rs/fgumi)
-* [Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/best-practice-consensus-pipeline.md): Recommended workflow from FASTQ to consensus
-* [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md): Threading, memory, and compression optimization
+* [Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/best-practices.md): Recommended workflow from FASTQ to consensus
+* [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/performance-tuning.md): Threading, memory, and compression optimization
 * [Snakemake Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/FastqToConsensus-RnD.smk): Reference implementation
-* [Metrics](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/metrics.md): Output metrics documentation
+* [Metrics](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/working-with-metrics.md): Output metrics documentation
 * [Developing](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/DEVELOPING.md): Developer guide
 * [Compare CLI](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/compare-cli.md): Compare command documentation (feature-gated)
 * [Simulate CLI](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/simulate-cli.md): Simulate command documentation (feature-gated)
@@ -231,7 +231,7 @@ fgumi supports multi-threading and memory management for optimal performance:
 > 2. **Queue memory < total process memory:** Actual RSS will be higher due to
 >    UMI data structures, decompressors, thread stacks, and working buffers.
 >
-> See the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/performance-tuning.md)
+> See the [Performance Tuning Guide](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/performance-tuning.md)
 > for detailed guidance, including scenario-based configurations and troubleshooting.
 
 ## Performance
