@@ -4,6 +4,27 @@ use crate::fields::{
     l_read_name, n_cigar_op, pos,
 };
 
+/// Converts a raw BAM CIGAR u32 op word to a noodles `Kind`.
+///
+/// Extracts the 4-bit op type from the raw u32 and maps it to the corresponding
+/// `Kind` variant. Returns `Kind::Pad` for unknown op types.
+#[inline]
+#[must_use]
+pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op::Kind {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    match raw_op & 0xF {
+        0 => Kind::Match,
+        1 => Kind::Insertion,
+        2 => Kind::Deletion,
+        3 => Kind::Skip,
+        4 => Kind::SoftClip,
+        5 => Kind::HardClip,
+        7 => Kind::SequenceMatch,
+        8 => Kind::SequenceMismatch,
+        _ => Kind::Pad,
+    }
+}
+
 /// Returns true if the CIGAR op type consumes the reference (M, D, N, =, X).
 #[inline]
 #[must_use]
