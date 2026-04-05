@@ -11,8 +11,13 @@
 use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::bam_io::create_bam_reader_for_pipeline;
 use crate::consensus_filter::{
-    FilterConfig, FilterResult, compute_read_stats_raw, filter_duplex_read_raw, filter_read_raw,
-    is_duplex_consensus_raw, mask_bases_raw, mask_duplex_bases_raw, template_passes_raw,
+    FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
+    check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats_raw,
+    filter_duplex_read_raw, filter_read_raw, is_duplex_consensus_raw, mask_bases_raw,
+    mask_duplex_bases_raw, mask_methylation_depth_duplex_raw_with_tags,
+    mask_methylation_depth_simplex_raw_with_tags,
+    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, resolve_ref_bases_for_record,
+    template_passes_raw,
 };
 use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use crate::logging::OperationTimer;
@@ -170,6 +175,25 @@ pub struct Filter {
     #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub require_single_strand_agreement: bool,
 
+    /// Minimum methylation depth (cu+ct) to keep a base call (EM-Seq only).
+    /// For duplex: provide 1-3 values for [duplex, AB consensus, BA consensus]
+    #[arg(long = "min-methylation-depth", value_delimiter = ',')]
+    pub min_methylation_depth: Vec<usize>,
+
+    #[allow(clippy::doc_markdown)]
+    /// Require strand methylation agreement at CpG sites for duplex consensus (EM-Seq only).
+    /// Masks both positions of a CpG dinucleotide when top and bottom strands disagree on
+    /// methylation status. Requires --ref.
+    #[arg(long = "require-strand-methylation-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub require_strand_methylation_agreement: bool,
+
+    #[allow(clippy::doc_markdown)]
+    /// Minimum bisulfite/enzymatic conversion fraction at non-CpG cytosines (EM-Seq only).
+    /// Reads with conversion rate below this threshold are discarded.
+    /// Requires --ref. Uses cu/ct tags.
+    #[arg(long = "min-conversion-fraction")]
+    pub min_conversion_fraction: Option<f64>,
+
     /// Compression options for output BAM.
     #[command(flatten)]
     pub compression: CompressionOptions,
@@ -258,6 +282,10 @@ struct FilterProcessCaptures {
     min_mean_base_quality: Option<f64>,
     max_no_call_fraction: f64,
     require_single_strand_agreement: bool,
+    methylation_depth_thresholds: Option<MethylationDepthThresholds>,
+    require_strand_methylation_agreement: bool,
+    min_conversion_fraction: Option<f64>,
+    ref_names: Arc<Vec<String>>,
     progress: Arc<AtomicU64>,
     header: Header,
 }
@@ -293,6 +321,15 @@ impl Command for Filter {
             info!("Min mean base quality: {q}");
         }
         info!("Max no-call fraction: {}", self.max_no_call_fraction);
+        if !self.min_methylation_depth.is_empty() {
+            info!("Min methylation depth: {:?}", self.min_methylation_depth);
+        }
+        if self.require_strand_methylation_agreement {
+            info!("Require strand methylation agreement: true");
+        }
+        if let Some(frac) = self.min_conversion_fraction {
+            info!("Min conversion fraction: {frac}");
+        }
 
         // Open input using streaming-capable reader for pipeline use
         let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
@@ -371,6 +408,8 @@ impl Filter {
         setup: &FilterPipelineSetup,
         header: &Header,
     ) -> FilterProcessCaptures {
+        let ref_names: Vec<String> =
+            header.reference_sequences().keys().map(|name| name.to_string()).collect();
         FilterProcessCaptures {
             config: Arc::clone(&setup.config),
             reference: setup.reference.clone(),
@@ -379,6 +418,14 @@ impl Filter {
             min_mean_base_quality: self.min_mean_base_quality,
             max_no_call_fraction: self.max_no_call_fraction,
             require_single_strand_agreement: self.require_single_strand_agreement,
+            methylation_depth_thresholds: if self.min_methylation_depth.is_empty() {
+                None
+            } else {
+                Some(MethylationDepthThresholds::from_values(&self.min_methylation_depth))
+            },
+            require_strand_methylation_agreement: self.require_strand_methylation_agreement,
+            min_conversion_fraction: self.min_conversion_fraction,
+            ref_names: Arc::new(ref_names),
             progress: Arc::clone(&setup.progress_counter),
             header: header.clone(),
         }
@@ -509,6 +556,10 @@ impl Filter {
                 ctx.require_single_strand_agreement,
                 ctx.min_mean_base_quality,
                 ctx.max_no_call_fraction,
+                ctx.methylation_depth_thresholds.as_ref(),
+                ctx.require_strand_methylation_agreement,
+                ctx.min_conversion_fraction,
+                &ctx.ref_names,
             )
             .map_err(io::Error::other)?;
 
@@ -585,6 +636,10 @@ impl Filter {
                         ctx.require_single_strand_agreement,
                         ctx.min_mean_base_quality,
                         ctx.max_no_call_fraction,
+                        ctx.methylation_depth_thresholds.as_ref(),
+                        ctx.require_strand_methylation_agreement,
+                        ctx.min_conversion_fraction,
+                        &ctx.ref_names,
                     )
                     .map_err(io::Error::other)?;
                     bases_masked += masked;
@@ -670,6 +725,10 @@ impl Filter {
         require_ss_agreement: bool,
         min_mean_base_quality: Option<f64>,
         max_no_call_fraction: f64,
+        methylation_depth_thresholds: Option<&MethylationDepthThresholds>,
+        require_strand_methylation_agreement: bool,
+        min_conversion_fraction: Option<f64>,
+        ref_names: &[String],
     ) -> Result<(u64, bool)> {
         // Fail fast if we encounter a mapped read without a reference, since masking
         // can invalidate NM/UQ/MD tags and we have no way to regenerate them.
@@ -692,7 +751,7 @@ impl Filter {
             is_duplex_consensus_raw(aux)
         };
 
-        let masked_count = if is_duplex {
+        let mut masked_count = if is_duplex {
             let (cc_thresh, ab_thresh, ba_thresh) = config
                 .duplex_thresholds()
                 .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
@@ -711,11 +770,49 @@ impl Filter {
             mask_bases_raw(record, thresholds, min_base_quality)?
         };
 
+        // Parse methylation tags once for all EM-Seq filters
+        let needs_methylation_tags = methylation_depth_thresholds.is_some()
+            || (require_strand_methylation_agreement && is_duplex)
+            || min_conversion_fraction.is_some();
+        let methylation_tags =
+            if needs_methylation_tags { Some(MethylationTags::from_record(record)) } else { None };
+
+        // Methylation depth masking (EM-Seq)
+        if let Some(thresholds) = methylation_depth_thresholds {
+            let tags =
+                methylation_tags.as_ref().expect("methylation_tags set when thresholds present");
+            masked_count += if is_duplex {
+                mask_methylation_depth_duplex_raw_with_tags(record, thresholds, tags)?
+            } else {
+                mask_methylation_depth_simplex_raw_with_tags(record, thresholds.duplex, tags)?
+            };
+        }
+
+        // Resolve reference bases once for all reference-dependent filters
+        let needs_ref_bases = (require_strand_methylation_agreement && is_duplex)
+            || min_conversion_fraction.is_some();
+        let ref_base_map = if needs_ref_bases {
+            reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
+        } else {
+            None
+        };
+
+        // Strand methylation agreement masking (EM-Seq, duplex only)
+        if require_strand_methylation_agreement && is_duplex {
+            masked_count += mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
+                record,
+                ref_base_map.as_deref(),
+                methylation_tags
+                    .as_ref()
+                    .expect("methylation_tags set when strand agreement enabled"),
+            )?;
+        }
+
         if let Some(reference) = reference {
             regenerate_alignment_tags_raw(record, header, reference)?;
         }
 
-        let pass = {
+        let mut pass = {
             let aux = bam_fields::aux_data_slice(record);
             if is_duplex {
                 let (cc_thresh, ab_thresh, ba_thresh) = config
@@ -743,6 +840,22 @@ impl Filter {
                 )?
             }
         };
+
+        // Conversion fraction filter (EM-Seq read-level)
+        if pass {
+            if let Some(min_frac) = min_conversion_fraction {
+                if !check_conversion_fraction_raw_with_ref_bases_and_tags(
+                    record,
+                    min_frac,
+                    ref_base_map.as_deref(),
+                    methylation_tags
+                        .as_ref()
+                        .expect("methylation_tags set when conversion fraction enabled"),
+                ) {
+                    pass = false;
+                }
+            }
+        }
 
         Ok((masked_count as u64, pass))
     }
@@ -905,6 +1018,49 @@ impl Filter {
             }
         }
 
+        // Validate min-methylation-depth
+        if self.min_methylation_depth.len() > 3 {
+            bail!(
+                "--min-methylation-depth must have 1-3 values, got {}",
+                self.min_methylation_depth.len()
+            );
+        }
+
+        // Validate min-methylation-depth ordering (same as min-reads: CC >= AB >= BA)
+        if self.min_methylation_depth.len() >= 2 {
+            let cc = self.min_methylation_depth[0];
+            let ab = self.min_methylation_depth[1];
+            if ab > cc {
+                bail!(
+                    "min-methylation-depth values must be specified high to low (duplex >= AB), got {cc} < {ab}"
+                );
+            }
+        }
+        if self.min_methylation_depth.len() == 3 {
+            let ab = self.min_methylation_depth[1];
+            let ba = self.min_methylation_depth[2];
+            if ba > ab {
+                bail!(
+                    "min-methylation-depth values must be specified high to low (AB >= BA), got {ab} < {ba}"
+                );
+            }
+        }
+
+        // Validate require-strand-methylation-agreement requires --ref
+        if self.require_strand_methylation_agreement && self.reference.is_none() {
+            bail!("--require-strand-methylation-agreement requires --ref to identify CpG sites");
+        }
+
+        // Validate min-conversion-fraction
+        if let Some(frac) = self.min_conversion_fraction {
+            if !(0.0..=1.0).contains(&frac) {
+                bail!("--min-conversion-fraction must be between 0.0 and 1.0, got {frac}");
+            }
+            if self.reference.is_none() {
+                bail!("--min-conversion-fraction requires --ref to identify non-CpG cytosines");
+            }
+        }
+
         Ok(())
     }
 }
@@ -936,6 +1092,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         }
@@ -999,6 +1158,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1030,6 +1192,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1058,6 +1223,9 @@ mod tests {
             rejects: Some(PathBuf::from("rejects.bam")),
             stats: Some(PathBuf::from("stats.txt")),
             require_single_strand_agreement: true,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1090,6 +1258,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1119,11 +1290,71 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
 
         assert!(filter.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_min_methylation_depth_too_many_values() {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.min_methylation_depth = vec![4, 3, 2, 1]; // Too many values
+        assert!(cmd.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_min_methylation_depth_invalid_order() {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.min_methylation_depth = vec![2, 5]; // AB > CC
+        assert!(cmd.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_strand_agreement_requires_ref() {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.reference = None;
+        cmd.require_strand_methylation_agreement = true;
+        assert!(cmd.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_conversion_fraction_out_of_range() {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.min_conversion_fraction = Some(1.5); // Out of range
+        assert!(cmd.validate_parameters().is_err());
+    }
+
+    #[test]
+    fn test_validate_conversion_fraction_requires_ref() {
+        let mut cmd = create_filter_with_paths(
+            PathBuf::from("input.bam"),
+            PathBuf::from("output.bam"),
+            PathBuf::from("ref.fa"),
+        );
+        cmd.reference = None;
+        cmd.min_conversion_fraction = Some(0.9);
+        assert!(cmd.validate_parameters().is_err());
     }
 
     // Integration tests for filtering logic
@@ -1481,6 +1712,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1516,6 +1750,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1549,6 +1786,9 @@ mod tests {
             rejects: Some(PathBuf::from("rejects.bam")),
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1579,6 +1819,9 @@ mod tests {
             rejects: None,
             stats: Some(PathBuf::from("stats.txt")),
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1609,6 +1852,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1638,6 +1884,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: true,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1667,6 +1916,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1696,6 +1948,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1725,6 +1980,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1754,6 +2012,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1783,6 +2044,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1814,6 +2078,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1845,6 +2112,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1875,6 +2145,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1906,6 +2179,9 @@ mod tests {
             rejects: Some(PathBuf::from("rejects.bam")),
             stats: Some(PathBuf::from("stats.txt")),
             require_single_strand_agreement: true,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1938,6 +2214,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -1967,6 +2246,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2070,6 +2352,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2190,6 +2475,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2343,6 +2631,9 @@ mod tests {
             rejects: Some(rejects_path.clone()),
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2415,6 +2706,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2481,6 +2775,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2604,6 +2901,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2672,6 +2972,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2738,6 +3041,9 @@ mod tests {
             rejects: None,
             stats: Some(stats_path.clone()),
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2808,6 +3114,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2831,6 +3140,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2894,6 +3206,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -2948,6 +3263,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3005,6 +3323,9 @@ mod tests {
             rejects: Some(rejects_path.clone()), // Enable rejects
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3071,6 +3392,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3094,6 +3418,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3175,6 +3502,9 @@ mod tests {
             rejects: Some(rejects_path.clone()),
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3284,6 +3614,9 @@ mod tests {
             rejects: Some(rejects_path.clone()),
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3399,6 +3732,9 @@ mod tests {
             rejects: Some(rejects_path.clone()),
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3435,6 +3771,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3466,6 +3805,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3521,6 +3863,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3581,6 +3926,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3644,6 +3992,9 @@ mod tests {
             rejects: None,
             stats: None,
             require_single_strand_agreement: false,
+            min_methylation_depth: vec![],
+            require_strand_methylation_agreement: false,
+            min_conversion_fraction: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         };
@@ -3883,12 +4234,19 @@ mod tests {
         let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
 
         let (bases_masked, pass) = Filter::process_record_raw(
-            &mut raw, &config, None, // no reference
-            &header, false, // no tag reversal
+            &mut raw,
+            &config,
+            None, // no reference
+            &header,
+            false, // no tag reversal
             None,  // no min base quality
             false, // no single-strand agreement
             None,  // no min mean base quality
             0.2,   // max no-call fraction
+            None,  // no methylation depth thresholds
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            &[],   // no ref names
         )?;
 
         assert_eq!(bases_masked, 0, "No bases should be masked with good tags");
@@ -3934,6 +4292,10 @@ mod tests {
             false,
             None,
             0.2,
+            None,  // no methylation depth thresholds
+            false, // no strand methylation agreement
+            None,  // no min conversion fraction
+            &[],   // no ref names
         );
 
         assert!(result.is_err(), "Should fail for mapped reads without reference");
