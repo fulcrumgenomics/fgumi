@@ -3134,7 +3134,7 @@ mod tests {
     #[test]
     fn test_conversion_fraction_passes_high_conversion() {
         use crate::methylation::tests::TestRef;
-        // Reference: ACATACATA (non-CpG C at positions 1, 4 -- A before each C means not CpG)
+        // Reference: ACATACATA (non-CpG C at positions 1, 5 — each C followed by A, not CpG)
         //            012345678
         let ref_seq = b"ACATACATA";
         let reference = TestRef::new(&[("chr1", ref_seq)]);
@@ -3149,13 +3149,13 @@ mod tests {
             .mapping_quality(60)
             .cigar("9M")
             .build();
-        // Non-CpG C at positions 1 and 4: high conversion (ct >> cu)
+        // Non-CpG C at positions 1 and 5: high conversion (ct >> cu)
         // cu: unconverted count, ct: converted count
-        add_i16_array_tag(&mut record, "cu", &[0, 1, 0, 0, 1, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 9, 0, 0, 9, 0, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
 
         let raw = build_raw_with_methylation_tags(&sam.header, &record);
-        // 18 converted out of 20 = 90% conversion
+        // 18 converted out of 20 = 90% conversion (positions 1 and 5)
         assert!(
             check_conversion_fraction_raw(&raw, 0.8, &reference, &ref_names),
             "Should pass with high conversion fraction"
@@ -3178,12 +3178,12 @@ mod tests {
             .mapping_quality(60)
             .cigar("9M")
             .build();
-        // Non-CpG C at positions 1 and 4: low conversion (cu >> ct)
-        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 9, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 1, 0, 0, 0, 0]);
+        // Non-CpG C at positions 1 and 5: low conversion (cu >> ct)
+        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
 
         let raw = build_raw_with_methylation_tags(&sam.header, &record);
-        // 2 converted out of 20 = 10% conversion
+        // 2 converted out of 20 = 10% conversion (positions 1 and 5)
         assert!(
             !check_conversion_fraction_raw(&raw, 0.8, &reference, &ref_names),
             "Should fail with low conversion fraction"

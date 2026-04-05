@@ -631,16 +631,19 @@ impl VanillaUmiConsensusCaller {
             return Ok(None);
         }
 
-        // Build consensus from source reads
-        let (mut bases, quals, depths, errors) =
-            self.create_consensus_from_source_reads(&source_reads)?;
-
-        // Apply methylation annotation if em_seq is enabled
-        let methylation = if self.options.em_seq {
-            self.annotate_methylation(&source_reads, &mut bases)
+        // For EM-seq: annotate methylation first (counts conversions), then normalize
+        // source read bases before consensus scoring so that C↔T / G↔A conversion
+        // events at ref-C positions don't inflate error counts or depress quality.
+        let (methylation, source_reads) = if self.options.em_seq {
+            let (annot, normalized) = self.annotate_and_normalize(source_reads);
+            (annot, normalized)
         } else {
-            None
+            (None, source_reads)
         };
+
+        // Build consensus from (possibly normalized) source reads
+        let (bases, quals, depths, errors) =
+            self.create_consensus_from_source_reads(&source_reads)?;
 
         // Build VanillaConsensusRead
         let consensus_read = VanillaConsensusRead {
@@ -656,46 +659,84 @@ impl VanillaUmiConsensusCaller {
         Ok(Some(consensus_read))
     }
 
-    /// Annotates methylation for a consensus read using reference and source reads.
-    fn annotate_methylation(
+    /// Annotates methylation evidence and normalizes source read bases at ref-C positions.
+    ///
+    /// Returns the methylation annotation (with conversion counts) and the source reads
+    /// with converted bases (T→C on top strand, A→G on bottom) normalized to unconverted
+    /// form, so that consensus scoring treats conversion events as agreement.
+    fn annotate_and_normalize(
         &self,
-        source_reads: &[SourceRead],
-        consensus_bases: &mut [u8],
-    ) -> Option<crate::methylation::MethylationAnnotation> {
+        mut source_reads: Vec<SourceRead>,
+    ) -> (Option<crate::methylation::MethylationAnnotation>, Vec<SourceRead>) {
         use crate::methylation;
 
-        let reference = self.reference.as_ref()?;
-        let ref_names = self.ref_names.as_ref()?;
+        let Some(reference) = self.reference.as_ref() else {
+            return (None, source_reads);
+        };
+        let Some(ref_names) = self.ref_names.as_ref() else {
+            return (None, source_reads);
+        };
 
-        // Get ref_id and alignment info from first source read
-        let first = source_reads.first()?;
-        if first.ref_id < 0 || first.alignment_start < 0 {
-            return None;
+        // Use a spanning read as the mapping anchor (item 7 fix)
+        let anchor_idx = source_reads
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, sr)| sr.bases.len())
+            .map(|(idx, _)| idx);
+        let Some(anchor_idx) = anchor_idx else {
+            return (None, source_reads);
+        };
+        let anchor = &source_reads[anchor_idx];
+        if anchor.ref_id < 0 || anchor.alignment_start < 0 {
+            return (None, source_reads);
         }
-        let ref_name = ref_names.get(usize::try_from(first.ref_id).ok()?)?;
+        let Some(ref_name) = ref_names.get(usize::try_from(anchor.ref_id).unwrap_or(usize::MAX))
+        else {
+            return (None, source_reads);
+        };
 
-        // Determine strand from source reads
-        let is_top = methylation::is_top_strand(first.flags);
+        let is_top = methylation::is_top_strand(anchor.flags);
 
-        // Map consensus positions to reference positions
         let ref_positions = methylation::query_to_ref_positions(
-            &first.simplified_cigar,
-            first.alignment_start,
-            first.flags & fgumi_raw_bam::flags::REVERSE != 0,
-            &first.original_cigar,
+            &anchor.simplified_cigar,
+            anchor.alignment_start,
+            anchor.flags & fgumi_raw_bam::flags::REVERSE != 0,
+            &anchor.original_cigar,
         );
 
-        // Fetch reference bases at aligned positions
         let ref_bases =
             methylation::fetch_ref_bases_at_positions(&ref_positions, ref_name, reference.as_ref());
 
-        // Annotate methylation
-        Some(methylation::annotate_simplex_methylation(
-            consensus_bases,
-            source_reads,
+        // First: annotate to count conversions (before normalization)
+        // Use a temporary dummy bases slice since annotate_simplex_methylation
+        // doesn't modify bases in current code
+        let mut dummy_bases = source_reads
+            .iter()
+            .max_by_key(|sr| sr.bases.len())
+            .map(|sr| sr.bases.clone())
+            .unwrap_or_default();
+        let annotation = methylation::annotate_simplex_methylation(
+            &mut dummy_bases,
+            &source_reads,
             &ref_bases,
             is_top,
-        ))
+        );
+
+        // Normalize source read bases: at ref-C positions, replace converted bases
+        // with unconverted form so consensus scoring treats them as agreement
+        let (unconverted_base, converted_base) = if is_top { (b'C', b'T') } else { (b'G', b'A') };
+        for sr in &mut source_reads {
+            for (i, ev) in annotation.evidence.iter().enumerate() {
+                if ev.is_ref_c && i < sr.bases.len() {
+                    let base = sr.bases[i].to_ascii_uppercase();
+                    if base == converted_base {
+                        sr.bases[i] = unconverted_base;
+                    }
+                }
+            }
+        }
+
+        (Some(annotation), source_reads)
     }
 
     /// Filters reads to remove secondary/supplementary alignments.
@@ -1168,16 +1209,18 @@ impl VanillaUmiConsensusCaller {
             Vec::new()
         };
 
-        // Build consensus from source reads
-        let (mut bases, quals, depths, errors) =
-            self.create_consensus_from_source_reads(&filtered_source_reads)?;
-
-        // Apply methylation annotation if em_seq is enabled
-        let methylation = if self.options.em_seq {
-            self.annotate_methylation(&filtered_source_reads, &mut bases)
+        // For EM-seq: annotate methylation first, then normalize source read bases
+        // before consensus scoring so conversion events don't inflate errors.
+        let (methylation, filtered_source_reads) = if self.options.em_seq {
+            let (annot, normalized) = self.annotate_and_normalize(filtered_source_reads);
+            (annot, normalized)
         } else {
-            None
+            (None, filtered_source_reads)
         };
+
+        // Build consensus from (possibly normalized) source reads
+        let (bases, quals, depths, errors) =
+            self.create_consensus_from_source_reads(&filtered_source_reads)?;
 
         // Get raw records for tag extraction
         let original_raws: Vec<&[u8]> = filtered_source_reads

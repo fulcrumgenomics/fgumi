@@ -184,7 +184,7 @@ pub struct Filter {
     /// Require strand methylation agreement at CpG sites for duplex consensus (EM-Seq only).
     /// Masks both positions of a CpG dinucleotide when top and bottom strands disagree on
     /// methylation status. Requires --ref.
-    #[arg(long = "require-strand-methylation-agreement", default_value = "false")]
+    #[arg(long = "require-strand-methylation-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub require_strand_methylation_agreement: bool,
 
     #[allow(clippy::doc_markdown)]
