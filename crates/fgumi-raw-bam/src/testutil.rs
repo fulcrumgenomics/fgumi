@@ -81,6 +81,12 @@ impl ParsedBamRecord {
     pub fn get_i16_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<i16>> {
         find_i16_array_tag_in_aux(&self.aux_data, *tag)
     }
+
+    /// Find a B:C (u8 array) tag value by tag name.
+    #[must_use]
+    pub fn get_u8_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+        find_u8_array_tag_in_aux(&self.aux_data, *tag)
+    }
 }
 
 fn unpack_sequence_for_test(packed: &[u8], l_seq: usize) -> Vec<u8> {
@@ -105,6 +111,11 @@ fn find_int_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<i32> {
 
 fn find_float_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<f32> {
     crate::tags::find_float_tag(aux, &tag)
+}
+
+fn find_u8_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
+    let arr = crate::tags::find_array_tag(aux, &tag)?;
+    (arr.elem_type == b'C').then(|| arr.data.to_vec())
 }
 
 fn find_i16_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<i16>> {

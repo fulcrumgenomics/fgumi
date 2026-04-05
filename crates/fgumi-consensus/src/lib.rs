@@ -31,6 +31,9 @@ pub mod duplex_caller;
 #[cfg(feature = "codec")]
 pub mod codec_caller;
 
+#[cfg(feature = "simplex")]
+pub mod methylation;
+
 mod vendored;
 
 // Re-export commonly used items
