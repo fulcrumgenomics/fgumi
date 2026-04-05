@@ -657,6 +657,7 @@ dependencies = [
  "fgoxide",
  "fgumi-bgzf",
  "fgumi-consensus",
+ "fgumi-derive",
  "fgumi-dna",
  "fgumi-lib",
  "fgumi-metrics",
@@ -717,6 +718,17 @@ dependencies = [
  "noodles",
  "rand 0.10.0",
  "wide 1.1.1",
+]
+
+[[package]]
+name = "fgumi-derive"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
