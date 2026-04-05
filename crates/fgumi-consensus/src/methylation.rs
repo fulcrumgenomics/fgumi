@@ -21,10 +21,12 @@ pub struct MethylationEvidence {
     pub is_ref_c: bool,
     /// Number of reads showing C (unconverted) at this ref-C position.
     /// For bottom strand (after RC): number showing G (complement of unconverted C).
-    pub unconverted_count: i16,
+    /// Stored as u32 to avoid overflow at high coverage; clamped to i16 on output.
+    pub unconverted_count: u32,
     /// Number of reads showing T (converted) at this ref-C position.
     /// For bottom strand (after RC): number showing A (complement of converted T).
-    pub converted_count: i16,
+    /// Stored as u32 to avoid overflow at high coverage; clamped to i16 on output.
+    pub converted_count: u32,
 }
 
 /// Methylation annotation for an entire consensus read.
@@ -36,15 +38,20 @@ pub struct MethylationAnnotation {
 
 impl MethylationAnnotation {
     /// Returns the unconverted counts as an i16 array for the `cu` tag.
+    /// Values are clamped to `i16::MAX` to fit the BAM tag format.
     #[must_use]
     pub fn unconverted_counts(&self) -> Vec<i16> {
-        self.evidence.iter().map(|e| e.unconverted_count).collect()
+        self.evidence
+            .iter()
+            .map(|e| i16::try_from(e.unconverted_count).unwrap_or(i16::MAX))
+            .collect()
     }
 
     /// Returns the converted counts as an i16 array for the `ct` tag.
+    /// Values are clamped to `i16::MAX` to fit the BAM tag format.
     #[must_use]
     pub fn converted_counts(&self) -> Vec<i16> {
-        self.evidence.iter().map(|e| e.converted_count).collect()
+        self.evidence.iter().map(|e| i16::try_from(e.converted_count).unwrap_or(i16::MAX)).collect()
     }
 
     /// Returns a truncated copy of this annotation with only the first `len` positions.
@@ -140,17 +147,16 @@ pub fn query_to_ref_positions(
 /// Annotates simplex consensus methylation from source reads and reference.
 ///
 /// For each consensus position that aligns to a reference cytosine (top strand)
-/// or reference guanine (bottom strand, after RC):
-/// - Counts source reads showing unconverted vs converted bases
-/// - Replaces converted consensus bases with the unconverted reference base
+/// or reference guanine (bottom strand, after RC), counts source reads showing
+/// unconverted vs converted bases. Does not modify the consensus bases.
 ///
 /// # Arguments
-/// * `consensus_bases` - Mutable consensus bases (may be modified to unconverted form)
+/// * `consensus_bases` - Consensus bases (used for length/position mapping)
 /// * `source_reads` - Source reads used to build this consensus
-/// * `ref_bases` - Reference bases at aligned positions (`None` for insertions)
+/// * `ref_bases_at_positions` - Reference bases at aligned positions (`None` for insertions)
 /// * `is_top_strand` - Whether this consensus represents the top (forward) strand
 pub(crate) fn annotate_simplex_methylation(
-    consensus_bases: &mut [u8],
+    consensus_bases: &[u8],
     source_reads: &[SourceRead],
     ref_bases_at_positions: &[Option<u8>],
     is_top_strand: bool,
@@ -188,10 +194,9 @@ pub(crate) fn annotate_simplex_methylation(
             }
         }
 
-        // Do NOT replace converted bases back to unconverted in the consensus sequence.
-        // When consensus reads are re-aligned through bwameth, replacement would cause
-        // bwameth to see C at every reference-C position and call everything as methylated.
-        // Methylation evidence is preserved in cu/ct per-base count tags and MM/ML tags.
+        // Base normalization (T→C / A→G at ref-C positions) is NOT done here — it is
+        // handled by the caller (annotate_and_normalize) which normalizes source reads
+        // after annotation so that conversion events don't inflate consensus error counts.
     }
 
     MethylationAnnotation { evidence }
@@ -239,14 +244,10 @@ pub fn build_mm_ml_tags(
 
         if ev.is_ref_c {
             // This is a ref-C position with a C/G in consensus
-            let total = i32::from(ev.unconverted_count) + i32::from(ev.converted_count);
+            let total = u64::from(ev.unconverted_count) + u64::from(ev.converted_count);
             if total > 0 {
                 // Methylation probability = unconverted / total, scaled to [0, 255]
-                #[expect(
-                    clippy::cast_sign_loss,
-                    reason = "values are known non-negative and bounded by 255"
-                )]
-                let prob = (i32::from(ev.unconverted_count) * 255 / total).clamp(0, 255) as u8;
+                let prob = (u64::from(ev.unconverted_count) * 255 / total).min(255) as u8;
                 skips.push(skip_count);
                 probs.push(prob);
                 skip_count = 0;
@@ -468,13 +469,13 @@ pub(crate) mod tests {
     #[test]
     fn test_annotate_simplex_all_methylated() {
         // All source reads show C at ref-C positions → methylated
-        let mut consensus = b"ACGT".to_vec();
+        let consensus = b"ACGT".to_vec();
         let sr1 = make_test_source_read(b"ACGT", 0);
         let sr2 = make_test_source_read(b"ACGT", 0);
         let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')];
 
         let annot = annotate_simplex_methylation(
-            &mut consensus,
+            &consensus,
             &[sr1, sr2],
             &ref_bases,
             true, // top strand
@@ -491,12 +492,12 @@ pub(crate) mod tests {
     #[test]
     fn test_annotate_simplex_all_unmethylated() {
         // All source reads show T at ref-C position → unmethylated
-        let mut consensus = b"ATGT".to_vec(); // consensus called T at pos 1
+        let consensus = b"ATGT".to_vec(); // consensus called T at pos 1
         let sr1 = make_test_source_read(b"ATGT", 0);
         let sr2 = make_test_source_read(b"ATGT", 0);
         let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')];
 
-        let annot = annotate_simplex_methylation(&mut consensus, &[sr1, sr2], &ref_bases, true);
+        let annot = annotate_simplex_methylation(&consensus, &[sr1, sr2], &ref_bases, true);
 
         assert!(annot.evidence[1].is_ref_c);
         assert_eq!(annot.evidence[1].unconverted_count, 0);
@@ -509,12 +510,12 @@ pub(crate) mod tests {
     #[test]
     fn test_annotate_simplex_mixed() {
         // Some C, some T at ref-C position
-        let mut consensus = b"ACGT".to_vec();
+        let consensus = b"ACGT".to_vec();
         let sr1 = make_test_source_read(b"ACGT", 0); // C at pos 1
         let sr2 = make_test_source_read(b"ATGT", 0); // T at pos 1
         let ref_bases = vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')];
 
-        let annot = annotate_simplex_methylation(&mut consensus, &[sr1, sr2], &ref_bases, true);
+        let annot = annotate_simplex_methylation(&consensus, &[sr1, sr2], &ref_bases, true);
 
         assert!(annot.evidence[1].is_ref_c);
         assert_eq!(annot.evidence[1].unconverted_count, 1);
@@ -524,11 +525,11 @@ pub(crate) mod tests {
     #[test]
     fn test_annotate_simplex_non_c_positions() {
         // Non-ref-C positions should not be annotated
-        let mut consensus = b"AGGT".to_vec();
+        let consensus = b"AGGT".to_vec();
         let sr1 = make_test_source_read(b"AGGT", 0);
         let ref_bases = vec![Some(b'A'), Some(b'G'), Some(b'G'), Some(b'T')];
 
-        let annot = annotate_simplex_methylation(&mut consensus, &[sr1], &ref_bases, true);
+        let annot = annotate_simplex_methylation(&consensus, &[sr1], &ref_bases, true);
 
         for ev in &annot.evidence {
             assert!(!ev.is_ref_c);
@@ -538,12 +539,12 @@ pub(crate) mod tests {
     #[test]
     fn test_annotate_simplex_reverse_strand() {
         // Bottom strand: ref=G (complement of C), unconverted=G, converted=A
-        let mut consensus = b"CAGT".to_vec(); // A at pos 1 = converted on bottom strand
+        let consensus = b"CAGT".to_vec(); // A at pos 1 = converted on bottom strand
         let sr1 = make_test_source_read(b"CAGT", flags::REVERSE);
         let ref_bases = vec![Some(b'T'), Some(b'G'), Some(b'C'), Some(b'A')]; // at reversed positions
 
         let annot = annotate_simplex_methylation(
-            &mut consensus,
+            &consensus,
             &[sr1],
             &ref_bases,
             false, // bottom strand
@@ -729,16 +730,16 @@ pub(crate) mod tests {
         let annotation = MethylationAnnotation {
             evidence: vec![MethylationEvidence {
                 is_ref_c: true,
-                unconverted_count: i16::MAX,
-                converted_count: i16::MAX,
+                unconverted_count: u32::MAX,
+                converted_count: u32::MAX,
             }],
         };
         let ab = &annotation;
         let ba = &annotation;
         let combined = combine_methylation_annotations(ab, ba, 1);
-        // Should saturate at i16::MAX, not wrap or panic
-        assert_eq!(combined.evidence[0].unconverted_count, i16::MAX);
-        assert_eq!(combined.evidence[0].converted_count, i16::MAX);
+        // Should saturate at u32::MAX, not wrap or panic
+        assert_eq!(combined.evidence[0].unconverted_count, u32::MAX);
+        assert_eq!(combined.evidence[0].converted_count, u32::MAX);
     }
 
     /// Helper to create a `SourceRead` for testing.

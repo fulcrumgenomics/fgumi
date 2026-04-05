@@ -12,16 +12,21 @@ use crate::fields::{
 #[must_use]
 pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op::Kind {
     use noodles::sam::alignment::record::cigar::op::Kind;
-    match raw_op & 0xF {
+    let op = raw_op & 0xF;
+    match op {
         0 => Kind::Match,
         1 => Kind::Insertion,
         2 => Kind::Deletion,
         3 => Kind::Skip,
         4 => Kind::SoftClip,
         5 => Kind::HardClip,
+        6 => Kind::Pad,
         7 => Kind::SequenceMatch,
         8 => Kind::SequenceMismatch,
-        _ => Kind::Pad,
+        _ => {
+            debug_assert!(false, "invalid BAM CIGAR op code: {op}");
+            Kind::Pad
+        }
     }
 }
 
