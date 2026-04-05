@@ -10,34 +10,34 @@ description = "Core library for fgumi UMI processing"
 name = "fgumi_lib"
 
 [dependencies]
-anyhow = "1.0.102"
-log = "0"
-thiserror = "2"
-noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
-noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
-noodles-csi = "0.54.0"
-clap = { version = "4", features = ["derive"] }
-read-structure = "0.2.0"
-bstr = "1.12.1"
-bytes = "1"
-tempfile = "3.3.0"
-crossbeam-channel = "0.5"
-crossbeam-queue = "0.3"
-crossbeam-utils = "0.8.21"
-parking_lot = "0.12"
-libdeflater = "1.22"
-serde = { version = "1.0.228", features = ["derive"] }
-rand = "0.10"
-rand_distr = "0.6"
-memchr = "2"
-ahash = "0.8"
-lru = "0.16.3"
-bytemuck = { version = "1.14", features = ["derive"] }
-bgzf = "0.3.0"
-flate2 = "1.1"
-rayon = "1.10"
-libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
-sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
+ahash = { workspace = true }
+anyhow = { workspace = true }
+bgzf = { workspace = true }
+bstr = { workspace = true }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
+flate2 = { workspace = true }
+libdeflater = { workspace = true }
+libmimalloc-sys = { workspace = true, optional = true }
+log = { workspace = true }
+lru = { workspace = true }
+memchr = { workspace = true }
+noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
+noodles-bgzf = { workspace = true }
+noodles-csi = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rayon = { workspace = true }
+read-structure = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true, optional = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-dna = { workspace = true }
 fgumi-bgzf = { workspace = true }
@@ -64,6 +64,6 @@ profile-adjacency = []
 stress-tests = []
 
 [dev-dependencies]
-proptest = "1.10"
-rstest = "0"
+proptest = { workspace = true }
+rstest = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }

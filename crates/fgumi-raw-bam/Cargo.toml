@@ -8,8 +8,8 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-noodles = { version = "0.106.0", features = ["bam", "sam"], optional = true }
-anyhow = { version = "1.0.102", optional = true }
+noodles = { workspace = true, features = ["bam", "sam"], optional = true }
+anyhow = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -17,5 +17,5 @@ noodles = ["dep:noodles", "dep:anyhow"]
 test-utils = []
 
 [dev-dependencies]
-proptest = "1.10"
-rstest = "0"
+proptest = { workspace = true }
+rstest = { workspace = true }
