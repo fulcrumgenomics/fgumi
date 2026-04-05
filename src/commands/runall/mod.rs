@@ -108,6 +108,16 @@ pub struct Runall {
     #[arg(long)]
     pub metrics: Option<PathBuf>,
 
+    /// Output prefix for consensus metrics files (family sizes, position group
+    /// sizes, UMI counts, yield projections).
+    #[arg(long = "consensus-metrics")]
+    pub consensus_metrics: Option<PathBuf>,
+
+    /// Intervals file (BED or Picard interval list) for restricting consensus
+    /// metrics to target regions.
+    #[arg(long = "intervals")]
+    pub intervals: Option<PathBuf>,
+
     // --- Scoped stage options ---
     /// Sort stage options.
     #[command(flatten)]
@@ -212,6 +222,10 @@ impl Runall {
         let caller = self.build_consensus_caller(read_name_prefix)?;
         let umi_tag_bytes = tag_bytes(&self.group_opts.group_umi_tag);
 
+        let metrics_collector = self.build_inline_collector()?;
+
+        let metrics_header = if metrics_collector.is_some() { Some(header.clone()) } else { None };
+
         let mut sink = processing_sink::ProcessingSink::new(
             writer,
             caller,
@@ -222,6 +236,9 @@ impl Runall {
             self.build_group_filter_config(),
             self.stop_after,
             cancel.clone(),
+            metrics_collector,
+            self.consensus_metrics.clone(),
+            metrics_header,
         );
 
         let pipeline_start = std::time::Instant::now();

@@ -11,80 +11,20 @@ use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::template::TemplateIterator;
 use fgumi_lib::validation::string_to_tag;
 use log::info;
-use murmur3::murmur3_32;
 use noodles::sam::alignment::record::Cigar;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Standard downsampling fractions: 5%, 10%, 15%, ..., 100%.
-pub const DOWNSAMPLING_FRACTIONS: [f64; 20] = [
-    0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80,
-    0.85, 0.90, 0.95, 1.00,
-];
+// Re-export types and functions that have been moved to fgumi-metrics.
+pub use fgumi_metrics::{
+    DOWNSAMPLING_FRACTIONS, Interval, ReadInfoKey, TemplateInfo, TemplateMetadata,
+    compute_hash_fraction, compute_template_metadata, overlaps_intervals, parse_intervals,
+};
 
 /// Cached R availability check (computed once per process).
 static R_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-/// Genomic interval for filtering, stored as 0-based half-open coordinates.
-#[derive(Clone, Debug)]
-pub struct Interval {
-    /// Reference sequence name (e.g. "chr1").
-    pub ref_name: String,
-    /// 0-based start position (inclusive).
-    pub start: i32,
-    /// 0-based end position (exclusive).
-    pub end: i32,
-}
-
-/// Read name and template information for downsampling.
-#[derive(Clone)]
-pub struct TemplateInfo {
-    /// Molecular identifier tag value (e.g. "1/A").
-    pub mi: String,
-    /// Raw UMI tag value (e.g. "AAA-TTT").
-    pub rx: String,
-    /// Reference sequence name, if mapped.
-    pub ref_name: Option<String>,
-    /// Alignment start position (1-based), if mapped.
-    pub position: Option<i32>,
-    /// Alignment end position (1-based), if mapped.
-    pub end_position: Option<i32>,
-    /// Hash fraction for deterministic downsampling (computed once per template).
-    pub hash_fraction: f64,
-}
-
-/// Grouping key matching fgbio's `ReadInfo` structure.
-///
-/// Fields are ordered so the earlier-mapping read comes first.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ReadInfoKey {
-    /// Reference sequence index for read 1.
-    pub ref_index1: Option<usize>,
-    /// Unclipped 5' position for read 1.
-    pub start1: i32,
-    /// `true` if read 1 is reverse-complemented.
-    pub strand1: bool,
-    /// Reference sequence index for read 2.
-    pub ref_index2: Option<usize>,
-    /// Unclipped 5' position for read 2.
-    pub start2: i32,
-    /// `true` if read 2 is reverse-complemented.
-    pub strand2: bool,
-}
-
-/// Pre-computed metadata for a template within a coordinate group.
-pub struct TemplateMetadata<'a> {
-    /// Reference to the underlying template info.
-    pub template: &'a TemplateInfo,
-    /// MI tag value with strand suffix stripped (e.g. "1" from "1/A").
-    pub base_umi: &'a str,
-    /// `true` if this template belongs to the A strand.
-    pub is_a_strand: bool,
-    /// `true` if this template belongs to the B strand.
-    pub is_b_strand: bool,
-}
 
 /// Computes the unclipped 5' position for a read, matching fgbio's `positionOf`.
 ///
@@ -121,135 +61,6 @@ pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<i32> {
             .map_or(0, |op| op.len() as i32);
 
         Some(alignment_start - leading_clips)
-    }
-}
-
-/// Computes a hash value normalized to the [0, 1] range using Murmur3.
-///
-/// Hashes the read name using the Murmur3 32-bit algorithm with seed 42, then
-/// normalizes the result to a floating-point value between 0 and 1. This is used
-/// for deterministic downsampling where reads are assigned to fractions based on
-/// their hash value. Matches the Scala implementation's hashing approach.
-///
-/// # Arguments
-///
-/// * `read_name` - The read name string to hash
-///
-/// # Returns
-///
-/// A floating-point value in the range [0, 1].
-pub fn compute_hash_fraction(read_name: &str) -> f64 {
-    // Use Murmur3 with seed 42 (matching Scala implementation)
-    let hash = murmur3_32(&mut std::io::Cursor::new(read_name.as_bytes()), 42).unwrap_or(0);
-
-    // Scala implementation uses Int (i32), takes absolute value, then normalizes
-    // Convert u32 to i32 first to match Scala's behavior
-    let positive_hash = (hash as i32).unsigned_abs() as f64;
-    positive_hash / i32::MAX as f64
-}
-
-/// Parses an intervals file in BED or Picard interval list format.
-///
-/// Auto-detects the format: if any line starts with `@`, the file is treated as a
-/// Picard interval list (1-based closed coordinates with a SAM header); otherwise
-/// it is treated as BED (0-based half-open coordinates).
-///
-/// Intervals are stored internally using BED conventions (0-based half-open).
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read or lines cannot be parsed.
-pub fn parse_intervals(path: &Path) -> Result<Vec<Interval>> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut intervals = Vec::new();
-    let mut is_interval_list = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Skip SAM header lines (interval list format)
-        if line.starts_with('@') {
-            is_interval_list = true;
-            continue;
-        }
-
-        let mut fields = line.splitn(4, '\t');
-        let ref_name = fields.next().unwrap(); // guaranteed non-empty (line isn't empty)
-        let start_str = fields.next();
-        let end_str = fields.next();
-
-        let (Some(start_str), Some(end_str)) = (start_str, end_str) else {
-            let fmt = if is_interval_list { "interval list" } else { "BED" };
-            anyhow::bail!("Invalid {fmt} line (needs at least 3 fields): {line}");
-        };
-
-        if is_interval_list {
-            // Picard interval list: chr start end strand name (1-based, closed)
-            let start: i32 = start_str
-                .parse::<i32>()
-                .map_err(|_| anyhow::anyhow!("Invalid start position: {start_str}"))?
-                - 1; // Convert 1-based to 0-based
-            let end: i32 =
-                end_str.parse().map_err(|_| anyhow::anyhow!("Invalid end position: {end_str}"))?;
-            // end stays the same: 1-based closed end == 0-based half-open end
-            intervals.push(Interval { ref_name: ref_name.to_string(), start, end });
-        } else {
-            // BED format: chr start end [name] [score] [strand] (0-based, half-open)
-            let start: i32 = start_str
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid start position: {start_str}"))?;
-            let end: i32 =
-                end_str.parse().map_err(|_| anyhow::anyhow!("Invalid end position: {end_str}"))?;
-            intervals.push(Interval { ref_name: ref_name.to_string(), start, end });
-        }
-    }
-
-    Ok(intervals)
-}
-
-/// Checks if a template's insert overlaps any provided interval.
-///
-/// Determines whether a template's genomic insert coordinates overlap with any
-/// of the specified intervals. An insert overlaps an interval if any part of it
-/// (from start to end position) overlaps the interval region. If no intervals are
-/// provided, all templates are considered to overlap (no filtering).
-///
-/// # Arguments
-///
-/// * `template` - Template information including chromosome and positions
-/// * `intervals` - Slice of intervals to check for overlap
-///
-/// # Returns
-///
-/// `true` if the template overlaps any interval or if no intervals are provided,
-/// `false` if the template is unmapped or does not overlap any interval.
-pub fn overlaps_intervals(template: &TemplateInfo, intervals: &[Interval]) -> bool {
-    if intervals.is_empty() {
-        return true; // No filtering if no intervals provided
-    }
-
-    if let (Some(ref_name), Some(start), Some(end)) =
-        (&template.ref_name, template.position, template.end_position)
-    {
-        // Intervals are 0-based half-open; template positions are 1-based inclusive.
-        // In 0-based half-open the template is [start-1, end), so the overlap
-        // test is: (start-1) < interval.end && interval.start < end
-        // which simplifies to: start <= interval.end && interval.start < end
-        intervals.iter().any(|interval| {
-            interval.ref_name == *ref_name && start <= interval.end && interval.start < end
-        })
-    } else {
-        false // Unmapped reads or reads without proper coordinates don't overlap any interval
     }
 }
 
@@ -364,26 +175,6 @@ pub fn execute_r_script(r_script_content: &str, args: &[&str], temp_file_name: &
             stderr
         )
     }
-}
-
-/// Pre-computes metadata for each template in a coordinate group.
-///
-/// Parses the MI tag to determine strand assignment and extract the base UMI
-/// (MI value without the `/A` or `/B` suffix).
-pub fn compute_template_metadata(group: &[TemplateInfo]) -> Vec<TemplateMetadata<'_>> {
-    group
-        .iter()
-        .map(|t| {
-            let (base_umi, is_a, is_b) = if t.mi.ends_with("/A") {
-                (&t.mi[..t.mi.len() - 2], true, false)
-            } else if t.mi.ends_with("/B") {
-                (&t.mi[..t.mi.len() - 2], false, true)
-            } else {
-                (t.mi.as_str(), false, false)
-            };
-            TemplateMetadata { template: t, base_umi, is_a_strand: is_a, is_b_strand: is_b }
-        })
-        .collect()
 }
 
 /// Reads a BAM file, groups templates by [`ReadInfoKey`], and calls a closure for each group.
@@ -560,10 +351,16 @@ where
             position: Some(position),
             end_position: Some(end_position),
             hash_fraction,
+            read_info_key: read_info_key.clone(),
         };
 
         // Check interval overlap
-        if !overlaps_intervals(&template_info, intervals) {
+        if !overlaps_intervals(
+            template_info.ref_name.as_deref(),
+            template_info.position,
+            template_info.end_position,
+            intervals,
+        ) {
             continue;
         }
 

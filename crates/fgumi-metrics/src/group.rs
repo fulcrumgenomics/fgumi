@@ -7,6 +7,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::Metric;
 
+/// Build a size distribution from (size, count) pairs.
+///
+/// Sorts by ascending size, computes per-entry fractions and reverse cumulative
+/// fractions (fraction of entries with size >= this value), then returns a `Vec`
+/// in ascending size order. The `ctor` closure maps `(size, count, fraction,
+/// cumulative_fraction)` into the caller's metric type.
+#[allow(clippy::cast_precision_loss)]
+fn build_size_distribution<T>(
+    counts: impl IntoIterator<Item = (usize, u64)>,
+    ctor: impl Fn(usize, u64, f64, f64) -> T,
+) -> Vec<T> {
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by_key(|(size, _)| *size);
+
+    let total: f64 = sorted.iter().map(|(_, count)| *count as f64).sum();
+    if total == 0.0 {
+        return Vec::new();
+    }
+
+    let mut metrics = Vec::with_capacity(sorted.len());
+    let mut cumulative = 0.0;
+    for &(size, count) in sorted.iter().rev() {
+        let fraction = count as f64 / total;
+        cumulative += fraction;
+        metrics.push(ctor(size, count, fraction, cumulative));
+    }
+    metrics.reverse();
+    metrics
+}
+
 /// Metrics for UMI grouping operations.
 ///
 /// These metrics track how reads are grouped by UMI and provide insight into
@@ -110,31 +140,14 @@ impl FamilySizeMetrics {
     ///
     /// Returns a `Vec` sorted by ascending family size, with cumulative
     /// fractions computed from largest to smallest.
-    #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn from_size_counts(counts: impl IntoIterator<Item = (usize, u64)>) -> Vec<Self> {
-        let mut sorted: Vec<_> = counts.into_iter().collect();
-        sorted.sort_by_key(|(size, _)| *size);
-
-        let total: f64 = sorted.iter().map(|(_, count)| *count as f64).sum();
-        if total == 0.0 {
-            return Vec::new();
-        }
-
-        let mut metrics = Vec::with_capacity(sorted.len());
-        let mut cumulative = 0.0;
-        for &(family_size, count) in sorted.iter().rev() {
-            let fraction = count as f64 / total;
-            cumulative += fraction;
-            metrics.push(Self {
-                family_size,
-                count,
-                fraction,
-                fraction_gt_or_eq_family_size: cumulative,
-            });
-        }
-        metrics.reverse();
-        metrics
+        build_size_distribution(counts, |family_size, count, fraction, cumulative| Self {
+            family_size,
+            count,
+            fraction,
+            fraction_gt_or_eq_family_size: cumulative,
+        })
     }
 }
 
@@ -147,6 +160,65 @@ impl Default for FamilySizeMetrics {
 impl Metric for FamilySizeMetrics {
     fn metric_name() -> &'static str {
         "family size"
+    }
+}
+
+/// Position group size distribution metrics.
+///
+/// Describes how many distinct UMI families share the same genomic position
+/// (start coordinate and strand). This provides insight into the complexity
+/// of the library at each position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PositionGroupSizeMetrics {
+    /// Position group size (number of families at a position)
+    pub position_group_size: usize,
+
+    /// Number of positions with this group size
+    pub count: u64,
+
+    /// Fraction of all positions with this group size
+    pub fraction: f64,
+
+    /// Cumulative fraction (positions with group size >= this value)
+    pub fraction_gt_or_eq_position_group_size: f64,
+}
+
+impl PositionGroupSizeMetrics {
+    /// Creates a new position group size metric.
+    #[must_use]
+    pub fn new(position_group_size: usize) -> Self {
+        Self {
+            position_group_size,
+            count: 0,
+            fraction: 0.0,
+            fraction_gt_or_eq_position_group_size: 0.0,
+        }
+    }
+
+    /// Build position group size metrics from (`position_group_size`, count) pairs.
+    ///
+    /// Returns a `Vec` sorted by ascending position group size, with cumulative
+    /// fractions computed from largest to smallest.
+    #[must_use]
+    pub fn from_size_counts(counts: impl IntoIterator<Item = (usize, u64)>) -> Vec<Self> {
+        build_size_distribution(counts, |position_group_size, count, fraction, cumulative| Self {
+            position_group_size,
+            count,
+            fraction,
+            fraction_gt_or_eq_position_group_size: cumulative,
+        })
+    }
+}
+
+impl Default for PositionGroupSizeMetrics {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl Metric for PositionGroupSizeMetrics {
+    fn metric_name() -> &'static str {
+        "position group size"
     }
 }
 
@@ -201,6 +273,38 @@ mod tests {
     #[test]
     fn test_from_size_counts_empty() {
         let metrics = FamilySizeMetrics::from_size_counts(std::iter::empty());
+        assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn test_position_group_size_metrics_new() {
+        let metrics = PositionGroupSizeMetrics::new(5);
+        assert_eq!(metrics.position_group_size, 5);
+        assert_eq!(metrics.count, 0);
+        assert!(metrics.fraction.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_position_group_size_metric_name() {
+        assert_eq!(PositionGroupSizeMetrics::metric_name(), "position group size");
+    }
+
+    #[test]
+    fn test_position_group_size_from_size_counts() {
+        let counts = vec![(3, 1u64), (1, 1), (2, 1)];
+        let metrics = PositionGroupSizeMetrics::from_size_counts(counts);
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].position_group_size, 1);
+        assert_eq!(metrics[1].position_group_size, 2);
+        assert_eq!(metrics[2].position_group_size, 3);
+        assert!((metrics[0].fraction - 1.0 / 3.0).abs() < 1e-10);
+        assert!((metrics[0].fraction_gt_or_eq_position_group_size - 1.0).abs() < 1e-10);
+        assert!((metrics[2].fraction_gt_or_eq_position_group_size - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_position_group_size_from_size_counts_empty() {
+        let metrics = PositionGroupSizeMetrics::from_size_counts(std::iter::empty());
         assert!(metrics.is_empty());
     }
 }

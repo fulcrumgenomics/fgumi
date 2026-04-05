@@ -98,6 +98,16 @@ impl UmiCountTracker {
         self.counts.values().map(|(_, _, unique)| unique).sum()
     }
 
+    /// Merge another tracker into this one by summing counts for each UMI.
+    pub fn merge(&mut self, other: Self) {
+        for (umi, (raw, errors, unique)) in other.counts {
+            let entry = self.counts.entry(umi).or_insert((0, 0, 0));
+            entry.0 += raw;
+            entry.1 += errors;
+            entry.2 += unique;
+        }
+    }
+
     /// Iterates over all tracked UMIs, yielding `(umi, raw_count, error_count, unique_count)`.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, usize, usize, usize)> {
         self.counts.iter().map(|(umi, &(raw, errors, unique))| (umi.as_str(), raw, errors, unique))
@@ -235,5 +245,42 @@ mod tests {
         let tracker = UmiCountTracker::new();
         let metrics = tracker.to_metrics();
         assert!(metrics.is_empty());
+    }
+
+    // =========================================================================
+    // UmiCountTracker::merge tests
+    // =========================================================================
+
+    #[test]
+    fn test_umi_count_tracker_merge() {
+        let mut a = UmiCountTracker::new();
+        a.record("AAAA", 10, 2, true);
+        a.record("CCCC", 5, 0, true);
+
+        let mut b = UmiCountTracker::new();
+        b.record("AAAA", 3, 1, true);
+        b.record("GGGG", 7, 0, true);
+
+        a.merge(b);
+
+        assert_eq!(a.total_raw(), 25);
+        assert_eq!(a.total_unique(), 4);
+
+        let mut items: Vec<_> = a.iter().collect();
+        items.sort_by(|x, y| x.0.cmp(y.0));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], ("AAAA", 13, 3, 2));
+        assert_eq!(items[1], ("CCCC", 5, 0, 1));
+        assert_eq!(items[2], ("GGGG", 7, 0, 1));
+    }
+
+    #[test]
+    fn test_umi_count_tracker_merge_empty() {
+        let mut a = UmiCountTracker::new();
+        a.record("AAAA", 10, 0, true);
+        let b = UmiCountTracker::new();
+        a.merge(b);
+        assert_eq!(a.total_raw(), 10);
+        assert_eq!(a.iter().count(), 1);
     }
 }

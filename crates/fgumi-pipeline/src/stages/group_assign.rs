@@ -6,8 +6,8 @@
 //! for consensus calling.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use fgumi_lib::grouper::{
@@ -15,8 +15,12 @@ use fgumi_lib::grouper::{
     get_pair_orientation_raw, group_by_queryname,
 };
 use fgumi_lib::template::Template;
+use fgumi_metrics::downsampling::compute_hash_fraction;
+use fgumi_metrics::inline_collector::InlineCollector;
+use fgumi_metrics::template_info::{ReadInfoKey, TemplateInfo};
 use fgumi_raw_bam::update_string_tag;
 use fgumi_umi::{Umi, UmiAssigner};
+use noodles::sam::Header;
 
 use crate::stage::PipelineStage;
 
@@ -59,6 +63,10 @@ pub struct GroupAndAssignStage {
     /// Global base offset for molecule IDs, incremented atomically across
     /// position groups so that MI values are globally unique.
     next_mi: AtomicU64,
+    /// Optional shared inline metrics collector (protected by mutex for thread safety).
+    metrics_collector: Option<Arc<Mutex<InlineCollector>>>,
+    /// BAM header for `ref_name` lookups during metrics collection.
+    header: Option<Arc<Header>>,
 }
 
 impl GroupAndAssignStage {
@@ -76,12 +84,171 @@ impl GroupAndAssignStage {
         assign_tag: [u8; 2],
         group_filter_config: GroupFilterConfig,
     ) -> Self {
-        Self { assigner, umi_tag, assign_tag, group_filter_config, next_mi: AtomicU64::new(0) }
+        Self {
+            assigner,
+            umi_tag,
+            assign_tag,
+            group_filter_config,
+            next_mi: AtomicU64::new(0),
+            metrics_collector: None,
+            header: None,
+        }
+    }
+
+    /// Enables inline metrics collection with a shared collector and BAM header.
+    ///
+    /// The collector is shared across all worker threads (protected by a mutex).
+    /// The header is used for reference name lookups during template-to-metrics
+    /// conversion.
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        collector: Arc<Mutex<InlineCollector>>,
+        header: Arc<Header>,
+    ) -> Self {
+        self.metrics_collector = Some(collector);
+        self.header = Some(header);
+        self
     }
 
     /// Extract the UMI string from a template, delegating to the shared helper.
     fn extract_umi(&self, template: &Template) -> Result<Umi> {
         extract_umi_from_template(template, self.umi_tag)
+    }
+
+    /// Converts templates with assigned MIs into `TemplateInfo` for metrics collection.
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "genomic positions never exceed i32::MAX; ref_id is validated non-negative"
+    )]
+    fn build_template_infos(&self, templates: &[Template]) -> Vec<TemplateInfo> {
+        use fgumi_raw_bam::cigar::{alignment_end_from_raw, alignment_start_from_raw};
+        use fgumi_raw_bam::fields::ref_id;
+
+        let mut mi_buf = String::with_capacity(16);
+        templates
+            .iter()
+            .filter(|t| t.mi.id().is_some())
+            .map(|t| {
+                t.mi.write_with_offset(0, &mut mi_buf);
+                let mi = mi_buf.clone();
+                let rx = extract_umi_from_template(t, self.umi_tag).unwrap_or_default();
+                let read_name = String::from_utf8_lossy(&t.name);
+                let hash_fraction = compute_hash_fraction(&read_name);
+
+                // Extract position info from raw R1 and R2 bytes
+                let r1 = t.raw_r1();
+                let r2 = t.raw_r2();
+
+                let ref_name = [r1, r2].into_iter().flatten().find_map(|raw| {
+                    let rid = ref_id(raw);
+                    if rid < 0 {
+                        return None;
+                    }
+                    self.header.as_ref().and_then(|h| {
+                        h.reference_sequences()
+                            .get_index(rid as usize)
+                            .map(|(name, _)| name.to_string())
+                    })
+                });
+
+                let r1_start = r1.and_then(|raw| alignment_start_from_raw(raw).map(|p| p as i32));
+                let r2_start = r2.and_then(|raw| alignment_start_from_raw(raw).map(|p| p as i32));
+                let r1_end = r1.and_then(|raw| alignment_end_from_raw(raw).map(|p| p as i32));
+                let r2_end = r2.and_then(|raw| alignment_end_from_raw(raw).map(|p| p as i32));
+
+                let position = match (r1_start, r2_start) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                let end_position = match (r1_end, r2_end) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+
+                // Build ReadInfoKey from unclipped 5' positions and strand
+                let read_info_key = Self::build_read_info_key(r1, r2);
+
+                TemplateInfo {
+                    mi,
+                    rx,
+                    ref_name,
+                    position,
+                    end_position,
+                    hash_fraction,
+                    read_info_key,
+                }
+            })
+            .collect()
+    }
+
+    /// Builds a [`ReadInfoKey`] from raw R1 and R2 BAM records.
+    ///
+    /// Uses unclipped 5' positions, reference indices, and strand from both mates.
+    /// Fields are ordered so the earlier-mapping read comes first (matching fgbio).
+    #[expect(clippy::cast_sign_loss, reason = "ref_id validated non-negative before cast")]
+    fn build_read_info_key(r1: Option<&[u8]>, r2: Option<&[u8]>) -> ReadInfoKey {
+        use fgumi_raw_bam::cigar::unclipped_5prime_from_raw_bam;
+        use fgumi_raw_bam::fields::{flags as raw_flags, ref_id};
+
+        fn mate_info(raw: &[u8]) -> Option<(usize, i32, bool)> {
+            let rid = ref_id(raw);
+            if rid < 0 {
+                return None;
+            }
+            let flg = raw_flags(raw);
+            let unmapped = (flg & fgumi_raw_bam::fields::flags::UNMAPPED) != 0;
+            if unmapped {
+                return None;
+            }
+            let five_prime = unclipped_5prime_from_raw_bam(raw);
+            let reverse = (flg & fgumi_raw_bam::fields::flags::REVERSE) != 0;
+            Some((rid as usize, five_prime, reverse))
+        }
+
+        let r1_info = r1.and_then(mate_info);
+        let r2_info = r2.and_then(mate_info);
+
+        match (r1_info, r2_info) {
+            (Some((ref1, s1, strand1)), Some((ref2, s2, strand2))) => {
+                if (Some(ref1), s1) <= (Some(ref2), s2) {
+                    ReadInfoKey {
+                        ref_index1: Some(ref1),
+                        start1: s1,
+                        strand1,
+                        ref_index2: Some(ref2),
+                        start2: s2,
+                        strand2,
+                    }
+                } else {
+                    ReadInfoKey {
+                        ref_index1: Some(ref2),
+                        start1: s2,
+                        strand1: strand2,
+                        ref_index2: Some(ref1),
+                        start2: s1,
+                        strand2: strand1,
+                    }
+                }
+            }
+            (Some((ref1, s1, strand1)), None) => ReadInfoKey {
+                ref_index1: Some(ref1),
+                start1: s1,
+                strand1,
+                ..ReadInfoKey::default()
+            },
+            (None, Some((ref2, s2, strand2))) => ReadInfoKey {
+                ref_index1: Some(ref2),
+                start1: s2,
+                strand1: strand2,
+                ..ReadInfoKey::default()
+            },
+            (None, None) => ReadInfoKey::default(),
+        }
     }
 }
 
@@ -155,6 +322,15 @@ impl PipelineStage for GroupAndAssignStage {
                 for (idx, mi) in valid_indices.into_iter().zip(molecule_ids) {
                     templates[idx].mi = mi;
                 }
+            }
+        }
+
+        // 4b. Collect inline metrics if enabled.
+        if let Some(ref collector_arc) = self.metrics_collector {
+            let template_infos = self.build_template_infos(&templates);
+            match collector_arc.lock() {
+                Ok(mut collector) => collector.record_coordinate_group(&template_infos),
+                Err(e) => log::warn!("Skipping metrics for position group (mutex poisoned): {e}"),
             }
         }
 

@@ -85,6 +85,8 @@ impl Runall {
             info!("Parallel pipeline complete in {pipeline_elapsed:.1}s");
             timer.log_completion(0);
 
+            self.write_parallel_metrics(config.metrics_collector.as_ref())?;
+
             if let Some(ref metrics_path) = self.metrics {
                 let mut pm = PipelineMetrics::new();
                 pm.add("sort+group+consensus (parallel)", pipeline_elapsed, 0, 0);

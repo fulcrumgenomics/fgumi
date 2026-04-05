@@ -51,6 +51,7 @@ use crate::stages::consensus::{CallerFactory, ConsensusStage};
 use crate::stages::filter::FilterStage;
 use crate::stages::group_assign::{GroupAndAssignStage, MiGroup, PositionGroupBatch};
 use crate::stages::position_batch::PositionBatcher;
+use fgumi_metrics::inline_collector::InlineCollector;
 
 // ============================================================================
 // Configuration types
@@ -111,6 +112,10 @@ pub struct PipelineConfig {
     pub sort_memory_limit: usize,
     /// Temporary directory for sort spill files.
     pub sort_temp_dir: Option<PathBuf>,
+
+    // -- Metrics config --
+    /// Optional shared inline metrics collector for consensus metrics.
+    pub metrics_collector: Option<Arc<Mutex<InlineCollector>>>,
 }
 
 /// Configuration for the full two-phase pipeline: Phase A (extract → align → zipper → sort)
@@ -622,12 +627,17 @@ impl Zone3 {
         }));
 
         // -- Stages --
-        let group_assign_stage = Arc::new(GroupAndAssignStage::new(
+        let mut group_assign_stage = GroupAndAssignStage::new(
             Arc::clone(&config.assigner),
             config.umi_tag,
             config.assign_tag,
             config.group_filter_config.clone(),
-        ));
+        );
+        if let Some(collector) = &config.metrics_collector {
+            group_assign_stage =
+                group_assign_stage.with_metrics(Arc::clone(collector), Arc::new(header.clone()));
+        }
+        let group_assign_stage = Arc::new(group_assign_stage);
         let consensus_stage = Arc::new(ConsensusStage::new(Arc::clone(&config.caller_factory)));
         let filter_stage =
             Arc::new(FilterStage::new(config.filter_config.clone(), config.require_ss_agreement));

@@ -477,6 +477,9 @@ impl Runall {
             }
         };
 
+        // Save a reference to the metrics collector before pipeline_config is consumed.
+        let metrics_collector = pipeline_config.metrics_collector.clone();
+
         let two_phase_config = TwoPhaseConfig {
             extract_source,
             extract_params,
@@ -504,6 +507,8 @@ impl Runall {
         let pipeline_elapsed = pipeline_start.elapsed().as_secs_f64();
         info!("Two-phase parallel pipeline complete in {pipeline_elapsed:.1}s");
         timer.log_completion(0);
+
+        self.write_parallel_metrics(metrics_collector.as_ref())?;
 
         Ok(())
     }

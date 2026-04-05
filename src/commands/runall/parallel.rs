@@ -225,6 +225,57 @@ impl Runall {
             compression_level: self.compression_level,
             sort_memory_limit: self.sort_opts.sort_memory_limit,
             sort_temp_dir: self.sort_opts.sort_temp_dir.clone(),
+            metrics_collector: self.build_metrics_collector()?,
         })
+    }
+
+    /// Build an inline metrics collector if `--consensus-metrics` is set.
+    pub(super) fn build_inline_collector(
+        &self,
+    ) -> Result<Option<fgumi_metrics::inline_collector::InlineCollector>> {
+        use fgumi_metrics::inline_collector::{InlineCollector, InlineMetricsCollector};
+
+        if self.consensus_metrics.is_none() {
+            return Ok(None);
+        }
+
+        let intervals = self
+            .intervals
+            .as_ref()
+            .map(|p| fgumi_metrics::intervals::parse_intervals(p))
+            .transpose()?
+            .unwrap_or_default();
+
+        let collector = match self.consensus_mode {
+            ConsensusMode::Simplex => {
+                InlineCollector::Simplex(InlineMetricsCollector::new(intervals))
+            }
+            ConsensusMode::Duplex | ConsensusMode::Codec => {
+                InlineCollector::Duplex(InlineMetricsCollector::new(intervals))
+            }
+        };
+
+        Ok(Some(collector))
+    }
+
+    /// Build a shared (thread-safe) inline metrics collector for the parallel pipeline.
+    fn build_metrics_collector(
+        &self,
+    ) -> Result<Option<Arc<std::sync::Mutex<fgumi_metrics::inline_collector::InlineCollector>>>>
+    {
+        Ok(self.build_inline_collector()?.map(|c| Arc::new(std::sync::Mutex::new(c))))
+    }
+
+    /// Write inline consensus metrics from a shared collector, if enabled.
+    pub(super) fn write_parallel_metrics(
+        &self,
+        collector: Option<&Arc<std::sync::Mutex<fgumi_metrics::inline_collector::InlineCollector>>>,
+    ) -> Result<()> {
+        if let (Some(prefix), Some(collector_arc)) = (&self.consensus_metrics, collector) {
+            let collector = collector_arc.lock().expect("metrics collector lock poisoned");
+            collector.write_metrics(prefix)?;
+            log::info!("Consensus metrics written to {}.*", prefix.display());
+        }
+        Ok(())
     }
 }

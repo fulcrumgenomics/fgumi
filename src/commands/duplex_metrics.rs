@@ -1753,17 +1753,33 @@ mod tests {
             position: Some(1000),
             end_position: Some(1100),
             hash_fraction: 0.5,
+            read_info_key: fgumi_metrics::ReadInfoKey::default(),
         };
 
-        assert!(overlaps_intervals(&template, &[]));
+        assert!(overlaps_intervals(
+            template.ref_name.as_deref(),
+            template.position,
+            template.end_position,
+            &[],
+        ));
 
         // Test with matching interval
         let intervals = vec![Interval { ref_name: "chr1".to_string(), start: 900, end: 1050 }];
-        assert!(overlaps_intervals(&template, &intervals));
+        assert!(overlaps_intervals(
+            template.ref_name.as_deref(),
+            template.position,
+            template.end_position,
+            &intervals,
+        ));
 
         // Test with non-matching interval
         let intervals = vec![Interval { ref_name: "chr1".to_string(), start: 2000, end: 3000 }];
-        assert!(!overlaps_intervals(&template, &intervals));
+        assert!(!overlaps_intervals(
+            template.ref_name.as_deref(),
+            template.position,
+            template.end_position,
+            &intervals,
+        ));
 
         // Test unmapped template
         let unmapped = TemplateInfo {
@@ -1773,8 +1789,14 @@ mod tests {
             position: None,
             end_position: None,
             hash_fraction: 0.5,
+            read_info_key: fgumi_metrics::ReadInfoKey::default(),
         };
-        assert!(!overlaps_intervals(&unmapped, &intervals));
+        assert!(!overlaps_intervals(
+            unmapped.ref_name.as_deref(),
+            unmapped.position,
+            unmapped.end_position,
+            &intervals,
+        ));
     }
 
     #[test]

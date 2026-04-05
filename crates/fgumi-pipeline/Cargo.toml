@@ -14,6 +14,7 @@ fgumi-sam = { workspace = true }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
 fgumi-umi = { workspace = true }
 fgumi-derive = { workspace = true }
+fgumi-metrics = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["string"] }
 crossbeam-channel = { workspace = true }
