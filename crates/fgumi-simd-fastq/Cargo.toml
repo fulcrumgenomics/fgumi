@@ -10,11 +10,11 @@ license.workspace = true
 [dependencies]
 
 [dev-dependencies]
-rstest = "0"
-proptest = "1.10"
-criterion = { version = "0.8", features = ["html_reports"] }
-memchr = "2"
-seq_io = "0.3.4"
+rstest = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+memchr = { workspace = true }
+seq_io = { workspace = true }
 
 [[bench]]
 name = "fastq_parsing"

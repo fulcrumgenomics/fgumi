@@ -8,14 +8,14 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-noodles = { version = "0.106.0", features = ["bam", "sam", "core"] }
+noodles = { workspace = true, features = ["bam", "sam", "core"] }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
-bstr = "1.12.1"
-clap = { version = "4", features = ["derive"] }
-log = "0"
-anyhow = "1.0"
+bstr = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
 fgumi-dna = { workspace = true }
-tempfile = "3.3.0"
+tempfile = { workspace = true }
 
 [dev-dependencies]
 fgumi-raw-bam = { workspace = true, features = ["test-utils"] }

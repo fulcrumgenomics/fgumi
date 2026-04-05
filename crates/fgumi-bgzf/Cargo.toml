@@ -8,9 +8,9 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-libdeflater = "1.22"
-crc32fast = "1.4"
-bgzf = "0.3.0"
+libdeflater = { workspace = true }
+crc32fast = { workspace = true }
+bgzf = { workspace = true }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
