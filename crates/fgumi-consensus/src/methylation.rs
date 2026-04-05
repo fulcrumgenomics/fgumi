@@ -21,10 +21,12 @@ pub struct MethylationEvidence {
     pub is_ref_c: bool,
     /// Number of reads showing C (unconverted) at this ref-C position.
     /// For bottom strand (after RC): number showing G (complement of unconverted C).
-    pub unconverted_count: i16,
+    /// Stored as u32 to avoid overflow at high coverage; clamped to i16 on output.
+    pub unconverted_count: u32,
     /// Number of reads showing T (converted) at this ref-C position.
     /// For bottom strand (after RC): number showing A (complement of converted T).
-    pub converted_count: i16,
+    /// Stored as u32 to avoid overflow at high coverage; clamped to i16 on output.
+    pub converted_count: u32,
 }
 
 /// Methylation annotation for an entire consensus read.
@@ -36,15 +38,20 @@ pub struct MethylationAnnotation {
 
 impl MethylationAnnotation {
     /// Returns the unconverted counts as an i16 array for the `cu` tag.
+    /// Values are clamped to `i16::MAX` to fit the BAM tag format.
     #[must_use]
     pub fn unconverted_counts(&self) -> Vec<i16> {
-        self.evidence.iter().map(|e| e.unconverted_count).collect()
+        self.evidence
+            .iter()
+            .map(|e| i16::try_from(e.unconverted_count).unwrap_or(i16::MAX))
+            .collect()
     }
 
     /// Returns the converted counts as an i16 array for the `ct` tag.
+    /// Values are clamped to `i16::MAX` to fit the BAM tag format.
     #[must_use]
     pub fn converted_counts(&self) -> Vec<i16> {
-        self.evidence.iter().map(|e| e.converted_count).collect()
+        self.evidence.iter().map(|e| i16::try_from(e.converted_count).unwrap_or(i16::MAX)).collect()
     }
 
     /// Returns a truncated copy of this annotation with only the first `len` positions.
@@ -249,14 +256,10 @@ pub fn build_mm_ml_tags(
 
         if ev.is_ref_c {
             // This is a ref-C position with a C/G in consensus
-            let total = i32::from(ev.unconverted_count) + i32::from(ev.converted_count);
+            let total = u64::from(ev.unconverted_count) + u64::from(ev.converted_count);
             if total > 0 {
                 // Methylation probability = unconverted / total, scaled to [0, 255]
-                #[expect(
-                    clippy::cast_sign_loss,
-                    reason = "values are known non-negative and bounded by 255"
-                )]
-                let prob = (i32::from(ev.unconverted_count) * 255 / total).clamp(0, 255) as u8;
+                let prob = (u64::from(ev.unconverted_count) * 255 / total).min(255) as u8;
                 skips.push(skip_count);
                 probs.push(prob);
                 skip_count = 0;
