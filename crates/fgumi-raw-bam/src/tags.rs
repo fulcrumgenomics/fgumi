@@ -519,6 +519,24 @@ pub fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16])
     }
 }
 
+/// Append a `u8` array (`B:C`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 'C', count_u32_le, values_u8...]`
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`.
+pub fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u8]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b'C');
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
+    record.extend_from_slice(values);
+}
+
 /// Append a Phred+33 encoded quality string (`Z`-type) tag.
 ///
 /// Converts raw Phred scores (0-93) to ASCII (Phred+33) and writes
@@ -2418,5 +2436,30 @@ mod tests {
         let mut dest = Vec::new();
         copy_aux_tags(&[], &mut dest, &[]);
         assert!(dest.is_empty());
+    }
+
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::single(&[42u8])]
+    #[case::multiple(&[0u8, 128, 255])]
+    fn test_append_u8_array_tag_round_trip(#[case] values: &[u8]) {
+        let tag = b"ML";
+        let mut record = Vec::new();
+        append_u8_array_tag(&mut record, tag, values);
+
+        // Verify wire format: [tag0, tag1, 'B', 'C', count_u32_le, values...]
+        assert_eq!(record[0], b'M');
+        assert_eq!(record[1], b'L');
+        assert_eq!(record[2], b'B');
+        assert_eq!(record[3], b'C');
+        let count = u32::from_le_bytes([record[4], record[5], record[6], record[7]]) as usize;
+        assert_eq!(count, values.len());
+        assert_eq!(&record[8..], values);
+
+        // Round-trip through find_array_tag
+        let arr = find_array_tag(&record, tag).expect("tag should be found");
+        assert_eq!(arr.elem_type, b'C');
+        assert_eq!(arr.count, values.len());
+        assert_eq!(arr.data, values);
     }
 }

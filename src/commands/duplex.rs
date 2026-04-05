@@ -47,6 +47,8 @@ use std::sync::Arc;
 
 use super::command::Command;
 
+use super::common::{EmSeqRef, load_em_seq_reference};
+
 // ============================================================================
 // Types for 7-step pipeline processing
 // ============================================================================
@@ -195,6 +197,16 @@ pub struct Duplex {
     /// Queue memory options.
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
+
+    /// Enable EM-Seq methylation-aware consensus calling.
+    /// When enabled, unconverted C/T counts are tracked at reference cytosine positions
+    /// and MM/ML methylation tags are emitted on consensus reads.
+    #[arg(long = "em-seq", default_value_t = false, requires = "reference")]
+    pub em_seq: bool,
+
+    /// Path to the reference FASTA file (required when --em-seq is enabled)
+    #[arg(long = "ref")]
+    pub reference: Option<std::path::PathBuf>,
 }
 
 impl Command for Duplex {
@@ -256,6 +268,9 @@ impl Command for Duplex {
     ///     max_reads_per_strand: None,
     ///     cell_tag: None,
     ///     scheduler_opts: SchedulerOptions::default(),
+    ///     queue_memory: QueueMemoryOptions::default(),
+    ///     em_seq: false,
+    ///     reference: None,
     /// };
     ///
     /// duplex.execute("test")?;
@@ -304,6 +319,9 @@ impl Command for Duplex {
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
 
+        // Load reference for EM-Seq methylation-aware consensus calling
+        let em_seq_ref: EmSeqRef = load_em_seq_reference(self.em_seq, &self.reference, &header)?;
+
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
         let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
         if overlapping_enabled {
@@ -327,6 +345,7 @@ impl Command for Duplex {
                 read_name_prefix.clone(),
                 track_rejects,
                 command_line,
+                em_seq_ref.clone(),
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
             return result;
@@ -370,6 +389,11 @@ impl Command for Duplex {
             self.consensus.error_rate_pre_umi,
             self.consensus.error_rate_post_umi,
         )?;
+
+        // Set reference for EM-Seq if enabled
+        if let Some((ref reference, ref ref_names)) = em_seq_ref {
+            consensus_caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+        }
 
         // Accumulator for overlapping stats from parallel processing
         let mut merged_overlapping_stats = CorrectionStats::new();
@@ -510,6 +534,7 @@ impl Duplex {
     ///
     /// This method is called when `--threads N` is specified with N > 1.
     /// It uses the lock-free 7-step unified pipeline for maximum performance.
+    #[expect(clippy::too_many_arguments, reason = "pipeline setup needs all configuration")]
     fn execute_threads_mode(
         &self,
         num_threads: usize,
@@ -518,6 +543,7 @@ impl Duplex {
         read_name_prefix: String,
         track_rejects: bool,
         command_line: &str,
+        em_seq_ref: EmSeqRef,
     ) -> Result<()> {
         // Create output header (for duplex, output is unmapped like simplex)
         let output_header = create_unmapped_consensus_header(
@@ -620,6 +646,11 @@ impl Duplex {
                 .map_err(|e| {
                     io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
                 })?;
+
+                // Set reference for EM-Seq if enabled
+                if let Some((ref reference, ref ref_names)) = em_seq_ref {
+                    caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+                }
 
                 // Create overlapping caller if enabled
                 let mut overlapping_caller = if overlapping_enabled {
@@ -875,6 +906,8 @@ mod tests {
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            em_seq: false,
+            reference: None,
         }
     }
 
@@ -1643,5 +1676,75 @@ mod tests {
         let estimate = batch.estimate_heap_size();
         assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
         assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
+    }
+
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn test_duplex_em_seq_command(#[case] threading: ThreadingOptions) -> Result<()> {
+        use std::io::Write;
+
+        // Create a FASTA with chr1 containing C bases at the aligned region
+        let ref_seq = "C".repeat(300);
+        let ref_file = {
+            let mut f = tempfile::NamedTempFile::new()?;
+            writeln!(f, ">chr1")?;
+            writeln!(f, "{ref_seq}")?;
+            f.flush()?;
+            f
+        };
+
+        // Create properly structured AB/BA duplex pairs
+        let mut records = Vec::new();
+
+        // AB reads: R1 forward at 100, R2 reverse at 100
+        for i in 0..3 {
+            let (r1, r2) =
+                build_duplex_pair(&format!("ab{i}"), 0, 100, 100, "1/A", "CCCCCCCCCC", None, None);
+            records.push(r1);
+            records.push(r2);
+        }
+
+        // BA reads: R1 reverse at 100, R2 forward at 100 (opposite strand orientation)
+        for i in 0..3 {
+            let flags1 = 0x53_u16; // paired, proper pair, first in pair, reverse
+            let flags2 = 0x83_u16; // paired, proper pair, second in pair, forward
+            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, "CCCCCCCCCC");
+            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, "CCCCCCCCCC");
+
+            *r1.mate_reference_sequence_id_mut() = Some(0);
+            *r1.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();
+            *r2.mate_reference_sequence_id_mut() = Some(0);
+            *r2.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();
+
+            let mi = Tag::from([b'M', b'I']);
+            r1.data_mut().insert(mi, Value::String(b"1/B".into()));
+            r2.data_mut().insert(mi, Value::String(b"1/B".into()));
+
+            records.push(r1);
+            records.push(r2);
+        }
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let mut cmd = create_duplex_with_paths(input.path().to_path_buf(), paths.output.clone());
+        cmd.em_seq = true;
+        cmd.reference = Some(ref_file.path().to_path_buf());
+        cmd.threading = threading;
+        cmd.execute("test")?;
+
+        let output_records = read_bam_records(&paths.output)?;
+        assert_eq!(output_records.len(), 2, "Should have 2 duplex consensus reads");
+
+        // Verify methylation tags are present on output reads
+        for record in &output_records {
+            let cu_tag = Tag::from([b'c', b'u']);
+            assert!(record.data().get(&cu_tag).is_some(), "cu tag should be present with EM-Seq");
+            let ct_tag = Tag::from([b'c', b't']);
+            assert!(record.data().get(&ct_tag).is_some(), "ct tag should be present with EM-Seq");
+        }
+
+        Ok(())
     }
 }
