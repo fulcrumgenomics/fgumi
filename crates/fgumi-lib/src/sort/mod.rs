@@ -42,12 +42,13 @@ pub mod radix;
 pub mod raw;
 pub mod raw_bam_reader;
 pub mod read_ahead;
+pub mod sink;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Statistics from a sort operation.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct SortStats {
     /// Total records read from input.
     pub total_records: u64,
@@ -140,7 +141,11 @@ pub use keys::{
     SortOrder, natural_compare, normalize_natural_key,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
-pub use raw::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline};
+pub use raw::{
+    LibraryLookup, RawExternalSorter, SortedChunks, cb_hasher, extract_template_key_inline,
+    merge_sorted_chunks_to_sink,
+};
+pub use sink::{BamWriterSink, SortedRecordSink};
 
 #[cfg(test)]
 mod tests {
@@ -199,7 +204,7 @@ mod tests {
             .expect("valid header");
         let header = Header::builder().set_header(hd).build();
 
-        // Re-sort as coordinate — GO and SS should be removed.
+        // Re-sort as coordinate -- GO and SS should be removed.
         let output = create_output_header(keys::SortOrder::Coordinate, &header);
 
         let hd = output.header().expect("should have @HD");

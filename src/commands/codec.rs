@@ -16,6 +16,7 @@ use fgumi_lib::bam_io::{
     create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader,
 };
+use fgumi_lib::defaults;
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, QueueMemoryOptions,
@@ -188,7 +189,7 @@ pub struct Codec {
 
     // --- CODEC-specific options below ---
     /// Minimum read pairs per strand to form consensus (same as --min-reads)
-    #[arg(short = 'M', long = "min-reads", default_value = "1")]
+    #[arg(short = 'M', long = "min-reads", default_value_t = defaults::CODEC_MIN_READS)]
     pub min_reads: usize,
 
     /// Maximum read pairs per strand (downsample if exceeded)
@@ -196,7 +197,7 @@ pub struct Codec {
     pub max_reads: Option<usize>,
 
     /// Minimum duplex overlap length in bases
-    #[arg(short = 'd', long = "min-duplex-length", default_value = "1")]
+    #[arg(short = 'd', long = "min-duplex-length", default_value_t = defaults::CODEC_MIN_DUPLEX_LENGTH)]
     pub min_duplex_length: usize,
 
     /// Reduce single-strand region quality to this value (0-93).
@@ -209,11 +210,11 @@ pub struct Codec {
     pub outer_bases_qual: Option<u8>,
 
     /// Number of outer bases to reduce quality for
-    #[arg(short = 'O', long = "outer-bases-length", default_value = "5")]
+    #[arg(short = 'O', long = "outer-bases-length", default_value_t = defaults::CODEC_OUTER_BASES_LENGTH)]
     pub outer_bases_length: usize,
 
     /// Maximum duplex disagreement rate (0.0-1.0)
-    #[arg(short = 'x', long = "max-duplex-disagreement-rate", default_value = "1.0")]
+    #[arg(short = 'x', long = "max-duplex-disagreement-rate", default_value_t = defaults::CODEC_MAX_DUPLEX_DISAGREEMENT_RATE)]
     pub max_duplex_disagreement_rate: f64,
 
     /// Maximum number of duplex disagreements
@@ -221,7 +222,7 @@ pub struct Codec {
     pub max_duplex_disagreements: Option<usize>,
 
     /// SAM tag containing the cell barcode
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: Option<String>,
 
     /// Scheduler and pipeline statistics options.

@@ -13,12 +13,14 @@ use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
+use fgumi_lib::defaults;
 use fgumi_lib::grouper::{
-    FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
-    build_templates_from_records,
+    FilterMetrics, GroupFilterConfig, ProcessedPositionGroup, RawPositionGroup,
+    RecordPositionGrouper, build_templates_from_records, filter_template_raw,
+    get_pair_orientation_raw,
 };
 use fgumi_lib::logging::{OperationTimer, log_umi_grouping_summary};
-use fgumi_lib::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
+use fgumi_lib::metrics::group::{FamilySizeMetrics, UmiGroupingMetrics};
 use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
 use fgumi_lib::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
@@ -42,7 +44,7 @@ use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Estimate total heap size of a template slice using sampling for large batches.
@@ -68,26 +70,7 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
 #[derive(Default, Debug)]
 struct CollectedMetrics {
     family_sizes: AHashMap<usize, u64>,
-    /// Number of UMI families in this position group.
-    position_group_size: usize,
     filter_metrics: FilterMetrics,
-}
-
-/// Configuration for template filtering during group processing.
-#[derive(Clone)]
-struct GroupFilterConfig {
-    /// UMI tag bytes (e.g., [b'R', b'X']).
-    umi_tag: [u8; 2],
-    /// Minimum mapping quality.
-    min_mapq: u8,
-    /// Whether to include non-PF reads.
-    include_non_pf: bool,
-    /// Minimum UMI length (None to disable).
-    min_umi_length: Option<usize>,
-    /// Skip UMI validation (position-only grouping).
-    no_umi: bool,
-    /// Whether to allow fully unmapped templates (both reads unmapped).
-    allow_unmapped: bool,
 }
 
 /// Filter a template based on filtering criteria.
@@ -202,159 +185,8 @@ fn filter_template(
 }
 
 // =============================================================================
-// Raw-byte filter and helper functions
+// Raw-byte helper functions
 // =============================================================================
-
-/// Filter a template in raw-byte mode based on filtering criteria.
-/// Returns true if the template should be kept, false if it should be discarded.
-fn filter_template_raw(
-    template: &Template,
-    config: &GroupFilterConfig,
-    metrics: &mut FilterMetrics,
-) -> bool {
-    use fgumi_lib::sort::bam_fields;
-
-    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-
-    let num_primary_reads = raw_r1.is_some() as u64 + raw_r2.is_some() as u64;
-    metrics.total_templates += num_primary_reads;
-
-    if raw_r1.is_none() && raw_r2.is_none() {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Check if both reads are unmapped
-    let both_unmapped = raw_r1
-        .is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0)
-        && raw_r2.is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0);
-    if both_unmapped && !config.allow_unmapped {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Phase 1: Cheap flag-based checks
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
-
-        if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
-            metrics.discarded_non_pf += num_primary_reads;
-            return false;
-        }
-
-        if (flg & bam_fields::flags::UNMAPPED) == 0 && bam_fields::mapq(raw) < config.min_mapq {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
-    for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
-        let aux = bam_fields::aux_data_slice(raw);
-        let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
-        let check_umi = !config.no_umi;
-
-        // Single pass over aux data to find both MQ and UMI tags
-        let mut found_mq: Option<i64> = None;
-        let mut found_umi: Option<&[u8]> = None;
-        let mut p = 0;
-        while p + 3 <= aux.len() {
-            let t = [aux[p], aux[p + 1]];
-            let val_type = aux[p + 2];
-
-            if check_umi && t == config.umi_tag && val_type == b'Z' {
-                let start = p + 3;
-                if let Some(end) = aux[start..].iter().position(|&b| b == 0) {
-                    found_umi = Some(&aux[start..start + end]);
-                    p = start + end + 1;
-                } else {
-                    break;
-                }
-                if !check_mq || found_mq.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            if check_mq && t == *b"MQ" {
-                // Extract MQ value (common types: C/c/S/s/I/i)
-                found_mq = match val_type {
-                    b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
-                    b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
-                    b'S' if p + 5 <= aux.len() => {
-                        Some(i64::from(u16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b's' if p + 5 <= aux.len() => {
-                        Some(i64::from(i16::from_le_bytes([aux[p + 3], aux[p + 4]])))
-                    }
-                    b'I' if p + 7 <= aux.len() => Some(i64::from(u32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    b'i' if p + 7 <= aux.len() => Some(i64::from(i32::from_le_bytes([
-                        aux[p + 3],
-                        aux[p + 4],
-                        aux[p + 5],
-                        aux[p + 6],
-                    ]))),
-                    _ => None,
-                };
-            }
-
-            if let Some(size) = bam_fields::tag_value_size(val_type, &aux[p + 3..]) {
-                p += 3 + size;
-            } else {
-                break;
-            }
-            if (!check_umi || found_umi.is_some()) && (!check_mq || found_mq.is_some()) {
-                break;
-            }
-        }
-
-        // Check mate MAPQ
-        if check_mq {
-            if let Some(mq) = found_mq {
-                if (mq as u8) < config.min_mapq {
-                    metrics.discarded_poor_alignment += num_primary_reads;
-                    return false;
-                }
-            }
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        // Check UMI for Ns and minimum length
-        if let Some(umi_bytes) = found_umi {
-            match validate_umi(umi_bytes) {
-                UmiValidation::ContainsN => {
-                    metrics.discarded_ns_in_umi += num_primary_reads;
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length {
-                        if base_count < min_len {
-                            metrics.discarded_umi_too_short += num_primary_reads;
-                            return false;
-                        }
-                    }
-                }
-            }
-        } else {
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    metrics.accepted_templates += num_primary_reads;
-    true
-}
 
 /// Check if R1 is genomically earlier than R2 using raw bytes.
 ///
@@ -371,17 +203,6 @@ fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
     let r1_pos = bam_fields::unclipped_5prime_from_raw_bam(r1);
     let r2_pos = bam_fields::unclipped_5prime_from_raw_bam(r2);
     r1_pos <= r2_pos
-}
-
-/// Get pair orientation from raw-byte template.
-fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
-    use fgumi_lib::sort::bam_fields;
-
-    let r1_positive =
-        template.raw_r1().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
-    let r2_positive =
-        template.raw_r2().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
-    (r1_positive, r2_positive)
 }
 
 // =============================================================================
@@ -743,20 +564,12 @@ pub struct GroupReadsByUmi {
     #[arg(short = 'g', long = "grouping-metrics")]
     pub grouping_metrics: Option<PathBuf>,
 
-    /// Output prefix for all group metrics files.
-    ///
-    /// Writes `PREFIX.family_sizes.txt`, `PREFIX.grouping_metrics.txt`,
-    /// and `PREFIX.position_group_sizes.txt`. Can be used alongside
-    /// `--family-size-histogram` and `--grouping-metrics`.
-    #[arg(short = 'M', long = "metrics")]
-    pub metrics: Option<PathBuf>,
-
     /// The tag containing the raw UMI
-    #[arg(short = 't', long = "raw-tag", default_value = "RX")]
+    #[arg(short = 't', long = "raw-tag", default_value = defaults::UMI_TAG)]
     pub raw_tag: String,
 
     /// The output tag for UMI grouping
-    #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
+    #[arg(short = 'T', long = "assign-tag", default_value = defaults::MI_TAG)]
     pub assign_tag: String,
 
     /// SAM tag containing the cell barcode.
@@ -764,7 +577,7 @@ pub struct GroupReadsByUmi {
     /// When set, reads at the same genomic coordinates are partitioned by cell barcode before
     /// UMI assignment, so reads from different cells are never grouped together even if they
     /// share a UMI and position. No correction is performed on the cell barcode itself.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: String,
 
     /// Minimum mapping quality for mapped reads
@@ -797,7 +610,7 @@ pub struct GroupReadsByUmi {
     pub strategy: Strategy,
 
     /// The allowable number of edits between UMIs
-    #[arg(short = 'e', long = "edits", default_value = "1")]
+    #[arg(short = 'e', long = "edits", default_value_t = defaults::GROUP_MAX_EDITS)]
     pub edits: u32,
 
     /// The minimum UMI length
@@ -814,7 +627,7 @@ pub struct GroupReadsByUmi {
 
     /// Minimum UMIs per position to use N-gram/BK-tree index for faster grouping.
     /// Set to 0 to always use linear scan. Only affects Adjacency/Paired strategies.
-    #[arg(long = "index-threshold", default_value = "100")]
+    #[arg(long = "index-threshold", default_value_t = defaults::GROUP_INDEX_THRESHOLD)]
     pub index_threshold: usize,
 
     /// Skip UMI-based grouping; group by position only. Forces identity strategy
@@ -1172,11 +985,11 @@ impl Command for GroupReadsByUmi {
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
-                        filter_metrics: FilterMetrics::new(),
+                        filter_metrics: FilterMetrics::default(),
                         input_record_count,
                     });
                 }
-                let mut filter_metrics = FilterMetrics::new();
+                let mut filter_metrics = FilterMetrics::default();
 
                 // Track memory usage if debug mode is enabled (optimized for hot path)
                 #[cfg(feature = "memory-debug")]
@@ -1376,10 +1189,8 @@ impl Command for GroupReadsByUmi {
                     return Ok(count);
                 }
                 // Collect metrics for later aggregation
-                let position_group_size: u64 = processed.family_sizes.values().sum();
                 let metrics = CollectedMetrics {
                     family_sizes: processed.family_sizes,
-                    position_group_size: position_group_size as usize,
                     filter_metrics: processed.filter_metrics,
                 };
 
@@ -1511,15 +1322,11 @@ impl Command for GroupReadsByUmi {
         // Aggregate collected metrics from lock-free SegQueue
         // Drain all metrics and merge them
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_metrics = FilterMetrics::default();
 
         while let Some(m) = collected_metrics.pop() {
             for (size, count) in m.family_sizes {
                 *family_size_counter.entry(size).or_insert(0) += count;
-            }
-            if m.position_group_size > 0 {
-                *position_group_size_counter.entry(m.position_group_size).or_insert(0) += 1;
             }
             total_filter_metrics.merge(&m.filter_metrics);
         }
@@ -1527,11 +1334,27 @@ impl Command for GroupReadsByUmi {
         let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
         log_umi_grouping_summary(&metrics);
 
-        // Write all metrics (individual flags and --metrics prefix)
-        self.write_all_metrics(&metrics, &family_size_counter, &position_group_size_counter)?;
+        // Write family size histogram
+        if let Some(path) = &self.family_size_histogram {
+            self.write_family_size_histogram(&family_size_counter).with_context(|| {
+                format!("Failed to write family size histogram: {}", path.display())
+            })?;
+            info!("Wrote family size histogram to {}", path.display());
+        }
+
+        // Save accepted_records before moving metrics
+        let accepted_records = metrics.accepted_records;
+
+        // Write grouping metrics using new metrics structure
+        if let Some(path) = &self.grouping_metrics {
+            DelimFile::default()
+                .write_tsv(path, [metrics])
+                .with_context(|| format!("Failed to write grouping metrics: {}", path.display()))?;
+            info!("Wrote grouping metrics to {}", path.display());
+        }
 
         // Log completion with timing
-        timer.log_completion(metrics.accepted_records);
+        timer.log_completion(accepted_records);
 
         info!("group completed successfully");
         info!("Records processed by pipeline: {records_processed}");
@@ -1579,9 +1402,8 @@ impl GroupReadsByUmi {
         let mut grouper = RecordPositionGrouper::new();
 
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_metrics = FilterMetrics::default();
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut next_mi_base: u64 = 0;
 
         // Progress tracking
@@ -1611,7 +1433,6 @@ impl GroupReadsByUmi {
                     assign_tag_bytes,
                     &mut total_filter_metrics,
                     &mut family_size_counter,
-                    &mut position_group_size_counter,
                     &mut next_mi_base,
                     header,
                     &mut writer,
@@ -1634,7 +1455,6 @@ impl GroupReadsByUmi {
                 assign_tag_bytes,
                 &mut total_filter_metrics,
                 &mut family_size_counter,
-                &mut position_group_size_counter,
                 &mut next_mi_base,
                 header,
                 &mut writer,
@@ -1650,11 +1470,27 @@ impl GroupReadsByUmi {
         let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
         log_umi_grouping_summary(&metrics);
 
-        // Write all metrics (individual flags and --metrics prefix)
-        self.write_all_metrics(&metrics, &family_size_counter, &position_group_size_counter)?;
+        // Write family size histogram
+        if let Some(path) = &self.family_size_histogram {
+            self.write_family_size_histogram(&family_size_counter).with_context(|| {
+                format!("Failed to write family size histogram: {}", path.display())
+            })?;
+            info!("Wrote family size histogram to {}", path.display());
+        }
+
+        // Save accepted_records before moving metrics
+        let accepted_records = metrics.accepted_records;
+
+        // Write grouping metrics
+        if let Some(path) = &self.grouping_metrics {
+            DelimFile::default()
+                .write_tsv(path, [metrics])
+                .with_context(|| format!("Failed to write grouping metrics: {}", path.display()))?;
+            info!("Wrote grouping metrics to {}", path.display());
+        }
 
         // Log completion with timing
-        timer.log_completion(metrics.accepted_records);
+        timer.log_completion(accepted_records);
 
         info!("group completed successfully");
         Ok(())
@@ -1674,7 +1510,6 @@ impl GroupReadsByUmi {
         assign_tag_bytes: [u8; 2],
         total_filter_metrics: &mut FilterMetrics,
         family_size_counter: &mut AHashMap<usize, u64>,
-        position_group_size_counter: &mut AHashMap<usize, u64>,
         next_mi_base: &mut u64,
         header: &Header,
         writer: &mut fgumi_lib::bam_io::BamWriter,
@@ -1682,7 +1517,7 @@ impl GroupReadsByUmi {
         // Build templates from raw records
         let all_templates = build_templates_from_records(group.records)?;
 
-        let mut filter_metrics = FilterMetrics::new();
+        let mut filter_metrics = FilterMetrics::default();
 
         // Filter templates
         let filtered_templates: Vec<Template> = all_templates
@@ -1734,11 +1569,10 @@ impl GroupReadsByUmi {
             a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
         });
 
-        // Count family sizes and position group size in one pass through sorted templates
+        // Count family sizes in one pass through sorted templates
         if !templates.is_empty() {
             let mut current_mi = templates[0].mi.to_vec_index();
             let mut current_count = 1usize;
-            let mut num_families = 0usize;
 
             for template in templates.iter().skip(1) {
                 let mi = template.mi.to_vec_index();
@@ -1748,7 +1582,6 @@ impl GroupReadsByUmi {
                     // Finish previous MI group
                     if current_mi.is_some() {
                         *family_size_counter.entry(current_count).or_insert(0) += 1;
-                        num_families += 1;
                     }
                     current_mi = mi;
                     current_count = 1;
@@ -1757,11 +1590,6 @@ impl GroupReadsByUmi {
             // Don't forget the last group
             if current_mi.is_some() {
                 *family_size_counter.entry(current_count).or_insert(0) += 1;
-                num_families += 1;
-            }
-
-            if num_families > 0 {
-                *position_group_size_counter.entry(num_families).or_insert(0) += 1;
             }
         }
 
@@ -1787,70 +1615,17 @@ impl GroupReadsByUmi {
         Ok(())
     }
 
-    /// Write all metrics files: individual flags and --metrics prefix outputs.
-    fn write_all_metrics(
-        &self,
-        grouping_metrics: &UmiGroupingMetrics,
-        family_sizes: &AHashMap<usize, u64>,
-        position_group_sizes: &AHashMap<usize, u64>,
-    ) -> Result<()> {
-        let family_size_metrics =
-            FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
-        let position_group_size_metrics = PositionGroupSizeMetrics::from_size_counts(
-            position_group_sizes.iter().map(|(&s, &c)| (s, c)),
-        );
-
-        // Write individual flag outputs (fgbio-compatible)
+    /// Write family size histogram
+    fn write_family_size_histogram(&self, family_sizes: &AHashMap<usize, u64>) -> Result<()> {
         if let Some(path) = &self.family_size_histogram {
-            write_metrics(path, &family_size_metrics, "family size histogram")?;
+            let metrics =
+                FamilySizeMetrics::from_size_counts(family_sizes.iter().map(|(&s, &c)| (s, c)));
+            DelimFile::default()
+                .write_tsv(path, metrics)
+                .with_context(|| format!("Failed to create file: {}", path.display()))?;
         }
-        if let Some(path) = &self.grouping_metrics {
-            write_metrics(path, std::slice::from_ref(grouping_metrics), "grouping metrics")?;
-        }
-
-        // Write --metrics prefix outputs (all three files)
-        if let Some(prefix) = &self.metrics {
-            let family_path = with_extension(prefix, "family_sizes.txt");
-            write_metrics(&family_path, &family_size_metrics, "family size histogram")?;
-
-            let grouping_path = with_extension(prefix, "grouping_metrics.txt");
-            write_metrics(
-                &grouping_path,
-                std::slice::from_ref(grouping_metrics),
-                "grouping metrics",
-            )?;
-
-            let position_path = with_extension(prefix, "position_group_sizes.txt");
-            write_metrics(
-                &position_path,
-                &position_group_size_metrics,
-                "position group size histogram",
-            )?;
-        }
-
         Ok(())
     }
-}
-
-/// Write metrics to a TSV file and log the output path.
-fn write_metrics<S: serde::Serialize>(
-    path: &Path,
-    data: impl IntoIterator<Item = S>,
-    label: &str,
-) -> Result<()> {
-    DelimFile::default()
-        .write_tsv(path, data)
-        .with_context(|| format!("Failed to write {label}: {}", path.display()))?;
-    info!("Wrote {label} to {}", path.display());
-    Ok(())
-}
-
-/// Build a path by appending `.{suffix}` to a prefix path.
-fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
-    let mut s = prefix.as_os_str().to_owned();
-    s.push(".");
-    s.push(suffix);
-    PathBuf::from(s)
 }
 
 #[cfg(test)]
@@ -1872,8 +1647,7 @@ mod tests {
         dir: TempDir,
         pub output: PathBuf,
         pub histogram: PathBuf,
-        pub grouping_metrics: PathBuf,
-        pub metrics_prefix: PathBuf,
+        pub metrics: PathBuf,
     }
 
     impl TestPaths {
@@ -1882,8 +1656,7 @@ mod tests {
             Ok(Self {
                 output: dir.path().join("output.bam"),
                 histogram: dir.path().join("histogram.txt"),
-                grouping_metrics: dir.path().join("grouping_metrics.txt"),
-                metrics_prefix: dir.path().join("metrics"),
+                metrics: dir.path().join("metrics.txt"),
                 dir,
             })
         }
@@ -1899,7 +1672,6 @@ mod tests {
             },
             family_size_histogram: None,
             grouping_metrics: None,
-            metrics: None,
             raw_tag: "RX".to_string(),
             assign_tag: "MI".to_string(),
             cell_tag: "CB".to_string(),
@@ -1950,21 +1722,17 @@ mod tests {
             .insert(go_tag, "query")
             .insert(ss_tag, "template-coordinate")
             .build()
-            .expect("valid header record");
+            .unwrap();
         builder = builder.set_header(map);
 
         // FIX: Use NonZeroUsize instead of Position
         builder = builder.add_reference_sequence(
             BString::from("chr1"),
-            Map::<ReferenceSequence>::new(
-                NonZeroUsize::new(248_956_422).expect("non-zero chr1 length"),
-            ),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
         );
         builder = builder.add_reference_sequence(
             BString::from("chr2"),
-            Map::<ReferenceSequence>::new(
-                NonZeroUsize::new(242_193_529).expect("non-zero chr2 length"),
-            ),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(242_193_529).unwrap()),
         );
 
         builder.build()
@@ -2297,7 +2065,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            grouping_metrics: Some(paths.grouping_metrics.clone()),
+            grouping_metrics: Some(paths.metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -2307,8 +2075,7 @@ mod tests {
         assert_eq!(output_records.len(), 4, "Should have 4 records (2 pairs, a02 filtered)");
 
         // Check metrics
-        let metrics: Vec<UmiGroupingMetrics> =
-            DelimFile::default().read_tsv(&paths.grouping_metrics)?;
+        let metrics: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&paths.metrics)?;
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].discarded_ns_in_umi, 2);
 
@@ -2453,264 +2220,6 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to build the paths for `--metrics PREFIX` output files.
-    fn metrics_prefix_paths(prefix: &Path) -> (PathBuf, PathBuf, PathBuf) {
-        (
-            with_extension(prefix, "family_sizes.txt"),
-            with_extension(prefix, "grouping_metrics.txt"),
-            with_extension(prefix, "position_group_sizes.txt"),
-        )
-    }
-
-    #[test]
-    fn test_metrics_prefix_writes_all_files() -> Result<()> {
-        // Test setup:
-        //   Position group 1 (pos 100,300): UMI AAA (3 reads) + UMI CCC (1 read) = 2 families
-        //   Position group 2 (pos 200,400): UMI AAA (2 reads) = 1 family
-        //   Position group 3 (pos 300,500): UMI AAA (1 read) + UMI CCC (1 read) + UMI GGG (1 read) = 3 families
-        //
-        // Family sizes: {1: 4, 2: 1, 3: 1}  (four size-1, one size-2, one size-3)
-        // Position group sizes: {1: 1, 2: 1, 3: 1}  (one group with 1, 2, 3 families)
-        let mut records = Vec::new();
-
-        // Position group 1: 2 families (AAA x3, CCC x1)
-        for i in 1..=3 {
-            let (r1, r2) = build_test_pair(&format!("a{i:02}"), 0, 100, 300, 60, 60, "AAAAAAAA");
-            records.push(r1);
-            records.push(r2);
-        }
-        let (r1, r2) = build_test_pair("a04", 0, 100, 300, 60, 60, "CCCCCCCC");
-        records.push(r1);
-        records.push(r2);
-
-        // Position group 2: 1 family (AAA x2)
-        for i in 1..=2 {
-            let (r1, r2) = build_test_pair(&format!("b{i:02}"), 0, 200, 400, 60, 60, "AAAAAAAA");
-            records.push(r1);
-            records.push(r2);
-        }
-
-        // Position group 3: 3 families (AAA x1, CCC x1, GGG x1)
-        let (r1, r2) = build_test_pair("c01", 0, 300, 500, 60, 60, "AAAAAAAA");
-        records.push(r1);
-        records.push(r2);
-        let (r1, r2) = build_test_pair("c02", 0, 300, 500, 60, 60, "CCCCCCCC");
-        records.push(r1);
-        records.push(r2);
-        let (r1, r2) = build_test_pair("c03", 0, 300, 500, 60, 60, "GGGGGGGG");
-        records.push(r1);
-        records.push(r2);
-
-        let input = create_test_bam(records)?;
-        let paths = TestPaths::new()?;
-
-        let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            metrics: Some(paths.metrics_prefix.clone()),
-            ..test_group_cmd(Strategy::Identity, 0)
-        };
-
-        cmd.execute("test")?;
-
-        let (family_path, grouping_path, position_path) =
-            metrics_prefix_paths(&paths.metrics_prefix);
-
-        assert!(family_path.exists(), "Family sizes file should exist");
-        assert!(grouping_path.exists(), "Grouping metrics file should exist");
-        assert!(position_path.exists(), "Position group sizes file should exist");
-
-        // ---- Family size histogram ----
-        // 6 families total: four size-1, one size-2, one size-3
-        let family_metrics: Vec<FamilySizeMetrics> = DelimFile::default().read_tsv(&family_path)?;
-        assert_eq!(family_metrics.len(), 3);
-        assert_eq!(
-            family_metrics[0],
-            FamilySizeMetrics {
-                family_size: 1,
-                count: 4,
-                fraction: 4.0 / 6.0,
-                fraction_gt_or_eq_family_size: 1.0,
-            }
-        );
-        assert_eq!(
-            family_metrics[1],
-            FamilySizeMetrics {
-                family_size: 2,
-                count: 1,
-                fraction: 1.0 / 6.0,
-                fraction_gt_or_eq_family_size: 2.0 / 6.0,
-            }
-        );
-        assert_eq!(
-            family_metrics[2],
-            FamilySizeMetrics {
-                family_size: 3,
-                count: 1,
-                fraction: 1.0 / 6.0,
-                fraction_gt_or_eq_family_size: 1.0 / 6.0,
-            }
-        );
-
-        // ---- Grouping metrics ----
-        // 9 read pairs = 18 records accepted, 6 unique families
-        let grouping: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&grouping_path)?;
-        assert_eq!(grouping.len(), 1);
-        assert_eq!(grouping[0].total_records, 18);
-        assert_eq!(grouping[0].accepted_records, 18);
-        assert_eq!(grouping[0].total_families, 6);
-
-        // ---- Position group size histogram ----
-        // 3 position groups: one with 1 family, one with 2, one with 3
-        let position_metrics: Vec<PositionGroupSizeMetrics> =
-            DelimFile::default().read_tsv(&position_path)?;
-        assert_eq!(position_metrics.len(), 3);
-        assert_eq!(
-            position_metrics[0],
-            PositionGroupSizeMetrics {
-                position_group_size: 1,
-                count: 1,
-                fraction: 1.0 / 3.0,
-                fraction_gt_or_eq_position_group_size: 1.0,
-            }
-        );
-        assert_eq!(
-            position_metrics[1],
-            PositionGroupSizeMetrics {
-                position_group_size: 2,
-                count: 1,
-                fraction: 1.0 / 3.0,
-                fraction_gt_or_eq_position_group_size: 2.0 / 3.0,
-            }
-        );
-        assert_eq!(
-            position_metrics[2],
-            PositionGroupSizeMetrics {
-                position_group_size: 3,
-                count: 1,
-                fraction: 1.0 / 3.0,
-                fraction_gt_or_eq_position_group_size: 1.0 / 3.0,
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_metrics_prefix_and_individual_flags_write_same_content() -> Result<()> {
-        // Verify that --metrics PREFIX produces identical content to
-        // --family-size-histogram and --grouping-metrics individual flags.
-        let mut records = Vec::new();
-
-        // Two position groups with different family structures
-        for i in 1..=3 {
-            let (r1, r2) = build_test_pair(&format!("a{i:02}"), 0, 100, 300, 60, 60, "AAAAAAAA");
-            records.push(r1);
-            records.push(r2);
-        }
-        let (r1, r2) = build_test_pair("b01", 0, 200, 400, 60, 60, "CCCCCCCC");
-        records.push(r1);
-        records.push(r2);
-
-        let input = create_test_bam(records)?;
-        let paths = TestPaths::new()?;
-
-        let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            family_size_histogram: Some(paths.histogram.clone()),
-            grouping_metrics: Some(paths.grouping_metrics.clone()),
-            metrics: Some(paths.metrics_prefix.clone()),
-            ..test_group_cmd(Strategy::Identity, 0)
-        };
-
-        cmd.execute("test")?;
-
-        let (prefix_family, prefix_grouping, prefix_position) =
-            metrics_prefix_paths(&paths.metrics_prefix);
-
-        // Family size histogram: individual flag and prefix should match
-        let individual_family: Vec<FamilySizeMetrics> =
-            DelimFile::default().read_tsv(&paths.histogram)?;
-        let prefix_family: Vec<FamilySizeMetrics> =
-            DelimFile::default().read_tsv(&prefix_family)?;
-        assert_eq!(individual_family, prefix_family);
-
-        // Grouping metrics: individual flag and prefix should match
-        let individual_grouping: Vec<UmiGroupingMetrics> =
-            DelimFile::default().read_tsv(&paths.grouping_metrics)?;
-        let prefix_grouping: Vec<UmiGroupingMetrics> =
-            DelimFile::default().read_tsv(&prefix_grouping)?;
-        assert_eq!(individual_grouping.len(), 1);
-        assert_eq!(prefix_grouping.len(), 1);
-        assert_eq!(individual_grouping[0].total_records, prefix_grouping[0].total_records);
-        assert_eq!(individual_grouping[0].accepted_records, prefix_grouping[0].accepted_records);
-        assert_eq!(individual_grouping[0].total_families, prefix_grouping[0].total_families);
-
-        // Position group sizes: only written via --metrics prefix
-        let position: Vec<PositionGroupSizeMetrics> =
-            DelimFile::default().read_tsv(&prefix_position)?;
-        assert_eq!(position.len(), 1);
-        // Both position groups have exactly 1 family each, so one entry: size=1, count=2
-        assert_eq!(position[0].position_group_size, 1);
-        assert_eq!(position[0].count, 2);
-        assert!((position[0].fraction - 1.0).abs() < f64::EPSILON);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_metrics_position_group_size_with_multi_read_families() -> Result<()> {
-        // Verify position group size counts families, not reads.
-        // Single position group with 2 families of different sizes:
-        //   UMI AAA: 5 reads  (family size 5)
-        //   UMI CCC: 2 reads  (family size 2)
-        // Position group size = 2 (two distinct families)
-        let mut records = Vec::new();
-
-        for i in 1..=5 {
-            let (r1, r2) = build_test_pair(&format!("r{i:02}"), 0, 100, 300, 60, 60, "AAAAAAAA");
-            records.push(r1);
-            records.push(r2);
-        }
-        for i in 6..=7 {
-            let (r1, r2) = build_test_pair(&format!("r{i:02}"), 0, 100, 300, 60, 60, "CCCCCCCC");
-            records.push(r1);
-            records.push(r2);
-        }
-
-        let input = create_test_bam(records)?;
-        let paths = TestPaths::new()?;
-
-        let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            metrics: Some(paths.metrics_prefix.clone()),
-            ..test_group_cmd(Strategy::Identity, 0)
-        };
-
-        cmd.execute("test")?;
-
-        let (family_path, _, position_path) = metrics_prefix_paths(&paths.metrics_prefix);
-
-        // Family sizes: one size-2 family, one size-5 family
-        let family_metrics: Vec<FamilySizeMetrics> = DelimFile::default().read_tsv(&family_path)?;
-        assert_eq!(family_metrics.len(), 2);
-        assert_eq!(family_metrics[0].family_size, 2);
-        assert_eq!(family_metrics[0].count, 1);
-        assert_eq!(family_metrics[1].family_size, 5);
-        assert_eq!(family_metrics[1].count, 1);
-
-        // Position group size: one group with 2 families
-        let position_metrics: Vec<PositionGroupSizeMetrics> =
-            DelimFile::default().read_tsv(&position_path)?;
-        assert_eq!(position_metrics.len(), 1);
-        assert_eq!(position_metrics[0].position_group_size, 2);
-        assert_eq!(position_metrics[0].count, 1);
-        assert!((position_metrics[0].fraction - 1.0).abs() < f64::EPSILON);
-        assert!(
-            (position_metrics[0].fraction_gt_or_eq_position_group_size - 1.0).abs() < f64::EPSILON
-        );
-
-        Ok(())
-    }
-
     #[test]
     fn test_outputs_grouping_metrics() -> Result<()> {
         let mut records = Vec::new();
@@ -2735,15 +2244,14 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            grouping_metrics: Some(paths.grouping_metrics.clone()),
+            grouping_metrics: Some(paths.metrics.clone()),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
 
-        let metrics: Vec<UmiGroupingMetrics> =
-            DelimFile::default().read_tsv(&paths.grouping_metrics)?;
+        let metrics: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&paths.metrics)?;
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].accepted_records, 2);
         assert_eq!(metrics[0].discarded_ns_in_umi, 2);
@@ -2773,7 +2281,7 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            grouping_metrics: Some(paths.grouping_metrics.clone()),
+            grouping_metrics: Some(paths.metrics.clone()),
             min_umi_length: Some(6),
             ..test_group_cmd(Strategy::Edit, 0)
         };
@@ -2784,8 +2292,7 @@ mod tests {
         assert_eq!(output_records.len(), 2, "Should only have records with UMI length >= 6");
 
         // Check metrics
-        let metrics: Vec<UmiGroupingMetrics> =
-            DelimFile::default().read_tsv(&paths.grouping_metrics)?;
+        let metrics: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&paths.metrics)?;
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].accepted_records, 2);
         assert_eq!(metrics[0].discarded_ns_in_umi, 0);
@@ -2907,8 +2414,8 @@ mod tests {
         assert_eq!(b_mis.len(), 1, "Group B should have 1 unique MI");
 
         // The prefix (before '/') should be the same for both groups
-        let a_prefix = a_mis[0].split('/').next().expect("MI tag should contain '/' separator");
-        let b_prefix = b_mis[0].split('/').next().expect("MI tag should contain '/' separator");
+        let a_prefix = a_mis[0].split('/').next().unwrap();
+        let b_prefix = b_mis[0].split('/').next().unwrap();
         assert_eq!(a_prefix, b_prefix, "Both groups should have same MI prefix");
 
         // But the full MI (including suffix) should be different
@@ -3217,9 +2724,8 @@ mod tests {
         let mut groups: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for record in &output_records {
-            let mi = get_string_tag(record, "MI").expect("record should have MI tag");
-            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
-                .to_string();
+            let mi = get_string_tag(record, "MI").unwrap();
+            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
             groups.entry(mi).or_default().push(name);
         }
 
@@ -4202,14 +3708,14 @@ mod tests {
 
         let cmd = GroupReadsByUmi {
             io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
-            grouping_metrics: Some(paths.grouping_metrics.clone()),
+            grouping_metrics: Some(paths.metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
         cmd.execute("test")?;
 
         // Verify metrics file was created
-        assert!(&paths.grouping_metrics.exists());
+        assert!(&paths.metrics.exists());
 
         Ok(())
     }
@@ -4385,8 +3891,7 @@ mod tests {
 
         // Verify the output contains only reads from the "good" template
         for record in &output_records {
-            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
-                .to_string();
+            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
             assert_eq!(
                 name, "good",
                 "Only 'good' reads should remain, but found read with name: {name}"
@@ -4529,8 +4034,7 @@ mod tests {
         let mut mi_by_name: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for record in &output_records {
-            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
-                .to_string();
+            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
             if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi)) =
                 record.data().get(&mi_tag)
             {
@@ -4586,8 +4090,7 @@ mod tests {
         let mut mi_by_name: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for record in &output_records {
-            let name = String::from_utf8_lossy(record.name().expect("record should have a name"))
-                .to_string();
+            let name = String::from_utf8_lossy(record.name().unwrap()).to_string();
             if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi)) =
                 record.data().get(&mi_tag)
             {
@@ -4846,8 +4349,7 @@ mod tests {
             30,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -4856,7 +4358,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
@@ -4871,8 +4373,7 @@ mod tests {
             10,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -4881,7 +4382,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -4897,8 +4398,7 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4907,7 +4407,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_non_pf, 1);
     }
@@ -4922,8 +4422,7 @@ mod tests {
             30,
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4932,7 +4431,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_ns_in_umi, 1);
     }
@@ -4947,8 +4446,7 @@ mod tests {
             30,
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4957,7 +4455,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_umi_too_short, 1);
     }
@@ -4971,8 +4469,7 @@ mod tests {
             0,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -4981,7 +4478,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -5020,8 +4517,7 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![supp])
-            .expect("Template::from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![supp]).unwrap();
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -5030,7 +4526,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
         assert!(!filter_template_raw(&template, &config, &mut metrics));
     }
@@ -5052,18 +4548,14 @@ mod tests {
         // Add header with queryname sort order
         let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
 
-        let map = HeaderRecordMap::<HeaderRecord>::builder()
-            .insert(so_tag, "queryname")
-            .build()
-            .expect("valid header record");
+        let map =
+            HeaderRecordMap::<HeaderRecord>::builder().insert(so_tag, "queryname").build().unwrap();
         builder = builder.set_header(map);
 
         // Add reference sequences (even though reads are unmapped, header needs refs)
         builder = builder.add_reference_sequence(
             BString::from("chr1"),
-            Map::<ReferenceSequence>::new(
-                NonZeroUsize::new(248_956_422).expect("non-zero chr1 length"),
-            ),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).unwrap()),
         );
 
         builder.build()
@@ -5111,7 +4603,7 @@ mod tests {
             allow_unmapped: true,
         };
 
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
@@ -5135,7 +4627,7 @@ mod tests {
             allow_unmapped: false,
         };
 
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let should_keep = filter_template(&template, &config, &mut metrics);
 
         assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");

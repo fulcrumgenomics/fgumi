@@ -764,6 +764,7 @@ dependencies = [
  "rayon",
  "read-structure",
  "rstest",
+ "seq_io",
  "serde",
  "sysinfo",
  "tempfile",
