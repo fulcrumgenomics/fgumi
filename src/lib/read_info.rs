@@ -22,6 +22,7 @@ use bstr::ByteSlice;
 use crate::sam::record_utils::{
     mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
 };
+use crate::sort::keys::PrimaryAlignmentInfo;
 use crate::template::Template;
 use crate::unified_pipeline::GroupKey;
 use noodles::sam;
@@ -211,7 +212,10 @@ impl Default for LibraryIndex {
 /// For paired-end reads with MC tag, both positions are computed and normalized
 /// so the lower position comes first (matching `ReadInfo` behavior).
 ///
-/// For unpaired reads or reads without MC tag, mate position uses UNKNOWN sentinels.
+/// For unpaired reads, if a `pa` tag is present and its 5' position matches the read's
+/// actual 5' position, the second position in the `pa` tag is used as the 3' end for
+/// grouping. This enables grouping by both 5' and 3' positions when the `pa` tag has
+/// been set by an upstream tool (e.g., after adapter trimming).
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn compute_group_key(
@@ -257,6 +261,26 @@ pub fn compute_group_key(
     // Check if paired and has mate info
     let is_paired = flags.is_segmented();
     if !is_paired {
+        // If the pa tag is present and its 5' end matches this read's actual 5' position,
+        // use the second position as the 3' end for grouping. This enables grouping by
+        // both ends when an upstream tool has set the pa tag (e.g., after adapter trimming).
+        if let Some(pa) = PrimaryAlignmentInfo::from_record(record) {
+            let pa_five_prime_matches =
+                pa.tid1 == ref_id && pa.pos1 == pos && u8::from(pa.neg1) == strand;
+            if pa_five_prime_matches {
+                return GroupKey::paired(
+                    ref_id,
+                    pos,
+                    strand,
+                    pa.tid2,
+                    pa.pos2,
+                    u8::from(pa.neg2),
+                    library_idx,
+                    cell_hash,
+                    name_hash,
+                );
+            }
+        }
         return GroupKey::single(ref_id, pos, strand, library_idx, cell_hash, name_hash);
     }
 
@@ -940,6 +964,132 @@ mod tests {
                     .expect("get_unclipped_position should succeed"),
                 137
             );
+        }
+    }
+
+    mod compute_group_key_pa_tag_tests {
+        use super::*;
+        use crate::sam::builder::RecordBuilder;
+        use crate::sort::keys::PrimaryAlignmentInfo;
+        use noodles::sam::alignment::record::data::field::Tag;
+
+        /// Build a forward-strand single-end record at a given position with a given CIGAR.
+        fn build_single_end(
+            name: &str,
+            ref_id: usize,
+            pos: usize,
+            cigar: &str,
+        ) -> sam::alignment::RecordBuf {
+            let read_len: usize = cigar
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty())
+                .zip(cigar.split(|c: char| c.is_ascii_digit()).filter(|s| !s.is_empty()))
+                .filter(|(_, op)| matches!(*op, "M" | "I" | "S" | "=" | "X"))
+                .map(|(n, _)| n.parse::<usize>().expect("valid CIGAR length"))
+                .sum();
+            let seq: String = "A".repeat(read_len);
+            RecordBuilder::new()
+                .name(name)
+                .sequence(&seq)
+                .reference_sequence_id(ref_id)
+                .alignment_start(pos)
+                .cigar(cigar)
+                .tag("RX", "AAAAAA")
+                .build()
+        }
+
+        #[test]
+        fn test_single_end_no_pa_tag_uses_single_key() {
+            let lib_index = LibraryIndex::default();
+            let record = build_single_end("read1", 0, 100, "50M");
+            let key = compute_group_key(&record, &lib_index, None);
+
+            // Without pa tag, should use single key (mate fields are UNKNOWN)
+            let expected = GroupKey::single(0, 100, 0, 0, 0, key.name_hash);
+            assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn test_single_end_with_matching_pa_tag_uses_paired_key() {
+            let lib_index = LibraryIndex::default();
+            let mut record = build_single_end("read1", 0, 100, "50M");
+
+            // Add pa tag: 5' = (tid=0, pos=100, fwd), 3' = (tid=0, pos=149, fwd)
+            let pa = PrimaryAlignmentInfo::new(0, 100, false, 0, 149, false);
+            record.data_mut().insert(Tag::new(b'p', b'a'), pa.to_tag_value());
+
+            let key = compute_group_key(&record, &lib_index, None);
+
+            // With matching pa tag, should use paired key with 3' position
+            let expected = GroupKey::paired(0, 100, 0, 0, 149, 0, 0, 0, key.name_hash);
+            assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn test_single_end_with_mismatched_pa_tag_falls_back_to_single() {
+            let lib_index = LibraryIndex::default();
+            let mut record = build_single_end("read1", 0, 100, "50M");
+
+            // Add pa tag with WRONG 5' position (999 instead of 100)
+            let pa = PrimaryAlignmentInfo::new(0, 999, false, 0, 149, false);
+            record.data_mut().insert(Tag::new(b'p', b'a'), pa.to_tag_value());
+
+            let key = compute_group_key(&record, &lib_index, None);
+
+            // Mismatched pa tag should be ignored, falls back to single key
+            let expected = GroupKey::single(0, 100, 0, 0, 0, key.name_hash);
+            assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn test_single_end_pa_tag_wrong_strand_falls_back() {
+            let lib_index = LibraryIndex::default();
+            let mut record = build_single_end("read1", 0, 100, "50M");
+
+            // pa tag says reverse strand but read is forward
+            let pa = PrimaryAlignmentInfo::new(0, 100, true, 0, 149, false);
+            record.data_mut().insert(Tag::new(b'p', b'a'), pa.to_tag_value());
+
+            let key = compute_group_key(&record, &lib_index, None);
+
+            // Strand mismatch — falls back to single key
+            let expected = GroupKey::single(0, 100, 0, 0, 0, key.name_hash);
+            assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn test_single_end_pa_tag_wrong_ref_falls_back() {
+            let lib_index = LibraryIndex::default();
+            let mut record = build_single_end("read1", 0, 100, "50M");
+
+            // pa tag says ref_id 1 but read is on ref_id 0
+            let pa = PrimaryAlignmentInfo::new(1, 100, false, 0, 149, false);
+            record.data_mut().insert(Tag::new(b'p', b'a'), pa.to_tag_value());
+
+            let key = compute_group_key(&record, &lib_index, None);
+
+            // Ref mismatch — falls back to single key
+            let expected = GroupKey::single(0, 100, 0, 0, 0, key.name_hash);
+            assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn test_different_pa_3prime_produces_different_keys() {
+            let lib_index = LibraryIndex::default();
+
+            let mut r1 = build_single_end("read_a", 0, 100, "50M");
+            let pa1 = PrimaryAlignmentInfo::new(0, 100, false, 0, 149, false);
+            r1.data_mut().insert(Tag::new(b'p', b'a'), pa1.to_tag_value());
+
+            let mut r2 = build_single_end("read_a", 0, 100, "100M");
+            let pa2 = PrimaryAlignmentInfo::new(0, 100, false, 0, 199, false);
+            r2.data_mut().insert(Tag::new(b'p', b'a'), pa2.to_tag_value());
+
+            let key1 = compute_group_key(&r1, &lib_index, None);
+            let key2 = compute_group_key(&r2, &lib_index, None);
+
+            // Same 5' but different 3' — keys should differ (except name_hash)
+            assert_ne!(key1, key2, "Different 3' positions should produce different group keys");
         }
     }
 }
