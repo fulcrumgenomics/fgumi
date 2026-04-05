@@ -43,6 +43,7 @@ libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 log = "0"
 lru = "0.16.3"
 memchr = "2"
+murmur3 = "0.5"
 noodles = { version = "0.106.0" }
 noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
 noodles-csi = "0.54.0"
@@ -108,7 +109,7 @@ log = { workspace = true }
 lru = { workspace = true }
 memchr = { workspace = true }
 mimalloc = { version = "0.1.48", default-features = false }
-murmur3 = "0.5"
+murmur3 = { workspace = true }
 noodles = { workspace = true, features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { workspace = true }
 noodles-csi = { workspace = true }

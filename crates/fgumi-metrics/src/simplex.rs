@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::inline_collector::MetricsCollector;
 use crate::shared::{UmiCountTracker, UmiMetric};
+use crate::template_info::TemplateMetadata;
 use crate::{Metric, frac};
 
 /// Metrics quantifying the distribution of CS and SS read family sizes.
@@ -155,6 +157,17 @@ impl SimplexMetricsCollector {
         self.umi_counts.record(umi, raw_count, error_count, is_unique);
     }
 
+    /// Merge another collector into this one by summing all histogram counts and UMI observations.
+    pub fn merge(&mut self, other: Self) {
+        for (size, count) in other.cs_family_sizes {
+            *self.cs_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ss_family_sizes {
+            *self.ss_family_sizes.entry(size).or_insert(0) += count;
+        }
+        self.umi_counts.merge(other.umi_counts);
+    }
+
     /// Generates family size metrics with fractions and cumulative fractions.
     ///
     /// Returns one [`SimplexFamilySizeMetric`] per observed family size (from 1 to the
@@ -218,6 +231,35 @@ impl SimplexMetricsCollector {
 impl Default for SimplexMetricsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl MetricsCollector for SimplexMetricsCollector {
+    fn record_group(&mut self, templates: &[TemplateMetadata<'_>]) {
+        if templates.is_empty() {
+            return;
+        }
+
+        // CS family: entire coordinate group
+        self.record_cs_family(templates.len());
+
+        // SS families: group by MI (base_umi with strand)
+        let mut ss_counts: HashMap<&str, usize> = HashMap::new();
+        for m in templates {
+            *ss_counts.entry(m.template.mi.as_str()).or_insert(0) += 1;
+        }
+        for count in ss_counts.values() {
+            self.record_ss_family(*count);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        // Delegate to the inherent merge method (inherent methods take priority)
+        self.merge(other);
+    }
+
+    fn write_metrics(&self, _prefix: &std::path::Path) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -354,5 +396,122 @@ mod tests {
         let cccc = metrics.iter().find(|m| m.umi == "CCCC").unwrap();
         assert_eq!(cccc.raw_observations, 8);
         assert_eq!(cccc.unique_observations, 1);
+    }
+
+    // =========================================================================
+    // SimplexMetricsCollector::merge tests
+    // =========================================================================
+
+    #[test]
+    fn test_simplex_metrics_collector_merge() {
+        let mut a = SimplexMetricsCollector::new();
+        a.record_cs_family(3);
+        a.record_cs_family(3);
+        a.record_ss_family(2);
+        a.record_umi("AAAA", 5, 1, true);
+
+        let mut b = SimplexMetricsCollector::new();
+        b.record_cs_family(3);
+        b.record_cs_family(5);
+        b.record_ss_family(2);
+        b.record_ss_family(4);
+        b.record_umi("AAAA", 3, 0, true);
+        b.record_umi("CCCC", 2, 0, true);
+
+        a.merge(b);
+
+        let metrics = a.family_size_metrics();
+        let cs3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        assert_eq!(cs3.cs_count, 3);
+        let cs5 = metrics.iter().find(|m| m.family_size == 5).unwrap();
+        assert_eq!(cs5.cs_count, 1);
+        let ss2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        assert_eq!(ss2.ss_count, 2);
+        let ss4 = metrics.iter().find(|m| m.family_size == 4).unwrap();
+        assert_eq!(ss4.ss_count, 1);
+
+        let umi_metrics = a.umi_metrics();
+        assert_eq!(umi_metrics.len(), 2);
+    }
+
+    #[test]
+    fn test_simplex_implements_metrics_collector() {
+        use crate::inline_collector::MetricsCollector;
+        use crate::template_info::{TemplateInfo, TemplateMetadata};
+
+        let mut collector = SimplexMetricsCollector::new();
+        let t1 = TemplateInfo {
+            mi: "1/A".to_string(),
+            rx: "AAAA".to_string(),
+            ref_name: Some("chr1".to_string()),
+            position: Some(100),
+            end_position: Some(200),
+            hash_fraction: 0.5,
+            read_info_key: crate::template_info::ReadInfoKey::default(),
+        };
+        let t2 = TemplateInfo {
+            mi: "1/A".to_string(),
+            rx: "AAAA".to_string(),
+            ref_name: Some("chr1".to_string()),
+            position: Some(100),
+            end_position: Some(200),
+            hash_fraction: 0.6,
+            read_info_key: crate::template_info::ReadInfoKey::default(),
+        };
+        let t3 = TemplateInfo {
+            mi: "2/A".to_string(),
+            rx: "CCCC".to_string(),
+            ref_name: Some("chr1".to_string()),
+            position: Some(100),
+            end_position: Some(200),
+            hash_fraction: 0.7,
+            read_info_key: crate::template_info::ReadInfoKey::default(),
+        };
+
+        let metadata: Vec<TemplateMetadata<'_>> = vec![
+            TemplateMetadata {
+                template: &t1,
+                base_umi: "1",
+                is_a_strand: true,
+                is_b_strand: false,
+            },
+            TemplateMetadata {
+                template: &t2,
+                base_umi: "1",
+                is_a_strand: true,
+                is_b_strand: false,
+            },
+            TemplateMetadata {
+                template: &t3,
+                base_umi: "2",
+                is_a_strand: true,
+                is_b_strand: false,
+            },
+        ];
+
+        collector.record_group(&metadata);
+
+        let metrics = collector.family_size_metrics();
+        // CS family: entire group = 3 templates
+        let cs3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        assert_eq!(cs3.cs_count, 1);
+        // SS families: MI "1/A" has 2 templates, MI "2/A" has 1 template
+        let ss2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        assert_eq!(ss2.ss_count, 1);
+        let ss1 = metrics.iter().find(|m| m.family_size == 1).unwrap();
+        assert_eq!(ss1.ss_count, 1);
+    }
+
+    #[test]
+    fn test_simplex_metrics_collector_merge_empty() {
+        let mut a = SimplexMetricsCollector::new();
+        a.record_cs_family(3);
+        let b = SimplexMetricsCollector::new();
+        a.merge(b);
+        let metrics = a.family_size_metrics();
+        // family_size_metrics returns entries for sizes 1..=max, so 3 entries
+        assert_eq!(metrics.len(), 3);
+        let cs3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        assert_eq!(cs3.cs_count, 1);
     }
 }

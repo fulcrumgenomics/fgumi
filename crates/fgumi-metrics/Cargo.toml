@@ -11,6 +11,7 @@ license.workspace = true
 serde = { workspace = true }
 anyhow = { workspace = true }
 fgoxide = { workspace = true }
+murmur3 = { workspace = true }
 noodles = { workspace = true, features = ["sam"], optional = true }
 
 [dev-dependencies]

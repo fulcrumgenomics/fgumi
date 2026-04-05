@@ -1,6 +1,7 @@
 //! `ProcessingSink`: bridges sort merge output into UMI grouping + consensus.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,9 +20,13 @@ use fgumi_lib::progress::ProgressTracker;
 use fgumi_lib::sort::inline_buffer::TemplateKey;
 use fgumi_lib::sort::sink::SortedRecordSink;
 use fgumi_lib::template::Template;
+use fgumi_metrics::downsampling::compute_hash_fraction;
+use fgumi_metrics::inline_collector::InlineCollector;
+use fgumi_metrics::template_info::{ReadInfoKey, TemplateInfo};
 use fgumi_raw_bam::fields::{aux_data_slice, l_seq};
 use fgumi_umi::{Umi, UmiAssigner};
 use log::info;
+use noodles::sam::Header;
 
 use super::options::StopAfter;
 
@@ -61,6 +66,12 @@ pub(super) struct ProcessingSink {
     progress: ProgressTracker,
     /// Progress tracker for position groups (periodic logging).
     group_progress: ProgressTracker,
+    /// Optional inline metrics collector (enabled via --consensus-metrics).
+    metrics_collector: Option<InlineCollector>,
+    /// Path prefix for metrics output files.
+    metrics_prefix: Option<PathBuf>,
+    /// BAM header for `ref_name` lookups during metrics collection.
+    header: Option<Header>,
 }
 
 impl ProcessingSink {
@@ -75,6 +86,9 @@ impl ProcessingSink {
         group_filter_config: GroupFilterConfig,
         stop_after: StopAfter,
         cancel: Arc<AtomicBool>,
+        metrics_collector: Option<InlineCollector>,
+        metrics_prefix: Option<PathBuf>,
+        header: Option<Header>,
     ) -> Self {
         Self {
             writer: Some(writer),
@@ -95,6 +109,9 @@ impl ProcessingSink {
             next_mi: 0,
             progress: ProgressTracker::new("Consensus reads written").with_interval(100_000),
             group_progress: ProgressTracker::new("Position groups processed").with_interval(10_000),
+            metrics_collector,
+            metrics_prefix,
+            header,
         }
     }
 
@@ -172,6 +189,13 @@ impl ProcessingSink {
                     templates[idx].mi = mi;
                 }
             }
+        }
+
+        // 4. Collect inline metrics if enabled.
+        if let Some(ref mut collector) = self.metrics_collector {
+            let template_infos =
+                build_template_infos(&templates, self.umi_tag, self.header.as_ref());
+            collector.record_coordinate_group(&template_infos);
         }
 
         // --stop-after group: write records with MI tags, grouped by MI, and skip
@@ -334,6 +358,151 @@ impl ProcessingSink {
     }
 }
 
+/// Converts templates with assigned MIs into `TemplateInfo` for metrics collection.
+fn build_template_infos(
+    templates: &[Template],
+    umi_tag: [u8; 2],
+    header: Option<&Header>,
+) -> Vec<TemplateInfo> {
+    let mut mi_buf = String::with_capacity(16);
+    templates
+        .iter()
+        .filter(|t| t.mi.id().is_some())
+        .map(|t| {
+            t.mi.write_with_offset(0, &mut mi_buf);
+            let mi = mi_buf.clone();
+            let rx = extract_umi_from_template(t, umi_tag).unwrap_or_default();
+            let (ref_name, position, end_position, read_info_key) =
+                extract_position_info(t, header);
+            let read_name = String::from_utf8_lossy(&t.name);
+            let hash_fraction = compute_hash_fraction(&read_name);
+
+            TemplateInfo { mi, rx, ref_name, position, end_position, hash_fraction, read_info_key }
+        })
+        .collect()
+}
+
+/// Extracts reference name, insert bounds, and `ReadInfoKey` from a template's
+/// raw R1 and R2 records.
+///
+/// The `ReadInfoKey` uses unclipped 5' positions and strand from both mates,
+/// ordered so the earlier-mapping read comes first (matching the standalone
+/// metrics path).
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "genomic positions never exceed i32::MAX; ref_id is validated non-negative"
+)]
+fn extract_position_info(
+    template: &Template,
+    header: Option<&Header>,
+) -> (Option<String>, Option<i32>, Option<i32>, ReadInfoKey) {
+    use fgumi_raw_bam::cigar::{alignment_end_from_raw, alignment_start_from_raw};
+    use fgumi_raw_bam::fields::ref_id;
+
+    let r1 = template.raw_r1();
+    let r2 = template.raw_r2();
+
+    let ref_name = [r1, r2].into_iter().flatten().find_map(|raw| {
+        let rid = ref_id(raw);
+        if rid < 0 {
+            return None;
+        }
+        header.and_then(|h| {
+            h.reference_sequences().get_index(rid as usize).map(|(name, _)| name.to_string())
+        })
+    });
+
+    // Compute insert start (min of R1/R2 alignment starts) and
+    // end (max of R1/R2 alignment ends), using 1-based coordinates.
+    let r1_start = r1.and_then(|raw| alignment_start_from_raw(raw).map(|p| p as i32));
+    let r2_start = r2.and_then(|raw| alignment_start_from_raw(raw).map(|p| p as i32));
+    let r1_end = r1.and_then(|raw| alignment_end_from_raw(raw).map(|p| p as i32));
+    let r2_end = r2.and_then(|raw| alignment_end_from_raw(raw).map(|p| p as i32));
+
+    let position = match (r1_start, r2_start) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+
+    let end_position = match (r1_end, r2_end) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+
+    // Build ReadInfoKey from unclipped 5' positions and strand, matching fgbio's ReadInfo.
+    let read_info_key = build_read_info_key(r1, r2);
+
+    (ref_name, position, end_position, read_info_key)
+}
+
+/// Builds a [`ReadInfoKey`] from raw R1 and R2 BAM records.
+///
+/// Uses unclipped 5' positions, reference indices, and strand from both mates.
+/// Fields are ordered so the earlier-mapping read comes first (matching fgbio).
+/// Returns `ReadInfoKey::default()` if neither mate is mapped.
+#[expect(clippy::cast_sign_loss, reason = "ref_id validated non-negative before cast")]
+fn build_read_info_key(r1: Option<&[u8]>, r2: Option<&[u8]>) -> ReadInfoKey {
+    use fgumi_raw_bam::cigar::unclipped_5prime_from_raw_bam;
+    use fgumi_raw_bam::fields::{flags as raw_flags, ref_id};
+
+    /// Extract (`ref_index`, `unclipped_5prime`, `is_reverse`) from a raw record, or `None` if unmapped.
+    fn mate_info(raw: &[u8]) -> Option<(usize, i32, bool)> {
+        let rid = ref_id(raw);
+        if rid < 0 {
+            return None;
+        }
+        let flg = raw_flags(raw);
+        let unmapped = (flg & fgumi_raw_bam::fields::flags::UNMAPPED) != 0;
+        if unmapped {
+            return None;
+        }
+        let five_prime = unclipped_5prime_from_raw_bam(raw);
+        let reverse = (flg & fgumi_raw_bam::fields::flags::REVERSE) != 0;
+        Some((rid as usize, five_prime, reverse))
+    }
+
+    let r1_info = r1.and_then(mate_info);
+    let r2_info = r2.and_then(mate_info);
+
+    match (r1_info, r2_info) {
+        (Some((ref1, s1, strand1)), Some((ref2, s2, strand2))) => {
+            // Order so earlier-mapping read comes first
+            if (Some(ref1), s1) <= (Some(ref2), s2) {
+                ReadInfoKey {
+                    ref_index1: Some(ref1),
+                    start1: s1,
+                    strand1,
+                    ref_index2: Some(ref2),
+                    start2: s2,
+                    strand2,
+                }
+            } else {
+                ReadInfoKey {
+                    ref_index1: Some(ref2),
+                    start1: s2,
+                    strand1: strand2,
+                    ref_index2: Some(ref1),
+                    start2: s1,
+                    strand2: strand1,
+                }
+            }
+        }
+        (Some((ref1, s1, strand1)), None) => {
+            ReadInfoKey { ref_index1: Some(ref1), start1: s1, strand1, ..ReadInfoKey::default() }
+        }
+        (None, Some((ref2, s2, strand2))) => ReadInfoKey {
+            ref_index1: Some(ref2),
+            start1: s2,
+            strand1: strand2,
+            ..ReadInfoKey::default()
+        },
+        (None, None) => ReadInfoKey::default(),
+    }
+}
+
 impl SortedRecordSink for ProcessingSink {
     fn emit(&mut self, key: &TemplateKey, record_bytes: Vec<u8>) -> Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
@@ -364,6 +533,14 @@ impl SortedRecordSink for ProcessingSink {
             self.total_mi_groups,
             self.total_consensus_reads
         );
+        // Write inline metrics if enabled.
+        if let (Some(collector), Some(prefix)) =
+            (self.metrics_collector.as_ref(), self.metrics_prefix.as_ref())
+        {
+            collector.write_metrics(prefix)?;
+            info!("Consensus metrics written to {}.* ", prefix.display());
+        }
+
         if let Some(writer) = self.writer.take() {
             writer.finish().context("Failed to finish output BAM")?;
         }

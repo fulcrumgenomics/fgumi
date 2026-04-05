@@ -231,8 +231,9 @@ impl Command for Duplex {
     /// # use fgumi::commands::duplex::Duplex;
     /// # use fgumi::commands::command::Command;
     /// # use fgumi::commands::common::{
-    /// #     BamIoOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
-    /// #     ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
+    /// #     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
+    /// #     QueueMemoryOptions, ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions,
+    /// #     ThreadingOptions,
     /// # };
     /// # use std::path::PathBuf;
     /// let duplex = Duplex {
@@ -257,6 +258,7 @@ impl Command for Duplex {
     ///     max_reads_per_strand: None,
     ///     cell_tag: None,
     ///     scheduler_opts: SchedulerOptions::default(),
+    ///     queue_memory: QueueMemoryOptions::default(),
     /// };
     ///
     /// duplex.execute("test")?;
