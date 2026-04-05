@@ -50,6 +50,8 @@
     clippy::map_unwrap_or
 )]
 
+pub mod runall;
+
 pub mod clip;
 pub mod codec;
 pub mod command;

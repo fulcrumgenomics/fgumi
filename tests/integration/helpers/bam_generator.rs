@@ -249,6 +249,90 @@ pub fn create_umi_family_with_errors(
     records
 }
 
+/// Read all records from a BAM file and return their sequences as byte vecs.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened or any record cannot be read.
+pub fn read_bam_sequences(path: &std::path::Path) -> Vec<Vec<u8>> {
+    use noodles::bam;
+    let mut reader = bam::io::Reader::new(std::fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    reader
+        .record_bufs(&header)
+        .map(|r| r.expect("Failed to read record").sequence().as_ref().to_vec())
+        .collect()
+}
+
+/// Count the number of records in a BAM file.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened or any record cannot be read.
+pub fn count_bam_records(path: &std::path::Path) -> usize {
+    use noodles::bam;
+    let mut reader = bam::io::Reader::new(std::fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    reader.record_bufs(&header).count()
+}
+
+/// Read all records from a BAM file as `RecordBuf`.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened or any record cannot be read.
+pub fn read_bam_records(path: &std::path::Path) -> Vec<RecordBuf> {
+    use noodles::bam;
+    let mut reader = bam::io::Reader::new(std::fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    reader.record_bufs(&header).map(|r| r.expect("Failed to read record")).collect()
+}
+
+/// Write a coordinate-sorted BAM with UMI-tagged reads for use as pipeline sort input.
+///
+/// Creates single-end reads at two genomic positions (100 and 500) with distinct
+/// UMIs ("AAAA" and "CCCC"), producing two clear position groups for grouping/consensus.
+pub fn create_mapped_bam_for_sort(path: &std::path::Path) {
+    use noodles::bam;
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
+    use std::fs;
+
+    let header = create_coordinate_sorted_header("chr1", 10000);
+    let mut writer =
+        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
+    writer.write_header(&header).expect("Failed to write header");
+
+    // Position group 1 (pos 100): 5 reads with UMI "AAAA"
+    for i in 0..5 {
+        let rec = RecordBuilder::new()
+            .name(&format!("grp1_{i}"))
+            .sequence("ACGTACGT")
+            .qualities(&[30u8; 8])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .tag("RX", "AAAA")
+            .build();
+        writer.write_alignment_record(&header, &rec).expect("write");
+    }
+
+    // Position group 2 (pos 500): 5 reads with UMI "CCCC"
+    for i in 0..5 {
+        let rec = RecordBuilder::new()
+            .name(&format!("grp2_{i}"))
+            .sequence("TTTTAAAA")
+            .qualities(&[30u8; 8])
+            .reference_sequence_id(0)
+            .alignment_start(500)
+            .mapping_quality(60)
+            .tag("RX", "CCCC")
+            .build();
+        writer.write_alignment_record(&header, &rec).expect("write");
+    }
+
+    writer.try_finish().expect("Failed to finish BAM");
+}
+
 /// Create a reference FASTA + FAI + sequence dictionary that matches the test header
 /// (chr1, 10000bp).
 ///

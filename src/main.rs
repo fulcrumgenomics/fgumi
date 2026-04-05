@@ -28,6 +28,7 @@ use commands::filter::Filter;
 use commands::group::GroupReadsByUmi;
 use commands::merge::Merge;
 use commands::review::Review;
+use commands::runall::Runall;
 use commands::simplex::Simplex;
 use commands::simplex_metrics::SimplexMetrics;
 #[cfg(feature = "simulate")]
@@ -70,6 +71,10 @@ struct Args {
 #[command(version)]
 #[allow(clippy::large_enum_variant)]
 enum Subcommand {
+    // End-to-end pipeline
+    #[command(display_order = 0)]
+    Runall(Runall),
+
     // Grouping
     #[command(display_order = 1)]
     Extract(Extract),
