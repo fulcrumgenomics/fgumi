@@ -22,6 +22,7 @@ pub use fgumi_metrics::consensus;
 pub use fgumi_metrics::correct;
 pub use fgumi_metrics::duplex;
 pub use fgumi_metrics::group;
+pub mod paired_half_match;
 pub use fgumi_metrics::shared;
 pub use fgumi_metrics::simplex;
 pub use fgumi_metrics::writer;
@@ -35,5 +36,6 @@ pub use duplex::{
     FamilySizeMetric,
 };
 pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
+pub use paired_half_match::{HalfMatchCollector, PairedHalfMatchMetric};
 pub use shared::UmiMetric;
 pub use writer::{read_metrics, write_metrics};
