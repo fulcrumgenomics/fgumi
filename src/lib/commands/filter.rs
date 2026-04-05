@@ -841,7 +841,8 @@ impl Filter {
             }
         };
 
-        // Conversion fraction filter (EM-Seq read-level)
+        // Conversion fraction filter (EM-Seq only — not applicable to TAPs where
+        // non-CpG cytosines are expected to remain unconverted)
         if pass {
             if let Some(min_frac) = min_conversion_fraction {
                 if !check_conversion_fraction_raw_with_ref_bases_and_tags(

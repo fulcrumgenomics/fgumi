@@ -333,7 +333,7 @@ impl CodecConsensusCaller {
             trim: false,
             min_consensus_base_quality: 0, // MIN - we handle quality masking
             cell_tag: None,
-            em_seq: false, // CODEC does not support EM-Seq
+            methylation_mode: crate::MethylationMode::Disabled, // CODEC does not support methylation
         };
 
         let ss_caller = VanillaUmiConsensusCaller::new(
