@@ -12,6 +12,7 @@ use fgumi_lib::bam_io::{
     create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader,
 };
+use fgumi_lib::defaults;
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
@@ -185,7 +186,7 @@ pub struct Duplex {
     pub max_reads_per_strand: Option<usize>,
 
     /// SAM tag containing the cell barcode
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
+    #[arg(short = 'c', long = "cell-tag", default_value = defaults::CELL_TAG)]
     pub cell_tag: Option<String>,
 
     /// Scheduler and pipeline stats options

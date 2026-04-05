@@ -14,6 +14,8 @@ use noodles::sam::alignment::record::Flags;
 use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 
+use fgumi_lib::defaults;
+
 use crate::commands::command::Command;
 
 /// Lookup table for Phred to Phred+33 ASCII conversion (clamped to 126)
@@ -77,11 +79,11 @@ pub struct Fastq {
     pub no_suffix: bool,
 
     /// Exclude reads with any of these flags present [0x900 = secondary|supplementary].
-    #[arg(short = 'F', long = "exclude-flags", default_value_t = 0x900, value_parser = parse_flags)]
+    #[arg(short = 'F', long = "exclude-flags", default_value_t = defaults::FASTQ_EXCLUDE_FLAGS, value_parser = parse_flags)]
     pub exclude_flags: u16,
 
     /// Only include reads with all of these flags present.
-    #[arg(short = 'f', long = "require-flags", default_value_t = 0, value_parser = parse_flags)]
+    #[arg(short = 'f', long = "require-flags", default_value_t = defaults::FASTQ_REQUIRE_FLAGS, value_parser = parse_flags)]
     pub require_flags: u16,
 
     /// Number of threads for BAM decompression.
@@ -90,7 +92,7 @@ pub struct Fastq {
 
     /// BWA -K parameter value (bases per batch). Sizes output buffer to match bwa's
     /// batch size for optimal pipe throughput. Default matches common bwa mem usage.
-    #[arg(short = 'K', long = "bwa-chunk-size", default_value = "150000000")]
+    #[arg(short = 'K', long = "bwa-chunk-size", default_value_t = defaults::BWA_CHUNK_SIZE)]
     pub bwa_chunk_size: u64,
 }
 
@@ -183,7 +185,7 @@ impl Command for Fastq {
 
 /// Write a single FASTQ record to the writer.
 #[inline]
-fn write_fastq_record<W: Write>(
+pub(crate) fn write_fastq_record<W: Write>(
     writer: &mut W,
     record: &bam::Record,
     flags: Flags,
