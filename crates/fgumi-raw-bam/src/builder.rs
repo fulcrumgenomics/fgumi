@@ -1,7 +1,7 @@
 use crate::sequence::pack_sequence_into;
 use crate::tags::{
     append_float_tag, append_i16_array_tag, append_int_tag, append_phred33_string_tag,
-    append_string_tag,
+    append_string_tag, append_u8_array_tag,
 };
 
 // ============================================================================
@@ -159,6 +159,13 @@ impl UnmappedBamRecordBuilder {
     pub fn append_i16_array_tag(&mut self, tag: &[u8; 2], values: &[i16]) {
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_i16_array_tag(&mut self.buf, tag, values);
+    }
+
+    /// Append a `u8` array (`B:C`-type) tag.
+    #[inline]
+    pub fn append_u8_array_tag(&mut self, tag: &[u8; 2], values: &[u8]) {
+        debug_assert!(self.sealed, "must call build_record before appending tags");
+        append_u8_array_tag(&mut self.buf, tag, values);
     }
 
     /// Append a Phred+33 encoded quality string (`Z`-type) tag.
