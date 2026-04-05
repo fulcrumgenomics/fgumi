@@ -1,7 +1,14 @@
-//! Methylation-aware consensus calling for EM-Seq data.
+//! Methylation-aware consensus calling for EM-Seq and TAPs data.
 //!
 //! EM-Seq enzymatically converts unmethylated cytosines to thymine before PCR.
 //! At a reference C position: methylated → reads show C; unmethylated → reads show T.
+//!
+//! TAPs/Illumina 5-base converts methylated cytosines to thymine.
+//! At a reference C position: unmethylated → reads show C; methylated → reads show T.
+//!
+//! The base counting (unconverted C vs converted T) is identical in both chemistries.
+//! Only the MM/ML probability interpretation differs: EM-Seq uses unconverted/total,
+//! TAPs uses converted/total.
 //!
 //! This module provides:
 //! - Reference position mapping from consensus coordinates
@@ -234,12 +241,17 @@ pub(crate) fn annotate_simplex_methylation(
 /// bottom-strand had C. We still report as `C+m` since the output is unmapped and
 /// the bases have been normalized to the top-strand orientation.
 ///
+/// The `methylation_mode` parameter controls the probability calculation:
+/// - EM-Seq: prob = unconverted/total (C stayed as C because it was methylated)
+/// - TAPs: prob = converted/total (C was converted to T because it was methylated)
+///
 /// Returns `(mm_string, ml_array)`. Returns `None` if no ref-C positions exist.
 #[must_use]
 pub fn build_mm_ml_tags(
     consensus_bases: &[u8],
     annotation: &MethylationAnnotation,
     is_top_strand: bool,
+    methylation_mode: crate::MethylationMode,
 ) -> Option<(String, Vec<u8>)> {
     // The base we track in MM depends on strand
     let track_base = if is_top_strand { b'C' } else { b'G' };
@@ -258,8 +270,16 @@ pub fn build_mm_ml_tags(
             // This is a ref-C position with a C/G in consensus
             let total = u64::from(ev.unconverted_count) + u64::from(ev.converted_count);
             if total > 0 {
-                // Methylation probability = unconverted / total, scaled to [0, 255]
-                let prob = (u64::from(ev.unconverted_count) * 255 / total).min(255) as u8;
+                // EM-Seq: methylation prob = unconverted/total (C = methylated, stayed as C)
+                // TAPs:   methylation prob = converted/total  (T = methylated, converted from C)
+                let numerator = match methylation_mode {
+                    crate::MethylationMode::EmSeq => u64::from(ev.unconverted_count),
+                    crate::MethylationMode::Taps => u64::from(ev.converted_count),
+                    crate::MethylationMode::Disabled => {
+                        unreachable!("build_mm_ml_tags called with Disabled mode")
+                    }
+                };
+                let prob = (numerator * 255 / total).min(255) as u8;
                 skips.push(skip_count);
                 probs.push(prob);
                 skip_count = 0;
@@ -296,8 +316,9 @@ pub fn build_mm_tag_no_ml(
     consensus_bases: &[u8],
     annotation: &MethylationAnnotation,
     is_top_strand: bool,
+    methylation_mode: crate::MethylationMode,
 ) -> Option<String> {
-    build_mm_ml_tags(consensus_bases, annotation, is_top_strand).map(|(mm, _)| mm)
+    build_mm_ml_tags(consensus_bases, annotation, is_top_strand, methylation_mode).map(|(mm, _)| mm)
 }
 
 /// Fetches reference bases for aligned positions.
@@ -569,7 +590,7 @@ pub(crate) mod tests {
             ],
         };
 
-        let result = build_mm_ml_tags(&consensus, &annotation, true);
+        let result = build_mm_ml_tags(&consensus, &annotation, true, crate::MethylationMode::EmSeq);
         assert!(result.is_some());
         let (mm, ml) = result.unwrap();
         // Two C bases that are ref-C: skip 0 to first, skip 0 to second
@@ -593,7 +614,7 @@ pub(crate) mod tests {
             ],
         };
 
-        let result = build_mm_ml_tags(&consensus, &annotation, true);
+        let result = build_mm_ml_tags(&consensus, &annotation, true, crate::MethylationMode::EmSeq);
         assert!(result.is_none());
     }
 
@@ -609,7 +630,8 @@ pub(crate) mod tests {
             ],
         };
 
-        let result = build_mm_tag_no_ml(&consensus, &annotation, true);
+        let result =
+            build_mm_tag_no_ml(&consensus, &annotation, true, crate::MethylationMode::EmSeq);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "C+m,0;");
     }
@@ -669,11 +691,70 @@ pub(crate) mod tests {
             ],
         };
 
-        let (mm, ml) = build_mm_ml_tags(&consensus, &annotation, true).unwrap();
+        let (mm, ml) =
+            build_mm_ml_tags(&consensus, &annotation, true, crate::MethylationMode::EmSeq).unwrap();
         // First ref-C is the 1st C (skip 0), second ref-C is the 4th C (skip 1 non-ref C + skip 1 more)
         // Walking: C at 0 (ref-C, skip=0), C at 1 (not ref-C, skip++), C at 3 (ref-C, skip=1), C at 4 (not ref-C)
         assert_eq!(mm, "C+m,0,1;");
         assert_eq!(ml, vec![255, 0]);
+    }
+
+    #[test]
+    fn test_build_mm_ml_tags_taps_all_methylated() {
+        // All converted (T) at ref-C → TAPs prob = converted/total = 255
+        let bases = vec![b'C'; 5]; // consensus restored to C
+        let annotation = MethylationAnnotation {
+            evidence: vec![
+                MethylationEvidence {
+                    is_ref_c: true,
+                    unconverted_count: 0,
+                    converted_count: 3
+                };
+                5
+            ],
+        };
+        let result = build_mm_ml_tags(&bases, &annotation, true, crate::MethylationMode::Taps);
+        let (mm, ml) = result.unwrap();
+        assert!(mm.starts_with("C+m"));
+        assert_eq!(ml, vec![255u8; 5]);
+    }
+
+    #[test]
+    fn test_build_mm_ml_tags_taps_all_unmethylated() {
+        // All unconverted (C) at ref-C → TAPs prob = converted/total = 0/3 = 0
+        let bases = vec![b'C'; 5];
+        let annotation = MethylationAnnotation {
+            evidence: vec![
+                MethylationEvidence {
+                    is_ref_c: true,
+                    unconverted_count: 3,
+                    converted_count: 0
+                };
+                5
+            ],
+        };
+        let result = build_mm_ml_tags(&bases, &annotation, true, crate::MethylationMode::Taps);
+        let (_, ml) = result.unwrap();
+        assert_eq!(ml, vec![0u8; 5]);
+    }
+
+    #[test]
+    fn test_build_mm_ml_tags_emseq_unchanged() {
+        // Verify EM-seq behavior is unchanged: unconverted/total
+        let bases = vec![b'C'; 5];
+        let annotation = MethylationAnnotation {
+            evidence: vec![
+                MethylationEvidence {
+                    is_ref_c: true,
+                    unconverted_count: 3,
+                    converted_count: 0
+                };
+                5
+            ],
+        };
+        let result = build_mm_ml_tags(&bases, &annotation, true, crate::MethylationMode::EmSeq);
+        let (_, ml) = result.unwrap();
+        assert_eq!(ml, vec![255u8; 5]); // EM-seq: 3/3 unconverted = 255
     }
 
     /// Helper to create a `SourceRead` for testing.

@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use super::command::Command;
 
-use super::common::{EmSeqRef, load_em_seq_reference};
+use super::common::{MethylationRef, load_methylation_reference};
 
 // ============================================================================
 // Types for 7-step pipeline processing
@@ -198,13 +198,14 @@ pub struct Duplex {
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
 
-    /// Enable EM-Seq methylation-aware consensus calling.
-    /// When enabled, unconverted C/T counts are tracked at reference cytosine positions
-    /// and MM/ML methylation tags are emitted on consensus reads.
-    #[arg(long = "em-seq", default_value_t = false, requires = "reference")]
-    pub em_seq: bool,
+    /// Methylation-aware consensus calling mode.
+    /// When set, C→T conversions at reference cytosine positions are tracked as
+    /// methylation events and MM/ML methylation tags are emitted on consensus reads.
+    /// Requires --ref.
+    #[arg(long = "methylation-mode", value_enum)]
+    pub methylation_mode: Option<crate::commands::common::MethylationModeArg>,
 
-    /// Path to the reference FASTA file (required when --em-seq is enabled)
+    /// Path to the reference FASTA file (required when --methylation-mode is set)
     #[arg(long = "ref")]
     pub reference: Option<std::path::PathBuf>,
 }
@@ -269,7 +270,7 @@ impl Command for Duplex {
     ///     cell_tag: None,
     ///     scheduler_opts: SchedulerOptions::default(),
     ///     queue_memory: QueueMemoryOptions::default(),
-    ///     em_seq: false,
+    ///     methylation_mode: None,
     ///     reference: None,
     /// };
     ///
@@ -319,8 +320,10 @@ impl Command for Duplex {
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
 
-        // Load reference for EM-Seq methylation-aware consensus calling
-        let em_seq_ref: EmSeqRef = load_em_seq_reference(self.em_seq, &self.reference, &header)?;
+        let methylation_mode =
+            crate::commands::common::resolve_methylation_mode(self.methylation_mode);
+        let methylation_ref: MethylationRef =
+            load_methylation_reference(methylation_mode, &self.reference, &header)?;
 
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
         let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
@@ -345,7 +348,8 @@ impl Command for Duplex {
                 read_name_prefix.clone(),
                 track_rejects,
                 command_line,
-                em_seq_ref.clone(),
+                methylation_ref.clone(),
+                methylation_mode,
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
             return result;
@@ -390,9 +394,13 @@ impl Command for Duplex {
             self.consensus.error_rate_post_umi,
         )?;
 
-        // Set reference for EM-Seq if enabled
-        if let Some((ref reference, ref ref_names)) = em_seq_ref {
-            consensus_caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+        // Set reference for methylation-aware consensus if enabled
+        if let Some((ref reference, ref ref_names)) = methylation_ref {
+            consensus_caller.set_reference(
+                Arc::clone(reference),
+                Arc::clone(ref_names),
+                methylation_mode,
+            );
         }
 
         // Accumulator for overlapping stats from parallel processing
@@ -543,7 +551,8 @@ impl Duplex {
         read_name_prefix: String,
         track_rejects: bool,
         command_line: &str,
-        em_seq_ref: EmSeqRef,
+        methylation_ref: MethylationRef,
+        methylation_mode: fgumi_consensus::MethylationMode,
     ) -> Result<()> {
         // Create output header (for duplex, output is unmapped like simplex)
         let output_header = create_unmapped_consensus_header(
@@ -647,9 +656,13 @@ impl Duplex {
                     io::Error::other(format!("Failed to create DuplexConsensusCaller: {e}"))
                 })?;
 
-                // Set reference for EM-Seq if enabled
-                if let Some((ref reference, ref ref_names)) = em_seq_ref {
-                    caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+                // Set reference for methylation-aware consensus if enabled
+                if let Some((ref reference, ref ref_names)) = methylation_ref {
+                    caller.set_reference(
+                        Arc::clone(reference),
+                        Arc::clone(ref_names),
+                        methylation_mode,
+                    );
                 }
 
                 // Create overlapping caller if enabled
@@ -906,7 +919,7 @@ mod tests {
             cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
-            em_seq: false,
+            methylation_mode: None,
             reference: None,
         }
     }
@@ -1729,7 +1742,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = create_duplex_with_paths(input.path().to_path_buf(), paths.output.clone());
-        cmd.em_seq = true;
+        cmd.methylation_mode = Some(crate::commands::common::MethylationModeArg::EmSeq);
         cmd.reference = Some(ref_file.path().to_path_buf());
         cmd.threading = threading;
         cmd.execute("test")?;
