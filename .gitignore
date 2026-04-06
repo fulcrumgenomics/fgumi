@@ -40,3 +40,6 @@ docs/book/
 docs/src/SUMMARY.md
 docs/src/tools/
 docs/src/metrics/
+
+# Benchmark data
+/tmp/

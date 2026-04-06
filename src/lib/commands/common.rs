@@ -567,11 +567,17 @@ impl QueueMemoryOptions {
 
     /// Warns if the requested memory exceeds reasonable system limits.
     fn validate_against_system_memory(requested_bytes: u64) {
-        use sysinfo::System;
-        let mut system = System::new();
+        let mut system = sysinfo::System::new();
         system.refresh_memory();
 
-        let total_memory_bytes = system.total_memory();
+        // Use cgroup-aware total clamped to physical RAM, matching detect_total_memory().
+        // A misconfigured container may report a cgroup limit exceeding physical RAM;
+        // clamping keeps warnings consistent with the value used by resolve_memory_limit.
+        let physical = system.total_memory();
+        let total_memory_bytes =
+            system.cgroup_limits().map_or(physical, |c| c.total_memory.min(physical));
+
+        // available_memory reflects free physical pages; no cgroup equivalent.
         let available_memory_bytes = system.available_memory();
 
         // Calculate 90% limit using integer arithmetic to avoid precision loss
@@ -631,6 +637,7 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
 }
 
 // Re-export from the library crate for backward compatibility.
+pub(crate) use crate::system::detect_total_memory;
 pub use crate::validation::parse_memory_size;
 
 /// Builds a [`BamPipelineConfig`] from the common CLI option structs.
@@ -1094,5 +1101,31 @@ mod tests {
     #[case(&["test", "--trim", "off"])]
     fn test_extended_bool_values_in_cli_invalid(#[case] args: &[&str]) {
         assert!(TestBoolFlags::try_parse_from(args).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // cgroup-aware memory detection
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_total_memory_returns_nonzero() {
+        let total = detect_total_memory();
+        assert!(total > 0, "detect_total_memory returned 0");
+        // Sanity: at least 64 MiB (even the smallest CI runner has more than this).
+        assert!(total >= 64 * 1024 * 1024, "detect_total_memory returned < 64 MiB: {total}");
+    }
+
+    #[test]
+    fn test_detect_total_memory_bounded_by_sysinfo() {
+        // cgroup_limits().total_memory is min(cgroup_max, physical_ram), so
+        // detect_total_memory() can never exceed what sysinfo reports.
+        let total = detect_total_memory();
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let sysinfo_total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
+        assert!(
+            total <= sysinfo_total,
+            "cgroup-limited total {total} exceeded sysinfo total {sysinfo_total}"
+        );
     }
 }

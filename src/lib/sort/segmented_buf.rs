@@ -187,13 +187,21 @@ impl SegmentedBuf {
 
     /// Translate a global byte offset to `(segment_index, offset_within_segment)`.
     ///
-    /// Relies on the invariant that all segments except the last are exactly
-    /// `segment_size` bytes, maintained by gap padding in `reserve_contiguous`.
+    /// # Invariant
+    ///
+    /// All segments except the last are exactly `segment_size` bytes long (full).
+    /// A write that doesn't fit in the current segment is always redirected to a
+    /// fresh segment with gap-padding applied to `total_len`, so the arithmetic
+    /// `offset / segment_size` and `offset % segment_size` are exact.
     #[inline]
     fn locate(&self, offset: usize) -> (usize, usize) {
-        // Fast path for fixed-size segments (all but the last are full)
         let seg_idx = offset / self.segment_size;
         let seg_offset = offset % self.segment_size;
+        debug_assert!(
+            seg_idx < self.segments.len(),
+            "locate({offset}): seg_idx {seg_idx} out of bounds (len {})",
+            self.segments.len()
+        );
         (seg_idx, seg_offset)
     }
 

@@ -31,7 +31,7 @@ use log::info;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
-use crate::commands::common::{CompressionOptions, parse_bool};
+use crate::commands::common::{CompressionOptions, detect_total_memory, parse_bool};
 use crate::validation::parse_memory_size;
 
 /// Sort order for BAM files.
@@ -408,13 +408,19 @@ fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> usize {
 
 /// Resolves a [`MemoryLimit`] to a concrete byte count.
 ///
-/// For [`MemoryLimit::Auto`]: detects total system memory, subtracts the
-/// reserve (via [`MemoryReserve`]), and divides by thread count (when
-/// `memory_per_thread` is true). The result is clamped to a minimum of
-/// 256 MiB per thread.
+/// For [`MemoryLimit::Auto`]: detects total system memory (cgroup-aware via
+/// [`detect_total_memory`]), subtracts the reserve (via [`MemoryReserve`]),
+/// and divides by thread count (when `memory_per_thread` is true). The result
+/// is clamped to a minimum of 256 MiB per thread.
 ///
 /// For [`MemoryLimit::Fixed`]: applies the same `memory_per_thread`
 /// multiplication as before. The reserve is ignored.
+///
+/// # Note
+///
+/// Calls [`detect_total_memory`] exactly once regardless of `limit` variant.
+/// That function invokes `sysinfo` (creates a `System` instance and refreshes
+/// memory counters), so repeated calls add unnecessary overhead.
 fn resolve_memory_limit(
     limit: MemoryLimit,
     reserve: MemoryReserve,
@@ -425,8 +431,8 @@ fn resolve_memory_limit(
         bail!("--threads must be at least 1");
     }
 
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
+    // Call once — detect_total_memory() invokes sysinfo, which is not free.
+    let total = detect_total_memory();
 
     let total_budget = match limit {
         MemoryLimit::Fixed(bytes) => {
@@ -439,8 +445,6 @@ fn resolve_memory_limit(
             }
         }
         MemoryLimit::Auto => {
-            let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
-
             let margin = resolve_reserve(reserve, total);
             let available = total.saturating_sub(margin);
 
@@ -482,8 +486,7 @@ fn resolve_memory_limit(
         }
     };
 
-    // Post-resolution system memory check: warn if any mode exceeds host RAM
-    let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
+    // Post-resolution sanity check: warn if budget exceeds the effective memory limit.
     if total_budget > total {
         log::warn!(
             "Memory budget {} exceeds total system memory {}; spill-to-disk is likely",
@@ -837,9 +840,7 @@ mod tests {
 
     #[test]
     fn test_resolve_memory_limit_auto() {
-        let mut system = sysinfo::System::new();
-        system.refresh_memory();
-        let total = system.total_memory() as usize;
+        let total = detect_total_memory();
 
         let resolved = resolve_memory_limit(MemoryLimit::Auto, MemoryReserve::Auto, 4, true)
             .expect("should succeed");
@@ -849,8 +850,11 @@ mod tests {
             resolved >= min_expected,
             "auto resolved to {resolved} bytes, expected at least {min_expected}"
         );
-        // And not more than total system memory
-        assert!(resolved <= total);
+        // And not more than effective total memory (cgroup-aware), unless total
+        // memory is so small that the per-thread floor already exceeds it.
+        if total >= MIN_MEMORY_PER_THREAD.saturating_mul(4) {
+            assert!(resolved <= total);
+        }
     }
 
     #[test]

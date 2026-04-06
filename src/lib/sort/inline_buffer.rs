@@ -150,8 +150,11 @@ pub struct RecordBuffer {
     nref: u32,
 }
 
-/// Segment size for `RecordBuffer`'s `SegmentedBuf`: 256 MiB.
-const RECORD_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
+/// Segment size for in-memory sort buffers: 256 MiB.
+///
+/// Both `RecordBuffer` and `TemplateRecordBuffer` use this segment size so that
+/// a single BAM record (≤128 MiB in practice) always fits within one segment.
+const SORT_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
 impl RecordBuffer {
     /// Create a new buffer with estimated capacity.
@@ -165,7 +168,7 @@ impl RecordBuffer {
         Self {
             data: SegmentedBuf::with_capacity(
                 estimated_bytes + estimated_records * HEADER_SIZE,
-                RECORD_SEGMENT_SIZE,
+                SORT_SEGMENT_SIZE,
             ),
             refs: Vec::with_capacity(estimated_records),
             nref,
@@ -193,12 +196,12 @@ impl RecordBuffer {
 
         let total_bytes = HEADER_SIZE + record.len();
         anyhow::ensure!(
-            total_bytes <= RECORD_SEGMENT_SIZE,
+            total_bytes <= SORT_SEGMENT_SIZE,
             "BAM record of {} bytes (+ {} byte header) exceeds segment size of {} bytes; \
              this is likely a malformed BAM file",
             record.len(),
             HEADER_SIZE,
-            RECORD_SEGMENT_SIZE,
+            SORT_SEGMENT_SIZE,
         );
         let len = u32::try_from(record.len())
             .map_err(|_| anyhow::anyhow!("record length {} exceeds u32::MAX", record.len()))?;
@@ -718,19 +721,14 @@ pub struct TemplateRecordBuffer {
     refs: Vec<TemplateRecordRef>,
 }
 
-/// Segment size for `TemplateRecordBuffer`'s `SegmentedBuf`: 256 MiB.
-const TEMPLATE_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
-
+//
 impl TemplateRecordBuffer {
     /// Create a new buffer with estimated capacity.
     #[must_use]
     pub fn with_capacity(estimated_records: usize, estimated_bytes: usize) -> Self {
         let header_bytes = estimated_records * TEMPLATE_HEADER_SIZE;
         Self {
-            data: SegmentedBuf::with_capacity(
-                estimated_bytes + header_bytes,
-                TEMPLATE_SEGMENT_SIZE,
-            ),
+            data: SegmentedBuf::with_capacity(estimated_bytes + header_bytes, SORT_SEGMENT_SIZE),
             refs: Vec::with_capacity(estimated_records),
         }
     }
@@ -745,12 +743,12 @@ impl TemplateRecordBuffer {
     pub fn push(&mut self, record: &[u8], key: TemplateKey) -> anyhow::Result<()> {
         let total_bytes = TEMPLATE_HEADER_SIZE + record.len();
         anyhow::ensure!(
-            total_bytes <= TEMPLATE_SEGMENT_SIZE,
+            total_bytes <= SORT_SEGMENT_SIZE,
             "BAM record of {} bytes (+ {} byte header) exceeds segment size of {} bytes; \
              this is likely a malformed BAM file",
             record.len(),
             TEMPLATE_HEADER_SIZE,
-            TEMPLATE_SEGMENT_SIZE,
+            SORT_SEGMENT_SIZE,
         );
         let record_len = u32::try_from(record.len())
             .map_err(|_| anyhow::anyhow!("record length {} exceeds u32::MAX", record.len()))?;
