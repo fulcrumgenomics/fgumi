@@ -41,7 +41,7 @@ use std::time::Instant;
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config,
+    build_pipeline_config, parse_bool,
 };
 
 /// Filters and masks consensus reads based on various quality metrics.
@@ -147,7 +147,7 @@ pub struct Filter {
     pub max_no_call_fraction: f64,
 
     /// Reverse per-base tags for negative strand reads
-    #[arg(short = 'R', long = "reverse-per-base-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'R', long = "reverse-per-base-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub reverse_per_base_tags: bool,
 
     /// Threading options for parallel processing
@@ -155,7 +155,7 @@ pub struct Filter {
     pub threading: ThreadingOptions,
 
     /// Filter templates together (all primary reads must pass)
-    #[arg(long = "filter-by-template", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "filter-by-template", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub filter_by_template: bool,
 
     /// Optional output BAM file for rejected reads
@@ -167,7 +167,7 @@ pub struct Filter {
     pub stats: Option<PathBuf>,
 
     /// Require single-strand agreement for duplex consensus (mask bases where AB and BA disagree)
-    #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 's', long = "require-single-strand-agreement", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub require_single_strand_agreement: bool,
 
     /// Compression options for output BAM.

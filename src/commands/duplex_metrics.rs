@@ -6,6 +6,7 @@
 //! - Ideal duplex fraction calculation using proper binomial CDF
 //! - Optional interval filtering (BED or Picard interval list format) to restrict analysis to specific regions
 
+use crate::commands::common::parse_bool;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
@@ -100,7 +101,7 @@ pub struct DuplexMetrics {
     pub min_ba_reads: usize,
 
     /// Collect duplex UMI counts (memory intensive)
-    #[arg(long = "duplex-umi-counts", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "duplex-umi-counts", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub duplex_umi_counts: bool,
 
     /// Optional intervals file to restrict analysis (BED or Picard interval list format)

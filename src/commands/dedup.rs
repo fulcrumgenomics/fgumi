@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config,
+    build_pipeline_config, parse_bool,
 };
 use fgumi_lib::sort::PA_TAG;
 use fgumi_lib::sort::bam_fields;
@@ -1073,7 +1073,7 @@ pub struct MarkDuplicates {
     pub family_size_histogram: Option<PathBuf>,
 
     /// Remove duplicates instead of just marking them
-    #[arg(short = 'r', long = "remove-duplicates", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'r', long = "remove-duplicates", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub remove_duplicates: bool,
 
     /// The tag containing the raw UMI sequence
@@ -1097,7 +1097,7 @@ pub struct MarkDuplicates {
     pub min_map_q: Option<u8>,
 
     /// Include reads flagged as not passing QC
-    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub include_non_pf_reads: bool,
 
     /// UMI grouping strategy
@@ -1126,7 +1126,7 @@ pub struct MarkDuplicates {
 
     /// Skip UMI-based grouping; group by position only. Forces identity strategy
     /// and ignores any existing UMI tags.
-    #[arg(long = "no-umi")]
+    #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
     /// Scheduler and pipeline options

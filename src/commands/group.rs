@@ -3,7 +3,7 @@
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config,
+    build_pipeline_config, parse_bool,
 };
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
@@ -772,7 +772,7 @@ pub struct GroupReadsByUmi {
     pub min_map_q: Option<u8>,
 
     /// Include non-PF reads
-    #[arg(short = 'n', long = "include-non-pf-reads")]
+    #[arg(short = 'n', long = "include-non-pf-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub include_non_pf_reads: bool,
 
     /// Allow fully unmapped templates (both reads unmapped).
@@ -789,7 +789,7 @@ pub struct GroupReadsByUmi {
     /// For paired UMIs (e.g., "ACGT-TGCA"), edit distance is computed on the
     /// concatenated sequence with dashes removed (30 bases for 15bp-15bp UMIs).
     /// With --edits 1, only 1 mismatch is allowed across ALL bases.
-    #[arg(long = "allow-unmapped")]
+    #[arg(long = "allow-unmapped", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub allow_unmapped: bool,
 
     /// The UMI assignment strategy
@@ -819,7 +819,7 @@ pub struct GroupReadsByUmi {
 
     /// Skip UMI-based grouping; group by position only. Forces identity strategy
     /// and ignores any existing UMI tags.
-    #[arg(long = "no-umi")]
+    #[arg(long = "no-umi", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_umi: bool,
 
     /// Scheduler and pipeline statistics options.
@@ -832,7 +832,7 @@ pub struct GroupReadsByUmi {
 
     /// Enable comprehensive memory debugging (reports every 1 second)
     #[cfg(feature = "memory-debug")]
-    #[arg(long)]
+    #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub debug_memory: bool,
 
     /// Memory report interval in seconds (default: 1, minimum: 1)
