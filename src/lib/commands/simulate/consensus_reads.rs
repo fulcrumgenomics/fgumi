@@ -1,16 +1,16 @@
 //! Generate consensus BAM with tags for filter.
 
+use crate::bam_io::create_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{StrandBiasArgs, generate_random_sequence};
+use crate::dna::reverse_complement;
+use crate::progress::ProgressTracker;
+use crate::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
+use crate::simulate::{StrandBiasModel, create_rng};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
-use fgumi_lib::bam_io::create_bam_writer;
-use fgumi_lib::dna::reverse_complement;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
-use fgumi_lib::simulate::{StrandBiasModel, create_rng};
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -399,7 +399,7 @@ fn build_consensus_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::simulate::create_rng;
+    use crate::simulate::create_rng;
 
     #[test]
     fn test_generate_random_sequence_length() {

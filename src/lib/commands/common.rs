@@ -5,28 +5,28 @@
 
 use std::path::PathBuf;
 
+use crate::bam_io::is_stdin_path;
+use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
+use crate::validation::validate_file_exists;
 use bytesize::ByteSize;
 use clap::Args;
-use fgumi_lib::bam_io::is_stdin_path;
-use fgumi_lib::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
-use fgumi_lib::validation::validate_file_exists;
 use noodles::sam::Header;
 
 /// Add a @PG record to an existing header, using the current fgumi version.
 ///
-/// Wraps [`fgumi_lib::header::add_pg_record`] with the binary's version string.
+/// Wraps [`crate::header::add_pg_record`] with the binary's version string.
 pub fn add_pg_record(header: Header, command_line: &str) -> anyhow::Result<Header> {
-    fgumi_lib::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
+    crate::header::add_pg_record(header, crate::version::VERSION.as_str(), command_line)
 }
 
 /// Add a @PG record to a header builder, using the current fgumi version.
 ///
-/// Wraps [`fgumi_lib::header::add_pg_to_builder`] with the binary's version string.
+/// Wraps [`crate::header::add_pg_to_builder`] with the binary's version string.
 pub fn add_pg_to_builder(
     builder: noodles::sam::header::Builder,
     command_line: &str,
 ) -> anyhow::Result<noodles::sam::header::Builder> {
-    fgumi_lib::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+    crate::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
 }
 
 /// Common input/output options for commands that read a BAM and write a BAM.
@@ -199,7 +199,7 @@ impl ReadGroupOptions {
     pub fn prefix_or_from_header(&self, header: &noodles::sam::Header) -> String {
         self.read_name_prefix
             .clone()
-            .unwrap_or_else(|| fgumi_lib::consensus_caller::make_prefix_from_header(header))
+            .unwrap_or_else(|| crate::consensus_caller::make_prefix_from_header(header))
     }
 }
 
@@ -631,7 +631,7 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
 }
 
 // Re-export from the library crate for backward compatibility.
-pub use fgumi_lib::validation::parse_memory_size;
+pub use crate::validation::parse_memory_size;
 
 /// Builds a [`BamPipelineConfig`] from the common CLI option structs.
 ///

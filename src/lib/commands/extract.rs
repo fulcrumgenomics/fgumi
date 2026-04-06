@@ -14,30 +14,30 @@
 //! Automatically detects and handles both Phred+33 (standard) and Phred+64 (Illumina 1.3-1.7)
 //! quality encodings.
 
+use crate::bam_io::{RawBamWriter, create_raw_bam_writer};
 use crate::commands::command::Command;
 use crate::commands::common::{
     CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
 };
+use crate::fastq::FastqSegment;
+use crate::fastq::FastqSet;
+use crate::fastq::ReadSetIterator;
+use crate::grouper::FastqTemplate;
+use crate::logging::OperationTimer;
+use crate::progress::ProgressTracker;
+use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
+use crate::validation::validate_file_exists;
 use anyhow::{Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgoxide::io::Io;
-use fgumi_lib::bam_io::{RawBamWriter, create_raw_bam_writer};
-use fgumi_lib::fastq::FastqSegment;
-use fgumi_lib::fastq::FastqSet;
-use fgumi_lib::fastq::ReadSetIterator;
-use fgumi_lib::grouper::FastqTemplate;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
-use fgumi_lib::validation::validate_file_exists;
 use fgumi_raw_bam::UnmappedBamRecordBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
 
 #[cfg(test)]
-use fgumi_lib::bam_io::create_bam_reader;
+use crate::bam_io::create_bam_reader;
 use fgumi_simd_fastq::SimdFastqReader;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::Map;
@@ -375,7 +375,7 @@ hyphen, then the UMIs extracted from the reads.
 )]
 #[command(verbatim_doc_comment)]
 #[allow(clippy::struct_excessive_bools)]
-pub(crate) struct Extract {
+pub struct Extract {
     /// Input FASTQ files corresponding to each sequencing read (e.g. R1, I1, etc.)
     #[arg(long, short = 'i', required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,

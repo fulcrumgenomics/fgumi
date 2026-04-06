@@ -4,11 +4,11 @@
 //! which may have slightly different floating-point representations.
 
 use crate::commands::common::parse_bool;
+use crate::logging::OperationTimer;
+use crate::progress::ProgressTracker;
+use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

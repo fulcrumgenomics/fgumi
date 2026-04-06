@@ -4,32 +4,32 @@
 //! consensus reads using a likelihood-based model that accounts for sequencing errors and
 //! errors introduced during sample preparation.
 
-use anyhow::{Context, Result, bail};
-use clap::Parser;
-use fgoxide::io::DelimFile;
-use fgumi_lib::bam_io::{
+use crate::bam_io::{
     create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader,
 };
-use fgumi_lib::consensus_caller::{
+use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
 };
-use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
-use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
-use fgumi_lib::overlapping_consensus::{
+use crate::logging::{OperationTimer, log_consensus_summary};
+use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus_raw,
 };
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::read_info::LibraryIndex;
-use fgumi_lib::unified_pipeline::{
+use crate::progress::ProgressTracker;
+use crate::read_info::LibraryIndex;
+use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+use fgoxide::io::DelimFile;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
+use crate::validation::optional_string_to_tag;
+use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
 use crossbeam_queue::SegQueue;
-use fgumi_lib::validation::optional_string_to_tag;
-use fgumi_lib::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
 use log::info;
 use noodles::sam::Header;
 use std::io;
@@ -706,7 +706,7 @@ impl Simplex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::metrics::consensus::ConsensusKvMetric;
+    use crate::metrics::consensus::ConsensusKvMetric;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
@@ -798,7 +798,7 @@ mod tests {
     // Integration Tests
     // ========================================================================
 
-    use fgumi_lib::sam::builder::SamBuilder;
+    use crate::sam::builder::SamBuilder;
     use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
     use std::collections::HashMap;
     use tempfile::TempDir;

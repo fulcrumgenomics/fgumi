@@ -5,12 +5,12 @@ use crate::commands::common::parse_bool;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, QualityArgs, SimulationCommon, generate_random_sequence,
 };
+use crate::progress::ProgressTracker;
+use crate::simulate::{FastqWriter, create_rng};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_dna::dna::complement_base;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::simulate::{FastqWriter, create_rng};
 use log::{info, warn};
 use noodles::fasta;
 use rand::{Rng, RngExt};
@@ -461,10 +461,10 @@ fn generate_molecule_reads(
     mol_id: usize,
     seed: u64,
     params: &GenerationParams,
-    quality_model: &fgumi_lib::simulate::PositionQualityModel,
-    quality_bias: &fgumi_lib::simulate::ReadPairQualityBias,
-    family_dist: &fgumi_lib::simulate::FamilySizeDistribution,
-    insert_model: &fgumi_lib::simulate::InsertSizeModel,
+    quality_model: &crate::simulate::PositionQualityModel,
+    quality_bias: &crate::simulate::ReadPairQualityBias,
+    family_dist: &crate::simulate::FamilySizeDistribution,
+    insert_model: &crate::simulate::InsertSizeModel,
     reference: Option<&ReferenceGenome>,
 ) -> Vec<ReadRecord> {
     let mut rng = create_rng(Some(seed));
@@ -674,7 +674,7 @@ fn pad_sequence_inplace(seq: &mut Vec<u8>, target_len: usize, rng: &mut impl Rng
 #[allow(clippy::naive_bytecount)]
 mod tests {
     use super::*;
-    use fgumi_lib::simulate::create_rng;
+    use crate::simulate::create_rng;
 
     /// Reverse complement a DNA sequence (test wrapper).
     fn reverse_complement(seq: &[u8]) -> Vec<u8> {
@@ -1081,10 +1081,10 @@ mod tests {
         };
 
         let quality_model =
-            fgumi_lib::simulate::PositionQualityModel::new(10, 25, 37, 100, 0.08, 2, 2.0);
-        let quality_bias = fgumi_lib::simulate::ReadPairQualityBias::new(0);
-        let family_dist = fgumi_lib::simulate::FamilySizeDistribution::log_normal(3.0, 1.0);
-        let insert_model = fgumi_lib::simulate::InsertSizeModel::new(150.0, 30.0, 50, 500);
+            crate::simulate::PositionQualityModel::new(10, 25, 37, 100, 0.08, 2, 2.0);
+        let quality_bias = crate::simulate::ReadPairQualityBias::new(0);
+        let family_dist = crate::simulate::FamilySizeDistribution::log_normal(3.0, 1.0);
+        let insert_model = crate::simulate::InsertSizeModel::new(150.0, 30.0, 50, 500);
 
         // Generate molecules and verify UMIs come from includelist
         for seed in 0..20u64 {

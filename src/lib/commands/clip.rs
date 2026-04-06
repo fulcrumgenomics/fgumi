@@ -4,25 +4,25 @@
 //! This is useful for variant calling to avoid double-counting evidence from
 //! overlapping portions of paired reads.
 
+use crate::alignment_tags::regenerate_alignment_tags;
+use crate::bam_io::{
+    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path,
+};
+use crate::clipper::{ClippingMode, SamRecordClipper};
+use crate::grouper::TemplateGrouper;
+use crate::logging::OperationTimer;
+use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
+use crate::metrics::writer::write_metrics as write_metrics_tsv;
+use crate::progress::ProgressTracker;
+use crate::reference::ReferenceReader;
+use crate::template::{TemplateBatch, TemplateIterator};
+use crate::unified_pipeline::{
+    Grouper, MemoryEstimate, run_bam_pipeline_from_reader, serialize_bam_records_into,
+};
+use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_queue::SegQueue;
-use fgumi_lib::alignment_tags::regenerate_alignment_tags;
-use fgumi_lib::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path,
-};
-use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
-use fgumi_lib::grouper::TemplateGrouper;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::clip::{ClipCounts, ClippingMetricsCollection};
-use fgumi_lib::metrics::writer::write_metrics as write_metrics_tsv;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::reference::ReferenceReader;
-use fgumi_lib::template::{TemplateBatch, TemplateIterator};
-use fgumi_lib::unified_pipeline::{
-    Grouper, MemoryEstimate, run_bam_pipeline_from_reader, serialize_bam_records_into,
-};
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -1656,8 +1656,8 @@ mod tests {
     }
 
     // Integration tests
+    use crate::sam::SamBuilder;
     use anyhow::Result;
-    use fgumi_lib::sam::SamBuilder;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use tempfile::TempDir;
 
@@ -2295,7 +2295,7 @@ mod tests {
 
     #[test]
     fn test_clip_processed_batch_memory_estimate() {
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::sam::builder::RecordBuilder;
         use noodles::sam::alignment::record_buf::RecordBuf;
 
         let record = RecordBuilder::new().sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
@@ -2353,9 +2353,9 @@ mod tests {
 
     #[test]
     fn test_clip_fragment_with_metrics() {
-        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
-        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::clipper::{ClippingMode, SamRecordClipper};
+        use crate::metrics::clip::ClippingMetricsCollection;
+        use crate::sam::builder::RecordBuilder;
 
         let clip = make_clip(3, 2, 0, 0);
         let clipper = SamRecordClipper::new(ClippingMode::Soft);
@@ -2384,9 +2384,9 @@ mod tests {
 
     #[test]
     fn test_clip_fragment_no_clipping_with_metrics() {
-        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
-        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::clipper::{ClippingMode, SamRecordClipper};
+        use crate::metrics::clip::ClippingMetricsCollection;
+        use crate::sam::builder::RecordBuilder;
 
         let clip = make_clip(0, 0, 0, 0);
         // Need at least one clipping option active for the Clip struct to be valid,
@@ -2414,9 +2414,9 @@ mod tests {
 
     #[test]
     fn test_clip_pair_with_metrics() {
-        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
-        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::clipper::{ClippingMode, SamRecordClipper};
+        use crate::metrics::clip::ClippingMetricsCollection;
+        use crate::sam::builder::RecordBuilder;
 
         let clip = make_clip(2, 1, 1, 2);
         let clipper = SamRecordClipper::new(ClippingMode::Soft);
@@ -2475,9 +2475,9 @@ mod tests {
 
     #[test]
     fn test_clip_pair_with_metrics_swapped_flags() {
-        use fgumi_lib::clipper::{ClippingMode, SamRecordClipper};
-        use fgumi_lib::metrics::clip::ClippingMetricsCollection;
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::clipper::{ClippingMode, SamRecordClipper};
+        use crate::metrics::clip::ClippingMetricsCollection;
+        use crate::sam::builder::RecordBuilder;
 
         // Test the !is_r1_first and !is_r2_last branches:
         // r1 is NOT first_segment, r2 is NOT last_segment

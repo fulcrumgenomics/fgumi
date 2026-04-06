@@ -5,22 +5,22 @@
 //! records in memory before sorting.
 
 use super::sort::TemplateCoordKey;
+use crate::bam_io::create_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MoleculeInfo, PositionDistArgs, QualityArgs, ReferenceArgs,
     SimulationCommon, compute_position, generate_random_sequence, pad_sequence,
 };
+use crate::dna::reverse_complement;
+use crate::progress::ProgressTracker;
+use crate::sam::builder::RecordBuilder;
+use crate::simulate::{
+    FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias, create_rng,
+};
 use anyhow::{Context, Result};
 use bstr::BString;
 use clap::Parser;
-use fgumi_lib::bam_io::create_bam_writer;
-use fgumi_lib::dna::reverse_complement;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::sam::builder::RecordBuilder;
-use fgumi_lib::simulate::{
-    FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias, create_rng,
-};
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -378,7 +378,7 @@ fn build_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::simulate::create_rng;
+    use crate::simulate::create_rng;
 
     // Tests for generate_random_sequence
     #[test]

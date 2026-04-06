@@ -46,25 +46,25 @@
 //! - `TemplateIterator`: Lazily groups records by name from a BAM reader
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge()`: Core function that transfers metadata between templates
+use crate::bam_io::{BamReaderAuto, create_bam_reader, create_raw_bam_writer, is_stdin_path};
+use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
-use anyhow::{Context, Result};
-use bstr::ByteSlice;
-use clap::Parser;
-use fgumi_lib::bam_io::{BamReaderAuto, create_bam_reader, create_raw_bam_writer, is_stdin_path};
-use fgumi_lib::batched_sam_reader::BatchedSamReader;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::reference::find_dict_path;
-use fgumi_lib::sam::{
+use crate::logging::OperationTimer;
+use crate::progress::ProgressTracker;
+use crate::reference::find_dict_path;
+use crate::sam::{
     buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
     unclipped_five_prime_position,
 };
-use fgumi_lib::sort::{PA_TAG, PrimaryAlignmentInfo, bam_fields};
-use fgumi_lib::template::{Template, TemplateIterator};
-use fgumi_lib::umi::TagInfo;
-use fgumi_lib::validation::validate_file_exists;
-use fgumi_lib::vendored::encode_record_buf;
+use crate::sort::{PA_TAG, PrimaryAlignmentInfo, bam_fields};
+use crate::template::{Template, TemplateIterator};
+use crate::umi::TagInfo;
+use crate::validation::validate_file_exists;
+use crate::vendored::encode_record_buf;
+use anyhow::{Context, Result};
+use bstr::ByteSlice;
+use clap::Parser;
 use log::{debug, info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -1274,11 +1274,11 @@ impl Command for Zipper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
-    use bstr::ByteSlice;
-    use fgumi_lib::sam::builder::{
+    use crate::sam::builder::{
         MAPPED_PG_ID, REFERENCE_LENGTH, RecordBuilder, SamBuilder, create_ref_dict,
     };
+    use anyhow::Result;
+    use bstr::ByteSlice;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
@@ -2441,7 +2441,7 @@ mod tests {
     /// Tests that the pa tag is added to supplementary reads with template sort key
     #[test]
     fn test_add_pa_tag_to_supplementary_r1() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         // Build a template with primary R1 and supplementary R1
         let primary_r1 = RecordBuilder::new()
@@ -2500,7 +2500,7 @@ mod tests {
     /// Tests that the pa tag is added to secondary reads with correct strand info
     #[test]
     fn test_add_pa_tag_to_secondary_reverse_strand() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         // Build a template with primary R1 on reverse strand and secondary R1
         let primary_r1 = RecordBuilder::new()
@@ -2552,7 +2552,7 @@ mod tests {
     /// Tests that pa tag contains full template sort key for paired-end data
     #[test]
     fn test_add_pa_tag_paired_end_r2_supplementary() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         // Primary R1 at position 100 (forward strand, 8M cigar)
         // Unclipped 5' = 100 (no soft clips)
@@ -2621,7 +2621,7 @@ mod tests {
     /// Tests that no pa tag is added when there's no corresponding primary
     #[test]
     fn test_no_pa_tag_when_no_primary() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         // Only supplementary, no primary
         let supplementary = RecordBuilder::new()
@@ -2718,7 +2718,7 @@ mod tests {
     /// secondary/supplementary reads (the early exit optimization).
     #[test]
     fn test_add_pa_tag_early_exit_no_secondary_supplementary() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         // Create a template with only primary reads (no secondary/supplementary)
         let primary_r1 = RecordBuilder::new()
@@ -2758,7 +2758,7 @@ mod tests {
     /// not to primary reads, even when secondary/supplementary are present.
     #[test]
     fn test_add_pa_tag_only_to_secondary_supplementary() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         // Create a template with primary + secondary
         let primary_r1 = RecordBuilder::new()
@@ -2799,7 +2799,7 @@ mod tests {
 
     #[test]
     fn test_skip_pa_tags_parameter() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         const FLAG_UNMAPPED: u16 = 0x4;
 
@@ -2854,7 +2854,7 @@ mod tests {
 
     #[test]
     fn test_skip_pa_tags_false_adds_tags() -> Result<()> {
-        use fgumi_lib::template::Template;
+        use crate::template::Template;
 
         const FLAG_UNMAPPED: u16 = 0x4;
 

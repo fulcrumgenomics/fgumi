@@ -1,6 +1,4 @@
 #![deny(unsafe_code)]
-pub mod commands;
-mod version;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,30 +10,29 @@ const STYLES: Styles = Styles::styled()
     .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
     .placeholder(AnsiColor::Cyan.on_default());
-use commands::clip::Clip;
-use commands::codec::Codec;
-use commands::command::Command;
-#[cfg(feature = "compare")]
-use commands::compare::Compare;
-use commands::correct::CorrectUmis;
-use commands::dedup::MarkDuplicates;
-use commands::downsample::Downsample;
-use commands::duplex::Duplex;
-use commands::duplex_metrics::DuplexMetrics;
-use commands::extract::Extract;
-use commands::fastq::Fastq;
-use commands::filter::Filter;
-use commands::group::GroupReadsByUmi;
-use commands::merge::Merge;
-use commands::review::Review;
-use commands::simplex::Simplex;
-use commands::simplex_metrics::SimplexMetrics;
-#[cfg(feature = "simulate")]
-use commands::simulate::Simulate;
-use commands::sort::Sort;
-use commands::zipper::Zipper;
-use enum_dispatch::enum_dispatch;
 use env_logger::Env;
+use fgumi_lib::commands::clip::Clip;
+use fgumi_lib::commands::codec::Codec;
+use fgumi_lib::commands::command::Command;
+#[cfg(feature = "compare")]
+use fgumi_lib::commands::compare::Compare;
+use fgumi_lib::commands::correct::CorrectUmis;
+use fgumi_lib::commands::dedup::MarkDuplicates;
+use fgumi_lib::commands::downsample::Downsample;
+use fgumi_lib::commands::duplex::Duplex;
+use fgumi_lib::commands::duplex_metrics::DuplexMetrics;
+use fgumi_lib::commands::extract::Extract;
+use fgumi_lib::commands::fastq::Fastq;
+use fgumi_lib::commands::filter::Filter;
+use fgumi_lib::commands::group::GroupReadsByUmi;
+use fgumi_lib::commands::merge::Merge;
+use fgumi_lib::commands::review::Review;
+use fgumi_lib::commands::simplex::Simplex;
+use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
+#[cfg(feature = "simulate")]
+use fgumi_lib::commands::simulate::Simulate;
+use fgumi_lib::commands::sort::Sort;
+use fgumi_lib::commands::zipper::Zipper;
 use log::info;
 
 /// Commands that require feature flags to be enabled.
@@ -65,7 +62,6 @@ struct Args {
     subcommand: Subcommand,
 }
 
-#[enum_dispatch(Command)]
 #[derive(Parser, Debug)]
 #[command(version)]
 #[allow(clippy::large_enum_variant)]
@@ -125,6 +121,34 @@ enum Subcommand {
     Simulate(Simulate),
 }
 
+impl Subcommand {
+    fn execute(&self, command_line: &str) -> Result<()> {
+        match self {
+            Self::Extract(cmd) => cmd.execute(command_line),
+            Self::Correct(cmd) => cmd.execute(command_line),
+            Self::Fastq(cmd) => cmd.execute(command_line),
+            Self::Zipper(cmd) => cmd.execute(command_line),
+            Self::Sort(cmd) => cmd.execute(command_line),
+            Self::Merge(cmd) => cmd.execute(command_line),
+            Self::Group(cmd) => cmd.execute(command_line),
+            Self::Dedup(cmd) => cmd.execute(command_line),
+            Self::Simplex(cmd) => cmd.execute(command_line),
+            Self::Duplex(cmd) => cmd.execute(command_line),
+            Self::Codec(cmd) => cmd.execute(command_line),
+            Self::Filter(cmd) => cmd.execute(command_line),
+            Self::Clip(cmd) => cmd.execute(command_line),
+            Self::DuplexMetrics(cmd) => cmd.execute(command_line),
+            Self::SimplexMetrics(cmd) => cmd.execute(command_line),
+            Self::Review(cmd) => cmd.execute(command_line),
+            Self::Downsample(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "compare")]
+            Self::Compare(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "simulate")]
+            Self::Simulate(cmd) => cmd.execute(command_line),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
@@ -155,6 +179,6 @@ fn main() -> Result<()> {
     let default_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
 
-    info!("Running fgumi version {}", version::VERSION.as_str());
+    info!("Running fgumi version {}", fgumi_lib::version::VERSION.as_str());
     args.subcommand.execute(&command_line)
 }

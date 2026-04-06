@@ -1,15 +1,15 @@
 //! Generate BAM and includelist for correct.
 
+use crate::bam_io::create_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::generate_random_sequence;
+use crate::progress::ProgressTracker;
+use crate::sam::builder::RecordBuilder;
+use crate::simulate::create_rng;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
-use fgumi_lib::bam_io::create_bam_writer;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::sam::builder::RecordBuilder;
-use fgumi_lib::simulate::create_rng;
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -431,7 +431,7 @@ fn introduce_n_errors(umi: &str, n: usize, rng: &mut impl Rng) -> String {
 #[allow(clippy::naive_bytecount)]
 mod tests {
     use super::*;
-    use fgumi_lib::simulate::create_rng;
+    use crate::simulate::create_rng;
     use noodles::sam::alignment::record::data::field::Tag;
 
     // Tests for generate_random_sequence

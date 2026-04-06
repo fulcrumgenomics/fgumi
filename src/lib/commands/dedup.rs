@@ -21,27 +21,27 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
+use crate::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
+use crate::grouper::{
+    FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
+};
+use crate::logging::OperationTimer;
+use crate::metrics::group::FamilySizeMetrics;
+use crate::read_info::LibraryIndex;
+use crate::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
+use crate::template::{MoleculeId, Template};
+use crate::umi::{UmiValidation, validate_umi};
+use crate::unified_pipeline::{
+    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    serialize_bam_records_into,
+};
+use crate::validation::{string_to_tag, validate_file_exists, validate_tag};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
-use fgumi_lib::grouper::{
-    FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
-};
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::group::FamilySizeMetrics;
-use fgumi_lib::read_info::LibraryIndex;
-use fgumi_lib::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
-use fgumi_lib::template::{MoleculeId, Template};
-use fgumi_lib::umi::{UmiValidation, validate_umi};
-use fgumi_lib::unified_pipeline::{
-    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
-};
-use fgumi_lib::validation::{string_to_tag, validate_file_exists, validate_tag};
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::Flags;
@@ -55,8 +55,8 @@ use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
     build_pipeline_config, parse_bool,
 };
-use fgumi_lib::sort::PA_TAG;
-use fgumi_lib::sort::bam_fields;
+use crate::sort::PA_TAG;
+use crate::sort::bam_fields;
 
 /// Duplicate flag bit in SAM flags (0x400)
 const DUPLICATE_FLAG: u16 = 0x400;
@@ -245,7 +245,7 @@ fn score_template(template: &Template) -> i64 {
 /// capping each quality at 15 per base (matching Picard/HTSJDK behavior).
 #[inline]
 fn score_template_raw(template: &Template) -> i64 {
-    use fgumi_lib::sort::bam_fields;
+    use crate::sort::bam_fields;
 
     let mut score: u32 = 0;
 
@@ -286,7 +286,7 @@ fn filter_template_raw(
     config: &DedupFilterConfig,
     metrics: &mut FilterMetrics,
 ) -> bool {
-    use fgumi_lib::sort::bam_fields;
+    use crate::sort::bam_fields;
 
     let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
     let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
@@ -1452,7 +1452,7 @@ fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathB
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::sam::builder::RecordBuilder;
+    use crate::sam::builder::RecordBuilder;
 
     // Helper to create a simple template for testing
     fn create_test_template(name: &str, qualities: &[u8]) -> Template {
@@ -2542,7 +2542,7 @@ mod tests {
         rec[9] = 30; // mapq = 30 (passes the direct MAPQ check)
         rec[12..14].copy_from_slice(&1u16.to_le_bytes()); // n_cigar_op = 1
         // flags: PAIRED but NOT MATE_UNMAPPED (so mate MQ check triggers)
-        rec[14..16].copy_from_slice(&(fgumi_lib::sort::bam_fields::flags::PAIRED).to_le_bytes());
+        rec[14..16].copy_from_slice(&(crate::sort::bam_fields::flags::PAIRED).to_le_bytes());
         rec[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         rec[32..36].copy_from_slice(b"tst\0"); // read name
         rec[36..40].copy_from_slice(&(4u32 << 4).to_le_bytes()); // CIGAR: 4M
@@ -2589,7 +2589,7 @@ mod tests {
         qualities: &[u8],
         umi: &[u8],
     ) -> Vec<u8> {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let l_read_name = (name.len() + 1) as u8;
         let cigar_ops: &[u32] = if (flag & bam_fields::flags::UNMAPPED) == 0 {
@@ -2644,8 +2644,7 @@ mod tests {
         // 4 bases with quality 20 each, capped at 15 → 4 * 15 = 60
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2661,8 +2660,7 @@ mod tests {
         // 4 bases with quality 10 each, no capping → 4 * 10 = 40
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
             30,
             4,
             &[10, 10, 10, 10],
@@ -2678,8 +2676,7 @@ mod tests {
         // Paired: R1 (4 bases * 15) + R2 (4 bases * 10) = 60 + 40 = 100
         let r1 = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2687,8 +2684,7 @@ mod tests {
         );
         let r2 = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::LAST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
             30,
             4,
             &[10, 10, 10, 10],
@@ -2707,8 +2703,8 @@ mod tests {
         let template_raw = {
             let raw = make_raw_bam_for_dedup(
                 b"q01",
-                fgumi_lib::sort::bam_fields::flags::PAIRED
-                    | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+                crate::sort::bam_fields::flags::PAIRED
+                    | crate::sort::bam_fields::flags::FIRST_SEGMENT,
                 30,
                 4,
                 qualities,
@@ -2728,9 +2724,9 @@ mod tests {
     fn test_filter_template_raw_accepts_valid() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2754,9 +2750,9 @@ mod tests {
     fn test_filter_template_raw_rejects_low_mapq() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             10, // below threshold
             4,
             &[20, 20, 20, 20],
@@ -2780,10 +2776,10 @@ mod tests {
     fn test_filter_template_raw_rejects_qc_fail() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED
-                | fgumi_lib::sort::bam_fields::flags::QC_FAIL,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED
+                | crate::sort::bam_fields::flags::QC_FAIL,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2807,9 +2803,9 @@ mod tests {
     fn test_filter_template_raw_rejects_umi_with_n() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2833,9 +2829,9 @@ mod tests {
     fn test_filter_template_raw_rejects_short_umi() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -2859,8 +2855,8 @@ mod tests {
     fn test_filter_template_raw_rejects_unmapped() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::UNMAPPED
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::UNMAPPED
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             0,
             4,
             &[20, 20, 20, 20],
@@ -2886,7 +2882,7 @@ mod tests {
 
     #[test]
     fn test_set_duplicate_flag_on_raw_record() {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let raw =
             make_raw_bam_for_dedup(b"rea", bam_fields::flags::PAIRED, 30, 4, &[20; 4], b"ACGT");
@@ -2992,7 +2988,7 @@ mod tests {
         seq_len: usize,
         qualities: &[u8],
     ) -> Vec<u8> {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let l_read_name = (name.len() + 1) as u8;
         let cigar_ops: &[u32] =
@@ -3033,9 +3029,9 @@ mod tests {
     fn test_filter_template_raw_accepts_missing_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup_no_tags(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -3060,9 +3056,9 @@ mod tests {
     fn test_filter_template_raw_accepts_umi_with_n_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],
@@ -3088,9 +3084,9 @@ mod tests {
     fn test_filter_template_raw_accepts_short_umi_when_no_umi_mode() {
         let raw = make_raw_bam_for_dedup(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             4,
             &[20, 20, 20, 20],

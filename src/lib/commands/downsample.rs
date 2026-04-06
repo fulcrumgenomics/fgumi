@@ -5,13 +5,13 @@
 //!
 //! Requires input BAM to be in template-coordinate order (from group).
 
+use crate::bam_io::{create_bam_reader, create_bam_writer, create_optional_bam_writer};
+use crate::logging::OperationTimer;
+use crate::progress::ProgressTracker;
+use crate::sam::is_template_coordinate_sorted;
+use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer, create_optional_bam_writer};
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::sam::is_template_coordinate_sorted;
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -343,7 +343,7 @@ fn get_mi_tag(record: &RecordBuf) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::sam::builder::RecordBuilder;
+    use crate::sam::builder::RecordBuilder;
 
     /// Create a test record with an MI tag
     fn create_test_record(name: &str, mi: &str) -> RecordBuf {
@@ -546,7 +546,7 @@ mod tests {
         assert!(cmd.histogram_rejected.is_some());
     }
 
-    // Note: Header validation tests are in fgumi_lib::sam::tests for is_template_coordinate_sorted
+    // Note: Header validation tests are in crate::sam::tests for is_template_coordinate_sorted
 
     #[test]
     fn test_deterministic_sampling_with_seed() {

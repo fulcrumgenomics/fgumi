@@ -9,8 +9,8 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use fgumi_lib::correct_umis::CorrectUmis;
-//! use fgumi_lib::commands::common::{
+//! use crate::commands::correct::CorrectUmis;
+//! use crate::commands::common::{
 //!     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
 //!     SchedulerOptions, ThreadingOptions,
 //! };
@@ -40,24 +40,24 @@
 //! corrector.execute().expect("Failed to correct UMIs");
 //! ```
 
+use crate::bam_io::{
+    BamWriter, create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader,
+};
+use crate::bitenc::BitEnc;
+use crate::dna::reverse_complement_str;
+use crate::grouper::TemplateGrouper;
+use crate::logging::OperationTimer;
+use crate::metrics::correct::UmiCorrectionMetrics;
+use crate::progress::ProgressTracker;
+use crate::sort::bam_fields;
+use crate::template::TemplateBatch;
+use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
+use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
-use fgumi_lib::bam_io::{
-    BamWriter, create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader,
-};
-use fgumi_lib::bitenc::BitEnc;
-use fgumi_lib::dna::reverse_complement_str;
-use fgumi_lib::grouper::TemplateGrouper;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::correct::UmiCorrectionMetrics;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::sort::bam_fields;
-use fgumi_lib::template::TemplateBatch;
-use fgumi_lib::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
-use fgumi_lib::validation::validate_file_exists;
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
@@ -112,8 +112,8 @@ pub struct UmiMatch {
 /// # Example
 ///
 /// ```no_run
-/// # use fgumi_lib::correct_umis::CorrectUmis;
-/// # use fgumi_lib::commands::common::{
+/// # use crate::commands::correct::CorrectUmis;
+/// # use crate::commands::common::{
 /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
 /// #     SchedulerOptions, ThreadingOptions,
 /// # };
@@ -372,10 +372,10 @@ impl Command for CorrectUmis {
     /// # Example
     ///
     /// ```no_run
-    /// # use fgumi_lib::correct_umis::CorrectUmis;
-    /// # use fgumi_lib::commands::common::{BamIoOptions, RejectsOptions, ThreadingOptions};
+    /// # use crate::commands::correct::CorrectUmis;
+    /// # use crate::commands::common::{BamIoOptions, RejectsOptions, ThreadingOptions};
     /// # use std::path::PathBuf;
-    /// # use fgumi_lib::commands::command::Command;
+    /// # use crate::commands::command::Command;
     /// let corrector = CorrectUmis {
     ///     /* ... field initialization ... */
     /// #   io: BamIoOptions { input: PathBuf::new(), output: PathBuf::new() },
@@ -646,7 +646,7 @@ impl CorrectUmis {
         raw_records: &[Vec<u8>],
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         if raw_records.is_empty() {
             return Ok(None);
@@ -702,7 +702,7 @@ impl CorrectUmis {
         umi_tag: [u8; 2],
         dont_store_original_umis: bool,
     ) {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         if correction.needs_correction {
             // Write corrected UMI first (in-place update avoids scanning past OX)
@@ -780,8 +780,8 @@ impl CorrectUmis {
 
         // Enable raw-byte mode (correct uses TemplateGrouper, no cell tag needed)
         {
-            use fgumi_lib::read_info::LibraryIndex;
-            use fgumi_lib::unified_pipeline::GroupKeyConfig;
+            use crate::read_info::LibraryIndex;
+            use crate::unified_pipeline::GroupKeyConfig;
 
             let library_index = LibraryIndex::from_header(&header);
             pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
@@ -1355,7 +1355,7 @@ impl CorrectUmis {
 /// # Example
 ///
 /// ```
-/// # use fgumi_lib::correct_umis::count_mismatches_with_max;
+/// # use crate::commands::correct::count_mismatches_with_max;
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"AAAAAA", 10), 0);
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"AAAAAT", 10), 1);
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"CCCCCC", 2), 3);
@@ -1513,7 +1513,7 @@ fn find_best_match_encoded(
 /// # Example
 ///
 /// ```
-/// # use fgumi_lib::correct_umis::find_umi_pairs_within_distance;
+/// # use crate::commands::correct::find_umi_pairs_within_distance;
 /// let umis = vec!["AAAA".to_string(), "AAAT".to_string()];
 /// let pairs = find_umi_pairs_within_distance(&umis, 2);
 /// assert_eq!(pairs.len(), 1);
@@ -1715,7 +1715,7 @@ mod tests {
     ///
     /// Returns an error if BAM file creation or writing fails.
     fn create_test_bam(records: Vec<(&str, Option<&str>)>) -> Result<NamedTempFile> {
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::sam::builder::RecordBuilder;
         use noodles::sam::header::record::value::map::Map;
 
         let temp_file = NamedTempFile::new()?;
@@ -3038,7 +3038,7 @@ mod tests {
     fn make_raw_bam_for_correct(name: &[u8], flag: u16, umi: &[u8]) -> Vec<u8> {
         let l_read_name = (name.len() + 1) as u8;
         let seq_len = 4usize;
-        let cigar_ops: &[u32] = if (flag & fgumi_lib::sort::bam_fields::flags::UNMAPPED) == 0 {
+        let cigar_ops: &[u32] = if (flag & crate::sort::bam_fields::flags::UNMAPPED) == 0 {
             &[(seq_len as u32) << 4]
         } else {
             &[]
@@ -3084,8 +3084,7 @@ mod tests {
     fn test_extract_and_validate_template_umi_raw_single_record() {
         let raw = make_raw_bam_for_correct(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
         let result =
@@ -3097,14 +3096,12 @@ mod tests {
     fn test_extract_and_validate_template_umi_raw_matching_pair() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
             b"ACGTAC",
         );
         let r2 = make_raw_bam_for_correct(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::LAST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
             b"ACGTAC",
         );
         let result =
@@ -3116,14 +3113,12 @@ mod tests {
     fn test_extract_and_validate_template_umi_raw_mismatch_errors() {
         let r1 = make_raw_bam_for_correct(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::FIRST_SEGMENT,
             b"AAAAAA",
         );
         let r2 = make_raw_bam_for_correct(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::LAST_SEGMENT,
+            crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
             b"CCCCCC",
         );
         let err = CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X'])
@@ -3143,8 +3138,8 @@ mod tests {
         let mut raw = vec![0u8; 42]; // minimal record
         raw[8] = 4; // l_read_name
         raw[14..16].copy_from_slice(
-            &(fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT)
+            &(crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT)
                 .to_le_bytes(),
         );
         raw[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
@@ -3160,7 +3155,7 @@ mod tests {
 
     #[test]
     fn test_apply_correction_to_raw_corrects_umi() {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let mut raw = make_raw_bam_for_correct(
             b"rea",
@@ -3191,7 +3186,7 @@ mod tests {
 
     #[test]
     fn test_apply_correction_to_raw_no_correction_needed() {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let mut raw = make_raw_bam_for_correct(
             b"rea",
@@ -3226,7 +3221,7 @@ mod tests {
     /// - Template 2 ("t2"): UMI "CCCCCC" (exact match) is unchanged, no OX tag
     #[test]
     fn test_single_thread_mode_produces_correct_output() -> Result<()> {
-        use fgumi_lib::sam::builder::SamBuilder;
+        use crate::sam::builder::SamBuilder;
         use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 
         let mut builder = SamBuilder::new();
@@ -3358,7 +3353,7 @@ mod tests {
 
     #[test]
     fn test_apply_correction_to_raw_dont_store_original() {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let mut raw = make_raw_bam_for_correct(
             b"rea",

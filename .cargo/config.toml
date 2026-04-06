@@ -4,4 +4,9 @@ ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets --features compare,simulate,profile-adjacency -- -D warnings -W clippy::pedantic"
 # Run tests with test-utils feature enabled (allows binary tests to use library test utilities)
 t = "test --features test-utils"
+# Generate and serve documentation locally (runs xtask then mdbook serve)
+docs = "run --package xtask -- docs"
+# Generate and build documentation (for CI validation)
+docs-build = "run --package xtask -- docs-build"
+
 [build]

@@ -9,12 +9,12 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::bam_io::create_bam_reader;
+use crate::logging::OperationTimer;
+use crate::sort::RawExternalSorter;
+use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_lib::bam_io::create_bam_reader;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::sort::RawExternalSorter;
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 

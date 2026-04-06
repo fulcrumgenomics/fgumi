@@ -7,13 +7,13 @@
 //! - UMI observation frequencies
 //! - Optional PDF plots via an embedded R script
 
+use crate::logging::OperationTimer;
+use crate::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
+use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
+use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::simplex::{SimplexMetricsCollector, SimplexYieldMetric};
-use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ use super::shared_metrics::{
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary).
-const R_SCRIPT: &str = include_str!("../../resources/CollectSimplexSeqMetrics.R");
+const R_SCRIPT: &str = include_str!("../../../resources/CollectSimplexSeqMetrics.R");
 
 /// Collects comprehensive QC metrics for simplex sequencing experiments.
 #[derive(Parser, Debug)]
@@ -353,10 +353,10 @@ impl SimplexMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
+    use crate::sam::builder::RecordPairBuilder;
     use anyhow::Result;
     use fgoxide::io::DelimFile;
-    use fgumi_lib::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
-    use fgumi_lib::sam::builder::RecordPairBuilder;
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_reject_consensus_bam() -> Result<()> {
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::sam::builder::RecordBuilder;
 
         let temp_file = NamedTempFile::new()?;
         let header = create_test_header();

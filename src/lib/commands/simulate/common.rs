@@ -68,8 +68,8 @@ fn parse_noise_stddev(s: &str) -> Result<f64, String> {
 
 impl QualityArgs {
     /// Convert to a [`PositionQualityModel`].
-    pub fn to_quality_model(&self) -> fgumi_lib::simulate::PositionQualityModel {
-        fgumi_lib::simulate::PositionQualityModel::new(
+    pub fn to_quality_model(&self) -> crate::simulate::PositionQualityModel {
+        crate::simulate::PositionQualityModel::new(
             self.warmup_bases,
             self.warmup_quality,
             self.peak_quality,
@@ -81,8 +81,8 @@ impl QualityArgs {
     }
 
     /// Convert to a [`ReadPairQualityBias`].
-    pub fn to_quality_bias(&self) -> fgumi_lib::simulate::ReadPairQualityBias {
-        fgumi_lib::simulate::ReadPairQualityBias::new(self.r2_quality_offset)
+    pub fn to_quality_bias(&self) -> crate::simulate::ReadPairQualityBias {
+        crate::simulate::ReadPairQualityBias::new(self.r2_quality_offset)
     }
 }
 
@@ -108,8 +108,8 @@ pub struct InsertSizeArgs {
 
 impl InsertSizeArgs {
     /// Convert to an [`InsertSizeModel`].
-    pub fn to_insert_size_model(&self) -> fgumi_lib::simulate::InsertSizeModel {
-        fgumi_lib::simulate::InsertSizeModel::new(
+    pub fn to_insert_size_model(&self) -> crate::simulate::InsertSizeModel {
+        crate::simulate::InsertSizeModel::new(
             self.insert_size_mean,
             self.insert_size_stddev,
             self.insert_size_min,
@@ -150,19 +150,19 @@ impl FamilySizeArgs {
     /// Convert to a [`FamilySizeDistribution`].
     pub fn to_family_size_distribution(
         &self,
-    ) -> anyhow::Result<fgumi_lib::simulate::FamilySizeDistribution> {
+    ) -> anyhow::Result<crate::simulate::FamilySizeDistribution> {
         match self.family_size_dist.as_str() {
-            "lognormal" => Ok(fgumi_lib::simulate::FamilySizeDistribution::log_normal(
+            "lognormal" => Ok(crate::simulate::FamilySizeDistribution::log_normal(
                 self.family_size_mean,
                 self.family_size_stddev,
             )),
-            "negbin" => Ok(fgumi_lib::simulate::FamilySizeDistribution::negative_binomial(
+            "negbin" => Ok(crate::simulate::FamilySizeDistribution::negative_binomial(
                 self.family_size_r,
                 self.family_size_p,
             )),
             path => {
                 // Treat as a path to a histogram file
-                fgumi_lib::simulate::FamilySizeDistribution::from_histogram(path)
+                crate::simulate::FamilySizeDistribution::from_histogram(path)
             }
         }
     }
@@ -182,8 +182,8 @@ pub struct StrandBiasArgs {
 
 impl StrandBiasArgs {
     /// Convert to a [`StrandBiasModel`].
-    pub fn to_strand_bias_model(&self) -> fgumi_lib::simulate::StrandBiasModel {
-        fgumi_lib::simulate::StrandBiasModel::new(self.strand_alpha, self.strand_beta)
+    pub fn to_strand_bias_model(&self) -> crate::simulate::StrandBiasModel {
+        crate::simulate::StrandBiasModel::new(self.strand_alpha, self.strand_beta)
     }
 }
 
@@ -281,7 +281,7 @@ impl Eq for MoleculeInfo {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::simulate::create_rng;
+    use crate::simulate::create_rng;
     use rstest::rstest;
     use std::io::Write;
     use tempfile::NamedTempFile;

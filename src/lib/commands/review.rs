@@ -5,16 +5,16 @@
 //! BAM files and a detailed TSV report.
 
 use crate::commands::common::parse_bool;
-use anyhow::{Result, bail};
-use clap::Parser;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::reference::find_dict_path;
-use fgumi_lib::umi::extract_mi_base;
-use fgumi_lib::validation::validate_file_exists;
-use fgumi_lib::variant_review::{
+use crate::logging::OperationTimer;
+use crate::progress::ProgressTracker;
+use crate::reference::find_dict_path;
+use crate::umi::extract_mi_base;
+use crate::validation::validate_file_exists;
+use crate::variant_review::{
     BaseCounts, ConsensusVariantReviewInfo, Variant, format_insert_string, read_number_suffix,
 };
+use anyhow::{Result, bail};
+use clap::Parser;
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::Cigar;
@@ -1098,7 +1098,7 @@ mod tests {
     // Test utilities for creating synthetic test data
     mod test_utils {
         use super::*;
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::sam::builder::RecordBuilder;
         use noodles::sam::Header;
         use noodles::sam::alignment::RecordBuf;
         use noodles::sam::header::record::value::{Map, map::ReferenceSequence};

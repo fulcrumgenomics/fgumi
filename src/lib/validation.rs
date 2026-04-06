@@ -373,7 +373,7 @@ pub fn parse_memory_size(size_str: &str) -> Result<u64> {
         Err(_) => Err(FgumiError::InvalidMemorySize {
             reason: format!(
                 "Invalid memory size '{trimmed}'. Valid formats:\n\
-                 - Plain numbers (interpreted as MB): '768', '4096'\n\
+                 - Plain numbers (interpreted as MiB): '768', '4096'\n\
                  - Human-readable (decimal): '2GB', '1024MB'\n\
                  - Human-readable (binary): '1GiB', '512MiB'"
             ),

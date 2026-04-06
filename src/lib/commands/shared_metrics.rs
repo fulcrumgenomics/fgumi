@@ -5,11 +5,11 @@
 //! deterministic downsampling. Both `duplex_metrics` and `simplex_metrics` commands
 //! build on these shared primitives.
 
+use crate::bam_io::create_bam_reader;
+use crate::progress::ProgressTracker;
+use crate::template::TemplateIterator;
+use crate::validation::string_to_tag;
 use anyhow::{Context, Result};
-use fgumi_lib::bam_io::create_bam_reader;
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::template::TemplateIterator;
-use fgumi_lib::validation::string_to_tag;
 use log::info;
 use murmur3::murmur3_32;
 use noodles::sam::alignment::record::Cigar;
@@ -263,7 +263,7 @@ pub fn overlaps_intervals(template: &TemplateInfo, intervals: &[Interval]) -> bo
 ///
 /// Returns an error if the BAM file cannot be read or if it appears to be a consensus BAM.
 pub fn validate_not_consensus_bam(input: &Path) -> Result<()> {
-    use fgumi_lib::consensus_tags::is_consensus;
+    use crate::consensus_tags::is_consensus;
 
     let (mut reader, header) = create_bam_reader(input, 1)?;
 

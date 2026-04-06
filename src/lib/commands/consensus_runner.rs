@@ -3,12 +3,12 @@
 //! This module provides shared traits and utilities used by simplex, duplex, and codec
 //! consensus calling commands to reduce code duplication.
 
+use crate::consensus::codec_caller::CodecConsensusStats;
+use crate::consensus_caller::ConsensusCallingStats;
+use crate::metrics::consensus::ConsensusMetrics;
+use crate::overlapping_consensus::CorrectionStats;
 use anyhow::Result;
 use bstr::BString;
-use fgumi_lib::consensus::codec_caller::CodecConsensusStats;
-use fgumi_lib::consensus_caller::ConsensusCallingStats;
-use fgumi_lib::metrics::consensus::ConsensusMetrics;
-use fgumi_lib::overlapping_consensus::CorrectionStats;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;

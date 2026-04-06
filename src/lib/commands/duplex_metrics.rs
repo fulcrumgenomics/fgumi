@@ -7,14 +7,14 @@
 //! - Optional interval filtering (BED or Picard interval list format) to restrict analysis to specific regions
 
 use crate::commands::common::parse_bool;
+use crate::logging::OperationTimer;
+use crate::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
+use crate::simple_umi_consensus::SimpleUmiConsensusCaller;
+use crate::umi::extract_mi_base;
+use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::metrics::duplex::{DuplexMetricsCollector, DuplexYieldMetric};
-use fgumi_lib::simple_umi_consensus::SimpleUmiConsensusCaller;
-use fgumi_lib::umi::extract_mi_base;
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ use super::shared_metrics::{
 };
 
 /// Embedded R script for PDF plot generation (bundled with binary)
-const R_SCRIPT: &str = include_str!("../../resources/CollectDuplexSeqMetrics.R");
+const R_SCRIPT: &str = include_str!("../../../resources/CollectDuplexSeqMetrics.R");
 
 /// Collects comprehensive QC metrics for duplex sequencing experiments
 #[derive(Parser, Debug)]
@@ -618,11 +618,11 @@ mod tests {
     use crate::commands::shared_metrics::{
         Interval, TemplateInfo, compute_hash_fraction, overlaps_intervals, parse_intervals,
     };
+    use crate::metrics::duplex::{DuplexFamilySizeMetric, DuplexUmiMetric, FamilySizeMetric};
+    use crate::metrics::shared::UmiMetric;
+    use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
     use anyhow::Result;
     use fgoxide::io::DelimFile;
-    use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, DuplexUmiMetric, FamilySizeMetric};
-    use fgumi_lib::metrics::shared::UmiMetric;
-    use fgumi_lib::sam::builder::{RecordBuilder, RecordPairBuilder};
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn test_duplex_umi_expected_fraction_calculation() -> Result<()> {
-        use fgumi_lib::metrics::duplex::DuplexMetricsCollector;
+        use crate::metrics::duplex::DuplexMetricsCollector;
 
         // Create a collector with duplex UMI counting enabled
         let mut collector = DuplexMetricsCollector::new(true);

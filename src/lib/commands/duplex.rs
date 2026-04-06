@@ -5,13 +5,13 @@
 //! 1. Single-strand consensus for /A and /B reads separately
 //! 2. Duplex consensus from paired single-strand consensuses
 
-use anyhow::{Context, Result};
-use clap::Parser;
-use fgoxide::io::DelimFile;
-use fgumi_lib::bam_io::{
+use crate::bam_io::{
     create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
     create_raw_bam_reader,
 };
+use anyhow::{Context, Result};
+use clap::Parser;
+use fgoxide::io::DelimFile;
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
@@ -21,23 +21,23 @@ use super::common::{
 use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
 };
-use crossbeam_queue::SegQueue;
-use fgumi_lib::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
-use fgumi_lib::duplex_consensus_caller::DuplexConsensusCaller;
-use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
-use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
-use fgumi_lib::overlapping_consensus::{
+use crate::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
+use crate::duplex_consensus_caller::DuplexConsensusCaller;
+use crate::logging::{OperationTimer, log_consensus_summary};
+use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus_raw,
 };
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::read_info::LibraryIndex;
-use fgumi_lib::sort::bam_fields;
-use fgumi_lib::umi::extract_mi_base;
-use fgumi_lib::unified_pipeline::{
+use crate::progress::ProgressTracker;
+use crate::read_info::LibraryIndex;
+use crate::sort::bam_fields;
+use crate::umi::extract_mi_base;
+use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
-use fgumi_lib::validation::{optional_string_to_tag, validate_file_exists};
+use crate::validation::{optional_string_to_tag, validate_file_exists};
+use crossbeam_queue::SegQueue;
 use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::Header;
@@ -818,9 +818,9 @@ fn has_both_strands_raw(records: &[Vec<u8>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bam_io::{create_bam_reader, create_bam_writer};
+    use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
     use anyhow::Result;
-    use fgumi_lib::bam_io::{create_bam_reader, create_bam_writer};
-    use fgumi_lib::sam::builder::{RecordBuilder, RecordPairBuilder};
     use noodles::sam;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use noodles::sam::alignment::record::data::field::Tag;

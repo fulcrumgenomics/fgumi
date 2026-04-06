@@ -207,7 +207,6 @@ impl RecordBuffer {
         let sort_key = extract_coordinate_key_inline(record, self.nref);
 
         // Reserve contiguous space for header + record
-        let total_bytes = HEADER_SIZE + record.len();
         let offset = self.data.reserve_contiguous(total_bytes) as u64;
 
         // Write inline header (16 bytes)
@@ -757,7 +756,6 @@ impl TemplateRecordBuffer {
             .map_err(|_| anyhow::anyhow!("record length {} exceeds u32::MAX", record.len()))?;
 
         // Reserve contiguous space for header + record
-        let total_bytes = TEMPLATE_HEADER_SIZE + record.len();
         let offset = self.data.reserve_contiguous(total_bytes) as u64;
 
         // Write inline header

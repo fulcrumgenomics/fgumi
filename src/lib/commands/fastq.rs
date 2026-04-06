@@ -3,12 +3,12 @@
 //! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
 //! Input should be queryname-sorted or template-coordinate sorted.
 
+use crate::bam_io::create_bam_reader;
 use crate::commands::common::parse_bool;
+use crate::logging::OperationTimer;
+use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use clap::Parser;
-use fgumi_lib::bam_io::create_bam_reader;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use noodles::bam;
 use noodles::sam::alignment::record::Flags;

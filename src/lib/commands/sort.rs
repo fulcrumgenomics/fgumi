@@ -20,19 +20,19 @@
 //!
 //! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
+use crate::bam_io::create_bam_reader;
+use crate::logging::OperationTimer;
+use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
+use crate::validation::{string_to_tag, validate_file_exists};
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
-use fgumi_lib::bam_io::create_bam_reader;
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
-use fgumi_lib::validation::{string_to_tag, validate_file_exists};
 use log::info;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
-use fgumi_lib::validation::parse_memory_size;
+use crate::validation::parse_memory_size;
 
 /// Sort order for BAM files.
 ///
@@ -333,7 +333,7 @@ type VerifySummary = (u64, u64, Option<(u64, String)>);
 /// Iterates all records, extracting a sort key from each and checking that
 /// consecutive keys satisfy the ordering invariant (no violations).
 fn verify_sort_order<K>(
-    raw_reader: fgumi_lib::sort::raw_bam_reader::RawBamRecordReader<std::fs::File>,
+    raw_reader: crate::sort::raw_bam_reader::RawBamRecordReader<std::fs::File>,
     extract_key: impl Fn(&[u8]) -> K,
     is_violation: impl Fn(&K, &K) -> bool,
 ) -> Result<VerifySummary> {
@@ -425,6 +425,9 @@ fn resolve_memory_limit(
         bail!("--threads must be at least 1");
     }
 
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+
     let total_budget = match limit {
         MemoryLimit::Fixed(bytes) => {
             if memory_per_thread {
@@ -436,8 +439,6 @@ fn resolve_memory_limit(
             }
         }
         MemoryLimit::Auto => {
-            let mut system = sysinfo::System::new();
-            system.refresh_memory();
             let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
 
             let margin = resolve_reserve(reserve, total);
@@ -482,8 +483,6 @@ fn resolve_memory_limit(
     };
 
     // Post-resolution system memory check: warn if any mode exceeds host RAM
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
     let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
     if total_budget > total {
         log::warn!(
@@ -599,8 +598,8 @@ impl Sort {
 
     /// Execute verify mode: read records and check sort order.
     fn execute_verify(&self) -> Result<()> {
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
-        use fgumi_lib::sort::{
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sort::{
             LibraryLookup, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, cb_hasher,
             extract_coordinate_key_inline, extract_template_key_inline,
         };
@@ -897,17 +896,19 @@ mod tests {
 
     #[test]
     fn test_resolve_memory_limit_auto_with_fixed_reserve() {
-        // With a large fixed reserve, auto should return less memory
+        // With a larger fixed reserve, auto should return less memory.
+        // Use modest reserve sizes (128 MiB vs 512 MiB) to stay well within
+        // CI runner RAM and avoid the per-thread floor clamping both results.
         let large_reserve = resolve_memory_limit(
             MemoryLimit::Auto,
-            MemoryReserve::Fixed(10 * 1024 * 1024 * 1024),
+            MemoryReserve::Fixed(512 * 1024 * 1024),
             4,
             true,
         )
         .expect("should succeed");
         let small_reserve = resolve_memory_limit(
             MemoryLimit::Auto,
-            MemoryReserve::Fixed(2 * 1024 * 1024 * 1024),
+            MemoryReserve::Fixed(128 * 1024 * 1024),
             4,
             true,
         )
@@ -994,8 +995,8 @@ mod tests {
 
     #[test]
     fn test_verify_sort_order_sorted() -> Result<()> {
-        use fgumi_lib::sam::builder::SamBuilder;
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sam::builder::SamBuilder;
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
 
         let mut builder = SamBuilder::new();
         // Add records with names in sorted order
@@ -1025,8 +1026,8 @@ mod tests {
 
     #[test]
     fn test_verify_sort_order_unsorted() -> Result<()> {
-        use fgumi_lib::sam::builder::SamBuilder;
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sam::builder::SamBuilder;
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
 
         let mut builder = SamBuilder::new();
         // Add records with names out of order (pairs are interleaved)
@@ -1060,8 +1061,8 @@ mod tests {
 
     #[test]
     fn test_verify_sort_order_empty() -> Result<()> {
-        use fgumi_lib::sam::builder::SamBuilder;
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sam::builder::SamBuilder;
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
 
         let builder = SamBuilder::new();
 
@@ -1091,13 +1092,13 @@ mod tests {
 
     /// Helper: build a BAM, sort it with the given order, then verify it passes.
     fn sort_and_verify_pass(order_str: &str) -> Result<()> {
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
-        use fgumi_lib::sort::{
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sort::{
             RawExternalSorter, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext,
             extract_coordinate_key_inline,
         };
 
-        let mut builder = fgumi_lib::sam::builder::SamBuilder::new();
+        let mut builder = crate::sam::builder::SamBuilder::new();
         // Add pairs with names that sort differently under natural vs lexicographic
         let _ = builder.add_pair().name("read2").contig(0).start1(200).build();
         let _ = builder.add_pair().name("read10").contig(0).start1(100).build();
@@ -1117,7 +1118,7 @@ mod tests {
 
         // Now verify
         let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = fgumi_lib::bam_io::create_bam_reader(&sorted_bam, 1)?;
+        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 
@@ -1179,11 +1180,11 @@ mod tests {
 
     #[test]
     fn test_verify_queryname_lex_fails_with_natural_verifier() -> Result<()> {
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
-        use fgumi_lib::sort::{RawExternalSorter, RawQuerynameKey, RawSortKey, SortContext};
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sort::{RawExternalSorter, RawQuerynameKey, RawSortKey, SortContext};
 
         // Build BAM with names that differ between lex and natural ordering
-        let mut builder = fgumi_lib::sam::builder::SamBuilder::new();
+        let mut builder = crate::sam::builder::SamBuilder::new();
         let _ = builder.add_pair().name("read2").contig(0).start1(100).build();
         let _ = builder.add_pair().name("read10").contig(0).start1(200).build();
 
@@ -1202,7 +1203,7 @@ mod tests {
         // Verify with natural comparator — should detect violations
         // because lex order puts read10 before read2, but natural expects read2 before read10
         let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = fgumi_lib::bam_io::create_bam_reader(&sorted_bam, 1)?;
+        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 
@@ -1220,11 +1221,11 @@ mod tests {
 
     #[test]
     fn test_verify_queryname_natural_fails_with_lex_verifier() -> Result<()> {
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
-        use fgumi_lib::sort::{RawExternalSorter, RawQuerynameLexKey, RawSortKey, SortContext};
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sort::{RawExternalSorter, RawQuerynameLexKey, RawSortKey, SortContext};
 
         // Build BAM with names that differ between lex and natural ordering
-        let mut builder = fgumi_lib::sam::builder::SamBuilder::new();
+        let mut builder = crate::sam::builder::SamBuilder::new();
         let _ = builder.add_pair().name("read2").contig(0).start1(100).build();
         let _ = builder.add_pair().name("read10").contig(0).start1(200).build();
 
@@ -1242,7 +1243,7 @@ mod tests {
         // Verify with lexicographic comparator — should detect violations
         // because natural puts read2 before read10, but lex expects read10 before read2
         let file = std::fs::File::open(&sorted_bam)?;
-        let (_, header) = fgumi_lib::bam_io::create_bam_reader(&sorted_bam, 1)?;
+        let (_, header) = crate::bam_io::create_bam_reader(&sorted_bam, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 
@@ -1279,11 +1280,11 @@ mod tests {
 
     #[test]
     fn test_verify_coordinate_fails_on_unsorted() -> Result<()> {
-        use fgumi_lib::sort::extract_coordinate_key_inline;
-        use fgumi_lib::sort::raw_bam_reader::RawBamRecordReader;
+        use crate::sort::extract_coordinate_key_inline;
+        use crate::sort::raw_bam_reader::RawBamRecordReader;
 
         // Build BAM with records deliberately out of coordinate order
-        let mut builder = fgumi_lib::sam::builder::SamBuilder::new();
+        let mut builder = crate::sam::builder::SamBuilder::new();
         let _ = builder.add_pair().name("a").contig(1).start1(100).build();
         let _ = builder.add_pair().name("b").contig(0).start1(200).build();
 
@@ -1292,7 +1293,7 @@ mod tests {
         builder.write_bam(&bam_path)?;
 
         let file = std::fs::File::open(&bam_path)?;
-        let (_, header) = fgumi_lib::bam_io::create_bam_reader(&bam_path, 1)?;
+        let (_, header) = crate::bam_io::create_bam_reader(&bam_path, 1)?;
         let mut reader = RawBamRecordReader::new(file)?;
         reader.skip_header()?;
 

@@ -6,36 +6,36 @@
 //! of the original duplex molecule. R1 comes from one strand, R2 from the opposite strand,
 //! allowing even a single read-pair to generate duplex consensus.
 
+use crate::bam_io::{
+    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader,
+};
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
-use fgumi_lib::bam_io::{
-    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader,
-};
 
 use super::common::{
     BamIoOptions, CompressionOptions, ConsensusCallingOptions, QueueMemoryOptions,
     ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
     build_pipeline_config,
 };
-use fgumi_lib::consensus::codec_caller::{
+use crate::consensus::codec_caller::{
     CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats,
 };
-use fgumi_lib::consensus_caller::{ConsensusCaller, ConsensusOutput};
-use fgumi_lib::logging::{OperationTimer, log_consensus_summary};
-use fgumi_lib::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::read_info::LibraryIndex;
-use fgumi_lib::unified_pipeline::{
+use crate::consensus_caller::{ConsensusCaller, ConsensusOutput};
+use crate::logging::{OperationTimer, log_consensus_summary};
+use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::progress::ProgressTracker;
+use crate::read_info::LibraryIndex;
+use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
-use fgumi_lib::validation::{optional_string_to_tag, validate_file_exists};
+use crate::validation::{optional_string_to_tag, validate_file_exists};
 use log::info;
 use noodles::sam::Header;
 use std::io::{self, Write as IoWrite};
@@ -779,7 +779,7 @@ mod tests {
     }
 
     // Integration tests
-    use fgumi_lib::sam::builder::RecordBuilder;
+    use crate::sam::builder::RecordBuilder;
     use noodles::sam::Header;
     use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record_buf::RecordBuf;

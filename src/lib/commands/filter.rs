@@ -8,28 +8,28 @@
 //! 2. **Read-level filtering**: Entire reads are filtered if they fail thresholds
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
+use crate::alignment_tags::regenerate_alignment_tags_raw;
+use crate::bam_io::create_bam_reader_for_pipeline;
+use crate::consensus_filter::{
+    FilterConfig, FilterResult, compute_read_stats_raw, filter_duplex_read_raw, filter_read_raw,
+    is_duplex_consensus_raw, mask_bases_raw, mask_duplex_bases_raw, template_passes_raw,
+};
+use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
+use crate::logging::OperationTimer;
+use crate::read_info::LibraryIndex;
+use crate::reference::ReferenceReader;
+use crate::sort::bam_fields;
+use crate::tag_reversal::reverse_per_base_tags_raw;
+use crate::template::TemplateBatch;
+use crate::unified_pipeline::{
+    BamPipelineConfig, BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
+    run_bam_pipeline_from_reader, run_bam_pipeline_from_reader_with_secondary,
+};
+use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
-use fgumi_lib::alignment_tags::regenerate_alignment_tags_raw;
-use fgumi_lib::bam_io::create_bam_reader_for_pipeline;
-use fgumi_lib::consensus_filter::{
-    FilterConfig, FilterResult, compute_read_stats_raw, filter_duplex_read_raw, filter_read_raw,
-    is_duplex_consensus_raw, mask_bases_raw, mask_duplex_bases_raw, template_passes_raw,
-};
-use fgumi_lib::grouper::{SingleRawRecordGrouper, TemplateGrouper};
-use fgumi_lib::logging::OperationTimer;
-use fgumi_lib::read_info::LibraryIndex;
-use fgumi_lib::reference::ReferenceReader;
-use fgumi_lib::sort::bam_fields;
-use fgumi_lib::tag_reversal::reverse_per_base_tags_raw;
-use fgumi_lib::template::TemplateBatch;
-use fgumi_lib::unified_pipeline::{
-    BamPipelineConfig, BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
-    run_bam_pipeline_from_reader, run_bam_pipeline_from_reader_with_secondary,
-};
-use fgumi_lib::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 use std::io;
@@ -779,7 +779,7 @@ impl Filter {
     fn check_filters_raw(
         bam: &[u8],
         aux_data: &[u8],
-        thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
+        thresholds: &crate::consensus_filter::FilterThresholds,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
@@ -797,9 +797,9 @@ impl Filter {
     fn check_duplex_filters_raw(
         bam: &[u8],
         aux_data: &[u8],
-        cc_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
-        ab_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
-        ba_thresholds: &fgumi_lib::consensus_filter::FilterThresholds,
+        cc_thresholds: &crate::consensus_filter::FilterThresholds,
+        ab_thresholds: &crate::consensus_filter::FilterThresholds,
+        ba_thresholds: &crate::consensus_filter::FilterThresholds,
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
@@ -1128,7 +1128,7 @@ mod tests {
 
     // Integration tests for filtering logic
 
-    use fgumi_lib::sam::builder::RecordBuilder;
+    use crate::sam::builder::RecordBuilder;
     use noodles::sam::alignment::record_buf::data::field::Value;
     use noodles::sam::alignment::record_buf::data::field::value::Array;
 
@@ -1193,59 +1193,53 @@ mod tests {
     #[test]
     fn test_count_no_calls_empty_sequence() {
         let record = create_filter_test_record("test", "", &[], None, None, None, None);
-        assert_eq!(fgumi_lib::consensus_filter::count_no_calls(&record), 0);
+        assert_eq!(crate::consensus_filter::count_no_calls(&record), 0);
     }
 
     #[test]
     fn test_count_no_calls_no_ns() {
         let record =
             create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
-        assert_eq!(fgumi_lib::consensus_filter::count_no_calls(&record), 0);
+        assert_eq!(crate::consensus_filter::count_no_calls(&record), 0);
     }
 
     #[test]
     fn test_count_no_calls_with_ns() {
         let record =
             create_filter_test_record("test", "ACNTN", &[30, 30, 0, 30, 0], None, None, None, None);
-        assert_eq!(fgumi_lib::consensus_filter::count_no_calls(&record), 2);
+        assert_eq!(crate::consensus_filter::count_no_calls(&record), 2);
     }
 
     #[test]
     fn test_count_no_calls_all_ns() {
         let record =
             create_filter_test_record("test", "NNNN", &[0, 0, 0, 0], None, None, None, None);
-        assert_eq!(fgumi_lib::consensus_filter::count_no_calls(&record), 4);
+        assert_eq!(crate::consensus_filter::count_no_calls(&record), 4);
     }
 
     #[test]
     fn test_mean_base_quality_empty() {
         let record = create_filter_test_record("test", "", &[], None, None, None, None);
-        assert!(
-            (fgumi_lib::consensus_filter::mean_base_quality(&record) - 0.0).abs() < f64::EPSILON
-        );
+        assert!((crate::consensus_filter::mean_base_quality(&record) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_mean_base_quality_uniform() {
         let record =
             create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
-        assert!(
-            (fgumi_lib::consensus_filter::mean_base_quality(&record) - 30.0).abs() < f64::EPSILON
-        );
+        assert!((crate::consensus_filter::mean_base_quality(&record) - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_mean_base_quality_mixed() {
         let record =
             create_filter_test_record("test", "ACGT", &[10, 20, 30, 40], None, None, None, None);
-        assert!(
-            (fgumi_lib::consensus_filter::mean_base_quality(&record) - 25.0).abs() < f64::EPSILON
-        );
+        assert!((crate::consensus_filter::mean_base_quality(&record) - 25.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_mask_bases_low_quality() {
-        use fgumi_lib::consensus_filter::{FilterThresholds, mask_bases};
+        use crate::consensus_filter::{FilterThresholds, mask_bases};
 
         // Test: mask_bases masks bases with low quality
         // Qualities: A=10 (<20, mask), C=30 (ok), G=5 (<20, mask), T=30 (ok)
@@ -1276,7 +1270,7 @@ mod tests {
 
     #[test]
     fn test_mask_bases_low_depth() {
-        use fgumi_lib::consensus_filter::{FilterThresholds, mask_bases};
+        use crate::consensus_filter::{FilterThresholds, mask_bases};
 
         let mut record = create_filter_test_record(
             "test",
@@ -1301,7 +1295,7 @@ mod tests {
 
     #[test]
     fn test_mask_bases_high_error_count() {
-        use fgumi_lib::consensus_filter::{FilterThresholds, mask_bases};
+        use crate::consensus_filter::{FilterThresholds, mask_bases};
 
         let mut record = create_filter_test_record(
             "test",
@@ -1330,7 +1324,7 @@ mod tests {
 
     #[test]
     fn test_filter_read_passes_all_thresholds() {
-        use fgumi_lib::consensus_filter::{FilterResult, FilterThresholds, filter_read};
+        use crate::consensus_filter::{FilterResult, FilterThresholds, filter_read};
 
         let record = create_filter_test_record(
             "test",
@@ -1351,7 +1345,7 @@ mod tests {
 
     #[test]
     fn test_filter_read_fails_low_depth() {
-        use fgumi_lib::consensus_filter::{FilterResult, FilterThresholds, filter_read};
+        use crate::consensus_filter::{FilterResult, FilterThresholds, filter_read};
 
         let record = create_filter_test_record(
             "test",
@@ -1372,7 +1366,7 @@ mod tests {
 
     #[test]
     fn test_filter_read_fails_high_error_rate() {
-        use fgumi_lib::consensus_filter::{FilterResult, FilterThresholds, filter_read};
+        use crate::consensus_filter::{FilterResult, FilterThresholds, filter_read};
 
         let record = create_filter_test_record(
             "test",
@@ -1393,7 +1387,7 @@ mod tests {
 
     #[test]
     fn test_filter_read_without_tags() {
-        use fgumi_lib::consensus_filter::{FilterResult, FilterThresholds, filter_read};
+        use crate::consensus_filter::{FilterResult, FilterThresholds, filter_read};
 
         // Record without depth/error tags should pass (tags are optional)
         let record =
@@ -1408,8 +1402,8 @@ mod tests {
 
     #[test]
     fn test_template_passes_all_pass() {
+        use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
-        use fgumi_lib::consensus_filter::template_passes;
 
         let r1 =
             create_filter_test_record("read1", "ACGT", &[30, 30, 30, 30], None, None, None, None);
@@ -1426,8 +1420,8 @@ mod tests {
 
     #[test]
     fn test_template_passes_one_fails() {
+        use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
-        use fgumi_lib::consensus_filter::template_passes;
 
         let r1 =
             create_filter_test_record("read1", "ACGT", &[30, 30, 30, 30], None, None, None, None);
@@ -1444,7 +1438,7 @@ mod tests {
 
     #[test]
     fn test_is_duplex_consensus_simplex() {
-        use fgumi_lib::consensus_filter::is_duplex_consensus;
+        use crate::consensus_filter::is_duplex_consensus;
 
         let record =
             create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
@@ -1453,13 +1447,13 @@ mod tests {
 
     #[test]
     fn test_is_duplex_consensus_with_tag() {
-        use fgumi_lib::consensus_filter::is_duplex_consensus;
+        use crate::consensus_filter::is_duplex_consensus;
 
         let mut record =
             create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
 
         // Add duplex consensus tags (aD per-read tag is key indicator)
-        record.data_mut().insert(fgumi_lib::consensus_tags::per_read::tag("aD"), Value::UInt8(10));
+        record.data_mut().insert(crate::consensus_tags::per_read::tag("aD"), Value::UInt8(10));
 
         assert!(is_duplex_consensus(&record));
     }
@@ -1984,7 +1978,7 @@ mod tests {
     // Integration Tests for Filter Command (execute())
     // ========================================================================
 
-    use fgumi_lib::sam::builder::SamBuilder;
+    use crate::sam::builder::SamBuilder;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -3198,7 +3192,7 @@ mod tests {
     #[test]
     fn test_filter_execute_with_supplementary_records() -> Result<()> {
         // Test filtering with supplementary alignments
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::sam::builder::RecordBuilder;
 
         let dir = TempDir::new()?;
         let ref_path = create_test_reference(&dir);
@@ -3308,7 +3302,7 @@ mod tests {
     #[test]
     fn test_filter_execute_parallel_with_supplementary() -> Result<()> {
         // Test supplementary records in parallel template mode
-        use fgumi_lib::sam::builder::RecordBuilder;
+        use crate::sam::builder::RecordBuilder;
 
         let dir = TempDir::new()?;
         let ref_path = create_test_reference(&dir);
@@ -3667,9 +3661,9 @@ mod tests {
     fn test_check_filters_raw_no_call_fraction_mode() -> Result<()> {
         // Test fraction mode (threshold < 1.0) with max_no_call_fraction = 0.2
         // Build a record with 10 bases, 2 Ns => 0.2 fraction => should pass
-        use fgumi_lib::consensus_filter::FilterThresholds;
-        use fgumi_lib::sam::builder::RecordBuilder;
-        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use crate::consensus_filter::FilterThresholds;
+        use crate::sam::builder::RecordBuilder;
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
         use noodles::sam::Header;
 
         let mut record = RecordBuilder::new()
@@ -3691,7 +3685,7 @@ mod tests {
         let mut raw = Vec::new();
         encode_record_buf(&mut raw, &header, &record)?;
 
-        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -3710,9 +3704,9 @@ mod tests {
     fn test_check_filters_raw_no_call_count_mode_pass() -> Result<()> {
         // Test count mode (threshold >= 1.0) with max_no_call_fraction = 5.0
         // Build a record with 10 bases, 3 Ns => 3 < 5 => should pass
-        use fgumi_lib::consensus_filter::FilterThresholds;
-        use fgumi_lib::sam::builder::RecordBuilder;
-        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use crate::consensus_filter::FilterThresholds;
+        use crate::sam::builder::RecordBuilder;
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
         use noodles::sam::Header;
 
         let mut record = RecordBuilder::new()
@@ -3734,7 +3728,7 @@ mod tests {
         let mut raw = Vec::new();
         encode_record_buf(&mut raw, &header, &record)?;
 
-        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -3753,9 +3747,9 @@ mod tests {
     fn test_check_filters_raw_no_call_count_mode_fail() -> Result<()> {
         // Test count mode (threshold >= 1.0) with max_no_call_fraction = 2.0
         // Build a record with 10 bases, 3 Ns => 3 > 2 => should fail
-        use fgumi_lib::consensus_filter::FilterThresholds;
-        use fgumi_lib::sam::builder::RecordBuilder;
-        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use crate::consensus_filter::FilterThresholds;
+        use crate::sam::builder::RecordBuilder;
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
         use noodles::sam::Header;
 
         let mut record = RecordBuilder::new()
@@ -3777,7 +3771,7 @@ mod tests {
         let mut raw = Vec::new();
         encode_record_buf(&mut raw, &header, &record)?;
 
-        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -3791,9 +3785,9 @@ mod tests {
     #[test]
     fn test_check_duplex_filters_raw_no_call_count_mode() -> Result<()> {
         // Test duplex filtering with count mode for no-call counting
-        use fgumi_lib::consensus_filter::FilterThresholds;
-        use fgumi_lib::sam::builder::RecordBuilder;
-        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use crate::consensus_filter::FilterThresholds;
+        use crate::sam::builder::RecordBuilder;
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
         use noodles::sam::Header;
 
         let mut record = RecordBuilder::new()
@@ -3831,7 +3825,7 @@ mod tests {
         let mut raw = Vec::new();
         encode_record_buf(&mut raw, &header, &record)?;
 
-        let aux = fgumi_lib::sort::bam_fields::aux_data_slice(&raw);
+        let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.1 };
 
@@ -3867,7 +3861,7 @@ mod tests {
     /// to regenerate alignment tags.
     #[test]
     fn test_process_record_raw_no_reference() -> Result<()> {
-        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
 
         // Build an unmapped record with consensus tags
         let record = RecordBuilder::new()
@@ -3876,7 +3870,7 @@ mod tests {
             .qualities(&[35, 35, 35, 35, 35, 35, 35, 35])
             .unmapped(true)
             .consensus_tags(
-                fgumi_lib::sam::builder::ConsensusTagsBuilder::new()
+                crate::sam::builder::ConsensusTagsBuilder::new()
                     .per_base_depths(&[10; 8])
                     .per_base_errors(&[0; 8]),
             )
@@ -3907,9 +3901,9 @@ mod tests {
     /// and the record is mapped, since NM/UQ/MD tags would become stale.
     #[test]
     fn test_process_record_raw_no_reference_mapped_fails() -> Result<()> {
-        use fgumi_lib::vendored::bam_codec::encoder::encode_record_buf;
+        use crate::vendored::bam_codec::encoder::encode_record_buf;
 
-        let sam_builder = fgumi_lib::sam::builder::SamBuilder::with_single_ref("chr1", 1000);
+        let sam_builder = crate::sam::builder::SamBuilder::with_single_ref("chr1", 1000);
         let record = RecordBuilder::new()
             .name("mapped_read")
             .sequence("ACGTACGT")
@@ -3919,7 +3913,7 @@ mod tests {
             .mapping_quality(60)
             .cigar("8M")
             .consensus_tags(
-                fgumi_lib::sam::builder::ConsensusTagsBuilder::new()
+                crate::sam::builder::ConsensusTagsBuilder::new()
                     .per_base_depths(&[10; 8])
                     .per_base_errors(&[0; 8]),
             )

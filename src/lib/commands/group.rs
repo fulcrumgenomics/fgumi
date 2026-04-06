@@ -1,40 +1,40 @@
 //! Groups reads by UMI to identify reads from the same original molecule.
 
+use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
+use crate::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
     build_pipeline_config, parse_bool,
 };
+use crate::grouper::{
+    FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
+    build_templates_from_records,
+};
+use crate::logging::{OperationTimer, log_umi_grouping_summary};
+use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
+use crate::progress::ProgressTracker;
+use crate::read_info::{LibraryIndex, compute_group_key};
+use crate::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
+use crate::template::{MoleculeId, Template};
+use crate::umi::parallel_assigner::{
+    ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
+    ParallelPairedAssigner,
+};
+use crate::umi::{UmiValidation, validate_umi};
+use crate::unified_pipeline::DecodedRecord;
+use crate::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
-use fgumi_lib::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use fgumi_lib::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
-use fgumi_lib::grouper::{
-    FilterMetrics, ProcessedPositionGroup, RawPositionGroup, RecordPositionGrouper,
-    build_templates_from_records,
-};
-use fgumi_lib::logging::{OperationTimer, log_umi_grouping_summary};
-use fgumi_lib::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
-use fgumi_lib::progress::ProgressTracker;
-use fgumi_lib::read_info::{LibraryIndex, compute_group_key};
-use fgumi_lib::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
-use fgumi_lib::template::{MoleculeId, Template};
-use fgumi_lib::umi::parallel_assigner::{
-    ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
-    ParallelPairedAssigner,
-};
-use fgumi_lib::umi::{UmiValidation, validate_umi};
-use fgumi_lib::unified_pipeline::DecodedRecord;
-use fgumi_lib::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 #[cfg(feature = "memory-debug")]
-use fgumi_lib::unified_pipeline::MemoryEstimate;
-use fgumi_lib::validation::{string_to_tag, validate_file_exists};
-use fgumi_lib::vendored::bam_codec::encode_record_buf;
+use crate::unified_pipeline::MemoryEstimate;
+use crate::validation::{string_to_tag, validate_file_exists};
+use crate::vendored::bam_codec::encode_record_buf;
 use log::{info, warn};
 use noodles::sam;
 use noodles::sam::Header;
@@ -62,7 +62,7 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
     }
 }
 
-// UmiGroupingMetrics and FamilySizeMetrics are imported from fgumi_lib::metrics
+// UmiGroupingMetrics and FamilySizeMetrics are imported from crate::metrics
 
 /// Collected metrics from `serialize_fn`, aggregated after pipeline completion.
 #[derive(Default, Debug)]
@@ -212,7 +212,7 @@ fn filter_template_raw(
     config: &GroupFilterConfig,
     metrics: &mut FilterMetrics,
 ) -> bool {
-    use fgumi_lib::sort::bam_fields;
+    use crate::sort::bam_fields;
 
     let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
     let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
@@ -361,7 +361,7 @@ fn filter_template_raw(
 /// Uses zero-allocation CIGAR iteration. Unmapped reads return position 0
 /// (matching noodles `unwrap_or(0)` behavior).
 fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
-    use fgumi_lib::sort::bam_fields;
+    use crate::sort::bam_fields;
 
     let ref1 = bam_fields::ref_id(r1);
     let ref2 = bam_fields::ref_id(r2);
@@ -375,7 +375,7 @@ fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
 
 /// Get pair orientation from raw-byte template.
 fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
-    use fgumi_lib::sort::bam_fields;
+    use crate::sort::bam_fields;
 
     let r1_positive =
         template.raw_r1().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
@@ -560,7 +560,7 @@ fn assign_umi_groups_for_indices_impl(
         } else {
             let (umi_str_ref, is_r1_earlier) = if raw_mode {
                 // Raw-byte mode: extract UMI from raw bytes
-                use fgumi_lib::sort::bam_fields;
+                use crate::sort::bam_fields;
 
                 let umi_bytes = if let Some(r1_raw) = template.raw_r1() {
                     let aux = bam_fields::aux_data_slice(r1_raw);
@@ -1070,7 +1070,7 @@ impl Command for GroupReadsByUmi {
         let debug_memory_flag = self.debug_memory;
         #[cfg(feature = "memory-debug")]
         let (memory_monitor_handle, shared_stats) = if self.debug_memory {
-            use fgumi_lib::unified_pipeline::{PipelineStats, start_memory_monitor};
+            use crate::unified_pipeline::{PipelineStats, start_memory_monitor};
             use std::sync::atomic::AtomicBool;
 
             info!("Memory debugging enabled - reporting every {}s", self.memory_report_interval);
@@ -1089,7 +1089,7 @@ impl Command for GroupReadsByUmi {
             (None, None)
         };
         #[cfg(not(feature = "memory-debug"))]
-        let shared_stats: Option<Arc<fgumi_lib::unified_pipeline::PipelineStats>> = None;
+        let shared_stats: Option<Arc<crate::unified_pipeline::PipelineStats>> = None;
 
         // Clone stats for hot path tracking (process_fn and serialize_fn closures)
         #[cfg(feature = "memory-debug")]
@@ -1183,7 +1183,7 @@ impl Command for GroupReadsByUmi {
                 let initial_group_size = if debug_memory_flag {
                     let size = group.estimate_heap_size();
                     if let Some(stats) = stats_for_tracking.as_ref() {
-                        use fgumi_lib::unified_pipeline::get_or_assign_thread_id;
+                        use crate::unified_pipeline::get_or_assign_thread_id;
                         let thread_id = get_or_assign_thread_id();
                         let record_count = group.records.len();
 
@@ -1229,7 +1229,7 @@ impl Command for GroupReadsByUmi {
                     let estimated_size = estimate_templates_heap_size(&filtered_templates);
 
                     if let Some(stats) = stats_for_tracking.as_ref() {
-                        let thread_id = fgumi_lib::unified_pipeline::get_or_assign_thread_id();
+                        let thread_id = crate::unified_pipeline::get_or_assign_thread_id();
 
                         stats.track_template_memory(estimated_size, true);
 
@@ -1417,7 +1417,7 @@ impl Command for GroupReadsByUmi {
                     .is_some_and(Template::is_raw_byte_mode);
                 if raw_mode {
                     // Raw-byte output: modify MI tag via scratch buffer
-                    use fgumi_lib::sort::bam_fields;
+                    use crate::sort::bam_fields;
                     let mut scratch = Vec::with_capacity(512);
                     let mut mi_buf = String::with_capacity(16);
                     for template in &processed.templates {
@@ -1495,7 +1495,7 @@ impl Command for GroupReadsByUmi {
         // Cleanup memory monitoring if it was enabled
         #[cfg(feature = "memory-debug")]
         if let Some((handle, shutdown_signal)) = memory_monitor_handle {
-            use fgumi_lib::unified_pipeline::log_comprehensive_memory_stats;
+            use crate::unified_pipeline::log_comprehensive_memory_stats;
 
             shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
             let _: Result<(), _> = handle.join();
@@ -1677,7 +1677,7 @@ impl GroupReadsByUmi {
         position_group_size_counter: &mut AHashMap<usize, u64>,
         next_mi_base: &mut u64,
         header: &Header,
-        writer: &mut fgumi_lib::bam_io::BamWriter,
+        writer: &mut crate::bam_io::BamWriter,
     ) -> Result<()> {
         // Build templates from raw records
         let all_templates = build_templates_from_records(group.records)?;
@@ -1856,8 +1856,8 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
-    use fgumi_lib::sam::builder::{RecordBuilder, RecordPairBuilder};
+    use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
+    use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
     use noodles::bam;
     use noodles::sam::alignment::RecordBuf;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -4794,7 +4794,7 @@ mod tests {
 
     /// Build a raw BAM record with specified flags, mapq, and UMI for testing.
     fn make_raw_bam_for_group(name: &[u8], flag: u16, mapq: u8, umi: &[u8]) -> Vec<u8> {
-        use fgumi_lib::sort::bam_fields;
+        use crate::sort::bam_fields;
 
         let seq_len = 4usize;
         let l_read_name = (name.len() + 1) as u8;
@@ -4840,9 +4840,9 @@ mod tests {
     fn test_group_filter_template_raw_accepts_valid() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             b"ACGTACGT",
         );
@@ -4865,9 +4865,9 @@ mod tests {
     fn test_group_filter_template_raw_rejects_low_mapq() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             10,
             b"ACGTACGT",
         );
@@ -4890,10 +4890,10 @@ mod tests {
     fn test_group_filter_template_raw_rejects_qc_fail() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED
-                | fgumi_lib::sort::bam_fields::flags::QC_FAIL,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED
+                | crate::sort::bam_fields::flags::QC_FAIL,
             30,
             b"ACGT",
         );
@@ -4916,9 +4916,9 @@ mod tests {
     fn test_group_filter_template_raw_rejects_umi_with_n() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             b"ANGT",
         );
@@ -4941,9 +4941,9 @@ mod tests {
     fn test_group_filter_template_raw_rejects_short_umi() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             b"AC",
         );
@@ -4966,8 +4966,8 @@ mod tests {
     fn test_group_filter_template_raw_rejects_unmapped() {
         let raw = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::UNMAPPED
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::UNMAPPED
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             0,
             b"ACGT",
         );
@@ -4994,18 +4994,18 @@ mod tests {
         let short_rec = [0u8; 16]; // Less than 32 bytes
         let valid_rec = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             b"ACGT",
         );
         // Build a template where raw_records[0] is too short — testing defense-in-depth
         // We can't use from_raw_records (it validates), so test the constant is correct
-        assert_eq!(fgumi_lib::sort::bam_fields::MIN_BAM_RECORD_LEN, 32);
+        assert_eq!(crate::sort::bam_fields::MIN_BAM_RECORD_LEN, 32);
         // Verify the valid record passes and the short one would be caught by from_raw_records
-        assert!(valid_rec.len() >= fgumi_lib::sort::bam_fields::MIN_BAM_RECORD_LEN);
-        assert!(short_rec.len() < fgumi_lib::sort::bam_fields::MIN_BAM_RECORD_LEN);
+        assert!(valid_rec.len() >= crate::sort::bam_fields::MIN_BAM_RECORD_LEN);
+        assert!(short_rec.len() < crate::sort::bam_fields::MIN_BAM_RECORD_LEN);
     }
 
     #[test]
@@ -5013,10 +5013,10 @@ mod tests {
         // Template with only supplementary records → no raw_r1/raw_r2
         let supp = make_raw_bam_for_group(
             b"rea",
-            fgumi_lib::sort::bam_fields::flags::PAIRED
-                | fgumi_lib::sort::bam_fields::flags::FIRST_SEGMENT
-                | fgumi_lib::sort::bam_fields::flags::SUPPLEMENTARY
-                | fgumi_lib::sort::bam_fields::flags::MATE_UNMAPPED,
+            crate::sort::bam_fields::flags::PAIRED
+                | crate::sort::bam_fields::flags::FIRST_SEGMENT
+                | crate::sort::bam_fields::flags::SUPPLEMENTARY
+                | crate::sort::bam_fields::flags::MATE_UNMAPPED,
             30,
             b"ACGT",
         );
