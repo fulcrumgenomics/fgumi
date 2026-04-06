@@ -24,10 +24,15 @@ For memory-constrained environments, start with `--queue-memory-per-thread false
 
 ## Threading Options
 
-### Single-threaded Mode
-- **Usage**: `--threads 1` or omit the parameter
-- **Behavior**: Uses optimized fast path with minimal overhead
+### No-flag Fast Path (default)
+- **Usage**: Omit `--threads` entirely
+- **Behavior**: Uses optimized single-threaded fast path with minimal overhead
 - **Best for**: Small files, memory-constrained systems, debugging
+
+### Explicit Single-threaded Mode
+- **Usage**: `--threads 1`
+- **Behavior**: Uses the unified pipeline with a single worker thread — same pipeline as `--threads N` but with N=1; does **not** use the no-flag fast path
+- **Best for**: Isolating pipeline behavior in a single-threaded context
 
 ### Multi-threaded Mode
 - **Usage**: `--threads N` where N > 1
@@ -71,7 +76,7 @@ fgumi filter --queue-memory 4096 --queue-memory-per-thread false
 
 ### Compression Level
 - **Range**: 1 (fastest) to 12 (best compression)
-- **Default**: 1 (fastest)
+- **Default**: 1 (fastest) for most commands; `fgumi merge` defaults to 6
 - **Usage**: `--compression-level N`
 
 ### Compression Threading
@@ -267,9 +272,33 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 - Benefits from high memory (large FASTQ processing)
 - Compression level affects output size significantly
 
+### Zipper
+- For best throughput, pipe SAM directly from the aligner rather than writing and re-reading a BAM
+- BAM file input is supported via `--input` but adds an extra decode step
+- The zipper pipeline uses raw-byte merging internally: aligned records are not fully decoded and
+  re-encoded unless the record actually needs modification, which eliminates a significant CPU
+  bottleneck on high-throughput runs
+
+### Sort
+- Uses an internal LoserTree (tournament tree) for k-way merging, which performs significantly
+  better than a simple heap merge when the number of sorted runs is large
+- `--max-memory` controls how much RAM is used for sort buffers; increase for large files to
+  reduce the number of intermediate merge passes
+- For template-coordinate sort with single-cell data, include `--cell-tag CB`
+
+### Merge
+- `fgumi merge` performs a k-way merge using a LoserTree for efficient multi-file merging
+- Thread count (`--threads`) controls compression parallelism, not merge concurrency
+- For template-coordinate merges with single-cell data, include `--cell-tag CB`
+
 ### Group/Dedup
-- Memory usage scales with UMI diversity
+- Memory usage scales with UMI diversity and the number of reads at any given position
 - Higher thread counts improve UMI processing
+- The `--metrics PREFIX` flag writes all grouping metrics in one step with minimal overhead
+
+### Simplex/Duplex Metrics
+- Both `simplex-metrics` and `duplex-metrics` are single-threaded; they do not benefit from `--threads`
+- Memory usage is proportional to the number of unique genomic positions in the input
 
 ### Consensus (Simplex/Duplex/CODEC)
 - Memory proportional to family sizes

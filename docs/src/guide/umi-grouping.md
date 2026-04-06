@@ -9,6 +9,7 @@ This page describes:
 2. How mapping coordinates and UMIs identify reads from the same molecule
 3. Template-coordinate sort order
 4. Cell barcode support
+5. Metrics output
 
 ## Filtering Reads and Templates
 
@@ -30,6 +31,21 @@ Reads and templates are filtered before grouping to prevent splitting reads from
 - Any non-secondary, non-supplementary read has mapping quality < `--min-map-q`
 - Any UMI sequence contains one or more `N` bases
 - `--min-umi-length` is specified and the UMI does not meet the length requirement
+
+### Grouping Unmapped Reads
+
+By default, templates where all reads are unmapped are excluded from grouping. Pass `--allow-unmapped`
+to include them. This is useful for workflows where some templates genuinely fail to align
+(e.g. cell-free DNA fragments that fall outside the target region) but should still be counted
+and may share UMIs with mapped templates from the same molecule:
+
+```bash
+fgumi group \
+  --input sorted.bam \
+  --output grouped.bam \
+  --strategy adjacency \
+  --allow-unmapped
+```
 
 ## Grouping Strategies
 
@@ -57,35 +73,108 @@ The `edit`, `adjacency`, and `paired` strategies use the `--edits` parameter to 
 
 ## Cell Barcode Support
 
-When processing data with cell barcodes (e.g. single-cell sequencing), the `--cell-tag` option (default: `CB`) partitions reads by cell barcode *before* UMI assignment. Reads from different cells are never grouped together, even if they share a UMI and mapping position.
+When processing data with cell barcodes (e.g. single-cell sequencing), reads at the same genomic
+position are partitioned by cell barcode *before* UMI assignment. This ensures that reads from
+different cells are never grouped together, even if they share a UMI and mapping position.
 
-No correction is performed on the cell barcode — it is treated as a known/fixed value. Pass `--cell-tag` through each step:
+The cell barcode is read from the tag specified by `--cell-tag` (default: `CB`). No correction or
+error-handling is performed on cell barcodes — they must be corrected upstream before grouping.
+
+Pass `--cell-tag` consistently through the entire pipeline:
 
 ```bash
-fgumi group --cell-tag CB ...
+fgumi sort   --order template-coordinate --cell-tag CB ...
+fgumi group  --cell-tag CB ...
 fgumi simplex --cell-tag CB ...
 ```
 
-The consensus callers validate that all source reads in a group share the same cell barcode and propagate it to the output consensus read.
+The consensus callers validate that all source reads in a group share the same cell barcode and
+propagate it to the output consensus read.
+
+## Metrics Output
+
+`fgumi group` can emit three types of metrics files. They can be specified individually or all at
+once with the `--metrics` prefix flag.
+
+### Using `--metrics` (recommended)
+
+The `-M`/`--metrics` flag writes all three metrics files under a single prefix in one step:
+
+```bash
+fgumi group \
+  --input sorted.bam \
+  --output grouped.bam \
+  --strategy adjacency \
+  --metrics my_sample
+```
+
+This produces:
+- `my_sample.family_sizes.txt` — histogram of UMI family sizes
+- `my_sample.grouping_metrics.txt` — overall grouping statistics
+- `my_sample.position_group_sizes.txt` — histogram of UMI families per genomic position
+
+### Using individual flags
+
+The three metrics can also be written to explicit paths:
+
+```bash
+fgumi group \
+  --input sorted.bam \
+  --output grouped.bam \
+  --strategy adjacency \
+  --family-size-histogram family_sizes.txt \
+  --grouping-metrics grouping_metrics.txt
+```
+
+Note: `position_group_sizes.txt` is only available via `--metrics`. The individual flags
+`--family-size-histogram` and `--grouping-metrics` can be used alongside `--metrics`.
+
+### Family sizes
+
+The `family_sizes.txt` file is a histogram of how many reads belong to each UMI family. A large
+fraction of singleton families may indicate UMI collisions, over-sequencing, or UMI extraction
+errors.
+
+### Grouping metrics
+
+The `grouping_metrics.txt` file contains summary statistics about the grouping run, including
+total reads, accepted reads, discarded reads by reason, and UMI assignment counts.
+
+### Position group sizes
+
+The `position_group_sizes.txt` file is a histogram of how many distinct UMI families were
+observed at each unique genomic position (coordinate + strand). A distribution skewed toward
+large position groups may indicate high on-target duplication or UMI exhaustion.
 
 ## Template-Coordinate Sort Order
 
-If the input is not sorted in template-coordinate order, `fgumi group` will internally sort the reads. To avoid this, pre-sort with:
+If the input is not sorted in template-coordinate order, `fgumi group` will internally sort the
+reads. To avoid this overhead, pre-sort with:
 
 ```bash
 fgumi sort --order template-coordinate --input aligned.bam --output sorted.bam
+```
+
+For single-cell data, include `--cell-tag CB` so that the sort key incorporates the cell barcode,
+keeping templates from different cells at the same locus separate:
+
+```bash
+fgumi sort --order template-coordinate --cell-tag CB --input aligned.bam --output sorted.bam
 ```
 
 Template-coordinate order sorts reads by:
 1. The earlier unclipped 5' coordinate of the read pair
 2. The higher unclipped 5' coordinate of the read pair
 3. Strand orientation
-4. The cellular barcode (CB tag, if present)
+4. The cellular barcode (CB tag, if `--cell-tag` is set)
 5. The molecular identifier (MI tag, if present)
 6. Read name
 7. Library (from read group)
 8. Whether R1 has the lower coordinates of the pair
 
-Reads grouped by `fgumi group` with the same MI will share the same outer start/stop coordinates. Because 5' coordinates are strand-aware, reads from opposite strands with the same UMI and position will not be grouped together (they belong to different strands of the same duplex molecule).
+Reads grouped by `fgumi group` with the same MI will share the same outer start/stop coordinates.
+Because 5' coordinates are strand-aware, reads from opposite strands with the same UMI and
+position will not be grouped together (they belong to different strands of the same duplex
+molecule).
 
 See also: [Consensus Calling](consensus-calling.md), [Duplex Consensus Calling](duplex-consensus-calling.md), [Best Practices](best-practices.md)

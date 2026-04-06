@@ -26,7 +26,7 @@ Base qualities are assumed to represent the probability of a sequencing error. T
 1. **Shift**: Subtract a fixed value from the phred-scaled qualities (e.g., Q30 with shift of 10 becomes Q20)
 2. **Cap**: Limit to a maximum phred-scaled value
 
-```
+```text
 Q' = min(Q - S_Q, M_Q)
 ```
 
@@ -34,13 +34,13 @@ These adjustments should only be used if input base qualities are systematically
 
 The adjusted quality is converted to an error probability:
 
-```
+```text
 P_Q' = 10^(-Q'/10)
 ```
 
 Then combined with the post-UMI error rate to produce a compound error probability covering all processes from UMI integration through sequencing:
 
-```
+```text
 P_Q'' = Err_post * (1 - P_Q') + (1 - Err_post) * P_Q' + (Err_post * P_Q' * 2/3)
 ```
 
@@ -82,5 +82,7 @@ Any consensus base with quality below the minimum threshold is masked to `N`.
 
 ## Caveats
 
-- Each end of a pair is treated independently; overlapping bases within a pair are not jointly called (unless `--consensus-call-overlapping-bases` is enabled)
+- Each end of a pair is treated independently; overlapping bases within a pair are jointly called by default (disable with `--consensus-call-overlapping-bases false`)
 - Indel errors in the reads are not considered in the consensus model
+- `simplex` and `codec` do not accept a `--sort-order` flag; consensus reads are emitted as
+  unmapped and should be sorted by the downstream pipeline (`fgumi zipper` + `fgumi sort`)

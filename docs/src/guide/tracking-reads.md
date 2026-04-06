@@ -10,7 +10,7 @@ This guide describes conventions for tracking reads from raw data through groupi
 
 For example:
 
-```
+```text
 x: R1----------------->    <-------------------R2
 y: R2----------------->    <-------------------R1
 z: R1----------------->

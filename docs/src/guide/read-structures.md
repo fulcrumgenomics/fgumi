@@ -57,11 +57,10 @@ R1 contains two cell barcodes separated by linker sequences, then a UMI, then te
 
 ## Formal Grammar
 
-```
-<read-structure>     ::= <fixed-structure> <variable-segment>
+```text
+<read-structure>     ::= <fixed-structure> <segment>
 <fixed-structure>    ::= "" | <fixed-length> <operator> <fixed-structure>
-<variable-segment>   ::= "" | <variable-length> <operator>
-<segment>            ::= <any-length><operator>
+<segment>            ::= <fixed-length> <operator> | <variable-length> <operator>
 <operator>           ::= "T" | "B" | "M" | "C" | "S"
 <fixed-length>       ::= <non-zero-digit>{<digit>}
 <variable-length>    ::= "+"

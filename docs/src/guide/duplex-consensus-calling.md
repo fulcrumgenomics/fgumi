@@ -27,9 +27,9 @@ Reads are split by strand of origin (A or B) and whether they are sequencing rea
 
 ### Quality Trimming
 
-Reads can be end-trimmed to remove low quality bases. This is highly recommended as it reduces disagreements in the consensus and fewer no-calls (`N`s). Trimming uses the same running-sum algorithm as BWA.
+Reads can be end-trimmed to remove low-quality bases. This is highly recommended as it reduces disagreements in the consensus and fewer no-calls (`N`s). Trimming uses the same running-sum algorithm as BWA.
 
-### Masking Low Quality Bases
+### Masking Low-Quality Bases
 
 Bases below the minimum quality threshold are converted to `N`s so they are not used in consensus calling. If quality trimming is disabled, reads are truncated to remove contiguous trailing `N`s.
 
@@ -41,7 +41,7 @@ Reads longer than the insert length read into adapter sequence. For duplex data,
 
 Without multiple alignment, length errors (indels) in raw reads cause reads to be out of phase with each other. For example:
 
-```
+```text
 1: ACGTGACTGACTAGCTTTTTTT-AGACTAGCTACTACT
 2: ACGTGACTGACTAGCTTTTTTT-AGACTAGCTACTACT
 3: ACGTGACTGACTAGCTTTTTTTT-GACTAGCTACTACT
