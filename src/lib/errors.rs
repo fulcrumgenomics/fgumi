@@ -54,6 +54,13 @@ pub enum FgumiError {
         /// The reference sequence name
         ref_name: String,
     },
+
+    /// Invalid memory size string
+    #[error("Invalid memory size: {reason}")]
+    InvalidMemorySize {
+        /// Explanation of why the value is invalid
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -89,6 +96,15 @@ mod tests {
         let msg = format!("{error}");
         assert!(msg.contains("Invalid BAM file"));
         assert!(msg.contains("truncated file"));
+    }
+
+    #[test]
+    fn test_invalid_memory_size() {
+        let error =
+            FgumiError::InvalidMemorySize { reason: "Memory size cannot be empty".to_string() };
+        let msg = format!("{error}");
+        assert!(msg.contains("Invalid memory size"));
+        assert!(msg.contains("cannot be empty"));
     }
 
     #[test]
