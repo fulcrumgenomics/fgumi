@@ -34,3 +34,6 @@ Session.vim
 # Local notes (DEV.md, RD.md)
 /notes/
 /plans/
+
+# Benchmark data
+/tmp/

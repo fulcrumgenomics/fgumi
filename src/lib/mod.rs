@@ -149,6 +149,7 @@ pub use fgumi_metrics::rejection;
 pub mod reorder_buffer;
 pub mod sam;
 pub mod sort;
+pub mod system;
 pub mod tag_reversal;
 pub mod template;
 pub mod umi;

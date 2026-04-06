@@ -20,11 +20,13 @@
 use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
 use crate::sort::inline_buffer::{RecordBuffer, TemplateKey, TemplateRecordBuffer};
-use crate::sort::keys::{QuerynameComparator, SortOrder};
-use crate::sort::read_ahead::RawReadAheadReader;
+use crate::sort::keys::{QuerynameComparator, RawSortKey, SortOrder};
+use crate::sort::pooled_chunk_writer::PooledChunkWriter;
+use crate::sort::read_ahead::{RawReadAheadReader, RecordSource};
+use crate::sort::worker_pool::SortWorkerPool;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use log::info;
+use log::{debug, info};
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles_bgzf::io::{
@@ -37,7 +39,160 @@ use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+// ============================================================================
+// Per-Phase Timing for Sort Pipeline
+// ============================================================================
+
+/// Tracks wall-clock time spent in each phase of the sort pipeline.
+///
+/// Used to identify bottlenecks and validate thread architecture changes.
+/// All times are cumulative (multiple spill cycles accumulate).
+#[derive(Debug, Default)]
+struct SortPhaseTimer {
+    /// Time reading records from input BAM (includes BGZF decompression).
+    read_secs: f64,
+    /// Time sorting in-memory buffers (rayon parallel sort or single-threaded).
+    sort_secs: f64,
+    /// Time writing sorted chunks to temp files (BGZF compression).
+    spill_write_secs: f64,
+    /// Time consolidating temp files when limit exceeded.
+    consolidate_secs: f64,
+    /// Time in the final k-way merge phase (includes reader decompression + writer compression).
+    merge_secs: f64,
+    /// Time writing in-memory-only output (no merge needed).
+    write_output_secs: f64,
+    /// Number of spill cycles (sort + write).
+    spill_count: usize,
+    /// Number of consolidation merges.
+    consolidate_count: usize,
+    /// Total bytes written to spill files.
+    total_spill_bytes: u64,
+    /// Wall-clock start of the entire sort operation.
+    overall_start: Option<Instant>,
+    /// Tracks the start of the current read span (between spills).
+    read_span_start: Option<Instant>,
+}
+
+impl SortPhaseTimer {
+    fn new() -> Self {
+        Self {
+            overall_start: Some(Instant::now()),
+            read_span_start: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    /// End a read span (call before sort/spill). Returns elapsed read time.
+    fn end_read_span(&mut self) -> Duration {
+        if let Some(start) = self.read_span_start.take() {
+            let elapsed = start.elapsed();
+            self.read_secs += elapsed.as_secs_f64();
+            elapsed
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Start a new read span (call after spill write completes).
+    fn begin_read_span(&mut self) {
+        self.read_span_start = Some(Instant::now());
+    }
+
+    /// Time a sort operation.
+    fn time_sort(&mut self, f: impl FnOnce()) {
+        let start = Instant::now();
+        f();
+        self.sort_secs += start.elapsed().as_secs_f64();
+    }
+
+    /// Time a spill write operation.
+    fn time_spill_write<T>(&mut self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let start = Instant::now();
+        let result = f();
+        self.spill_write_secs += start.elapsed().as_secs_f64();
+        self.spill_count += 1;
+        result
+    }
+
+    /// Record the size of a spill file.
+    fn record_spill_size(&mut self, path: &Path) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            self.total_spill_bytes += meta.len();
+        }
+    }
+
+    /// Time a consolidation operation.
+    fn time_consolidate(&mut self, f: impl FnOnce() -> Result<()>) -> Result<()> {
+        let start = Instant::now();
+        let result = f();
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed > 0.001 {
+            // Only count if consolidation actually happened
+            self.consolidate_secs += elapsed;
+            self.consolidate_count += 1;
+        }
+        result
+    }
+
+    /// Time the merge phase.
+    fn time_merge<T>(&mut self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let start = Instant::now();
+        let result = f();
+        self.merge_secs += start.elapsed().as_secs_f64();
+        result
+    }
+
+    /// Time writing in-memory-only output (no merge needed).
+    fn time_write_output(&mut self, f: impl FnOnce() -> Result<()>) -> Result<()> {
+        let start = Instant::now();
+        let result = f();
+        self.write_output_secs += start.elapsed().as_secs_f64();
+        result
+    }
+
+    /// Log the final summary.
+    #[allow(clippy::cast_precision_loss)]
+    fn log_summary(&self, threads: usize) {
+        let overall = self.overall_start.map_or(0.0, |s| s.elapsed().as_secs_f64());
+        let read_pct = 100.0 * self.read_secs / overall;
+        let sort_pct = 100.0 * self.sort_secs / overall;
+        let spill_pct = 100.0 * self.spill_write_secs / overall;
+        let spill_count = self.spill_count;
+        let read_secs = self.read_secs;
+        let sort_secs = self.sort_secs;
+        let spill_secs = self.spill_write_secs;
+
+        info!("=== Sort Phase Timing ===");
+        info!("  Read + decompress: {read_secs:.1}s ({read_pct:.0}%)");
+        info!("  In-memory sort:    {sort_secs:.1}s ({sort_pct:.0}%) [{spill_count} spills]");
+        let spill_mb = self.total_spill_bytes as f64 / (1024.0 * 1024.0);
+        info!(
+            "  Spill write:       {spill_secs:.1}s ({spill_pct:.0}%) [{spill_count} writes, {spill_mb:.1} MB total]"
+        );
+        if self.consolidate_count > 0 {
+            let cons_secs = self.consolidate_secs;
+            let cons_pct = 100.0 * cons_secs / overall;
+            let cons_count = self.consolidate_count;
+            info!("  Consolidation:     {cons_secs:.1}s ({cons_pct:.0}%) [{cons_count} merges]");
+        }
+        if self.merge_secs > 0.0 {
+            let merge_secs = self.merge_secs;
+            let merge_pct = 100.0 * merge_secs / overall;
+            info!("  K-way merge:       {merge_secs:.1}s ({merge_pct:.0}%)");
+        }
+        if self.write_output_secs > 0.0 {
+            let write_secs = self.write_output_secs;
+            let write_pct = 100.0 * write_secs / overall;
+            info!("  Write output:      {write_secs:.1}s ({write_pct:.0}%)");
+        }
+        info!("  Total wall clock:  {overall:.1}s");
+        info!("  Threads: {threads}");
+        info!("=========================");
+    }
+}
 
 // ============================================================================
 // Library Lookup for Template-Coordinate Sort
@@ -177,7 +332,6 @@ pub(crate) fn make_reader_semaphore(threads: usize) -> Arc<ChunkReaderSemaphore>
 // Stores pre-computed sort keys alongside each record for O(1) merge comparisons.
 // Format: [key: serialized][len: 4 bytes][record: len bytes] per record
 
-use crate::sort::keys::RawSortKey;
 use std::marker::PhantomData;
 
 /// Wrapper for temp chunk writers supporting both raw and compressed output.
@@ -409,6 +563,10 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
         Ok(Self { receiver: rx, buf_return: buf_tx, _handle: handle })
     }
 
+    /// Open a keyed chunk file with pool-based BGZF decompression.
+    ///
+    /// Instead of decompressing BGZF blocks on the reader thread, raw blocks are
+    /// submitted to the shared `SortWorkerPool` for decompression. This matches
     /// Read records from a reader and send them through the channel.
     ///
     /// When a semaphore is provided, reads records in batches of 64: acquires
@@ -562,16 +720,25 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 
 /// Source for keyed chunks during merge (disk or in-memory).
 enum ChunkSource<K: RawSortKey + Default + 'static> {
-    /// Disk-based chunk with prefetching reader.
+    /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
     Disk(GenericKeyedChunkReader<K>),
     /// In-memory sorted records.
     Memory { records: Vec<(K, Vec<u8>)>, idx: usize },
+    /// Pool-integrated disk source — workers read and decompress, main thread parses.
+    /// The `source_id` maps to the `MainThreadChunkConsumer`'s per-source buffer.
+    PoolDisk { source_id: usize },
 }
 
 impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
     /// Fill `buf` with the next record's bytes and return the sort key,
     /// or `None` at EOF.
-    fn next_record(&mut self, buf: &mut Vec<u8>) -> Result<Option<K>> {
+    ///
+    /// For `PoolDisk` sources, `consumer` must be `Some`.
+    fn next_record(
+        &mut self,
+        buf: &mut Vec<u8>,
+        consumer: Option<&mut MainThreadChunkConsumer<K>>,
+    ) -> Result<Option<K>> {
         match self {
             ChunkSource::Disk(reader) => reader.next_record(buf),
             ChunkSource::Memory { records, idx } => {
@@ -585,6 +752,366 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
                     Ok(None)
                 }
             }
+            ChunkSource::PoolDisk { source_id } => consumer
+                .expect("PoolDisk source requires MainThreadChunkConsumer")
+                .next_record(*source_id, buf),
+        }
+    }
+}
+
+// ============================================================================
+// MainThreadChunkConsumer — pool-integrated merge reader (replaces GenericKeyedChunkReader)
+// ============================================================================
+
+/// Per-source buffer for reassembling decompressed blocks into a record stream.
+struct PerSourceBuffer {
+    /// Pending decompressed blocks waiting for consumption, keyed by serial.
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// Next serial number to consume from this source.
+    next_serial: u64,
+    /// Current byte buffer being consumed by the record parser.
+    current_buf: Vec<u8>,
+    /// Read position within `current_buf`.
+    current_pos: usize,
+    /// Whether this source has seen all its decompressed blocks.
+    eof: bool,
+}
+
+impl PerSourceBuffer {
+    fn new() -> Self {
+        Self {
+            pending: std::collections::BTreeMap::new(),
+            next_serial: 0,
+            current_buf: Vec::new(),
+            current_pos: 0,
+            eof: false,
+        }
+    }
+
+    /// Return how many bytes remain in the current buffer.
+    fn remaining(&self) -> usize {
+        self.current_buf.len() - self.current_pos
+    }
+
+    /// Advance to the next pending block if the current one is exhausted.
+    /// Returns true if data is now available.
+    fn advance_if_needed(&mut self) -> bool {
+        if self.remaining() > 0 {
+            return true;
+        }
+        if let Some(data) = self.pending.remove(&self.next_serial) {
+            self.current_buf = data;
+            self.current_pos = 0;
+            self.next_serial += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Reads from the pool's `decompressed_chunks` queue and presents records to the merge loop.
+///
+/// Replaces `GenericKeyedChunkReader` for the pool-integrated path. No threads are spawned —
+/// the main thread drives all consumption. Workers in the pool do all the reading and
+/// decompression.
+///
+/// # Type Parameter
+///
+/// `K` is the sort key type (`RawCoordinateKey`, `TemplateKey`, etc.).
+pub struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
+    /// Per-source reorder/parse buffers.
+    per_source: Vec<PerSourceBuffer>,
+    /// `ArrayQueue` to pop decompressed blocks from pool workers.
+    decompressed_chunks: std::sync::Arc<
+        crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedDecompressedBlock>,
+    >,
+    /// Raw (pre-decompression) chunk blocks in flight.
+    ///
+    /// `all_chunks_eof` is set when raw reads from disk finish, but blocks may still
+    /// be in this queue awaiting decompression. The EOF check in `poll_decompressed_blocks`
+    /// must wait for this queue to drain to avoid declaring EOF prematurely and losing data.
+    raw_chunk_blocks:
+        std::sync::Arc<crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedRawBlock>>,
+    /// Shared flag: set when all chunk files have been fully read from disk.
+    ///
+    /// Note: this is set when raw reads finish, not when decompression is done.
+    /// Always check `raw_chunk_blocks.is_empty()` alongside this before declaring EOF.
+    all_chunks_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Maximum total pending blocks across all per-source buffers before we stop draining.
+    ///
+    /// Caps memory growth: without this, `poll_decompressed_blocks` could drain the entire
+    /// `decompressed_chunks` queue into unbounded per-source `pending` maps, bypassing the
+    /// backpressure the `ArrayQueue` was meant to provide.
+    max_pending_blocks: usize,
+    _phantom: std::marker::PhantomData<K>,
+}
+
+impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
+    /// Create a new consumer for the given number of sources.
+    #[must_use]
+    pub fn new(
+        num_sources: usize,
+        decompressed_chunks: std::sync::Arc<
+            crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedDecompressedBlock>,
+        >,
+        raw_chunk_blocks: std::sync::Arc<
+            crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedRawBlock>,
+        >,
+        all_chunks_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let per_source = (0..num_sources).map(|_| PerSourceBuffer::new()).collect();
+        // Default cap: queue capacity (num_workers * 8); keeps total pending ≤ 2× queue depth.
+        let max_pending_blocks = decompressed_chunks.capacity();
+        Self {
+            per_source,
+            decompressed_chunks,
+            raw_chunk_blocks,
+            all_chunks_eof,
+            max_pending_blocks,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Get the next record from a specific source.
+    ///
+    /// Polls the `decompressed_chunks` queue as needed, dispatching blocks to their
+    /// correct per-source buffer. Parses the next record from the source's byte stream.
+    ///
+    /// Returns `Ok(Some(key))` with record bytes swapped into `buf`, `Ok(None)` at EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a record is truncated or if reading from the source fails.
+    pub fn next_record(&mut self, source_id: usize, buf: &mut Vec<u8>) -> Result<Option<K>> {
+        loop {
+            let source = &mut self.per_source[source_id];
+
+            // Try to advance to next block if current is exhausted
+            source.advance_if_needed();
+
+            // Try to parse a record from the current data
+            if source.remaining() > 0 {
+                return self.parse_next_record(source_id, buf);
+            }
+
+            // If this source is at EOF and no pending blocks, it's done
+            if source.eof && source.pending.is_empty() {
+                return Ok(None);
+            }
+
+            // Need more data — poll the shared queue and dispatch
+            if !self.poll_decompressed_blocks(source_id)? {
+                // Queue closed and no more data for this source
+                self.per_source[source_id].eof = true;
+                if self.per_source[source_id].pending.is_empty()
+                    && self.per_source[source_id].remaining() == 0
+                {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Poll the `decompressed_chunks` `ArrayQueue`, dispatching blocks to per-source buffers.
+    ///
+    /// Drains all available blocks into per-source buffers, then checks if the
+    /// target source has data. If not, parks the thread until a worker calls
+    /// `unpark()` after pushing new data.
+    ///
+    /// Returns `false` if all chunks are done (no more blocks coming).
+    fn poll_decompressed_blocks(&mut self, target_source: usize) -> Result<bool> {
+        loop {
+            // Drain available blocks into per-source buffers, respecting the pending cap.
+            // Without this cap, we could drain the entire decompressed_chunks ArrayQueue
+            // into unbounded per-source maps, bypassing the backpressure the queue provides.
+            let pending_total: usize = self.per_source.iter().map(|s| s.pending.len()).sum();
+            if pending_total < self.max_pending_blocks {
+                while let Some(block) = self.decompressed_chunks.pop() {
+                    let sid = block.source_id;
+                    let source = &mut self.per_source[sid];
+                    if block.serial == source.next_serial && source.remaining() == 0 {
+                        // Immediately consumable — install as current_buf (not pending)
+                        source.current_buf = block.data;
+                        source.current_pos = 0;
+                        source.next_serial += 1;
+                    } else {
+                        source.pending.insert(block.serial, block.data);
+                    }
+                    // Re-check cap after each block to avoid overshooting
+                    let new_total: usize = self.per_source.iter().map(|s| s.pending.len()).sum();
+                    if new_total >= self.max_pending_blocks {
+                        break;
+                    }
+                }
+            }
+
+            // Check if the target source now has data
+            let target = &self.per_source[target_source];
+            if target.remaining() > 0 || target.pending.contains_key(&target.next_serial) {
+                return Ok(true);
+            }
+
+            // Check EOF: all raw blocks must be read AND decompressed before declaring done.
+            // `all_chunks_eof` is set when raw disk reads finish, but blocks may still be
+            // in `raw_chunk_blocks` awaiting decompression. Checking only `decompressed_chunks`
+            // would race with the decompression workers and lose in-flight records.
+            if self.all_chunks_eof.load(std::sync::atomic::Ordering::Acquire)
+                && self.raw_chunk_blocks.is_empty()
+                && self.decompressed_chunks.is_empty()
+            {
+                for source in &mut self.per_source {
+                    source.eof = true;
+                }
+                return Ok(false);
+            }
+
+            // Park until a worker pushes a block and calls unpark()
+            std::thread::park();
+        }
+    }
+
+    /// Parse the next record from a source's byte stream.
+    ///
+    /// Handles the format: for `EMBEDDED_IN_RECORD` keys, reads [len(4)][record(len)].
+    /// For keyed format, reads [key][len(4)][record(len)].
+    fn parse_next_record(&mut self, source_id: usize, buf: &mut Vec<u8>) -> Result<Option<K>> {
+        let mut len_buf = [0u8; 4];
+
+        if K::EMBEDDED_IN_RECORD {
+            if !self.read_exact_from_source(source_id, &mut len_buf)? {
+                return Ok(None);
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            buf.clear();
+            buf.resize(len, 0);
+            if !self.read_exact_from_source(source_id, buf)? {
+                return Err(anyhow::anyhow!("truncated record in chunk source {source_id}"));
+            }
+            let key = K::extract_from_record(buf);
+            Ok(Some(key))
+        } else {
+            let Some(key) = self.read_key_from_source::<K>(source_id)? else {
+                return Ok(None);
+            };
+
+            if !self.read_exact_from_source(source_id, &mut len_buf)? {
+                return Err(anyhow::anyhow!("truncated record length in chunk source {source_id}"));
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            buf.clear();
+            buf.resize(len, 0);
+            if !self.read_exact_from_source(source_id, buf)? {
+                return Err(anyhow::anyhow!("truncated record in chunk source {source_id}"));
+            }
+            Ok(Some(key))
+        }
+    }
+
+    /// Read exactly `n` bytes from a source into `out`, pulling more blocks as needed.
+    ///
+    /// Returns `Ok(false)` at clean EOF (zero bytes available), `Ok(true)` on success.
+    fn read_exact_from_source(&mut self, source_id: usize, out: &mut [u8]) -> Result<bool> {
+        let n = out.len();
+        let mut filled = 0;
+
+        while filled < n {
+            let source = &mut self.per_source[source_id];
+            source.advance_if_needed();
+
+            if source.remaining() > 0 {
+                let take = (n - filled).min(source.remaining());
+                out[filled..filled + take].copy_from_slice(
+                    &source.current_buf[source.current_pos..source.current_pos + take],
+                );
+                source.current_pos += take;
+                filled += take;
+            } else if source.eof && source.pending.is_empty() {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(anyhow::anyhow!(
+                    "truncated data in chunk source {source_id}: got {filled} of {n} bytes",
+                ));
+            } else if !self.poll_decompressed_blocks(source_id)? {
+                self.per_source[source_id].eof = true;
+                self.per_source[source_id].advance_if_needed();
+                if self.per_source[source_id].remaining() == 0 {
+                    if filled == 0 {
+                        return Ok(false);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "truncated data in chunk source {source_id}: got {filled} of {n} bytes",
+                    ));
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Read a sort key from a source's byte stream.
+    ///
+    /// Returns `Ok(None)` at clean EOF.
+    fn read_key_from_source<KK: RawSortKey>(&mut self, source_id: usize) -> Result<Option<KK>> {
+        // Create a Read adapter over the source's buffer
+        let mut adapter = SourceReadAdapter { consumer: self, source_id };
+        match KK::read_from(&mut adapter) {
+            Ok(key) => Ok(Some(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("error reading key from source {source_id}: {e}")),
+        }
+    }
+}
+
+/// Adapter that implements `std::io::Read` over a `MainThreadChunkConsumer` source.
+///
+/// This allows `K::read_from(&mut reader)` to read from the pool-based byte stream.
+struct SourceReadAdapter<'a, K: RawSortKey + 'static> {
+    consumer: &'a mut MainThreadChunkConsumer<K>,
+    source_id: usize,
+}
+
+impl<K: RawSortKey + 'static> Read for SourceReadAdapter<'_, K> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let source = &mut self.consumer.per_source[self.source_id];
+
+        // Try current buffer first
+        source.advance_if_needed();
+        if source.remaining() > 0 {
+            let take = buf.len().min(source.remaining());
+            buf[..take].copy_from_slice(
+                &source.current_buf[source.current_pos..source.current_pos + take],
+            );
+            source.current_pos += take;
+            return Ok(take);
+        }
+
+        // Need more blocks
+        if source.eof && source.pending.is_empty() {
+            return Ok(0); // EOF
+        }
+
+        // Poll for more data (blocking)
+        match self.consumer.poll_decompressed_blocks(self.source_id) {
+            Ok(true) => {
+                let source = &mut self.consumer.per_source[self.source_id];
+                source.advance_if_needed();
+                if source.remaining() > 0 {
+                    let take = buf.len().min(source.remaining());
+                    buf[..take].copy_from_slice(
+                        &source.current_buf[source.current_pos..source.current_pos + take],
+                    );
+                    source.current_pos += take;
+                    Ok(take)
+                } else {
+                    Ok(0)
+                }
+            }
+            Ok(false) => Ok(0), // Channel closed
+            Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
 }
@@ -618,6 +1145,16 @@ impl<'a> ChunkNamer<'a> {
         self.merge_count += 1;
         path
     }
+}
+
+/// A spill write that is finishing in the background.
+///
+/// Used for pipelining: the I/O thread continues writing while the main thread
+/// reads the next batch. The chunk path is stored alongside the handle so it
+/// can be pushed to `chunk_files` only after the write completes.
+struct PendingSpill {
+    handle: crate::sort::pooled_chunk_writer::SpillWriteHandle,
+    chunk_path: PathBuf,
 }
 
 /// Raw-bytes external sorter for BAM files.
@@ -778,6 +1315,7 @@ impl RawExternalSorter {
         &self,
         chunk_files: &mut Vec<PathBuf>,
         namer: &mut ChunkNamer<'_>,
+        pool: &Arc<SortWorkerPool>,
     ) -> Result<()> {
         use crate::sort::loser_tree::LoserTree;
 
@@ -803,19 +1341,15 @@ impl RawExternalSorter {
         // Create merged output file
         let merged_path = namer.next_merged_path();
 
-        // Open readers with semaphore to cap concurrent I/O
+        // Open readers with semaphore to cap concurrent I/O.
         let sem = make_reader_semaphore(self.threads);
         let mut readers: Vec<GenericKeyedChunkReader<K>> = files_to_merge
             .iter()
             .map(|p| GenericKeyedChunkReader::<K>::open(p, Some(Arc::clone(&sem))))
             .collect::<Result<Vec<_>>>()?;
 
-        // Create writer for merged output
-        let mut writer = GenericKeyedChunkWriter::<K>::create(
-            &merged_path,
-            self.temp_compression,
-            self.threads,
-        )?;
+        // Use pooled writer for parallel compression during consolidation.
+        let mut writer = PooledChunkWriter::<K>::new(Arc::clone(pool), &merged_path)?;
 
         // Initialize loser tree with first record from each reader
         let mut initial_keys: Vec<K> = Vec::with_capacity(readers.len());
@@ -882,8 +1416,22 @@ impl RawExternalSorter {
         info!("Memory limit: {} MB", self.memory_limit / (1024 * 1024));
         info!("Threads: {}", self.threads);
 
-        // Open input BAM with lazy record reading
-        let (reader, header) = create_raw_bam_reader(input, self.threads)?;
+        // Shared worker pool for parallel BGZF compress/decompress across all phases
+        let pool = Arc::new(SortWorkerPool::new(
+            self.threads.max(1),
+            self.temp_compression,
+            self.output_compression,
+        ));
+
+        // Open input BAM and create record source
+        // N+2 model: workers do ReadInputBlocks + DecompressInput,
+        // main thread reads records directly from PooledInputStream.
+        info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
+        let (record_source, header) = {
+            let (reader, header) =
+                crate::bam_io::create_raw_bam_reader_pool_integrated(input, &pool)?;
+            (RecordSource::direct(reader), header)
+        };
 
         // Add @PG record if pg_info was provided
         let header = if let Some((ref version, ref command_line)) = self.pg_info {
@@ -898,12 +1446,14 @@ impl RawExternalSorter {
 
         // Sort based on order
         match self.sort_order {
-            SortOrder::Coordinate => self.sort_coordinate(reader, &header, output, temp_path),
+            SortOrder::Coordinate => {
+                self.sort_coordinate(record_source, pool, &header, output, temp_path)
+            }
             SortOrder::Queryname(comparator) => {
-                self.sort_queryname(reader, &header, output, temp_path, comparator)
+                self.sort_queryname(record_source, pool, &header, output, temp_path, comparator)
             }
             SortOrder::TemplateCoordinate => {
-                self.sort_template_coordinate(reader, &header, output, temp_path)
+                self.sort_template_coordinate(record_source, pool, &header, output, temp_path)
             }
         }
     }
@@ -1051,15 +1601,16 @@ impl RawExternalSorter {
     /// Sort by coordinate order using optimized radix sort for large arrays.
     fn sort_coordinate(
         &self,
-        reader: crate::bam_io::RawBamReaderAuto,
+        record_source: RecordSource,
+        pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
         temp_path: &Path,
     ) -> Result<RawSortStats> {
         if self.write_index {
-            self.sort_coordinate_with_index(reader, header, output, temp_path)
+            self.sort_coordinate_with_index(record_source, pool, header, output, temp_path)
         } else {
-            self.sort_coordinate_optimized(reader, header, output, temp_path)
+            self.sort_coordinate_optimized(record_source, pool, header, output, temp_path)
         }
     }
 
@@ -1067,10 +1618,11 @@ impl RawExternalSorter {
     ///
     /// Uses `RecordBuffer` which stores records in a single contiguous allocation
     /// with pre-computed sort keys, eliminating per-record heap allocations.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn sort_coordinate_optimized(
         &self,
-        reader: crate::bam_io::RawBamReaderAuto,
+        mut record_source: RecordSource,
+        pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -1078,6 +1630,7 @@ impl RawExternalSorter {
         use crate::sort::keys::RawCoordinateKey;
 
         let mut stats = RawSortStats::default();
+        let mut timer = SortPhaseTimer::new();
 
         // Get number of references (unmapped reads map to nref)
         let nref = header.reference_sequences().len() as u32;
@@ -1093,13 +1646,12 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
-
-        let read_ahead = RawReadAheadReader::new(reader);
+        let mut pending_spill: Option<PendingSpill> = None;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
 
-        for record in read_ahead {
+        for record in record_source.by_ref() {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
@@ -1108,72 +1660,98 @@ impl RawExternalSorter {
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
+                timer.end_read_span();
+
+                // Wait for any previous spill to complete before starting a new one
+                if let Some(prev) = pending_spill.take() {
+                    prev.handle.wait()?;
+                    timer.record_spill_size(&prev.chunk_path);
+                    chunk_files.push(prev.chunk_path);
+                    stats.chunks_written += 1;
+
+                    timer.time_consolidate(|| {
+                        self.maybe_consolidate_temp_files::<RawCoordinateKey>(
+                            &mut chunk_files,
+                            &mut namer,
+                            &pool,
+                        )
+                    })?;
+                }
+
                 let chunk_path = namer.next_chunk_path();
 
-                // Sort in place using parallel sort for large buffers
-                if self.threads > 1 {
-                    buffer.par_sort();
-                } else {
+                timer.time_sort(|| {
                     buffer.sort();
-                }
+                });
 
-                // Write keyed temp file (stores sort key with each record for O(1) merge)
-                let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(
-                    &chunk_path,
-                    self.temp_compression,
-                    self.threads,
-                )?;
-                for r in buffer.refs() {
-                    let key = RawCoordinateKey { sort_key: r.sort_key };
-                    let record_bytes = buffer.get_record(r);
-                    writer.write_record(&key, record_bytes)?;
-                }
-                writer.finish()?;
+                // Write keyed temp file with parallel BGZF compression via worker pool.
+                // Use start_finish() for pipelining: I/O continues in background
+                // while we read the next batch.
+                let handle = timer.time_spill_write(|| {
+                    let mut writer =
+                        PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &chunk_path)?;
+                    for r in buffer.refs() {
+                        let key = RawCoordinateKey { sort_key: r.sort_key };
+                        let record_bytes = buffer.get_record(r);
+                        writer.write_record(&key, record_bytes)?;
+                    }
+                    writer.start_finish()
+                })?;
 
-                stats.chunks_written += 1;
-                chunk_files.push(chunk_path);
-
-                // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<RawCoordinateKey>(
-                    &mut chunk_files,
-                    &mut namer,
-                )?;
+                pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 buffer.clear();
+                timer.begin_read_span();
             }
         }
 
+        timer.end_read_span();
         progress.log_final();
+        if let Some(err) = record_source.take_error() {
+            return Err(anyhow::Error::from(err));
+        }
+
+        // Drain any pending spill before merge
+        if let Some(prev) = pending_spill.take() {
+            prev.handle.wait()?;
+            timer.record_spill_size(&prev.chunk_path);
+            chunk_files.push(prev.chunk_path);
+            stats.chunks_written += 1;
+
+            timer.time_consolidate(|| {
+                self.maybe_consolidate_temp_files::<RawCoordinateKey>(
+                    &mut chunk_files,
+                    &mut namer,
+                    &pool,
+                )
+            })?;
+        }
 
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
             info!("All records fit in memory, performing in-memory sort");
 
-            if self.threads > 1 {
-                buffer.par_sort();
-            } else {
+            timer.time_sort(|| {
                 buffer.sort();
-            }
+            });
 
-            let output_header = self.create_output_header(header);
-            let mut writer = crate::bam_io::create_raw_bam_writer(
-                output,
-                &output_header,
-                self.threads,
-                self.output_compression,
-            )?;
+            timer.time_write_output(|| {
+                use crate::sort::pooled_bam_writer::PooledBamWriter;
+                let output_header = self.create_output_header(header);
+                let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
-            for record_bytes in buffer.iter_sorted() {
-                writer.write_raw_record(record_bytes)?;
-            }
-            writer.finish()?;
+                for record_bytes in buffer.iter_sorted() {
+                    writer.write_raw_record(record_bytes)?;
+                }
+                writer.finish()?;
+                Ok(())
+            })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
+            let sort_start = Instant::now();
             let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
-                buffer.par_sort_into_chunks(self.threads)
             } else {
                 buffer.sort();
                 let chunk = buffer
@@ -1186,6 +1764,7 @@ impl RawExternalSorter {
                     .collect();
                 vec![chunk]
             };
+            timer.sort_secs += sort_start.elapsed().as_secs_f64();
 
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
@@ -1194,16 +1773,23 @@ impl RawExternalSorter {
             );
 
             // Merge disk chunks + in-memory chunks using O(1) key comparisons
-            self.merge_chunks_generic::<RawCoordinateKey>(
-                &chunk_files,
-                memory_chunks,
-                header,
-                output,
-                stats.total_records,
-            )?;
+            timer.time_merge(|| {
+                self.merge_chunks_generic::<RawCoordinateKey>(
+                    &chunk_files,
+                    memory_chunks,
+                    header,
+                    output,
+                    stats.total_records,
+                    &pool,
+                )
+            })?;
         }
 
         stats.output_records = stats.total_records;
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+        timer.log_summary(self.threads);
         info!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -1217,7 +1803,8 @@ impl RawExternalSorter {
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn sort_coordinate_with_index(
         &self,
-        reader: crate::bam_io::RawBamReaderAuto,
+        mut record_source: RecordSource,
+        pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -1228,6 +1815,8 @@ impl RawExternalSorter {
         info!("Indexing enabled: will write BAM index alongside output");
 
         let mut stats = RawSortStats::default();
+        let mut timer = SortPhaseTimer::new();
+
         let nref = header.reference_sequences().len() as u32;
         let init_cap = self.effective_initial_capacity();
         // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
@@ -1237,49 +1826,78 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
-        let read_ahead = RawReadAheadReader::new(reader);
+        let mut pending_spill: Option<PendingSpill> = None;
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
 
-        for record in read_ahead {
+        for record in record_source.by_ref() {
             stats.total_records += 1;
             buffer.push_coordinate(record.as_ref())?;
 
             if buffer.memory_usage() >= self.memory_limit {
+                timer.end_read_span();
+
+                // Wait for any previous spill to complete
+                if let Some(prev) = pending_spill.take() {
+                    prev.handle.wait()?;
+                    timer.record_spill_size(&prev.chunk_path);
+                    chunk_files.push(prev.chunk_path);
+                    stats.chunks_written += 1;
+
+                    timer.time_consolidate(|| {
+                        self.maybe_consolidate_temp_files::<RawCoordinateKey>(
+                            &mut chunk_files,
+                            &mut namer,
+                            &pool,
+                        )
+                    })?;
+                }
+
                 let chunk_path = namer.next_chunk_path();
 
-                if self.threads > 1 {
-                    buffer.par_sort();
-                } else {
+                timer.time_sort(|| {
                     buffer.sort();
-                }
+                });
 
-                let mut writer = GenericKeyedChunkWriter::<RawCoordinateKey>::create(
-                    &chunk_path,
-                    self.temp_compression,
-                    self.threads,
-                )?;
-                for r in buffer.refs() {
-                    let key = RawCoordinateKey { sort_key: r.sort_key };
-                    let record_bytes = buffer.get_record(r);
-                    writer.write_record(&key, record_bytes)?;
-                }
-                writer.finish()?;
+                let handle = timer.time_spill_write(|| {
+                    let mut writer =
+                        PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &chunk_path)?;
+                    for r in buffer.refs() {
+                        let key = RawCoordinateKey { sort_key: r.sort_key };
+                        let record_bytes = buffer.get_record(r);
+                        writer.write_record(&key, record_bytes)?;
+                    }
+                    writer.start_finish()
+                })?;
 
-                stats.chunks_written += 1;
-                chunk_files.push(chunk_path);
-
-                // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<RawCoordinateKey>(
-                    &mut chunk_files,
-                    &mut namer,
-                )?;
+                pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 buffer.clear();
+                timer.begin_read_span();
             }
         }
 
+        timer.end_read_span();
         info!("Read {} records total", stats.total_records);
+        if let Some(err) = record_source.take_error() {
+            return Err(anyhow::Error::from(err));
+        }
+
+        // Drain any pending spill before merge
+        if let Some(prev) = pending_spill.take() {
+            prev.handle.wait()?;
+            timer.record_spill_size(&prev.chunk_path);
+            chunk_files.push(prev.chunk_path);
+            stats.chunks_written += 1;
+
+            timer.time_consolidate(|| {
+                self.maybe_consolidate_temp_files::<RawCoordinateKey>(
+                    &mut chunk_files,
+                    &mut namer,
+                    &pool,
+                )
+            })?;
+        }
 
         let output_header = self.create_output_header(header);
 
@@ -1287,37 +1905,34 @@ impl RawExternalSorter {
             // All records fit in memory - no merge needed
             info!("All records fit in memory, performing in-memory sort");
 
-            if self.threads > 1 {
-                buffer.par_sort();
-            } else {
+            timer.time_sort(|| {
                 buffer.sort();
-            }
+            });
 
-            // Use IndexingBamWriter for single-pass index generation
-            let mut writer = create_indexing_bam_writer(
-                output,
-                &output_header,
-                self.output_compression,
-                self.threads,
-            )?;
+            timer.time_write_output(|| {
+                let mut writer = create_indexing_bam_writer(
+                    output,
+                    &output_header,
+                    self.output_compression,
+                    self.threads,
+                )?;
 
-            for record_bytes in buffer.iter_sorted() {
-                writer.write_raw_record(record_bytes)?;
-            }
+                for record_bytes in buffer.iter_sorted() {
+                    writer.write_raw_record(record_bytes)?;
+                }
 
-            let index = writer.finish()?;
+                let index = writer.finish()?;
 
-            // Write the index file
-            let index_path = output.with_extension("bam.bai");
-            write_bai_index(&index_path, &index)?;
-            info!("Wrote BAM index: {}", index_path.display());
+                let index_path = output.with_extension("bam.bai");
+                write_bai_index(&index_path, &index)?;
+                info!("Wrote BAM index: {}", index_path.display());
+                Ok(())
+            })?;
         } else {
-            // Sort remaining records into separate sub-array chunks (avoids
-            // intermediate merge back into a single sorted buffer)
+            // Sort remaining records into separate sub-array chunks
+            let sort_start = Instant::now();
             let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
-                buffer.par_sort_into_chunks(self.threads)
             } else {
                 buffer.sort();
                 let chunk = buffer
@@ -1330,6 +1945,7 @@ impl RawExternalSorter {
                     .collect();
                 vec![chunk]
             };
+            timer.sort_secs += sort_start.elapsed().as_secs_f64();
 
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
@@ -1337,22 +1953,28 @@ impl RawExternalSorter {
                 chunk_files.len() + n_memory
             );
 
-            // Merge with index generation
-            let index = self.merge_chunks_with_index::<RawCoordinateKey>(
-                &chunk_files,
-                memory_chunks,
-                header,
-                output,
-                stats.total_records,
-            )?;
+            timer.time_merge(|| {
+                let index = self.merge_chunks_with_index::<RawCoordinateKey>(
+                    &chunk_files,
+                    memory_chunks,
+                    header,
+                    output,
+                    stats.total_records,
+                    &pool,
+                )?;
 
-            // Write the index file
-            let index_path = output.with_extension("bam.bai");
-            write_bai_index(&index_path, &index)?;
-            info!("Wrote BAM index: {}", index_path.display());
+                let index_path = output.with_extension("bam.bai");
+                write_bai_index(&index_path, &index)?;
+                info!("Wrote BAM index: {}", index_path.display());
+                Ok(())
+            })?;
         }
 
         stats.output_records = stats.total_records;
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+        timer.log_summary(self.threads);
         info!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -1365,7 +1987,8 @@ impl RawExternalSorter {
     /// - `Natural`: uses `RawQuerynameKey` (natural numeric comparison)
     fn sort_queryname(
         &self,
-        reader: crate::bam_io::RawBamReaderAuto,
+        record_source: RecordSource,
+        pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -1374,19 +1997,29 @@ impl RawExternalSorter {
         use crate::sort::keys::{RawQuerynameKey, RawQuerynameLexKey};
         info!("Using queryname sort with {comparator} comparator");
         match comparator {
-            QuerynameComparator::Lexicographic => {
-                self.sort_queryname_keyed::<RawQuerynameLexKey>(reader, header, output, temp_path)
-            }
-            QuerynameComparator::Natural => {
-                self.sort_queryname_keyed::<RawQuerynameKey>(reader, header, output, temp_path)
-            }
+            QuerynameComparator::Lexicographic => self.sort_queryname_keyed::<RawQuerynameLexKey>(
+                record_source,
+                pool,
+                header,
+                output,
+                temp_path,
+            ),
+            QuerynameComparator::Natural => self.sort_queryname_keyed::<RawQuerynameKey>(
+                record_source,
+                pool,
+                header,
+                output,
+                temp_path,
+            ),
         }
     }
 
     /// Generic queryname sort using a specific key type.
+    #[allow(clippy::too_many_lines)]
     fn sort_queryname_keyed<K: RawSortKey + Default + 'static>(
         &self,
-        reader: crate::bam_io::RawBamReaderAuto,
+        mut record_source: RecordSource,
+        pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
         temp_path: &Path,
@@ -1394,6 +2027,8 @@ impl RawExternalSorter {
         use crate::sort::keys::SortContext;
 
         let mut stats = RawSortStats::default();
+        let mut timer = SortPhaseTimer::new();
+
         let ctx = SortContext::from_header(header);
 
         // Estimate capacity from initial_capacity to avoid huge upfront allocations.
@@ -1404,13 +2039,12 @@ impl RawExternalSorter {
         let mut entries: Vec<(K, Vec<u8>)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
         let mut namer = ChunkNamer::new(temp_path);
-
-        let read_ahead = RawReadAheadReader::new(reader);
+        let mut pending_spill: Option<PendingSpill> = None;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (keyed output)...");
 
-        for record in read_ahead {
+        for record in record_source.by_ref() {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
@@ -1426,83 +2060,90 @@ impl RawExternalSorter {
 
             // Check if we need to spill to disk
             if memory_used >= self.memory_limit {
+                timer.end_read_span();
+
+                // Wait for any previous spill to complete
+                if let Some(prev) = pending_spill.take() {
+                    prev.handle.wait()?;
+                    timer.record_spill_size(&prev.chunk_path);
+                    chunk_files.push(prev.chunk_path);
+                    stats.chunks_written += 1;
+
+                    timer.time_consolidate(|| {
+                        self.maybe_consolidate_temp_files::<K>(&mut chunk_files, &mut namer, &pool)
+                    })?;
+                }
+
                 let chunk_path = namer.next_chunk_path();
 
-                // Sort the entries
-                if self.threads > 1 {
-                    use rayon::prelude::*;
-                    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                } else {
+                timer.time_sort(|| {
                     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                }
+                });
 
-                // Write keyed temp file
-                let mut writer = GenericKeyedChunkWriter::<K>::create(
-                    &chunk_path,
-                    self.temp_compression,
-                    self.threads,
-                )?;
-                for (key, record) in entries.drain(..) {
-                    writer.write_record(&key, &record)?;
-                }
-                writer.finish()?;
+                // Write keyed temp file with parallel BGZF compression via worker pool.
+                let handle = timer.time_spill_write(|| {
+                    let mut writer = PooledChunkWriter::<K>::new(Arc::clone(&pool), &chunk_path)?;
+                    for (key, record) in entries.drain(..) {
+                        writer.write_record(&key, &record)?;
+                    }
+                    writer.start_finish()
+                })?;
 
-                stats.chunks_written += 1;
-                chunk_files.push(chunk_path);
-
-                // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<K>(&mut chunk_files, &mut namer)?;
+                pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 memory_used = 0;
+                timer.begin_read_span();
             }
         }
 
+        timer.end_read_span();
         progress.log_final();
+        if let Some(err) = record_source.take_error() {
+            return Err(anyhow::Error::from(err));
+        }
+
+        // Drain any pending spill before merge
+        if let Some(prev) = pending_spill.take() {
+            prev.handle.wait()?;
+            timer.record_spill_size(&prev.chunk_path);
+            chunk_files.push(prev.chunk_path);
+            stats.chunks_written += 1;
+
+            timer.time_consolidate(|| {
+                self.maybe_consolidate_temp_files::<K>(&mut chunk_files, &mut namer, &pool)
+            })?;
+        }
 
         if chunk_files.is_empty() {
             // All records fit in memory
             info!("All records fit in memory, performing in-memory sort");
 
-            if self.threads > 1 {
-                use rayon::prelude::*;
-                entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            } else {
+            timer.time_sort(|| {
                 entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            }
+            });
 
-            let output_header = self.create_output_header(header);
-            let mut writer = crate::bam_io::create_raw_bam_writer(
-                output,
-                &output_header,
-                self.threads,
-                self.output_compression,
-            )?;
+            timer.time_write_output(|| {
+                use crate::sort::pooled_bam_writer::PooledBamWriter;
+                let output_header = self.create_output_header(header);
+                let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
-            for (_key, record) in entries {
-                writer.write_raw_record(&record)?;
-            }
-            writer.finish()?;
+                for (_key, record) in entries {
+                    writer.write_raw_record(&record)?;
+                }
+                writer.finish()?;
+                Ok(())
+            })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
+            let sort_start = Instant::now();
             let memory_chunks: Vec<Vec<(K, Vec<u8>)>> = if entries.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
-                use rayon::prelude::*;
-                let chunk_size = entries.len().div_ceil(self.threads.max(1));
-                entries.par_chunks_mut(chunk_size).for_each(|chunk| {
-                    chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                });
-                let mut chunks = Vec::new();
-                while !entries.is_empty() {
-                    let take = chunk_size.min(entries.len());
-                    chunks.push(entries.drain(..take).collect());
-                }
-                chunks
             } else {
                 entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 vec![entries]
             };
+            timer.sort_secs += sort_start.elapsed().as_secs_f64();
 
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
@@ -1511,16 +2152,23 @@ impl RawExternalSorter {
             );
 
             // Merge disk chunks + in-memory records using keyed comparisons
-            self.merge_chunks_generic::<K>(
-                &chunk_files,
-                memory_chunks,
-                header,
-                output,
-                stats.total_records,
-            )?;
+            timer.time_merge(|| {
+                self.merge_chunks_generic::<K>(
+                    &chunk_files,
+                    memory_chunks,
+                    header,
+                    output,
+                    stats.total_records,
+                    &pool,
+                )
+            })?;
         }
 
         stats.output_records = stats.total_records;
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+        timer.log_summary(self.threads);
         info!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
@@ -1533,14 +2181,17 @@ impl RawExternalSorter {
     ///
     /// Writes keyed temp chunks that preserve pre-computed sort keys, enabling O(1)
     /// comparisons during merge (instead of expensive CIGAR/aux parsing).
+    #[allow(clippy::too_many_lines)]
     fn sort_template_coordinate(
         &self,
-        reader: crate::bam_io::RawBamReaderAuto,
+        mut record_source: RecordSource,
+        pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
         temp_path: &Path,
     ) -> Result<RawSortStats> {
         let mut stats = RawSortStats::default();
+        let mut timer = SortPhaseTimer::new();
 
         // Build library lookup ONCE before sorting for O(1) ordinal lookups
         let lib_lookup = LibraryLookup::from_header(header);
@@ -1561,13 +2212,12 @@ impl RawExternalSorter {
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(temp_path);
-
-        let read_ahead = RawReadAheadReader::new(reader);
+        let mut pending_spill: Option<PendingSpill> = None;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer)...");
 
-        for record in read_ahead {
+        for record in record_source.by_ref() {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
@@ -1583,109 +2233,166 @@ impl RawExternalSorter {
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
+                timer.end_read_span();
+
+                // Wait for any previous spill to complete
+                if let Some(prev) = pending_spill.take() {
+                    prev.handle.wait()?;
+                    timer.record_spill_size(&prev.chunk_path);
+                    chunk_files.push(prev.chunk_path);
+                    stats.chunks_written += 1;
+
+                    timer.time_consolidate(|| {
+                        self.maybe_consolidate_temp_files::<TemplateKey>(
+                            &mut chunk_files,
+                            &mut namer,
+                            &pool,
+                        )
+                    })?;
+                }
+
                 let chunk_path = namer.next_chunk_path();
 
-                // Sort in place using parallel sort for large buffers
-                if self.threads > 1 {
-                    buffer.par_sort();
-                } else {
+                timer.time_sort(|| {
                     buffer.sort();
-                }
+                });
 
-                // Write keyed chunk preserving sort keys for O(1) merge comparisons
-                let mut keyed_writer = GenericKeyedChunkWriter::<TemplateKey>::create(
-                    &chunk_path,
-                    self.temp_compression,
-                    self.threads,
-                )?;
-                for (key, record) in buffer.iter_sorted_keyed() {
-                    keyed_writer.write_record(&key, record)?;
-                }
-                keyed_writer.finish()?;
+                // Write keyed chunk with parallel BGZF compression via worker pool.
+                let handle = timer.time_spill_write(|| {
+                    let mut writer =
+                        PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)?;
+                    for (key, record) in buffer.iter_sorted_keyed() {
+                        writer.write_record(&key, record)?;
+                    }
+                    writer.start_finish()
+                })?;
 
-                stats.chunks_written += 1;
-                chunk_files.push(chunk_path);
-
-                // Consolidate if we have too many temp files
-                self.maybe_consolidate_temp_files::<TemplateKey>(&mut chunk_files, &mut namer)?;
+                pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 buffer.clear();
+                timer.begin_read_span();
             }
         }
 
+        timer.end_read_span();
         progress.log_final();
+        if let Some(err) = record_source.take_error() {
+            return Err(anyhow::Error::from(err));
+        }
+
+        // Drain any pending spill before merge
+        if let Some(prev) = pending_spill.take() {
+            prev.handle.wait()?;
+            timer.record_spill_size(&prev.chunk_path);
+            chunk_files.push(prev.chunk_path);
+            stats.chunks_written += 1;
+
+            timer.time_consolidate(|| {
+                self.maybe_consolidate_temp_files::<TemplateKey>(
+                    &mut chunk_files,
+                    &mut namer,
+                    &pool,
+                )
+            })?;
+        }
 
         if chunk_files.is_empty() {
             // All records fit in memory
             info!("All records fit in memory, performing in-memory sort");
 
-            if self.threads > 1 {
-                buffer.par_sort();
-            } else {
+            timer.time_sort(|| {
                 buffer.sort();
-            }
+            });
 
-            let output_header = self.create_output_header(header);
-            let mut writer = crate::bam_io::create_raw_bam_writer(
-                output,
-                &output_header,
-                self.threads,
-                self.output_compression,
-            )?;
+            timer.time_write_output(|| {
+                use crate::sort::pooled_bam_writer::PooledBamWriter;
+                let output_header = self.create_output_header(header);
+                let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
 
-            for record_bytes in buffer.iter_sorted() {
-                writer.write_raw_record(record_bytes)?;
-            }
-            writer.finish()?;
+                for record_bytes in buffer.iter_sorted() {
+                    writer.write_raw_record(record_bytes)?;
+                }
+                writer.finish()?;
+                Ok(())
+            })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
+            let sort_start = Instant::now();
             let memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>> = if buffer.is_empty() {
                 Vec::new()
-            } else if self.threads > 1 {
-                buffer.par_sort_into_chunks(self.threads)
             } else {
                 buffer.sort();
                 let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
                 vec![chunk]
             };
+            timer.sort_secs += sort_start.elapsed().as_secs_f64();
 
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!("Phase 2: Merging {} chunks...", chunk_files.len() + n_memory);
 
             // Merge using O(1) key comparisons
-            self.merge_chunks_keyed(
-                &chunk_files,
-                memory_chunks,
-                header,
-                output,
-                stats.total_records,
-            )?;
+            timer.time_merge(|| {
+                self.merge_chunks_keyed(
+                    &chunk_files,
+                    memory_chunks,
+                    header,
+                    output,
+                    stats.total_records,
+                    &pool,
+                )
+            })?;
         }
 
         stats.output_records = stats.total_records;
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+        timer.log_summary(self.threads);
         info!("Sort complete: {} records processed", stats.total_records);
 
         Ok(stats)
     }
 
     /// Build chunk sources from disk files and in-memory chunks.
+    ///
+    /// When `pool_decompress` is true, disk sources become `PoolDisk` variants —
+    /// workers read and decompress in the background, main thread parses records.
+    /// No per-source threads are spawned.
+    ///
+    /// When `pool_decompress` is false, disk sources use `GenericKeyedChunkReader`
+    /// with its own per-source background thread. Used by the indexing path, which
+    /// does not yet support pool-integrated decompression.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
         memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
-        threads: usize,
+        reader_concurrency: usize,
+        pool_decompress: bool,
+        pool: &Arc<SortWorkerPool>,
     ) -> Result<Vec<ChunkSource<K>>> {
-        let sem = make_reader_semaphore(threads);
         let num_disk = chunk_files.len();
         let num_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
-
         let mut sources: Vec<ChunkSource<K>> = Vec::with_capacity(num_disk + num_memory);
 
-        for path in chunk_files {
-            sources.push(ChunkSource::Disk(GenericKeyedChunkReader::<K>::open(
-                path,
-                Some(Arc::clone(&sem)),
-            )?));
+        if pool_decompress && !chunk_files.is_empty() {
+            // Pool-integrated path: distribute files to workers, create PoolDisk sources.
+            // Files are assigned: worker i gets files i, i+N, i+2N...
+            let files_with_ids: Vec<(PathBuf, usize)> =
+                chunk_files.iter().enumerate().map(|(idx, path)| (path.clone(), idx)).collect();
+            pool.distribute_chunk_files(files_with_ids)?;
+
+            for source_id in 0..num_disk {
+                sources.push(ChunkSource::PoolDisk { source_id });
+            }
+        } else {
+            // Legacy path: per-source reader threads (used by indexing path)
+            let sem = make_reader_semaphore(reader_concurrency);
+            for path in chunk_files {
+                sources.push(ChunkSource::Disk(GenericKeyedChunkReader::<K>::open(
+                    path,
+                    Some(Arc::clone(&sem)),
+                )?));
+            }
         }
 
         for chunk in memory_chunks {
@@ -1708,6 +2415,7 @@ impl RawExternalSorter {
         header: &Header,
         output: &Path,
         total_records: u64,
+        pool: &Arc<SortWorkerPool>,
     ) -> Result<u64> {
         self.merge_chunks_generic::<TemplateKey>(
             chunk_files,
@@ -1715,6 +2423,7 @@ impl RawExternalSorter {
             header,
             output,
             total_records,
+            pool,
         )
     }
 
@@ -1723,6 +2432,7 @@ impl RawExternalSorter {
     /// This is the unified merge function that works with any `RawSortKey` type.
     /// It provides `O(1)` comparisons during merge for fixed-size keys (coordinate, template)
     /// and `O(name_len)` for variable-size keys (queryname).
+    #[allow(clippy::too_many_lines)]
     fn merge_chunks_generic<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
@@ -1730,13 +2440,47 @@ impl RawExternalSorter {
         header: &Header,
         output: &Path,
         total_records: u64,
+        pool: &Arc<SortWorkerPool>,
     ) -> Result<u64> {
         use crate::sort::loser_tree::LoserTree;
+        use crate::sort::pooled_bam_writer::PooledBamWriter;
+        use crate::sort::worker_pool::phase;
 
-        let mut sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, self.threads)?;
+        let reader_concurrency: usize = 1;
+        let num_disk = chunk_files.len();
+
+        if num_disk > 0 {
+            info!(
+                "Pool-integrated merge: {} disk sources, {} pool workers (N+2 model)",
+                num_disk,
+                pool.num_workers()
+            );
+        }
+
+        let mut sources = Self::build_chunk_sources::<K>(
+            chunk_files,
+            memory_chunks,
+            reader_concurrency,
+            true,
+            pool,
+        )?;
 
         let num_sources = sources.len();
         info!("Merging from {num_sources} sources...");
+
+        // Create pool consumer for PoolDisk sources and activate Phase 2
+        let mut consumer: Option<MainThreadChunkConsumer<K>> = if num_disk > 0 {
+            let consumer = MainThreadChunkConsumer::new(
+                num_disk,
+                pool.decompressed_chunks_queue(),
+                pool.raw_chunk_blocks_queue(),
+                pool.all_chunks_eof_flag(),
+            );
+            pool.set_phase(phase::PHASE2);
+            Some(consumer)
+        } else {
+            None
+        };
 
         let output_header = self.create_output_header(header);
 
@@ -1747,7 +2491,7 @@ impl RawExternalSorter {
 
         for (idx, source) in sources.iter_mut().enumerate() {
             let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record)? {
+            if let Some(key) = source.next_record(&mut record, consumer.as_mut())? {
                 initial_keys.push(key);
                 records.push(record);
                 source_map.push(idx);
@@ -1756,42 +2500,89 @@ impl RawExternalSorter {
 
         if initial_keys.is_empty() {
             info!("Merge complete: 0 records merged");
-            let writer = crate::bam_io::create_raw_bam_writer(
-                output,
-                &output_header,
-                self.threads,
-                self.output_compression,
-            )?;
+            if consumer.is_some() {
+                pool.set_phase(phase::LEGACY);
+            }
+            let writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
             writer.finish()?;
             return Ok(0);
         }
 
         let mut tree = LoserTree::new(initial_keys);
 
-        let mut writer = crate::bam_io::create_raw_bam_writer(
-            output,
-            &output_header,
-            self.threads,
-            self.output_compression,
-        )?;
+        info!("Merge thread budget: {} pool workers + 1 I/O + 1 main (N+2)", pool.num_workers());
+        let mut writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
 
         let mut records_merged = 0u64;
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
             .with_total(total_records);
 
+        // Sub-phase timing: only paid when debug logging is enabled.
+        let debug_timing = log::log_enabled!(log::Level::Debug);
+        let merge_sample_interval: u64 = 1024;
+        let mut merge_write_secs = 0.0f64;
+        let mut merge_read_secs = 0.0f64;
+        let mut merge_tree_secs = 0.0f64;
+        let mut samples_taken: u64 = 0;
+        let loop_start = Instant::now();
+
         while tree.winner_is_active() {
             let winner = tree.winner();
-            writer.write_raw_record(&records[winner])?;
+            let sample_this = debug_timing && records_merged.is_multiple_of(merge_sample_interval);
+
+            if sample_this {
+                let t0 = Instant::now();
+                writer.write_raw_record(&records[winner])?;
+                merge_write_secs += t0.elapsed().as_secs_f64();
+            } else {
+                writer.write_raw_record(&records[winner])?;
+            }
+
             records_merged += 1;
             merge_progress.log_if_needed(1);
 
             let src_idx = source_map[winner];
-            if let Some(key) = sources[src_idx].next_record(&mut records[winner])? {
-                tree.replace_winner(key);
+
+            if sample_this {
+                let t0 = Instant::now();
+                let next = sources[src_idx].next_record(&mut records[winner], consumer.as_mut())?;
+                merge_read_secs += t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                if let Some(key) = next {
+                    tree.replace_winner(key);
+                } else {
+                    tree.remove_winner();
+                }
+                merge_tree_secs += t0.elapsed().as_secs_f64();
+                samples_taken += 1;
             } else {
-                tree.remove_winner();
+                let next = sources[src_idx].next_record(&mut records[winner], consumer.as_mut())?;
+                if let Some(key) = next {
+                    tree.replace_winner(key);
+                } else {
+                    tree.remove_winner();
+                }
             }
+        }
+
+        // Return to legacy mode before finishing writer (workers still need to compress)
+        if consumer.is_some() {
+            pool.set_phase(phase::LEGACY);
+        }
+
+        if debug_timing {
+            let loop_total = loop_start.elapsed().as_secs_f64();
+            #[allow(clippy::cast_precision_loss)]
+            let scale =
+                if samples_taken > 0 { records_merged as f64 / samples_taken as f64 } else { 1.0 };
+            let est_write = merge_write_secs * scale;
+            let est_read = merge_read_secs * scale;
+            let est_tree = merge_tree_secs * scale;
+            debug!(
+                "Merge sub-phases (sampled {samples_taken}/{records_merged}, scale={scale:.1}x): write={est_write:.2}s read={est_read:.2}s tree={est_tree:.2}s total={loop_total:.2}s records={records_merged}"
+            );
         }
 
         writer.finish()?;
@@ -1815,8 +2606,9 @@ impl RawExternalSorter {
         memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
         header: &Header,
         output: &Path,
+        pool: &Arc<SortWorkerPool>,
     ) -> Result<u64> {
-        self.merge_chunks_generic::<K>(chunk_files, memory_chunks, header, output, 0)
+        self.merge_chunks_generic::<K>(chunk_files, memory_chunks, header, output, 0, pool)
     }
 
     /// Merge keyed chunks with BAM index generation.
@@ -1830,14 +2622,35 @@ impl RawExternalSorter {
         header: &Header,
         output: &Path,
         total_records: u64,
+        pool: &Arc<SortWorkerPool>,
     ) -> Result<noodles::bam::bai::Index> {
         use crate::bam_io::create_indexing_bam_writer;
         use crate::sort::loser_tree::LoserTree;
 
-        let mut sources = Self::build_chunk_sources::<K>(chunk_files, memory_chunks, self.threads)?;
+        // Thread budget: writer gets all threads (merge is output-compression-bound),
+        // readers use semaphore concurrency of 1. Same split as merge_chunks_generic.
+        // TODO: Replace create_indexing_bam_writer with PooledIndexingBamWriter (Step 4)
+        let writer_threads = self.threads;
+        let reader_concurrency: usize = 1;
+
+        // The indexing path uses a non-pooled writer and has no pool consumer set up,
+        // so use GenericKeyedChunkReader (pool_decompress=false).
+        // TODO: Replace create_indexing_bam_writer with PooledIndexingBamWriter to
+        // enable pool-integrated decompression for the indexing path.
+        let mut sources = Self::build_chunk_sources::<K>(
+            chunk_files,
+            memory_chunks,
+            reader_concurrency,
+            false,
+            pool,
+        )?;
 
         let num_sources = sources.len();
-        info!("Merging from {num_sources} sources...");
+        info!(
+            "Merge thread budget (indexing): {writer_threads} writer + {reader_concurrency} reader + 1 main = {} total",
+            writer_threads + reader_concurrency + 1
+        );
+        info!("Merging from {num_sources} sources (indexing)...");
 
         let output_header = self.create_output_header(header);
 
@@ -1848,7 +2661,7 @@ impl RawExternalSorter {
 
         for (idx, source) in sources.iter_mut().enumerate() {
             let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record)? {
+            if let Some(key) = source.next_record(&mut record, None)? {
                 initial_keys.push(key);
                 records.push(record);
                 source_map.push(idx);
@@ -1860,7 +2673,7 @@ impl RawExternalSorter {
                 output,
                 &output_header,
                 self.output_compression,
-                self.threads,
+                writer_threads,
             )?;
             let index = writer.finish()?;
             info!("Merge complete: 0 records merged");
@@ -1873,7 +2686,7 @@ impl RawExternalSorter {
             output,
             &output_header,
             self.output_compression,
-            self.threads,
+            writer_threads,
         )?;
         let merge_progress = ProgressTracker::new("Merged records")
             .with_interval(1_000_000)
@@ -1885,7 +2698,7 @@ impl RawExternalSorter {
             merge_progress.log_if_needed(1);
 
             let src_idx = source_map[winner];
-            if let Some(key) = sources[src_idx].next_record(&mut records[winner])? {
+            if let Some(key) = sources[src_idx].next_record(&mut records[winner], None)? {
                 tree.replace_winner(key);
             } else {
                 tree.remove_winner();
@@ -2414,6 +3227,7 @@ mod tests {
     #[case::coordinate(SortOrder::Coordinate, false)]
     #[case::coordinate_with_index(SortOrder::Coordinate, true)]
     #[case::queryname(SortOrder::Queryname(QuerynameComparator::default()), false)]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural), false)]
     #[case::template_coordinate(SortOrder::TemplateCoordinate, false)]
     fn test_sort_with_consolidation_preserves_all_records(
         #[case] sort_order: SortOrder,
@@ -2426,7 +3240,7 @@ mod tests {
         for i in 0..num_pairs {
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i:04}"))
+                .name(&format!("read{i}"))
                 .start1(i * 200 + 1)
                 .start2(i * 200 + 101)
                 .build();
@@ -2459,11 +3273,12 @@ mod tests {
         assert_eq!(observed, expected, "chunk filename collision likely lost data");
     }
 
-    /// Verifies that sort with many chunks exercises the semaphore-capped
+    /// Verifies that sort with many chunks exercises the pool-integrated
     /// merge readers during the final merge phase (not just consolidation).
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
     #[case::queryname(SortOrder::Queryname(QuerynameComparator::default()))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_many_chunks_with_semaphore(#[case] sort_order: SortOrder) {
         use crate::sam::builder::SamBuilder;
@@ -2473,7 +3288,7 @@ mod tests {
         for i in 0..num_pairs {
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i:04}"))
+                .name(&format!("read{i}"))
                 .start1(i * 200 + 1)
                 .start2(i * 200 + 101)
                 .build();
@@ -2485,9 +3300,12 @@ mod tests {
         builder.write_bam(&input).expect("failed to write BAM");
 
         // Small memory limit + many records = guaranteed spill to multiple chunks
-        // (no consolidation, so the semaphore must cap concurrent readers)
+        // (no consolidation, so the semaphore must cap concurrent readers).
+        // 32 KiB is small enough to force several spills across 400 records but
+        // large enough to avoid creating hundreds of tiny chunks that saturate
+        // OS threads on the CI runner and cause timeouts.
         let stats = RawExternalSorter::new(sort_order)
-            .memory_limit(4096)
+            .memory_limit(32 * 1024)
             .max_temp_files(0) // disable consolidation
             .threads(2) // semaphore allows 2 concurrent readers
             .temp_compression(0)
@@ -2511,10 +3329,11 @@ mod tests {
     // ========================================================================
 
     /// Verifies that multi-threaded sort produces the same output as single-threaded
-    /// sort for each sort order, exercising the parallel sub-array merge path.
+    /// sort for each sort order.
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
     #[case::queryname(SortOrder::Queryname(QuerynameComparator::default()))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_sub_arrays_match_single_thread(#[case] sort_order: SortOrder) {
         use crate::sam::builder::SamBuilder;
@@ -2524,7 +3343,7 @@ mod tests {
         for i in 0..num_pairs {
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i:04}"))
+                .name(&format!("read{i}"))
                 .start1(i * 200 + 1)
                 .start2(i * 200 + 101)
                 .build();
@@ -2538,16 +3357,16 @@ mod tests {
 
         // Sort single-threaded
         RawExternalSorter::new(sort_order)
-            .memory_limit(2048) // force spill so merge path is exercised
+            .memory_limit(16 * 1024) // force spill (50 pairs × ~300B ≈ 15KB) so merge path is exercised
             .threads(1)
             .temp_compression(0)
             .output_compression(0)
             .sort(&input, &output_st)
             .expect("sort should succeed");
 
-        // Sort multi-threaded (exercises par_sort_into_chunks / par_chunks_mut)
+        // Sort multi-threaded
         RawExternalSorter::new(sort_order)
-            .memory_limit(2048)
+            .memory_limit(16 * 1024)
             .threads(2)
             .temp_compression(0)
             .output_compression(0)
@@ -2565,11 +3384,11 @@ mod tests {
         assert_eq!(names_st, names_mt, "multi-thread sort order differs from single-thread");
     }
 
-    /// Verifies that the in-memory-only path (no spill to disk) also works
-    /// correctly with multi-threaded sub-array chunks.
+    /// Verifies that the in-memory-only path (no spill to disk) works correctly.
     #[rstest::rstest]
     #[case::coordinate(SortOrder::Coordinate)]
     #[case::queryname(SortOrder::Queryname(QuerynameComparator::default()))]
+    #[case::queryname_natural(SortOrder::Queryname(QuerynameComparator::Natural))]
     #[case::template_coordinate(SortOrder::TemplateCoordinate)]
     fn test_sort_sub_arrays_in_memory_only(#[case] sort_order: SortOrder) {
         use crate::sam::builder::SamBuilder;
@@ -2579,7 +3398,7 @@ mod tests {
         for i in 0..num_pairs {
             let _ = builder
                 .add_pair()
-                .name(&format!("read{i:04}"))
+                .name(&format!("read{i}"))
                 .start1(i * 200 + 1)
                 .start2(i * 200 + 101)
                 .build();
@@ -2830,5 +3649,101 @@ mod tests {
         for w in positions.windows(2) {
             assert!(w[0] <= w[1], "coordinate sort violated with k={k}: {:?} > {:?}", w[0], w[1]);
         }
+    }
+
+    #[test]
+    fn test_merge_bams_queryname_natural_sort() {
+        let dir = tempfile::tempdir().expect("failed to create temp directory");
+        let nat = SortOrder::Queryname(QuerynameComparator::Natural);
+        let (bam_a, _) = create_sorted_bam(dir.path(), "a", 10, 0, nat);
+        let (bam_b, _) = create_sorted_bam(dir.path(), "b", 10, 10_000, nat);
+
+        let merged = dir.path().join("merged.bam");
+        let header = default_merge_header();
+        let count = RawExternalSorter::new(nat)
+            .output_compression(0)
+            .merge_bams(&[bam_a, bam_b], &header, &merged)
+            .expect("merge should succeed");
+
+        assert_eq!(count, 40);
+        assert_eq!(count_bam_records(&merged), 40);
+
+        // Verify natural queryname order: names are non-decreasing
+        let names = collect_read_names(&merged);
+        for w in names.windows(2) {
+            assert!(w[0] <= w[1], "natural queryname sort violated: {:?} > {:?}", w[0], w[1]);
+        }
+    }
+
+    // ========================================================================
+    // SortPhaseTimer tests
+    // ========================================================================
+
+    #[test]
+    fn test_sort_phase_timer_all_methods() {
+        let mut timer = SortPhaseTimer::new();
+        assert!(timer.overall_start.is_some());
+        assert!(timer.read_span_start.is_some());
+
+        // end_read_span accumulates and clears the span
+        let elapsed = timer.end_read_span();
+        assert!(timer.read_secs >= 0.0);
+        assert!(timer.read_span_start.is_none());
+        let _ = elapsed;
+
+        // end_read_span with no active span → zero, no panic
+        let elapsed2 = timer.end_read_span();
+        assert_eq!(elapsed2, std::time::Duration::ZERO);
+        assert!(timer.read_secs >= 0.0); // unchanged
+
+        // begin_read_span restores the span
+        timer.begin_read_span();
+        assert!(timer.read_span_start.is_some());
+
+        // time_sort measures elapsed
+        timer.time_sort(|| {});
+        assert!(timer.sort_secs >= 0.0);
+
+        // time_spill_write: counts spills and returns the closure result
+        let result = timer.time_spill_write(|| Ok::<u32, anyhow::Error>(42));
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(timer.spill_count, 1);
+        assert!(timer.spill_write_secs >= 0.0);
+
+        // record_spill_size: adds file size to total
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spill.bin");
+        std::fs::write(&path, b"hello world").expect("write");
+        timer.record_spill_size(&path);
+        assert_eq!(timer.total_spill_bytes, 11);
+
+        // record_spill_size with nonexistent path: no-op, no panic
+        timer.record_spill_size(&dir.path().join("nonexistent.bin"));
+        assert_eq!(timer.total_spill_bytes, 11);
+
+        // time_consolidate: fast closure (<1ms) → consolidate_count stays 0
+        timer.time_consolidate(|| Ok(())).expect("consolidate ok");
+        assert_eq!(timer.consolidate_count, 0);
+
+        // time_consolidate: slow closure (>1ms) → counted
+        timer
+            .time_consolidate(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                Ok(())
+            })
+            .expect("consolidate ok");
+        assert_eq!(timer.consolidate_count, 1);
+        assert!(timer.consolidate_secs > 0.0);
+
+        // time_merge
+        timer.time_merge(|| Ok::<(), anyhow::Error>(())).expect("merge ok");
+        assert!(timer.merge_secs >= 0.0);
+
+        // time_write_output
+        timer.time_write_output(|| Ok(())).expect("write ok");
+        assert!(timer.write_output_secs >= 0.0);
+
+        // log_summary must not panic (output goes to log sink)
+        timer.log_summary(4);
     }
 }
