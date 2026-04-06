@@ -6,7 +6,7 @@
 
 use super::sort::TemplateCoordKey;
 use crate::commands::command::Command;
-use crate::commands::common::CompressionOptions;
+use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MoleculeInfo, PositionDistArgs, QualityArgs, ReferenceArgs,
     SimulationCommon, StrandBiasArgs, compute_position, generate_random_sequence, pad_sequence,
@@ -57,7 +57,7 @@ pub struct GroupedReads {
     pub truth_output: PathBuf,
 
     /// Generate duplex-style MI tags (e.g., "1/A", "1/B")
-    #[arg(long = "duplex")]
+    #[arg(long = "duplex", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub duplex: bool,
 
     /// Mapping quality for aligned reads

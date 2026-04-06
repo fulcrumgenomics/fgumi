@@ -104,11 +104,11 @@ pub struct ConsensusCallingOptions {
     pub min_input_base_quality: u8,
 
     /// Produce per-base tags (cd, ce) in addition to per-read tags
-    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'B', long = "output-per-base-tags", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub output_per_base_tags: bool,
 
     /// Quality-trim reads before consensus calling (removes low-quality bases from ends)
-    #[arg(long = "trim", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "trim", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub trim: bool,
 
     /// Minimum consensus base quality (output consensus bases below this are masked to N)
@@ -214,7 +214,7 @@ impl Default for ReadGroupOptions {
 #[derive(Debug, Clone, Args)]
 pub struct OverlappingConsensusOptions {
     /// Consensus call overlapping bases in read pairs before UMI consensus calling
-    #[arg(long = "consensus-call-overlapping-bases", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "consensus-call-overlapping-bases", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub consensus_call_overlapping_bases: bool,
 }
 
@@ -315,7 +315,7 @@ pub struct SchedulerOptions {
     ///
     /// Shows per-step timing, throughput, contention metrics, and
     /// per-thread work distribution.
-    #[arg(long = "pipeline-stats", default_value_t = false, hide = true)]
+    #[arg(long = "pipeline-stats", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool, hide = true)]
     pub pipeline_stats: bool,
 
     /// Timeout in seconds for deadlock detection (default: 10, 0 = disabled).
@@ -329,7 +329,7 @@ pub struct SchedulerOptions {
     ///
     /// Uses progressive doubling: 2x -> 4x -> unbind, with restoration
     /// after 30s of sustained progress.
-    #[arg(long = "deadlock-recover", default_value_t = false, hide = true)]
+    #[arg(long = "deadlock-recover", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool, hide = true)]
     pub deadlock_recover: bool,
 }
 
@@ -451,7 +451,7 @@ pub struct QueueMemoryOptions {
     /// When true, total memory = queue-memory * threads. For example,
     /// --queue-memory 768 with --threads 16 allocates 12 GB total.
     /// Set to false for a fixed total memory budget regardless of thread count.
-    #[arg(long = "queue-memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "queue-memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub queue_memory_per_thread: bool,
 
     /// DEPRECATED: Use --queue-memory instead. Memory limit for pipeline queues in megabytes.
@@ -620,6 +620,16 @@ impl QueueMemoryOptions {
         } else {
             log::info!("Queue memory limit: {} total (fixed)", ByteSize(total_memory));
         }
+    }
+}
+
+/// Parses a boolean value from a string, accepting: true/false, yes/no, y/n, t/f
+/// (case-insensitive). Matches sopt/fgbio behavior.
+pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" => Ok(true),
+        "false" | "f" | "no" | "n" => Ok(false),
+        _ => Err(format!("Invalid boolean value '{s}'. Expected: true|false|yes|no|y|n|t|f")),
     }
 }
 
@@ -1207,5 +1217,77 @@ mod tests {
     fn test_queue_memory_per_thread_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
         assert_eq!(cmd.queue_memory.queue_memory_per_thread, expected);
+    }
+
+    #[rstest]
+    #[case("true", true)]
+    #[case("false", false)]
+    #[case("yes", true)]
+    #[case("no", false)]
+    #[case("t", true)]
+    #[case("f", false)]
+    #[case("y", true)]
+    #[case("n", false)]
+    #[case("True", true)]
+    #[case("TRUE", true)]
+    #[case("False", false)]
+    #[case("FALSE", false)]
+    #[case("Yes", true)]
+    #[case("YES", true)]
+    #[case("No", false)]
+    #[case("NO", false)]
+    #[case("T", true)]
+    #[case("F", false)]
+    #[case("Y", true)]
+    #[case("N", false)]
+    #[case("tRuE", true)]
+    #[case("fAlSe", false)]
+    #[case("yEs", true)]
+    fn test_parse_bool_valid(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(parse_bool(input).expect("should parse"), expected);
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("tru")]
+    #[case("fals")]
+    #[case("truee")]
+    #[case("noo")]
+    #[case("yess")]
+    #[case("maybe")]
+    #[case("0")]
+    #[case("1")]
+    #[case("on")]
+    #[case("off")]
+    #[case(" true")]
+    #[case("true ")]
+    fn test_parse_bool_invalid(#[case] input: &str) {
+        assert!(parse_bool(input).is_err(), "expected error for input: {input:?}");
+    }
+
+    #[rstest]
+    #[case(&["test", "--trim", "yes"], true)]
+    #[case(&["test", "--trim", "no"], false)]
+    #[case(&["test", "--trim", "y"], true)]
+    #[case(&["test", "--trim", "n"], false)]
+    #[case(&["test", "--trim", "t"], true)]
+    #[case(&["test", "--trim", "f"], false)]
+    #[case(&["test", "--trim", "YES"], true)]
+    #[case(&["test", "--trim", "NO"], false)]
+    #[case(&["test", "--trim=yes"], true)]
+    #[case(&["test", "--trim=no"], false)]
+    fn test_extended_bool_values_in_cli(#[case] args: &[&str], #[case] expected: bool) {
+        let cmd = TestBoolFlags::try_parse_from(args).expect("valid CLI args should parse");
+        assert_eq!(cmd.consensus.trim, expected);
+    }
+
+    #[rstest]
+    #[case(&["test", "--trim", "maybe"])]
+    #[case(&["test", "--trim", "0"])]
+    #[case(&["test", "--trim", "1"])]
+    #[case(&["test", "--trim", "on"])]
+    #[case(&["test", "--trim", "off"])]
+    fn test_extended_bool_values_in_cli_invalid(#[case] args: &[&str]) {
+        assert!(TestBoolFlags::try_parse_from(args).is_err());
     }
 }

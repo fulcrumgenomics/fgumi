@@ -1,6 +1,7 @@
 //! Generate paired-end FASTQ files with UMI sequences.
 
 use crate::commands::command::Command;
+use crate::commands::common::parse_bool;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, QualityArgs, SimulationCommon, generate_random_sequence,
 };
@@ -57,7 +58,7 @@ pub struct FastqReads {
     pub read_structure_r2: String,
 
     /// Generate duplex-style reads (A/B strand pairs)
-    #[arg(long = "duplex")]
+    #[arg(long = "duplex", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub duplex: bool,
 
     /// Reference FASTA file for sampling template sequences.

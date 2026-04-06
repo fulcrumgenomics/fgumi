@@ -47,7 +47,7 @@
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge()`: Core function that transfers metadata between templates
 use crate::commands::command::Command;
-use crate::commands::common::CompressionOptions;
+use crate::commands::common::{CompressionOptions, parse_bool};
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use clap::Parser;
@@ -165,14 +165,14 @@ pub struct Zipper {
 
     /// Exclude reads from the unmapped BAM that are not present in the aligned BAM.
     /// Useful when reads were intentionally removed (e.g., by adapter trimming) prior to alignment.
-    #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub exclude_missing_reads: bool,
 
     /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
     /// By default, zipper adds a `pa` tag containing the primary alignment's template
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
-    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub skip_pa_tags: bool,
 }
 

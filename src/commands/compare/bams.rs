@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use crate::commands::command::Command;
+use crate::commands::common::parse_bool;
 
 use super::raw_compare::{raw_compare_structured, raw_records_byte_equal};
 
@@ -164,14 +165,14 @@ pub struct CompareBams {
     pub max_diffs: usize,
 
     /// Quiet mode - only exit code indicates result (0=equal, 1=different)
-    #[arg(short = 'q', long = "quiet")]
+    #[arg(short = 'q', long = "quiet", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub quiet: bool,
 
     /// Ignore record order when comparing in grouping mode.
     /// Required for comparing output from consensus commands (simplex/duplex/codec)
     /// when run with --threads, as parallel processing causes non-deterministic ordering.
     /// Only valid with --mode grouping.
-    #[arg(long = "ignore-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "ignore-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub ignore_order: bool,
 
     /// Initial buffer size for --ignore-order mode (number of records)

@@ -3,6 +3,7 @@
 //! This is useful for comparing metrics files produced by fgbio and fgumi,
 //! which may have slightly different floating-point representations.
 
+use crate::commands::common::parse_bool;
 use anyhow::Result;
 use clap::Parser;
 use fgumi_lib::logging::OperationTimer;
@@ -69,11 +70,11 @@ pub struct CompareMetrics {
     pub max_diffs: usize,
 
     /// Quiet mode - only exit code indicates result (0=equal, 1=different)
-    #[arg(short = 'q', long = "quiet")]
+    #[arg(short = 'q', long = "quiet", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub quiet: bool,
 
     /// Verbose mode - print success message when files match
-    #[arg(short = 'v', long = "verbose")]
+    #[arg(short = 'v', long = "verbose", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub verbose: bool,
 }
 

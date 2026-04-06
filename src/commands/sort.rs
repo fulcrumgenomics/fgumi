@@ -30,7 +30,7 @@ use log::info;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
-use crate::commands::common::CompressionOptions;
+use crate::commands::common::{CompressionOptions, parse_bool};
 
 /// Sort order for BAM files.
 ///
@@ -161,7 +161,7 @@ pub struct Sort {
     pub input: PathBuf,
 
     /// Output BAM file (required unless --verify is used).
-    #[arg(short = 'o', long = "output", conflicts_with = "verify")]
+    #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
     /// Verify the input file is correctly sorted (no output written).
@@ -169,7 +169,7 @@ pub struct Sort {
     /// Reads records sequentially and checks that each record's sort key
     /// is >= the previous record's key. Exits 0 if sorted correctly,
     /// non-zero if any records are out of order.
-    #[arg(long = "verify", conflicts_with = "output")]
+    #[arg(long = "verify", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub verify: bool,
 
     /// Sort order.
@@ -196,7 +196,7 @@ pub struct Sort {
     ///
     /// When enabled (default), --max-memory specifies memory per thread.
     /// Total memory = `max_memory` × threads. Disable for fixed total memory.
-    #[arg(long = "memory-per-thread", default_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub memory_per_thread: bool,
 
     /// Temporary directory for intermediate files.
@@ -230,7 +230,7 @@ pub struct Sort {
     /// Only valid for coordinate sort. The index file will be written to
     /// `<output>.bai`. Uses single-threaded compression for accurate virtual
     /// position tracking.
-    #[arg(long = "write-index", default_value = "false", conflicts_with = "verify")]
+    #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub write_index: bool,
 
     /// Cell barcode tag for template-coordinate sort.
@@ -323,6 +323,13 @@ fn verify_sort_order<K>(
 
 impl Command for Sort {
     fn execute(&self, command_line: &str) -> Result<()> {
+        if self.verify && self.output.is_some() {
+            bail!("--verify cannot be used with --output");
+        }
+        if self.verify && self.write_index {
+            bail!("--write-index cannot be used with --verify");
+        }
+
         // Validate inputs
         validate_file_exists(&self.input, "Input BAM")?;
 
@@ -975,6 +982,25 @@ mod tests {
         assert!(total > 0);
         assert!(violations > 0, "natural-sorted file should fail lex verify");
         Ok(())
+    }
+
+    #[test]
+    fn test_verify_conflicts_with_output() {
+        let sort = Sort {
+            verify: true,
+            output: Some(PathBuf::from("out.bam")),
+            ..make_sort(SortOrderArg::Coordinate, "CB")
+        };
+        let err = sort.execute("test").unwrap_err();
+        assert!(err.to_string().contains("--verify cannot be used with --output"));
+    }
+
+    #[test]
+    fn test_verify_conflicts_with_write_index() {
+        let sort =
+            Sort { verify: true, write_index: true, ..make_sort(SortOrderArg::Coordinate, "CB") };
+        let err = sort.execute("test").unwrap_err();
+        assert!(err.to_string().contains("--write-index cannot be used with --verify"));
     }
 
     #[test]

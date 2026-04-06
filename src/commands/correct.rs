@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions, SchedulerOptions,
-    ThreadingOptions, build_pipeline_config,
+    ThreadingOptions, build_pipeline_config, parse_bool,
 };
 
 /// Result of matching an observed UMI to an expected UMI.
@@ -229,7 +229,7 @@ pub struct CorrectUmis {
     pub umi_tag: String,
 
     /// Don't store original UMIs in a separate tag.
-    #[arg(long)]
+    #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub dont_store_original_umis: bool,
 
     /// Size of the LRU cache for UMI matching.
@@ -241,7 +241,7 @@ pub struct CorrectUmis {
     pub min_corrected: Option<f64>,
 
     /// Reverse complement UMIs before matching.
-    #[arg(long)]
+    #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub revcomp: bool,
 
     /// Threading options for parallel processing.

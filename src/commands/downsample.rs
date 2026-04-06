@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::commands::command::Command;
-use crate::commands::common::{BamIoOptions, CompressionOptions};
+use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
 
 /// MI tag for molecular identifier
 const MI_TAG: Tag = Tag::new(b'M', b'I');
@@ -76,7 +76,7 @@ pub struct Downsample {
     pub seed: Option<u64>,
 
     /// Validate that MI tags appear in consecutive groups (error if seen non-consecutively)
-    #[arg(long = "validate-mi-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "validate-mi-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub validate_mi_order: bool,
 
     /// Output file for kept family size histogram

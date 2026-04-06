@@ -3,6 +3,7 @@
 //! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
 //! Input should be queryname-sorted or template-coordinate sorted.
 
+use crate::commands::common::parse_bool;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgumi_lib::bam_io::create_bam_reader;
@@ -73,7 +74,7 @@ pub struct Fastq {
     pub input: PathBuf,
 
     /// Don't append /1 and /2 to read names.
-    #[arg(short = 'n', long = "no-read-suffix", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'n', long = "no-read-suffix", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub no_suffix: bool,
 
     /// Exclude reads with any of these flags present [0x900 = secondary|supplementary].

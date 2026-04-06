@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::command::Command;
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
-    build_pipeline_config,
+    build_pipeline_config, parse_bool,
 };
 
 /// Clips reads in a BAM file to remove overlaps
@@ -100,7 +100,7 @@ pub struct Clip {
     pub sort_order: Option<String>,
 
     /// Clip overlapping read pairs
-    #[arg(long = "clip-overlapping-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "clip-overlapping-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub clip_overlapping_reads: bool,
 
     /// Clip reads that extend past their mate's start position
@@ -111,6 +111,7 @@ pub struct Clip {
         num_args = 0..=1,
         default_missing_value = "true",
         action = clap::ArgAction::Set,
+        value_parser = parse_bool,
     )]
     pub clip_extending_past_mate: bool,
 
@@ -131,11 +132,11 @@ pub struct Clip {
     pub read_two_three_prime: usize,
 
     /// Upgrade existing clipping to the specified clipping mode
-    #[arg(short = 'H', long = "upgrade-clipping", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'H', long = "upgrade-clipping", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub upgrade_clipping: bool,
 
     /// Automatically clip extended attributes that match read length
-    #[arg(short = 'a', long = "auto-clip-attributes", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(short = 'a', long = "auto-clip-attributes", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub auto_clip_attributes: bool,
 
     /// Output file for clipping metrics
