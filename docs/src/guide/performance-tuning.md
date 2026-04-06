@@ -284,12 +284,12 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
   better than a simple heap merge when the number of sorted runs is large
 - `--max-memory` controls how much RAM is used for sort buffers; increase for large files to
   reduce the number of intermediate merge passes
-- For template-coordinate sort with single-cell data, include `--cell-tag CB`
+- For template-coordinate sort with single-cell data, the `CB` tag is included automatically
 
 ### Merge
 - `fgumi merge` performs a k-way merge using a LoserTree for efficient multi-file merging
 - Thread count (`--threads`) controls compression parallelism, not merge concurrency
-- For template-coordinate merges with single-cell data, include `--cell-tag CB`
+- For template-coordinate merges with single-cell data, the `CB` tag is included automatically
 
 ### Group/Dedup
 - Memory usage scales with UMI diversity and the number of reads at any given position

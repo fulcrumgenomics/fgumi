@@ -77,19 +77,12 @@ When processing data with cell barcodes (e.g. single-cell sequencing), reads at 
 position are partitioned by cell barcode *before* UMI assignment. This ensures that reads from
 different cells are never grouped together, even if they share a UMI and mapping position.
 
-The cell barcode is read from the tag specified by `--cell-tag` (default: `CB`). No correction or
+The cell barcode is read from the standard `CB` tag. No correction or
 error-handling is performed on cell barcodes — they must be corrected upstream before grouping.
 
-Pass `--cell-tag` consistently through the entire pipeline:
-
-```bash
-fgumi sort   --order template-coordinate --cell-tag CB ...
-fgumi group  --cell-tag CB ...
-fgumi simplex --cell-tag CB ...
-```
-
-The consensus callers validate that all source reads in a group share the same cell barcode and
-propagate it to the output consensus read.
+Cell barcodes are detected automatically across the entire pipeline — no additional flags are
+needed. The consensus callers validate that all source reads in a group share the same cell
+barcode and propagate it to the output consensus read.
 
 ## Metrics Output
 
@@ -155,18 +148,18 @@ reads. To avoid this overhead, pre-sort with:
 fgumi sort --order template-coordinate --input aligned.bam --output sorted.bam
 ```
 
-For single-cell data, include `--cell-tag CB` so that the sort key incorporates the cell barcode,
+For single-cell data, the `CB` cell barcode tag is automatically incorporated in the sort key,
 keeping templates from different cells at the same locus separate:
 
 ```bash
-fgumi sort --order template-coordinate --cell-tag CB --input aligned.bam --output sorted.bam
+fgumi sort --order template-coordinate --input aligned.bam --output sorted.bam
 ```
 
 Template-coordinate order sorts reads by:
 1. The earlier unclipped 5' coordinate of the read pair
 2. The higher unclipped 5' coordinate of the read pair
 3. Strand orientation
-4. The cellular barcode (CB tag, if `--cell-tag` is set)
+4. The cellular barcode (CB tag, if present)
 5. The molecular identifier (MI tag, if present)
 6. Read name
 7. Library (from read group)

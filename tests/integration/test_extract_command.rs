@@ -898,7 +898,7 @@ fn test_variable_length_reads_bgzf() {
 }
 
 /// Regression test: verify that user-configurable options (--read-group-id,
-/// --umi-tag, --annotate-read-names) are correctly propagated in multi-threaded mode.
+/// --annotate-read-names) are correctly propagated in multi-threaded mode.
 #[test]
 fn test_extract_multithreaded_custom_options() {
     use noodles::sam::alignment::record::data::field::Tag;
@@ -930,8 +930,6 @@ fn test_extract_multithreaded_custom_options() {
             "1",
             "--read-group-id",
             "MyRG",
-            "--umi-tag",
-            "ZU",
             "--annotate-read-names",
         ])
         .status()
@@ -953,12 +951,8 @@ fn test_extract_multithreaded_custom_options() {
             _ => panic!("RG tag should be a string"),
         }
 
-        // Verify UMI stored under custom tag ZU (not default RX)
-        assert!(record.data().get(&Tag::from(*b"ZU")).is_some(), "UMI should be under ZU tag");
-        assert!(
-            record.data().get(&Tag::from(*b"RX")).is_none(),
-            "RX tag should not be present when --umi-tag ZU is used"
-        );
+        // Verify UMI stored under standard RX tag
+        assert!(record.data().get(&Tag::from(*b"RX")).is_some(), "UMI should be under RX tag");
 
         // Verify read name annotation (should contain '+' with UMI appended)
         let name = std::str::from_utf8(record.name().unwrap().as_ref()).unwrap();

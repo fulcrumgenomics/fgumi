@@ -476,8 +476,6 @@ fn test_codec_command_cell_barcode_preservation() {
             "1",
             "--min-duplex-length",
             "1",
-            "--cell-tag",
-            "CB",
             "--compression-level",
             "1",
         ])

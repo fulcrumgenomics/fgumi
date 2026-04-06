@@ -87,14 +87,6 @@ pub struct Merge {
     /// Level 12 produces smallest files but is slowest.
     #[arg(long = "compression-level", default_value_t = 6)]
     pub compression_level: u32,
-
-    /// Cell barcode tag for template-coordinate merge.
-    ///
-    /// When merging in template-coordinate order, this tag is included in the
-    /// sort key so that templates from different cells at the same locus are
-    /// not interleaved. Only used for template-coordinate merge.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: String,
 }
 
 impl Command for Merge {
@@ -135,7 +127,7 @@ impl Command for Merge {
             }
         }
 
-        let cell_tag = crate::commands::sort::parse_cell_tag(self.order, &self.cell_tag)?;
+        let cell_tag = crate::commands::sort::parse_cell_tag(self.order)?;
 
         let timer = OperationTimer::new("Merging BAMs");
 
@@ -425,7 +417,6 @@ mod tests {
             order: SortOrderArg::Coordinate,
             threads: 1,
             compression_level: 6,
-            cell_tag: "CB".to_string(),
         };
 
         let result = merge.execute("test");
@@ -448,7 +439,6 @@ mod tests {
             order: SortOrderArg::Coordinate,
             threads: 1,
             compression_level: 6,
-            cell_tag: "CB".to_string(),
         };
 
         let result = merge.execute("test");

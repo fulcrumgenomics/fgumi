@@ -98,8 +98,8 @@ fgumi's `sort` command supports the same sort orders as fgbio:
 - `queryname` — sort by read name
 - `template-coordinate` — sort by template 5' positions (required input for `group`)
 
-For single-cell data, `fgumi sort --order template-coordinate --cell-tag CB` includes the cell
-barcode in the sort key so that templates from different cells at the same locus are not
+For single-cell data, `fgumi sort --order template-coordinate` automatically includes the `CB`
+cell barcode tag in the sort key so that templates from different cells at the same locus are not
 interleaved. fgbio's template-coordinate sort does not support this.
 
 ### Boolean Flag Values

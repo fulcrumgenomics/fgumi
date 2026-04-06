@@ -85,14 +85,6 @@ pub struct SimplexMetrics {
     /// Optional sample name or description for PDF plot titles.
     #[arg(long = "description")]
     pub description: Option<String>,
-
-    /// SAM tag containing the raw UMI sequence.
-    #[arg(long = "umi-tag", default_value = "RX")]
-    pub umi_tag: String,
-
-    /// SAM tag containing the molecular identifier (assigned by `group`).
-    #[arg(long = "mi-tag", default_value = "MI")]
-    pub mi_tag: String,
 }
 
 impl Command for SimplexMetrics {
@@ -134,8 +126,6 @@ impl Command for SimplexMetrics {
         let (total_template_count, fraction_template_counts) = process_templates_from_bam(
             &self.input,
             &intervals,
-            &self.mi_tag,
-            &self.umi_tag,
             fractions.len(),
             |group, fraction_counts| {
                 Self::process_coordinate_group(
@@ -494,8 +484,6 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
         cmd.execute("test")?;
 
@@ -552,8 +540,6 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
         cmd.execute("test")?;
 
@@ -578,12 +564,8 @@ mod tests {
             min_reads: 1,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
         assert_eq!(cmd.min_reads, 1);
-        assert_eq!(cmd.umi_tag, "RX");
-        assert_eq!(cmd.mi_tag, "MI");
     }
 
     #[test]

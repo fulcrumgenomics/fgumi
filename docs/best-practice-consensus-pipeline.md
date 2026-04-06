@@ -11,6 +11,22 @@ This pipeline uses only fgumi and a read aligner:
 
 Unlike fgbio-based pipelines, **no samtools is required** - fgumi provides native `fastq` and `sort` commands.
 
+## SAM Tag Policy
+
+fgumi always uses the SAM specification standard tags for UMIs, molecule identifiers, and cell barcodes. These tags are not configurable per-command:
+
+| Tag | Meaning | Written by |
+|-----|---------|-----------|
+| `RX` | Raw UMI sequence | `extract`, `correct` |
+| `QX` | UMI base quality scores | `extract` (with `--store-umi-quals`) |
+| `MI` | Molecule identifier (assigned group) | `group`, `dedup` |
+| `CB` | Cell barcode | `extract` |
+| `CY` | Cell barcode quality scores | `extract` (with `--store-cell-quals`) |
+
+If your upstream data uses non-standard tags, normalize them to the SAM spec values before entering the fgumi pipeline using a tool that rewrites per-record auxiliary tags (e.g. a custom preprocessing step with [pysam](https://pysam.readthedocs.io/) or [htslib](https://www.htslib.org/)). Note that `samtools reheader` only rewrites the SAM/BAM header and does **not** modify per-record auxiliary tags such as `RX`, `MI`, or `CB`.
+
+---
+
 ## Common Configuration Options
 
 ### Compression Level
@@ -100,7 +116,6 @@ fgumi extract \
 
 Key parameters:
 - `--read-structures`: Define UMI and template positions (e.g., `8M+T` = 8bp UMI + template)
-- `--umi-tag`: Tag for storing UMIs (default: `RX`)
 
 For dual-index UMIs (duplex sequencing), use paired read structures:
 

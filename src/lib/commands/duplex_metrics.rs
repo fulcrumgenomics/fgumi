@@ -111,14 +111,6 @@ pub struct DuplexMetrics {
     /// Optional sample name or description for PDF plot titles
     #[arg(long = "description")]
     pub description: Option<String>,
-
-    /// SAM tag containing the raw UMI sequence
-    #[arg(long = "umi-tag", default_value = "RX")]
-    pub umi_tag: String,
-
-    /// SAM tag containing the molecular identifier (assigned by `group`)
-    #[arg(long = "mi-tag", default_value = "MI")]
-    pub mi_tag: String,
 }
 
 impl Command for DuplexMetrics {
@@ -177,8 +169,6 @@ impl Command for DuplexMetrics {
         let (total_template_count, fraction_template_counts) = process_templates_from_bam(
             &self.input,
             &intervals,
-            &self.mi_tag,
-            &self.umi_tag,
             fractions.len(),
             |group, fraction_counts| {
                 Self::process_coordinate_group(
@@ -725,8 +715,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -788,8 +776,6 @@ mod tests {
             duplex_umi_counts: true,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -866,8 +852,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -972,8 +956,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -1100,8 +1082,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -1195,8 +1175,6 @@ mod tests {
                 duplex_umi_counts: false,
                 intervals: None,
                 description: None,
-                umi_tag: "RX".to_string(),
-                mi_tag: "MI".to_string(),
             };
 
             cmd.execute("test")?;
@@ -1224,8 +1202,6 @@ mod tests {
                 duplex_umi_counts: false,
                 intervals: None,
                 description: None,
-                umi_tag: "RX".to_string(),
-                mi_tag: "MI".to_string(),
             };
 
             cmd.execute("test")?;
@@ -1253,8 +1229,6 @@ mod tests {
                 duplex_umi_counts: false,
                 intervals: None,
                 description: None,
-                umi_tag: "RX".to_string(),
-                mi_tag: "MI".to_string(),
             };
 
             cmd.execute("test")?;
@@ -1379,8 +1353,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: Some(intervals_path),
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -1440,8 +1412,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -1646,8 +1616,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         // This should fail with an error about consensus BAM
@@ -1672,8 +1640,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         assert_eq!(metrics.min_ab_reads, 1);
@@ -1693,8 +1659,6 @@ mod tests {
             duplex_umi_counts: true,
             intervals: Some(PathBuf::from("intervals.bed")),
             description: Some("Test Sample".to_string()),
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         assert_eq!(metrics.min_ab_reads, 3);
@@ -1713,8 +1677,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         // The validation happens in execute(), check during command construction would be ideal
@@ -1946,8 +1908,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: Some(intervals_path),
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         cmd.execute("test")?;
@@ -2023,8 +1983,6 @@ mod tests {
             duplex_umi_counts: false,
             intervals: None,
             description: None,
-            umi_tag: "RX".to_string(),
-            mi_tag: "MI".to_string(),
         };
 
         // Should complete without panicking or errors

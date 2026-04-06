@@ -36,12 +36,13 @@ use crate::unified_pipeline::{
     BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
     serialize_bam_records_into,
 };
-use crate::validation::{string_to_tag, validate_file_exists, validate_tag};
+use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
 use fgoxide::io::DelimFile;
+
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::Flags;
@@ -1039,8 +1040,8 @@ is selected as the representative; all others are marked as duplicates.
 # Input Requirements
 
 - Must be processed with `fgumi zipper` (adds `pa` tag for secondary/supplementary reads)
-- Must be sorted with `fgumi sort --order template-coordinate` (use matching `--cell-tag` value)
-- UMI tags on reads (default: RX tag)
+- Must be sorted with `fgumi sort --order template-coordinate`
+- UMI tags on reads (RX tag), unless `--no-umi` is specified
 
 Note: Using `samtools sort` will NOT work correctly because it doesn't use the
 `pa` tag for template-coordinate ordering of secondary/supplementary reads.
@@ -1055,7 +1056,7 @@ Note: Using `samtools sort` will NOT work correctly because it doesn't use the
 If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same
 genomic position are partitioned by cell barcode before deduplication. This ensures that reads from
 different cells are never marked as duplicates of each other, even if they share a UMI sequence and
-mapping position. The cell barcode is read from the tag specified by `--cell-tag` (default: CB). No
+mapping position. The cell barcode is read from the standard `CB` tag. No
 correction or error-handling is performed on cell barcodes; they must be corrected upstream.
 "#
 )]
@@ -1075,22 +1076,6 @@ pub struct MarkDuplicates {
     /// Remove duplicates instead of just marking them
     #[arg(short = 'r', long = "remove-duplicates", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub remove_duplicates: bool,
-
-    /// The tag containing the raw UMI sequence
-    #[arg(short = 't', long = "raw-tag", default_value = "RX")]
-    pub raw_tag: String,
-
-    /// The output tag for the assigned molecule ID
-    #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
-    pub assign_tag: String,
-
-    /// SAM tag containing the cell barcode.
-    ///
-    /// When set, reads at the same genomic coordinates are partitioned by cell barcode before
-    /// deduplication, so reads from different cells are never grouped together even if they
-    /// share a UMI and position. No correction is performed on the cell barcode itself.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: String,
 
     /// Minimum mapping quality for a read to be included
     #[arg(short = 'q', long = "min-map-q")]
@@ -1199,10 +1184,8 @@ impl Command for MarkDuplicates {
             bail!(
                 "Input BAM must be template-coordinate sorted.\n\n\
                 To prepare your BAM file, run:\n  \
-                fgumi zipper -u unmapped.bam -r reference.fa -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate \
-                --cell-tag {}",
-                self.cell_tag
+                fgumi zipper -i mapped.bam -u unmapped.bam -r reference.fa -o merged.bam\n  \
+                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate"
             );
         }
         info!("Template-coordinate sorted");
@@ -1210,18 +1193,10 @@ impl Command for MarkDuplicates {
         // Add @PG record
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        // Prepare tags
-        if self.raw_tag.len() != 2 {
-            bail!("Raw tag must be exactly 2 characters");
-        }
-        let raw_tag: [u8; 2] = {
-            let bytes = self.raw_tag.as_bytes();
-            [bytes[0], bytes[1]]
-        };
-
-        let cell_tag = string_to_tag(&self.cell_tag, "cell-tag")?;
-
-        let assign_tag_bytes: [u8; 2] = validate_tag(&self.assign_tag, "assign-tag")?;
+        // Tag constants per SAM specification
+        let raw_tag: [u8; 2] = *b"RX";
+        let cell_tag = Tag::new(b'C', b'B');
+        let assign_tag_bytes: [u8; 2] = *b"MI";
 
         let filter_config = DedupFilterConfig {
             umi_tag: raw_tag,
@@ -1410,12 +1385,10 @@ impl Command for MarkDuplicates {
                 secondary and supplementary alignments. This tag is added by \
                 `fgumi zipper` during the merge of unmapped and mapped BAMs.\n\n\
                 To fix this, re-run your pipeline starting from `fgumi zipper`:\n  \
-                fgumi zipper --unmapped unmapped.bam --mapped aligned.bam -o merged.bam\n  \
-                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate \
-                --cell-tag {}\n  \
+                fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
+                fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
                 fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_pa_tag,
-                self.cell_tag
+                final_metrics.missing_pa_tag
             );
         }
 

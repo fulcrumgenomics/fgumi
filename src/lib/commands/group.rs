@@ -33,7 +33,7 @@ use fgoxide::io::DelimFile;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 #[cfg(feature = "memory-debug")]
 use crate::unified_pipeline::MemoryEstimate;
-use crate::validation::{string_to_tag, validate_file_exists};
+use crate::validation::validate_file_exists;
 use crate::vendored::bam_codec::encode_record_buf;
 use log::{info, warn};
 use noodles::sam;
@@ -668,12 +668,13 @@ Accepts reads in any order (including unsorted) and outputs reads sorted by:
 
    1. The lower genome coordinate of the two outer ends of the templates (strand-aware)
    2. The sequencing library
-   3. The assigned UMI tag
-   4. Read Name
+   3. The cell barcode (CB tag, if present)
+   4. The assigned UMI tag
+   5. Read Name
 
 It is recommended to sort the reads into template-coordinate order prior to running
 this tool to avoid re-sorting the input. Use `fgumi sort --order template-coordinate`
-(with matching `--cell-tag`) for the pre-sorting. The output will always be written
+for the pre-sorting. The output will always be written
 in template-coordinate order.
 
 During grouping, reads and templates are filtered out as follows:
@@ -721,7 +722,7 @@ directly settable on the command line.
 If the input data contains cell barcodes (e.g. from single-cell sequencing), reads at the same
 genomic position are partitioned by cell barcode before UMI grouping. This ensures that reads from
 different cells are never grouped together, even if they share a UMI sequence and mapping position.
-The cell barcode is read from the tag specified by `--cell-tag` (default: CB). No correction or
+The cell barcode is read from the standard `CB` tag. No correction or
 error-handling is performed on cell barcodes; they must be corrected upstream.
 
 Multi-threaded operation is supported via --threads N which spawns exactly N threads.
@@ -750,22 +751,6 @@ pub struct GroupReadsByUmi {
     /// `--family-size-histogram` and `--grouping-metrics`.
     #[arg(short = 'M', long = "metrics")]
     pub metrics: Option<PathBuf>,
-
-    /// The tag containing the raw UMI
-    #[arg(short = 't', long = "raw-tag", default_value = "RX")]
-    pub raw_tag: String,
-
-    /// The output tag for UMI grouping
-    #[arg(short = 'T', long = "assign-tag", default_value = "MI")]
-    pub assign_tag: String,
-
-    /// SAM tag containing the cell barcode.
-    ///
-    /// When set, reads at the same genomic coordinates are partitioned by cell barcode before
-    /// UMI assignment, so reads from different cells are never grouped together even if they
-    /// share a UMI and position. No correction is performed on the cell barcode itself.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: String,
 
     /// Minimum mapping quality for mapped reads
     #[arg(short = 'm', long = "min-map-q")]
@@ -988,9 +973,7 @@ impl Command for GroupReadsByUmi {
                 bail!(
                     "Input BAM must be template-coordinate sorted.\n\n\
                     To sort your BAM file, run:\n  \
-                    fgumi sort -i input.bam -o sorted.bam --order template-coordinate \
-                    --cell-tag {}",
-                    self.cell_tag
+                    fgumi sort -i input.bam -o sorted.bam --order template-coordinate"
                 );
             }
         }
@@ -1005,23 +988,10 @@ impl Command for GroupReadsByUmi {
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        // Prepare raw tag as byte array
-        if self.raw_tag.len() != 2 {
-            bail!("Raw tag must be length two.")
-        }
-        let raw_tag: [u8; 2] = {
-            let bytes = self.raw_tag.as_bytes();
-            [bytes[0], bytes[1]]
-        };
-
-        // Prepare cell tag
-        let cell_tag = string_to_tag(&self.cell_tag, "cell-tag")?;
-
-        // Prepare assign tag for MI updates
-        let assign_tag_bytes: [u8; 2] = {
-            let bytes = self.assign_tag.as_bytes();
-            [bytes[0], bytes[1]]
-        };
+        // Tag constants per SAM specification
+        let raw_tag: [u8; 2] = *b"RX";
+        let cell_tag = Tag::new(b'C', b'B');
+        let assign_tag_bytes: [u8; 2] = *b"MI";
 
         // Create filter configuration
         let filter_config = GroupFilterConfig {
@@ -1900,9 +1870,6 @@ mod tests {
             family_size_histogram: None,
             grouping_metrics: None,
             metrics: None,
-            raw_tag: "RX".to_string(),
-            assign_tag: "MI".to_string(),
-            cell_tag: "CB".to_string(),
             min_map_q: None,
             include_non_pf_reads: false,
             strategy,

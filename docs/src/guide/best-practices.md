@@ -113,7 +113,6 @@ fgumi extract \
 
 Key parameters:
 - `--read-structures`: Define UMI and template positions (e.g., `8M+T` = 8bp UMI + template)
-- `--umi-tag`: Tag for storing UMIs (default: `RX`)
 
 For dual-index UMIs (duplex sequencing), use paired read structures:
 
@@ -178,15 +177,14 @@ fgumi sort \
   --max-memory 4G
 ```
 
-For single-cell data, include `--cell-tag CB` so that templates from different cells at the
-same locus are kept separate throughout sorting, merging, and grouping:
+For single-cell data, the `CB` cell barcode tag is automatically included in the
+template-coordinate sort key, keeping templates from different cells at the same locus separate:
 
 ```bash
 fgumi sort \
   --input aligned.bam \
   --output sorted.bam \
   --order template-coordinate \
-  --cell-tag CB \
   --threads 8
 ```
 
@@ -211,7 +209,7 @@ fgumi merge \
   --output merged.bam
 ```
 
-For single-cell data, pass `--cell-tag CB` to include the cell barcode in the merge key.
+For single-cell data, the `CB` cell barcode tag is automatically included in the merge key.
 
 All inputs must be sorted in the same order as `--order`. Do not use `samtools merge` for
 template-coordinate BAMs — it does not understand the `pa` tag that `fgumi sort` adds, and

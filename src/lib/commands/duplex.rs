@@ -36,11 +36,12 @@ use crate::umi::extract_mi_base;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
-use crate::validation::{optional_string_to_tag, validate_file_exists};
+use crate::validation::validate_file_exists;
 use crossbeam_queue::SegQueue;
 use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::Header;
+use noodles::sam::alignment::record::data::field::Tag;
 use std::io;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -184,10 +185,6 @@ pub struct Duplex {
     #[arg(long = "max-reads-per-strand")]
     pub max_reads_per_strand: Option<usize>,
 
-    /// SAM tag containing the cell barcode
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: Option<String>,
-
     /// Scheduler and pipeline stats options
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -202,14 +199,15 @@ impl Command for Duplex {
     ///
     /// This method processes grouped reads with MI tags ending in /A and /B suffixes to generate
     /// duplex consensus reads. The process involves:
-    /// 1. Parsing and validating the cell tag parameter
-    /// 2. Creating a duplex consensus caller with specified parameters
-    /// 3. Opening input BAM and creating output BAM writer
-    /// 4. Processing templates through the template iterator
-    /// 5. Calling consensus for each template
-    /// 6. Writing consensus reads to output
-    /// 7. Optionally writing rejected reads to a separate BAM
-    /// 8. Logging statistics
+    /// 1. Creating a duplex consensus caller with specified parameters
+    /// 2. Opening input BAM and creating output BAM writer
+    /// 3. Processing templates through the template iterator
+    /// 4. Calling consensus for each template
+    /// 5. Writing consensus reads to output
+    /// 6. Optionally writing rejected reads to a separate BAM
+    /// 7. Logging statistics
+    ///
+    /// The cell barcode tag is fixed to the SAM standard `CB` tag.
     ///
     /// # Returns
     ///
@@ -218,7 +216,6 @@ impl Command for Duplex {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Cell tag is not exactly 2 characters
     /// - Input BAM cannot be opened or read
     /// - Output BAM cannot be created or written
     /// - Template processing encounters errors
@@ -254,7 +251,6 @@ impl Command for Duplex {
     ///     compression: CompressionOptions::default(),
     ///     min_reads: vec![1],
     ///     max_reads_per_strand: None,
-    ///     cell_tag: None,
     ///     scheduler_opts: SchedulerOptions::default(),
     /// };
     ///
@@ -283,7 +279,6 @@ impl Command for Duplex {
         info!("  Reader threads: {reader_threads}");
         info!("  Trim reads: {}", self.consensus.trim);
         info!("  Max reads per strand: {:?}", self.max_reads_per_strand);
-        info!("  Cell tag: {:?}", self.cell_tag);
         info!(
             "  Consensus call overlapping bases: {}",
             self.overlapping.consensus_call_overlapping_bases
@@ -298,8 +293,8 @@ impl Command for Duplex {
         // Use library name from header if no prefix is specified (like fgbio)
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
-        // Parse cell_tag if provided
-        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        // Cell barcode tag is fixed to the SAM standard CB tag
+        let cell_tag = Tag::new(b'C', b'B');
 
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
@@ -365,7 +360,7 @@ impl Command for Duplex {
             self.consensus.output_per_base_tags,
             self.consensus.trim,
             self.max_reads_per_strand,
-            cell_tag,
+            Some(cell_tag),
             track_rejects,
             self.consensus.error_rate_pre_umi,
             self.consensus.error_rate_post_umi,
@@ -416,7 +411,7 @@ impl Command for Duplex {
                 let mi_str = String::from_utf8_lossy(mi_bytes);
                 extract_mi_base(&mi_str).to_string()
             })
-            .with_cell_tag(cell_tag.map(|ct| *ct.as_ref()));
+            .with_cell_tag(Some(*b"CB"));
         // Single-threaded processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -549,7 +544,7 @@ impl Duplex {
         let error_rate_post_umi = self.consensus.error_rate_post_umi;
         let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
         let read_group_id = self.read_group.read_group_id.clone();
-        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        let cell_tag = Tag::new(b'C', b'B');
         let batch_size = 100; // MI groups per batch
 
         // Record filter for duplex on raw bytes: skip secondary/supplementary, keep mapped or mate-mapped
@@ -579,11 +574,7 @@ impl Duplex {
 
         // Set raw-byte mode GroupKeyConfig so decode step skips noodles parsing
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(if let Some(ct) = cell_tag {
-            GroupKeyConfig::new_raw(library_index, ct)
-        } else {
-            GroupKeyConfig::new_raw_no_cell(library_index)
-        });
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -592,14 +583,17 @@ impl Duplex {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create RawMiGrouper with filter and transform ==========
+            // ========== grouper_fn: Create RawMiGrouper with filter, transform, and cell tag ==========
             move |_header: &Header| {
-                Box::new(RawMiGrouper::with_filter_and_transform(
-                    "MI",
-                    batch_size,
-                    record_filter,
-                    mi_transform,
-                )) as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
+                Box::new(
+                    RawMiGrouper::with_filter_and_transform(
+                        "MI",
+                        batch_size,
+                        record_filter,
+                        mi_transform,
+                    )
+                    .with_cell_tag(Some(*b"CB")),
+                ) as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
             },
             // ========== process_fn: Duplex consensus calling ==========
             move |batch: RawMiGroupBatch| -> io::Result<DuplexProcessedBatch> {
@@ -612,7 +606,7 @@ impl Duplex {
                     output_per_base_tags,
                     trim,
                     max_reads_per_strand,
-                    cell_tag,
+                    Some(cell_tag),
                     track_rejects,
                     error_rate_pre_umi,
                     error_rate_post_umi,
@@ -872,7 +866,6 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             min_reads: vec![1],
             max_reads_per_strand: None,
-            cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         }
@@ -972,7 +965,7 @@ mod tests {
             builder = builder.tag("RX", rx);
         }
         if let Some(cell) = cell_tag {
-            builder = builder.tag("XX", cell);
+            builder = builder.tag("CB", cell);
         }
 
         builder.build()
@@ -1400,9 +1393,9 @@ mod tests {
             r1.data_mut().insert(rx, Value::String(b"CCG-AAT".into()));
             r2.data_mut().insert(rx, Value::String(b"CCG-AAT".into()));
 
-            let xx = Tag::from([b'X', b'X']);
-            r1.data_mut().insert(xx, Value::String(b"CELLBC".into()));
-            r2.data_mut().insert(xx, Value::String(b"CELLBC".into()));
+            let cb = Tag::from([b'C', b'B']);
+            r1.data_mut().insert(cb, Value::String(b"CELLBC".into()));
+            r2.data_mut().insert(cb, Value::String(b"CELLBC".into()));
 
             records.push(r1);
             records.push(r2);
@@ -1411,17 +1404,16 @@ mod tests {
         let input = create_test_bam(records)?;
         let paths = TestPaths::new()?;
 
-        let mut cmd = create_duplex_with_paths(input.path().to_path_buf(), paths.output.clone());
-        cmd.cell_tag = Some("XX".to_string()); // Enable cell barcode tracking
+        let cmd = create_duplex_with_paths(input.path().to_path_buf(), paths.output.clone());
 
         cmd.execute("test")?;
 
         let output_records = read_bam_records(&paths.output)?;
         assert_eq!(output_records.len(), 2, "Should have 2 consensus reads");
 
-        // Check that cell barcode is preserved
+        // Check that cell barcode (CB) is preserved in the consensus output
         for record in &output_records {
-            let cell_bc = get_string_tag(record, "XX");
+            let cell_bc = get_string_tag(record, "CB");
             assert_eq!(cell_bc, Some("CELLBC".to_string()), "Cell barcode should be preserved");
         }
 

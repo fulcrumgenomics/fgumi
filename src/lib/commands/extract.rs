@@ -87,6 +87,16 @@ enum CompressionFormat {
     Plain,
 }
 
+/// Returns true if `tag` is a valid SAM optional-field tag name.
+///
+/// Per the SAM v1.6 specification, tag names must match `/[A-Za-z][A-Za-z0-9]/`:
+/// the first character must be ASCII alphabetic and the second ASCII alphanumeric.
+/// Multi-byte (UTF-8) characters are rejected because `as_bytes()` will have length > 2.
+fn is_valid_sam_tag(tag: &str) -> bool {
+    let b = tag.as_bytes();
+    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1].is_ascii_alphanumeric()
+}
+
 /// Detect the compression format of a file by reading its header.
 ///
 /// BGZF files are identified by:
@@ -292,7 +302,7 @@ impl QualityEncoding {
 ///
 /// UMIs may be extracted from the read sequences, the read names, or both.  If `--extract-umis-from-read-names` is
 /// specified, any UMIs present in the read names are extracted; read names are expected to be `:`-separated with
-/// any UMIs present in the 8th field.  If this option is specified, the `--umi-qual-tag` option may not be used as
+/// any UMIs present in the 8th field.  If this option is specified, `--store-umi-quals` may not be used as
 /// qualities are not available for UMIs in the read name. If UMI segments are present in the read structures those
 /// will also be extracted.  If UMIs are present in both, the final UMIs are constructed by first taking the UMIs
 /// from the read names, then adding a hyphen, then the UMIs extracted from the reads.
@@ -388,21 +398,13 @@ pub struct Extract {
     #[arg(long, short = 'r', num_args = 0..)]
     read_structures: Vec<ReadStructure>,
 
-    /// Tag in which to store molecular barcodes/UMIs
-    #[arg(long, short = 'u', default_value = "RX")]
-    umi_tag: String,
+    /// Store UMI base quality scores in the QX SAM tag
+    #[arg(long, short = 'q', conflicts_with = "extract_umis_from_read_names")]
+    store_umi_quals: bool,
 
-    /// Tag in which to store molecular barcode/UMI qualities
-    #[arg(long, short = 'q')]
-    umi_qual_tag: Option<String>,
-
-    /// SAM tag containing the cell barcode
-    #[arg(long = "cell-tag", short = 'c', default_value = "CB")]
-    cell_tag: String,
-
-    /// Tag in which to store the cellular barcode qualities
+    /// Store cell barcode base quality scores in the CY SAM tag
     #[arg(long, short = 'C')]
-    cell_qual_tag: Option<String>,
+    store_cell_quals: bool,
 
     /// Store the sample barcode qualities in the QT Tag
     #[arg(long, short = 'Q')]
@@ -519,8 +521,8 @@ impl Extract {
         );
 
         ensure!(
-            !self.extract_umis_from_read_names || self.umi_qual_tag.is_none(),
-            "Cannot extract UMI qualities when also extracting UMI from read names."
+            !self.extract_umis_from_read_names || !self.store_umi_quals,
+            "Cannot store UMI qualities (--store-umi-quals) when also extracting UMIs from read names (--extract-umis-from-read-names)."
         );
 
         // Validate threads parameter (ThreadingOptions handles minimum of 1 internally)
@@ -535,29 +537,27 @@ impl Extract {
             ensure!(!rs.segments().is_empty(), "Read structure {} is empty", i + 1);
         }
 
-        // Validate tag lengths (must be exactly 2 ASCII characters per SAM spec)
-        ensure!(self.umi_tag.len() == 2, "UMI tag must be exactly 2 characters: {}", self.umi_tag);
-        ensure!(
-            self.cell_tag.len() == 2,
-            "Cell tag must be exactly 2 characters: {}",
-            self.cell_tag
-        );
-        if let Some(ref tag) = self.umi_qual_tag {
-            ensure!(tag.len() == 2, "UMI quality tag must be exactly 2 characters: {tag}");
-        }
-        if let Some(ref tag) = self.cell_qual_tag {
-            ensure!(tag.len() == 2, "Cell quality tag must be exactly 2 characters: {tag}");
-        }
-
-        // Validate single_tag is 2 characters if specified
+        // Validate single_tag conforms to SAM spec (/[A-Za-z][A-Za-z0-9]/) and is not reserved
+        const RESERVED_TAGS: &[&str] = &["RX", "MI", "CB", "QX", "CY", "BC", "QT", "RG"];
         if let Some(ref tag) = self.single_tag {
-            ensure!(tag.len() == 2, "Single tag must be exactly 2 characters: {tag}");
-            ensure!(tag != &self.umi_tag, "Single tag cannot be the same as umi-tag: {tag}");
+            ensure!(
+                is_valid_sam_tag(tag),
+                "Single tag must be a valid two-character SAM tag ([A-Za-z][A-Za-z0-9]): {tag}"
+            );
+            let tag_upper = tag.to_ascii_uppercase();
+            ensure!(
+                !RESERVED_TAGS.contains(&tag_upper.as_str()),
+                "Single tag cannot use a reserved BAM tag: {tag}"
+            );
         }
 
-        // Validate clipping_attribute is 2 characters if specified
+        // Validate clipping_attribute conforms to SAM spec (/[A-Za-z][A-Za-z0-9]/)
         if let Some(ref tag) = self.clipping_attribute {
-            ensure!(tag.len() == 2, "Clipping attribute must be exactly 2 characters: {tag}");
+            ensure!(
+                is_valid_sam_tag(tag),
+                "Clipping attribute must be a valid two-character SAM tag ([A-Za-z][A-Za-z0-9]): \
+                 {tag}"
+            );
         }
 
         // Note: clipping_attribute doesn't apply to FASTQ input (no existing clipping to adjust)
@@ -788,10 +788,8 @@ impl Extract {
         };
 
         let num_templates = templates.len();
-        let umi_tag: &[u8; 2] =
-            self.umi_tag.as_bytes().try_into().expect("umi_tag must be 2 bytes");
-        let cell_tag: &[u8; 2] =
-            self.cell_tag.as_bytes().try_into().expect("cell_tag must be 2 bytes");
+        let umi_tag: &[u8; 2] = b"RX";
+        let cell_tag: &[u8; 2] = b"CB";
 
         for (index, template) in templates.iter().enumerate() {
             // Compute flags for unmapped reads
@@ -836,12 +834,8 @@ impl Extract {
                 builder.append_string_tag(cell_tag, cell_barcode_bs.as_bytes());
             }
 
-            if !cell_quals_bs.is_empty() {
-                if let Some(ref qual_tag) = self.cell_qual_tag {
-                    let qt: &[u8; 2] =
-                        qual_tag.as_bytes().try_into().expect("cell_qual_tag must be 2 bytes");
-                    builder.append_string_tag(qt, cell_quals_bs.as_bytes());
-                }
+            if !cell_quals_bs.is_empty() && self.store_cell_quals {
+                builder.append_string_tag(b"CY", cell_quals_bs.as_bytes());
             }
 
             // Sample barcode
@@ -865,12 +859,8 @@ impl Extract {
                 }
 
                 // Only add UMI qualities if not extracted from read names
-                if umi_from_name.is_none() && !umi_qual_bs.is_empty() {
-                    if let Some(ref qual_tag) = self.umi_qual_tag {
-                        let qt: &[u8; 2] =
-                            qual_tag.as_bytes().try_into().expect("umi_qual_tag must be 2 bytes");
-                        builder.append_string_tag(qt, umi_qual_bs.as_bytes());
-                    }
+                if umi_from_name.is_none() && !umi_qual_bs.is_empty() && self.store_umi_quals {
+                    builder.append_string_tag(b"QX", umi_qual_bs.as_bytes());
                 }
             }
 
@@ -978,16 +968,8 @@ impl Extract {
         // Build config capturing all user options for the pipeline closure
         let extract_config = ExtractConfig {
             read_group_id: self.read_group_id.clone(),
-            umi_tag: self.umi_tag.as_bytes().try_into().expect("validated in validate()"),
-            cell_tag: self.cell_tag.as_bytes().try_into().expect("validated in validate()"),
-            umi_qual_tag: self
-                .umi_qual_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
-            cell_qual_tag: self
-                .cell_qual_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
+            store_umi_quals: self.store_umi_quals,
+            store_cell_quals: self.store_cell_quals,
             single_tag: self
                 .single_tag
                 .as_ref()
@@ -1081,12 +1063,11 @@ impl Extract {
 /// Cloneable config for the extract pipeline closure, capturing all user options
 /// needed by `make_raw_records_static` so they aren't hardcoded.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct ExtractConfig {
     read_group_id: String,
-    umi_tag: [u8; 2],
-    cell_tag: [u8; 2],
-    umi_qual_tag: Option<[u8; 2]>,
-    cell_qual_tag: Option<[u8; 2]>,
+    store_umi_quals: bool,
+    store_cell_quals: bool,
     single_tag: Option<[u8; 2]>,
     annotate_read_names: bool,
     extract_umis_from_read_names: bool,
@@ -1192,13 +1173,11 @@ fn make_raw_records_static(
 
         // Cell barcode
         if !cell_barcode_bs.is_empty() {
-            builder.append_string_tag(&cfg.cell_tag, cell_barcode_bs.as_bytes());
+            builder.append_string_tag(b"CB", cell_barcode_bs.as_bytes());
         }
 
-        if !cell_quals_bs.is_empty() {
-            if let Some(ref qt) = cfg.cell_qual_tag {
-                builder.append_string_tag(qt, cell_quals_bs.as_bytes());
-            }
+        if !cell_quals_bs.is_empty() && cfg.store_cell_quals {
+            builder.append_string_tag(b"CY", cell_quals_bs.as_bytes());
         }
 
         // Sample barcode
@@ -1212,7 +1191,7 @@ fn make_raw_records_static(
 
         // UMI
         if !final_umi_bs.is_empty() {
-            builder.append_string_tag(&cfg.umi_tag, final_umi_bs.as_bytes());
+            builder.append_string_tag(b"RX", final_umi_bs.as_bytes());
 
             // Single tag for all concatenated UMIs (if specified)
             if let Some(ref st) = cfg.single_tag {
@@ -1220,10 +1199,8 @@ fn make_raw_records_static(
             }
 
             // Only add UMI qualities if not extracted from read names
-            if umi_from_name.is_none() && !umi_qual_bs.is_empty() {
-                if let Some(ref qt) = cfg.umi_qual_tag {
-                    builder.append_string_tag(qt, umi_qual_bs.as_bytes());
-                }
+            if umi_from_name.is_none() && !umi_qual_bs.is_empty() && cfg.store_umi_quals {
+                builder.append_string_tag(b"QX", umi_qual_bs.as_bytes());
             }
         }
 
@@ -1423,10 +1400,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1479,10 +1454,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1539,10 +1512,8 @@ mod tests {
             inputs: vec![r1, r2],
             output: output.clone(),
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: Some("QX".to_string()),
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: true,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1589,10 +1560,8 @@ mod tests {
                 ReadStructure::from_str("4M+T").expect("valid read structure"),
                 ReadStructure::from_str("+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1648,10 +1617,8 @@ mod tests {
                 ReadStructure::from_str("4M+T").expect("valid read structure"),
                 ReadStructure::from_str("+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: Some("QX".to_string()),
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: true,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1700,10 +1667,8 @@ mod tests {
                 ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
                 ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1759,10 +1724,8 @@ mod tests {
                 ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
                 ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: Some("QX".to_string()),
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: true,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1815,10 +1778,8 @@ mod tests {
                 ReadStructure::from_str("4B").expect("valid read structure"),
                 ReadStructure::from_str("4M").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1878,10 +1839,8 @@ mod tests {
                 ReadStructure::from_str("4B").expect("valid read structure"),
                 ReadStructure::from_str("4M").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: Some("QX".to_string()),
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: true,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1926,10 +1885,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("10T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -1997,10 +1954,8 @@ mod tests {
                 ReadStructure::from_str("+T").expect("valid read structure"), // Variable length to allow zero-length
                 ReadStructure::from_str("+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2064,10 +2019,8 @@ mod tests {
             read_structures: vec![
                 ReadStructure::from_str("10T").expect("valid read structure"), // Fixed length - should error
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2118,10 +2071,8 @@ mod tests {
             read_structures: vec![
                 ReadStructure::from_str("3B3M3B+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: true,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2165,10 +2116,8 @@ mod tests {
             read_structures: vec![
                 ReadStructure::from_str("3B3M3B+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2219,10 +2168,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: true,
             annotate_read_names: false,
@@ -2274,10 +2221,8 @@ mod tests {
             read_structures: vec![
                 ReadStructure::from_str("2M1S2M+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: true,
             annotate_read_names: false,
@@ -2328,10 +2273,8 @@ mod tests {
             read_structures: vec![
                 ReadStructure::from_str("2C1S2C+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: Some("CY".to_string()),
+            store_umi_quals: false,
+            store_cell_quals: true,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2377,10 +2320,8 @@ mod tests {
             inputs: vec![r1, r2],
             output,
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2423,10 +2364,8 @@ mod tests {
             inputs: vec![r1, r2],
             output,
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2467,10 +2406,8 @@ mod tests {
                 ReadStructure::from_str("+T").expect("valid read structure"),
                 ReadStructure::from_str("+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2511,10 +2448,8 @@ mod tests {
                 ReadStructure::from_str("4M+T").expect("valid read structure"),
                 ReadStructure::from_str("+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Enable read name annotation
@@ -2563,10 +2498,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Enable read name annotation
@@ -2614,10 +2547,8 @@ mod tests {
                 ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
                 ReadStructure::from_str("3B3M3B5T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2657,7 +2588,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Single tag must be exactly 2 characters")]
+    #[should_panic(expected = "Single tag must be a valid two-character SAM tag")]
     fn test_single_tag_invalid_length() {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
@@ -2667,10 +2598,8 @@ mod tests {
             inputs: vec![r1],
             output,
             read_structures: vec![ReadStructure::from_str("4M+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2698,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Single tag cannot be the same as umi-tag")]
+    #[should_panic(expected = "Single tag cannot use a reserved BAM tag: RX")]
     fn test_single_tag_same_as_umi_tag() {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
@@ -2708,10 +2637,8 @@ mod tests {
             inputs: vec![r1],
             output,
             read_structures: vec![ReadStructure::from_str("4M+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2752,10 +2679,8 @@ mod tests {
                 ReadStructure::from_str("4M+T").expect("valid read structure"),
                 ReadStructure::from_str("+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Both features enabled
@@ -2810,10 +2735,8 @@ mod tests {
             inputs: vec![r1],
             output,
             read_structures: vec![ReadStructure::from_str("8M8S+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -2863,10 +2786,8 @@ mod tests {
             read_structures: vec![
                 ReadStructure::from_str("4M4B4S+T").expect("valid read structure"),
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3076,10 +2997,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3141,10 +3060,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3197,10 +3114,8 @@ mod tests {
                 ReadStructure::from_str("4M4S+T").expect("valid read structure"), // R1: 4M UMI, 4S skip, rest template
                 ReadStructure::from_str("4M+T").expect("valid read structure"), // R2: 4M UMI, rest template
             ],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3268,10 +3183,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("5M+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3331,10 +3244,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("5M+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3388,10 +3299,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("5B+T").expect("valid read structure")], // 5B for barcode
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: Some("QX".to_string()),
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: Some("CY".to_string()),
+            store_umi_quals: true,
+            store_cell_quals: true,
             store_sample_barcode_qualities: true,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3438,10 +3347,8 @@ mod tests {
             inputs: vec![fastq1, fastq2],
             output: output.clone(),
             read_structures: vec![],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3569,10 +3476,8 @@ mod tests {
             inputs: vec![r1],
             output: output.clone(),
             read_structures: vec![ReadStructure::from_str("5M+T").expect("valid read structure")],
-            umi_tag: "RX".to_string(),
-            umi_qual_tag: None,
-            cell_tag: "CB".to_string(),
-            cell_qual_tag: None,
+            store_umi_quals: false,
+            store_cell_quals: false,
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
@@ -3605,6 +3510,67 @@ mod tests {
         assert_eq!(records[0].sequence().as_ref(), b"CGTACGT");
         assert_eq!(records[1].sequence().as_ref(), b"TTTTTTT");
         assert_eq!(records[2].sequence().as_ref(), b"GGGAAAA");
+
+        Ok(())
+    }
+
+    /// Verifies that the threaded pipeline path emits the same tags (RX, QX, RG) as the
+    /// single-threaded path, ensuring `make_raw_records_static` stays in sync with
+    /// `make_raw_records`.
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::threaded(ThreadingOptions::new(2))]
+    fn test_threading_modes_emit_correct_tags(#[case] threading: ThreadingOptions) -> Result<()> {
+        let tmp = TempDir::new()?;
+        let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs: vec![r1],
+            output: output.clone(),
+            read_structures: vec![ReadStructure::from_str("4M+T").expect("valid read structure")],
+            store_umi_quals: true,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: false,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "RG1".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading,
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        extract.execute("test")?;
+
+        let records = read_bam_records(&output);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+
+        // RX tag: UMI sequence "ACGT"
+        let rx = get_tag_string(record, "RX");
+        assert_eq!(rx.as_deref(), Some("ACGT"), "RX tag should contain the extracted UMI");
+
+        // QX tag: UMI qualities from "IIII" (Phred+33 = 40)
+        let qx = get_tag_string(record, "QX");
+        assert!(qx.is_some(), "QX tag should be present when store_umi_quals is true");
+
+        // RG tag
+        let rg = get_tag_string(record, "RG");
+        assert_eq!(rg.as_deref(), Some("RG1"), "RG tag should match read_group_id");
 
         Ok(())
     }
