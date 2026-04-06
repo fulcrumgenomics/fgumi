@@ -12,6 +12,7 @@
 use crate::sort::bam_fields;
 use crate::sort::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::sort::radix::bytes_needed_u64;
+use crate::sort::segmented_buf::SegmentedBuf;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 
@@ -141,13 +142,16 @@ const HEADER_SIZE: usize = std::mem::size_of::<InlineHeader>(); // 16 bytes
 /// An index array of `RecordRef` is maintained for sorting.
 /// Sorting only reorders the index; records stay in place.
 pub struct RecordBuffer {
-    /// Raw byte storage for all records (headers + BAM data).
-    data: Vec<u8>,
+    /// Segmented byte storage for all records (headers + BAM data).
+    data: SegmentedBuf,
     /// Index of record references for sorting.
     refs: Vec<RecordRef>,
     /// Number of reference sequences (for unmapped handling).
     nref: u32,
 }
+
+/// Segment size for `RecordBuffer`'s `SegmentedBuf`: 256 MiB.
+const RECORD_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
 impl RecordBuffer {
     /// Create a new buffer with estimated capacity.
@@ -159,7 +163,10 @@ impl RecordBuffer {
     #[must_use]
     pub fn with_capacity(estimated_records: usize, estimated_bytes: usize, nref: u32) -> Self {
         Self {
-            data: Vec::with_capacity(estimated_bytes + estimated_records * HEADER_SIZE),
+            data: SegmentedBuf::with_capacity(
+                estimated_bytes + estimated_records * HEADER_SIZE,
+                RECORD_SEGMENT_SIZE,
+            ),
             refs: Vec::with_capacity(estimated_records),
             nref,
         }
@@ -169,30 +176,52 @@ impl RecordBuffer {
     ///
     /// Extracts the sort key inline from raw BAM bytes (zero-copy).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the record length exceeds `u32::MAX`.
+    /// Returns an error if the record (plus header) exceeds the segment size
+    /// (256 MiB) or if the record length exceeds `u32::MAX`.
     #[inline]
-    pub fn push_coordinate(&mut self, record: &[u8]) {
-        let offset = self.data.len() as u64;
-        let len = u32::try_from(record.len()).expect("record length exceeds u32::MAX");
+    pub fn push_coordinate(&mut self, record: &[u8]) -> anyhow::Result<()> {
+        // BAM fixed-length block is 32 bytes; coordinate fields end at offset 15.
+        const MIN_BAM_RECORD_LEN: usize = 16;
+        anyhow::ensure!(
+            record.len() >= MIN_BAM_RECORD_LEN,
+            "BAM record is truncated: need at least {} bytes to extract coordinate fields, got {}",
+            MIN_BAM_RECORD_LEN,
+            record.len(),
+        );
+
+        let total_bytes = HEADER_SIZE + record.len();
+        anyhow::ensure!(
+            total_bytes <= RECORD_SEGMENT_SIZE,
+            "BAM record of {} bytes (+ {} byte header) exceeds segment size of {} bytes; \
+             this is likely a malformed BAM file",
+            record.len(),
+            HEADER_SIZE,
+            RECORD_SEGMENT_SIZE,
+        );
+        let len = u32::try_from(record.len())
+            .map_err(|_| anyhow::anyhow!("record length {} exceeds u32::MAX", record.len()))?;
 
         // Extract sort key from raw BAM bytes
         let sort_key = extract_coordinate_key_inline(record, self.nref);
 
+        // Reserve contiguous space for header + record
+        let total_bytes = HEADER_SIZE + record.len();
+        let offset = self.data.reserve_contiguous(total_bytes) as u64;
+
         // Write inline header (16 bytes)
         let header = InlineHeader { sort_key, record_len: len, padding: 0 };
-
-        // Extend data with header bytes
-        self.data.extend_from_slice(&header.sort_key.to_le_bytes());
-        self.data.extend_from_slice(&header.record_len.to_le_bytes());
-        self.data.extend_from_slice(&header.padding.to_le_bytes());
+        self.data.extend_in_place(&header.sort_key.to_le_bytes());
+        self.data.extend_in_place(&header.record_len.to_le_bytes());
+        self.data.extend_in_place(&header.padding.to_le_bytes());
 
         // Write raw BAM data
-        self.data.extend_from_slice(record);
+        self.data.extend_in_place(record);
 
         // Add to index
         self.refs.push(RecordRef { sort_key, offset, len, padding: 0 });
+        Ok(())
     }
 
     /// Sort the index by key (records stay in place).
@@ -267,9 +296,7 @@ impl RecordBuffer {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn get_record(&self, r: &RecordRef) -> &[u8] {
-        let start = r.offset as usize + HEADER_SIZE;
-        let end = start + r.len as usize;
-        &self.data[start..end]
+        self.data.slice(r.offset as usize + HEADER_SIZE, r.len as usize)
     }
 
     /// Iterate over sorted records.
@@ -587,16 +614,19 @@ const _: () = assert!(
 );
 
 impl TemplateInlineHeader {
-    /// Write header to a byte buffer.
+    /// Serialize header to a byte array.
     #[inline]
-    pub fn write_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.key.primary.to_le_bytes());
-        buf.extend_from_slice(&self.key.secondary.to_le_bytes());
-        buf.extend_from_slice(&self.key.cb_hash.to_le_bytes());
-        buf.extend_from_slice(&self.key.tertiary.to_le_bytes());
-        buf.extend_from_slice(&self.key.name_hash_upper.to_le_bytes());
-        buf.extend_from_slice(&self.record_len.to_le_bytes());
-        buf.extend_from_slice(&self.padding.to_le_bytes());
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; TEMPLATE_HEADER_SIZE] {
+        let mut buf = [0u8; TEMPLATE_HEADER_SIZE];
+        buf[0..8].copy_from_slice(&self.key.primary.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.key.secondary.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.key.cb_hash.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.key.tertiary.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.key.name_hash_upper.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.record_len.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.padding.to_le_bytes());
+        buf
     }
 
     /// Read header from a byte slice.
@@ -683,43 +713,63 @@ impl Ord for TemplateRecordRef {
 /// 1. Compares primary keys from refs (fast, O(1))
 /// 2. On ties, fetches full keys from inline headers
 pub struct TemplateRecordBuffer {
-    /// Raw byte storage: inline headers + record data.
-    data: Vec<u8>,
+    /// Segmented byte storage: inline headers + record data.
+    data: SegmentedBuf,
     /// Minimal index for sorting.
     refs: Vec<TemplateRecordRef>,
 }
+
+/// Segment size for `TemplateRecordBuffer`'s `SegmentedBuf`: 256 MiB.
+const TEMPLATE_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
 impl TemplateRecordBuffer {
     /// Create a new buffer with estimated capacity.
     #[must_use]
     pub fn with_capacity(estimated_records: usize, estimated_bytes: usize) -> Self {
-        // Account for inline headers in data capacity
         let header_bytes = estimated_records * TEMPLATE_HEADER_SIZE;
         Self {
-            data: Vec::with_capacity(estimated_bytes + header_bytes),
+            data: SegmentedBuf::with_capacity(
+                estimated_bytes + header_bytes,
+                TEMPLATE_SEGMENT_SIZE,
+            ),
             refs: Vec::with_capacity(estimated_records),
         }
     }
 
     /// Push a record with a pre-computed template key.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the record length exceeds `u32::MAX`.
+    /// Returns an error if the record (plus header) exceeds the segment size
+    /// (256 MiB) or if the record length exceeds `u32::MAX`.
     #[inline]
-    pub fn push(&mut self, record: &[u8], key: TemplateKey) {
-        let offset = self.data.len() as u64;
-        let record_len = u32::try_from(record.len()).expect("record length exceeds u32::MAX");
+    pub fn push(&mut self, record: &[u8], key: TemplateKey) -> anyhow::Result<()> {
+        let total_bytes = TEMPLATE_HEADER_SIZE + record.len();
+        anyhow::ensure!(
+            total_bytes <= TEMPLATE_SEGMENT_SIZE,
+            "BAM record of {} bytes (+ {} byte header) exceeds segment size of {} bytes; \
+             this is likely a malformed BAM file",
+            record.len(),
+            TEMPLATE_HEADER_SIZE,
+            TEMPLATE_SEGMENT_SIZE,
+        );
+        let record_len = u32::try_from(record.len())
+            .map_err(|_| anyhow::anyhow!("record length {} exceeds u32::MAX", record.len()))?;
 
-        // Write inline header using manual byte operations (avoids alignment issues)
+        // Reserve contiguous space for header + record
+        let total_bytes = TEMPLATE_HEADER_SIZE + record.len();
+        let offset = self.data.reserve_contiguous(total_bytes) as u64;
+
+        // Write inline header
         let header = TemplateInlineHeader { key, record_len, padding: 0 };
-        header.write_to(&mut self.data);
+        self.data.extend_in_place(&header.to_bytes());
 
         // Write raw BAM data
-        self.data.extend_from_slice(record);
+        self.data.extend_in_place(record);
 
         // Add ref with cached key for O(1) sort comparisons
         self.refs.push(TemplateRecordRef { key, offset, len: record_len, padding: 0 });
+        Ok(())
     }
 
     /// Sort the index by cached key using stable LSD radix sort.
@@ -744,9 +794,7 @@ impl TemplateRecordBuffer {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn get_record(&self, r: &TemplateRecordRef) -> &[u8] {
-        let start = r.offset as usize + TEMPLATE_HEADER_SIZE;
-        let end = start + r.len as usize;
-        &self.data[start..end]
+        self.data.slice(r.offset as usize + TEMPLATE_HEADER_SIZE, r.len as usize)
     }
 
     /// Iterate over sorted records.
@@ -795,12 +843,6 @@ impl TemplateRecordBuffer {
     pub fn clear(&mut self) {
         self.data.clear();
         self.refs.clear();
-    }
-
-    /// Get underlying data buffer (for direct access to raw bytes).
-    #[must_use]
-    pub fn data(&self) -> &[u8] {
-        &self.data
     }
 
     /// Sort in parallel and return each sub-array as a separate sorted chunk.
@@ -1637,7 +1679,7 @@ mod tests {
             while record.len() < 40 {
                 record.push(0);
             }
-            buffer.push(&record, key);
+            buffer.push(&record, key).expect("push should succeed in tests");
         }
 
         buffer.sort();
@@ -1779,7 +1821,7 @@ mod tests {
                 0,
                 false,
             );
-            buffer.push(&make_bam_record(i as u16), key);
+            buffer.push(&make_bam_record(i as u16), key).expect("push should succeed in tests");
         }
 
         let chunks = buffer.par_sort_into_chunks(1);
@@ -1824,7 +1866,7 @@ mod tests {
                     0,
                     false,
                 );
-                buffer.push(&make_bam_record(i as u16), key);
+                buffer.push(&make_bam_record(i as u16), key).expect("push should succeed in tests");
             }
 
             buffer.par_sort_into_chunks(4)
@@ -1882,7 +1924,9 @@ mod tests {
         for i in 0..n {
             // Reverse order so sorting is non-trivial
             let pos = (n - i) as i32;
-            buffer.push_coordinate(&make_coordinate_bam_record(0, pos));
+            buffer
+                .push_coordinate(&make_coordinate_bam_record(0, pos))
+                .expect("push_coordinate should succeed in tests");
         }
 
         let chunks = buffer.par_sort_into_chunks(1);
@@ -1913,7 +1957,9 @@ mod tests {
 
             for i in 0..n {
                 let pos = (n - i) as i32;
-                buffer.push_coordinate(&make_coordinate_bam_record(0, pos));
+                buffer
+                    .push_coordinate(&make_coordinate_bam_record(0, pos))
+                    .expect("push_coordinate should succeed in tests");
             }
 
             buffer.par_sort_into_chunks(4)

@@ -304,38 +304,20 @@ pub fn initial_allocation_for_command(
 /// # Errors
 ///
 /// Returns an error if:
-/// - The value cannot be parsed as a number
-/// - The value is below the minimum (256MB)
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// - The value cannot be parsed by [`crate::validation::parse_memory_size`]
+/// - The value is below the minimum (256 MiB)
+///
+/// Plain numeric values are interpreted as MB (e.g. "768" = 768 MB).
+/// See [`crate::validation::parse_memory_size`] for the full set of accepted formats.
 pub fn parse_memory_limit(s: &str) -> Result<u64, String> {
-    const MIN_BYTES: u64 = 256 * 1024 * 1024; // 256MB
+    const MIN_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
-    let s = s.trim().to_uppercase();
+    let bytes = crate::validation::parse_memory_size(s).map_err(|e| e.to_string())?;
 
-    let (num_str, multiplier) = if s.ends_with("GB") {
-        (s.trim_end_matches("GB"), 1024 * 1024 * 1024)
-    } else if s.ends_with('G') {
-        (s.trim_end_matches('G'), 1024 * 1024 * 1024)
-    } else if s.ends_with("MB") {
-        (s.trim_end_matches("MB"), 1024 * 1024)
-    } else if s.ends_with('M') {
-        (s.trim_end_matches('M'), 1024 * 1024)
-    } else if s.ends_with("KB") {
-        (s.trim_end_matches("KB"), 1024)
-    } else if s.ends_with('K') {
-        (s.trim_end_matches('K'), 1024)
-    } else {
-        // Assume bytes
-        (s.as_str(), 1)
-    };
-
-    let num: f64 = num_str.trim().parse().map_err(|_| format!("Invalid memory value: {s}"))?;
-
-    let bytes = (num * f64::from(multiplier)) as u64;
     if bytes < MIN_BYTES {
         return Err(format!(
-            "Queue memory limit {}MB is too low (minimum: 256MB)",
-            bytes / (1024 * 1024)
+            "Queue memory limit {} is too low (minimum: 256 MiB)",
+            bytesize::ByteSize(bytes)
         ));
     }
 
@@ -347,42 +329,47 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn test_parse_memory_limit() {
+        // Suffixed values use ByteSize (decimal: GB=1000^3, MB=1000^2)
         assert_eq!(
             parse_memory_limit("4GB").expect("parsing \"4GB\" should succeed"),
-            4 * 1024 * 1024 * 1024
+            4_000_000_000
         );
-        assert_eq!(
-            parse_memory_limit("4G").expect("parsing \"4G\" should succeed"),
-            4 * 1024 * 1024 * 1024
-        );
+        assert_eq!(parse_memory_limit("4G").expect("parsing \"4G\" should succeed"), 4_000_000_000);
         assert_eq!(
             parse_memory_limit("512MB").expect("parsing \"512MB\" should succeed"),
-            512 * 1024 * 1024
+            512_000_000
         );
         assert_eq!(
             parse_memory_limit("512M").expect("parsing \"512M\" should succeed"),
-            512 * 1024 * 1024
+            512_000_000
         );
         assert_eq!(
             parse_memory_limit("1gb").expect("parsing \"1gb\" should succeed"),
-            1024 * 1024 * 1024
+            1_000_000_000
         );
         assert_eq!(
             parse_memory_limit("  2GB  ").expect("parsing \"  2GB  \" should succeed"),
-            2 * 1024 * 1024 * 1024
+            2_000_000_000
         );
         assert_eq!(
             parse_memory_limit("1.5GB").expect("parsing \"1.5GB\" should succeed"),
-            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+            1_500_000_000
+        );
+        // Binary suffix for exact 1 GiB
+        assert_eq!(
+            parse_memory_limit("1GiB").expect("parsing \"1GiB\" should succeed"),
+            1024 * 1024 * 1024
         );
     }
 
     #[test]
     fn test_parse_memory_limit_minimum() {
         assert!(parse_memory_limit("100MB").is_err());
-        assert!(parse_memory_limit("256MB").is_ok());
+        // 256 MiB exceeds the 256 MiB minimum
+        assert!(parse_memory_limit("256MiB").is_ok());
+        // 256 MB (decimal) = 256,000,000 < 268,435,456 (256 MiB minimum)
+        assert!(parse_memory_limit("256MB").is_err());
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub mod radix;
 pub mod raw;
 pub mod raw_bam_reader;
 pub mod read_ahead;
+pub(crate) mod segmented_buf;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;

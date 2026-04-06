@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
 use bytesize::ByteSize;
 use clap::Args;
 use fgumi_lib::bam_io::is_stdin_path;
@@ -487,7 +486,6 @@ impl QueueMemoryOptions {
     /// or the memory calculation would overflow.
     pub fn calculate_memory_limit(&self, num_threads: usize) -> anyhow::Result<u64> {
         let total_memory = self.compute_memory_limit(num_threads)?;
-        #[cfg(feature = "memory-debug")]
         Self::validate_against_system_memory(total_memory);
         Ok(total_memory)
     }
@@ -522,8 +520,8 @@ impl QueueMemoryOptions {
             )
         } else {
             (
-                parse_memory_size(&self.queue_memory).with_context(|| {
-                    format!("Failed to parse queue memory size: {}", self.queue_memory)
+                parse_memory_size(&self.queue_memory).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse queue memory size: {}: {e}", self.queue_memory)
                 })?,
                 false,
             )
@@ -568,7 +566,6 @@ impl QueueMemoryOptions {
     }
 
     /// Warns if the requested memory exceeds reasonable system limits.
-    #[cfg(feature = "memory-debug")]
     fn validate_against_system_memory(requested_bytes: u64) {
         use sysinfo::System;
         let mut system = System::new();
@@ -633,95 +630,8 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
     }
 }
 
-/// Parses a memory size string into bytes.
-///
-/// Accepts both plain numbers (interpreted as MB) and human-readable formats like:
-/// - "2GB", "2G" -> 2 gigabytes
-/// - "1.5GB" -> 1.5 gigabytes
-/// - "1024MB", "1024M" -> 1024 megabytes
-/// - "512MiB" -> 512 mebibytes
-/// - "768" -> 768 megabytes (backward compatibility)
-///
-/// # Examples
-///
-/// ```
-/// # use anyhow::Result;
-/// # use fgumi::commands::common::parse_memory_size;
-/// assert_eq!(parse_memory_size("768")?, 768 * 1024 * 1024);
-/// assert_eq!(parse_memory_size("2GB")?, 2 * 1000 * 1000 * 1000);
-/// assert_eq!(parse_memory_size("1024MiB")?, 1024 * 1024 * 1024);
-/// ```
-///
-/// # Errors
-///
-/// Returns an error if the string cannot be parsed as a valid size.
-pub fn parse_memory_size(size_str: &str) -> anyhow::Result<u64> {
-    // Validate input string
-    let trimmed = size_str.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("Memory size cannot be empty");
-    }
-
-    // Handle negative values early
-    if trimmed.starts_with('-') {
-        anyhow::bail!("Memory size cannot be negative: '{trimmed}'");
-    }
-
-    // First try parsing as a plain integer in MB (backward compatibility)
-    // Only accept simple integers, not floats or scientific notation
-    if let Ok(mb_value) = trimmed.parse::<u64>() {
-        // Validate reasonable range for plain numbers
-        if mb_value == 0 {
-            anyhow::bail!("Memory size cannot be zero");
-        }
-        if mb_value > 1_000_000 {
-            // Sanity guard: >1TB as a plain number likely means the user forgot a unit suffix.
-            // Values above this should use human-readable format (e.g. "2TB") which bypasses
-            // this check and goes through ByteSize parsing instead.
-            anyhow::bail!(
-                "Plain number memory size too large: {} MB. Use human-readable format like '{}GB' instead.",
-                mb_value,
-                mb_value / 1000
-            );
-        }
-
-        return mb_value
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| anyhow::anyhow!("Memory size calculation overflow for {mb_value} MB"));
-    }
-
-    // Reject scientific notation (e.g. "1e3") but allow decimals in human-readable sizes (e.g. "1.5GB")
-    if trimmed.contains('e') || trimmed.contains('E') {
-        anyhow::bail!(
-            "Scientific notation not supported: '{trimmed}'. Use integer values or human-readable formats like '2GB'."
-        );
-    }
-
-    // Reject bare decimal numbers without a unit suffix (e.g. "1.5") since plain numbers are MB
-    if trimmed.contains('.') && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        anyhow::bail!(
-            "Plain decimal numbers not supported: '{trimmed}'. Use an integer for MB (e.g. '768') or a human-readable format (e.g. '1.5GB')."
-        );
-    }
-
-    // Fall back to parsing as a human-readable size (like "2GB", "1024MiB")
-    match trimmed.parse::<ByteSize>() {
-        Ok(size) => {
-            if size.0 == 0 {
-                anyhow::bail!("Memory size cannot be zero: '{trimmed}'");
-            }
-            Ok(size.0)
-        }
-        Err(_) => {
-            anyhow::bail!(
-                "Invalid memory size '{trimmed}'. Valid formats:\n\
-                 - Plain numbers (interpreted as MB): '768', '4096'\n\
-                 - Human-readable (decimal): '2GB', '1024MB'\n\
-                 - Human-readable (binary): '1GiB', '512MiB'"
-            )
-        }
-    }
-}
+// Re-export from the library crate for backward compatibility.
+pub use fgumi_lib::validation::parse_memory_size;
 
 /// Builds a [`BamPipelineConfig`] from the common CLI option structs.
 ///
@@ -918,111 +828,6 @@ mod tests {
             deadlock_recover: true,
         };
         assert!(opts.deadlock_recover_enabled());
-    }
-
-    // ========== Tests for memory size parsing ==========
-
-    #[test]
-    fn test_parse_memory_size_plain_numbers() {
-        assert_eq!(
-            parse_memory_size("768").expect("parse '768' should succeed"),
-            768 * 1024 * 1024
-        );
-        assert_eq!(parse_memory_size("1").expect("parse '1' should succeed"), 1024 * 1024);
-        assert_eq!(
-            parse_memory_size("4096").expect("parse '4096' should succeed"),
-            4096 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn test_parse_memory_size_human_readable() {
-        assert_eq!(
-            parse_memory_size("2GB").expect("parse '2GB' should succeed"),
-            2 * 1000 * 1000 * 1000
-        );
-        assert_eq!(
-            parse_memory_size("2G").expect("parse '2G' should succeed"),
-            2 * 1000 * 1000 * 1000
-        );
-        assert_eq!(
-            parse_memory_size("1024MB").expect("parse '1024MB' should succeed"),
-            1024 * 1000 * 1000
-        );
-        assert_eq!(
-            parse_memory_size("1024M").expect("parse '1024M' should succeed"),
-            1024 * 1000 * 1000
-        );
-        assert_eq!(
-            parse_memory_size("1GiB").expect("parse '1GiB' should succeed"),
-            1024 * 1024 * 1024
-        );
-        assert_eq!(
-            parse_memory_size("512MiB").expect("parse '512MiB' should succeed"),
-            512 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn test_parse_memory_size_invalid() {
-        assert!(parse_memory_size("invalid").is_err());
-        assert!(parse_memory_size("").is_err());
-        assert!(parse_memory_size("GB2").is_err());
-    }
-
-    #[test]
-    fn test_parse_memory_size_zero() {
-        // Zero values should be rejected
-        assert!(parse_memory_size("0").is_err());
-        assert!(parse_memory_size("0MB").is_err());
-        assert!(parse_memory_size("0GB").is_err());
-    }
-
-    // ========== Tests for new edge cases and validation ==========
-
-    #[test]
-    fn test_parse_memory_size_edge_cases() {
-        // Empty and whitespace
-        assert!(parse_memory_size("").is_err());
-        assert!(parse_memory_size("   ").is_err());
-
-        // Negative values
-        assert!(parse_memory_size("-100").is_err());
-        assert!(parse_memory_size("-1GB").is_err());
-
-        // Bare floating point without unit suffix (should be rejected)
-        assert!(parse_memory_size("1.5").is_err());
-
-        // Floating point with unit suffix (should be accepted via ByteSize)
-        assert!(parse_memory_size("1.5GB").is_ok());
-        assert!(parse_memory_size("2.5GB").is_ok());
-
-        // Scientific notation (should be rejected for plain numbers)
-        assert!(parse_memory_size("1e3").is_err());
-        assert!(parse_memory_size("1E6").is_err());
-
-        // Very large plain numbers (should be rejected)
-        assert!(parse_memory_size("9999999").is_err());
-    }
-
-    #[test]
-    fn test_parse_memory_size_whitespace_handling() {
-        // Trimmed input should work
-        assert_eq!(
-            parse_memory_size("  768  ").expect("parse trimmed '768' should succeed"),
-            768 * 1024 * 1024
-        );
-        assert_eq!(
-            parse_memory_size("\t1GB\n").expect("parse trimmed '1GB' should succeed"),
-            1000 * 1000 * 1000
-        );
-    }
-
-    #[test]
-    fn test_parse_memory_size_overflow() {
-        // Very large MB values should be caught
-        let very_large = format!("{}", u64::MAX / 1024); // Would overflow when * 1024 * 1024
-        assert!(parse_memory_size(&very_large).is_err());
     }
 
     // ========== Tests for QueueMemoryOptions ==========

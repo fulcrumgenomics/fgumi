@@ -647,6 +647,12 @@ pub struct RawExternalSorter {
     /// Cell barcode tag for template-coordinate sort (e.g., `[b'C', b'B']`).
     /// When `Some`, CB hash is included in sort key for single-cell data.
     cell_tag: Option<[u8; 2]>,
+    /// Initial buffer capacity hint (bytes) for pre-allocation.
+    ///
+    /// Decoupled from `memory_limit` so that auto-detected limits can start with
+    /// a modest allocation and let `Vec` grow on demand, while explicit limits
+    /// pre-allocate the full budget upfront (preserving prior behavior).
+    initial_capacity: Option<usize>,
 }
 
 impl RawExternalSorter {
@@ -664,6 +670,7 @@ impl RawExternalSorter {
             pg_info: None,
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
             cell_tag: None,
+            initial_capacity: None,
         }
     }
 
@@ -743,6 +750,24 @@ impl RawExternalSorter {
     pub fn cell_tag(mut self, tag: [u8; 2]) -> Self {
         self.cell_tag = Some(tag);
         self
+    }
+
+    /// Set the initial buffer capacity hint (bytes).
+    ///
+    /// When set, buffer pre-allocation uses this value instead of `memory_limit`.
+    /// This avoids huge upfront allocations when auto-detecting memory, while
+    /// still allowing the buffer to grow up to `memory_limit` before spilling.
+    #[must_use]
+    pub fn initial_capacity(mut self, bytes: usize) -> Self {
+        self.initial_capacity = Some(bytes);
+        self
+    }
+
+    /// Returns the effective initial capacity for buffer pre-allocation.
+    ///
+    /// Uses `initial_capacity` if set, otherwise falls back to `memory_limit`.
+    fn effective_initial_capacity(&self) -> usize {
+        self.initial_capacity.unwrap_or(self.memory_limit).min(self.memory_limit)
     }
 
     /// Consolidate temp files if we've exceeded the limit.
@@ -1057,11 +1082,16 @@ impl RawExternalSorter {
         // Get number of references (unmapped reads map to nref)
         let nref = header.reference_sequences().len() as u32;
 
-        // Estimate capacity: ~200 bytes per record average
-        let estimated_records = self.memory_limit / 200;
+        // Estimate capacity from initial_capacity (not memory_limit) to avoid
+        // huge upfront allocations when auto-detecting memory.
+        let init_cap = self.effective_initial_capacity();
+        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        let estimated_records = init_cap / 240;
+        // Data bytes = init_cap minus ref overhead (24 bytes/record)
+        let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
-        let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
+        let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
 
         let read_ahead = RawReadAheadReader::new(reader);
@@ -1074,7 +1104,7 @@ impl RawExternalSorter {
             progress.log_if_needed(1);
 
             // Push directly to buffer - key extracted inline from raw bytes
-            buffer.push_coordinate(record.as_ref());
+            buffer.push_coordinate(record.as_ref())?;
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
@@ -1199,10 +1229,13 @@ impl RawExternalSorter {
 
         let mut stats = RawSortStats::default();
         let nref = header.reference_sequences().len() as u32;
-        let estimated_records = self.memory_limit / 200;
+        let init_cap = self.effective_initial_capacity();
+        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
+        let estimated_records = init_cap / 240;
+        let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
-        let mut buffer = RecordBuffer::with_capacity(estimated_records, self.memory_limit, nref);
+        let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
         let read_ahead = RawReadAheadReader::new(reader);
 
@@ -1210,7 +1243,7 @@ impl RawExternalSorter {
 
         for record in read_ahead {
             stats.total_records += 1;
-            buffer.push_coordinate(record.as_ref());
+            buffer.push_coordinate(record.as_ref())?;
 
             if buffer.memory_usage() >= self.memory_limit {
                 let chunk_path = namer.next_chunk_path();
@@ -1363,8 +1396,9 @@ impl RawExternalSorter {
         let mut stats = RawSortStats::default();
         let ctx = SortContext::from_header(header);
 
-        // Estimate capacity: ~250 bytes per record + ~50 bytes for name + flags
-        let estimated_records = self.memory_limit / 300;
+        // Estimate capacity from initial_capacity to avoid huge upfront allocations.
+        let init_cap = self.effective_initial_capacity();
+        let estimated_records = init_cap / 300;
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut entries: Vec<(K, Vec<u8>)> = Vec::with_capacity(estimated_records);
@@ -1512,16 +1546,16 @@ impl RawExternalSorter {
         let lib_lookup = LibraryLookup::from_header(header);
         let cb_hasher = cb_hasher();
 
-        // Estimate capacity accounting for inline headers and cached-key refs
+        // Estimate capacity from initial_capacity to avoid huge upfront allocations.
         // Memory layout per record:
         //   - data: 48 bytes (inline header) + ~250 bytes (BAM record) = 298 bytes
         //   - refs: 56 bytes (TemplateKey + u64 offset + u32 len + u32 pad)
         //   - Total: ~354 bytes per record
-        // The larger refs trade memory for cache locality during sort
+        let init_cap = self.effective_initial_capacity();
         let bytes_per_record = 354;
-        let estimated_records = self.memory_limit / bytes_per_record;
+        let estimated_records = init_cap / bytes_per_record;
         // Allocate ~86% for data, ~14% for refs (48/338 ≈ 14%)
-        let estimated_data_bytes = self.memory_limit * 86 / 100;
+        let estimated_data_bytes = init_cap * 86 / 100;
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
@@ -1545,7 +1579,7 @@ impl RawExternalSorter {
                 self.cell_tag.as_ref(),
                 &cb_hasher,
             );
-            buffer.push(bam_bytes, key);
+            buffer.push(bam_bytes, key)?;
 
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {

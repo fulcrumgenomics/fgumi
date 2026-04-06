@@ -21,6 +21,7 @@
 //! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
 use anyhow::{Result, bail};
+use bytesize::ByteSize;
 use clap::Parser;
 use fgumi_lib::bam_io::create_bam_reader;
 use fgumi_lib::logging::OperationTimer;
@@ -31,6 +32,7 @@ use std::path::PathBuf;
 
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
+use fgumi_lib::validation::parse_memory_size;
 
 /// Sort order for BAM files.
 ///
@@ -133,7 +135,7 @@ PERFORMANCE:
   - Handles BAM files larger than available RAM via spill-to-disk
   - Uses parallel sorting (--threads) for in-memory chunks
   - Configurable temp file compression (--temp-compression)
-  - Memory scales with threads by default (768MB/thread, like samtools)
+  - Auto memory detection with configurable reserve for co-running processes
 
 EXAMPLES:
 
@@ -146,9 +148,14 @@ EXAMPLES:
   # Sort by queryname for zipper
   fgumi sort -i input.bam -o sorted.bam --order queryname
 
-  # High-performance sort with more memory and threads
-  fgumi sort -i input.bam -o sorted.bam --order template-coordinate \
-    --max-memory 8G --threads 8
+  # Multi-threaded sort (auto-detects available memory)
+  fgumi sort -i input.bam -o sorted.bam --order template-coordinate --threads 8
+
+  # Override auto memory with an explicit per-thread limit
+  fgumi sort -i input.bam -o sorted.bam -m 2GiB --threads 8
+
+  # Reserve extra memory for bwa mem running in a pipeline
+  fgumi sort -i input.bam -o sorted.bam --memory-reserve 12GiB --threads 4
 
   # Verify a BAM file is correctly sorted
   fgumi sort -i sorted.bam --verify --order template-coordinate
@@ -181,16 +188,27 @@ pub struct Sort {
     #[arg(long = "order", default_value = "template-coordinate", value_parser = SortOrderArg::parse)]
     pub order: SortOrderArg,
 
-    /// Maximum memory to use for in-memory sorting (per thread when --memory-per-thread).
+    /// Maximum memory for in-memory sorting.
     ///
-    /// Accepts values like "512M", "1G", "2G". When the memory limit
-    /// is reached, sorted chunks are written to temporary files and
-    /// merged at the end.
+    /// "auto" (default) detects system memory and subtracts --memory-reserve
+    /// to leave room for the OS and co-running processes (e.g. an aligner).
+    /// Explicit values like "512M", "1G", "4GiB" are per-thread when
+    /// --memory-per-thread is enabled (default).
     ///
-    /// With --memory-per-thread (default), this is multiplied by thread count
-    /// (like samtools' -m option). With 8 threads and 768M, total = 6GB.
-    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
-    pub max_memory: usize,
+    /// When the limit is reached, sorted chunks spill to temporary files.
+    #[arg(short = 'm', long = "max-memory", default_value = "auto", value_parser = parse_memory)]
+    pub max_memory: MemoryLimit,
+
+    /// Memory to reserve for other processes when --max-memory=auto.
+    ///
+    /// "auto" (default) reserves min(10 GiB, 50% of system memory). Explicit
+    /// values like "10G", "8GiB" set a fixed reservation. Set higher when
+    /// running alongside a memory-intensive aligner (e.g. `bwa mem` with a
+    /// human genome index uses ~8 GiB).
+    ///
+    /// Ignored when --max-memory is set to an explicit value.
+    #[arg(long = "memory-reserve", default_value = "auto", value_parser = parse_memory_reserve)]
+    pub memory_reserve: MemoryReserve,
 
     /// Scale memory limit by thread count (samtools behavior).
     ///
@@ -243,32 +261,57 @@ pub struct Sort {
     pub cell_tag: String,
 }
 
-/// Parse memory size string (e.g., "512M", "1G", "2G").
-pub(crate) fn parse_memory(s: &str) -> Result<usize, String> {
-    let s = s.trim().to_uppercase();
+/// Represents the memory limit configuration for sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLimit {
+    /// Automatically detect system memory and compute an optimal limit.
+    Auto,
+    /// Use a fixed memory limit in bytes.
+    Fixed(usize),
+}
 
-    if s.is_empty() {
-        return Err("Empty memory specification".to_string());
+/// Represents how much memory to reserve for other processes (OS, aligners, etc.)
+/// when `--max-memory=auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryReserve {
+    /// Automatic: `min(10 GiB, 50% of system memory)`.
+    Auto,
+    /// Reserve a fixed number of bytes.
+    Fixed(usize),
+}
+
+/// Parse a memory size string into `usize` bytes, suitable for use in clap
+/// value parsers.
+///
+/// Delegates to [`parse_memory_size`] for numeric parsing. Plain numbers are
+/// interpreted as MiB (e.g. "768" = 768 MiB). Supports human-readable formats
+/// like "2GB", "1GiB", "512MiB". See [`parse_memory_size`] for full details.
+fn parse_memory_bytes(s: &str, label: &str) -> Result<usize, String> {
+    let bytes = parse_memory_size(s).map_err(|e| e.to_string())?;
+    usize::try_from(bytes).map_err(|_| format!("{label} too large: {bytes}"))
+}
+
+/// Parse memory size string (e.g., "512M", "1G", "2G", "auto").
+pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
+    let s = s.trim();
+
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MemoryLimit::Auto);
     }
 
-    let (num_str, multiplier) = if s.ends_with('G') {
-        (&s[..s.len() - 1], 1024 * 1024 * 1024)
-    } else if s.ends_with('M') {
-        (&s[..s.len() - 1], 1024 * 1024)
-    } else if s.ends_with('K') {
-        (&s[..s.len() - 1], 1024)
-    } else {
-        // Assume bytes
-        (s.as_str(), 1)
-    };
+    Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
+}
 
-    let num: f64 = num_str.parse().map_err(|_| format!("Invalid number: {num_str}"))?;
+/// Parse memory reserve string (e.g., "10G", "auto").
+pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
+    let s = s.trim();
 
-    if num < 0.0 {
-        return Err("Memory size must be positive".to_string());
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(MemoryReserve::Auto);
     }
 
-    Ok((num * multiplier as f64) as usize)
+    let bytes = parse_memory_bytes(s, "Memory reserve")?;
+    Ok(MemoryReserve::Fixed(bytes))
 }
 
 /// Parse the cell tag for template-coordinate sort/verify, returning `None`
@@ -346,6 +389,113 @@ impl Command for Sort {
     }
 }
 
+/// The minimum per-thread memory budget (256 MiB).
+const MIN_MEMORY_PER_THREAD: usize = 256 * 1024 * 1024;
+
+/// Default auto-reserve cap: 10 GiB.
+const AUTO_RESERVE_CAP: usize = 10 * 1024 * 1024 * 1024;
+
+/// Resolve a [`MemoryReserve`] to a concrete byte count given total system memory.
+fn resolve_reserve(reserve: MemoryReserve, total_memory: usize) -> usize {
+    match reserve {
+        MemoryReserve::Fixed(bytes) => bytes,
+        MemoryReserve::Auto => {
+            // min(10 GiB, 50% of system memory)
+            AUTO_RESERVE_CAP.min(total_memory / 2)
+        }
+    }
+}
+
+/// Resolves a [`MemoryLimit`] to a concrete byte count.
+///
+/// For [`MemoryLimit::Auto`]: detects total system memory, subtracts the
+/// reserve (via [`MemoryReserve`]), and divides by thread count (when
+/// `memory_per_thread` is true). The result is clamped to a minimum of
+/// 256 MiB per thread.
+///
+/// For [`MemoryLimit::Fixed`]: applies the same `memory_per_thread`
+/// multiplication as before. The reserve is ignored.
+fn resolve_memory_limit(
+    limit: MemoryLimit,
+    reserve: MemoryReserve,
+    threads: usize,
+    memory_per_thread: bool,
+) -> Result<usize> {
+    if threads == 0 {
+        bail!("--threads must be at least 1");
+    }
+
+    let total_budget = match limit {
+        MemoryLimit::Fixed(bytes) => {
+            if memory_per_thread {
+                bytes
+                    .checked_mul(threads)
+                    .ok_or_else(|| anyhow::anyhow!("--max-memory × --threads overflowed"))?
+            } else {
+                bytes
+            }
+        }
+        MemoryLimit::Auto => {
+            let mut system = sysinfo::System::new();
+            system.refresh_memory();
+            let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
+
+            let margin = resolve_reserve(reserve, total);
+            let available = total.saturating_sub(margin);
+
+            if memory_per_thread {
+                let per_thread = (available / threads).max(MIN_MEMORY_PER_THREAD);
+                let budget = per_thread
+                    .checked_mul(threads)
+                    .ok_or_else(|| anyhow::anyhow!("auto memory budget overflowed"))?;
+                if budget > available {
+                    log::warn!(
+                        "Auto memory: total budget {} exceeds available {} \
+                         ({}/thread x {} threads, reserve {}); may spill to disk earlier than expected",
+                        ByteSize(budget as u64),
+                        ByteSize(available as u64),
+                        ByteSize(per_thread as u64),
+                        threads,
+                        ByteSize(margin as u64),
+                    );
+                }
+                info!(
+                    "Auto memory: using {} of {} ({}/thread x {} threads, reserve {})",
+                    ByteSize(budget as u64),
+                    ByteSize(total as u64),
+                    ByteSize(per_thread as u64),
+                    threads,
+                    ByteSize(margin as u64),
+                );
+                budget
+            } else {
+                let budget = available.max(MIN_MEMORY_PER_THREAD);
+                info!(
+                    "Auto memory: using {} of {} (fixed total, reserve {})",
+                    ByteSize(budget as u64),
+                    ByteSize(total as u64),
+                    ByteSize(margin as u64),
+                );
+                budget
+            }
+        }
+    };
+
+    // Post-resolution system memory check: warn if any mode exceeds host RAM
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let total = usize::try_from(system.total_memory()).unwrap_or(usize::MAX);
+    if total_budget > total {
+        log::warn!(
+            "Memory budget {} exceeds total system memory {}; spill-to-disk is likely",
+            ByteSize(total_budget as u64),
+            ByteSize(total as u64),
+        );
+    }
+
+    Ok(total_budget)
+}
+
 impl Sort {
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
@@ -357,10 +507,6 @@ impl Sort {
     fn execute_sort(&self, command_line: &str) -> Result<()> {
         let output = self.output.as_ref().expect("output required for sort mode");
 
-        if self.max_memory == 0 {
-            bail!("--max-memory must be greater than 0");
-        }
-
         // --write-index only valid for coordinate sort
         if self.write_index && !matches!(self.order, SortOrderArg::Coordinate) {
             bail!("--write-index is only valid for coordinate sort");
@@ -368,12 +514,13 @@ impl Sort {
 
         let timer = OperationTimer::new("Sorting BAM");
 
-        // Calculate effective memory: per-thread or fixed total
-        let effective_memory = if self.memory_per_thread {
-            self.max_memory.saturating_mul(self.threads.max(1))
-        } else {
-            self.max_memory
-        };
+        // Resolve memory limit (auto-detect or fixed)
+        let effective_memory = resolve_memory_limit(
+            self.max_memory,
+            self.memory_reserve,
+            self.threads,
+            self.memory_per_thread,
+        )?;
 
         let cell_tag = self.parse_cell_tag()?;
 
@@ -384,15 +531,17 @@ impl Sort {
         if let Some(ct) = cell_tag {
             info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
         }
-        if self.memory_per_thread {
-            info!(
-                "Max memory: {} MB ({} MB/thread × {} threads)",
-                effective_memory / (1024 * 1024),
-                self.max_memory / (1024 * 1024),
-                self.threads
-            );
-        } else {
-            info!("Max memory: {} MB (fixed)", effective_memory / (1024 * 1024));
+        if let MemoryLimit::Fixed(per_thread) = self.max_memory {
+            if self.memory_per_thread {
+                info!(
+                    "Max memory: {} ({}/thread x {} threads)",
+                    ByteSize(effective_memory as u64),
+                    ByteSize(per_thread as u64),
+                    self.threads
+                );
+            } else {
+                info!("Max memory: {} (fixed)", ByteSize(effective_memory as u64));
+            }
         }
         info!("Threads: {}", self.threads);
         info!("Temp compression level: {}", self.temp_compression);
@@ -411,6 +560,17 @@ impl Sort {
             .temp_compression(self.temp_compression)
             .write_index(self.write_index)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
+
+        // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
+        // (matching samtools default) to avoid huge upfront allocations.
+        // The buffer will grow on demand up to memory_limit.
+        if matches!(self.max_memory, MemoryLimit::Auto) {
+            let init = 768_usize
+                .checked_mul(1024 * 1024)
+                .and_then(|b| b.checked_mul(self.threads))
+                .ok_or_else(|| anyhow::anyhow!("initial auto buffer size overflowed"))?;
+            sorter = sorter.initial_capacity(effective_memory.min(init));
+        }
 
         if let Some(ct) = cell_tag {
             sorter = sorter.cell_tag(ct);
@@ -537,7 +697,8 @@ mod tests {
             output: None,
             verify: false,
             order,
-            max_memory: 512 * 1024 * 1024,
+            max_memory: MemoryLimit::Fixed(512 * 1024 * 1024),
+            memory_reserve: MemoryReserve::Auto,
             memory_per_thread: true,
             tmp_dir: None,
             threads: 1,
@@ -575,62 +736,77 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_memory_megabytes() {
+    fn test_parse_memory_auto() {
         assert_eq!(
-            parse_memory("512M").expect("parse_memory should succeed for 512M"),
-            512 * 1024 * 1024
+            parse_memory("auto").expect("parse_memory should succeed for 'auto'"),
+            MemoryLimit::Auto
         );
         assert_eq!(
-            parse_memory("1024M").expect("parse_memory should succeed for 1024M"),
-            1024 * 1024 * 1024
+            parse_memory("AUTO").expect("parse_memory should succeed for 'AUTO'"),
+            MemoryLimit::Auto
+        );
+        assert_eq!(
+            parse_memory("Auto").expect("parse_memory should succeed for 'Auto'"),
+            MemoryLimit::Auto
         );
     }
 
     #[test]
-    fn test_parse_memory_gigabytes() {
+    fn test_parse_memory_plain_numbers_as_mb() {
+        // Plain numbers are interpreted as MB (via parse_memory_size)
+        assert_eq!(
+            parse_memory("768").expect("parse_memory should succeed for 768"),
+            MemoryLimit::Fixed(768 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_memory("1").expect("parse_memory should succeed for 1"),
+            MemoryLimit::Fixed(1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_parse_memory_human_readable() {
+        // Suffixed values use ByteSize (decimal: G=1000^3, M=1000^2)
+        assert_eq!(
+            parse_memory("512MB").expect("parse_memory should succeed for 512MB"),
+            MemoryLimit::Fixed(512 * 1000 * 1000)
+        );
         assert_eq!(
             parse_memory("1G").expect("parse_memory should succeed for 1G"),
-            1024 * 1024 * 1024
+            MemoryLimit::Fixed(1_000_000_000)
         );
         assert_eq!(
-            parse_memory("2G").expect("parse_memory should succeed for 2G"),
-            2 * 1024 * 1024 * 1024
+            parse_memory("2GB").expect("parse_memory should succeed for 2GB"),
+            MemoryLimit::Fixed(2_000_000_000)
         );
-    }
-
-    #[test]
-    fn test_parse_memory_kilobytes() {
+        // Binary suffixes (GiB, MiB)
         assert_eq!(
-            parse_memory("1024K").expect("parse_memory should succeed for 1024K"),
-            1024 * 1024
+            parse_memory("1GiB").expect("parse_memory should succeed for 1GiB"),
+            MemoryLimit::Fixed(1024 * 1024 * 1024)
         );
-    }
-
-    #[test]
-    fn test_parse_memory_bytes() {
         assert_eq!(
-            parse_memory("1048576").expect("parse_memory should succeed for bare bytes"),
-            1_048_576
+            parse_memory("512MiB").expect("parse_memory should succeed for 512MiB"),
+            MemoryLimit::Fixed(512 * 1024 * 1024)
         );
     }
 
     #[test]
-    fn test_parse_memory_lowercase() {
+    fn test_parse_memory_case_insensitive() {
         assert_eq!(
-            parse_memory("512m").expect("parse_memory should succeed for lowercase 512m"),
-            512 * 1024 * 1024
+            parse_memory("512mb").expect("parse_memory should succeed for lowercase 512mb"),
+            MemoryLimit::Fixed(512 * 1000 * 1000)
         );
         assert_eq!(
-            parse_memory("1g").expect("parse_memory should succeed for lowercase 1g"),
-            1024 * 1024 * 1024
+            parse_memory("1gb").expect("parse_memory should succeed for lowercase 1gb"),
+            MemoryLimit::Fixed(1_000_000_000)
         );
     }
 
     #[test]
-    fn test_parse_memory_decimal() {
+    fn test_parse_memory_decimal_with_suffix() {
         assert_eq!(
-            parse_memory("1.5G").expect("parse_memory should succeed for 1.5G"),
-            (1.5 * 1024.0 * 1024.0 * 1024.0) as usize
+            parse_memory("1.5GB").expect("parse_memory should succeed for 1.5GB"),
+            MemoryLimit::Fixed(1_500_000_000)
         );
     }
 
@@ -639,6 +815,104 @@ mod tests {
         assert!(parse_memory("").is_err());
         assert!(parse_memory("abc").is_err());
         assert!(parse_memory("-1G").is_err());
+    }
+
+    #[test]
+    fn test_resolve_memory_limit_fixed() {
+        let fixed = MemoryLimit::Fixed(1024 * 1024 * 1024); // 1 GiB
+        // Reserve is ignored for fixed limits
+        let resolved =
+            resolve_memory_limit(fixed, MemoryReserve::Auto, 4, true).expect("should succeed");
+        // Fixed + memory_per_thread: total = 1 GiB * 4 = 4 GiB
+        assert_eq!(resolved, 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resolve_memory_limit_fixed_no_per_thread() {
+        let fixed = MemoryLimit::Fixed(4 * 1024 * 1024 * 1024); // 4 GiB
+        let resolved =
+            resolve_memory_limit(fixed, MemoryReserve::Auto, 4, false).expect("should succeed");
+        // Fixed + no per-thread: total = 4 GiB
+        assert_eq!(resolved, 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resolve_memory_limit_auto() {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let total = system.total_memory() as usize;
+
+        let resolved = resolve_memory_limit(MemoryLimit::Auto, MemoryReserve::Auto, 4, true)
+            .expect("should succeed");
+        // Must be at least the per-thread minimum floor (256 MiB * 4 threads)
+        let min_expected = MIN_MEMORY_PER_THREAD.saturating_mul(4).min(total);
+        assert!(
+            resolved >= min_expected,
+            "auto resolved to {resolved} bytes, expected at least {min_expected}"
+        );
+        // And not more than total system memory
+        assert!(resolved <= total);
+    }
+
+    #[test]
+    fn test_resolve_memory_limit_auto_no_per_thread() {
+        let resolved = resolve_memory_limit(MemoryLimit::Auto, MemoryReserve::Auto, 8, false)
+            .expect("should succeed");
+        // Auto + no per-thread: should be total budget, not divided by threads
+        // Must be at least the minimum floor (256 MB)
+        assert!(resolved >= 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_resolve_reserve_auto() {
+        let gib = 1024 * 1024 * 1024;
+        // 32 GiB system: min(10 GiB, 16 GiB) = 10 GiB
+        assert_eq!(resolve_reserve(MemoryReserve::Auto, 32 * gib), 10 * gib);
+        // 16 GiB system: min(10 GiB, 8 GiB) = 8 GiB
+        assert_eq!(resolve_reserve(MemoryReserve::Auto, 16 * gib), 8 * gib);
+        // 8 GiB system: min(10 GiB, 4 GiB) = 4 GiB
+        assert_eq!(resolve_reserve(MemoryReserve::Auto, 8 * gib), 4 * gib);
+        // 128 GiB system: min(10 GiB, 64 GiB) = 10 GiB
+        assert_eq!(resolve_reserve(MemoryReserve::Auto, 128 * gib), 10 * gib);
+    }
+
+    #[test]
+    fn test_resolve_reserve_fixed() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(resolve_reserve(MemoryReserve::Fixed(12 * gib), 64 * gib), 12 * gib);
+    }
+
+    #[test]
+    fn test_parse_memory_reserve() {
+        assert_eq!(parse_memory_reserve("auto").expect("should parse 'auto'"), MemoryReserve::Auto,);
+        assert_eq!(
+            parse_memory_reserve("10GiB").expect("should parse '10GiB'"),
+            MemoryReserve::Fixed(10 * 1024 * 1024 * 1024),
+        );
+        assert_eq!(
+            parse_memory_reserve("8G").expect("should parse '8G'"),
+            MemoryReserve::Fixed(8_000_000_000),
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_limit_auto_with_fixed_reserve() {
+        // With a large fixed reserve, auto should return less memory
+        let large_reserve = resolve_memory_limit(
+            MemoryLimit::Auto,
+            MemoryReserve::Fixed(10 * 1024 * 1024 * 1024),
+            4,
+            true,
+        )
+        .expect("should succeed");
+        let small_reserve = resolve_memory_limit(
+            MemoryLimit::Auto,
+            MemoryReserve::Fixed(2 * 1024 * 1024 * 1024),
+            4,
+            true,
+        )
+        .expect("should succeed");
+        assert!(large_reserve < small_reserve);
     }
 
     #[test]

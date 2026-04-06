@@ -66,7 +66,7 @@ memchr = "2"
 murmur3 = "0.5"
 statrs = "0.18"
 bytesize = "2.3"
-sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"
@@ -93,7 +93,7 @@ duplex = ["fgumi-consensus/duplex"]
 codec = ["fgumi-consensus/codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
-memory-debug = ["dep:libmimalloc-sys", "dep:sysinfo"]
+memory-debug = ["dep:libmimalloc-sys"]
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
 # Enable simulate commands for generating synthetic test data
