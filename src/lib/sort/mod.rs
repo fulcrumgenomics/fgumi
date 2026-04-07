@@ -9,7 +9,8 @@
 //!
 //! - **External merge-sort**: Handles BAM files larger than available RAM via spill-to-disk
 //! - **Lazy decoding**: Only parses fields needed for sort key extraction
-//! - **Parallel sorting**: Uses rayon for in-memory parallel sort
+//! - **N+2 worker pool**: Dedicated reader, writer, and N sort workers stream
+//!   chunks through the pipeline; in-memory sort uses parallel radix sort
 //! - **Buffer recycling**: Reuses buffers via channel-based allocation patterns
 //! - **Fast compression**: Uses libdeflate for temporary file compression
 //!
@@ -19,9 +20,9 @@
 //!
 //! 1. **Read phase**: Stream BAM records, extract sort keys lazily
 //! 2. **Accumulate phase**: Buffer records until memory limit reached
-//! 3. **Sort phase**: Parallel sort in-memory records using rayon
+//! 3. **Sort phase**: Parallel radix sort over the in-memory record buffer
 //! 4. **Spill phase**: Compress and write sorted chunk to temp file
-//! 5. **Merge phase**: K-way merge of sorted temp files using min-heap
+//! 5. **Merge phase**: K-way merge of sorted temp files using a loser tree
 
 use std::path::Path;
 
@@ -34,7 +35,6 @@ use tempfile::TempDir;
 
 pub use fgumi_raw_bam as bam_fields;
 pub mod bgzf_io;
-pub mod external;
 pub mod inline_buffer;
 pub mod keys;
 pub mod loser_tree;
@@ -137,7 +137,6 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
     }
 }
 
-pub use external::ExternalSorter;
 pub use inline_buffer::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
     CoordinateKey, PA_TAG, PrimaryAlignmentInfo, QuerynameComparator, QuerynameKey,

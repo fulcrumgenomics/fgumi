@@ -273,23 +273,6 @@ where
     }
 }
 
-/// Hybrid sort: uses binary insertion for small arrays, parallel sort for large.
-pub fn hybrid_sort<T: Send, F>(arr: &mut [T], compare: F, parallel: bool)
-where
-    F: Fn(&T, &T) -> Ordering + Sync,
-{
-    const INSERTION_THRESHOLD: usize = 32;
-
-    if arr.len() <= INSERTION_THRESHOLD {
-        binary_insertion_sort(arr, compare);
-    } else if parallel {
-        use rayon::prelude::*;
-        arr.par_sort_unstable_by(|a, b| compare(a, b));
-    } else {
-        arr.sort_unstable_by(|a, b| compare(a, b));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,16 +372,6 @@ mod tests {
         assert_eq!(arr[1].0, 3);
         assert_eq!(arr[2].0, 5);
         assert_eq!(arr[3].0, 8);
-    }
-
-    #[test]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn test_hybrid_sort() {
-        let mut arr: Vec<i32> = (0..100).rev().collect();
-        hybrid_sort(&mut arr, std::cmp::Ord::cmp, false);
-        for (i, &v) in arr.iter().enumerate() {
-            assert_eq!(v, i as i32);
-        }
     }
 
     #[test]
