@@ -22,6 +22,7 @@
 
 use crate::bam_io::create_bam_reader;
 use crate::logging::OperationTimer;
+use crate::sam::SamTag;
 use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
@@ -309,7 +310,7 @@ pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
 /// Parse the cell tag for template-coordinate sort/verify, returning `None`
 /// for other sort orders.
 pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<[u8; 2]>> {
-    if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(*b"CB")) } else { Ok(None) }
+    if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(*SamTag::CB)) } else { Ok(None) }
 }
 
 /// Summary of sort-order verification: `(total_records, violations, first_violation)`.
@@ -695,7 +696,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(SortOrderArg::TemplateCoordinate, Some(*b"CB"))]
+    #[case(SortOrderArg::TemplateCoordinate, Some(*SamTag::CB))]
     #[case(SortOrderArg::Coordinate, None)]
     #[case(SortOrderArg::Queryname, None)]
     fn test_parse_cell_tag(#[case] order: SortOrderArg, #[case] expected: Option<[u8; 2]>) {

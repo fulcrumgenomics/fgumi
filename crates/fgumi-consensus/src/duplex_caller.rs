@@ -4736,7 +4736,7 @@ mod tests {
             ba_consensus: None,
         };
 
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(fgumi_sam::SamTag::CB);
         let cell_barcode = "ACGTACGT-1";
 
         let mut builder = UnmappedBamRecordBuilder::new();

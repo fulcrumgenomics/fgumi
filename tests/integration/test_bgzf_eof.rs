@@ -39,7 +39,7 @@ fn write_grouped_bam(path: &Path, families: &[(&str, &[RecordBuf])]) {
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
-    let mi_tag = Tag::new(b'M', b'I');
+    let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
     for &(mi, records) in families {
         for record in records {
             let mut rec = record.clone();
@@ -117,7 +117,7 @@ fn create_duplex_pair(
     )]
     let tlen: i32 = if is_b_strand { -((read_len + 100) as i32) } else { (read_len + 100) as i32 };
 
-    let mi = Tag::new(b'M', b'I');
+    let mi = Tag::from(fgumi_lib::sam::SamTag::MI);
 
     let mut r1 = RecordBuilder::new()
         .name(name)

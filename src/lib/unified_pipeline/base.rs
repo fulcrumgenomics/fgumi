@@ -91,6 +91,7 @@ use super::deadlock::{DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
 use crate::read_info::LibraryIndex;
 use crate::reorder_buffer::ReorderBuffer;
+use crate::sam::SamTag;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::data::field::Tag;
 
@@ -1638,7 +1639,7 @@ impl Default for GroupKeyConfig {
     fn default() -> Self {
         Self {
             library_index: Arc::new(LibraryIndex::default()),
-            cell_tag: Some(Tag::from([b'C', b'B'])), // Default cell barcode tag
+            cell_tag: Some(Tag::from(SamTag::CB)), // Default cell barcode tag
             raw_byte_mode: false,
         }
     }

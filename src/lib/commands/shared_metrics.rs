@@ -7,6 +7,7 @@
 
 use crate::bam_io::create_bam_reader;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
 
@@ -430,8 +431,8 @@ where
     let mut template_count = 0;
     let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
     let mut fraction_template_counts: Vec<usize> = vec![0; num_fractions];
-    let mi_tag = Tag::new(b'M', b'I');
-    let umi_tag = Tag::new(b'R', b'X');
+    let mi_tag = Tag::from(SamTag::MI);
+    let umi_tag = Tag::from(SamTag::RX);
 
     for template in template_iter {
         let template = template?;

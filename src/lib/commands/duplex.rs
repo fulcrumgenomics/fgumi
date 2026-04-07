@@ -31,6 +31,7 @@ use crate::overlapping_consensus::{
 };
 use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
+use crate::sam::SamTag;
 use crate::sort::bam_fields;
 use crate::umi::extract_mi_base;
 use crate::unified_pipeline::{
@@ -294,7 +295,7 @@ impl Command for Duplex {
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
         // Cell barcode tag is fixed to the SAM standard CB tag
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(SamTag::CB);
 
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
@@ -411,7 +412,7 @@ impl Command for Duplex {
                 let mi_str = String::from_utf8_lossy(mi_bytes);
                 extract_mi_base(&mi_str).to_string()
             })
-            .with_cell_tag(Some(*b"CB"));
+            .with_cell_tag(Some(*SamTag::CB));
         // Single-threaded processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -544,7 +545,7 @@ impl Duplex {
         let error_rate_post_umi = self.consensus.error_rate_post_umi;
         let overlapping_enabled = self.overlapping.consensus_call_overlapping_bases;
         let read_group_id = self.read_group.read_group_id.clone();
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(SamTag::CB);
         let batch_size = 100; // MI groups per batch
 
         // Record filter for duplex on raw bytes: skip secondary/supplementary, keep mapped or mate-mapped
@@ -592,7 +593,7 @@ impl Duplex {
                         record_filter,
                         mi_transform,
                     )
-                    .with_cell_tag(Some(*b"CB")),
+                    .with_cell_tag(Some(*SamTag::CB)),
                 ) as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
             },
             // ========== process_fn: Duplex consensus calling ==========

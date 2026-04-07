@@ -1130,6 +1130,7 @@ where
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
+    use crate::sam::SamTag;
     use crate::sam::builder::RecordBuilder;
     use crate::umi::extract_mi_base;
 
@@ -1719,7 +1720,7 @@ mod tests {
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "TGCA")),
         ];
         let mut iter =
-            RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some([b'C', b'B']));
+            RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some(*SamTag::CB));
 
         // First group: MI=1, CB=ACGT
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
@@ -1759,7 +1760,7 @@ mod tests {
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
         ];
         let mut iter =
-            RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some([b'C', b'B']));
+            RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some(*SamTag::CB));
 
         // First group: MI=1, no CB (key = "1\t")
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
@@ -1786,7 +1787,7 @@ mod tests {
             let s = String::from_utf8_lossy(raw);
             extract_mi_base(&s).to_string()
         })
-        .with_cell_tag(Some([b'C', b'B']));
+        .with_cell_tag(Some(*SamTag::CB));
 
         // All three have base MI "1", but different cells
         // First group: base MI=1, CB=ACGT (2 records: 1/A and 1/B)
@@ -2040,7 +2041,7 @@ mod tests {
             DecodedRecord::from_raw_bytes(raw, key)
         }
 
-        let mut grouper = RawMiGrouper::new("MI", 10).with_cell_tag(Some([b'C', b'B']));
+        let mut grouper = RawMiGrouper::new("MI", 10).with_cell_tag(Some(*SamTag::CB));
 
         // Two records per (MI, CB) combination; MI=1,CB=ACGT and MI=1,CB=TGCA must be split.
         let records = vec![

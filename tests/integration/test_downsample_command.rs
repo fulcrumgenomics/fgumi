@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::create_minimal_header;
 
 /// MI tag constant
-const MI_TAG: Tag = Tag::new(b'M', b'I');
+const MI_TAG: Tag = fgumi_lib::sam::SamTag::MI.to_noodles_tag();
 
 /// Create a grouped BAM file with MI tags (simulating output from group).
 fn create_grouped_bam(path: &PathBuf, families: Vec<(&str, usize)>) {

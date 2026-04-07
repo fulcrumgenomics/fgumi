@@ -8,6 +8,7 @@ use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::reference::find_dict_path;
+use crate::sam::SamTag;
 use crate::umi::extract_mi_base;
 use crate::validation::validate_file_exists;
 use crate::variant_review::{
@@ -623,7 +624,7 @@ impl Review {
                 if self.has_non_reference_base(&record, variant)? {
                     // Extract MI tag
                     let mi_tag =
-                        noodles::sam::alignment::record::data::field::Tag::from([b'M', b'I']);
+                        noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
                     if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(
                         mi_bytes,
                     )) = record.data().get(&mi_tag)
@@ -682,7 +683,7 @@ impl Review {
             progress.log_if_needed(1);
 
             // Extract MI tag
-            let mi_tag = noodles::sam::alignment::record::data::field::Tag::from([b'M', b'I']);
+            let mi_tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
             if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi_bytes)) =
                 record.data().get(&mi_tag)
             {
@@ -791,7 +792,7 @@ impl Review {
                 let read_qual = self.get_quality_at_position(&record, variant.pos)?.unwrap_or(0);
 
                 // Extract MI tag
-                let mi_tag = noodles::sam::alignment::record::data::field::Tag::from([b'M', b'I']);
+                let mi_tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
                 let mi_str = match record.data().get(&mi_tag) {
                     Some(noodles::sam::alignment::record_buf::data::field::Value::String(
                         mi_bytes,
@@ -831,7 +832,7 @@ impl Review {
 
                         // Extract MI tag
                         let mi_tag =
-                            noodles::sam::alignment::record::data::field::Tag::from([b'M', b'I']);
+                            noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
                         let mi_str = match record.data().get(&mi_tag) {
                             Some(
                                 noodles::sam::alignment::record_buf::data::field::Value::String(

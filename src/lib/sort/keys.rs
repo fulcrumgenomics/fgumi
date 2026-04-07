@@ -27,13 +27,14 @@ use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::cmp::Ordering;
 
+use crate::sam::SamTag;
 use crate::sort::bam_fields;
 use std::io::{Read, Write};
 
 /// The PA (Primary Alignment) tag for secondary/supplementary reads.
 /// Stores template-coordinate sort key as B:i array (6 int32s).
 /// Added by `fgumi zipper` to enable proper template-coordinate sorting.
-pub const PA_TAG: Tag = Tag::new(b'p', b'a');
+pub const PA_TAG: Tag = SamTag::PA.to_noodles_tag();
 
 // ============================================================================
 // Primary Alignment Info (PA tag)

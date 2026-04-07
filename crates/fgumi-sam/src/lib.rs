@@ -36,6 +36,7 @@ pub mod alignment_tags;
 pub mod builder;
 pub mod clipper;
 pub mod record_utils;
+pub mod tag;
 
 /// Abstraction over reference genome access for alignment tag calculation.
 ///
@@ -91,6 +92,7 @@ pub use record_utils::{
     reference_length, trailing_clipping, trailing_soft_clipping, unclipped_end,
     unclipped_five_prime_position, unclipped_start,
 };
+pub use tag::SamTag;
 
 use bstr::ByteSlice;
 use log::warn;
