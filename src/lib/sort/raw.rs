@@ -1736,66 +1736,91 @@ impl RawExternalSorter {
         // Get number of references (unmapped reads map to nref)
         let nref = header.reference_sequences().len() as u32;
 
-        // Estimate capacity from initial_capacity (not memory_limit) to avoid
-        // huge upfront allocations when auto-detecting memory.
-        let init_cap = self.effective_initial_capacity();
-        // Per-record footprint: ~200 bytes BAM + 16 header + 24 ref = ~240 bytes
-        let estimated_records = init_cap / 240;
-        // Data bytes = init_cap minus ref overhead (24 bytes/record)
-        let estimated_data_bytes = init_cap.saturating_sub(estimated_records * 24);
+        // ============================================================
+        // HYBRID EXPERIMENT: small cycles + in-memory retention pool
+        // ============================================================
+        // See PR #245 follow-up. Hardcoded constants for validation only.
+        #[allow(clippy::items_after_statements)]
+        const CYCLE_TARGET: usize = 4 * 1024 * 1024 * 1024; // 4 GiB per sort cycle
+        #[allow(clippy::items_after_statements)]
+        const RETENTION_BUDGET: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB in-memory pool
+        let cycle_records = CYCLE_TARGET / 240;
+        let cycle_data_bytes = CYCLE_TARGET.saturating_sub(cycle_records * 24);
+        info!(
+            "HYBRID: cycle_target={} MiB, retention_budget={} MiB",
+            CYCLE_TARGET / (1024 * 1024),
+            RETENTION_BUDGET / (1024 * 1024)
+        );
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
-        let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
+        let mut buffer = RecordBuffer::with_capacity(cycle_records, cycle_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
-        let mut pending_spill: Option<PendingSpill> = None;
+
+        // Retention pool: sorted, materialized chunks kept in RAM.
+        let mut retained_memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = Vec::new();
+        let mut retained_bytes: u64 = 0;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
-        info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
+        info!("Phase 1: Reading and sorting chunks (HYBRID retention pool)...");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
             progress.log_if_needed(1);
 
-            // Push directly to buffer - key extracted inline from raw bytes
             buffer.push_coordinate(record.as_ref())?;
 
-            // Check memory usage
-            if buffer.memory_usage() >= self.memory_limit {
+            if buffer.memory_usage() >= CYCLE_TARGET {
                 timer.end_read_span();
-
-                // Wait for any previous spill to complete before starting a new one
-                self.drain_pending_spill::<RawCoordinateKey>(
-                    &mut pending_spill,
-                    &mut chunk_files,
-                    &mut stats,
-                    &mut timer,
-                    &mut namer,
-                    &pool,
-                )?;
-
-                let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
                     buffer.par_sort();
                 });
 
-                // Write keyed temp file with parallel BGZF compression via worker pool.
-                // Use start_finish() for pipelining: I/O continues in background
-                // while we read the next batch.
-                let handle = timer.time_spill_write(|| {
-                    let mut writer =
-                        PooledChunkWriter::<RawCoordinateKey>::new(Arc::clone(&pool), &chunk_path)?;
-                    for r in buffer.refs() {
+                // Materialize sorted buffer into a Vec<(Key, Vec<u8>)> chunk.
+                let chunk: Vec<(RawCoordinateKey, Vec<u8>)> = buffer
+                    .refs()
+                    .iter()
+                    .map(|r| {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
-                        let record_bytes = buffer.get_record(r);
-                        writer.write_record(&key, record_bytes)?;
-                    }
-                    writer.start_finish()
-                })?;
-
-                pending_spill = Some(PendingSpill { handle, chunk_path });
-
+                        (key, buffer.get_record(r).to_vec())
+                    })
+                    .collect();
+                let chunk_bytes: u64 = chunk.iter().map(|(_, v)| v.len() as u64 + 32).sum::<u64>();
                 buffer.clear();
+
+                if retained_bytes + chunk_bytes <= RETENTION_BUDGET {
+                    retained_bytes += chunk_bytes;
+                    info!(
+                        "HYBRID: retained chunk ({} MiB), pool now {} MiB ({} chunks)",
+                        chunk_bytes / (1024 * 1024),
+                        retained_bytes / (1024 * 1024),
+                        retained_memory_chunks.len() + 1
+                    );
+                    retained_memory_chunks.push(chunk);
+                } else {
+                    // Overflow: spill this chunk to disk (no pipelining).
+                    let chunk_path = namer.next_chunk_path();
+                    info!(
+                        "HYBRID: retention full, spilling chunk ({} MiB) to disk",
+                        chunk_bytes / (1024 * 1024)
+                    );
+                    timer.time_spill_write(|| {
+                        let mut writer = PooledChunkWriter::<RawCoordinateKey>::new(
+                            Arc::clone(&pool),
+                            &chunk_path,
+                        )?;
+                        for (key, bytes) in &chunk {
+                            writer.write_record(key, bytes)?;
+                        }
+                        let handle = writer.start_finish()?;
+                        handle.wait()?;
+                        Ok(())
+                    })?;
+                    timer.record_spill_size(&chunk_path);
+                    chunk_files.push(chunk_path);
+                    stats.chunks_written += 1;
+                }
+
                 timer.begin_read_span();
             }
         }
@@ -1806,55 +1831,47 @@ impl RawExternalSorter {
             return Err(anyhow::Error::from(err));
         }
 
-        // Drain any pending spill before merge
-        self.drain_pending_spill::<RawCoordinateKey>(
-            &mut pending_spill,
-            &mut chunk_files,
-            &mut stats,
-            &mut timer,
-            &mut namer,
-            &pool,
-        )?;
+        info!(
+            "HYBRID: phase 1 done. retained={} chunks ({} MiB), disk={} chunks",
+            retained_memory_chunks.len(),
+            retained_bytes / (1024 * 1024),
+            chunk_files.len()
+        );
 
-        if chunk_files.is_empty() {
-            // All records fit in memory - no merge needed
-            info!("All records fit in memory, performing in-memory sort");
-
+        // HYBRID: Fold final unspilled buffer into retained chunks, then decide path.
+        if !buffer.is_empty() {
             timer.time_sort(|| {
-                buffer.sort();
+                buffer.par_sort();
             });
+            let final_chunk: Vec<(RawCoordinateKey, Vec<u8>)> = buffer
+                .refs()
+                .iter()
+                .map(|r| {
+                    let key = RawCoordinateKey { sort_key: r.sort_key };
+                    (key, buffer.get_record(r).to_vec())
+                })
+                .collect();
+            buffer.clear();
+            retained_memory_chunks.push(final_chunk);
+        }
+        drop(buffer);
 
+        if chunk_files.is_empty() && retained_memory_chunks.len() == 1 {
+            // All records fit in a single in-memory chunk - stream directly to output
+            info!("HYBRID: single in-memory chunk, writing directly");
+            let single = retained_memory_chunks.pop().unwrap();
             timer.time_write_output(|| {
                 use crate::sort::pooled_bam_writer::PooledBamWriter;
                 let output_header = self.create_output_header(header);
                 let mut writer = PooledBamWriter::new(Arc::clone(&pool), output, &output_header)?;
-
-                for record_bytes in buffer.iter_sorted() {
-                    writer.write_raw_record(record_bytes)?;
+                for (_, bytes) in &single {
+                    writer.write_raw_record(bytes)?;
                 }
                 writer.finish()?;
                 Ok(())
             })?;
         } else {
-            // Sort remaining records into separate sub-array chunks (avoids
-            // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
-                Vec::new()
-            } else {
-                timer.time_sort(|| {
-                    buffer.par_sort();
-                });
-                let chunk = buffer
-                    .refs()
-                    .iter()
-                    .map(|r| {
-                        let key = RawCoordinateKey { sort_key: r.sort_key };
-                        (key, buffer.get_record(r).to_vec())
-                    })
-                    .collect();
-                vec![chunk]
-            };
-
+            let memory_chunks = retained_memory_chunks;
             let n_memory = memory_chunks.iter().filter(|c| !c.is_empty()).count();
             info!(
                 "Phase 2: Merging {} chunks (keyed O(1) comparisons)...",
