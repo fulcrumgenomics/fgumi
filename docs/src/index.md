@@ -1,4 +1,4 @@
-# fgumi
+<h1><span style="color:#26a8e0">fg</span><span style="color:#38b44a">umi</span></h1>
 
 High-performance tools for UMI-tagged sequencing data: extraction, grouping, and consensus calling.
 
@@ -73,13 +73,3 @@ cargo build --release
 | `merge` | Merge sorted BAM files |
 
 See the [Tool Reference](tools/README.md) for detailed documentation of each command.
-
-## Links
-
-- [GitHub Repository](https://github.com/fulcrumgenomics/fgumi)
-- [API Documentation (docs.rs)](https://docs.rs/fgumi)
-- [Releases](https://github.com/fulcrumgenomics/fgumi/releases)
-- [Issues](https://github.com/fulcrumgenomics/fgumi/issues)
-- [Discussions](https://github.com/fulcrumgenomics/fgumi/discussions)
-- [fgbio](https://github.com/fulcrumgenomics/fgbio) — Scala predecessor
-- [Fulcrum Genomics](https://fulcrumgenomics.com)

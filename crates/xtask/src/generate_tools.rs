@@ -29,7 +29,7 @@ pub fn generate(docs_src: &Path) -> Result<Vec<ToolPage>> {
     let commands = collect_commands();
 
     let mut pages = Vec::new();
-    let mut by_category: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut by_category: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
 
     for (name, category, description, long_about, cmd) in &commands {
         let markdown = render_tool_page(name, category, description, long_about.as_deref(), cmd);
@@ -44,7 +44,11 @@ pub fn generate(docs_src: &Path) -> Result<Vec<ToolPage>> {
             path: rel_path.clone(),
         });
 
-        by_category.entry(category.clone()).or_default().push((name.clone(), rel_path));
+        by_category.entry(category.clone()).or_default().push((
+            name.clone(),
+            rel_path,
+            description.clone(),
+        ));
     }
 
     let index = render_tools_index(&by_category);
@@ -294,7 +298,7 @@ fn format_default(arg: &clap::Arg) -> String {
 }
 
 /// Render the tools index page grouped by category.
-fn render_tools_index(by_category: &BTreeMap<String, Vec<(String, String)>>) -> String {
+fn render_tools_index(by_category: &BTreeMap<String, Vec<(String, String, String)>>) -> String {
     let mut md = String::new();
     md.push_str("# Tool Reference\n\n");
     md.push_str("Auto-generated from fgumi command definitions.\n\n");

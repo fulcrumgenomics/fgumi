@@ -10,9 +10,12 @@ build-dir = "book"
 
 [output.html]
 additional-css = ["theme/custom.css"]
+additional-js = ["theme/sidebar-brand.js"]
 git-repository-url = "https://github.com/fulcrumgenomics/fgumi"
 edit-url-template = "https://github.com/fulcrumgenomics/fgumi/edit/main/docs/{path}"
 no-section-label = true
+default-theme = "navy"
+preferred-dark-theme = "navy"
 
 [output.html.search]
 enable = true
