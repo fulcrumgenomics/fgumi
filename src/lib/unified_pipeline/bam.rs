@@ -678,7 +678,13 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             next_group_serial: AtomicU64::new(0),
             batches_grouped: AtomicU64::new(0),
             // Output-half state (Group → Process → Serialize → Compress → Write)
-            output: OutputPipelineQueues::new(cap, output, stats, "Processed records"),
+            output: OutputPipelineQueues::new(
+                cap,
+                output,
+                stats,
+                "Processed records",
+                memory_limit,
+            ),
             // Deadlock detection
             deadlock_state,
         }
@@ -1139,6 +1145,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
         self.deadlock_state.record_q7_push();
     }
 
+    fn write_reorder_can_proceed(&self, serial: u64) -> bool {
+        self.output.write_reorder_state.can_proceed(serial)
+    }
+
     fn stats(&self) -> Option<&PipelineStats> {
         self.output.stats.as_deref()
     }
@@ -1248,6 +1258,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> WritePipelineState
 
     fn write_reorder_buffer(&self) -> &Mutex<ReorderBuffer<CompressedBlockBatch>> {
         &self.output.write_reorder
+    }
+
+    fn write_reorder_state(&self) -> &super::base::ReorderBufferState {
+        &self.output.write_reorder_state
     }
 
     fn write_output(&self) -> &Mutex<Option<Box<dyn Write + Send>>> {
@@ -2818,16 +2832,18 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     {
         let mut reorder = state.output.write_reorder.lock();
 
-        // Drain Q7 into reorder buffer
+        // Drain Q7 into reorder buffer, tracking heap bytes for admission control.
         while let Some((serial, batch)) = state.output.compressed.pop() {
             let q7_heap = batch.estimate_heap_size() as u64;
             state.q6_track_pop(q7_heap);
             state.deadlock_state.record_q7_pop();
-            reorder.insert(serial, batch);
+            let heap_size = batch.estimate_heap_size();
+            reorder.insert_with_size(serial, batch, heap_size);
+            state.output.write_reorder_state.add_heap_bytes(heap_size as u64);
         }
 
         // Write all ready batches
-        while let Some(batch) = reorder.try_pop_next() {
+        while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
             // Write all blocks in the batch
             let mut batch_bytes: u64 = 0;
             for block in &batch.blocks {
@@ -2852,6 +2868,10 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
                     }
                 }
             }
+
+            // Update admission-control state so write_reorder_can_proceed stays accurate.
+            state.output.write_reorder_state.sub_heap_bytes(heap_size as u64);
+            state.output.write_reorder_state.update_next_seq(reorder.next_seq());
 
             // Record bytes written for throughput metrics
             if let Some(stats) = state.stats() {

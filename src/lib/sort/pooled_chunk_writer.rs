@@ -15,13 +15,15 @@
 //!                                              ──────► write ordered
 //! ```
 //!
-//! The reorder buffer is bounded (capacity = `num_workers * 4`) with backpressure:
-//! if the I/O thread falls behind, the main thread blocks on submit, which is
-//! the correct behavior (don't produce faster than we can write).
+//! The reorder buffer is bounded (capacity = `num_workers * 4`) via a `PermitPool`:
+//! `StagingBuffer::flush()` acquires a permit before each submit; `io_writer_loop`
+//! releases it after each block is handed to the OS write buffer (`write_all` on a
+//! `BufWriter`), blocking the main thread when the budget is exhausted rather than
+//! accumulating blocks in an unbounded reorder buffer.
 
 use crate::sort::bgzf_io::{StagingBuffer, io_writer_loop};
 use crate::sort::keys::RawSortKey;
-use crate::sort::worker_pool::{CompressResult, SortWorkerPool};
+use crate::sort::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
@@ -37,7 +39,8 @@ use std::thread::{self, JoinHandle};
 /// for compression. An I/O thread receives compressed blocks and writes them
 /// in serial order using a bounded reorder buffer.
 pub struct PooledChunkWriter<K: RawSortKey> {
-    staging: StagingBuffer,
+    /// `None` only after `start_finish()` transfers ownership to `SpillWriteHandle`.
+    staging: Option<StagingBuffer>,
     /// Reusable scratch buffer for key serialization (non-embedded keys only).
     key_buf: Vec<u8>,
     io_handle: Option<JoinHandle<Result<()>>>,
@@ -60,11 +63,13 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
         let reorder_capacity = pool.num_workers() * 4;
         let (result_tx, result_rx) = bounded::<CompressResult>(reorder_capacity);
         let buffer_pool = pool.buffer_pool.clone();
+        let permit_pool = Arc::new(PermitPool::new(reorder_capacity));
 
-        let io_handle = thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool));
+        let pp = Arc::clone(&permit_pool);
+        let io_handle = thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
 
         Ok(Self {
-            staging: StagingBuffer::new(pool, result_tx),
+            staging: Some(StagingBuffer::new(pool, result_tx, permit_pool)),
             key_buf: Vec::new(),
             io_handle: Some(io_handle),
             _phantom: PhantomData,
@@ -79,21 +84,26 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
     /// # Errors
     ///
     /// Returns an error if key serialization fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`start_finish`](Self::start_finish) has been called.
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_record(&mut self, key: &K, record: &[u8]) -> Result<()> {
+        let staging = self.staging.as_mut().expect("write_record called after start_finish");
         if K::EMBEDDED_IN_RECORD {
             // Fast path: key is part of the record bytes, no extra serialization.
             // Budget: 4-byte length prefix + record bytes.
             let needed = 4 + record.len();
-            if self.staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
-                self.staging.flush();
+            if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
+                staging.flush()?;
             }
-            self.staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
+            staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
             if record.len() > BGZF_MAX_BLOCK_SIZE.saturating_sub(4) {
-                self.staging.write_chunked(record);
+                staging.write_chunked(record)?;
             } else {
-                self.staging.buf().extend_from_slice(record);
-                self.staging.flush_if_full();
+                staging.buf().extend_from_slice(record);
+                staging.flush_if_full()?;
             }
         } else {
             // Non-embedded key: serialize key into a reusable scratch buffer so we
@@ -101,17 +111,15 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
             self.key_buf.clear();
             key.write_to(&mut self.key_buf)?;
             let needed = self.key_buf.len() + 4 + record.len();
-            anyhow::ensure!(
-                needed <= BGZF_MAX_BLOCK_SIZE,
-                "record + key ({needed} bytes) exceeds BGZF block size limit; \
-                 this is likely a malformed BAM file"
-            );
-            if self.staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
-                self.staging.flush();
+            // No size limit check: records larger than one BGZF block are handled
+            // by write_chunked(), which splits them across multiple blocks. The
+            // reader uses streaming read_exact() that transparently spans blocks.
+            if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
+                staging.flush()?;
             }
-            self.staging.buf().extend_from_slice(&self.key_buf);
-            self.staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
-            self.staging.write_chunked(record);
+            staging.buf().extend_from_slice(&self.key_buf);
+            staging.buf().extend_from_slice(&(record.len() as u32).to_le_bytes());
+            staging.write_chunked(record)?;
         }
         Ok(())
     }
@@ -135,11 +143,31 @@ impl<K: RawSortKey> PooledChunkWriter<K> {
     ///
     /// Returns an error if flushing the staging buffer fails.
     pub fn start_finish(mut self) -> Result<SpillWriteHandle> {
-        if !self.staging.buf().is_empty() {
-            self.staging.flush();
+        if let Some(mut staging) = self.staging.take() {
+            if !staging.buf().is_empty() {
+                staging.flush()?;
+            }
+            drop(staging); // closes result_tx → I/O thread exits after draining
         }
-        drop(self.staging);
         Ok(SpillWriteHandle::new(self.io_handle.take()))
+    }
+}
+
+impl<K: RawSortKey> Drop for PooledChunkWriter<K> {
+    fn drop(&mut self) {
+        if self.io_handle.is_some() {
+            // Writer dropped before finish()/start_finish() (e.g. early error return).
+            // Drop staging first — this closes result_tx, signaling the I/O thread to
+            // drain and exit. Then join the thread to avoid silently detaching it.
+            drop(self.staging.take());
+            if let Some(handle) = self.io_handle.take() {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::error!("PooledChunkWriter: I/O writer thread error: {e}"),
+                    Err(_) => log::error!("PooledChunkWriter: I/O writer thread panicked"),
+                }
+            }
+        }
     }
 }
 
@@ -387,6 +415,29 @@ mod tests {
         // File must exist and be non-empty (the I/O thread completed via Drop)
         assert!(chunk_path.exists());
         assert!(std::fs::metadata(&chunk_path).unwrap().len() > 0);
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+    }
+
+    #[test]
+    fn test_drop_before_finish() {
+        // Dropping `PooledChunkWriter` without calling finish() must not panic or
+        // deadlock — the Drop impl signals the I/O thread and joins it.
+        let dir = TempDir::new().unwrap();
+        let chunk_path = dir.path().join("dropped_writer.keyed");
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+
+        {
+            let mut writer = PooledChunkWriter::<TemplateKey>::new(Arc::clone(&pool), &chunk_path)
+                .expect("create writer");
+            writer.write_record(&make_key(0), &[1, 2, 3]).expect("write");
+            // Drop without calling finish() — exercises the Drop impl
+        }
+
+        // File must exist (I/O thread completed via Drop)
+        assert!(chunk_path.exists());
 
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();

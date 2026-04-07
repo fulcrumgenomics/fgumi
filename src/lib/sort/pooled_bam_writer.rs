@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! Pool-based BAM writer using `SortWorkerPool` for parallel BGZF compression.
 //!
 //! `PooledBamWriter` replaces the noodles `MultithreadedWriter` during merge output,
@@ -20,7 +21,7 @@
 //! ```
 
 use crate::sort::bgzf_io::{StagingBuffer, io_writer_loop};
-use crate::sort::worker_pool::{CompressResult, SortWorkerPool};
+use crate::sort::worker_pool::{CompressResult, PermitPool, SortWorkerPool};
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use fgumi_bgzf::BGZF_MAX_BLOCK_SIZE;
@@ -40,7 +41,8 @@ use super::pooled_chunk_writer::SpillWriteHandle;
 ///
 /// This writer produces valid BAM output (header + length-prefixed records in BGZF blocks).
 pub struct PooledBamWriter {
-    staging: StagingBuffer,
+    /// `None` only after `start_finish()` transfers ownership to `SpillWriteHandle`.
+    staging: Option<StagingBuffer>,
     io_handle: Option<JoinHandle<Result<()>>>,
 }
 
@@ -62,19 +64,21 @@ impl PooledBamWriter {
         let reorder_capacity = pool.num_workers() * 4;
         let (result_tx, result_rx) = bounded::<CompressResult>(reorder_capacity);
         let buffer_pool = pool.buffer_pool.clone();
+        let permit_pool = Arc::new(PermitPool::new(reorder_capacity));
 
-        let io_handle = thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool));
+        let pp = Arc::clone(&permit_pool);
+        let io_handle = thread::spawn(move || io_writer_loop(writer, result_rx, buffer_pool, pp));
 
-        let mut staging = StagingBuffer::new(pool, result_tx);
+        let mut staging = StagingBuffer::new(pool, result_tx, permit_pool);
 
         // Write BAM header into a temporary buffer then flush in BGZF-sized chunks.
         // Headers can exceed BGZF_MAX_BLOCK_SIZE; write_chunked handles the splitting.
         let mut header_buf = Vec::new();
         crate::bam_io::write_bam_header(&mut header_buf, header)?;
-        staging.write_chunked(&header_buf);
-        staging.flush();
+        staging.write_chunked(&header_buf)?;
+        staging.flush()?;
 
-        Ok(Self { staging, io_handle: Some(io_handle) })
+        Ok(Self { staging: Some(staging), io_handle: Some(io_handle) })
     }
 
     /// Write a raw BAM record to the output.
@@ -85,26 +89,31 @@ impl PooledBamWriter {
     /// # Errors
     ///
     /// Returns an error if writing fails (currently infallible for staging buffer).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`start_finish`](Self::start_finish) has been called.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_raw_record(&mut self, record_bytes: &[u8]) -> Result<()> {
+        let staging = self.staging.as_mut().expect("write_raw_record called after start_finish");
         let block_size = record_bytes.len() as u32;
         // Pre-flush if this record won't fit in the current block to keep each
         // CompressJob within BGZF_MAX_BLOCK_SIZE.
         let needed = 4 + record_bytes.len();
-        if self.staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
-            self.staging.flush();
+        if staging.buf().len() + needed > BGZF_MAX_BLOCK_SIZE {
+            staging.flush()?;
         }
         // Write the 4-byte length prefix (always fits: staging is empty after the pre-flush,
         // and 4 bytes is well within BGZF_MAX_BLOCK_SIZE).
-        self.staging.buf().extend_from_slice(&block_size.to_le_bytes());
+        staging.buf().extend_from_slice(&block_size.to_le_bytes());
         // If the record payload itself exceeds one BGZF block, split it across blocks.
         // BAM records can legally span BGZF blocks; readers handle this transparently.
         if record_bytes.len() > BGZF_MAX_BLOCK_SIZE.saturating_sub(4) {
-            self.staging.write_chunked(record_bytes);
+            staging.write_chunked(record_bytes)?;
         } else {
-            self.staging.buf().extend_from_slice(record_bytes);
-            self.staging.flush_if_full();
+            staging.buf().extend_from_slice(record_bytes);
+            staging.flush_if_full()?;
         }
         Ok(())
     }
@@ -126,12 +135,31 @@ impl PooledBamWriter {
     ///
     /// Returns an error if flushing the staging buffer fails.
     pub fn start_finish(mut self) -> Result<SpillWriteHandle> {
-        if !self.staging.buf().is_empty() {
-            self.staging.flush();
+        if let Some(mut staging) = self.staging.take() {
+            if !staging.buf().is_empty() {
+                staging.flush()?;
+            }
+            drop(staging); // closes result_tx → I/O thread exits after draining
         }
-        // Drop staging (and its result_tx clone) to signal I/O thread
-        drop(self.staging);
         Ok(SpillWriteHandle::new(self.io_handle.take()))
+    }
+}
+
+impl Drop for PooledBamWriter {
+    fn drop(&mut self) {
+        if self.io_handle.is_some() {
+            // Writer dropped before finish()/start_finish() (e.g. early error return).
+            // Drop staging first — this closes result_tx, signaling the I/O thread to
+            // drain and exit. Then join the thread to avoid silently detaching it.
+            drop(self.staging.take());
+            if let Some(handle) = self.io_handle.take() {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::error!("PooledBamWriter: I/O writer thread error: {e}"),
+                    Err(_) => log::error!("PooledBamWriter: I/O writer thread panicked"),
+                }
+            }
+        }
     }
 }
 
@@ -247,7 +275,12 @@ mod tests {
             .expect("open reader");
         let read_header = reader.read_header().expect("read header");
         assert_eq!(read_header.reference_sequences().len(), 2);
-        assert_eq!(reader.records().count(), 0);
+        let record_count = reader
+            .records()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("records should read cleanly")
+            .len();
+        assert_eq!(record_count, 0);
 
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
@@ -276,7 +309,12 @@ mod tests {
             .build_from_path(&bam_path)
             .expect("open reader");
         let _header = reader.read_header().expect("read header");
-        assert_eq!(reader.records().count(), num_records);
+        let record_count = reader
+            .records()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("records should read cleanly")
+            .len();
+        assert_eq!(record_count, num_records);
 
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();
@@ -341,7 +379,37 @@ mod tests {
             .build_from_path(&bam_path)
             .expect("open reader");
         let _header = reader.read_header().expect("read header");
-        assert_eq!(reader.records().count(), 1, "oversized record should round-trip");
+        let record_count = reader
+            .records()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("records should read cleanly")
+            .len();
+        assert_eq!(record_count, 1, "oversized record should round-trip");
+
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown();
+        }
+    }
+
+    #[test]
+    fn test_drop_before_finish() {
+        // Dropping `PooledBamWriter` without calling finish() must not panic or
+        // deadlock — the Drop impl signals the I/O thread and joins it.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bam_path = dir.path().join("dropped_writer.bam");
+        let header = test_header();
+        let pool = Arc::new(SortWorkerPool::new(2, 1, 6));
+
+        {
+            let mut writer =
+                PooledBamWriter::new(Arc::clone(&pool), &bam_path, &header).expect("create writer");
+            let rec = make_test_record(b"r0", 10);
+            writer.write_raw_record(&rec).expect("write");
+            // Drop without calling finish() — exercises the Drop impl
+        }
+
+        // File must exist (I/O thread completed via Drop)
+        assert!(bam_path.exists());
 
         if let Ok(pool) = Arc::try_unwrap(pool) {
             pool.shutdown();

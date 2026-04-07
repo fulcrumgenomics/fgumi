@@ -1760,6 +1760,13 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     pub compressed_heap_bytes: AtomicU64,
     /// Reorder buffer to ensure blocks are written in order.
     pub write_reorder: Mutex<ReorderBuffer<CompressedBlockBatch>>,
+    /// Atomic admission-control state for the write reorder buffer.
+    ///
+    /// Mirrors the Q2/Q3 pattern: the compress step checks `can_proceed` before
+    /// pushing to Q6; the write step updates `heap_bytes` and `next_seq` after
+    /// each disk write. Kept outside the mutex so compress workers can check
+    /// admission without acquiring the write lock.
+    pub write_reorder_state: ReorderBufferState,
 
     // ========== Output ==========
     /// Output file, mutex-protected for exclusive access.
@@ -1792,12 +1799,14 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     /// - `output`: Output writer (will be wrapped in Mutex)
     /// - `stats`: Optional performance statistics collector
     /// - `progress_name`: Name for the progress tracker (e.g., "Processed records")
+    /// - `queue_memory_limit`: Memory limit for the write reorder buffer in bytes (0 = 512 MiB default)
     #[must_use]
     pub fn new(
         queue_capacity: usize,
         output: Box<dyn Write + Send>,
         stats: Option<Arc<PipelineStats>>,
         progress_name: &str,
+        queue_memory_limit: u64,
     ) -> Self {
         Self {
             groups: ArrayQueue::new(queue_capacity),
@@ -1809,6 +1818,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
             compressed: ArrayQueue::new(queue_capacity),
             compressed_heap_bytes: AtomicU64::new(0),
             write_reorder: Mutex::new(ReorderBuffer::new()),
+            write_reorder_state: ReorderBufferState::new(queue_memory_limit),
             output: Mutex::new(Some(output)),
             secondary_output: None,
             error_flag: AtomicBool::new(false),
@@ -2445,6 +2455,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> WritePipelineState
 
     fn write_reorder_buffer(&self) -> &Mutex<ReorderBuffer<CompressedBlockBatch>> {
         &self.write_reorder
+    }
+
+    fn write_reorder_state(&self) -> &ReorderBufferState {
+        &self.write_reorder_state
     }
 
     fn write_output(&self) -> &Mutex<Option<Box<dyn Write + Send>>> {
@@ -4186,6 +4200,18 @@ pub trait OutputPipelineState: Send + Sync {
     /// Record progress when pushing to compressed queue (Q7).
     fn record_q7_push_progress(&self) {}
 
+    /// Check whether the compress step can push a batch with the given serial to Q6.
+    ///
+    /// Delegates to the write reorder buffer's admission control state. Returns
+    /// `false` when the write reorder buffer is over its memory threshold and the
+    /// serial is not the one the write step is currently waiting for. Workers that
+    /// receive `false` should hold the batch and retry (same pattern as Q2/Q3).
+    ///
+    /// Default implementation always returns `true` (no backpressure).
+    fn write_reorder_can_proceed(&self, _serial: u64) -> bool {
+        true
+    }
+
     // Stats access (optional, with default no-op implementation)
     /// Get reference to pipeline stats for recording metrics.
     fn stats(&self) -> Option<&PipelineStats> {
@@ -4601,7 +4627,11 @@ where
     // =========================================================================
     // Priority 1: Try to advance any held compressed batch
     // =========================================================================
-    if let Some((serial, held, _heap_size)) = worker.held_compressed_mut().take() {
+    if let Some((serial, held, heap_size)) = worker.held_compressed_mut().take() {
+        if !state.write_reorder_can_proceed(serial) {
+            *worker.held_compressed_mut() = Some((serial, held, heap_size));
+            return StepResult::OutputFull;
+        }
         match state.q6_push((serial, held)) {
             Ok(()) => {
                 // Successfully advanced held item, continue to process more
@@ -4672,6 +4702,11 @@ where
     // =========================================================================
     // Priority 5: Try to push result
     // =========================================================================
+    if !state.write_reorder_can_proceed(serial) {
+        let heap_size = batch.estimate_heap_size();
+        *worker.held_compressed_mut() = Some((serial, batch, heap_size));
+        return StepResult::OutputFull;
+    }
     match state.q6_push((serial, batch)) {
         Ok(()) => {
             state.record_q7_push_progress();
@@ -5063,6 +5098,12 @@ pub trait WritePipelineState: Send + Sync {
     /// Get reference to the output writer.
     fn write_output(&self) -> &Mutex<Option<Box<dyn Write + Send>>>;
 
+    /// Get reference to the write reorder buffer admission-control state.
+    ///
+    /// Used by `shared_try_step_write_new` to track heap bytes and `next_seq`
+    /// so that `write_reorder_can_proceed` in the compress step stays accurate.
+    fn write_reorder_state(&self) -> &ReorderBufferState;
+
     /// Check if an error has occurred.
     fn has_error(&self) -> bool;
 
@@ -5095,7 +5136,9 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
         let mut reorder = state.write_reorder_buffer().lock();
         let queue = state.write_input_queue();
         while let Some((serial, batch)) = queue.pop() {
-            reorder.insert(serial, batch);
+            let heap_size = batch.estimate_heap_size();
+            reorder.insert_with_size(serial, batch, heap_size);
+            state.write_reorder_state().add_heap_bytes(heap_size as u64);
         }
     }
     // Reorder lock released here
@@ -5121,17 +5164,21 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
 
         // Drain any additional items that arrived since phase 1
         while let Some((serial, batch)) = queue.pop() {
-            reorder.insert(serial, batch);
+            let heap_size = batch.estimate_heap_size();
+            reorder.insert_with_size(serial, batch, heap_size);
+            state.write_reorder_state().add_heap_bytes(heap_size as u64);
         }
 
         // Write all ready batches in sequence order
-        while let Some(batch) = reorder.try_pop_next() {
+        while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
             for block in &batch.blocks {
                 if let Err(e) = output.write_all(&block.data) {
                     state.set_error(e);
                     return StepResult::InputEmpty;
                 }
             }
+            state.write_reorder_state().sub_heap_bytes(heap_size as u64);
+            state.write_reorder_state().update_next_seq(reorder.next_seq());
             state.record_written(batch.record_count);
             wrote_any = true;
         }
@@ -5846,7 +5893,7 @@ mod tests {
     fn test_output_queues_new() {
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         let queues: OutputPipelineQueues<(), TestProcessed> =
-            OutputPipelineQueues::new(16, output, None, "test");
+            OutputPipelineQueues::new(16, output, None, "test", 0);
         assert!(queues.groups.is_empty());
         assert!(queues.processed.is_empty());
         assert!(queues.serialized.is_empty());
@@ -5857,7 +5904,7 @@ mod tests {
     fn test_output_queues_set_take_error() {
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         let queues: OutputPipelineQueues<(), TestProcessed> =
-            OutputPipelineQueues::new(16, output, None, "test");
+            OutputPipelineQueues::new(16, output, None, "test", 0);
         assert!(!queues.has_error());
         queues.set_error(io::Error::other("test error"));
         assert!(queues.has_error());
@@ -5870,7 +5917,7 @@ mod tests {
     fn test_output_queues_draining() {
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         let queues: OutputPipelineQueues<(), TestProcessed> =
-            OutputPipelineQueues::new(16, output, None, "test");
+            OutputPipelineQueues::new(16, output, None, "test", 0);
         assert!(!queues.is_draining());
         queues.set_draining(true);
         assert!(queues.is_draining());
@@ -5880,7 +5927,7 @@ mod tests {
     fn test_output_queues_queue_depths_empty() {
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         let queues: OutputPipelineQueues<(), TestProcessed> =
-            OutputPipelineQueues::new(16, output, None, "test");
+            OutputPipelineQueues::new(16, output, None, "test", 0);
         let depths = queues.queue_depths();
         assert_eq!(depths.groups, 0);
         assert_eq!(depths.processed, 0);
@@ -5892,7 +5939,7 @@ mod tests {
     fn test_output_queues_are_queues_empty() {
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         let queues: OutputPipelineQueues<(), TestProcessed> =
-            OutputPipelineQueues::new(16, output, None, "test");
+            OutputPipelineQueues::new(16, output, None, "test", 0);
         assert!(queues.are_queues_empty());
     }
 

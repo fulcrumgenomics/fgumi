@@ -320,6 +320,60 @@ impl Clone for BufferPool {
 }
 
 // ============================================================================
+// Permit Pool
+// ============================================================================
+
+/// Bounded semaphore for controlling in-flight compressed blocks.
+///
+/// Pre-filled with `capacity` permits. `StagingBuffer::flush()` acquires a
+/// permit (blocking) before submitting each compress job; `io_writer_loop`
+/// releases a permit after each `write_all`. At most `capacity` compressed
+/// blocks exist anywhere in the pipeline simultaneously, bounding the reorder
+/// buffer to `capacity × BGZF_MAX_BLOCK_SIZE` bytes.
+pub(crate) struct PermitPool {
+    tx: std::sync::Mutex<Option<Sender<()>>>,
+    rx: Receiver<()>,
+}
+
+impl PermitPool {
+    /// Create a permit pool pre-filled with `capacity` permits.
+    pub(crate) fn new(capacity: usize) -> Self {
+        let (tx, rx) = bounded(capacity);
+        for _ in 0..capacity {
+            tx.try_send(()).expect("fresh channel has capacity for initial permits");
+        }
+        Self { tx: std::sync::Mutex::new(Some(tx)), rx }
+    }
+
+    /// Acquire a permit, blocking until one is available.
+    ///
+    /// Returns an error if the pool has been closed (I/O writer exited with an error).
+    pub(crate) fn acquire(&self) -> anyhow::Result<()> {
+        self.rx.recv().map_err(|_| anyhow::anyhow!("permit pool closed: I/O writer thread exited"))
+    }
+
+    /// Release a permit back to the pool after a block has been written to disk.
+    pub(crate) fn release(&self) {
+        if let Ok(guard) = self.tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+
+    /// Close the pool, unblocking any threads waiting on `acquire()`.
+    ///
+    /// Drops the sending half of the channel so that `rx.recv()` in `acquire()`
+    /// returns `Err`, which is mapped to an `anyhow` error. Called by
+    /// `io_writer_loop` on write error to prevent producers from parking forever.
+    pub(crate) fn close(&self) {
+        if let Ok(mut guard) = self.tx.lock() {
+            guard.take(); // drops the Sender, closing the channel
+        }
+    }
+}
+
+// ============================================================================
 // Phase 2 Data Types (chunk reading)
 // ============================================================================
 
