@@ -54,7 +54,7 @@ use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::reference::find_dict_path;
 use crate::sam::{
-    buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
+    SamTag, buf_value_to_smallest_signed_int, check_sort, revcomp_buf_value, reverse_buf_value,
     unclipped_five_prime_position,
 };
 use crate::sort::{PA_TAG, PrimaryAlignmentInfo, bam_fields};
@@ -495,8 +495,8 @@ pub fn merge(
     // Normalize alignment integer tags (AS, XS) to Int8 to match fgbio's encoding.
     // When reading from SAM format, noodles may parse these tags with different types
     // (e.g., Int32 or UInt8). fgbio consistently uses signed int8 (SAM type code 'c').
-    let as_tag = Tag::new(b'A', b'S');
-    let xs_tag = Tag::new(b'X', b'S');
+    let as_tag = Tag::from(SamTag::AS);
+    let xs_tag = Tag::from(SamTag::XS);
     for i in 0..mapped.read_count() {
         // Normalize AS tag
         if let Some(value) = mapped.records[i].data().get(&as_tag) {
@@ -1394,20 +1394,20 @@ mod tests {
         // Check that tags from unmapped BAM were copied
         for rec in &records {
             // Should have RX tag from unmapped
-            assert!(rec.data().get(&Tag::new(b'R', b'X')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::RX)).is_some());
 
             // Should have xy tag from unmapped
             assert!(rec.data().get(&Tag::new(b'x', b'y')).is_some());
 
             // Should have AS tag from mapped
-            assert!(rec.data().get(&Tag::new(b'A', b'S')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::AS)).is_some());
 
             // Should have PG tag from mapped
-            assert!(rec.data().get(&Tag::new(b'P', b'G')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::PG)).is_some());
 
             // Should have MC (mate CIGAR) and MQ (mate mapping quality) tags
-            assert!(rec.data().get(&Tag::new(b'M', b'C')).is_some(), "MC tag should be present");
-            assert!(rec.data().get(&Tag::new(b'M', b'Q')).is_some(), "MQ tag should be present");
+            assert!(rec.data().get(&Tag::from(SamTag::MC)).is_some(), "MC tag should be present");
+            assert!(rec.data().get(&Tag::from(SamTag::MQ)).is_some(), "MQ tag should be present");
         }
 
         Ok(())
@@ -1448,9 +1448,9 @@ mod tests {
 
         for rec in &records {
             // Should have tags from both unmapped and mapped
-            assert!(rec.data().get(&Tag::new(b'R', b'X')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::RX)).is_some());
             assert!(rec.data().get(&Tag::new(b'x', b'y')).is_some());
-            assert!(rec.data().get(&Tag::new(b'A', b'S')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::AS)).is_some());
         }
 
         Ok(())
@@ -1493,7 +1493,7 @@ mod tests {
 
         for rec in &records {
             // AS tag should be removed
-            assert!(rec.data().get(&Tag::new(b'A', b'S')).is_none());
+            assert!(rec.data().get(&Tag::from(SamTag::AS)).is_none());
 
             if rec.flags().is_first_segment() {
                 // R1 is positive strand - no reversing/revcomping
@@ -1736,14 +1736,14 @@ mod tests {
             .expect("expected R2 record not found");
 
         // Check that MQ tags are set
-        let r1_mq = r1.data().get(&Tag::new(b'M', b'Q'));
-        let r2_mq = r2.data().get(&Tag::new(b'M', b'Q'));
+        let r1_mq = r1.data().get(&Tag::from(SamTag::MQ));
+        let r2_mq = r2.data().get(&Tag::from(SamTag::MQ));
         assert!(r1_mq.is_some(), "R1 should have MQ tag");
         assert!(r2_mq.is_some(), "R2 should have MQ tag");
 
         // Check that MC tags are set
-        let r1_mc = r1.data().get(&Tag::new(b'M', b'C'));
-        let r2_mc = r2.data().get(&Tag::new(b'M', b'C'));
+        let r1_mc = r1.data().get(&Tag::from(SamTag::MC));
+        let r2_mc = r2.data().get(&Tag::from(SamTag::MC));
         assert!(r1_mc.is_some(), "R1 should have MC tag");
         assert!(r2_mc.is_some(), "R2 should have MC tag");
 
@@ -1935,7 +1935,7 @@ mod tests {
         // Check each record
         for rec in &records {
             // AS tag should be removed from all records
-            assert!(rec.data().get(&Tag::new(b'A', b'S')).is_none(), "AS tag should be removed");
+            assert!(rec.data().get(&Tag::from(SamTag::AS)).is_none(), "AS tag should be removed");
 
             if rec.flags().is_reverse_complemented() {
                 // Negative strand - should be reversed/revcomped
@@ -2086,9 +2086,9 @@ mod tests {
 
         // Verify all records have both unmapped and mapped tags
         for rec in &records {
-            assert!(rec.data().get(&Tag::new(b'R', b'X')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::RX)).is_some());
             assert!(rec.data().get(&Tag::new(b'x', b'y')).is_some());
-            assert!(rec.data().get(&Tag::new(b'A', b'S')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::AS)).is_some());
         }
 
         Ok(())
@@ -2130,13 +2130,13 @@ mod tests {
             RecordBuilder::new().sequence("ACGT").tag("PG", "old_pg").tag("XY", 123i32).build();
 
         let mut dest_data = Data::default();
-        dest_data.insert(Tag::new(b'P', b'G'), BufValue::from("new_pg".to_string()));
+        dest_data.insert(Tag::from(SamTag::PG), BufValue::from("new_pg".to_string()));
 
         let tag_info = TagInfo::new(vec![], vec![], vec![]);
         copy_tags(&src, &mut dest_data, &tag_info)?;
 
         // PG should not be overwritten
-        if let Some(BufValue::String(s)) = dest_data.get(&Tag::new(b'P', b'G')) {
+        if let Some(BufValue::String(s)) = dest_data.get(&Tag::from(SamTag::PG)) {
             assert_eq!(s.to_string(), "new_pg");
         }
 
@@ -2191,7 +2191,7 @@ mod tests {
 
         // All records should have the unmapped tags
         for rec in &records {
-            assert!(rec.data().get(&Tag::new(b'R', b'X')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::RX)).is_some());
             assert!(rec.data().get(&Tag::new(b'x', b'y')).is_some());
         }
 
@@ -2256,7 +2256,7 @@ mod tests {
 
         // All records should have the RX tag
         for rec in &records {
-            assert!(rec.data().get(&Tag::new(b'R', b'X')).is_some());
+            assert!(rec.data().get(&Tag::from(SamTag::RX)).is_some());
         }
 
         Ok(())
@@ -2293,7 +2293,7 @@ mod tests {
 
         let r2 = &records[0];
         assert!(!r2.flags().is_first_segment());
-        assert!(r2.data().get(&Tag::new(b'R', b'X')).is_some());
+        assert!(r2.data().get(&Tag::from(SamTag::RX)).is_some());
 
         Ok(())
     }
@@ -2705,7 +2705,7 @@ mod tests {
         assert_eq!(pa_info.pos2, 299, "pos2 should be R2's unclipped 5' position (reverse strand)");
 
         // Verify RX tag was also copied
-        let rx_tag = Tag::new(b'R', b'X');
+        let rx_tag = Tag::from(SamTag::RX);
         assert!(
             supp_record.data().get(&rx_tag).is_some(),
             "Supplementary should also have RX tag copied from unmapped"
@@ -2942,11 +2942,11 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         // AS=77 fits in i8 (-128..127), should be normalized to Int8
-        let as_val = records[0].data().get(&Tag::new(b'A', b'S')).unwrap();
+        let as_val = records[0].data().get(&Tag::from(SamTag::AS)).unwrap();
         assert!(matches!(as_val, BufValue::Int8(77)), "AS=77 should be Int8, got {as_val:?}");
 
         // XS=50 fits in i8, should be normalized to Int8
-        let xs_val = records[0].data().get(&Tag::new(b'X', b'S')).unwrap();
+        let xs_val = records[0].data().get(&Tag::from(SamTag::XS)).unwrap();
         assert!(matches!(xs_val, BufValue::Int8(50)), "XS=50 should be Int8, got {xs_val:?}");
 
         Ok(())
@@ -2983,11 +2983,11 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         // AS=200 doesn't fit in i8, should be Int16
-        let as_val = records[0].data().get(&Tag::new(b'A', b'S')).unwrap();
+        let as_val = records[0].data().get(&Tag::from(SamTag::AS)).unwrap();
         assert!(matches!(as_val, BufValue::Int16(200)), "AS=200 should be Int16, got {as_val:?}");
 
         // XS=-200 doesn't fit in i8, should be Int16
-        let xs_val = records[0].data().get(&Tag::new(b'X', b'S')).unwrap();
+        let xs_val = records[0].data().get(&Tag::from(SamTag::XS)).unwrap();
         assert!(matches!(xs_val, BufValue::Int16(-200)), "XS=-200 should be Int16, got {xs_val:?}");
 
         Ok(())
@@ -3186,8 +3186,8 @@ mod tests {
         assert_eq!(r1_tlen, -r2_tlen, "R1 TLEN should be negation of R2 TLEN");
 
         // MQ: R1 should have R2's mapping quality, and vice versa
-        let r1_mq = r1.data().get(&Tag::new(b'M', b'Q'));
-        let r2_mq = r2.data().get(&Tag::new(b'M', b'Q'));
+        let r1_mq = r1.data().get(&Tag::from(SamTag::MQ));
+        let r2_mq = r2.data().get(&Tag::from(SamTag::MQ));
         assert!(
             matches!(r1_mq, Some(BufValue::Int8(30))),
             "R1's MQ should be R2's mapq (30), got {r1_mq:?}"
@@ -3198,12 +3198,12 @@ mod tests {
         );
 
         // MC: R1 should have R2's CIGAR, and vice versa
-        if let Some(BufValue::String(mc)) = r1.data().get(&Tag::new(b'M', b'C')) {
+        if let Some(BufValue::String(mc)) = r1.data().get(&Tag::from(SamTag::MC)) {
             assert_eq!(mc.to_string(), "75M", "R1's MC should be R2's CIGAR");
         } else {
             panic!("R1 should have MC tag");
         }
-        if let Some(BufValue::String(mc)) = r2.data().get(&Tag::new(b'M', b'C')) {
+        if let Some(BufValue::String(mc)) = r2.data().get(&Tag::from(SamTag::MC)) {
             assert_eq!(mc.to_string(), "50M", "R2's MC should be R1's CIGAR");
         } else {
             panic!("R2 should have MC tag");
@@ -3311,21 +3311,21 @@ mod tests {
         );
 
         // MQ on supplementary should be R2 primary's mapping quality
-        let supp_mq = r1_supp.data().get(&Tag::new(b'M', b'Q'));
+        let supp_mq = r1_supp.data().get(&Tag::from(SamTag::MQ));
         assert!(
             matches!(supp_mq, Some(BufValue::Int8(30))),
             "R1 supp MQ should be R2 primary's mapq (30), got {supp_mq:?}"
         );
 
         // MC on supplementary should be R2 primary's CIGAR
-        if let Some(BufValue::String(mc)) = r1_supp.data().get(&Tag::new(b'M', b'C')) {
+        if let Some(BufValue::String(mc)) = r1_supp.data().get(&Tag::from(SamTag::MC)) {
             assert_eq!(mc.to_string(), "75M", "R1 supp MC should be R2 primary's CIGAR");
         } else {
             panic!("R1 supp should have MC tag");
         }
 
         // ms (mate score) on supplementary should be R2 primary's AS value
-        let supp_ms = r1_supp.data().get(&Tag::new(b'm', b's'));
+        let supp_ms = r1_supp.data().get(&Tag::from(SamTag::MS));
         assert!(
             matches!(supp_ms, Some(BufValue::Int8(55))),
             "R1 supp ms should be R2 primary's AS (55), got {supp_ms:?}"
@@ -3379,11 +3379,11 @@ mod tests {
 
         // Mapped read (R1) should NOT have MQ or MC (mate is unmapped)
         assert!(
-            r1.data().get(&Tag::new(b'M', b'Q')).is_none(),
+            r1.data().get(&Tag::from(SamTag::MQ)).is_none(),
             "Mapped read should not have MQ when mate is unmapped"
         );
         assert!(
-            r1.data().get(&Tag::new(b'M', b'C')).is_none(),
+            r1.data().get(&Tag::from(SamTag::MC)).is_none(),
             "Mapped read should not have MC when mate is unmapped"
         );
 
@@ -3480,21 +3480,21 @@ mod tests {
         );
 
         // MQ on R2 supplementary should be R1 primary's mapping quality
-        let supp_mq = r2_supp.data().get(&Tag::new(b'M', b'Q'));
+        let supp_mq = r2_supp.data().get(&Tag::from(SamTag::MQ));
         assert!(
             matches!(supp_mq, Some(BufValue::Int8(40))),
             "R2 supp MQ should be R1 primary's mapq (40), got {supp_mq:?}"
         );
 
         // MC on R2 supplementary should be R1 primary's CIGAR
-        if let Some(BufValue::String(mc)) = r2_supp.data().get(&Tag::new(b'M', b'C')) {
+        if let Some(BufValue::String(mc)) = r2_supp.data().get(&Tag::from(SamTag::MC)) {
             assert_eq!(mc.to_string(), "50M", "R2 supp MC should be R1 primary's CIGAR");
         } else {
             panic!("R2 supp should have MC tag");
         }
 
         // ms (mate score) should be R1 primary's AS value
-        let supp_ms = r2_supp.data().get(&Tag::new(b'm', b's'));
+        let supp_ms = r2_supp.data().get(&Tag::from(SamTag::MS));
         assert!(
             matches!(supp_ms, Some(BufValue::Int8(77))),
             "R2 supp ms should be R1 primary's AS (77), got {supp_ms:?}"
@@ -3529,11 +3529,11 @@ mod tests {
         for rec in &records {
             assert_eq!(rec.template_length(), 0, "TLEN should be 0 when both unmapped");
             assert!(
-                rec.data().get(&Tag::new(b'M', b'Q')).is_none(),
+                rec.data().get(&Tag::from(SamTag::MQ)).is_none(),
                 "MQ should not exist when both unmapped"
             );
             assert!(
-                rec.data().get(&Tag::new(b'M', b'C')).is_none(),
+                rec.data().get(&Tag::from(SamTag::MC)).is_none(),
                 "MC should not exist when both unmapped"
             );
         }

@@ -598,7 +598,7 @@ impl<'a> PairBuilder<'a> {
         }
 
         // Add read group tag
-        let rg_tag = Tag::new(b'R', b'G');
+        let rg_tag = Tag::from(crate::SamTag::RG);
         first_read.data_mut().insert(rg_tag, BufValue::from(self.parent.read_group_id.clone()));
 
         // Add custom attributes
@@ -833,7 +833,7 @@ impl<'a> FragBuilder<'a> {
         }
 
         // Add read group tag
-        let rg_tag = Tag::new(b'R', b'G');
+        let rg_tag = Tag::from(crate::SamTag::RG);
         rec.data_mut().insert(rg_tag, BufValue::from(self.parent.read_group_id.clone()));
 
         // Add custom attributes
@@ -2024,7 +2024,7 @@ mod tests {
         let (read_one, read_two) =
             builder.add_pair().attr("MI", "test_umi").attr("RX", "ACGT").build();
 
-        let mi_tag = Tag::new(b'M', b'I');
+        let mi_tag = Tag::from(crate::SamTag::MI);
         assert!(read_one.data().get(&mi_tag).is_some());
         assert!(read_two.data().get(&mi_tag).is_some());
     }

@@ -16,6 +16,7 @@
 use crate::bam_io::{RawBamReaderAuto, create_raw_bam_reader};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Result, anyhow, bail};
@@ -438,10 +439,11 @@ struct MiExtractResult {
 /// Tries integer-type MI first, then falls back to string-type MI parsed as i64.
 fn get_mi_tag_raw_i64(raw: &RawRecord) -> Option<i64> {
     let aux = raw_fields::aux_data_slice(raw.as_ref());
-    if let Some(v) = find_int_tag(aux, b"MI") {
+    if let Some(v) = find_int_tag(aux, &SamTag::MI) {
         return Some(v);
     }
-    find_string_tag(aux, b"MI").and_then(|bytes| std::str::from_utf8(bytes).ok()?.parse().ok())
+    find_string_tag(aux, &SamTag::MI)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok()?.parse().ok())
 }
 
 /// Build an MI map from a BAM file using parallel batch processing.

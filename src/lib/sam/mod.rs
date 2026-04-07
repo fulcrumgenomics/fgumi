@@ -9,6 +9,9 @@ pub use fgumi_sam::alignment_tags;
 // Re-export modules from fgumi-sam
 pub use fgumi_sam::{builder, record_utils};
 
+// Re-export SamTag newtype
+pub use fgumi_sam::SamTag;
+
 // Re-export top-level functions from fgumi-sam
 pub use fgumi_sam::{
     buf_value_to_smallest_signed_int, check_sort, is_sorted, is_template_coordinate_sorted,

@@ -10,6 +10,7 @@ use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
+use crate::sam::SamTag;
 use crate::sort::bam_fields;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
@@ -509,7 +510,7 @@ impl RecordPositionGrouper {
                     && !flags.is_unmapped()
                     && !flags.is_mate_unmapped()
                 {
-                    let mc_tag = Tag::from([b'M', b'C']);
+                    let mc_tag = Tag::from(SamTag::MC);
                     if record.data().get(&mc_tag).is_none() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,

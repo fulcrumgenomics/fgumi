@@ -27,6 +27,7 @@ use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
+use crate::sam::SamTag;
 use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
 use crossbeam_queue::SegQueue;
 
@@ -249,7 +250,7 @@ impl Command for Simplex {
         // Use library name from header if no prefix is specified (like fgbio)
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(SamTag::CB);
 
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
@@ -473,7 +474,7 @@ impl Simplex {
         let trim = self.consensus.trim;
         let overlapping_enabled = self.overlapping.is_enabled();
         let read_group_id = self.read_group.read_group_id.clone();
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(SamTag::CB);
         let batch_size = 50; // MI groups per batch (reduced for memory efficiency)
 
         // Create options for consensus caller

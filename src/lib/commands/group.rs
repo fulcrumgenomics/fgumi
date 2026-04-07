@@ -31,6 +31,7 @@ use clap::Parser;
 use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
+use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
 use crate::unified_pipeline::MemoryEstimate;
 use crate::validation::validate_file_exists;
@@ -989,9 +990,9 @@ impl Command for GroupReadsByUmi {
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Tag constants per SAM specification
-        let raw_tag: [u8; 2] = *b"RX";
-        let cell_tag = Tag::new(b'C', b'B');
-        let assign_tag_bytes: [u8; 2] = *b"MI";
+        let raw_tag: [u8; 2] = *SamTag::RX;
+        let cell_tag = Tag::from(SamTag::CB);
+        let assign_tag_bytes: [u8; 2] = *SamTag::MI;
 
         // Create filter configuration
         let filter_config = GroupFilterConfig {

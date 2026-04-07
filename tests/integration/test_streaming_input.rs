@@ -256,7 +256,7 @@ fn create_grouped_test_bam(path: &PathBuf) {
     writer.write_header(&header).expect("Failed to write header");
 
     // Create grouped reads with MI tag
-    let mi_tag = Tag::new(b'M', b'I');
+    let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
     let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
 
     // Add MI tag to each record

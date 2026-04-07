@@ -179,6 +179,7 @@ pub fn raw_compare_structured(r1: &[u8], r2: &[u8]) -> RawCompareResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sam::SamTag;
     use fgumi_raw_bam::testutil::make_bam_bytes;
 
     /// Helper to build aux bytes for a Z-type string tag.
@@ -269,8 +270,8 @@ mod tests {
 
     #[test]
     fn test_core_equal_same_core_different_tags() {
-        let aux1 = make_z_tag(*b"RG", b"sample1");
-        let aux2 = make_z_tag(*b"RG", b"sample2");
+        let aux1 = make_z_tag(*SamTag::RG, b"sample1");
+        let aux2 = make_z_tag(*SamTag::RG, b"sample2");
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
         assert!(raw_core_fields_equal(&r1, &r2));
@@ -322,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_tags_byte_equal_same_tags() {
-        let aux = make_z_tag(*b"RG", b"sample1");
+        let aux = make_z_tag(*SamTag::RG, b"sample1");
         let r1 = base_record(&aux);
         let r2 = base_record(&aux);
         assert!(raw_tags_byte_equal(&r1, &r2));
@@ -330,17 +331,17 @@ mod tests {
 
     #[test]
     fn test_tags_byte_not_equal_different_values() {
-        let r1 = base_record(&make_z_tag(*b"RG", b"sample1"));
-        let r2 = base_record(&make_z_tag(*b"RG", b"sample2"));
+        let r1 = base_record(&make_z_tag(*SamTag::RG, b"sample1"));
+        let r2 = base_record(&make_z_tag(*SamTag::RG, b"sample2"));
         assert!(!raw_tags_byte_equal(&r1, &r2));
     }
 
     #[test]
     fn test_tags_byte_not_equal_different_order() {
-        let mut aux1 = make_z_tag(*b"RG", b"s1");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
         aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
         let mut aux2 = make_i_tag(*b"NM", 5);
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"s1"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
         assert!(!raw_tags_byte_equal(&r1, &r2));
@@ -352,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_order_independent_same_order() {
-        let mut aux = make_z_tag(*b"RG", b"s1");
+        let mut aux = make_z_tag(*SamTag::RG, b"s1");
         aux.extend_from_slice(&make_i_tag(*b"NM", 5));
         let r1 = base_record(&aux);
         let r2 = base_record(&aux);
@@ -361,10 +362,10 @@ mod tests {
 
     #[test]
     fn test_order_independent_different_order() {
-        let mut aux1 = make_z_tag(*b"RG", b"s1");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
         aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
         let mut aux2 = make_i_tag(*b"NM", 5);
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"s1"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
         assert!(raw_tags_equal_order_independent(&r1, &r2));
@@ -379,9 +380,9 @@ mod tests {
 
     #[test]
     fn test_order_independent_missing_tag() {
-        let mut aux1 = make_z_tag(*b"RG", b"s1");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
         aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
-        let aux2 = make_z_tag(*b"RG", b"s1");
+        let aux2 = make_z_tag(*SamTag::RG, b"s1");
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
         assert!(!raw_tags_equal_order_independent(&r1, &r2));
@@ -391,7 +392,7 @@ mod tests {
     fn test_order_independent_extra_tag() {
         let aux1 = make_i_tag(*b"NM", 5);
         let mut aux2 = make_i_tag(*b"NM", 5);
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"s1"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
         assert!(!raw_tags_equal_order_independent(&r1, &r2));
@@ -407,14 +408,14 @@ mod tests {
     #[test]
     fn test_order_independent_multiple_types() {
         // Mix of Z, i, C, and f tags in different orders
-        let mut aux1 = make_z_tag(*b"RG", b"grp");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"grp");
         aux1.extend_from_slice(&make_i_tag(*b"NM", 3));
         aux1.extend_from_slice(&make_c_tag(*b"MQ", 42));
         aux1.extend_from_slice(&make_f_tag(*b"GC", 0.75));
 
         let mut aux2 = make_f_tag(*b"GC", 0.75);
         aux2.extend_from_slice(&make_c_tag(*b"MQ", 42));
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"grp"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"grp"));
         aux2.extend_from_slice(&make_i_tag(*b"NM", 3));
 
         let r1 = base_record(&aux1);
@@ -457,10 +458,10 @@ mod tests {
 
     #[test]
     fn test_structured_same_core_different_tag_order() {
-        let mut aux1 = make_z_tag(*b"RG", b"s1");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
         aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
         let mut aux2 = make_i_tag(*b"NM", 5);
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"s1"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
         let result = raw_compare_structured(&r1, &r2);
@@ -492,10 +493,10 @@ mod tests {
         // Records with different bin values and different tag order should report:
         // core_match=true (bin is not semantically meaningful),
         // tags_match=false (byte order differs), tag_order_match=true (values match)
-        let mut aux1 = make_z_tag(*b"RG", b"s1");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
         aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
         let mut aux2 = make_i_tag(*b"NM", 5);
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"s1"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let mut r1 = base_record(&aux1);
         let mut r2 = base_record(&aux2);
         // Set different bin values
@@ -529,12 +530,12 @@ mod tests {
 
     #[test]
     fn test_collect_entries_multiple() {
-        let mut aux = make_z_tag(*b"RG", b"grp");
+        let mut aux = make_z_tag(*SamTag::RG, b"grp");
         aux.extend_from_slice(&make_i_tag(*b"NM", 5));
         let entries = collect_tag_entries(&aux)
             .expect("collect_tag_entries should succeed for multiple tags");
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, *b"RG");
+        assert_eq!(entries[0].0, *SamTag::RG);
         assert_eq!(entries[1].0, *b"NM");
     }
 
@@ -632,13 +633,13 @@ mod tests {
     #[test]
     fn test_order_independent_semantic_int_with_reordered_tags() {
         // Multiple tags, different order, AND different integer encodings
-        let mut aux1 = make_z_tag(*b"RG", b"grp");
+        let mut aux1 = make_z_tag(*SamTag::RG, b"grp");
         aux1.extend_from_slice(&make_c_tag(*b"cD", 200));
         aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
 
         let mut aux2 = make_i_tag(*b"NM", 5);
         aux2.extend_from_slice(&make_upper_s_tag(*b"cD", 200));
-        aux2.extend_from_slice(&make_z_tag(*b"RG", b"grp"));
+        aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"grp"));
 
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);

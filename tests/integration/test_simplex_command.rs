@@ -33,7 +33,7 @@ fn create_grouped_bam(path: &Path, families: Vec<(&str, Vec<RecordBuf>)>) {
             // Add MI tag for molecule identity (simplex expects grouped reads with MI)
             use noodles::sam::alignment::record::data::field::Tag;
             use noodles::sam::alignment::record_buf::data::field::Value;
-            let mi_tag = Tag::new(b'M', b'I');
+            let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
             record.data_mut().insert(mi_tag, Value::from(mi));
             writer.write_alignment_record(&header, &record).expect("Failed to write record");
         }
@@ -209,7 +209,7 @@ fn create_grouped_bam_with_header(
         for mut record in records {
             use noodles::sam::alignment::record::data::field::Tag;
             use noodles::sam::alignment::record_buf::data::field::Value;
-            let mi_tag = Tag::new(b'M', b'I');
+            let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
             record.data_mut().insert(mi_tag, Value::from(mi));
             writer.write_alignment_record(header, &record).expect("Failed to write record");
         }

@@ -8,6 +8,7 @@
 use crate::bam_io::{create_bam_reader, create_bam_writer, create_optional_bam_writer};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::sam::is_template_coordinate_sorted;
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
@@ -27,7 +28,7 @@ use crate::commands::command::Command;
 use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
 
 /// MI tag for molecular identifier
-const MI_TAG: Tag = Tag::new(b'M', b'I');
+const MI_TAG: Tag = SamTag::MI.to_noodles_tag();
 
 /// Downsample a BAM file by UMI family using streaming.
 ///

@@ -35,7 +35,7 @@
 //! }
 //! ```
 
-use crate::sam::{record_utils, to_smallest_signed_int};
+use crate::sam::{SamTag, record_utils, to_smallest_signed_int};
 use crate::unified_pipeline::MemoryEstimate;
 use anyhow::{Result, anyhow, bail};
 use noodles::sam::alignment::record::Cigar;
@@ -862,10 +862,10 @@ impl Template {
             return Ok(());
         }
 
-        let mapq_tag = Tag::new(b'M', b'Q');
-        let mate_cigar_tag = Tag::new(b'M', b'C');
-        let mate_score_tag = Tag::new(b'm', b's');
-        let align_score_tag = Tag::new(b'A', b'S');
+        let mapq_tag = Tag::from(SamTag::MQ);
+        let mate_cigar_tag = Tag::from(SamTag::MC);
+        let mate_score_tag = Tag::from(SamTag::MS);
+        let align_score_tag = Tag::from(SamTag::AS);
 
         // Fix mate info for primary R1/R2 pair
         // Following htsjdk's SamPairUtil.setMateInfo exactly
@@ -2319,8 +2319,8 @@ mod tests {
     /// This was a bug where only `Int32` AS values were recognized.
     #[test]
     fn test_fix_mate_info_sets_ms_tag_with_int8_as() -> Result<()> {
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         let mut r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);
         r1.data_mut().insert(as_tag, BufValue::Int8(55)); // AS as Int8 (small value)
@@ -2351,8 +2351,8 @@ mod tests {
     /// Tests that `fix_mate_info` correctly sets ms tag when AS is stored as `UInt8`
     #[test]
     fn test_fix_mate_info_sets_ms_tag_with_uint8_as() -> Result<()> {
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         let mut r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);
         r1.data_mut().insert(as_tag, BufValue::UInt8(77)); // AS as UInt8
@@ -2383,8 +2383,8 @@ mod tests {
     /// Tests that `fix_mate_info` correctly sets ms tag when AS is stored as `Int16`
     #[test]
     fn test_fix_mate_info_sets_ms_tag_with_int16_as() -> Result<()> {
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         let mut r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);
         r1.data_mut().insert(as_tag, BufValue::Int16(1000)); // AS as Int16
@@ -2415,8 +2415,8 @@ mod tests {
     /// Tests that `fix_mate_info` correctly sets ms tag when AS is stored as `Int32`
     #[test]
     fn test_fix_mate_info_sets_ms_tag_with_int32_as() -> Result<()> {
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         let mut r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);
         r1.data_mut().insert(as_tag, BufValue::Int32(100_000)); // AS as Int32
@@ -2447,7 +2447,7 @@ mod tests {
     /// Tests that `fix_mate_info` does not set ms tag when AS is missing
     #[test]
     fn test_fix_mate_info_no_ms_tag_without_as() -> Result<()> {
-        let ms_tag = Tag::new(b'm', b's');
+        let ms_tag = Tag::from(SamTag::MS);
 
         let r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);
         let r2 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ2, 200, 40);
@@ -2469,8 +2469,8 @@ mod tests {
     /// Tests that `fix_mate_info` sets ms tag on supplementary alignments
     #[test]
     fn test_fix_mate_info_sets_ms_tag_on_supplementals() -> Result<()> {
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         let mut r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);
         r1.data_mut().insert(as_tag, BufValue::Int8(55));
@@ -2869,10 +2869,10 @@ mod tests {
     /// The mate is R2 primary, so supplementary should get R2's info.
     #[test]
     fn test_fix_mate_info_sets_full_mate_info_on_r1_supplementals() -> Result<()> {
-        let mq_tag = Tag::new(b'M', b'Q');
-        let mc_tag = Tag::new(b'M', b'C');
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let mq_tag = Tag::from(SamTag::MQ);
+        let mc_tag = Tag::from(SamTag::MC);
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         // R1 primary at pos=100, forward strand, TLEN=200
         let mut r1 = create_mapped_record_with_flags(
@@ -2968,10 +2968,10 @@ mod tests {
     /// The mate is R1 primary, so supplementary should get R1's info.
     #[test]
     fn test_fix_mate_info_sets_full_mate_info_on_r2_supplementals() -> Result<()> {
-        let mq_tag = Tag::new(b'M', b'Q');
-        let mc_tag = Tag::new(b'M', b'C');
-        let as_tag = Tag::new(b'A', b'S');
-        let ms_tag = Tag::new(b'm', b's');
+        let mq_tag = Tag::from(SamTag::MQ);
+        let mc_tag = Tag::from(SamTag::MC);
+        let as_tag = Tag::from(SamTag::AS);
+        let ms_tag = Tag::from(SamTag::MS);
 
         // R1 primary at pos=100, forward strand, TLEN=300
         let mut r1 = create_mapped_record_with_flags(
@@ -3054,7 +3054,7 @@ mod tests {
     /// When mate is unmapped, `mate_unmapped` flag should be set and MC tag should not be set.
     #[test]
     fn test_fix_mate_info_supplemental_with_unmapped_mate() -> Result<()> {
-        let mc_tag = Tag::new(b'M', b'C');
+        let mc_tag = Tag::from(SamTag::MC);
 
         // R1 primary at pos=100, forward strand
         let r1 = create_mapped_record_with_flags(
@@ -3189,7 +3189,7 @@ mod tests {
     /// Tests that `fix_mate_info` handles multiple supplementary alignments.
     #[test]
     fn test_fix_mate_info_multiple_supplementals() -> Result<()> {
-        let as_tag = Tag::new(b'A', b'S');
+        let as_tag = Tag::from(SamTag::AS);
 
         // R1 primary, forward
         let r1 = create_mapped_record_with_flags(
@@ -3590,7 +3590,7 @@ mod tests {
     /// Test `fix_mate_info` correctly sets mate CIGAR (MC tag)
     #[test]
     fn test_fix_mate_info_sets_mate_cigar() -> Result<()> {
-        let mc_tag = Tag::new(b'M', b'C');
+        let mc_tag = Tag::from(SamTag::MC);
 
         let r1 = RecordBuilder::new()
             .name("read1")
@@ -3645,8 +3645,8 @@ mod tests {
     /// Test `fix_mate_info` correctly handles both unmapped case
     #[test]
     fn test_fix_mate_info_both_unmapped() -> Result<()> {
-        let mq_tag = Tag::new(b'M', b'Q');
-        let mc_tag = Tag::new(b'M', b'C');
+        let mq_tag = Tag::from(SamTag::MQ);
+        let mc_tag = Tag::from(SamTag::MC);
 
         let mut r1 = create_test_record(b"read1", FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED);
         *r1.reference_sequence_id_mut() = Some(0); // Originally had a reference
@@ -3685,8 +3685,8 @@ mod tests {
     /// Test `fix_mate_info` correctly handles one mapped, one unmapped case
     #[test]
     fn test_fix_mate_info_one_unmapped() -> Result<()> {
-        let mq_tag = Tag::new(b'M', b'Q');
-        let mc_tag = Tag::new(b'M', b'C');
+        let mq_tag = Tag::from(SamTag::MQ);
+        let mc_tag = Tag::from(SamTag::MC);
 
         // R1 is mapped
         let r1 = create_mapped_record(b"read1", FLAG_PAIRED | FLAG_READ1, 100, 30);

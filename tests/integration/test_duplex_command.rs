@@ -84,7 +84,7 @@ fn create_duplex_read_pair(
         .build();
 
     // Add MI tag
-    let mi = Tag::new(b'M', b'I');
+    let mi = Tag::from(fgumi_lib::sam::SamTag::MI);
     r1.data_mut().insert(mi, Value::from(mi_tag));
     r2.data_mut().insert(mi, Value::from(mi_tag));
 

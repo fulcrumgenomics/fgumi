@@ -19,6 +19,8 @@
 
 use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
+#[cfg(test)]
+use crate::sam::SamTag;
 use crate::sort::inline_buffer::{RecordBuffer, TemplateKey, TemplateRecordBuffer};
 use crate::sort::keys::{QuerynameComparator, RawSortKey, SortOrder};
 use crate::sort::pooled_chunk_writer::PooledChunkWriter;
@@ -289,7 +291,7 @@ impl LibraryLookup {
     #[cfg(test)]
     #[must_use]
     pub fn get_ordinal(&self, bam: &[u8]) -> u32 {
-        fgumi_raw_bam::tags::find_string_tag_in_record(bam, b"RG")
+        fgumi_raw_bam::tags::find_string_tag_in_record(bam, &SamTag::RG)
             .and_then(|rg| self.rg_to_ordinal.get(rg))
             .copied()
             .unwrap_or(0)
@@ -3109,7 +3111,7 @@ mod tests {
     #[case::absent(b"".as_slice(), None)]
     fn test_find_rg_tag(#[case] aux_data: &[u8], #[case] expected: Option<&[u8]>) {
         let bam = build_bam_with_aux(aux_data);
-        assert_eq!(fgumi_raw_bam::tags::find_string_tag_in_record(&bam, b"RG"), expected);
+        assert_eq!(fgumi_raw_bam::tags::find_string_tag_in_record(&bam, &SamTag::RG), expected);
     }
 
     #[test]
@@ -3121,7 +3123,7 @@ mod tests {
         aux.extend_from_slice(b"RGZmygroup\0");
         let bam = build_bam_with_aux(&aux);
         assert_eq!(
-            fgumi_raw_bam::tags::find_string_tag_in_record(&bam, b"RG"),
+            fgumi_raw_bam::tags::find_string_tag_in_record(&bam, &SamTag::RG),
             Some(b"mygroup".as_slice())
         );
     }
@@ -3138,8 +3140,8 @@ mod tests {
 
     #[test]
     fn test_raw_sorter_cell_tag_builder() {
-        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(*b"CB");
-        assert_eq!(sorter.cell_tag, Some(*b"CB"));
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(*SamTag::CB);
+        assert_eq!(sorter.cell_tag, Some(*SamTag::CB));
     }
 
     // ========================================================================

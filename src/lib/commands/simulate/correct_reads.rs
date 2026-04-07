@@ -431,6 +431,7 @@ fn introduce_n_errors(umi: &str, n: usize, rng: &mut impl Rng) -> String {
 #[allow(clippy::naive_bytecount)]
 mod tests {
     use super::*;
+    use crate::sam::SamTag;
     use crate::simulate::create_rng;
     use noodles::sam::alignment::record::data::field::Tag;
 
@@ -696,7 +697,7 @@ mod tests {
         assert_eq!(r1.name(), r2.name());
 
         // Both should have the same RX tag
-        let rx_tag: Tag = [b'R', b'X'].into();
+        let rx_tag: Tag = Tag::from(SamTag::RX);
         assert!(r1.data().get(&rx_tag).is_some());
         assert!(r2.data().get(&rx_tag).is_some());
     }

@@ -29,6 +29,7 @@ use crate::grouper::{
 use crate::logging::OperationTimer;
 use crate::metrics::group::FamilySizeMetrics;
 use crate::read_info::LibraryIndex;
+use crate::sam::SamTag;
 use crate::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
 use crate::template::{MoleculeId, Template};
 use crate::umi::{UmiValidation, validate_umi};
@@ -1194,9 +1195,9 @@ impl Command for MarkDuplicates {
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Tag constants per SAM specification
-        let raw_tag: [u8; 2] = *b"RX";
-        let cell_tag = Tag::new(b'C', b'B');
-        let assign_tag_bytes: [u8; 2] = *b"MI";
+        let raw_tag: [u8; 2] = *SamTag::RX;
+        let cell_tag = Tag::from(SamTag::CB);
+        let assign_tag_bytes: [u8; 2] = *SamTag::MI;
 
         let filter_config = DedupFilterConfig {
             umi_tag: raw_tag,
@@ -1786,7 +1787,7 @@ mod tests {
 
     fn default_filter_config() -> DedupFilterConfig {
         DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
@@ -2226,7 +2227,7 @@ mod tests {
         let mut record =
             RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
         let mi = MoleculeId::Single(42);
-        let assign_tag = Tag::from([b'M', b'I']);
+        let assign_tag = Tag::from(SamTag::MI);
         set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
 
         let Some(DataValue::String(val)) = record.data().get(&assign_tag) else {
@@ -2240,7 +2241,7 @@ mod tests {
         let mut record =
             RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
         let mi = MoleculeId::None;
-        let assign_tag = Tag::from([b'M', b'I']);
+        let assign_tag = Tag::from(SamTag::MI);
         set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
 
         let mi_value = record.data().get(&assign_tag);
@@ -2252,7 +2253,7 @@ mod tests {
         let mut record =
             RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
         let mi = MoleculeId::Single(42);
-        let assign_tag = Tag::from([b'M', b'I']);
+        let assign_tag = Tag::from(SamTag::MI);
         set_mi_tag_on_record(&mut record, mi, assign_tag, 100);
 
         let Some(DataValue::String(val)) = record.data().get(&assign_tag) else {
@@ -2488,7 +2489,7 @@ mod tests {
             .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
@@ -2532,7 +2533,7 @@ mod tests {
             .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
@@ -2708,7 +2709,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
@@ -2734,7 +2735,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
@@ -2761,7 +2762,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 0,
             include_non_pf: false,
             min_umi_length: None,
@@ -2787,7 +2788,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 0,
             include_non_pf: false,
             min_umi_length: None,
@@ -2813,7 +2814,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 0,
             include_non_pf: false,
             min_umi_length: Some(6),
@@ -2838,7 +2839,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 0,
             include_non_pf: false,
             min_umi_length: None,
@@ -3012,7 +3013,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 20,
             include_non_pf: false,
             min_umi_length: None,
@@ -3040,7 +3041,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 0,
             include_non_pf: false,
             min_umi_length: None,
@@ -3068,7 +3069,7 @@ mod tests {
         let template = Template::from_raw_records(vec![raw])
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
-            umi_tag: [b'R', b'X'],
+            umi_tag: *SamTag::RX,
             min_mapq: 0,
             include_non_pf: false,
             min_umi_length: Some(6),
@@ -3212,7 +3213,7 @@ mod tests {
         let mut mi_count = 0usize;
         let mut non_dup_names = HashSet::new();
 
-        let mi_tag = Tag::from([b'M', b'I']);
+        let mi_tag = Tag::from(SamTag::MI);
 
         for result in reader.record_bufs(&out_header) {
             let record: RecordBuf = result.expect("read record");

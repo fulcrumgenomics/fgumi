@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use bstr::ByteSlice;
 
+use crate::sam::SamTag;
 use crate::sam::record_utils::{
     mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
 };
@@ -236,12 +237,13 @@ pub fn compute_group_key(
     let strand = u8::from(flags.is_reverse_complemented());
 
     // Extract library index from RG tag
-    let library_idx = if let Some(DataValue::String(rg_bytes)) = record.data().get(b"RG") {
-        let rg_hash = LibraryIndex::hash_rg(rg_bytes);
-        library_index.get(rg_hash)
-    } else {
-        0 // unknown
-    };
+    let library_idx =
+        if let Some(DataValue::String(rg_bytes)) = record.data().get(&Tag::from(SamTag::RG)) {
+            let rg_hash = LibraryIndex::hash_rg(rg_bytes);
+            library_index.get(rg_hash)
+        } else {
+            0 // unknown
+        };
 
     // Extract cell barcode hash
     let cell_hash = if let Some(tag) = cell_tag {
@@ -533,14 +535,14 @@ impl ReadInfo {
         // This matches fgbio's behavior where grouping uses the library name (LB field),
         // not the read group ID.
         // Uses Arc<str> to avoid cloning strings - Arc::clone is just a reference count increment.
-        let library: Arc<str> = if let Some(DataValue::String(rg_bytes)) = record.data().get(b"RG")
-        {
-            // Convert bytes to str for lookup without allocating a String
-            let rg_id = std::str::from_utf8(rg_bytes).unwrap_or("unknown");
-            library_lookup.get(rg_id).cloned().unwrap_or_else(|| Arc::clone(&UNKNOWN_LIBRARY))
-        } else {
-            Arc::clone(&UNKNOWN_LIBRARY)
-        };
+        let library: Arc<str> =
+            if let Some(DataValue::String(rg_bytes)) = record.data().get(&Tag::from(SamTag::RG)) {
+                // Convert bytes to str for lookup without allocating a String
+                let rg_id = std::str::from_utf8(rg_bytes).unwrap_or("unknown");
+                library_lookup.get(rg_id).cloned().unwrap_or_else(|| Arc::clone(&UNKNOWN_LIBRARY))
+            } else {
+                Arc::clone(&UNKNOWN_LIBRARY)
+            };
 
         // Extract cell barcode
         let cell_barcode = if let Some(DataValue::String(cb_str)) = record.data().get(&cell_tag) {

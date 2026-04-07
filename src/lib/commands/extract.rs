@@ -25,6 +25,7 @@ use crate::fastq::ReadSetIterator;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail, ensure};
@@ -85,16 +86,6 @@ enum CompressionFormat {
     Gzip,
     /// Uncompressed file
     Plain,
-}
-
-/// Returns true if `tag` is a valid SAM optional-field tag name.
-///
-/// Per the SAM v1.6 specification, tag names must match `/[A-Za-z][A-Za-z0-9]/`:
-/// the first character must be ASCII alphabetic and the second ASCII alphanumeric.
-/// Multi-byte (UTF-8) characters are rejected because `as_bytes()` will have length > 2.
-fn is_valid_sam_tag(tag: &str) -> bool {
-    let b = tag.as_bytes();
-    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1].is_ascii_alphanumeric()
 }
 
 /// Detect the compression format of a file by reading its header.
@@ -421,11 +412,11 @@ pub struct Extract {
 
     /// Single tag to store all concatenated UMIs (in addition to per-segment tags)
     #[arg(long, short = 's')]
-    single_tag: Option<String>,
+    single_tag: Option<SamTag>,
 
     /// Tag containing adapter clipping position to adjust (e.g. 'XT' from `MarkIlluminaAdapters`)
     #[arg(long)]
-    clipping_attribute: Option<String>,
+    clipping_attribute: Option<SamTag>,
 
     /// Read group ID to use in the file header
     #[arg(long, default_value = "A")]
@@ -537,26 +528,17 @@ impl Extract {
             ensure!(!rs.segments().is_empty(), "Read structure {} is empty", i + 1);
         }
 
-        // Validate single_tag conforms to SAM spec (/[A-Za-z][A-Za-z0-9]/) and is not reserved
-        const RESERVED_TAGS: &[&str] = &["RX", "MI", "CB", "QX", "CY", "BC", "QT", "RG"];
-        if let Some(ref tag) = self.single_tag {
+        // SamTag::from_str enforces the SAM aux-tag pattern via clap, so format
+        // is already validated. Reject `--single-tag` matching any tag the
+        // extractor itself emits, since those would either be silently
+        // overwritten or produce conflicting aux fields.
+        const RESERVED_OUTPUT_TAGS: &[SamTag] =
+            &[SamTag::RX, SamTag::QX, SamTag::CB, SamTag::CY, SamTag::BC, SamTag::QT, SamTag::RG];
+        if let Some(tag) = self.single_tag {
             ensure!(
-                is_valid_sam_tag(tag),
-                "Single tag must be a valid two-character SAM tag ([A-Za-z][A-Za-z0-9]): {tag}"
-            );
-            let tag_upper = tag.to_ascii_uppercase();
-            ensure!(
-                !RESERVED_TAGS.contains(&tag_upper.as_str()),
-                "Single tag cannot use a reserved BAM tag: {tag}"
-            );
-        }
-
-        // Validate clipping_attribute conforms to SAM spec (/[A-Za-z][A-Za-z0-9]/)
-        if let Some(ref tag) = self.clipping_attribute {
-            ensure!(
-                is_valid_sam_tag(tag),
-                "Clipping attribute must be a valid two-character SAM tag ([A-Za-z][A-Za-z0-9]): \
-                 {tag}"
+                !RESERVED_OUTPUT_TAGS.contains(&tag),
+                "Single tag cannot collide with tags emitted by extract \
+                 (RX, QX, CB, CY, BC, QT, RG): {tag}"
             );
         }
 
@@ -788,8 +770,8 @@ impl Extract {
         };
 
         let num_templates = templates.len();
-        let umi_tag: &[u8; 2] = b"RX";
-        let cell_tag: &[u8; 2] = b"CB";
+        let umi_tag: &[u8; 2] = &SamTag::RX;
+        let cell_tag: &[u8; 2] = &SamTag::CB;
 
         for (index, template) in templates.iter().enumerate() {
             // Compute flags for unmapped reads
@@ -827,7 +809,7 @@ impl Extract {
 
             // Append tags
             // Read group
-            builder.append_string_tag(b"RG", self.read_group_id.as_bytes());
+            builder.append_string_tag(&SamTag::RG, self.read_group_id.as_bytes());
 
             // Cell barcode
             if !cell_barcode_bs.is_empty() {
@@ -835,16 +817,16 @@ impl Extract {
             }
 
             if !cell_quals_bs.is_empty() && self.store_cell_quals {
-                builder.append_string_tag(b"CY", cell_quals_bs.as_bytes());
+                builder.append_string_tag(&SamTag::CY, cell_quals_bs.as_bytes());
             }
 
             // Sample barcode
             if !sample_barcode_bs.is_empty() {
-                builder.append_string_tag(b"BC", sample_barcode_bs.as_bytes());
+                builder.append_string_tag(&SamTag::BC, sample_barcode_bs.as_bytes());
             }
 
             if self.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-                builder.append_string_tag(b"QT", sample_quals_bs.as_bytes());
+                builder.append_string_tag(&SamTag::QT, sample_quals_bs.as_bytes());
             }
 
             // UMI
@@ -852,15 +834,13 @@ impl Extract {
                 builder.append_string_tag(umi_tag, final_umi_bs.as_bytes());
 
                 // Single tag for all concatenated UMIs (if specified)
-                if let Some(ref single_tag) = self.single_tag {
-                    let st: &[u8; 2] =
-                        single_tag.as_bytes().try_into().expect("single_tag must be 2 bytes");
-                    builder.append_string_tag(st, final_umi_bs.as_bytes());
+                if let Some(single_tag) = self.single_tag {
+                    builder.append_string_tag(&single_tag, final_umi_bs.as_bytes());
                 }
 
                 // Only add UMI qualities if not extracted from read names
                 if umi_from_name.is_none() && !umi_qual_bs.is_empty() && self.store_umi_quals {
-                    builder.append_string_tag(b"QX", umi_qual_bs.as_bytes());
+                    builder.append_string_tag(&SamTag::QX, umi_qual_bs.as_bytes());
                 }
             }
 
@@ -970,10 +950,7 @@ impl Extract {
             read_group_id: self.read_group_id.clone(),
             store_umi_quals: self.store_umi_quals,
             store_cell_quals: self.store_cell_quals,
-            single_tag: self
-                .single_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().expect("validated in validate()")),
+            single_tag: self.single_tag,
             annotate_read_names: self.annotate_read_names,
             extract_umis_from_read_names: self.extract_umis_from_read_names,
             store_sample_barcode_qualities: self.store_sample_barcode_qualities,
@@ -1068,7 +1045,7 @@ struct ExtractConfig {
     read_group_id: String,
     store_umi_quals: bool,
     store_cell_quals: bool,
-    single_tag: Option<[u8; 2]>,
+    single_tag: Option<SamTag>,
     annotate_read_names: bool,
     extract_umis_from_read_names: bool,
     store_sample_barcode_qualities: bool,
@@ -1169,38 +1146,38 @@ fn make_raw_records_static(
 
         // Append tags
         // Read group
-        builder.append_string_tag(b"RG", cfg.read_group_id.as_bytes());
+        builder.append_string_tag(&SamTag::RG, cfg.read_group_id.as_bytes());
 
         // Cell barcode
         if !cell_barcode_bs.is_empty() {
-            builder.append_string_tag(b"CB", cell_barcode_bs.as_bytes());
+            builder.append_string_tag(&SamTag::CB, cell_barcode_bs.as_bytes());
         }
 
         if !cell_quals_bs.is_empty() && cfg.store_cell_quals {
-            builder.append_string_tag(b"CY", cell_quals_bs.as_bytes());
+            builder.append_string_tag(&SamTag::CY, cell_quals_bs.as_bytes());
         }
 
         // Sample barcode
         if !sample_barcode_bs.is_empty() {
-            builder.append_string_tag(b"BC", sample_barcode_bs.as_bytes());
+            builder.append_string_tag(&SamTag::BC, sample_barcode_bs.as_bytes());
         }
 
         if cfg.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-            builder.append_string_tag(b"QT", sample_quals_bs.as_bytes());
+            builder.append_string_tag(&SamTag::QT, sample_quals_bs.as_bytes());
         }
 
         // UMI
         if !final_umi_bs.is_empty() {
-            builder.append_string_tag(b"RX", final_umi_bs.as_bytes());
+            builder.append_string_tag(&SamTag::RX, final_umi_bs.as_bytes());
 
             // Single tag for all concatenated UMIs (if specified)
-            if let Some(ref st) = cfg.single_tag {
-                builder.append_string_tag(st, final_umi_bs.as_bytes());
+            if let Some(st) = cfg.single_tag {
+                builder.append_string_tag(&st, final_umi_bs.as_bytes());
             }
 
             // Only add UMI qualities if not extracted from read names
             if umi_from_name.is_none() && !umi_qual_bs.is_empty() && cfg.store_umi_quals {
-                builder.append_string_tag(b"QX", umi_qual_bs.as_bytes());
+                builder.append_string_tag(&SamTag::QX, umi_qual_bs.as_bytes());
             }
         }
 
@@ -2552,7 +2529,7 @@ mod tests {
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
-            single_tag: Some("ZU".to_string()), // Use single tag
+            single_tag: Some("ZU".parse().expect("valid tag")), // Use single tag
             clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
@@ -2588,46 +2565,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Single tag must be a valid two-character SAM tag")]
-    fn test_single_tag_invalid_length() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
-        let output = tmp.path().join("output.bam");
-
-        let extract = Extract {
-            inputs: vec![r1],
-            output,
-            read_structures: vec![ReadStructure::from_str("4M+T").expect("valid read structure")],
-            store_umi_quals: false,
-            store_cell_quals: false,
-            store_sample_barcode_qualities: false,
-            extract_umis_from_read_names: false,
-            annotate_read_names: false,
-            single_tag: Some("INVALID".to_string()), // Too long
-            clipping_attribute: None,
-            read_group_id: "A".to_string(),
-            sample: "s".to_string(),
-            library: "l".to_string(),
-            barcode: None,
-            platform: "illumina".to_string(),
-            platform_unit: None,
-            platform_model: None,
-            sequencing_center: None,
-            predicted_insert_size: None,
-            description: None,
-            comment: vec![],
-            run_date: None,
-            threading: ThreadingOptions::none(),
-            compression: CompressionOptions { compression_level: 1 },
-            scheduler_opts: SchedulerOptions::default(),
-            queue_memory: QueueMemoryOptions::default(),
-        };
-
-        extract.execute("test").expect("execute should succeed");
-    }
-
-    #[test]
-    #[should_panic(expected = "Single tag cannot use a reserved BAM tag: RX")]
+    #[should_panic(expected = "Single tag cannot collide with tags emitted by extract")]
     fn test_single_tag_same_as_umi_tag() {
         let tmp = TempDir::new().expect("failed to create temp dir");
         let r1 = create_fastq(&tmp, "r1.fq", &[("q1", "ACGTAAAAAA", "IIII======")]);
@@ -2642,7 +2580,7 @@ mod tests {
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: false,
-            single_tag: Some("RX".to_string()), // Same as umi_tag
+            single_tag: Some(SamTag::RX), // Same as umi_tag
             clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
@@ -2684,7 +2622,7 @@ mod tests {
             store_sample_barcode_qualities: false,
             extract_umis_from_read_names: false,
             annotate_read_names: true, // Both features enabled
-            single_tag: Some("ZU".to_string()),
+            single_tag: Some("ZU".parse().expect("valid tag")),
             clipping_attribute: None,
             read_group_id: "A".to_string(),
             sample: "s".to_string(),
@@ -3151,7 +3089,7 @@ mod tests {
         assert_eq!(records[1].sequence().as_ref(), b"GGGG");
 
         // Both should have same UMI: AAAA-TTTT
-        let rx_tag = noodles::sam::alignment::record::data::field::Tag::from([b'R', b'X']);
+        let rx_tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::RX);
         let r1_umi = records[0].data().get(&rx_tag).expect("expected tag not found");
         let r2_umi = records[1].data().get(&rx_tag).expect("expected tag not found");
 

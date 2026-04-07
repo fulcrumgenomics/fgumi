@@ -35,6 +35,7 @@ use crate::unified_pipeline::{
 };
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
+use crate::sam::SamTag;
 use crate::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
@@ -276,7 +277,7 @@ impl Command for Codec {
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
         // Parse cell tag
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(SamTag::CB);
 
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
@@ -502,7 +503,7 @@ impl Codec {
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Parse cell tag
-        let cell_tag = Tag::new(b'C', b'B');
+        let cell_tag = Tag::from(SamTag::CB);
 
         // Create options for CODEC consensus caller
         let options = CodecConsensusOptions {

@@ -21,6 +21,8 @@ use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
 use crate::progress::ProgressTracker;
 use crate::reorder_buffer::ReorderBuffer;
+use crate::sam::SamTag;
+use noodles::sam::alignment::record::data::field::Tag;
 
 use super::base::{
     ActiveSteps, BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch,
@@ -3842,9 +3844,8 @@ where
 
     // Build GroupKeyConfig from header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&header);
-        let cell_tag = Tag::from([b'C', b'B']); // Default cell tag
+        let cell_tag = Tag::from(SamTag::CB);
         GroupKeyConfig::new(library_index, cell_tag)
     });
 
@@ -3952,9 +3953,8 @@ where
 
     // Build GroupKeyConfig from input header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from([b'C', b'B']); // Default cell tag
+        let cell_tag = Tag::from(SamTag::CB);
         GroupKeyConfig::new(library_index, cell_tag)
     });
 
@@ -4054,9 +4054,8 @@ where
 
     // Build GroupKeyConfig from input header if not provided
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from([b'C', b'B']); // Default cell tag
+        let cell_tag = Tag::from(SamTag::CB);
         GroupKeyConfig::new(library_index, cell_tag)
     });
 
@@ -4150,9 +4149,8 @@ where
 
     // Build GroupKeyConfig
     let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        use noodles::sam::alignment::record::data::field::Tag;
         let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from([b'C', b'B']);
+        let cell_tag = Tag::from(SamTag::CB);
         GroupKeyConfig::new(library_index, cell_tag)
     });
 
@@ -4189,8 +4187,7 @@ mod tests {
         // Create minimal GroupKeyConfig for testing
         let header = Header::default();
         let library_index = LibraryIndex::from_header(&header);
-        let cell_tag: [u8; 2] = [b'C', b'B'];
-        let group_key_config = GroupKeyConfig::new(library_index, cell_tag.into());
+        let group_key_config = GroupKeyConfig::new(library_index, SamTag::CB.into());
         BamPipelineState::new(config, input, output, group_key_config)
     }
 

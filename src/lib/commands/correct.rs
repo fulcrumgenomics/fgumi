@@ -49,6 +49,7 @@ use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::sort::bam_fields;
 use crate::template::TemplateBatch;
 use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
@@ -706,7 +707,11 @@ impl CorrectUmis {
             // Store original UMI if there were actual mismatches
             // Use update_string_tag to avoid duplicate OX tags
             if !dont_store_original_umis && correction.has_mismatches {
-                bam_fields::update_string_tag(record, b"OX", correction.original_umi.as_bytes());
+                bam_fields::update_string_tag(
+                    record,
+                    &SamTag::OX,
+                    correction.original_umi.as_bytes(),
+                );
             }
         }
     }
@@ -788,7 +793,7 @@ impl CorrectUmis {
         const BATCH_SIZE: usize = 1000; // Templates per batch
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
-        let umi_tag = Tag::new(b'R', b'X');
+        let umi_tag = Tag::from(SamTag::RX);
         let revcomp = self.revcomp;
         let cache_size = self.cache_size;
         let dont_store_original_umis = self.dont_store_original_umis;
@@ -3057,7 +3062,7 @@ mod tests {
             b"AAAAAA",
         );
         let result =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], [b'R', b'X']).unwrap();
+            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap();
         assert_eq!(result, Some("AAAAAA".to_string()));
     }
 
@@ -3074,7 +3079,7 @@ mod tests {
             b"ACGTAC",
         );
         let result =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X']).unwrap();
+            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], *SamTag::RX).unwrap();
         assert_eq!(result, Some("ACGTAC".to_string()));
     }
 
@@ -3090,14 +3095,14 @@ mod tests {
             crate::sort::bam_fields::flags::PAIRED | crate::sort::bam_fields::flags::LAST_SEGMENT,
             b"CCCCCC",
         );
-        let err = CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], [b'R', b'X'])
-            .unwrap_err();
+        let err =
+            CorrectUmis::extract_and_validate_template_umi_raw(&[r1, r2], *SamTag::RX).unwrap_err();
         assert!(err.to_string().contains("mismatched UMIs"));
     }
 
     #[test]
     fn test_extract_and_validate_template_umi_raw_empty() {
-        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[], [b'R', b'X']).unwrap();
+        let result = CorrectUmis::extract_and_validate_template_umi_raw(&[], *SamTag::RX).unwrap();
         assert!(result.is_none());
     }
 
@@ -3114,7 +3119,7 @@ mod tests {
         raw[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
         raw[32..36].copy_from_slice(b"rea\0");
         let result =
-            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], [b'R', b'X']).unwrap();
+            CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap();
         assert!(result.is_none());
     }
 
@@ -3142,14 +3147,14 @@ mod tests {
             rejection_reason: RejectionReason::None,
         };
 
-        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, [b'R', b'X'], false);
+        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, false);
 
         // Verify corrected UMI
-        let umi = bam_fields::find_string_tag_in_record(&raw, b"RX");
+        let umi = bam_fields::find_string_tag_in_record(&raw, &SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
 
         // Verify OX tag with original UMI
-        let ox = bam_fields::find_string_tag_in_record(&raw, b"OX");
+        let ox = bam_fields::find_string_tag_in_record(&raw, &SamTag::OX);
         assert_eq!(ox, Some(b"AAAAAG".as_ref()));
     }
 
@@ -3174,11 +3179,11 @@ mod tests {
             rejection_reason: RejectionReason::None,
         };
 
-        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, [b'R', b'X'], false);
+        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, false);
 
         // Record should be unchanged
         assert_eq!(raw.len(), orig_len);
-        let umi = bam_fields::find_string_tag_in_record(&raw, b"RX");
+        let umi = bam_fields::find_string_tag_in_record(&raw, &SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
     }
 
@@ -3256,7 +3261,7 @@ mod tests {
         let mut reader = noodles::bam::io::reader::Builder.build_from_path(&paths.output)?;
         let header = reader.read_header()?;
 
-        let rx_tag = Tag::new(b'R', b'X');
+        let rx_tag = Tag::from(SamTag::RX);
         let ox_tag = Tag::ORIGINAL_UMI_BARCODE_SEQUENCE;
 
         for result in reader.records() {
@@ -3339,14 +3344,14 @@ mod tests {
             rejection_reason: RejectionReason::None,
         };
 
-        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, [b'R', b'X'], true);
+        CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, true);
 
         // Corrected UMI should be present
-        let umi = bam_fields::find_string_tag_in_record(&raw, b"RX");
+        let umi = bam_fields::find_string_tag_in_record(&raw, &SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
 
         // OX tag should NOT be present (dont_store_original_umis = true)
-        let ox = bam_fields::find_string_tag_in_record(&raw, b"OX");
+        let ox = bam_fields::find_string_tag_in_record(&raw, &SamTag::OX);
         assert!(ox.is_none());
     }
 }
