@@ -26,7 +26,6 @@
 //!     min_distance_diff: 2,
 //!     umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
 //!     umi_files: vec![],
-//!     umi_tag: "RX".to_string(),
 //!     dont_store_original_umis: false,
 //!     cache_size: 100_000,
 //!     min_corrected: None,
@@ -129,7 +128,6 @@ pub struct UmiMatch {
 ///     min_distance_diff: 2,
 ///     umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
 ///     umi_files: vec![],
-///     umi_tag: "RX".to_string(),
 ///     dont_store_original_umis: false,
 ///     cache_size: 100_000,
 ///     min_corrected: None,
@@ -154,10 +152,10 @@ Corrects UMIs stored in BAM files when a set of fixed UMIs is in use.
 
 If the set of UMIs used in an experiment is known and is a _subset_ of the possible randomers
 of the same length, it is possible to error-correct UMIs prior to grouping reads by UMI. This
-tool takes an input BAM with UMIs in a tag (`RX` by default) and set of known UMIs (either on
+tool takes an input BAM with UMIs in the `RX` tag and set of known UMIs (either on
 the command line or in a file) and produces:
 
-1. A new BAM with corrected UMIs in the same tag the UMIs were found in
+1. A new BAM with corrected UMIs written to the `RX` tag
 2. Optionally a set of metrics about the representation of each UMI in the set
 3. Optionally a second BAM file of reads whose UMIs could not be corrected within the specific parameters
 
@@ -223,10 +221,6 @@ pub struct CorrectUmis {
     /// Files containing UMI sequences, one per line.
     #[arg(short = 'U', long)]
     pub umi_files: Vec<PathBuf>,
-
-    /// SAM tag for the UMI field.
-    #[arg(long, default_value = "RX")]
-    pub umi_tag: String,
 
     /// Don't store original UMIs in a separate tag.
     #[arg(long, default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
@@ -385,7 +379,6 @@ impl Command for CorrectUmis {
     /// #   min_distance_diff: 2,
     /// #   umis: vec![],
     /// #   umi_files: vec![],
-    /// #   umi_tag: "RX".to_string(),
     /// #   dont_store_original_umis: false,
     /// #   cache_size: 100_000,
     /// #   min_corrected: None,
@@ -795,7 +788,7 @@ impl CorrectUmis {
         const BATCH_SIZE: usize = 1000; // Templates per batch
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
-        let umi_tag = Tag::new(self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]);
+        let umi_tag = Tag::new(b'R', b'X');
         let revcomp = self.revcomp;
         let cache_size = self.cache_size;
         let dont_store_original_umis = self.dont_store_original_umis;
@@ -1153,7 +1146,7 @@ impl CorrectUmis {
         let mut mismatched = 0u64;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        let umi_tag_bytes: [u8; 2] = [self.umi_tag.as_bytes()[0], self.umi_tag.as_bytes()[1]];
+        let umi_tag_bytes: [u8; 2] = *b"RX";
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
         let revcomp = self.revcomp;
@@ -1800,7 +1793,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -1835,7 +1827,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -1864,7 +1855,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -1916,7 +1906,6 @@ mod tests {
                 "TTTTTT".to_string(),
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -1979,7 +1968,6 @@ mod tests {
                 "TTTTTT".to_string(),
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2036,7 +2024,6 @@ mod tests {
                 "TTTTTT".to_string(),
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2057,7 +2044,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec![],
             umi_files: vec![umi_file.path().to_path_buf()],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2099,7 +2085,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2139,7 +2124,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: true,
             cache_size: 100_000,
             min_corrected: None,
@@ -2180,7 +2164,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "TTTTTT".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2234,7 +2217,6 @@ mod tests {
             min_distance_diff: 1,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2284,7 +2266,6 @@ mod tests {
                 "TTTTTT".to_string(),
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2335,7 +2316,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()], // Only one UMI
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2377,7 +2357,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2418,7 +2397,6 @@ mod tests {
             min_distance_diff: 5, // Large distance for long UMIs
             umis: vec!["AAAAAAAAAAAAAAAAAAAA".to_string(), "CCCCCCCCCCCCCCCCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2458,7 +2436,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: Some(0.75), // Require 75% of reads to pass
@@ -2492,7 +2469,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: Some(0.75), // Require 75% but only 25% will pass
@@ -2530,7 +2506,6 @@ mod tests {
             min_distance_diff: 1,
             umis: vec!["AAAAAA".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2584,7 +2559,6 @@ mod tests {
                 "TTTTTT".to_string(),
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2643,7 +2617,6 @@ mod tests {
                 "TTTTTT".to_string(),
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2797,7 +2770,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2857,7 +2829,6 @@ mod tests {
                 "GGGGGG".to_string(), // No reads match this
             ],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -2939,7 +2910,6 @@ mod tests {
             min_distance_diff: 2,
             umis: vec!["AAAAAA".to_string(), "CCCCCC".to_string()],
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -3011,7 +2981,6 @@ mod tests {
             min_distance_diff: 2,
             umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,
@@ -3253,7 +3222,6 @@ mod tests {
             min_distance_diff: 2,
             umis: FIXED_UMIS.iter().map(|s| (*s).to_string()).collect(),
             umi_files: vec![],
-            umi_tag: "RX".to_string(),
             dont_store_original_umis: false,
             cache_size: 100_000,
             min_corrected: None,

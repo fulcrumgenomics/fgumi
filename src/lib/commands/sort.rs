@@ -23,10 +23,11 @@
 use crate::bam_io::create_bam_reader;
 use crate::logging::OperationTimer;
 use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
-use crate::validation::{string_to_tag, validate_file_exists};
+use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
+
 use log::info;
 use std::path::PathBuf;
 
@@ -250,15 +251,6 @@ pub struct Sort {
     /// position tracking.
     #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub write_index: bool,
-
-    /// Cell barcode tag for template-coordinate sort.
-    ///
-    /// When sorting in template-coordinate order, this tag is included in the
-    /// sort key so that templates from different cells at the same locus are
-    /// not interleaved. Use the same value as `--cell-tag` in `fgumi group`
-    /// and `fgumi dedup`. Only used for template-coordinate sort.
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: String,
 }
 
 /// Represents the memory limit configuration for sorting.
@@ -316,13 +308,8 @@ pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
 
 /// Parse the cell tag for template-coordinate sort/verify, returning `None`
 /// for other sort orders.
-pub(crate) fn parse_cell_tag(order: SortOrderArg, cell_tag: &str) -> Result<Option<[u8; 2]>> {
-    if matches!(order, SortOrderArg::TemplateCoordinate) {
-        let tag = string_to_tag(cell_tag, "cell-tag")?;
-        Ok(Some([tag.as_ref()[0], tag.as_ref()[1]]))
-    } else {
-        Ok(None)
-    }
+pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<[u8; 2]>> {
+    if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(*b"CB")) } else { Ok(None) }
 }
 
 /// Summary of sort-order verification: `(total_records, violations, first_violation)`.
@@ -499,7 +486,7 @@ impl Sort {
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
     fn parse_cell_tag(&self) -> Result<Option<[u8; 2]>> {
-        parse_cell_tag(self.order, &self.cell_tag)
+        parse_cell_tag(self.order)
     }
 
     /// Execute sort mode: read, sort, and write output.
@@ -689,8 +676,8 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    /// Helper to construct a `Sort` struct with a given order and cell tag.
-    fn make_sort(order: SortOrderArg, cell_tag: &str) -> Sort {
+    /// Helper to construct a `Sort` struct with a given order.
+    fn make_sort(order: SortOrderArg) -> Sort {
         Sort {
             input: PathBuf::from("test.bam"),
             output: None,
@@ -704,34 +691,16 @@ mod tests {
             compression: CompressionOptions::default(),
             temp_compression: 1,
             write_index: false,
-            cell_tag: cell_tag.to_string(),
         }
     }
 
     #[rstest]
-    #[case(SortOrderArg::TemplateCoordinate, "CB", Some(*b"CB"))]
-    #[case(SortOrderArg::TemplateCoordinate, "CR", Some(*b"CR"))]
-    #[case(SortOrderArg::Coordinate, "CB", None)]
-    #[case(SortOrderArg::Queryname, "CB", None)]
-    fn test_parse_cell_tag(
-        #[case] order: SortOrderArg,
-        #[case] cell_tag: &str,
-        #[case] expected: Option<[u8; 2]>,
-    ) {
-        let sort = make_sort(order, cell_tag);
+    #[case(SortOrderArg::TemplateCoordinate, Some(*b"CB"))]
+    #[case(SortOrderArg::Coordinate, None)]
+    #[case(SortOrderArg::Queryname, None)]
+    fn test_parse_cell_tag(#[case] order: SortOrderArg, #[case] expected: Option<[u8; 2]>) {
+        let sort = make_sort(order);
         assert_eq!(sort.parse_cell_tag().expect("parse_cell_tag should succeed"), expected);
-    }
-
-    #[test]
-    fn test_parse_cell_tag_invalid_single_char() {
-        let sort = make_sort(SortOrderArg::TemplateCoordinate, "X");
-        assert!(sort.parse_cell_tag().is_err());
-    }
-
-    #[test]
-    fn test_parse_cell_tag_invalid_too_long() {
-        let sort = make_sort(SortOrderArg::TemplateCoordinate, "ABC");
-        assert!(sort.parse_cell_tag().is_err());
     }
 
     #[test]
@@ -1264,7 +1233,7 @@ mod tests {
         let sort = Sort {
             verify: true,
             output: Some(PathBuf::from("out.bam")),
-            ..make_sort(SortOrderArg::Coordinate, "CB")
+            ..make_sort(SortOrderArg::Coordinate)
         };
         let err = sort.execute("test").unwrap_err();
         assert!(err.to_string().contains("--verify cannot be used with --output"));
@@ -1272,8 +1241,7 @@ mod tests {
 
     #[test]
     fn test_verify_conflicts_with_write_index() {
-        let sort =
-            Sort { verify: true, write_index: true, ..make_sort(SortOrderArg::Coordinate, "CB") };
+        let sort = Sort { verify: true, write_index: true, ..make_sort(SortOrderArg::Coordinate) };
         let err = sort.execute("test").unwrap_err();
         assert!(err.to_string().contains("--write-index cannot be used with --verify"));
     }
@@ -1306,6 +1274,66 @@ mod tests {
 
         assert!(total > 0);
         assert!(violations > 0, "unsorted file should fail coordinate verify");
+        Ok(())
+    }
+
+    /// Verifies that template-coordinate sort groups reads by CB when pairs share
+    /// the same outer genomic coordinates. CB is used as a hash-based tiebreaker,
+    /// so reads with the same CB value must appear contiguously in the output.
+    #[test]
+    fn test_template_coordinate_sorts_by_cell_barcode() -> Result<()> {
+        use crate::commands::command::Command;
+        use crate::sam::builder::SamBuilder;
+        use bstr::ByteSlice;
+
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("input.bam");
+        let output = dir.path().join("output.bam");
+
+        let mut builder = SamBuilder::new();
+        // Three pairs at the same position: two with CB=A and one with CB=B interleaved.
+        // After sorting, the two CB=A pairs must be adjacent (not split by CB=B).
+        let _ = builder.add_pair().name("pair_a1").contig(0).start1(100).attr("CB", "A").build();
+        let _ = builder.add_pair().name("pair_b").contig(0).start1(100).attr("CB", "B").build();
+        let _ = builder.add_pair().name("pair_a2").contig(0).start1(100).attr("CB", "A").build();
+        builder.write_bam(&input)?;
+
+        let mut sort = make_sort(SortOrderArg::TemplateCoordinate);
+        sort.input = input;
+        sort.output = Some(output.clone());
+        sort.execute("test")?;
+
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&output)?;
+        let header = reader.read_header()?;
+        let records: Vec<_> = reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?;
+
+        assert_eq!(records.len(), 6, "should have 6 records (3 pairs × 2 reads)");
+
+        // Collect output record names and find positions of the two CB=A pairs.
+        // They must be contiguous — i.e. not interleaved with the CB=B pair.
+        let names: Vec<String> = records
+            .iter()
+            .map(|r| {
+                r.name()
+                    .map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let a_positions: Vec<usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.starts_with("pair_a"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(a_positions.len(), 4, "expected 4 reads for the two CB=A pairs");
+        let min = a_positions[0];
+        let max = *a_positions.last().unwrap();
+        assert_eq!(
+            max - min,
+            3,
+            "CB=A reads must be grouped together; got positions {a_positions:?}"
+        );
+
         Ok(())
     }
 }

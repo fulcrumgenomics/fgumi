@@ -109,8 +109,6 @@ Key options:
 - `--min-reads N` — minimum templates per SS family to count it as a consensus family in yield metrics (default: 1)
 - `--intervals FILE` — restrict analysis to a BED or Picard interval list
 - `--description TEXT` — sample name or description for PDF plot titles
-- `--umi-tag TAG` — SAM tag containing the raw UMI (default: `RX`)
-- `--mi-tag TAG` — SAM tag containing the molecular identifier from `group` (default: `MI`)
 
 The simplex-metrics output files include:
 

@@ -56,14 +56,14 @@ This pipes reads through:
 > Piping SAM directly from the aligner is preferred for best performance; BAM input is
 > functional but involves an extra decode step.
 
-For single-cell data, pass `--cell-tag CB` to `sort` to include the cell barcode in the
+For single-cell data, the `CB` cell barcode tag is automatically included in the
 template-coordinate sort key, keeping templates from different cells at the same locus separate:
 
 ```bash
 fgumi fastq --input unaligned.bam \
   | bwa mem -p ref.fa - \
   | fgumi zipper --unmapped unaligned.bam \
-  | fgumi sort --output sorted.bam --order template-coordinate --cell-tag CB
+  | fgumi sort --output sorted.bam --order template-coordinate
 ```
 
 ### 3b. (Optional) Merge Multiple BAMs
@@ -86,7 +86,7 @@ fgumi merge \
   --output merged.bam
 ```
 
-For single-cell data, pass `--cell-tag CB` to include the cell barcode in the merge key.
+For single-cell data, the `CB` cell barcode tag is automatically included in the merge key.
 
 ### 4. Group Reads by UMI
 

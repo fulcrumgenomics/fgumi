@@ -8,7 +8,6 @@
 
 use crate::errors::{FgumiError, Result};
 use bytesize::ByteSize;
-use noodles::sam::alignment::record::data::field::Tag;
 use std::fmt::Display;
 use std::path::Path;
 
@@ -65,98 +64,6 @@ pub fn validate_files_exist<P: AsRef<Path>>(files: &[(P, &str)]) -> Result<()> {
         validate_file_exists(path, desc)?;
     }
     Ok(())
-}
-
-/// Validate that a SAM tag is exactly 2 characters
-///
-/// # Arguments
-/// * `tag` - Tag string to validate
-/// * `name` - Name of the parameter for error messages
-///
-/// # Returns
-/// A 2-byte array representing the tag
-///
-/// # Errors
-/// Returns an error if the tag is not exactly 2 characters
-///
-/// # Example
-/// ```
-/// use fgumi_lib::validation::validate_tag;
-///
-/// let tag = validate_tag("MI", "UMI tag").unwrap();
-/// assert_eq!(tag, [b'M', b'I']);
-///
-/// let result = validate_tag("ABC", "UMI tag");
-/// assert!(result.is_err());
-/// ```
-pub fn validate_tag(tag: &str, name: &str) -> Result<[u8; 2]> {
-    if tag.len() != 2 {
-        return Err(FgumiError::InvalidParameter {
-            parameter: name.to_string(),
-            reason: format!("Tag must be exactly 2 characters, got: '{tag}'"),
-        });
-    }
-    let bytes = tag.as_bytes();
-    Ok([bytes[0], bytes[1]])
-}
-
-/// Convert a validated string tag to noodles Tag type
-///
-/// This combines validation and conversion for convenience.
-///
-/// # Arguments
-/// * `tag` - Tag string to validate and convert
-/// * `name` - Name of the parameter for error messages
-///
-/// # Returns
-/// A noodles `Tag` object
-///
-/// # Errors
-/// Returns an error if the tag is not exactly 2 characters
-///
-/// # Example
-/// ```
-/// use fgumi_lib::validation::string_to_tag;
-///
-/// let tag = string_to_tag("MI", "UMI tag").unwrap();
-/// ```
-pub fn string_to_tag(tag: &str, name: &str) -> Result<Tag> {
-    let tag_array = validate_tag(tag, name)?;
-    Ok(Tag::from(tag_array))
-}
-
-/// Convert an optional string tag to an optional noodles Tag type
-///
-/// This is a convenience function for optional CLI arguments like cell barcode tags.
-///
-/// # Arguments
-/// * `tag` - Optional tag string to validate and convert
-/// * `name` - Name of the parameter for error messages
-///
-/// # Returns
-/// `Some(Tag)` if the input is `Some` and valid, `None` if the input is `None`
-///
-/// # Errors
-/// Returns an error if the tag is `Some` but not exactly 2 characters
-///
-/// # Example
-/// ```
-/// use fgumi_lib::validation::optional_string_to_tag;
-///
-/// // Some tag - validates and converts
-/// let tag = optional_string_to_tag(Some("CB"), "cell tag").unwrap();
-/// assert!(tag.is_some());
-///
-/// // None - returns None
-/// let tag = optional_string_to_tag(None, "cell tag").unwrap();
-/// assert!(tag.is_none());
-///
-/// // Invalid tag - returns error
-/// let result = optional_string_to_tag(Some("ABC"), "cell tag");
-/// assert!(result.is_err());
-/// ```
-pub fn optional_string_to_tag(tag: Option<&str>, name: &str) -> Result<Option<Tag>> {
-    tag.map(|t| string_to_tag(t, name)).transpose()
 }
 
 /// Validate that max >= min for optional max values
@@ -428,73 +335,6 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("File 2"));
-    }
-
-    #[rstest]
-    #[case("MI", true, Some([b'M', b'I']), "valid MI tag")]
-    #[case("RX", true, Some([b'R', b'X']), "valid RX tag")]
-    #[case("AB", true, Some([b'A', b'B']), "valid AB tag")]
-    #[case("M", false, None, "too short")]
-    #[case("ABC", false, None, "too long")]
-    #[case("", false, None, "empty string")]
-    fn test_validate_tag(
-        #[case] input: &str,
-        #[case] should_succeed: bool,
-        #[case] expected: Option<[u8; 2]>,
-        #[case] description: &str,
-    ) {
-        let result = validate_tag(input, "test tag");
-        if should_succeed {
-            assert!(result.is_ok(), "Failed for: {description}");
-            assert_eq!(
-                result.expect("result should be Ok"),
-                expected.expect("result should be Ok"),
-                "Failed for: {description}"
-            );
-        } else {
-            assert!(result.is_err(), "Should have failed for: {description}");
-            let err_msg = result.unwrap_err().to_string();
-            assert!(
-                err_msg.contains("must be exactly 2 characters"),
-                "Missing expected error message for: {description}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_string_to_tag_valid() -> Result<()> {
-        let tag = string_to_tag("MI", "UMI tag")?;
-        assert_eq!(tag, Tag::from([b'M', b'I']));
-        Ok(())
-    }
-
-    #[test]
-    fn test_string_to_tag_invalid_length() {
-        let result = string_to_tag("ABC", "UMI tag");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_optional_string_to_tag_some_valid() -> Result<()> {
-        let tag = optional_string_to_tag(Some("CB"), "cell tag")?;
-        assert!(tag.is_some());
-        assert_eq!(tag.expect("tag should be valid"), Tag::from([b'C', b'B']));
-        Ok(())
-    }
-
-    #[test]
-    fn test_optional_string_to_tag_none() -> Result<()> {
-        let tag = optional_string_to_tag(None, "cell tag")?;
-        assert!(tag.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_optional_string_to_tag_some_invalid() {
-        let result = optional_string_to_tag(Some("ABC"), "cell tag");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("must be exactly 2 characters"));
     }
 
     #[test]

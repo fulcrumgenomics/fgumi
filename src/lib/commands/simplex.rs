@@ -27,11 +27,12 @@ use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
-use crate::validation::optional_string_to_tag;
 use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
 use crossbeam_queue::SegQueue;
+
 use log::info;
 use noodles::sam::Header;
+use noodles::sam::alignment::record::data::field::Tag;
 use std::io;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -189,10 +190,6 @@ pub struct Simplex {
     #[command(flatten)]
     pub compression: CompressionOptions,
 
-    /// The SAM tag containing the unique molecule identifier
-    #[arg(short = 't', long = "tag", default_value = "MI")]
-    pub tag: String,
-
     /// Minimum number of reads to produce a consensus (required, no default)
     /// Matches fgbio's `CallMolecularConsensusReads` which requires this argument
     #[arg(short = 'M', long = "min-reads")]
@@ -201,10 +198,6 @@ pub struct Simplex {
     /// Maximum reads to use per tag family (downsample if exceeded)
     #[arg(long = "max-reads")]
     pub max_reads: Option<usize>,
-
-    /// SAM tag containing the cell barcode
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: Option<String>,
 
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
@@ -222,10 +215,6 @@ impl Command for Simplex {
 
         // Validate inputs
         self.io.validate()?;
-
-        if self.tag.len() != 2 {
-            bail!("Tag must be exactly 2 characters, got: {}", self.tag);
-        }
 
         if let Some(max) = self.max_reads {
             if max < self.min_reads {
@@ -260,8 +249,7 @@ impl Command for Simplex {
         // Use library name from header if no prefix is specified (like fgbio)
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
-        // Parse cell tag if provided
-        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        let cell_tag = Tag::new(b'C', b'B');
 
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
@@ -318,7 +306,7 @@ impl Command for Simplex {
         )?;
 
         let options = VanillaUmiConsensusOptions {
-            tag: self.tag.clone(),
+            tag: "MI".to_string(),
             error_rate_pre_umi: self.consensus.error_rate_pre_umi,
             error_rate_post_umi: self.consensus.error_rate_post_umi,
             min_input_base_quality: self.consensus.min_input_base_quality,
@@ -328,7 +316,7 @@ impl Command for Simplex {
             seed: Some(42), // Hard-coded seed for reproducible downsampling
             trim: self.consensus.trim,
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
-            cell_tag,
+            cell_tag: Some(cell_tag),
         };
 
         // Create a single-threaded caller for stats collection
@@ -356,8 +344,8 @@ impl Command for Simplex {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter = RawMiGroupIterator::new(raw_record_iter, &self.tag)
-            .with_cell_tag(cell_tag.map(|ct| *ct.as_ref()));
+        let mi_group_iter =
+            RawMiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
         // Single-threaded streaming processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -474,7 +462,7 @@ impl Simplex {
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Capture configuration for closures
-        let tag_str = self.tag.clone();
+        let tag_str = "MI".to_string();
         let min_reads = self.min_reads;
         let max_reads = self.max_reads;
         let error_rate_pre_umi = self.consensus.error_rate_pre_umi;
@@ -485,7 +473,7 @@ impl Simplex {
         let trim = self.consensus.trim;
         let overlapping_enabled = self.overlapping.is_enabled();
         let read_group_id = self.read_group.read_group_id.clone();
-        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        let cell_tag = Tag::new(b'C', b'B');
         let batch_size = 50; // MI groups per batch (reduced for memory efficiency)
 
         // Create options for consensus caller
@@ -500,7 +488,7 @@ impl Simplex {
             seed: Some(42),
             trim,
             min_consensus_base_quality,
-            cell_tag,
+            cell_tag: Some(cell_tag),
         };
 
         // Clone input_header before pipeline (needed for rejects writing)
@@ -508,11 +496,7 @@ impl Simplex {
 
         // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(if let Some(ct) = cell_tag {
-            GroupKeyConfig::new_raw(library_index, ct)
-        } else {
-            GroupKeyConfig::new_raw_no_cell(library_index)
-        });
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -523,7 +507,7 @@ impl Simplex {
             Some(output_header.clone()),
             // ========== grouper_fn: Create RawMiGrouper ==========
             move |_header: &Header| {
-                Box::new(RawMiGrouper::new(&tag_str, batch_size))
+                Box::new(RawMiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
                     as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
             },
             // ========== process_fn: Consensus calling ==========
@@ -740,25 +724,15 @@ mod tests {
             threading: ThreadingOptions::none(),
             compression: CompressionOptions { compression_level: 1 },
             queue_memory: QueueMemoryOptions::default(),
-            tag: "MI".to_string(),
             min_reads: 1,
             max_reads: None,
-            cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
         }
     }
 
     #[test]
-    fn test_tag_validation() {
-        let cmd = create_test_simplex();
-        assert_eq!(cmd.tag, "MI");
-        assert_eq!(cmd.tag.len(), 2);
-    }
-
-    #[test]
     fn test_default_parameters() {
         let cmd = create_test_simplex();
-        assert_eq!(cmd.tag, "MI");
         assert_eq!(cmd.consensus.error_rate_pre_umi, 45);
         assert_eq!(cmd.consensus.error_rate_post_umi, 40);
         assert_eq!(cmd.consensus.min_input_base_quality, 10);
@@ -773,13 +747,11 @@ mod tests {
     #[test]
     fn test_custom_parameters() {
         let mut cmd = create_test_simplex();
-        cmd.tag = "RX".to_string();
         cmd.min_reads = 3;
         cmd.max_reads = Some(10);
         cmd.consensus.output_per_base_tags = true;
         cmd.threading = ThreadingOptions::new(4);
 
-        assert_eq!(cmd.tag, "RX");
         assert_eq!(cmd.min_reads, 3);
         assert_eq!(cmd.max_reads, Some(10));
         assert!(cmd.consensus.output_per_base_tags);
@@ -947,27 +919,30 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_end_to_end_single_end_workflow() -> Result<()> {
-        // Similar to Scala test for single-end data with cell tags
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::threaded(ThreadingOptions::new(2))]
+    fn test_end_to_end_single_end_workflow(#[case] threading: ThreadingOptions) -> Result<()> {
+        // Verify CB partitioning: two groups share the same MI but differ in CB.
+        // They must produce two separate consensus reads, one per cell barcode.
         let mut builder = SamBuilder::new_unmapped();
 
         let mut attrs_a = HashMap::new();
         attrs_a.insert("RX", BufValue::from("ACGT"));
-        attrs_a.insert("MI", BufValue::from("a"));
-        attrs_a.insert("XX", BufValue::from("AB"));
+        attrs_a.insert("MI", BufValue::from("shared"));
+        attrs_a.insert("CB", BufValue::from("AB"));
 
-        // Add 3 fragments with same UMI
+        // 3 fragments from cell AB
         builder.add_frag_with_attrs("a1", None, true, &attrs_a);
         builder.add_frag_with_attrs("a2", None, true, &attrs_a);
         builder.add_frag_with_attrs("a3", None, true, &attrs_a);
 
         let mut attrs_b = HashMap::new();
-        attrs_b.insert("RX", BufValue::from("ACAC"));
-        attrs_b.insert("MI", BufValue::from("b"));
-        attrs_b.insert("XX", BufValue::from("AB"));
+        attrs_b.insert("RX", BufValue::from("ACGT"));
+        attrs_b.insert("MI", BufValue::from("shared"));
+        attrs_b.insert("CB", BufValue::from("CD"));
 
-        // Add 2 fragments with different UMI
+        // 2 fragments from cell CD — same MI, different cell
         builder.add_frag_with_attrs("b1", None, true, &attrs_b);
         builder.add_frag_with_attrs("b2", None, true, &attrs_b);
 
@@ -976,34 +951,38 @@ mod tests {
 
         let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
         cmd.read_group.read_group_id = "ABC".to_string();
-        cmd.cell_tag = Some("XX".to_string());
+        cmd.threading = threading;
 
         cmd.execute("test")?;
 
         // Verify output
         let records = read_bam_records(&paths.output)?;
 
-        // Should have 2 consensus reads
-        assert_eq!(records.len(), 2, "Should have 2 consensus reads");
+        // Should have 2 consensus reads — one per cell barcode
+        assert_eq!(records.len(), 2, "Should have 2 consensus reads (one per cell barcode)");
 
         // All should be unpaired
         assert!(records.iter().all(|r| !r.flags().is_segmented()), "All reads should be unpaired");
 
-        // Verify attributes
+        // Both cell barcodes must survive independently
+        let observed_cbs: std::collections::HashSet<_> =
+            records.iter().filter_map(|r| get_string_tag(r, "CB")).collect();
+        assert_eq!(
+            observed_cbs,
+            ["AB".to_string(), "CD".to_string()].into_iter().collect(),
+            "Both cell barcodes should produce independent consensus reads"
+        );
+
+        // Verify per-record attributes
         for record in &records {
             let rg = get_string_tag(record, "RG");
             assert_eq!(rg.as_deref(), Some("ABC"), "Read group should be ABC");
 
-            // Check consensus depth tag
             let cd_tag = get_int_tag(record, "cD");
             assert!(cd_tag.is_some(), "cD tag should be present");
             assert!(cd_tag.expect("cD tag should have a value") >= 2, "Depth should be at least 2");
 
             assert_eq!(record.sequence().len(), 100, "Sequence length should be 100");
-
-            // Cell barcode tag (XX) should be preserved when configured via cell_tag option
-            let xx_tag = get_string_tag(record, "XX");
-            assert!(xx_tag.is_some(), "XX cell tag should be preserved");
         }
 
         Ok(())
@@ -1180,21 +1159,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn test_invalid_tag_length_fails() {
-        // Create a dummy BAM file so validation gets to tag check
-        let builder = SamBuilder::new_unmapped();
-        let paths = TestPaths::new().expect("failed to create test paths");
-        builder.write(&paths.input).expect("failed to write test BAM");
-
-        let mut cmd = create_simplex_with_paths(paths.input.clone(), PathBuf::from("out.bam"));
-        cmd.tag = "M".to_string(); // Invalid: only 1 character
-
-        let result = cmd.execute("test");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Tag must be exactly 2 characters"));
     }
 
     #[test]

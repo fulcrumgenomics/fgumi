@@ -35,9 +35,10 @@ use crate::unified_pipeline::{
 };
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
-use crate::validation::{optional_string_to_tag, validate_file_exists};
+use crate::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
+use noodles::sam::alignment::record::data::field::Tag;
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
 
@@ -100,7 +101,7 @@ struct CollectedCodecMetrics {
 /// - Required tags:
 ///   - `RX`: Raw UMI bases
 ///   - `MI`: Molecule ID (from `group`)
-///   - `CB`: Cell barcode (optional, if using --cell-tag)
+///   - `CB`: Cell barcode (optional, for single-cell data)
 ///
 /// ## Grouping Strategy
 ///
@@ -220,10 +221,6 @@ pub struct Codec {
     #[arg(short = 'X', long = "max-duplex-disagreements")]
     pub max_duplex_disagreements: Option<usize>,
 
-    /// SAM tag containing the cell barcode
-    #[arg(short = 'c', long = "cell-tag", default_value = "CB")]
-    pub cell_tag: Option<String>,
-
     /// Scheduler and pipeline statistics options.
     #[command(flatten)]
     pub scheduler_opts: SchedulerOptions,
@@ -279,7 +276,7 @@ impl Command for Codec {
         let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
         // Parse cell tag
-        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        let cell_tag = Tag::new(b'C', b'B');
 
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
@@ -342,7 +339,7 @@ impl Command for Codec {
             outer_bases_length: self.outer_bases_length,
             max_duplex_disagreements: self.max_duplex_disagreements.unwrap_or(usize::MAX),
             max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
-            cell_tag,
+            cell_tag: Some(cell_tag),
             produce_per_base_tags: self.consensus.output_per_base_tags,
             trim: self.consensus.trim,
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
@@ -365,8 +362,8 @@ impl Command for Codec {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter = RawMiGroupIterator::new(raw_record_iter, "MI")
-            .with_cell_tag(cell_tag.map(|ct| *ct.as_ref()));
+        let mi_group_iter =
+            RawMiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
 
         let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
             read_name_prefix,
@@ -476,8 +473,6 @@ impl Codec {
             bail!("max-duplex-disagreement-rate must be between 0.0 and 1.0");
         }
 
-        // Note: cell_tag validation is done in execute() via optional_string_to_tag()
-
         Ok(())
     }
 
@@ -507,7 +502,7 @@ impl Codec {
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Parse cell tag
-        let cell_tag = optional_string_to_tag(self.cell_tag.as_deref(), "cell-tag")?;
+        let cell_tag = Tag::new(b'C', b'B');
 
         // Create options for CODEC consensus caller
         let options = CodecConsensusOptions {
@@ -522,7 +517,7 @@ impl Codec {
             outer_bases_length: self.outer_bases_length,
             max_duplex_disagreements: self.max_duplex_disagreements.unwrap_or(usize::MAX),
             max_duplex_disagreement_rate: self.max_duplex_disagreement_rate,
-            cell_tag,
+            cell_tag: Some(cell_tag),
             produce_per_base_tags: self.consensus.output_per_base_tags,
             trim: self.consensus.trim,
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
@@ -539,11 +534,7 @@ impl Codec {
 
         // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(if let Some(ct) = cell_tag {
-            GroupKeyConfig::new_raw(library_index, ct)
-        } else {
-            GroupKeyConfig::new_raw_no_cell(library_index)
-        });
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -716,7 +707,6 @@ mod tests {
             outer_bases_length: 5,
             max_duplex_disagreement_rate: 1.0,
             max_duplex_disagreements: None,
-            cell_tag: None,
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
         }
@@ -757,9 +747,6 @@ mod tests {
         assert!(cmd.validate().is_err());
         cmd.max_duplex_disagreement_rate = 1.0;
 
-        // Note: cell_tag validation is now done at execute() time via optional_string_to_tag()
-        // rather than in validate(), so we don't test it here
-        cmd.cell_tag = None;
         assert!(cmd.validate().is_ok());
     }
 
@@ -1202,5 +1189,61 @@ mod tests {
         let estimate = batch.estimate_heap_size();
         assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
         assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
+    }
+
+    /// Asserts that single-threaded and multi-threaded codec produce the same number of
+    /// consensus records and identical CB tag presence when some groups have CB and some do not.
+    #[test]
+    fn test_threading_parity_mixed_cb() -> Result<()> {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::value::Value;
+
+        let dir = TempDir::new()?;
+        let input_path = dir.path().join("input.bam");
+
+        // Group 1: MI001 with CB=CELL1
+        let (mut r1, mut r2) = create_codec_fr_pair_overlapping("MI001", 100, 105, 20, &[30; 20]);
+        let cb_tag = Tag::new(b'C', b'B');
+        r1.data_mut().insert(cb_tag, Value::String("CELL1".into()));
+        r2.data_mut().insert(cb_tag, Value::String("CELL1".into()));
+
+        // Group 2: MI002 without CB
+        let (r3, r4) = create_codec_fr_pair_overlapping("MI002", 200, 205, 20, &[30; 20]);
+
+        write_codec_bam(&input_path, vec![r1, r2, r3, r4])?;
+
+        // Run single-threaded
+        let out_st = dir.path().join("out_st.bam");
+        let mut cmd_st = create_codec_with_paths(input_path.clone(), out_st.clone());
+        cmd_st.outer_bases_length = 0;
+        cmd_st.threading = ThreadingOptions::none();
+        cmd_st.execute("test")?;
+        let records_st = read_bam_records(&out_st)?;
+
+        // Run multi-threaded
+        let out_mt = dir.path().join("out_mt.bam");
+        let mut cmd_mt = create_codec_with_paths(input_path, out_mt.clone());
+        cmd_mt.outer_bases_length = 0;
+        cmd_mt.threading = ThreadingOptions::new(2);
+        cmd_mt.execute("test")?;
+        let records_mt = read_bam_records(&out_mt)?;
+
+        assert_eq!(
+            records_st.len(),
+            records_mt.len(),
+            "single-threaded and multi-threaded should produce the same number of consensus records"
+        );
+
+        // Both runs should have the same CB tag presence on each record
+        let cb_presence_st: Vec<bool> =
+            records_st.iter().map(|r| r.data().get(&cb_tag).is_some()).collect();
+        let cb_presence_mt: Vec<bool> =
+            records_mt.iter().map(|r| r.data().get(&cb_tag).is_some()).collect();
+        assert_eq!(
+            cb_presence_st, cb_presence_mt,
+            "CB tag presence should match between single-threaded and multi-threaded modes"
+        );
+
+        Ok(())
     }
 }

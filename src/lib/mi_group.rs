@@ -789,6 +789,8 @@ pub struct RawMiGrouper {
     mi_transform: Option<RawMiTransformFn>,
     /// Optional record filter
     record_filter: Option<RawRecordFilterFn>,
+    /// Optional cell barcode tag for composite grouping (MI + cell barcode)
+    cell_tag: Option<[u8; 2]>,
 }
 
 impl RawMiGrouper {
@@ -811,6 +813,7 @@ impl RawMiGrouper {
             finished: false,
             mi_transform: None,
             record_filter: None,
+            cell_tag: None,
         }
     }
 
@@ -841,18 +844,38 @@ impl RawMiGrouper {
             finished: false,
             mi_transform: Some(Box::new(mi_transform)),
             record_filter: Some(Box::new(record_filter)),
+            cell_tag: None,
         }
     }
 
+    /// Sets an optional cell barcode tag for composite grouping.
+    ///
+    /// When set, the group key becomes `"MI_VALUE\tCELL_VALUE"` so that reads from
+    /// different cells with the same MI tag are placed in separate groups.
+    #[must_use]
+    pub fn with_cell_tag(mut self, cell_tag: Option<[u8; 2]>) -> Self {
+        self.cell_tag = cell_tag;
+        self
+    }
+
     /// Get MI tag from raw BAM bytes, optionally applying transformation.
+    ///
+    /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.
     fn get_mi_tag(&self, bam: &[u8]) -> Option<String> {
         use crate::sort::bam_fields;
         let value = bam_fields::find_string_tag_in_record(bam, &self.tag)?;
-        if let Some(ref transform) = self.mi_transform {
-            Some(transform(value))
+        let mut key = if let Some(ref transform) = self.mi_transform {
+            transform(value)
         } else {
-            Some(String::from_utf8_lossy(value).into_owned())
+            String::from_utf8_lossy(value).into_owned()
+        };
+        if let Some(ct) = &self.cell_tag {
+            key.push('\t');
+            if let Some(cell_value) = bam_fields::find_string_tag_in_record(bam, ct) {
+                key.push_str(&String::from_utf8_lossy(cell_value));
+            }
         }
+        Some(key)
     }
 
     /// Check if a raw record passes the filter.
@@ -2004,6 +2027,50 @@ mod tests {
         assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "1");
         assert_eq!(final_batch.groups[0].records.len(), 2); // primary 1/A + 1/B
+    }
+
+    #[test]
+    fn test_raw_grouper_cell_tag_composite_grouping() {
+        // Records with the same MI but different cell barcodes must form separate groups.
+        // The composite key (MI\tCB) is used internally for grouping only; it is stored in
+        // `RawMiGroup::mi` for logging but never written back to the output records.
+        fn make_two_tag_decoded(mi: &str, cb: &str) -> DecodedRecord {
+            let raw = make_raw_bam_with_two_tags("MI", mi, "CB", cb);
+            let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
+            DecodedRecord::from_raw_bytes(raw, key)
+        }
+
+        let mut grouper = RawMiGrouper::new("MI", 10).with_cell_tag(Some([b'C', b'B']));
+
+        // Two records per (MI, CB) combination; MI=1,CB=ACGT and MI=1,CB=TGCA must be split.
+        let records = vec![
+            make_two_tag_decoded("1", "ACGT"),
+            make_two_tag_decoded("1", "ACGT"),
+            make_two_tag_decoded("1", "TGCA"),
+            make_two_tag_decoded("1", "TGCA"),
+        ];
+
+        let batches = grouper.add_records(records).expect("add_records should succeed");
+        assert!(batches.is_empty()); // 2 groups < batch_size 10
+
+        let final_batch =
+            grouper.finish().expect("finish should succeed").expect("should return final batch");
+        assert_eq!(final_batch.groups.len(), 2);
+        // Composite key is stored in the mi field
+        assert_eq!(final_batch.groups[0].mi, "1\tACGT");
+        assert_eq!(final_batch.groups[0].records.len(), 2);
+        assert_eq!(final_batch.groups[1].mi, "1\tTGCA");
+        assert_eq!(final_batch.groups[1].records.len(), 2);
+
+        // Output records must be unchanged (composite key not written back as a tag).
+        for group in &final_batch.groups {
+            for raw in &group.records {
+                use crate::sort::bam_fields;
+                // MI tag still holds the original value, not the composite key
+                let mi_val = bam_fields::find_string_tag_in_record(raw, b"MI");
+                assert_eq!(mi_val, Some(b"1".as_ref()), "MI tag must retain original value");
+            }
+        }
     }
 
     // ========================================================================

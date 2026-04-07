@@ -8,12 +8,13 @@
 use crate::bam_io::create_bam_reader;
 use crate::progress::ProgressTracker;
 use crate::template::TemplateIterator;
-use crate::validation::string_to_tag;
 use anyhow::{Context, Result};
+
 use log::info;
 use murmur3::murmur3_32;
 use noodles::sam::alignment::record::Cigar;
 use noodles::sam::alignment::record::cigar::op::Kind;
+use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -396,10 +397,10 @@ pub fn compute_template_metadata(group: &[TemplateInfo]) -> Vec<TemplateMetadata
 ///
 /// * `input` - Path to the input BAM file
 /// * `intervals` - Intervals for filtering templates (empty = no filtering)
-/// * `mi_tag_str` - MI tag name (e.g. "MI")
-/// * `umi_tag_str` - UMI tag name (e.g. "RX")
 /// * `num_fractions` - Number of downsampling fractions (used to size the counts vector)
 /// * `process_group` - Closure called for each coordinate group with `(group, fraction_counts)`
+///
+/// The SAM spec standard tags `MI` and `RX` are always used.
 ///
 /// # Returns
 ///
@@ -407,12 +408,11 @@ pub fn compute_template_metadata(group: &[TemplateInfo]) -> Vec<TemplateMetadata
 ///
 /// # Errors
 ///
-/// Returns an error if the BAM file cannot be read or tag parsing fails.
+/// Returns an error if the BAM file cannot be read, if required `MI`/`RX` tags
+/// are missing on qualifying templates, or if tag values are invalid UTF-8.
 pub fn process_templates_from_bam<F>(
     input: &Path,
     intervals: &[Interval],
-    mi_tag_str: &str,
-    umi_tag_str: &str,
     num_fractions: usize,
     mut process_group: F,
 ) -> Result<(usize, Vec<usize>)>
@@ -430,8 +430,8 @@ where
     let mut template_count = 0;
     let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
     let mut fraction_template_counts: Vec<usize> = vec![0; num_fractions];
-    let mi_tag = string_to_tag(mi_tag_str, "MI tag")?;
-    let umi_tag = string_to_tag(umi_tag_str, "UMI tag")?;
+    let mi_tag = Tag::new(b'M', b'I');
+    let umi_tag = Tag::new(b'R', b'X');
 
     for template in template_iter {
         let template = template?;
@@ -474,7 +474,11 @@ where
         {
             String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
         } else {
-            continue;
+            return Err(anyhow::anyhow!(
+                "Read '{}' is missing the required MI tag. \
+                 Metrics commands require standard MI/RX tags.",
+                read_name
+            ));
         };
 
         // Get UMI tag (raw UMI)
@@ -483,7 +487,11 @@ where
         {
             String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
         } else {
-            continue;
+            return Err(anyhow::anyhow!(
+                "Read '{}' is missing the required RX tag. \
+                 Metrics commands require standard MI/RX tags.",
+                read_name
+            ));
         };
 
         // Get reference position and calculate insert coordinates
