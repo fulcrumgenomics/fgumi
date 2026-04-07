@@ -1181,7 +1181,13 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             group_done: AtomicBool::new(false),
             total_templates_pushed: AtomicU64::new(0),
             total_records_serialized: AtomicU64::new(0),
-            output: OutputPipelineQueues::new(cap, output, stats, "Processed records"),
+            output: OutputPipelineQueues::new(
+                cap,
+                output,
+                stats,
+                "Processed records",
+                memory_limit,
+            ),
             deadlock_state,
             config,
         }
@@ -1576,6 +1582,10 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
         self.deadlock_state.record_q7_push();
     }
 
+    fn write_reorder_can_proceed(&self, serial: u64) -> bool {
+        self.output.write_reorder_state.can_proceed(serial)
+    }
+
     fn stats(&self) -> Option<&PipelineStats> {
         self.output.stats.as_deref()
     }
@@ -1659,6 +1669,10 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> WritePipel
 
     fn write_reorder_buffer(&self) -> &Mutex<ReorderBuffer<CompressedBlockBatch>> {
         &self.output.write_reorder
+    }
+
+    fn write_reorder_state(&self) -> &super::base::ReorderBufferState {
+        &self.output.write_reorder_state
     }
 
     fn write_output(&self) -> &Mutex<Option<Box<dyn Write + Send>>> {
@@ -2507,14 +2521,16 @@ fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 
 
         // Drain Q6 into reorder buffer.
         while let Some((serial, batch)) = state.output.compressed.pop() {
-            let q7_heap = batch.estimate_heap_size() as u64;
+            let heap_size = batch.estimate_heap_size();
+            let q7_heap = heap_size as u64;
             state.q6_track_pop(q7_heap);
-            reorder.insert(serial, batch);
+            reorder.insert_with_size(serial, batch, heap_size);
+            state.output.write_reorder_state.add_heap_bytes(q7_heap);
             state.deadlock_state.record_q7_pop();
         }
 
         // Write in-order batches.
-        while let Some(batch) = reorder.try_pop_next() {
+        while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
             let mut batch_bytes: u64 = 0;
             for block in &batch.blocks {
                 batch_bytes += block.data.len() as u64;
@@ -2523,6 +2539,8 @@ fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 
                     return false;
                 }
             }
+            state.output.write_reorder_state.sub_heap_bytes(heap_size as u64);
+            state.output.write_reorder_state.update_next_seq(reorder.next_seq());
             if let Some(stats) = state.stats() {
                 stats.bytes_written.fetch_add(batch_bytes, Ordering::Relaxed);
             }

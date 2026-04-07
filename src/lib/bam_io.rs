@@ -748,6 +748,135 @@ pub fn create_raw_bam_reader<P: AsRef<Path>>(
     Ok((raw_reader, header))
 }
 
+/// Create a raw BAM reader using the pool's Phase 1 integrated reading.
+///
+/// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main thread
+/// consumes decompressed bytes via `PooledInputStream`. No extra threads are spawned.
+///
+/// # Flow
+///
+/// 1. Parse header with noodles (first pass, single-threaded)
+/// 2. Open file again, set as pool's input file
+/// 3. Set pool to PHASE1 — workers start reading/decompressing
+/// 4. Main thread skips header bytes from decompressed stream
+/// 5. Returns `RawBamReader<PooledInputStream>` for direct record iteration
+///
+/// # Preconditions
+///
+/// The pool must be in the idle state (not already in PHASE1 with active workers).
+/// Call this function only once per sort operation; calling it while workers are
+/// actively reading will corrupt shared pool state.
+///
+/// # Errors
+///
+/// Returns an error if the BAM file cannot be opened, the header cannot be parsed,
+/// or header bytes cannot be skipped from the decompressed stream.
+pub fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
+    path: P,
+    pool: &std::sync::Arc<crate::sort::worker_pool::SortWorkerPool>,
+) -> Result<(RawBamReader<crate::sort::read_ahead::PooledInputStream>, Header)> {
+    use crate::sort::read_ahead::PooledInputStream;
+    use crate::sort::worker_pool::phase;
+
+    let path_ref = path.as_ref();
+
+    // For stdin/FIFOs we cannot seek back after reading the header, so we use the
+    // TeeReader + ChainedReader pattern to buffer and replay the consumed bytes.
+    // For regular files we seek back to byte 0 (faster, no buffering needed).
+    let (header, reader): (Header, Box<dyn io::Read + Send>) = if is_stdin_path(path_ref) {
+        let stdin = io::stdin();
+        let tee = TeeReader::new(stdin);
+        let bgzf = BgzfReader::new(tee);
+        let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
+        let header =
+            noodles_reader.read_header().with_context(|| "Failed to read BAM header from stdin")?;
+
+        let bgzf = noodles_reader.into_inner();
+        let tee = bgzf.into_inner();
+        let (buffered_bytes, stdin) = tee.into_parts();
+        let chained = ChainedReader::new(buffered_bytes, stdin);
+        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, chained)))
+    } else {
+        use std::io::{Seek, SeekFrom};
+        // Open once: reuse the same handle for header reading and pool input.
+        // Re-opening would break non-replayable inputs (FIFOs, process substitution).
+        let mut file = File::open(path_ref)
+            .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
+
+        let header = {
+            let bgzf = BgzfReader::new(&mut file);
+            let mut noodles_reader = noodles::bam::io::Reader::from(bgzf);
+            noodles_reader
+                .read_header()
+                .with_context(|| format!("Failed to read header from: {}", path_ref.display()))?
+        };
+
+        // Rewind to start so pool workers read from byte 0
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("Failed to rewind input BAM: {}", path_ref.display()))?;
+
+        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file)))
+    };
+
+    // Set the input file for pool workers and activate Phase 1
+    pool.set_input_file(reader);
+    pool.set_phase(phase::PHASE1);
+
+    // Create the decompressed input stream for the main thread.
+    // Uses the shared ArrayQueue and flags from the pool's pipeline state.
+    let mut pooled_input = PooledInputStream::new(
+        pool.decompressed_input_queue(),
+        pool.decompressed_input_done_flag(),
+        pool.input_read_error_flag(),
+        pool.decompress_error_flag(),
+    );
+
+    // Skip BAM header from the decompressed stream
+    skip_bam_header(&mut pooled_input)
+        .with_context(|| format!("Failed to skip header from: {}", path_ref.display()))?;
+
+    let raw_reader = RawBamReader::new(pooled_input);
+    Ok((raw_reader, header))
+}
+
+/// Skip the BAM header from a reader positioned at the start of a BAM stream.
+///
+/// Reads and discards: magic (4 bytes), header text length + text, `n_ref` + reference entries.
+fn skip_bam_header<R: Read>(reader: &mut R) -> Result<()> {
+    let mut buf4 = [0u8; 4];
+
+    // Magic: "BAM\1"
+    reader.read_exact(&mut buf4)?;
+    anyhow::ensure!(&buf4 == b"BAM\x01", "Not a BAM file (bad magic)");
+
+    // Header text length + text
+    reader.read_exact(&mut buf4)?;
+    let l_text = u32::from_le_bytes(buf4) as usize;
+    let copied = io::copy(&mut reader.take(l_text as u64), &mut io::sink())?;
+    anyhow::ensure!(
+        copied == l_text as u64,
+        "BAM header text truncated: expected {l_text} bytes, got {copied}"
+    );
+
+    // Number of reference sequences
+    reader.read_exact(&mut buf4)?;
+    let n_ref = u32::from_le_bytes(buf4) as usize;
+
+    // Each reference: l_name (4 bytes) + name (l_name bytes) + l_ref (4 bytes)
+    for _ in 0..n_ref {
+        reader.read_exact(&mut buf4)?;
+        let l_name = u32::from_le_bytes(buf4) as usize;
+        let copied = io::copy(&mut reader.take(l_name as u64), &mut io::sink())?;
+        anyhow::ensure!(
+            copied == l_name as u64,
+            "BAM reference name truncated: expected {l_name} bytes, got {copied}"
+        );
+        reader.read_exact(&mut buf4)?; // l_ref (discard)
+    }
+
+    Ok(())
+}
+
 /// Create a BAM writer and write the header in one operation
 ///
 /// # Arguments
@@ -914,7 +1043,7 @@ impl<R: Read> Read for TeeReader<R> {
 /// A reader that chains buffered data with a remaining stream.
 ///
 /// First yields all bytes from the buffer, then reads from the inner reader.
-pub struct ChainedReader<R> {
+pub(crate) struct ChainedReader<R> {
     buffer: io::Cursor<Vec<u8>>,
     inner: R,
     buffer_exhausted: bool,
@@ -922,7 +1051,7 @@ pub struct ChainedReader<R> {
 
 impl<R: Read> ChainedReader<R> {
     /// Create a new chained reader from buffered data and an inner reader.
-    pub fn new(buffer: Vec<u8>, inner: R) -> Self {
+    pub(crate) fn new(buffer: Vec<u8>, inner: R) -> Self {
         Self { buffer: io::Cursor::new(buffer), inner, buffer_exhausted: false }
     }
 }
@@ -937,16 +1066,6 @@ impl<R: Read> Read for ChainedReader<R> {
             self.buffer_exhausted = true;
         }
         self.inner.read(buf)
-    }
-}
-
-impl<R: Read + Send> ChainedReader<R> {
-    /// Box this reader as a trait object for use with the pipeline.
-    pub fn into_boxed(self) -> Box<dyn Read + Send>
-    where
-        R: 'static,
-    {
-        Box::new(self)
     }
 }
 

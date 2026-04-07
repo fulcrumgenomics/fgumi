@@ -14,7 +14,7 @@ use std::io;
 // ============================================================================
 
 /// Maximum uncompressed size for a BGZF block (64KB - header/footer overhead).
-const BGZF_MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
+pub const BGZF_MAX_BLOCK_SIZE: usize = bgzf::BGZF_BLOCK_SIZE;
 
 // ============================================================================
 // Block types

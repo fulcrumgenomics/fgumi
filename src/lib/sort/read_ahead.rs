@@ -28,7 +28,8 @@ use noodles::bam::Record;
 use std::thread::{self, JoinHandle};
 
 use crate::bam_io::{BamReaderAuto, RawBamReaderAuto};
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawBamReader, RawRecord};
+use std::io::Read as IoRead;
 
 /// Number of records per batch sent through the channel.
 /// This reduces channel synchronization overhead by sending multiple records per send.
@@ -91,6 +92,18 @@ impl ReadAheadReader {
     }
 
     /// Reader thread function - reads records in batches.
+    ///
+    /// # Error handling
+    ///
+    /// Unlike [`RawReadAheadReader`], this reader does **not** propagate I/O errors
+    /// to the foreground thread. When a read fails the error is logged and the thread
+    /// sends an EOF sentinel, making the error indistinguishable from clean EOF.
+    ///
+    /// This is intentional: `ReadAheadReader` is used in paths (e.g. group/correct)
+    /// where errors are surfaced by the noodles layer before they reach here, and
+    /// adding an `error_slot` would complicate the public API for no practical gain.
+    /// If you need error propagation, use [`RawReadAheadReader`] which provides
+    /// `take_error()`.
     #[allow(clippy::needless_pass_by_value)]
     fn reader_thread(reader: &mut BamReaderAuto, tx: Sender<Vec<Record>>, batch_size: usize) {
         let mut record = Record::default();
@@ -203,34 +216,69 @@ pub struct RawReadAheadReader {
     current_batch: Vec<RawRecord>,
     /// Index into current batch.
     batch_index: usize,
+    /// Captures any I/O error from the background reader thread.
+    ///
+    /// The background thread stores its error here before sending the EOF sentinel,
+    /// so callers can retrieve it via `take_error()` after iteration.
+    error_slot: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
 }
 
 impl RawReadAheadReader {
     /// Create a new raw read-ahead reader with default buffer size.
     #[must_use]
     pub fn new(reader: RawBamReaderAuto) -> Self {
-        Self::with_batch_size(reader, BATCH_SIZE, CHANNEL_BUFFER_SIZE)
+        Self::from_reader(reader)
     }
 
-    /// Create a new raw read-ahead reader with specified batch and buffer sizes.
+    /// Create a raw read-ahead reader from any `RawBamReader<R>`.
+    ///
+    /// This accepts any `RawBamReader<R>` and spawns a background thread that
+    /// reads records in batches.
+    ///
+    /// # Note
+    ///
+    /// Do not pass a `RawBamReader<PooledInputStream>` here: the pool workers only
+    /// unpark the pool's stored main-thread handle, which would cause a deadlock if
+    /// the consumer thread is the background reader thread instead of the main thread.
+    /// Use `RecordSource::direct` for pool-integrated reading.
     #[must_use]
-    pub fn with_batch_size(
-        mut reader: RawBamReaderAuto,
+    pub(crate) fn from_reader<R: IoRead + Send + 'static>(reader: RawBamReader<R>) -> Self {
+        Self::from_reader_with_batch_size(reader, BATCH_SIZE, CHANNEL_BUFFER_SIZE)
+    }
+
+    /// Create a raw read-ahead reader from any `RawBamReader<R>` with specified
+    /// batch and buffer sizes.
+    #[must_use]
+    pub(crate) fn from_reader_with_batch_size<R: IoRead + Send + 'static>(
+        mut reader: RawBamReader<R>,
         batch_size: usize,
         channel_buffer: usize,
     ) -> Self {
+        let error_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let error_slot_thread = std::sync::Arc::clone(&error_slot);
         let (tx, rx) = bounded(channel_buffer);
 
         let handle = thread::spawn(move || {
-            Self::reader_thread(&mut reader, tx, batch_size);
+            Self::reader_thread_generic(&mut reader, tx, batch_size, error_slot_thread);
         });
 
-        Self { receiver: Some(rx), handle: Some(handle), current_batch: Vec::new(), batch_index: 0 }
+        Self {
+            receiver: Some(rx),
+            handle: Some(handle),
+            current_batch: Vec::new(),
+            batch_index: 0,
+            error_slot,
+        }
     }
 
-    /// Reader thread function - reads raw records in batches.
+    /// Reader thread function - reads raw records in batches from any reader type.
     #[allow(clippy::needless_pass_by_value)]
-    fn reader_thread(reader: &mut RawBamReaderAuto, tx: Sender<Vec<RawRecord>>, batch_size: usize) {
+    fn reader_thread_generic<R: IoRead>(
+        reader: &mut RawBamReader<R>,
+        tx: Sender<Vec<RawRecord>>,
+        batch_size: usize,
+        error_slot: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
+    ) {
         let mut record = RawRecord::new();
         let mut batch = Vec::with_capacity(batch_size);
 
@@ -260,7 +308,11 @@ impl RawReadAheadReader {
                 }
                 Err(e) => {
                     log::error!("Error reading raw BAM record: {e}");
-                    // Send any accumulated records before error
+                    // Store error so the foreground thread can retrieve it via take_error()
+                    if let Ok(mut slot) = error_slot.lock() {
+                        *slot = Some(e);
+                    }
+                    // Send any accumulated records before the EOF sentinel
                     if !batch.is_empty() {
                         let _ = tx.send(batch);
                     }
@@ -269,6 +321,15 @@ impl RawReadAheadReader {
                 }
             }
         }
+    }
+
+    /// Take any I/O error that occurred in the background reader thread.
+    ///
+    /// Returns `Some(err)` if the background thread stopped due to a read error
+    /// rather than clean EOF. Call this after exhausting the iterator.
+    #[must_use]
+    pub fn take_error(&self) -> Option<std::io::Error> {
+        self.error_slot.lock().ok()?.take()
     }
 
     /// Get the next raw record from the read-ahead buffer.
@@ -315,6 +376,236 @@ impl Iterator for RawReadAheadReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_record()
+    }
+}
+
+// ============================================================================
+// PooledInputStream — pool-based decompressed input stream (no extra threads)
+// ============================================================================
+
+/// A `Read` implementation that consumes decompressed blocks from the pool's
+/// `decompressed_input` `ArrayQueue` and presents a contiguous byte stream.
+///
+/// Workers do `ReadInputBlocks` + `DecompressInput`; this struct reassembles
+/// the decompressed blocks in order for the main thread to parse records from.
+///
+/// Uses non-blocking `ArrayQueue::pop()` with `park()`/`unpark()` notification.
+/// Workers call `unpark()` on the main thread after pushing blocks, so the main
+/// thread sleeps at zero CPU when waiting and wakes instantly when data arrives.
+/// EOF is detected via the shared `decompressed_input_done` `AtomicBool` flag.
+pub struct PooledInputStream {
+    /// `ArrayQueue` to pop decompressed blocks from pool workers.
+    decompressed_input: std::sync::Arc<crossbeam_queue::ArrayQueue<(u64, Vec<u8>)>>,
+    /// Shared flag: set when all input blocks have been decompressed.
+    decompressed_input_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared flag: set when a worker encountered an I/O error reading the input file.
+    input_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared flag: set when a worker failed to decompress a BGZF block.
+    decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Reorder buffer: holds out-of-order decompressed blocks until their serial is next.
+    reorder: crate::reorder_buffer::ReorderBuffer<Vec<u8>>,
+    /// Current buffer being read from.
+    current_buf: Vec<u8>,
+    /// Read position within `current_buf`.
+    current_pos: usize,
+}
+
+impl PooledInputStream {
+    /// Create a new pooled input stream from the pool's shared state.
+    #[must_use]
+    pub fn new(
+        decompressed_input: std::sync::Arc<crossbeam_queue::ArrayQueue<(u64, Vec<u8>)>>,
+        decompressed_input_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        input_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            decompressed_input,
+            decompressed_input_done,
+            input_read_error,
+            decompression_error,
+            reorder: crate::reorder_buffer::ReorderBuffer::new(),
+            current_buf: Vec::new(),
+            current_pos: 0,
+        }
+    }
+
+    /// Check if all input has been decompressed and the queue is drained.
+    fn is_eof(&self) -> bool {
+        self.decompressed_input_done.load(std::sync::atomic::Ordering::Acquire)
+            && self.decompressed_input.is_empty()
+    }
+
+    /// Drain available blocks from the `ArrayQueue` into the reorder buffer.
+    ///
+    /// Caps the drain at `queue.capacity()` iterations to bound the reorder
+    /// buffer size. In the normal case the reorder buffer stays small (only
+    /// the few blocks that arrive out of order are buffered); the cap prevents
+    /// a temporarily fast producer from building an unbounded backlog.
+    fn drain_queue(&mut self) {
+        let limit = self.decompressed_input.capacity();
+        for _ in 0..limit {
+            match self.decompressed_input.pop() {
+                Some((serial, data)) => self.reorder.insert(serial, data),
+                None => break,
+            }
+        }
+    }
+
+    /// Get the next decompressed block in serial order.
+    ///
+    /// Drains the `ArrayQueue` into a reorder buffer, then checks if the next
+    /// expected serial is available. If not, parks the thread until a worker
+    /// calls `unpark()` after pushing new data.
+    fn next_block(&mut self) -> Option<Vec<u8>> {
+        loop {
+            // Drain everything available into the reorder buffer
+            self.drain_queue();
+
+            // Check if the block we need is ready (O(1) via ReorderBuffer)
+            if let Some(data) = self.reorder.try_pop_next() {
+                return Some(data);
+            }
+
+            // Nothing available — check EOF
+            if self.is_eof() {
+                // Re-drain one more time before declaring EOF: a block could have
+                // been pushed between the previous drain and the is_eof() check.
+                // `decompressed_input_done` is only set after the block is in the
+                // queue, so the risk is low, but a second drain makes this watertight.
+                self.drain_queue();
+                if let Some(data) = self.reorder.try_pop_next() {
+                    return Some(data);
+                }
+                return None;
+            }
+
+            // Park until a worker pushes a block and calls unpark()
+            std::thread::park();
+
+            // After waking, check for errors before looping back to drain.
+            // A worker may have set an error flag instead of pushing a block.
+            if self.input_read_error.load(std::sync::atomic::Ordering::Acquire)
+                || self.decompression_error.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return None;
+            }
+        }
+    }
+}
+
+impl IoRead for PooledInputStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Serve from current buffer first
+        if self.current_pos < self.current_buf.len() {
+            let available = &self.current_buf[self.current_pos..];
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            self.current_pos += n;
+            return Ok(n);
+        }
+
+        // Check for I/O or decompression error before blocking on next_block()
+        if self.input_read_error.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "I/O error reading input BAM blocks (see log for details)",
+            ));
+        }
+        if self.decompression_error.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "BGZF decompression error on input blocks (see log for details)",
+            ));
+        }
+
+        // Get next block
+        if let Some(data) = self.next_block() {
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            if n < data.len() {
+                self.current_buf = data;
+                self.current_pos = n;
+            } else {
+                self.current_buf.clear();
+                self.current_pos = 0;
+            }
+            Ok(n)
+        } else {
+            // Double-check error flags after draining (an error may have caused early EOF)
+            if self.input_read_error.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::other(
+                    "I/O error reading input BAM blocks (see log for details)",
+                ));
+            }
+            if self.decompression_error.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::other(
+                    "BGZF decompression error on input blocks (see log for details)",
+                ));
+            }
+            Ok(0) // clean EOF
+        }
+    }
+}
+
+// ============================================================================
+// RecordSource — unified iterator for pool and non-pool paths
+// ============================================================================
+
+/// Unified record source for Phase 1 reading.
+///
+/// Wraps either a `RawReadAheadReader` (non-pool path, has background thread)
+/// or a direct `RawBamReader<PooledInputStream>` (pool path, no extra threads).
+pub enum RecordSource {
+    /// Legacy path: background thread prefetches records.
+    ReadAhead(RawReadAheadReader),
+    /// Pool path: main thread reads directly from pool's decompressed stream.
+    ///
+    /// The second field stores the first I/O error encountered during iteration,
+    /// if any. Callers should call `take_error()` after the iteration loop to
+    /// propagate errors rather than silently treating them as EOF.
+    Direct(RawBamReader<PooledInputStream>, Option<std::io::Error>),
+}
+
+impl RecordSource {
+    /// Wrap a pooled reader as the `Direct` variant.
+    #[must_use]
+    pub fn direct(reader: RawBamReader<PooledInputStream>) -> Self {
+        Self::Direct(reader, None)
+    }
+
+    /// Take any I/O error that occurred during iteration.
+    ///
+    /// Returns `Some(err)` if the iterator stopped due to a read error rather than
+    /// clean EOF. Call this after exhausting the iterator to detect truncated input.
+    pub fn take_error(&mut self) -> Option<std::io::Error> {
+        match self {
+            Self::Direct(_, err) => err.take(),
+            Self::ReadAhead(r) => r.take_error(),
+        }
+    }
+}
+
+impl Iterator for RecordSource {
+    type Item = RawRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::ReadAhead(r) => r.next(),
+            Self::Direct(reader, error_slot) => {
+                let mut record = RawRecord::default();
+                match reader.read_record(&mut record) {
+                    Ok(0) => None, // EOF
+                    Ok(_) => Some(record),
+                    Err(e) => {
+                        log::error!("Error reading raw BAM record: {e}");
+                        // Preserve the first error; don't overwrite with later ones.
+                        if error_slot.is_none() {
+                            *error_slot = Some(e);
+                        }
+                        None
+                    }
+                }
+            }
+        }
     }
 }
 

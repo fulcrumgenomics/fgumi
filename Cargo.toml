@@ -67,6 +67,7 @@ murmur3 = "0.5"
 statrs = "0.18"
 bytesize = "2.3"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory
+num_cpus = "1.16"
 rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"

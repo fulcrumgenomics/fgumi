@@ -33,16 +33,20 @@ use noodles::sam::header::record::value::map::header::tag as header_tag;
 use tempfile::TempDir;
 
 pub use fgumi_raw_bam as bam_fields;
+pub mod bgzf_io;
 pub mod external;
 pub mod inline_buffer;
 pub mod keys;
 pub mod loser_tree;
 pub mod pipeline;
+pub mod pooled_bam_writer;
+pub mod pooled_chunk_writer;
 pub mod radix;
 pub mod raw;
 pub mod raw_bam_reader;
 pub mod read_ahead;
 pub(crate) mod segmented_buf;
+pub mod worker_pool;
 
 /// Buffer size for `BufReader` during merge phase.
 const MERGE_BUFFER_SIZE: usize = 64 * 1024;
