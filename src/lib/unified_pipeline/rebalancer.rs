@@ -316,7 +316,8 @@ pub fn parse_memory_limit(s: &str) -> Result<u64, String> {
 
     if bytes < MIN_BYTES {
         return Err(format!(
-            "Queue memory limit {} is too low (minimum: 256 MiB)",
+            "Queue memory limit {} is too low (minimum: 256 MiB); \
+             if you used a decimal suffix like MB, try MiB instead (e.g., '256MiB')",
             bytesize::ByteSize(bytes)
         ));
     }

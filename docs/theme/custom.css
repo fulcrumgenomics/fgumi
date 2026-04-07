@@ -1,0 +1,793 @@
+/* ============================================================
+   Fulcrum Genomics — fgumi documentation theme
+   "Lab Readout": clinical precision, bold genomics energy
+   ============================================================ */
+
+/* --- Google Fonts: IBM Plex family -------------------------- */
+@import 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,600;0,700;1,400&family=IBM+Plex+Serif:wght@400;600&display=swap';
+
+/* --- Fulcrum Genomics brand palette ------------------------- */
+:root {
+    --fg-blue:       #26a8e0;
+    --fg-green:      #38b44a;
+    --fg-pacific:    #1693b9;
+    --fg-sky:        #4dcce8;
+    --fg-teal:       #2fae99;
+    --fg-emerald:    #4dcc68;
+    --fg-forest:     #269e2a;
+    --fg-deep-blue:  #160052;
+    --fg-night-blue: #10003d;
+    --fg-ghost:      #f8f5ff;
+    --fg-gray:       #a5a8a7;
+}
+
+/* --- Body typography ---------------------------------------- */
+
+/* Override mdBook's small root font size */
+html {
+    font-size: 18px !important;
+    scroll-behavior: smooth;
+}
+
+body {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-size: 1rem !important;
+    line-height: 1.75 !important;
+}
+
+code, kbd, pre, samp, .hljs {
+    font-family: 'IBM Plex Mono', monospace !important;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.3;
+}
+
+.content main {
+    font-size: 1rem !important;
+    line-height: 1.8 !important;
+}
+
+.content main p,
+.content main li,
+.content main td,
+.content main th {
+    font-size: 1rem !important;
+    line-height: 1.8 !important;
+}
+
+.content main h1 { font-size: 2.1rem !important;  margin-top: 1rem !important; }
+.content main h2 { font-size: 1.55rem !important; margin-top: 2rem !important; margin-bottom: 1rem !important; }
+.content main h3 { font-size: 1.25rem !important; margin-top: 1.5rem !important; }
+.content main h4 { font-size: 1.15rem !important; color: var(--fg-pacific); }
+.content main h5 { font-size: 1rem !important; color: var(--fg-pacific); }
+.content main h6 { font-size: 0.9rem !important; color: var(--fg-pacific); }
+
+/* ============================================================
+   NAVY THEME (default dark)
+   ============================================================ */
+.navy {
+    --bg:                   #fafbff;
+    --fg:                   #1a1a2e;
+    --sidebar-bg:           transparent;   /* handled by gradient */
+    --sidebar-fg:           #e2e8f0;
+    --sidebar-active:       #ffffff;
+    --sidebar-spacer:       rgba(255,255,255,0.08);
+    --scrollbar:            rgba(255,255,255,0.2);
+    --icons:                rgba(255,255,255,0.5);
+    --icons-hover:          var(--fg-sky);
+    --links:                var(--fg-blue);
+    --inline-code-color:    var(--fg-deep-blue);
+    --theme-popup-bg:       #ffffff;
+    --theme-popup-border:   #e0e0f0;
+    --theme-hover:          var(--fg-ghost);
+    --quote-bg:             #e8f6ed;
+    --quote-border:         var(--fg-green);
+    --warning-border:       var(--fg-blue);
+    --table-border-color:   #e0e4f0;
+    --table-header-bg:      #eef6ff;
+    --table-alternate-bg:   #f0f8ff;
+    --searchbar-border-color: var(--fg-blue);
+    --searchbar-bg:         #ffffff;
+    --searchbar-fg:         var(--fg-deep-blue);
+    --searchbar-shadow-color: rgba(38,168,224,0.3);
+    --searchresults-header-fg: var(--fg-gray);
+    --searchresults-border-color: #e0e0f0;
+    --searchresults-li-bg:  var(--fg-ghost);
+    --search-mark-bg:       var(--fg-teal);
+}
+
+/* --- Content area: light, clean ----------------------------- */
+.navy .content main,
+.navy .page-wrapper {
+    background: #fafbff;
+    color: #1a1a2e;
+}
+
+/* ============================================================
+   LIGHT THEME
+   ============================================================ */
+.light {
+    --bg:                   #ffffff;
+    --fg:                   #1a1a2e;
+    --sidebar-bg:           transparent;
+    --sidebar-fg:           #e2e8f0;
+    --sidebar-active:       #ffffff;
+    --sidebar-spacer:       rgba(255,255,255,0.08);
+    --scrollbar:            rgba(255,255,255,0.2);
+    --icons:                rgba(255,255,255,0.5);
+    --icons-hover:          var(--fg-sky);
+    --links:                var(--fg-blue);
+    --inline-code-color:    var(--fg-deep-blue);
+    --theme-popup-bg:       #ffffff;
+    --theme-popup-border:   #e0e0f0;
+    --theme-hover:          var(--fg-ghost);
+    --quote-bg:             #e8f6ed;
+    --quote-border:         var(--fg-green);
+    --warning-border:       var(--fg-blue);
+    --table-border-color:   #e0e4f0;
+    --table-header-bg:      #eef6ff;
+    --table-alternate-bg:   #f0f8ff;
+    --searchbar-border-color: var(--fg-blue);
+    --searchbar-bg:         #ffffff;
+    --searchbar-fg:         var(--fg-deep-blue);
+    --searchbar-shadow-color: rgba(38,168,224,0.3);
+    --searchresults-header-fg: var(--fg-gray);
+    --searchresults-border-color: #e0e0f0;
+    --searchresults-li-bg:  var(--fg-ghost);
+    --search-mark-bg:       var(--fg-teal);
+}
+
+/* ============================================================
+   SIDEBAR — FG Night Blue ➜ Forest Green gradient
+   ============================================================ */
+.sidebar {
+    background: linear-gradient(
+        160deg,
+        #10003d 0%,
+        #160052 35%,
+        #0d2e1a 75%,
+        #0a2214 100%
+    ) !important;
+    border-right: 1px solid rgba(56, 180, 74, 0.2);
+}
+
+.sidebar .sidebar-scrollbox {
+    padding-top: 0.5rem;
+}
+
+/* Sidebar book title */
+.sidebar .sidebar-scrollbox .sidebar-title {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: #ffffff;
+    letter-spacing: 0.02em;
+    padding: 0.75rem 1rem 0.5rem;
+    display: block;
+}
+
+/* All sidebar links */
+.sidebar a {
+    color: rgba(226, 232, 240, 0.95) !important;
+    font-size: 0.875rem;
+    transition: color 0.15s ease, padding-left 0.15s ease;
+}
+
+.sidebar a:hover {
+    color: var(--fg-sky) !important;
+    text-decoration: none;
+}
+
+/* Section header spans (no-link items like "Core Concepts") */
+.sidebar .chapter-link-wrapper > span {
+    color: var(--fg-blue) !important;
+    font-size: 0.8rem;
+    font-weight: 500;
+}
+
+/* Active page — green left-bar accent */
+.sidebar a.active {
+    color: #ffffff !important;
+    position: relative;
+    font-weight: 600;
+}
+
+.sidebar a.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--fg-green);
+    border-radius: 0 2px 2px 0;
+}
+
+/* Top-level part titles (User Guide, Tool Reference, Metrics Reference) */
+.sidebar-scrollbox .part-title {
+    color: var(--fg-emerald) !important;
+    font-size: 0.8rem !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 700;
+    margin-top: 1.5rem;
+    padding-left: 0 !important;
+}
+
+/* Sidebar separator lines */
+.sidebar hr {
+    border-color: rgba(56, 180, 74, 0.2);
+    margin: 0.5rem 1rem;
+}
+
+/* ============================================================
+   TOP MENU BAR
+   ============================================================ */
+.menu-bar,
+.menu-bar .menu-bar-sticky-container {
+    background: var(--fg-night-blue) !important;
+    border-bottom: 2px solid var(--fg-green) !important;
+}
+
+.menu-title {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.01em !important;
+}
+
+.menu-bar i.fa,
+.menu-bar .icon-button {
+    color: rgba(255,255,255,0.75) !important;
+}
+
+.menu-bar i.fa:hover,
+.menu-bar .icon-button:hover {
+    color: var(--fg-sky) !important;
+}
+
+/* ============================================================
+   CONTENT AREA
+   ============================================================ */
+
+/* H1: green underline */
+.content main h1 {
+    color: var(--fg-deep-blue);
+    border-bottom: 3px solid var(--fg-green);
+    padding-bottom: 0.4rem;
+    margin-bottom: 1.5rem;
+}
+
+.content main h2 {
+    color: var(--fg-deep-blue);
+    border-bottom: 1px solid #e0e4f0;
+    padding-bottom: 0.25rem;
+}
+
+.content main h3 {
+    color: var(--fg-pacific);
+}
+
+/* Links — FG Blue for visibility, Sky on hover */
+a {
+    color: var(--fg-blue);
+    text-decoration: none;
+}
+
+a:hover {
+    color: var(--fg-sky);
+    text-decoration: underline;
+}
+
+/* ============================================================
+   BREADCRUMBS
+   ============================================================ */
+.fg-breadcrumb {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--fg-gray);
+    margin-bottom: 1.5rem;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+}
+
+.fg-breadcrumb a {
+    color: var(--fg-pacific) !important;
+    text-decoration: none;
+}
+
+.fg-breadcrumb a:hover {
+    color: var(--fg-blue) !important;
+    text-decoration: underline;
+}
+
+.fg-breadcrumb-sep {
+    color: var(--fg-gray);
+    margin: 0 0.1rem;
+    opacity: 0.6;
+}
+
+.fg-breadcrumb-current {
+    color: var(--fg);
+    font-weight: 600;
+}
+
+/* ============================================================
+   CODE
+   ============================================================ */
+
+/* Inline code — high specificity to beat mdBook's theme overrides */
+.content main code,
+.content p code,
+.content li code,
+.content td code,
+.content th code,
+.content h1 code,
+.content h2 code,
+.content h3 code,
+.content h4 code,
+p code,
+li code,
+td code {
+    font-family: 'IBM Plex Mono', monospace !important;
+    background: #dff0fb !important;
+    color: #0d2d52 !important;
+    border: 1px solid #b3d9f0 !important;
+    border-radius: 3px !important;
+    padding: 0.1em 0.4em !important;
+    font-size: 0.9em !important;
+}
+
+/* Code blocks — green left accent */
+pre {
+    border-left: 4px solid var(--fg-green) !important;
+    border-radius: 0 6px 6px 0 !important;
+    background: #f4f8ff !important;
+    box-shadow: inset 0 1px 3px rgba(22, 0, 82, 0.06);
+    padding: 0.75rem 1rem !important;
+}
+
+pre code {
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: #1a1a2e;
+    font-size: 0.875rem;
+    line-height: 1.6;
+}
+
+/* Copy button */
+.copy-button {
+    border: 1px solid var(--fg-green) !important;
+    color: var(--fg-forest) !important;
+    background: rgba(56, 180, 74, 0.2) !important;
+}
+
+.copy-button:hover {
+    background: rgba(56, 180, 74, 0.35) !important;
+}
+
+/* ============================================================
+   TABLES
+   ============================================================ */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.25rem 0;
+    font-size: 0.9rem;
+    box-shadow: 0 1px 4px rgba(22, 0, 82, 0.07);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+table th {
+    background: var(--fg-deep-blue);
+    color: #ffffff;
+    text-align: left;
+    padding: 0.6rem 0.85rem;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    font-weight: 600;
+}
+
+table td {
+    padding: 0.55rem 0.85rem;
+    border-bottom: 1px solid var(--table-border-color);
+    vertical-align: top;
+}
+
+table tr:last-child td {
+    border-bottom: none;
+}
+
+table tr:nth-child(even) td {
+    background: #f0f8ff;
+}
+
+table tr:hover td {
+    background: #d6ebff;
+}
+
+/* ============================================================
+   BLOCKQUOTES — green accent (notes, tips)
+   ============================================================ */
+blockquote {
+    border-left: 4px solid var(--fg-green) !important;
+    background: #e8f6ed !important;
+    padding: 0.85rem 1.1rem !important;
+    border-radius: 0 6px 6px 0;
+    color: #1a3a28;
+    margin: 1.25rem 0;
+}
+
+blockquote p {
+    margin: 0;
+}
+
+blockquote strong {
+    color: var(--fg-forest);
+}
+
+/* ============================================================
+   SEARCH
+   ============================================================ */
+#searchbar {
+    font-family: 'IBM Plex Mono', monospace !important;
+    border: 1px solid var(--fg-blue);
+    border-radius: 4px;
+    font-size: 0.875rem;
+}
+
+#searchbar:focus {
+    border-color: var(--fg-green);
+    box-shadow: 0 0 0 3px rgba(56, 180, 74, 0.5);
+    outline: 2px solid transparent;
+}
+
+/* ============================================================
+   TOOL REFERENCE (auto-generated pages)
+   ============================================================ */
+
+/* Category labels */
+.tool-category {
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 600;
+    color: var(--fg-green);
+    margin-top: 2rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    border-bottom: 1px solid rgba(56, 180, 74, 0.3);
+    padding-bottom: 0.3rem;
+}
+
+.tool-description code,
+.metric-description code {
+    font-size: 0.875em;
+}
+
+/* ============================================================
+   LANDING PAGE
+   ============================================================ */
+.hero {
+    text-align: center;
+    padding: 3rem 0 2rem;
+    margin-bottom: 3rem;
+    border-bottom: 1px solid #e0e4f0;
+}
+
+.hero h1 {
+    font-size: 3rem;
+    font-weight: 700;
+    color: var(--fg-deep-blue);
+    border-bottom: none;
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.03em;
+}
+
+.hero h1 span {
+    color: var(--fg-green);
+}
+
+.hero .tagline {
+    font-size: 1.15rem;
+    color: var(--fg-pacific);
+    font-weight: 300;
+}
+
+/* Feature / use-case cards */
+.use-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: clamp(1rem, 3vw, 1.5rem);
+    margin: 1.5rem 0;
+}
+
+.use-card {
+    border: 1px solid #e0e4f0;
+    border-top: 4px solid var(--fg-blue);
+    border-radius: 0 0 8px 8px;
+    padding: 1.5rem;
+    background: #fafbff;
+    box-shadow: 0 2px 8px rgba(22, 0, 82, 0.06);
+    transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.use-card:hover {
+    box-shadow: 0 4px 16px rgba(22, 0, 82, 0.12);
+    transform: translateY(-2px);
+}
+
+.use-card:nth-child(2) { border-top-color: var(--fg-green); }
+.use-card:nth-child(3) { border-top-color: var(--fg-teal); }
+.use-card:nth-child(4) { border-top-color: var(--fg-pacific); }
+
+.use-card h3 {
+    margin-top: 0;
+    color: var(--fg-deep-blue);
+    font-size: 1rem;
+}
+
+/* ============================================================
+   FG BRANDING INJECTED BY sidebar-brand.js
+   ============================================================ */
+.fg-brand-header {
+    padding: 1.1rem 1rem 0.85rem;
+    border-bottom: 1px solid rgba(56, 180, 74, 0.25);
+    margin-bottom: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.fg-brand-link {
+    display: block;
+    line-height: 0;
+}
+
+.fg-brand-logo {
+    height: 64px;
+    width: auto;
+    display: block;
+    opacity: 0.92;
+    transition: opacity 0.15s ease;
+}
+
+.fg-brand-link:hover .fg-brand-logo {
+    opacity: 1;
+}
+
+.fg-brand-divider {
+    height: 1px;
+    background: rgba(56, 180, 74, 0.2);
+    margin: 0.1rem 0;
+}
+
+.fg-brand-product {
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 700;
+    font-size: 1.2rem;
+    letter-spacing: 0.01em;
+    padding: 0 0.1rem;
+    line-height: 1.2;
+}
+
+.fg-brand-tagline {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.7rem;
+    color: rgba(255, 255, 255, 0.5);
+    letter-spacing: 0.05em;
+    padding: 0 0.1rem;
+}
+
+.fg-brand-corp {
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 0.72rem;
+    color: rgba(77, 204, 104, 0.7) !important;
+    text-decoration: none !important;
+    letter-spacing: 0.02em;
+    margin-top: 0.15rem;
+    transition: color 0.15s ease;
+}
+
+.fg-brand-corp:hover {
+    color: var(--fg-emerald) !important;
+    text-decoration: none !important;
+}
+
+/* ============================================================
+   CONTENT WIDTH & MARGINS
+   ============================================================ */
+
+/* Override mdBook's narrow 750px content column */
+:root {
+    --content-max-width: 98%;
+    --page-padding: 10px;
+}
+
+.content {
+    padding: 0 0.75rem 50px !important;
+}
+
+@media (min-width: 768px) {
+    .content {
+        padding: 0 1.5rem 50px !important;
+    }
+}
+
+.content main {
+    max-width: 1000px !important;
+    margin-inline-start: 0 !important;
+    margin-inline-end: auto !important;
+}
+
+.page-wrapper {
+    padding-bottom: 3rem;
+}
+
+@media (min-width: 1400px) {
+    .content main {
+        max-width: 1200px !important;
+    }
+}
+
+/* ============================================================
+   BYLINE (inline attribution next to h1 on index page)
+   ============================================================ */
+.fg-byline-inline {
+    font-size: 0.7rem;
+    font-weight: 400;
+    color: rgba(255, 255, 255, 0.55);
+    vertical-align: middle;
+    margin-left: 0.6em;
+    white-space: nowrap;
+}
+
+.fg-byline-inline a {
+    color: rgba(255, 255, 255, 0.55);
+    text-decoration: none;
+}
+
+.fg-byline-inline a:hover {
+    color: rgba(255, 255, 255, 0.9);
+    text-decoration: none;
+}
+
+/* ============================================================
+   VISIT US SECTION (index.md top + footer on all pages)
+   ============================================================ */
+.fg-visit-us {
+    margin-top: 2.5rem;
+    padding: 1.5rem 1rem 1.25rem;
+    border: 1px solid var(--table-border-color);
+    border-top: 4px solid var(--fg-green);
+    border-radius: 0 0 8px 8px;
+    background: var(--fg-ghost);
+    text-align: center;
+}
+
+.fg-visit-us img {
+    margin: 0 auto 1rem;
+    display: block;
+    max-width: 320px;
+    width: 100%;
+    height: auto;
+}
+
+.fg-visit-us p {
+    font-size: 1rem;
+    color: var(--fg);
+    margin: 0 auto 1.25rem;
+    max-width: 100%;
+    text-align: center;
+}
+
+.fg-visit-buttons {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+}
+
+.fg-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.65rem 1.6rem;
+    border-radius: 5px;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 600;
+    font-size: 0.9rem;
+    text-decoration: none !important;
+    transition: filter 0.15s ease, transform 0.15s ease;
+    letter-spacing: 0.02em;
+}
+
+.fg-btn:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+    text-decoration: none !important;
+}
+
+.fg-btn-green {
+    background: var(--fg-green);
+    color: #ffffff !important;
+}
+
+.fg-btn-blue {
+    background: var(--fg-blue);
+    color: #ffffff !important;
+}
+
+/* Quick links row in footer */
+.fg-footer-links {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    align-items: center;
+    font-size: 0.85rem;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--table-border-color);
+}
+
+.fg-footer-links a {
+    color: var(--fg-pacific) !important;
+    text-decoration: none;
+}
+
+.fg-footer-links a:hover {
+    color: var(--fg-blue) !important;
+    text-decoration: underline;
+}
+
+.fg-footer-links .fg-footer-sep {
+    color: var(--fg-gray);
+    opacity: 0.5;
+}
+
+/* ============================================================
+   MISC POLISH
+   ============================================================ */
+
+/* Better list spacing in content */
+.content main li {
+    margin-bottom: 0.25rem;
+}
+
+/* Warning/note callouts */
+.warning {
+    border-left: 4px solid var(--fg-blue) !important;
+    background: #eef6ff !important;
+}
+
+/* ============================================================
+   PRINT
+   ============================================================ */
+@media print {
+    .sidebar,
+    .menu-bar,
+    .nav-chapters,
+    .fg-breadcrumb,
+    .fg-page-footer,
+    .fg-visit-us {
+        display: none !important;
+    }
+    .page-wrapper {
+        margin-left: 0 !important;
+    }
+    .content main {
+        max-width: 100% !important;
+    }
+}

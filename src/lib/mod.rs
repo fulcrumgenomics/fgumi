@@ -128,6 +128,8 @@
 
 pub mod bam_io;
 pub mod batched_sam_reader;
+pub mod commands;
+pub mod version;
 pub use fgumi_bgzf::reader as bgzf_reader;
 pub use fgumi_bgzf::writer as bgzf_writer;
 pub use fgumi_dna::bitenc;

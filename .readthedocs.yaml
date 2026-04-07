@@ -1,0 +1,16 @@
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    rust: "latest"  # RTD does not support specific 1.x versions; rust-toolchain.toml pins the actual version
+  commands:
+    # Install mdbook
+    - cargo install mdbook --version 0.5.2
+
+    # Generate documentation markdown and build the mdbook site
+    - cargo run --package xtask --release -- docs-build
+
+    # Move output to where Read the Docs expects it
+    - mkdir -p _readthedocs/html
+    - cp -r docs/book/. _readthedocs/html/

@@ -34,3 +34,9 @@ Session.vim
 # Local notes (DEV.md, RD.md)
 /notes/
 /plans/
+
+# mdBook auto-generated output and content
+docs/book/
+docs/src/SUMMARY.md
+docs/src/tools/
+docs/src/metrics/

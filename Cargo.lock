@@ -2964,6 +2964,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
+name = "xtask"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fgumi",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
