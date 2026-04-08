@@ -865,6 +865,7 @@ impl SortWorkerPool {
     /// 5. Try owned exclusive step first (prevents starvation)
     /// 6. Try each priority step (break on first success)
     /// 7. Backoff with jitter
+    #[allow(clippy::too_many_lines)]
     fn worker_loop(
         shared: &SharedPipelineState,
         worker: &mut SortWorkerState,
@@ -924,16 +925,16 @@ impl SortWorkerPool {
                 }
             }
 
-            // 6. Try each priority step (break on first success or OutputFull)
-            //    Only compute backpressure/priorities when needed (skip if work already found)
+            // 6. Partitioned primary → secondary dispatch.
+            //    Each worker has a preferred (primary) step and a fallback
+            //    (secondary) step. This partitions the pool between decompress
+            //    and compress work, eliminating the contention that previously
+            //    caused spill compression to starve input decompression.
             if !did_work {
-                let bp = shared.get_backpressure();
-                let priorities = get_sort_priorities(&bp);
-
-                for &step in priorities {
-                    if !Self::is_step_eligible(step, shared, worker, current_phase) {
-                        continue;
-                    }
+                let (primary, secondary) =
+                    Self::worker_roles(worker.worker_id, shared.num_workers, current_phase);
+                for maybe_step in [primary, secondary] {
+                    let Some(step) = maybe_step else { continue };
                     // Skip exclusive steps this worker doesn't own
                     if Self::is_exclusive_step(step)
                         && !Self::can_attempt_exclusive(owned_step, step, shared)
@@ -944,7 +945,9 @@ impl SortWorkerPool {
                     if owned_step == Some(step) {
                         continue;
                     }
-
+                    if !Self::is_step_eligible(step, shared, worker, current_phase) {
+                        continue;
+                    }
                     let t0 = Instant::now();
                     match Self::execute_step(shared, worker, step) {
                         StepResult::Success => {
@@ -954,10 +957,41 @@ impl SortWorkerPool {
                                 Self::nanos_u64(t0.elapsed()),
                             );
                             did_work = true;
-                            break; // Restart priority evaluation
+                            break;
                         }
-                        StepResult::OutputFull => break, // Try downstream via held-item advancement
-                        StepResult::InputEmpty => {}     // Try next step
+                        StepResult::OutputFull => break,
+                        StepResult::InputEmpty => {}
+                    }
+                }
+            }
+
+            // 6b. Fallback: when primary/secondary partition doesn't cover the
+            //     needed work (e.g. `ReadChunkBlocks` in phase 2, or during phase
+            //     transitions), fall through to the legacy backpressure-aware
+            //     priority list so no step is ever orphaned.
+            if !did_work {
+                let bp = shared.get_backpressure();
+                let priorities = get_sort_priorities(&bp);
+                for &step in priorities {
+                    if !Self::is_step_eligible(step, shared, worker, current_phase) {
+                        continue;
+                    }
+                    if owned_step == Some(step) {
+                        continue;
+                    }
+                    let t0 = Instant::now();
+                    match Self::execute_step(shared, worker, step) {
+                        StepResult::Success => {
+                            pstats.record_step(
+                                worker.worker_id,
+                                step,
+                                Self::nanos_u64(t0.elapsed()),
+                            );
+                            did_work = true;
+                            break;
+                        }
+                        StepResult::OutputFull => break,
+                        StepResult::InputEmpty => {}
                     }
                 }
             }
@@ -1024,6 +1058,50 @@ impl SortWorkerPool {
             phase::PHASE1 => Some(SortStep::ReadInputBlocks),
             // Phase 2: each worker reads its own files, no exclusive ownership needed
             _ => None,
+        }
+    }
+
+    /// Return (primary, secondary) steps for a worker in a given phase.
+    ///
+    /// Partitions workers to eliminate compress/decompress contention on the
+    /// shared pool: approximately half the workers prefer decompress work, half
+    /// prefer compress work. Each worker falls back to the opposite step when
+    /// its primary queue is empty, so no worker is ever idle when work exists.
+    ///
+    /// Worker 0 owns `ReadInputBlocks` exclusively (shared input file mutex);
+    /// its primary is the exclusive read step and its secondary is decompress.
+    /// For `num_workers < 2`, returns `(None, None)` — single-worker mode
+    /// falls through to the legacy priority path.
+    fn worker_roles(
+        worker_id: usize,
+        num_workers: usize,
+        current_phase: u8,
+    ) -> (Option<SortStep>, Option<SortStep>) {
+        if num_workers < 2 {
+            return (None, None);
+        }
+        match current_phase {
+            phase::PHASE1 => {
+                if worker_id == 0 {
+                    (Some(SortStep::ReadInputBlocks), Some(SortStep::DecompressInput))
+                } else {
+                    let split = num_workers.div_ceil(2); // ceil(N/2)
+                    if worker_id < split {
+                        (Some(SortStep::DecompressInput), Some(SortStep::CompressSpill))
+                    } else {
+                        (Some(SortStep::CompressSpill), Some(SortStep::DecompressInput))
+                    }
+                }
+            }
+            phase::PHASE2 => {
+                let split = num_workers.div_ceil(2);
+                if worker_id < split {
+                    (Some(SortStep::DecompressChunks), Some(SortStep::CompressOutput))
+                } else {
+                    (Some(SortStep::CompressOutput), Some(SortStep::DecompressChunks))
+                }
+            }
+            _ => (None, None),
         }
     }
 
