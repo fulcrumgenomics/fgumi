@@ -137,7 +137,8 @@ PERFORMANCE:
   - Handles BAM files larger than available RAM via spill-to-disk
   - Uses parallel sorting (--threads) for in-memory chunks
   - Configurable temp file compression (--temp-compression)
-  - Auto memory detection with configurable reserve for co-running processes
+  - Default 768M per-thread memory limit (samtools-compatible); pass
+    `--max-memory auto` to detect system memory (opt-in)
 
 EXAMPLES:
 
@@ -150,11 +151,14 @@ EXAMPLES:
   # Sort by queryname for zipper
   fgumi sort -i input.bam -o sorted.bam --order queryname
 
-  # Multi-threaded sort (auto-detects available memory)
+  # Multi-threaded sort (default 768M per thread)
   fgumi sort -i input.bam -o sorted.bam --order template-coordinate --threads 8
 
-  # Override auto memory with an explicit per-thread limit
+  # Override the per-thread memory limit
   fgumi sort -i input.bam -o sorted.bam -m 2GiB --threads 8
+
+  # Opt in to auto-detected system memory (subtracts --memory-reserve)
+  fgumi sort -i input.bam -o sorted.bam -m auto --threads 8
 
   # Reserve extra memory for bwa mem running in a pipeline
   fgumi sort -i input.bam -o sorted.bam --memory-reserve 12GiB --threads 4
@@ -192,13 +196,14 @@ pub struct Sort {
 
     /// Maximum memory for in-memory sorting.
     ///
-    /// "auto" (default) detects system memory and subtracts --memory-reserve
-    /// to leave room for the OS and co-running processes (e.g. an aligner).
-    /// Explicit values like "512M", "1G", "4GiB" are per-thread when
-    /// --memory-per-thread is enabled (default).
+    /// Default is "768M" per thread (matching samtools behavior). Pass "auto"
+    /// to detect system memory and subtract --memory-reserve, leaving room
+    /// for the OS and co-running processes (e.g. an aligner). Explicit values
+    /// like "512M", "1G", "4GiB" are per-thread when --memory-per-thread is
+    /// enabled (default).
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
-    #[arg(short = 'm', long = "max-memory", default_value = "auto", value_parser = parse_memory)]
+    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
 
     /// Memory to reserve for other processes when --max-memory=auto.
