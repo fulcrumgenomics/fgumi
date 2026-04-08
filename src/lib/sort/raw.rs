@@ -112,8 +112,8 @@ impl SortPhaseTimer {
     }
 
     /// Time a sort operation.
-    fn time_sort(&mut self, f: impl FnOnce()) {
-        Self::time(&mut self.sort_secs, f);
+    fn time_sort<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        Self::time(&mut self.sort_secs, f)
     }
 
     /// Time a spill write operation.
@@ -767,102 +767,59 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
 }
 
 // ============================================================================
-// MainThreadChunkConsumer — pool-integrated merge reader (replaces GenericKeyedChunkReader)
+// MainThreadChunkConsumer — pool-integrated merge reader
 // ============================================================================
+//
+// The pool's worker threads read raw BGZF blocks from disk, decompress them,
+// and insert the decompressed blocks into per-file `ReorderBuffer`s held in
+// each `Phase2FileState`. The main thread (the merge loop) holds a snapshot of
+// those file states and pulls one decompressed block at a time per source as
+// the loser tree advances. There is no global queue and no per-source
+// reorder/buffering layer in the consumer itself — the per-file
+// `Phase2FileState.decompressed` reorder buffer IS the per-source buffer.
+//
+// Backpressure is enforced inside the worker pool: when a per-file reorder
+// buffer reaches `PHASE2_DECOMP_CAP`, workers stop pulling new raw blocks for
+// that file (with a deadlock-free escape hatch for the gap-filling serial).
 
-/// Per-source buffer for reassembling decompressed blocks into a record stream.
-struct PerSourceBuffer {
-    /// Reorder buffer: holds out-of-order decompressed blocks until their serial is next.
-    ///
-    /// Uses `ReorderBuffer` instead of `BTreeMap` for O(1) insert and pop (sequential
-    /// blocks from the pool are common, giving `VecDeque` O(1) amortised behaviour vs
-    /// `BTreeMap`'s O(log n)).
-    pending: crate::reorder_buffer::ReorderBuffer<Vec<u8>>,
-    /// Current byte buffer being consumed by the record parser.
+/// Per-source byte-stream parser state owned by the main thread.
+///
+/// As blocks are pulled from `Phase2FileState.decompressed`, the bytes are
+/// stashed in `current_buf` and consumed left-to-right by the record parser.
+struct SourceParserState {
+    /// Current decompressed block being consumed.
     current_buf: Vec<u8>,
     /// Read position within `current_buf`.
     current_pos: usize,
-    /// Whether this source has seen all its decompressed blocks.
-    eof: bool,
 }
 
-impl PerSourceBuffer {
+impl SourceParserState {
     fn new() -> Self {
-        Self {
-            pending: crate::reorder_buffer::ReorderBuffer::new(),
-            current_buf: Vec::new(),
-            current_pos: 0,
-            eof: false,
-        }
+        Self { current_buf: Vec::new(), current_pos: 0 }
     }
 
-    /// Return how many bytes remain in the current buffer.
     fn remaining(&self) -> usize {
         self.current_buf.len() - self.current_pos
     }
-
-    /// Advance to the next pending block if the current one is exhausted.
-    ///
-    /// Returns `(data_available, consumed_pending)` where `consumed_pending` is `true`
-    /// when a block was moved from `pending` into `current_buf`.  The caller uses
-    /// `consumed_pending` to decrement the consumer's `pending_total` counter.
-    fn advance_if_needed(&mut self) -> (bool, bool) {
-        if self.remaining() > 0 {
-            return (true, false);
-        }
-        if let Some(data) = self.pending.try_pop_next() {
-            self.current_buf = data;
-            self.current_pos = 0;
-            (true, true)
-        } else {
-            (false, false)
-        }
-    }
 }
 
-/// Reads from the pool's `decompressed_chunks` queue and presents records to the merge loop.
+/// Reads from per-file decompressed-block reorder buffers and presents records
+/// to the merge loop.
 ///
-/// Replaces `GenericKeyedChunkReader` for the pool-integrated path. No threads are spawned —
-/// the main thread drives all consumption. Workers in the pool do all the reading and
-/// decompression.
+/// The main thread drives all record consumption; no threads are spawned here.
+/// Sort-pool workers do the disk reads and BGZF decompression in parallel and
+/// publish results into per-file `Phase2FileState.decompressed` reorder
+/// buffers, which this consumer drains in serial order.
 ///
 /// # Type Parameter
 ///
 /// `K` is the sort key type (`RawCoordinateKey`, `TemplateKey`, etc.).
-pub struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
-    /// Per-source reorder/parse buffers.
-    per_source: Vec<PerSourceBuffer>,
-    /// `ArrayQueue` to pop decompressed blocks from pool workers.
-    decompressed_chunks: std::sync::Arc<
-        crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedDecompressedBlock>,
-    >,
-    /// Raw (pre-decompression) chunk blocks in flight.
-    ///
-    /// `all_chunks_eof` is set when raw reads from disk finish, but blocks may still
-    /// be in this queue awaiting decompression. The EOF check in `poll_decompressed_blocks`
-    /// must wait for this queue to drain to avoid declaring EOF prematurely and losing data.
-    raw_chunk_blocks:
-        std::sync::Arc<crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedRawBlock>>,
-    /// Shared flag: set when all chunk files have been fully read from disk.
-    ///
-    /// Note: this is set when raw reads finish, not when decompression is done.
-    /// Always check `raw_chunk_blocks.is_empty()` alongside this before declaring EOF.
-    all_chunks_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Maximum total pending blocks across all per-source buffers before we stop draining.
-    ///
-    /// Caps memory growth: without this, `poll_decompressed_blocks` could drain the entire
-    /// `decompressed_chunks` queue into unbounded per-source `pending` maps, bypassing the
-    /// backpressure the `ArrayQueue` was meant to provide.
-    max_pending_blocks: usize,
-    /// Running total of blocks currently in all per-source `pending` maps.
-    ///
-    /// Maintained incrementally so the cap check in `poll_decompressed_blocks` is O(1)
-    /// instead of `O(num_sources)`.
-    pending_total: usize,
+pub(crate) struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
+    /// Snapshot of the pool's Phase 2 file vector. Indexed by `source_id`.
+    files: Arc<Vec<crate::sort::worker_pool::Phase2FileState>>,
+    /// Per-source parser state.
+    parser_state: Vec<SourceParserState>,
     /// Set by a pool worker when BGZF decompression of a chunk block fails.
-    ///
-    /// Checked in `poll_decompressed_blocks` so the main thread surfaces the error instead
-    /// of parking forever waiting for data that will never arrive.
     decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by a pool worker when a chunk file I/O read fails.
     chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -872,31 +829,18 @@ pub struct MainThreadChunkConsumer<K: RawSortKey + 'static> {
 }
 
 impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
-    /// Create a new consumer for the given number of sources.
+    /// Create a new consumer for the given pool file snapshot.
     #[must_use]
-    pub fn new(
-        num_sources: usize,
-        decompressed_chunks: std::sync::Arc<
-            crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedDecompressedBlock>,
-        >,
-        raw_chunk_blocks: std::sync::Arc<
-            crossbeam_queue::ArrayQueue<crate::sort::worker_pool::TaggedRawBlock>,
-        >,
-        all_chunks_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) fn new(
+        files: Arc<Vec<crate::sort::worker_pool::Phase2FileState>>,
         decompression_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         chunk_read_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
         worker_panicked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        let per_source = (0..num_sources).map(|_| PerSourceBuffer::new()).collect();
-        // Default cap: queue capacity (num_workers * 8); keeps total pending ≤ 2× queue depth.
-        let max_pending_blocks = decompressed_chunks.capacity();
+        let parser_state = (0..files.len()).map(|_| SourceParserState::new()).collect();
         Self {
-            per_source,
-            decompressed_chunks,
-            raw_chunk_blocks,
-            all_chunks_eof,
-            max_pending_blocks,
-            pending_total: 0,
+            files,
+            parser_state,
             decompression_error,
             chunk_read_error,
             worker_panicked,
@@ -906,84 +850,51 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
 
     /// Get the next record from a specific source.
     ///
-    /// Polls the `decompressed_chunks` queue as needed, dispatching blocks to their
-    /// correct per-source buffer. Parses the next record from the source's byte stream.
+    /// Pulls decompressed blocks from the source's per-file reorder buffer as
+    /// needed. Parses the next record from the source's byte stream.
     ///
     /// Returns `Ok(Some(key))` with record bytes swapped into `buf`, `Ok(None)` at EOF.
     ///
     /// # Errors
     ///
-    /// Returns an error if a record is truncated or if reading from the source fails.
+    /// Returns an error if a record is truncated or if a worker reported an error.
     pub fn next_record(&mut self, source_id: usize, buf: &mut Vec<u8>) -> Result<Option<K>> {
-        loop {
-            let (_, consumed) = self.per_source[source_id].advance_if_needed();
-            if consumed {
-                self.pending_total = self.pending_total.saturating_sub(1);
-            }
-
-            // Try to parse a record from the current data
-            if self.per_source[source_id].remaining() > 0 {
-                return self.parse_next_record(source_id, buf);
-            }
-
-            // If this source is at EOF and no pending blocks, it's done
-            if self.per_source[source_id].eof && self.per_source[source_id].pending.is_empty() {
-                return Ok(None);
-            }
-
-            // Need more data — poll the shared queue and dispatch
-            if !self.poll_decompressed_blocks(source_id)? {
-                // Queue closed and no more data for this source
-                self.per_source[source_id].eof = true;
-                if self.per_source[source_id].pending.is_empty()
-                    && self.per_source[source_id].remaining() == 0
-                {
-                    return Ok(None);
-                }
-            }
+        // Make sure we have data (or detect EOF) before parsing.
+        if self.parser_state[source_id].remaining() == 0
+            && !self.advance_to_next_block(source_id)?
+        {
+            return Ok(None);
         }
+        self.parse_next_record(source_id, buf)
     }
 
-    /// Poll the `decompressed_chunks` `ArrayQueue`, dispatching blocks to per-source buffers.
+    /// Pull the next decompressed block for `source_id` from the per-file
+    /// reorder buffer, blocking the main thread (`std::thread::park`) until
+    /// either a block becomes available, the source drains, or a worker error
+    /// is reported.
     ///
-    /// Drains all available blocks into per-source buffers, then checks if the
-    /// target source has data. If not, parks the thread until a worker calls
-    /// `unpark()` after pushing new data.
-    ///
-    /// Returns `false` if all chunks are done (no more blocks coming).
-    fn poll_decompressed_blocks(&mut self, target_source: usize) -> Result<bool> {
+    /// Returns `Ok(true)` if a new block was loaded into `current_buf`,
+    /// `Ok(false)` if the source has produced all its data, or an error if a
+    /// worker reported a fatal failure.
+    fn advance_to_next_block(&mut self, source_id: usize) -> Result<bool> {
+        let file = &self.files[source_id];
         loop {
-            // Drain available blocks into per-source buffers.
-            //
-            // We always drain until the target source has data, regardless of the pending cap.
-            // Once the target is satisfied we respect the cap to bound memory growth — without
-            // it we could drain the entire decompressed_chunks ArrayQueue into unbounded
-            // per-source maps, bypassing the backpressure the ArrayQueue was meant to provide.
-            // Skipping the drain entirely when at cap is a deadlock: if the target's next block
-            // is already in the queue but we refuse to pop it, we park forever.
-            while let Some(block) = self.decompressed_chunks.pop() {
-                let sid = block.source_id;
-                self.per_source[sid].pending.insert(block.serial, block.data);
-                self.pending_total += 1;
-                // Once the target has data, respect the pending cap to bound memory growth.
-                // `can_pop()` is O(1) — no map lookup needed.
-                let target = &self.per_source[target_source];
-                if (target.remaining() > 0 || target.pending.can_pop())
-                    && self.pending_total >= self.max_pending_blocks
-                {
-                    break;
+            // Try to pop the next-in-order decompressed block.
+            {
+                let mut guard =
+                    file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
+                if let Some(data) = guard.try_pop_next() {
+                    drop(guard);
+                    let st = &mut self.parser_state[source_id];
+                    st.current_buf = data;
+                    st.current_pos = 0;
+                    return Ok(true);
                 }
             }
 
-            // Check if the target source now has data
-            let target = &self.per_source[target_source];
-            if target.remaining() > 0 || target.pending.can_pop() {
-                return Ok(true);
-            }
-
-            // Check for worker errors before EOF — if a worker failed, the EOF condition
-            // may also be set (e.g. single-source sort where all_chunks_eof fires on the
-            // same iteration). The error must win to avoid silently truncating output.
+            // No block ready. Check error flags first — they take precedence
+            // over EOF detection so a single-source sort that fails on its
+            // last block surfaces the error rather than silently truncating.
             if self.decompression_error.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(anyhow::anyhow!(
                     "BGZF decompression error on chunk blocks (see log for details)"
@@ -998,21 +909,15 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                 ));
             }
 
-            // Check EOF: all raw blocks must be read AND decompressed before declaring done.
-            // `all_chunks_eof` is set when raw disk reads finish, but blocks may still be
-            // in `raw_chunk_blocks` awaiting decompression. Checking only `decompressed_chunks`
-            // would race with the decompression workers and lose in-flight records.
-            if self.all_chunks_eof.load(std::sync::atomic::Ordering::Acquire)
-                && self.raw_chunk_blocks.is_empty()
-                && self.decompressed_chunks.is_empty()
-            {
-                for source in &mut self.per_source {
-                    source.eof = true;
-                }
+            // Source produced everything it ever will?
+            if file.is_drained() {
                 return Ok(false);
             }
 
-            // Park until a worker pushes a block and calls unpark()
+            // Park until a worker unparks us. Workers unpark after pushing a
+            // decompressed block, after setting reader.eof, and after error
+            // flags. The loop re-checks all conditions on wake-up so spurious
+            // wake-ups are harmless.
             std::thread::park();
         }
     }
@@ -1056,7 +961,8 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         }
     }
 
-    /// Read exactly `n` bytes from a source into `out`, pulling more blocks as needed.
+    /// Read exactly `out.len()` bytes from a source into `out`, pulling more
+    /// blocks from the per-file reorder buffer as needed.
     ///
     /// Returns `Ok(false)` at clean EOF (zero bytes available), `Ok(true)` on success.
     fn read_exact_from_source(&mut self, source_id: usize, out: &mut [u8]) -> Result<bool> {
@@ -1064,20 +970,8 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
         let mut filled = 0;
 
         while filled < n {
-            let (_, consumed) = self.per_source[source_id].advance_if_needed();
-            if consumed {
-                self.pending_total = self.pending_total.saturating_sub(1);
-            }
-
-            if self.per_source[source_id].remaining() > 0 {
-                let src = &mut self.per_source[source_id];
-                let take = (n - filled).min(src.remaining());
-                out[filled..filled + take]
-                    .copy_from_slice(&src.current_buf[src.current_pos..src.current_pos + take]);
-                src.current_pos += take;
-                filled += take;
-            } else if self.per_source[source_id].eof
-                && self.per_source[source_id].pending.is_empty()
+            if self.parser_state[source_id].remaining() == 0
+                && !self.advance_to_next_block(source_id)?
             {
                 if filled == 0 {
                     return Ok(false);
@@ -1085,21 +979,14 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
                 return Err(anyhow::anyhow!(
                     "truncated data in chunk source {source_id}: got {filled} of {n} bytes",
                 ));
-            } else if !self.poll_decompressed_blocks(source_id)? {
-                self.per_source[source_id].eof = true;
-                let (_, consumed) = self.per_source[source_id].advance_if_needed();
-                if consumed {
-                    self.pending_total = self.pending_total.saturating_sub(1);
-                }
-                if self.per_source[source_id].remaining() == 0 {
-                    if filled == 0 {
-                        return Ok(false);
-                    }
-                    return Err(anyhow::anyhow!(
-                        "truncated data in chunk source {source_id}: got {filled} of {n} bytes",
-                    ));
-                }
             }
+
+            let st = &mut self.parser_state[source_id];
+            let take = (n - filled).min(st.remaining());
+            out[filled..filled + take]
+                .copy_from_slice(&st.current_buf[st.current_pos..st.current_pos + take]);
+            st.current_pos += take;
+            filled += take;
         }
 
         Ok(true)
@@ -1109,16 +996,13 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
     ///
     /// Returns `Ok(None)` at clean EOF.
     fn read_key_from_source<KK: RawSortKey>(&mut self, source_id: usize) -> Result<Option<KK>> {
-        // Create a Read adapter over the source's buffer
         let mut adapter = SourceReadAdapter { consumer: self, source_id, bytes_read: 0 };
         match KK::read_from(&mut adapter) {
             Ok(key) => Ok(Some(key)),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 if adapter.bytes_read == 0 {
-                    // No bytes consumed — clean EOF between records
                     Ok(None)
                 } else {
-                    // Some bytes consumed before EOF — truncated key
                     Err(anyhow::anyhow!(
                         "truncated key in chunk source {source_id}: \
                          got {n} bytes then EOF",
@@ -1144,52 +1028,21 @@ struct SourceReadAdapter<'a, K: RawSortKey + 'static> {
 
 impl<K: RawSortKey + 'static> Read for SourceReadAdapter<'_, K> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Try current buffer first
-        let (_, consumed) = self.consumer.per_source[self.source_id].advance_if_needed();
-        if consumed {
-            self.consumer.pending_total = self.consumer.pending_total.saturating_sub(1);
-        }
-        if self.consumer.per_source[self.source_id].remaining() > 0 {
-            let src = &mut self.consumer.per_source[self.source_id];
-            let take = buf.len().min(src.remaining());
-            buf[..take].copy_from_slice(&src.current_buf[src.current_pos..src.current_pos + take]);
-            src.current_pos += take;
-            self.bytes_read += take;
-            return Ok(take);
-        }
-
-        // Need more blocks
-        let sid = self.source_id;
-        if self.consumer.per_source[sid].eof && self.consumer.per_source[sid].pending.is_empty() {
-            return Ok(0); // EOF
-        }
-
-        // Poll for more data (blocking)
-        match self.consumer.poll_decompressed_blocks(self.source_id) {
-            Ok(true) => {
-                let (_, consumed) = self.consumer.per_source[self.source_id].advance_if_needed();
-                if consumed {
-                    self.consumer.pending_total = self.consumer.pending_total.saturating_sub(1);
-                }
-                if self.consumer.per_source[self.source_id].remaining() > 0 {
-                    let sid = self.source_id;
-                    let source = &mut self.consumer.per_source[sid];
-                    let take = buf.len().min(source.remaining());
-                    buf[..take].copy_from_slice(
-                        &source.current_buf[source.current_pos..source.current_pos + take],
-                    );
-                    source.current_pos += take;
-                    self.bytes_read += take;
-                    Ok(take)
-                } else {
-                    // poll said data is ready but the source is still empty — retry rather
-                    // than returning Ok(0) which read_key_from_source treats as clean EOF.
-                    self.read(buf)
-                }
+        // Pull the next block if the current one is exhausted.
+        if self.consumer.parser_state[self.source_id].remaining() == 0 {
+            match self.consumer.advance_to_next_block(self.source_id) {
+                Ok(true) => {}
+                Ok(false) => return Ok(0), // clean EOF
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
             }
-            Ok(false) => Ok(0), // All chunks done — clean EOF
-            Err(e) => Err(std::io::Error::other(e.to_string())),
         }
+
+        let st = &mut self.consumer.parser_state[self.source_id];
+        let take = buf.len().min(st.remaining());
+        buf[..take].copy_from_slice(&st.current_buf[st.current_pos..st.current_pos + take]);
+        st.current_pos += take;
+        self.bytes_read += take;
+        Ok(take)
     }
 }
 
@@ -1267,6 +1120,39 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
+}
+
+/// RAII guard that ensures Phase 2 teardown runs on every exit path between
+/// `pool.set_phase(PHASE2)` and the explicit `deactivate()` in the merge loop.
+/// Without this, any `?` early-return would leave the pool stuck in PHASE2 with
+/// `phase2_files` still published. `deactivate()` drops the consumer (releasing
+/// the Arc snapshot of the per-file vector), resets the phase to `LEGACY`, and
+/// clears the pool's published file vector — in that order.
+struct Phase2Guard<'a, K: RawSortKey + 'static> {
+    pool: &'a Arc<SortWorkerPool>,
+    consumer: Option<MainThreadChunkConsumer<K>>,
+    active: bool,
+}
+
+impl<K: RawSortKey + 'static> Phase2Guard<'_, K> {
+    fn consumer_mut(&mut self) -> Option<&mut MainThreadChunkConsumer<K>> {
+        self.consumer.as_mut()
+    }
+
+    fn deactivate(&mut self) {
+        if self.active {
+            drop(self.consumer.take());
+            self.pool.set_phase(crate::sort::worker_pool::phase::LEGACY);
+            self.pool.clear_phase2_files();
+            self.active = false;
+        }
+    }
+}
+
+impl<K: RawSortKey + 'static> Drop for Phase2Guard<'_, K> {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
 }
 
 impl RawExternalSorter {
@@ -1382,6 +1268,27 @@ impl RawExternalSorter {
     /// Uses `initial_capacity` if set, otherwise falls back to `memory_limit`.
     fn effective_initial_capacity(&self) -> usize {
         self.initial_capacity.unwrap_or(self.memory_limit).min(self.memory_limit)
+    }
+
+    /// Build a rayon thread pool sized to `self.threads`.
+    ///
+    /// The sort path uses `par_sort` and friends at several points. Rayon's
+    /// global pool defaults to `num_cpus::get()`, which silently violates the
+    /// user's `--threads` contract on machines where more physical cores are
+    /// available. Every rayon call site is wrapped with `pool.install(...)`
+    /// so that `rayon::current_num_threads()` returns `self.threads` and
+    /// fan-out is bounded to the requested thread count.
+    ///
+    /// Oversubscription with the `SortWorkerPool` is not a concern because
+    /// every call site is preceded by `drain_pending_spill`, which joins the
+    /// prior chunk's I/O thread and therefore guarantees all sort workers are
+    /// idle at the moment rayon fans out.
+    fn build_sort_rayon_pool(&self) -> Result<rayon::ThreadPool> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads.max(1))
+            .thread_name(|i| format!("fgumi-sort-rayon-{i}"))
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build rayon sort pool: {e}"))
     }
 
     /// Consolidate temp files if we've exceeded the limit.
@@ -1750,6 +1657,7 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
+        let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
@@ -1778,7 +1686,7 @@ impl RawExternalSorter {
                 let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
-                    buffer.par_sort();
+                    rayon_pool.install(|| buffer.par_sort());
                 });
 
                 // Write keyed temp file with parallel BGZF compression via worker pool.
@@ -1823,7 +1731,7 @@ impl RawExternalSorter {
             info!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
-                buffer.sort();
+                rayon_pool.install(|| buffer.par_sort());
             });
 
             timer.time_write_output(|| {
@@ -1839,12 +1747,15 @@ impl RawExternalSorter {
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
-            // intermediate merge back into a single sorted buffer)
+            // intermediate merge back into a single sorted buffer); each
+            // chunk becomes its own in-memory merge source.
             let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
                 Vec::new()
+            } else if self.threads > 1 {
+                timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
             } else {
                 timer.time_sort(|| {
-                    buffer.par_sort();
+                    rayon_pool.install(|| buffer.par_sort());
                 });
                 let chunk = buffer
                     .refs()
@@ -1918,6 +1829,7 @@ impl RawExternalSorter {
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
         let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
+        let rayon_pool = self.build_sort_rayon_pool()?;
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
 
@@ -1941,7 +1853,7 @@ impl RawExternalSorter {
                 let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
-                    buffer.par_sort();
+                    rayon_pool.install(|| buffer.par_sort());
                 });
 
                 let handle = timer.time_spill_write(|| {
@@ -1985,7 +1897,7 @@ impl RawExternalSorter {
             info!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
-                buffer.sort();
+                rayon_pool.install(|| buffer.par_sort());
             });
 
             timer.time_write_output(|| {
@@ -2011,9 +1923,11 @@ impl RawExternalSorter {
             // Sort remaining records into separate sub-array chunks
             let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
                 Vec::new()
+            } else if self.threads > 1 {
+                timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
             } else {
                 timer.time_sort(|| {
-                    buffer.par_sort();
+                    rayon_pool.install(|| buffer.par_sort());
                 });
                 let chunk = buffer
                     .refs()
@@ -2119,6 +2033,7 @@ impl RawExternalSorter {
         let mut memory_used = 0usize;
         let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
+        let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (keyed output)...");
@@ -2155,7 +2070,7 @@ impl RawExternalSorter {
 
                 timer.time_sort(|| {
                     use rayon::prelude::*;
-                    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
                 });
 
                 // Write keyed temp file with parallel BGZF compression via worker pool.
@@ -2196,7 +2111,7 @@ impl RawExternalSorter {
 
             timer.time_sort(|| {
                 use rayon::prelude::*;
-                entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                rayon_pool.install(|| entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0)));
             });
 
             timer.time_write_output(|| {
@@ -2215,10 +2130,37 @@ impl RawExternalSorter {
             // intermediate merge back into a single sorted buffer)
             let memory_chunks: Vec<Vec<(K, Vec<u8>)>> = if entries.is_empty() {
                 Vec::new()
-            } else {
+            } else if self.threads > 1 {
                 timer.time_sort(|| {
                     use rayon::prelude::*;
-                    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    let chunk_size = entries.len().div_ceil(self.threads.max(1));
+                    rayon_pool.install(|| {
+                        entries.par_chunks_mut(chunk_size).for_each(|chunk| {
+                            chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        });
+                    });
+                    // Carve sub-chunks aligned with par_chunks_mut boundaries.
+                    // par_chunks_mut produces [0..cs), [cs..2cs), ..., [n-tail..n).
+                    // We peel the short tail first, then full chunks from the end,
+                    // and reverse. Each split_off is O(chunk_size) → O(n) total.
+                    let mut remaining = std::mem::take(&mut entries);
+                    let num_chunks = remaining.len().div_ceil(chunk_size);
+                    let mut chunks: Vec<Vec<(K, Vec<u8>)>> = Vec::with_capacity(num_chunks);
+                    let tail_len = remaining.len() % chunk_size;
+                    if tail_len != 0 {
+                        let split_at = remaining.len() - tail_len;
+                        chunks.push(remaining.split_off(split_at));
+                    }
+                    while !remaining.is_empty() {
+                        let split_at = remaining.len().saturating_sub(chunk_size);
+                        chunks.push(remaining.split_off(split_at));
+                    }
+                    chunks.reverse();
+                    chunks
+                })
+            } else {
+                timer.time_sort(|| {
+                    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 });
                 vec![entries]
             };
@@ -2291,6 +2233,7 @@ impl RawExternalSorter {
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
         let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
+        let rayon_pool = self.build_sort_rayon_pool()?;
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer)...");
@@ -2326,7 +2269,7 @@ impl RawExternalSorter {
                 let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
-                    buffer.par_sort();
+                    rayon_pool.install(|| buffer.par_sort());
                 });
 
                 // Write keyed chunk with parallel BGZF compression via worker pool.
@@ -2367,7 +2310,7 @@ impl RawExternalSorter {
             info!("All records fit in memory, performing in-memory sort");
 
             timer.time_sort(|| {
-                buffer.sort();
+                rayon_pool.install(|| buffer.par_sort());
             });
 
             timer.time_write_output(|| {
@@ -2386,9 +2329,11 @@ impl RawExternalSorter {
             // intermediate merge back into a single sorted buffer)
             let memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>> = if buffer.is_empty() {
                 Vec::new()
+            } else if self.threads > 1 {
+                timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
             } else {
                 timer.time_sort(|| {
-                    buffer.par_sort();
+                    rayon_pool.install(|| buffer.par_sort());
                 });
                 let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
                 vec![chunk]
@@ -2441,11 +2386,10 @@ impl RawExternalSorter {
         let mut sources: Vec<ChunkSource<K>> = Vec::with_capacity(num_disk + num_memory);
 
         if pool_decompress && !chunk_files.is_empty() {
-            // Pool-integrated path: distribute files to workers, create PoolDisk sources.
-            // Files are assigned: worker i gets files i, i+N, i+2N...
-            let files_with_ids: Vec<(PathBuf, usize)> =
-                chunk_files.iter().enumerate().map(|(idx, path)| (path.clone(), idx)).collect();
-            pool.distribute_chunk_files(files_with_ids)?;
+            // Pool-integrated path: install per-file Phase 2 state on the
+            // pool, then create one PoolDisk source per file. Workers
+            // cooperatively read+decompress all files via work-stealing.
+            pool.set_phase2_files(chunk_files)?;
 
             for source_id in 0..num_disk {
                 sources.push(ChunkSource::PoolDisk { source_id });
@@ -2534,21 +2478,22 @@ impl RawExternalSorter {
         let num_sources = sources.len();
         info!("Merging from {num_sources} sources...");
 
-        // Create pool consumer for PoolDisk sources and activate Phase 2
-        let mut consumer: Option<MainThreadChunkConsumer<K>> = if num_disk > 0 {
+        // Create pool consumer for PoolDisk sources and activate Phase 2.
+        // The consumer holds an Arc snapshot of the pool's per-file Phase 2
+        // state — workers populate per-file reorder buffers, the consumer pops
+        // from them.
+        let mut guard: Phase2Guard<'_, K> = if num_disk > 0 {
+            let files = pool.phase2_files();
             let consumer = MainThreadChunkConsumer::new(
-                num_disk,
-                pool.decompressed_chunks_queue(),
-                pool.raw_chunk_blocks_queue(),
-                pool.all_chunks_eof_flag(),
+                files,
                 pool.decompress_error_flag(),
                 pool.chunk_read_error_flag(),
                 pool.worker_panicked_flag(),
             );
             pool.set_phase(phase::PHASE2);
-            Some(consumer)
+            Phase2Guard { pool, consumer: Some(consumer), active: true }
         } else {
-            None
+            Phase2Guard { pool, consumer: None, active: false }
         };
 
         let output_header = self.create_output_header(header);
@@ -2560,7 +2505,7 @@ impl RawExternalSorter {
 
         for (idx, source) in sources.iter_mut().enumerate() {
             let mut record = Vec::new();
-            if let Some(key) = source.next_record(&mut record, consumer.as_mut())? {
+            if let Some(key) = source.next_record(&mut record, guard.consumer_mut())? {
                 initial_keys.push(key);
                 records.push(record);
                 source_map.push(idx);
@@ -2569,9 +2514,7 @@ impl RawExternalSorter {
 
         if initial_keys.is_empty() {
             info!("Merge complete: 0 records merged");
-            if consumer.is_some() {
-                pool.set_phase(phase::LEGACY);
-            }
+            guard.deactivate();
             let writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
             writer.finish()?;
             return Ok(0);
@@ -2615,7 +2558,8 @@ impl RawExternalSorter {
 
             if sample_this {
                 let t0 = Instant::now();
-                let next = sources[src_idx].next_record(&mut records[winner], consumer.as_mut())?;
+                let next =
+                    sources[src_idx].next_record(&mut records[winner], guard.consumer_mut())?;
                 merge_read_secs += t0.elapsed().as_secs_f64();
 
                 let t0 = Instant::now();
@@ -2627,7 +2571,8 @@ impl RawExternalSorter {
                 merge_tree_secs += t0.elapsed().as_secs_f64();
                 samples_taken += 1;
             } else {
-                let next = sources[src_idx].next_record(&mut records[winner], consumer.as_mut())?;
+                let next =
+                    sources[src_idx].next_record(&mut records[winner], guard.consumer_mut())?;
                 if let Some(key) = next {
                     tree.replace_winner(key);
                 } else {
@@ -2636,10 +2581,10 @@ impl RawExternalSorter {
             }
         }
 
-        // Return to legacy mode before finishing writer (workers still need to compress)
-        if consumer.is_some() {
-            pool.set_phase(phase::LEGACY);
-        }
+        // Return to legacy mode before finishing writer (workers still need to compress).
+        // The guard's deactivate() drops the consumer, resets phase, and clears the
+        // pool's published file vector in the correct order.
+        guard.deactivate();
 
         if debug_timing {
             let loop_total = loop_start.elapsed().as_secs_f64();
@@ -3814,5 +3759,69 @@ mod tests {
 
         // log_summary must not panic (output goes to log sink)
         timer.log_summary(4);
+    }
+
+    // ========================================================================
+    // Chunk boundary alignment tests
+    // ========================================================================
+
+    /// Regression test: `split_off` from the tail must align with `par_chunks_mut`
+    /// boundaries so that every emitted chunk is individually sorted.
+    ///
+    /// The old code split fixed-size chunks from the tail, which crossed sorted
+    /// chunk boundaries when `n % chunk_size != 0`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_split_off_aligns_with_par_chunks_mut() {
+        use rayon::prelude::*;
+
+        let pool =
+            rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("build rayon pool");
+
+        // Test a variety of (n, threads) combinations that exercise the tail case
+        for &(n, threads) in &[(10, 3), (11, 4), (17, 3), (100, 7), (1000, 8), (13, 5)] {
+            let mut entries: Vec<(u64, Vec<u8>)> =
+                (0..n).rev().map(|i| (i as u64, vec![i as u8])).collect();
+
+            let chunk_size = entries.len().div_ceil(threads);
+
+            pool.install(|| {
+                entries.par_chunks_mut(chunk_size).for_each(|chunk| {
+                    chunk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                });
+            });
+
+            // Apply the same split logic as production code
+            let mut remaining = std::mem::take(&mut entries);
+            let num_chunks = remaining.len().div_ceil(chunk_size);
+            let mut chunks: Vec<Vec<(u64, Vec<u8>)>> = Vec::with_capacity(num_chunks);
+            let tail_len = remaining.len() % chunk_size;
+            if tail_len != 0 {
+                let split_at = remaining.len() - tail_len;
+                chunks.push(remaining.split_off(split_at));
+            }
+            while !remaining.is_empty() {
+                let split_at = remaining.len().saturating_sub(chunk_size);
+                chunks.push(remaining.split_off(split_at));
+            }
+            chunks.reverse();
+
+            // Every chunk must be individually sorted
+            for (ci, chunk) in chunks.iter().enumerate() {
+                for i in 1..chunk.len() {
+                    assert!(
+                        chunk[i - 1].0 <= chunk[i].0,
+                        "n={n} threads={threads}: chunk {ci} not sorted at index {i} \
+                         ({} > {})",
+                        chunk[i - 1].0,
+                        chunk[i].0,
+                    );
+                }
+            }
+
+            // Total record count must match
+            let total: usize = chunks.iter().map(Vec::len).sum();
+            assert_eq!(total, n, "n={n} threads={threads}: total mismatch");
+        }
     }
 }
