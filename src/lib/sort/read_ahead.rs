@@ -438,13 +438,28 @@ impl PooledInputStream {
 
     /// Drain available blocks from the `ArrayQueue` into the reorder buffer.
     ///
-    /// Caps the drain at `queue.capacity()` iterations to bound the reorder
-    /// buffer size. In the normal case the reorder buffer stays small (only
-    /// the few blocks that arrive out of order are buffered); the cap prevents
-    /// a temporarily fast producer from building an unbounded backlog.
+    /// Applies a soft cap (`2 * queue.capacity()`) on the reorder buffer so
+    /// a temporarily fast producer cannot build an unbounded backlog, while
+    /// still draining unconditionally when the next expected sequence has not
+    /// yet landed (otherwise the pop that would unblock the main thread could
+    /// remain stuck in the `ArrayQueue` and deadlock the pipeline).
     fn drain_queue(&mut self) {
-        let limit = self.decompressed_input.capacity();
-        for _ in 0..limit {
+        // Deadlock-free soft cap on the reorder buffer to apply real
+        // backpressure upstream. Without a cap, drain_queue unconditionally
+        // empties the bounded ArrayQueue into the unbounded ReorderBuffer,
+        // allowing it to grow to tens of GB when the main thread consumes
+        // slower than workers produce.
+        //
+        // Invariant: if we *cannot* currently pop (next_seq is missing), we
+        // must keep draining unconditionally — otherwise next_seq, which may
+        // still be sitting in the ArrayQueue, can never be transferred, and
+        // we deadlock.
+        let reorder_cap = self.decompressed_input.capacity() * 2;
+        loop {
+            // Only enforce the cap when forward progress is possible.
+            if self.reorder.can_pop() && self.reorder.buffer_len() >= reorder_cap {
+                break;
+            }
             match self.decompressed_input.pop() {
                 Some((serial, data)) => self.reorder.insert(serial, data),
                 None => break,

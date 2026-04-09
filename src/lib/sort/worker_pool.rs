@@ -15,11 +15,14 @@
 //!
 //! - **Phase-aware scheduling**: Workers check the current phase to pick eligible steps.
 //!   Phase 1: `DecompressInput` > `ReadInputBlocks` > `CompressSpill`.
-//!   Phase 2: `DecompressChunks` > `ReadChunkBlocks` > `CompressOutput`.
+//!   Phase 2: `Phase2FileWork` (read+decompress the next block of any file that has
+//!   room in its reorder buffer) > `CompressOutput`.
 //! - **Per-worker state**: Each worker owns an `InlineBgzfCompressor` and a
 //!   `libdeflater::Decompressor`, avoiding cross-thread synchronization.
-//! - **Worker-owns-files**: In Phase 2, each worker exclusively owns a subset of spill
-//!   files (worker i owns files i, i+N, i+2N...). No locks needed for file access.
+//! - **Per-file work-stealing (Phase 2)**: Each spill file has its own `Phase2FileState`
+//!   with a `Mutex`-guarded reader, a raw-block FIFO, and a decompressed reorder buffer.
+//!   Workers scan the shared snapshot, pick a file with work to do, and advance it
+//!   one block at a time — any worker can make progress on any file.
 //! - **Held-item pattern**: Workers never block on queue push. If output is full, they
 //!   hold the result locally and advance it first on the next iteration.
 //! - **Buffer recycling**: A shared buffer pool (`crossbeam` channel) recycles
@@ -33,12 +36,15 @@ use fgumi_bgzf::reader::read_raw_blocks;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
 use fgumi_bgzf::{RawBgzfBlock, decompress_block};
 use log::info;
+use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, Read};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+
+use crate::reorder_buffer::ReorderBuffer;
 
 // ============================================================================
 // Job and Result Types
@@ -95,17 +101,15 @@ pub enum SortStep {
     DecompressInput = 1,
     /// Compress data for spill files during Phase 1.
     CompressSpill = 2,
-    /// Read raw BGZF blocks from spill files during Phase 2.
-    ReadChunkBlocks = 3,
-    /// Decompress spill file blocks during Phase 2.
-    DecompressChunks = 4,
+    /// Read+decompress one unit of work for some Phase 2 spill file (work-stealing).
+    Phase2FileWork = 3,
     /// Compress data for merge output during Phase 2.
-    CompressOutput = 5,
+    CompressOutput = 4,
 }
 
 impl SortStep {
     /// Number of distinct sort steps.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 5;
 
     /// Short label for display.
     #[must_use]
@@ -114,8 +118,7 @@ impl SortStep {
             Self::ReadInputBlocks => "RdInp",
             Self::DecompressInput => "DecInp",
             Self::CompressSpill => "CmpSpl",
-            Self::ReadChunkBlocks => "RdChk",
-            Self::DecompressChunks => "DecChk",
+            Self::Phase2FileWork => "P2File",
             Self::CompressOutput => "CmpOut",
         }
     }
@@ -189,8 +192,7 @@ impl SortPipelineStats {
             SortStep::ReadInputBlocks,
             SortStep::DecompressInput,
             SortStep::CompressSpill,
-            SortStep::ReadChunkBlocks,
-            SortStep::DecompressChunks,
+            SortStep::Phase2FileWork,
             SortStep::CompressOutput,
         ];
 
@@ -373,56 +375,94 @@ impl PermitPool {
     }
 }
 
-// ============================================================================
-// Phase 2 Data Types (chunk reading)
-// ============================================================================
-
-/// Number of raw BGZF blocks to read in each I/O batch per file.
-const CHUNK_READ_BATCH_SIZE: usize = 16;
-
 /// Number of raw BGZF blocks to read in each I/O batch from input file.
 const INPUT_READ_BATCH_SIZE: usize = 16;
 
-/// A raw BGZF block tagged with its source (spill file) ID and serial number.
-pub struct TaggedRawBlock {
-    /// The raw compressed BGZF block.
-    pub block: RawBgzfBlock,
-    /// Which spill file this block came from.
-    pub source_id: usize,
-    /// Per-source serial number for reordering after decompression.
-    pub serial: u64,
-}
+// ============================================================================
+// Phase 2 per-file state (work-stealing across files)
+// ============================================================================
 
-/// A decompressed block tagged with its source ID and serial number.
-pub struct TaggedDecompressedBlock {
-    /// Decompressed data.
-    pub data: Vec<u8>,
-    /// Which spill file this block came from.
-    pub source_id: usize,
-    /// Per-source serial number for reordering.
-    pub serial: u64,
-}
-
-/// Per-spill-file state for the worker-owns-files pattern.
+/// Number of raw BGZF blocks to keep read-ahead per spill file.
 ///
-/// Each worker exclusively owns a set of `ChunkFileState` instances.
-/// Worker `i` owns files `i, i+N, i+2N, ...` where `N` is the number of workers.
-/// No locks needed — each worker has exclusive access to its files.
-pub struct ChunkFileState {
-    /// Buffered reader for this spill file.
-    reader: BufReader<std::fs::File>,
-    /// Source ID for tagging blocks.
-    source_id: usize,
-    /// Next serial number to assign to blocks from this file.
-    next_serial: u64,
-    /// Whether this file has reached EOF.
-    eof: bool,
+/// Bounds disk read-ahead memory: K files × `PHASE2_RAW_CAP` × ~64 KB.
+pub(crate) const PHASE2_RAW_CAP: usize = 8;
+
+/// Number of decompressed BGZF blocks the per-file reorder buffer may hold
+/// before workers stop decompressing more for that file.
+///
+/// Bounds in-flight decompressed memory: K files × `PHASE2_DECOMP_CAP` × ~256 KB.
+/// This is a soft cap — the "always accept the next-expected serial" rule lets
+/// it transiently exceed by up to ~`num_workers` blocks per file.
+pub(crate) const PHASE2_DECOMP_CAP: usize = 8;
+
+/// Number of raw blocks to read from disk per `ReadRawBlocks` call.
+pub(crate) const PHASE2_READ_BATCH: usize = 4;
+
+/// Reader state for a single spill file. Locked when reading from disk.
+pub(crate) struct Phase2Reader {
+    pub(crate) inner: BufReader<std::fs::File>,
+    pub(crate) next_serial: u64,
+    pub(crate) eof: bool,
 }
 
-impl ChunkFileState {
-    /// Create a new chunk file state.
-    fn new(reader: BufReader<std::fs::File>, source_id: usize) -> Self {
-        Self { reader, source_id, next_serial: 0, eof: false }
+/// Per-spill-file state shared between all pool workers and the main thread.
+///
+/// Phase 2 uses work stealing across files: any worker can grab work from any
+/// file. The locks here are deliberately fine-grained so different workers can
+/// be reading, decompressing, and the main thread can be popping records all
+/// concurrently as long as they touch different sub-states.
+pub(crate) struct Phase2FileState {
+    /// Disk reader. Held only while popping bytes from disk.
+    pub(crate) reader: Mutex<Phase2Reader>,
+    /// Lock-free copy of `reader.eof`. Set immediately after any code path
+    /// that sets `reader_guard.eof = true`, so `is_drained` can fast-path
+    /// without touching the reader mutex (called per decompressed block on
+    /// the hot Phase 2 path).
+    pub(crate) reader_eof: AtomicBool,
+    /// Raw BGZF blocks read from disk, in serial order. FIFO.
+    pub(crate) raw_blocks: Mutex<VecDeque<(u64, RawBgzfBlock)>>,
+    /// Decompressed blocks reordered by serial. Main thread pops the next-in-order
+    /// block here when its parser exhausts the current buffer.
+    pub(crate) decompressed: Mutex<ReorderBuffer<Vec<u8>>>,
+    /// Number of raw blocks currently being decompressed (popped from
+    /// `raw_blocks` but not yet inserted into `decompressed`). Used by
+    /// `is_drained` to avoid a race where the consumer exits while a worker
+    /// is mid-decompress.
+    pub(crate) decomp_in_flight: AtomicUsize,
+}
+
+impl Phase2FileState {
+    pub(crate) fn new(reader: BufReader<std::fs::File>) -> Self {
+        Self {
+            reader: Mutex::new(Phase2Reader { inner: reader, next_serial: 0, eof: false }),
+            reader_eof: AtomicBool::new(false),
+            raw_blocks: Mutex::new(VecDeque::with_capacity(PHASE2_RAW_CAP)),
+            decompressed: Mutex::new(ReorderBuffer::new()),
+            decomp_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    /// Returns true when this file has produced all its data: disk reader at
+    /// EOF, no raw blocks waiting, no decompressed blocks waiting, and no
+    /// decompression in progress.
+    ///
+    /// Fast path: if the disk reader has not yet reached EOF, returns `false`
+    /// without acquiring any mutex. This is the overwhelmingly common case on
+    /// the Phase 2 hot path — every successful decompression calls this to
+    /// decide whether to wake the consumer.
+    pub(crate) fn is_drained(&self) -> bool {
+        if !self.reader_eof.load(Ordering::Acquire) {
+            return false;
+        }
+        let raw_empty =
+            self.raw_blocks.lock().expect("phase2 raw_blocks mutex poisoned").is_empty();
+        if !raw_empty {
+            return false;
+        }
+        if self.decomp_in_flight.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        self.decompressed.lock().expect("phase2 decompressed mutex poisoned").is_empty()
     }
 }
 
@@ -458,7 +498,9 @@ pub mod phase {
 ///
 /// Workers check the current phase to determine eligible steps:
 /// - **Phase 1**: `DecompressInput` > `ReadInputBlocks` > `CompressSpill`
-/// - **Phase 2**: `DecompressChunks` > `ReadChunkBlocks` > `CompressOutput`
+/// - **Phase 2**: `Phase2FileWork` (per-file work stealing: read next raw block
+///   batch from any file with FIFO room, OR decompress the next queued raw
+///   block for any file whose reorder buffer has capacity) > `CompressOutput`
 pub struct SortWorkerPool {
     // Shared pipeline state (visible to workers and main thread)
     shared: Arc<SharedPipelineState>,
@@ -522,14 +564,18 @@ pub(crate) struct SharedPipelineState {
     /// worker with a held (not-yet-queued) block causes premature EOF signalling.
     input_blocks_queued: AtomicU64,
 
-    // --- Phase 2 queues ---
-    /// Raw chunk blocks: `ReadChunkBlocks` → `DecompressChunks`.
-    pub(crate) raw_chunk_blocks: Arc<ArrayQueue<TaggedRawBlock>>,
-    /// Decompressed chunk blocks: `DecompressChunks` → main thread.
-    pub(crate) decompressed_chunks: Arc<ArrayQueue<TaggedDecompressedBlock>>,
-    /// All chunk files have reached EOF.
+    // --- Phase 2 per-file state (work-stealing) ---
+    /// Per-spill-file state, indexed by merge source id (`0..K`). Built before
+    /// `set_phase(PHASE2)` and cleared when phase 2 ends.
+    ///
+    /// `RwLock` so the main thread can swap the vector across phase 2
+    /// invocations. Workers and the main thread only hold the read guard long
+    /// enough to `Arc::clone` the inner `Vec` (see `phase2_files_snapshot`),
+    /// so writers never block on a long-held reader.
+    pub(crate) phase2_files: std::sync::RwLock<Arc<Vec<Phase2FileState>>>,
+    /// All chunk files have reached disk EOF (raw queues may still hold blocks).
     pub(crate) all_chunks_eof: Arc<AtomicBool>,
-    /// Number of sources that have reached EOF (when == `total_sources`, set `all_chunks_eof`).
+    /// Number of files whose disk reader has hit EOF (when == K, set `all_chunks_eof`).
     sources_at_eof: AtomicU64,
     /// Total number of chunk sources (set before Phase 2 starts).
     pub(crate) total_sources: AtomicU64,
@@ -538,18 +584,14 @@ pub(crate) struct SharedPipelineState {
     /// Compress jobs: main thread → workers (`ArrayQueue`, non-blocking push).
     pub(crate) compress_queue: Arc<ArrayQueue<CompressJob>>,
 
-    // --- Per-worker chunk file distribution (Phase 2) ---
-    /// One sender per worker; main thread sends `Vec<ChunkFileState>` before Phase 2.
-    chunk_file_senders: Vec<std::sync::Mutex<Option<Sender<Vec<ChunkFileState>>>>>,
-    /// One receiver per worker; worker receives its assigned files.
-    chunk_file_receivers: Vec<Receiver<Vec<ChunkFileState>>>,
-
     /// Number of workers (for `low_water` threshold in backpressure).
     num_workers: usize,
 
     /// Main thread handle for `park()`/`unpark()` notification.
-    /// Workers call `unpark()` after pushing to `decompressed_input` or `decompressed_chunks`
-    /// so the main thread wakes immediately instead of spin-yielding.
+    /// Workers call `unpark()` after inserting into `decompressed_input`
+    /// (Phase 1) or into a per-file `Phase2FileState.decompressed` reorder
+    /// buffer (Phase 2) so the main thread wakes immediately instead of
+    /// spin-yielding.
     main_thread_handle: std::thread::Thread,
 }
 
@@ -557,15 +599,6 @@ impl SharedPipelineState {
     fn new(num_workers: usize, main_thread_handle: std::thread::Thread) -> Self {
         let data_queue_cap = num_workers * 8;
         let compress_queue_cap = num_workers * 4;
-
-        // Per-worker channels for chunk file distribution (one-shot, keep as channel)
-        let mut senders = Vec::with_capacity(num_workers);
-        let mut receivers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let (tx, rx) = bounded::<Vec<ChunkFileState>>(1);
-            senders.push(std::sync::Mutex::new(Some(tx)));
-            receivers.push(rx);
-        }
 
         Self {
             phase: AtomicU8::new(phase::LEGACY),
@@ -582,20 +615,21 @@ impl SharedPipelineState {
             decompressed_input_done: Arc::new(AtomicBool::new(false)),
             input_blocks_queued: AtomicU64::new(0),
 
-            raw_chunk_blocks: Arc::new(ArrayQueue::new(data_queue_cap)),
-            decompressed_chunks: Arc::new(ArrayQueue::new(data_queue_cap)),
+            phase2_files: std::sync::RwLock::new(Arc::new(Vec::new())),
             all_chunks_eof: Arc::new(AtomicBool::new(false)),
             sources_at_eof: AtomicU64::new(0),
             total_sources: AtomicU64::new(0),
 
             compress_queue: Arc::new(ArrayQueue::new(compress_queue_cap)),
 
-            chunk_file_senders: senders,
-            chunk_file_receivers: receivers,
-
             num_workers,
             main_thread_handle,
         }
+    }
+
+    /// Snapshot the current Phase 2 file vector. Cheap (just clones the `Arc`).
+    pub(crate) fn phase2_files_snapshot(&self) -> Arc<Vec<Phase2FileState>> {
+        Arc::clone(&self.phase2_files.read().expect("phase2_files rwlock poisoned"))
     }
 
     /// Snapshot current queue depths for backpressure-driven scheduling.
@@ -607,9 +641,6 @@ impl SharedPipelineState {
             decompressed_input_low: self.decompressed_input.len() < low_water,
             input_eof: self.input_eof.load(Ordering::Acquire),
             decompressed_input_done: self.decompressed_input_done.load(Ordering::Acquire),
-
-            decompressed_chunks_low: self.decompressed_chunks.len() < low_water,
-            all_chunks_eof: self.all_chunks_eof.load(Ordering::Acquire),
 
             compress_has_items: !self.compress_queue.is_empty(),
             phase: current_phase,
@@ -631,18 +662,16 @@ struct SortWorkerState {
     /// Compressor used for Phase 2 merge output (output compression level).
     output_compressor: InlineBgzfCompressor,
     decompressor: libdeflater::Decompressor,
-    /// Worker's assigned chunk files for Phase 2 (worker i owns files i, i+N, i+2N...).
-    chunk_files: Vec<ChunkFileState>,
+    /// Phase 2 file scan cursor — starts at `worker_id` and advances on success
+    /// for cache locality and reduced lock contention. Workers no longer own a
+    /// fixed subset of files; any worker can do work on any file.
+    phase2_file_cursor: usize,
 
     // Held items (one per step output) — see plan §Worker State
     /// Held raw input blocks from `ReadInputBlocks` (couldn't push to `raw_input_blocks` queue).
     held_raw_input_blocks: Vec<(u64, RawBgzfBlock)>,
     /// Held decompressed input block from `DecompressInput`.
     held_decompressed_input: Option<(u64, Vec<u8>)>,
-    /// Held raw chunk blocks from `ReadChunkBlocks` (couldn't push to `raw_chunk_blocks` queue).
-    held_raw_chunk_blocks: Vec<TaggedRawBlock>,
-    /// Held decompressed chunk block from `DecompressChunks`.
-    held_decompressed_chunk: Option<TaggedDecompressedBlock>,
     // Compress output goes directly to result_tx channel (I/O thread) — no held item.
     /// Backoff microseconds for idle spinning.
     backoff_us: u64,
@@ -655,10 +684,7 @@ impl SortWorkerState {
     /// Returns true if this worker is holding any items that need advancement.
     /// CRITICAL: Workers must not exit while holding items — they would be lost.
     fn has_any_held_items(&self) -> bool {
-        !self.held_raw_input_blocks.is_empty()
-            || self.held_decompressed_input.is_some()
-            || !self.held_raw_chunk_blocks.is_empty()
-            || self.held_decompressed_chunk.is_some()
+        !self.held_raw_input_blocks.is_empty() || self.held_decompressed_input.is_some()
     }
 }
 
@@ -676,10 +702,6 @@ struct SortBackpressureState {
     decompressed_input_low: bool,
     input_eof: bool,
     decompressed_input_done: bool,
-
-    // Phase 2
-    decompressed_chunks_low: bool,
-    all_chunks_eof: bool,
 
     // Shared
     compress_has_items: bool,
@@ -712,15 +734,15 @@ fn get_sort_priorities(bp: &SortBackpressureState) -> &'static [SortStep] {
             }
         }
         phase::PHASE2 => {
-            if bp.all_chunks_eof && !bp.compress_has_items {
-                // All chunks at EOF and no compress work — nothing productive to do
-                &[]
-            } else if bp.compress_has_items && !bp.decompressed_chunks_low {
-                // Output compression backpressure (15.4s at t4). Drain it.
-                &[SortStep::CompressOutput, SortStep::DecompressChunks, SortStep::ReadChunkBlocks]
+            // Phase 2 file work and output compression are independent: each
+            // worker grabs whatever has work. We never gate on `all_chunks_eof`
+            // — even after disk reads finish, decompression and parser drain
+            // continue until all per-file reorder buffers empty.
+            if bp.compress_has_items {
+                // Drain output compression while we can; it's the writer-side bottleneck.
+                &[SortStep::CompressOutput, SortStep::Phase2FileWork]
             } else {
-                // Default: feed the merge loop, compress output when available
-                &[SortStep::DecompressChunks, SortStep::ReadChunkBlocks, SortStep::CompressOutput]
+                &[SortStep::Phase2FileWork, SortStep::CompressOutput]
             }
         }
         // Legacy/transition: compress only (drain any remaining jobs)
@@ -834,11 +856,9 @@ impl SortWorkerPool {
                         compressor: InlineBgzfCompressor::new(temp_compression),
                         output_compressor: InlineBgzfCompressor::new(output_compression),
                         decompressor: libdeflater::Decompressor::new(),
-                        chunk_files: Vec::new(),
+                        phase2_file_cursor: worker_id,
                         held_raw_input_blocks: Vec::new(),
                         held_decompressed_input: None,
-                        held_raw_chunk_blocks: Vec::new(),
-                        held_decompressed_chunk: None,
                         backoff_us: MIN_BACKOFF_US,
                         idle_iter: 0,
                     };
@@ -879,9 +899,7 @@ impl SortWorkerPool {
 
             // 2. Check phase completion — wait for next phase, only exit on SHUTDOWN.
             //    Workers must survive across Phase 1 → Phase 2 transitions.
-            if Self::is_phase_complete(shared, worker, current_phase)
-                && !worker.has_any_held_items()
-            {
+            if Self::is_phase_complete(shared, current_phase) && !worker.has_any_held_items() {
                 sleep_with_jitter(worker.backoff_us, worker.worker_id, worker.idle_iter);
                 worker.idle_iter = worker.idle_iter.wrapping_add(1);
                 worker.backoff_us = (worker.backoff_us * 2).min(MAX_BACKOFF_US);
@@ -892,16 +910,6 @@ impl SortWorkerPool {
 
             // 3. Try to advance ALL held items first (deadlock prevention)
             did_work |= Self::try_advance_all_held(shared, worker);
-
-            // Phase 2: receive chunk files on first iteration
-            if current_phase == phase::PHASE2
-                && worker.chunk_files.is_empty()
-                && shared.total_sources.load(Ordering::Acquire) > 0
-            {
-                if let Ok(files) = shared.chunk_file_receivers[worker.worker_id].try_recv() {
-                    worker.chunk_files = files;
-                }
-            }
 
             // 4. Get backpressure state and resolve priorities (done inline in step 6)
             let owned_step = Self::exclusive_step_for(worker.worker_id, shared, current_phase);
@@ -978,22 +986,21 @@ impl SortWorkerPool {
     /// Check if the current phase is "complete" (no more work to do).
     ///
     /// This does NOT mean the worker should exit — it must also have no held items.
-    fn is_phase_complete(
-        shared: &SharedPipelineState,
-        worker: &SortWorkerState,
-        current_phase: u8,
-    ) -> bool {
+    fn is_phase_complete(shared: &SharedPipelineState, current_phase: u8) -> bool {
         match current_phase {
             phase::PHASE1 => {
                 shared.decompressed_input_done.load(Ordering::Acquire)
                     && shared.compress_queue.is_empty()
             }
             phase::PHASE2 => {
-                shared.all_chunks_eof.load(Ordering::Acquire)
-                    && shared.raw_chunk_blocks.is_empty()
-                    && shared.decompressed_chunks.is_empty()
-                    && shared.compress_queue.is_empty()
-                    && worker.chunk_files.iter().all(|f| f.eof)
+                if !shared.all_chunks_eof.load(Ordering::Acquire) {
+                    return false;
+                }
+                if !shared.compress_queue.is_empty() {
+                    return false;
+                }
+                let files = shared.phase2_files_snapshot();
+                files.iter().all(Phase2FileState::is_drained)
             }
             // Legacy mode never "completes" — it runs until phase changes
             _ => false,
@@ -1006,9 +1013,11 @@ impl SortWorkerPool {
 
     /// Return the exclusive step this worker owns, if any.
     ///
-    /// For `num_workers >= 2`: Worker 0 owns `ReadInputBlocks` (Phase 1) and
-    /// `ReadChunkBlocks` (Phase 2). For `num_workers == 1`: single worker does
-    /// everything (returns `None`, no ownership restrictions).
+    /// For `num_workers >= 2`: Worker 0 owns `ReadInputBlocks` (Phase 1) so
+    /// only one worker at a time can hold the input file lock. For
+    /// `num_workers == 1`: the single worker does everything (returns `None`,
+    /// no ownership restrictions). Phase 2 has no exclusive step — work
+    /// stealing across files handles contention via per-file mutexes.
     fn exclusive_step_for(
         worker_id: usize,
         shared: &SharedPipelineState,
@@ -1022,7 +1031,6 @@ impl SortWorkerPool {
         }
         match current_phase {
             phase::PHASE1 => Some(SortStep::ReadInputBlocks),
-            // Phase 2: each worker reads its own files, no exclusive ownership needed
             _ => None,
         }
     }
@@ -1030,8 +1038,7 @@ impl SortWorkerPool {
     /// Whether a step is exclusive (requires ownership).
     ///
     /// Only `ReadInputBlocks` is exclusive — it reads from a shared input file
-    /// protected by a Mutex. `ReadChunkBlocks` is NOT exclusive because each
-    /// worker reads from its own assigned chunk files (no contention).
+    /// protected by a Mutex.
     fn is_exclusive_step(step: SortStep) -> bool {
         matches!(step, SortStep::ReadInputBlocks)
     }
@@ -1079,17 +1086,7 @@ impl SortWorkerPool {
                             && !shared.decompressed_input_done.load(Ordering::Acquire)))
             }
             SortStep::CompressSpill | SortStep::CompressOutput => !shared.compress_queue.is_empty(),
-            SortStep::ReadChunkBlocks => {
-                current_phase == phase::PHASE2
-                    && worker.held_raw_chunk_blocks.is_empty()
-                    && !worker.chunk_files.is_empty()
-                    && !worker.chunk_files.iter().all(|f| f.eof)
-            }
-            SortStep::DecompressChunks => {
-                current_phase == phase::PHASE2
-                    && worker.held_decompressed_chunk.is_none()
-                    && !shared.raw_chunk_blocks.is_empty()
-            }
+            SortStep::Phase2FileWork => current_phase == phase::PHASE2,
         }
     }
 
@@ -1108,8 +1105,7 @@ impl SortWorkerPool {
             // at the output level.
             SortStep::CompressSpill => Self::try_compress(shared, &mut worker.compressor),
             SortStep::CompressOutput => Self::try_compress(shared, &mut worker.output_compressor),
-            SortStep::ReadChunkBlocks => Self::try_read_chunk_blocks(shared, worker),
-            SortStep::DecompressChunks => Self::try_decompress_chunks(shared, worker),
+            SortStep::Phase2FileWork => Self::try_phase2_file_work(shared, worker),
         }
     }
 
@@ -1154,25 +1150,6 @@ impl SortWorkerPool {
                     shared.decompressed_input_done.store(true, Ordering::Release);
                     shared.main_thread_handle.unpark();
                 }
-            }
-        }
-
-        // Raw chunk blocks (batch)
-        if !worker.held_raw_chunk_blocks.is_empty() {
-            let before = worker.held_raw_chunk_blocks.len();
-            try_advance_held_batch(&shared.raw_chunk_blocks, &mut worker.held_raw_chunk_blocks);
-            if worker.held_raw_chunk_blocks.len() < before {
-                advanced = true;
-            }
-        }
-
-        // Decompressed chunks (single) — unpark main only on successful push
-        if worker.held_decompressed_chunk.is_some() {
-            let pushed =
-                try_advance_held(&shared.decompressed_chunks, &mut worker.held_decompressed_chunk);
-            if pushed {
-                shared.main_thread_handle.unpark();
-                advanced = true;
             }
         }
 
@@ -1320,123 +1297,199 @@ impl SortWorkerPool {
     }
 
     // ========================================================================
-    // Phase 2 Steps
+    // Phase 2 Step: work-stealing across spill files
     // ========================================================================
 
-    /// `ReadChunkBlocks`: read raw BGZF blocks from this worker's assigned chunk files.
+    /// `Phase2FileWork`: do one unit of work for some Phase 2 spill file.
     ///
-    /// Worker-owns-files pattern: no locks needed. Worker i exclusively owns its files.
-    fn try_read_chunk_blocks(
+    /// This is the unified Phase 2 work step. Each call attempts to find a file
+    /// where we can productively make progress and does ONE unit of work for it
+    /// (either decompress one block or read a batch of raw blocks). On success,
+    /// the worker's per-file cursor advances so the next call rotates through
+    /// the file set fairly.
+    ///
+    /// # Per-file state
+    ///
+    /// Each [`Phase2FileState`] has three independently-locked sub-states:
+    /// - `reader`: the disk reader. Held while pulling raw bytes from disk.
+    /// - `raw_blocks`: FIFO of raw BGZF blocks waiting to be decompressed.
+    /// - `decompressed`: per-file [`ReorderBuffer`] of decompressed blocks the
+    ///   main thread will pop in serial order.
+    ///
+    /// Workers always prefer decompression to disk reads (decompressed blocks
+    /// directly feed the merge loop). They use `try_lock` everywhere so a
+    /// blocked file never starves the others.
+    ///
+    /// # Deadlock-free admission
+    ///
+    /// Workers refuse to pull a new raw block when the per-file decompressed
+    /// reorder buffer is at `PHASE2_DECOMP_CAP`, EXCEPT in the case where the
+    /// raw FIFO's head matches the buffer's `next_seq` and the buffer is stuck
+    /// (`!can_pop`). That is the gap-filler the main thread is waiting for, and
+    /// failing to admit it would deadlock the merge.
+    fn try_phase2_file_work(
         shared: &SharedPipelineState,
         worker: &mut SortWorkerState,
     ) -> StepResult {
-        if worker.chunk_files.is_empty() || shared.all_chunks_eof.load(Ordering::Acquire) {
+        let files = shared.phase2_files_snapshot();
+        let n = files.len();
+        if n == 0 {
             return StepResult::InputEmpty;
         }
 
-        let mut read_any = false;
+        for offset in 0..n {
+            let i = (worker.phase2_file_cursor + offset) % n;
+            let file = &files[i];
 
-        // Round-robin through this worker's assigned files
-        for file_state in &mut worker.chunk_files {
-            if file_state.eof {
+            // -- Try decompression first (highest-value work) ----------------
+            // `try_pop_raw_for_decompress` increments `decomp_in_flight` before
+            // returning, so the consumer's `is_drained` check sees this work as
+            // outstanding even after the raw FIFO becomes empty. We MUST
+            // decrement after inserting into the reorder buffer (or on the
+            // error path) to keep the counter balanced.
+            let popped = Self::try_pop_raw_for_decompress(file);
+            if let Some((serial, raw_block)) = popped {
+                let data = match decompress_block(&raw_block, &mut worker.decompressor) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::error!(
+                            "BGZF decompression error (chunk source {i} serial {serial}): {e}"
+                        );
+                        shared.decompression_error.store(true, Ordering::Release);
+                        // Balance the in-flight increment from try_pop_raw_for_decompress.
+                        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                        shared.main_thread_handle.unpark();
+                        worker.phase2_file_cursor = (i + 1) % n;
+                        return StepResult::Success;
+                    }
+                };
+                let now_poppable = {
+                    let mut dec_guard =
+                        file.decompressed.lock().expect("phase2 decompressed mutex poisoned");
+                    dec_guard.insert(serial, data);
+                    dec_guard.can_pop()
+                };
+                // Decrement AFTER the insert is published. The unpark below
+                // wakes the consumer in case it has been parked waiting on
+                // this specific file (now_poppable=true) or is in the
+                // is_drained path waiting for in_flight to reach zero.
+                file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+                if now_poppable || file.is_drained() {
+                    // Wake the consumer either because new data is available
+                    // or because the last in-flight decompression for this
+                    // file just completed and the file is now fully drained.
+                    shared.main_thread_handle.unpark();
+                }
+                worker.phase2_file_cursor = (i + 1) % n;
+                return StepResult::Success;
+            }
+
+            // -- Try reading raw blocks from disk ----------------------------
+            // Skip if disk reader is contended OR already at EOF.
+            let Ok(mut reader_guard) = file.reader.try_lock() else {
+                continue; // another worker is reading this file
+            };
+            if reader_guard.eof {
                 continue;
             }
 
-            let blocks = match read_raw_blocks(&mut file_state.reader, CHUNK_READ_BATCH_SIZE) {
+            // Bound disk read-ahead per file: don't keep pulling if the raw
+            // FIFO is already full. Use try_lock so a momentarily contended
+            // raw FIFO doesn't block the reader.
+            let raw_full = match file.raw_blocks.try_lock() {
+                Ok(g) => g.len() >= PHASE2_RAW_CAP,
+                Err(_) => true,
+            };
+            if raw_full {
+                continue;
+            }
+
+            let blocks = match read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH) {
                 Ok(b) => b,
                 Err(e) => {
-                    log::error!(
-                        "I/O error reading chunk file (source {}): {e}",
-                        file_state.source_id
-                    );
+                    log::error!("I/O error reading chunk file (source {i}): {e}");
                     shared.chunk_read_error.store(true, Ordering::Release);
-                    file_state.eof = true;
+                    reader_guard.eof = true;
+                    file.reader_eof.store(true, Ordering::Release);
+                    drop(reader_guard);
                     shared.main_thread_handle.unpark();
                     Self::maybe_mark_all_eof(shared);
-                    continue;
+                    worker.phase2_file_cursor = (i + 1) % n;
+                    return StepResult::Success;
                 }
             };
 
             if blocks.is_empty() {
-                file_state.eof = true;
+                reader_guard.eof = true;
+                file.reader_eof.store(true, Ordering::Release);
+                drop(reader_guard);
+                shared.main_thread_handle.unpark();
                 Self::maybe_mark_all_eof(shared);
-                continue;
+                worker.phase2_file_cursor = (i + 1) % n;
+                return StepResult::Success;
             }
 
-            let mut blocks_iter = blocks.into_iter();
-            let source_id = file_state.source_id;
-            let mut backed_up = false;
-            for block in blocks_iter.by_ref() {
-                let serial = file_state.next_serial;
-                file_state.next_serial += 1;
-                let tagged = TaggedRawBlock { block, source_id, serial };
-                match shared.raw_chunk_blocks.push(tagged) {
-                    Ok(()) => {}
-                    Err(tagged) => {
-                        worker.held_raw_chunk_blocks.push(tagged);
-                        backed_up = true;
-                        break;
-                    }
-                }
+            // Acquire the raw_blocks lock BEFORE releasing the reader lock and
+            // assigning serials. This is critical for FIFO order: if we dropped
+            // the reader lock before pushing, two workers could each read a
+            // batch and bump `next_serial`, then race on the raw_blocks push,
+            // landing higher serials in front of lower ones. The merge
+            // consumer's gap-filler admission rule cannot recover from that
+            // and would deadlock. Lock order `reader → raw_blocks` is the only
+            // nested-lock path in this function.
+            let mut raw_guard = file.raw_blocks.lock().expect("phase2 raw_blocks mutex poisoned");
+            let start_serial = reader_guard.next_serial;
+            reader_guard.next_serial += blocks.len() as u64;
+            for (idx, b) in blocks.into_iter().enumerate() {
+                raw_guard.push_back((start_serial + idx as u64, b));
             }
-            // Hold any remaining blocks we didn't attempt to push
-            if backed_up {
-                for block in blocks_iter {
-                    let serial = file_state.next_serial;
-                    file_state.next_serial += 1;
-                    worker.held_raw_chunk_blocks.push(TaggedRawBlock { block, source_id, serial });
-                }
-            }
-            read_any = true;
-            break; // Read from one file per step to be fair
+            drop(raw_guard);
+            drop(reader_guard);
+
+            worker.phase2_file_cursor = (i + 1) % n;
+            return StepResult::Success;
         }
 
-        if read_any { StepResult::Success } else { StepResult::InputEmpty }
+        StepResult::InputEmpty
     }
 
-    /// `DecompressChunks`: decompress a raw chunk block.
-    fn try_decompress_chunks(
-        shared: &SharedPipelineState,
-        worker: &mut SortWorkerState,
-    ) -> StepResult {
-        // Don't take new work if we're holding an item
-        if worker.held_decompressed_chunk.is_some() {
-            return StepResult::OutputFull;
+    /// Try to pop a raw block from `file` for decompression, applying
+    /// deadlock-free admission control against the file's reorder buffer.
+    ///
+    /// Returns `Some((serial, raw_block))` if a block was popped, `None` otherwise.
+    /// `None` is returned when:
+    /// - either lock is contended (`try_lock` failed),
+    /// - the raw FIFO is empty,
+    /// - or the reorder buffer is at cap and the head raw block isn't a gap-filler.
+    ///
+    /// On success, `decomp_in_flight` is incremented so the consumer's
+    /// `is_drained()` check correctly reflects the in-progress decompression.
+    /// The caller is responsible for the matching decrement after inserting
+    /// (or on the decompression-error path).
+    fn try_pop_raw_for_decompress(file: &Phase2FileState) -> Option<(u64, RawBgzfBlock)> {
+        let mut raw_guard = file.raw_blocks.try_lock().ok()?;
+        let head_serial = raw_guard.front().map(|(s, _)| *s)?;
+
+        // Cheap admission check using the per-file reorder buffer.
+        // Two cases admit: (1) under cap (normal), (2) reorder buffer is stuck
+        // and this serial is the gap-filler. Otherwise: backpressure.
+        let admit = {
+            let dec_guard = file.decompressed.try_lock().ok()?;
+            dec_guard.len() < PHASE2_DECOMP_CAP
+                || (!dec_guard.can_pop() && head_serial == dec_guard.next_seq())
+        };
+        if !admit {
+            return None;
         }
 
-        let Some(tagged) = shared.raw_chunk_blocks.pop() else {
-            return StepResult::InputEmpty;
-        };
-
-        let data = match decompress_block(&tagged.block, &mut worker.decompressor) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!(
-                    "BGZF decompression error (chunk block source {} serial {}): {e}",
-                    tagged.source_id,
-                    tagged.serial
-                );
-                shared.decompression_error.store(true, Ordering::Release);
-                shared.main_thread_handle.unpark();
-                return StepResult::InputEmpty;
-            }
-        };
-
-        let result =
-            TaggedDecompressedBlock { data, source_id: tagged.source_id, serial: tagged.serial };
-
-        match shared.decompressed_chunks.push(result) {
-            Ok(()) => {
-                shared.main_thread_handle.unpark();
-            }
-            Err(item) => {
-                worker.held_decompressed_chunk = Some(item);
-                // Queue full — wake main thread to drain so we can push next time
-                shared.main_thread_handle.unpark();
-            }
+        // Reserve the in-flight slot under the raw_blocks lock so the consumer
+        // can never observe (raw_empty && in_flight==0 && decompressed_empty)
+        // while a worker is still in the middle of decompressing this block.
+        let popped = raw_guard.pop_front();
+        if popped.is_some() {
+            file.decomp_in_flight.fetch_add(1, Ordering::AcqRel);
         }
-
-        StepResult::Success
+        popped
     }
 
     // ========================================================================
@@ -1515,25 +1568,12 @@ impl SortWorkerPool {
         Arc::clone(&self.shared.decompression_error)
     }
 
-    /// Get a clone of the decompressed chunks `ArrayQueue` for Phase 2 merge.
-    pub(crate) fn decompressed_chunks_queue(
-        &self,
-    ) -> Arc<crossbeam_queue::ArrayQueue<TaggedDecompressedBlock>> {
-        Arc::clone(&self.shared.decompressed_chunks)
-    }
-
-    /// Get a clone of the `all_chunks_eof` flag for Phase 2 merge.
-    pub(crate) fn all_chunks_eof_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.shared.all_chunks_eof)
-    }
-
-    /// Get a clone of the raw (pre-decompression) chunk blocks queue for Phase 2 merge.
+    /// Snapshot the Phase 2 per-file state vector for the merge consumer.
     ///
-    /// Used by `MainThreadChunkConsumer` to verify all blocks have been decompressed
-    /// before declaring EOF — `all_chunks_eof` is set when raw reads finish, but blocks
-    /// may still be in this queue awaiting decompression.
-    pub(crate) fn raw_chunk_blocks_queue(&self) -> Arc<ArrayQueue<TaggedRawBlock>> {
-        Arc::clone(&self.shared.raw_chunk_blocks)
+    /// Returns the same `Arc` workers see — the consumer reads from per-file
+    /// reorder buffers via this snapshot.
+    pub(crate) fn phase2_files(&self) -> Arc<Vec<Phase2FileState>> {
+        self.shared.phase2_files_snapshot()
     }
 
     /// Set the current pipeline phase.
@@ -1553,10 +1593,10 @@ impl SortWorkerPool {
             Some(reader);
     }
 
-    /// Distribute chunk files to workers for Phase 2.
+    /// Build the Phase 2 per-file state vector and publish it to all workers.
     ///
-    /// Worker `i` gets files `i, i+N, i+2N, ...` where `N` is `num_workers`.
-    /// Must be called before `set_phase(PHASE2)`.
+    /// Workers do not own files — they cooperatively scan all files and steal
+    /// work via `try_lock`. Must be called before `set_phase(PHASE2)`.
     ///
     /// # Errors
     ///
@@ -1564,12 +1604,8 @@ impl SortWorkerPool {
     ///
     /// # Panics
     ///
-    /// Panics if a sender mutex is poisoned.
-    pub fn distribute_chunk_files(
-        &self,
-        files: Vec<(std::path::PathBuf, usize)>,
-    ) -> anyhow::Result<()> {
-        let n = self.num_workers;
+    /// Panics if the `phase2_files` rwlock is poisoned.
+    pub fn set_phase2_files(&self, files: &[std::path::PathBuf]) -> anyhow::Result<()> {
         let total_sources = files.len();
         self.shared.total_sources.store(total_sources as u64, Ordering::Release);
 
@@ -1577,28 +1613,29 @@ impl SortWorkerPool {
         self.shared.all_chunks_eof.store(false, Ordering::Release);
         self.shared.sources_at_eof.store(0, Ordering::Release);
 
-        // Assign files to workers: worker i gets files i, i+N, i+2N...
-        let mut per_worker: Vec<Vec<ChunkFileState>> = (0..n).map(|_| Vec::new()).collect();
-
-        for (idx, (path, source_id)) in files.into_iter().enumerate() {
-            let worker_idx = idx % n;
-            let file = std::fs::File::open(&path).map_err(|e| {
+        let mut states: Vec<Phase2FileState> = Vec::with_capacity(total_sources);
+        for path in files {
+            let file = std::fs::File::open(path).map_err(|e| {
                 anyhow::anyhow!("Failed to open chunk file {}: {e}", path.display())
             })?;
             let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-            per_worker[worker_idx].push(ChunkFileState::new(reader, source_id));
+            states.push(Phase2FileState::new(reader));
         }
 
-        // Send to each worker via their dedicated channel
-        for (worker_idx, files) in per_worker.into_iter().enumerate() {
-            let guard = self.shared.chunk_file_senders[worker_idx]
-                .lock()
-                .expect("chunk_file_sender mutex should not be poisoned");
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(files);
-            }
-        }
+        let mut guard = self.shared.phase2_files.write().expect("phase2_files rwlock poisoned");
+        *guard = Arc::new(states);
         Ok(())
+    }
+
+    /// Clear the Phase 2 file vector. Call this after Phase 2 finishes (and
+    /// before any subsequent Phase 1) so the file descriptors are released.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `phase2_files` rwlock is poisoned.
+    pub fn clear_phase2_files(&self) {
+        let mut guard = self.shared.phase2_files.write().expect("phase2_files rwlock poisoned");
+        *guard = Arc::new(Vec::new());
     }
 
     /// Submit a compression job to the pool (non-blocking, spin-yield on full).
@@ -1648,12 +1685,6 @@ impl SortWorkerPool {
     /// (idempotent via `Option::take`). Called by both `shutdown` and `Drop`.
     fn do_shutdown(&mut self) {
         self.shared.phase.store(phase::SHUTDOWN, Ordering::Release);
-        // Drop chunk file senders so workers blocked on receiving them unblock.
-        for sender in &self.shared.chunk_file_senders {
-            if let Ok(mut guard) = sender.lock() {
-                *guard = None;
-            }
-        }
         if let Some(workers) = self.workers.take() {
             for w in workers {
                 if w.join().is_err() {
@@ -1905,8 +1936,6 @@ mod tests {
             decompressed_input_low: true,
             input_eof: false,
             decompressed_input_done: false,
-            decompressed_chunks_low: false,
-            all_chunks_eof: false,
             compress_has_items: false,
             phase: phase::PHASE1,
         };
@@ -1920,8 +1949,6 @@ mod tests {
             decompressed_input_low: false,
             input_eof: false,
             decompressed_input_done: false,
-            decompressed_chunks_low: false,
-            all_chunks_eof: false,
             compress_has_items: true,
             phase: phase::PHASE1,
         };
@@ -1935,8 +1962,6 @@ mod tests {
             decompressed_input_low: false,
             input_eof: true,
             decompressed_input_done: true,
-            decompressed_chunks_low: false,
-            all_chunks_eof: false,
             compress_has_items: false,
             phase: phase::PHASE1,
         };
@@ -1949,13 +1974,11 @@ mod tests {
             decompressed_input_low: false,
             input_eof: false,
             decompressed_input_done: false,
-            decompressed_chunks_low: true,
-            all_chunks_eof: false,
             compress_has_items: false,
             phase: phase::PHASE2,
         };
         let priorities = get_sort_priorities(&bp);
-        assert_eq!(priorities[0], SortStep::DecompressChunks);
+        assert_eq!(priorities[0], SortStep::Phase2FileWork);
     }
 
     #[test]
@@ -1964,8 +1987,6 @@ mod tests {
             decompressed_input_low: false,
             input_eof: false,
             decompressed_input_done: false,
-            decompressed_chunks_low: false,
-            all_chunks_eof: false,
             compress_has_items: true,
             phase: phase::PHASE2,
         };
@@ -1974,17 +1995,18 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_priorities_phase2_all_done_returns_empty() {
+    fn test_sort_priorities_phase2_after_eof_still_drains_files() {
+        // Even after all_chunks_eof, file work continues until per-file
+        // reorder buffers drain — `is_phase_complete` is the actual exit gate.
         let bp = SortBackpressureState {
             decompressed_input_low: false,
             input_eof: false,
             decompressed_input_done: false,
-            decompressed_chunks_low: false,
-            all_chunks_eof: true,
             compress_has_items: false,
             phase: phase::PHASE2,
         };
-        assert!(get_sort_priorities(&bp).is_empty());
+        let priorities = get_sort_priorities(&bp);
+        assert_eq!(priorities[0], SortStep::Phase2FileWork);
     }
 
     #[test]
@@ -1993,8 +2015,6 @@ mod tests {
             decompressed_input_low: false,
             input_eof: false,
             decompressed_input_done: false,
-            decompressed_chunks_low: false,
-            all_chunks_eof: false,
             compress_has_items: true,
             phase: phase::LEGACY,
         };
@@ -2008,5 +2028,145 @@ mod tests {
         let pool = SortWorkerPool::new(3, 1, 6);
         assert_eq!(pool.num_workers(), 3);
         pool.shutdown();
+    }
+
+    // ========================================================================
+    // Phase2FileState admission and drain tests
+    // ========================================================================
+
+    /// Build an empty `Phase2FileState` for unit-testing the admission rule.
+    /// The reader is backed by a temporary empty file — we don't exercise it
+    /// here; we only manipulate `raw_blocks` and `decompressed` directly.
+    fn empty_phase2_file() -> Phase2FileState {
+        let tmp = tempfile::tempfile().expect("failed to create tempfile");
+        let reader = BufReader::with_capacity(1024, tmp);
+        Phase2FileState::new(reader)
+    }
+
+    /// Build a tiny placeholder `RawBgzfBlock` whose contents we never decode.
+    fn dummy_raw_block(byte: u8) -> RawBgzfBlock {
+        RawBgzfBlock { data: vec![byte; 8] }
+    }
+
+    #[test]
+    fn test_admission_under_cap_admits() {
+        let file = empty_phase2_file();
+        file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
+        assert!(popped.is_some(), "under cap with empty reorder buffer should admit");
+        assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
+        assert!(file.raw_blocks.lock().expect("raw lock").is_empty());
+    }
+
+    #[test]
+    fn test_admission_at_cap_poppable_rejects() {
+        let file = empty_phase2_file();
+        // Fill the reorder buffer to PHASE2_DECOMP_CAP starting at serial 0,
+        // so the buffer is poppable (next_seq = 0 is present) AND at cap.
+        {
+            let mut dec = file.decompressed.lock().expect("dec lock");
+            for s in 0..PHASE2_DECOMP_CAP as u64 {
+                dec.insert(s, vec![0u8; 4]);
+            }
+            assert_eq!(dec.len(), PHASE2_DECOMP_CAP);
+            assert!(dec.can_pop());
+        }
+        // Head raw is the next serial after the buffer's contents — not the
+        // gap-filler, so admission should reject (consumer is supposed to
+        // drain the buffer first).
+        file.raw_blocks
+            .lock()
+            .expect("raw lock")
+            .push_back((PHASE2_DECOMP_CAP as u64, dummy_raw_block(1)));
+        let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
+        assert!(popped.is_none(), "at cap and poppable should reject (apply backpressure)");
+        assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(file.raw_blocks.lock().expect("raw lock").len(), 1);
+    }
+
+    #[test]
+    fn test_admission_at_cap_stuck_admits_gap_filler() {
+        let file = empty_phase2_file();
+        // Fill the reorder buffer with serials 1..=PHASE2_DECOMP_CAP, leaving
+        // serial 0 as the gap. Buffer is at cap and !can_pop.
+        {
+            let mut dec = file.decompressed.lock().expect("dec lock");
+            for s in 1..=PHASE2_DECOMP_CAP as u64 {
+                dec.insert(s, vec![0u8; 4]);
+            }
+            assert_eq!(dec.len(), PHASE2_DECOMP_CAP);
+            assert!(!dec.can_pop(), "buffer should be stuck waiting for serial 0");
+        }
+        // The head raw is serial 0 — the gap-filler. Admission must take it
+        // even though we're at cap, otherwise the consumer deadlocks.
+        file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
+        assert!(popped.is_some(), "at cap and stuck should admit gap-filler at next_seq");
+        assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn test_admission_at_cap_stuck_wrong_head_rejects() {
+        let file = empty_phase2_file();
+        // Same setup as gap-filler test, but the head raw is NOT the
+        // gap-filler — admission must reject and the merge must rely on
+        // another file's progress to make this one drainable.
+        {
+            let mut dec = file.decompressed.lock().expect("dec lock");
+            for s in 1..=PHASE2_DECOMP_CAP as u64 {
+                dec.insert(s, vec![0u8; 4]);
+            }
+        }
+        file.raw_blocks
+            .lock()
+            .expect("raw lock")
+            .push_back((PHASE2_DECOMP_CAP as u64 + 1, dummy_raw_block(2)));
+        let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
+        assert!(popped.is_none(), "at cap, stuck, but head != next_seq should reject");
+        assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_admission_empty_raw_returns_none() {
+        let file = empty_phase2_file();
+        // Empty raw FIFO — try_pop must return None without touching in_flight.
+        let popped = SortWorkerPool::try_pop_raw_for_decompress(&file);
+        assert!(popped.is_none());
+        assert_eq!(file.decomp_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_is_drained_respects_in_flight_counter() {
+        let file = empty_phase2_file();
+        // Mark reader as EOF and ensure both queues are empty.
+        file.reader.lock().expect("reader lock").eof = true;
+        file.reader_eof.store(true, Ordering::Release);
+        assert!(file.is_drained(), "reader_eof + empty queues + no in-flight should be drained");
+
+        // Simulate a worker mid-decompression: in_flight > 0 must hide drain.
+        file.decomp_in_flight.fetch_add(1, Ordering::AcqRel);
+        assert!(!file.is_drained(), "in-flight decompression must keep is_drained=false");
+
+        // Decrementing brings us back to drained.
+        file.decomp_in_flight.fetch_sub(1, Ordering::AcqRel);
+        assert!(file.is_drained());
+    }
+
+    #[test]
+    fn test_is_drained_blocks_on_pending_raw() {
+        let file = empty_phase2_file();
+        file.reader.lock().expect("reader lock").eof = true;
+        file.reader_eof.store(true, Ordering::Release);
+        file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
+        assert!(!file.is_drained(), "raw blocks pending must keep is_drained=false");
+    }
+
+    #[test]
+    fn test_is_drained_blocks_on_pending_decompressed() {
+        let file = empty_phase2_file();
+        file.reader.lock().expect("reader lock").eof = true;
+        file.reader_eof.store(true, Ordering::Release);
+        file.decompressed.lock().expect("dec lock").insert(0, vec![1, 2, 3]);
+        assert!(!file.is_drained(), "decompressed blocks pending must keep is_drained=false");
     }
 }
