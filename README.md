@@ -9,11 +9,11 @@
 
 # fgumi
 
-**⚠️ ALPHA SOFTWARE - USE AT YOUR OWN RISK**
+**⚠️ RESEARCH PREVIEW - USE AT YOUR OWN RISK**
 
-This software is currently in **ALPHA**. While we have extensively tested these
-tools across a wide variety of vendor-provided data, **no guarantees are made**
-regarding correctness or stability.
+This software is currently a **research preview**. While we have extensively
+tested these tools across a wide variety of vendor-provided data, **no
+guarantees are made** regarding correctness or stability.
 
 We are targeting **June 1, 2026** to recommend fgumi over
 [fgbio](https://github.com/fulcrumgenomics/fgbio) for production use.
