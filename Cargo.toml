@@ -41,7 +41,7 @@ thiserror = "2"
 noodles = { version = "0.106.0", features = ["bam", "fasta", "sam", "bgzf", "core", "vcf"] }
 noodles-bgzf = { version = "0.46.0", features = ["libdeflate"] }
 mimalloc = { version = "0.1.48", default-features = false }
-libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
+libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
 env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
 anyhow = "1.0.102"
@@ -87,6 +87,9 @@ fgumi-simd-fastq = { workspace = true }
 fgumi-umi = { workspace = true }
 fgumi-consensus = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+
 [features]
 default = ["simplex", "duplex", "codec"]
 simplex = ["fgumi-consensus/simplex"]
@@ -94,7 +97,7 @@ duplex = ["fgumi-consensus/duplex"]
 codec = ["fgumi-consensus/codec"]
 dhat-heap = ["dep:dhat"]
 # Enable comprehensive memory debugging infrastructure (monitor thread, hot-path atomics, CLI args)
-memory-debug = ["dep:libmimalloc-sys"]
+memory-debug = []
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
 # Enable simulate commands for generating synthetic test data

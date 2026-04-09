@@ -178,6 +178,18 @@ impl SegmentedBuf {
         &seg[seg_offset..seg_offset + len]
     }
 
+    /// Total allocated capacity in bytes across all segments.
+    #[must_use]
+    pub fn allocated_capacity(&self) -> usize {
+        self.segments.iter().map(Vec::capacity).sum()
+    }
+
+    /// Number of allocated segments.
+    #[must_use]
+    pub fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
     /// Clear all data, retaining the first segment's allocation.
     pub fn clear(&mut self) {
         self.segments.truncate(1);
@@ -210,12 +222,6 @@ impl SegmentedBuf {
     pub fn segment_size(&self) -> usize {
         self.segment_size
     }
-
-    /// Number of allocated segments.
-    #[must_use]
-    pub fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
 }
 
 impl Default for SegmentedBuf {
@@ -233,7 +239,7 @@ mod tests {
         let buf = SegmentedBuf::new();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
-        assert_eq!(buf.segment_count(), 1); // one pre-allocated segment
+        assert_eq!(buf.num_segments(), 1); // one pre-allocated segment
     }
 
     #[test]
@@ -268,12 +274,12 @@ mod tests {
 
         // Fill first segment exactly
         let o1 = buf.extend_from_slice(b"0123456789");
-        assert_eq!(buf.segment_count(), 1);
+        assert_eq!(buf.num_segments(), 1);
         assert_eq!(buf.len(), 10);
 
         // Next write starts a new segment
         let o2 = buf.extend_from_slice(b"abcde");
-        assert_eq!(buf.segment_count(), 2);
+        assert_eq!(buf.num_segments(), 2);
         assert_eq!(buf.len(), 15);
 
         // Data is retrievable across segments
@@ -287,13 +293,13 @@ mod tests {
 
         let o1 = buf.extend_from_slice(b"1234567"); // 7 bytes in seg 0
         assert_eq!(o1, 0);
-        assert_eq!(buf.segment_count(), 1);
+        assert_eq!(buf.num_segments(), 1);
 
         // 5 bytes won't fit in remaining 3 bytes, so spills to seg 1
         // total_len jumps from 7 → 10 (gap) → 15
         let o2 = buf.extend_from_slice(b"abcde");
         assert_eq!(o2, 10); // starts at segment boundary
-        assert_eq!(buf.segment_count(), 2);
+        assert_eq!(buf.num_segments(), 2);
         assert_eq!(buf.len(), 15); // 10 (seg 0 padded) + 5
 
         assert_eq!(buf.slice(o1, 7), b"1234567");
@@ -339,7 +345,7 @@ mod tests {
 
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
-        assert_eq!(buf.segment_count(), 1);
+        assert_eq!(buf.num_segments(), 1);
     }
 
     #[test]
@@ -356,7 +362,7 @@ mod tests {
         }
 
         // Each record in its own 100-byte segment
-        assert_eq!(buf.segment_count(), 50);
+        assert_eq!(buf.num_segments(), 50);
 
         // Verify all records readable
         #[allow(clippy::cast_possible_truncation)]
@@ -414,7 +420,7 @@ mod tests {
         buf.extend_in_place(&[0xCC; 16]);
         buf.extend_in_place(&[0xDD; 60]);
 
-        assert_eq!(buf.segment_count(), 2);
+        assert_eq!(buf.num_segments(), 2);
         assert_eq!(buf.slice(0, 16), &[0xAA; 16]);
         assert_eq!(buf.slice(16, 60), &[0xBB; 60]);
         assert_eq!(buf.slice(100, 16), &[0xCC; 16]);
@@ -433,7 +439,7 @@ mod tests {
         assert_eq!(o1, 0);
         assert_eq!(o2, 4);
         assert_eq!(o3, 8);
-        assert_eq!(buf.segment_count(), 1);
+        assert_eq!(buf.num_segments(), 1);
 
         // Can read the entire contiguous range
         assert_eq!(buf.slice(0, 12), b"aaaabbbbcccc");

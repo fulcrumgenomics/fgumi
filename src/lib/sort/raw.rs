@@ -21,8 +21,13 @@ use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
 #[cfg(test)]
 use crate::sam::SamTag;
-use crate::sort::inline_buffer::{RecordBuffer, TemplateKey, TemplateRecordBuffer};
+use crate::sort::inline_buffer::{
+    ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
+};
 use crate::sort::keys::{QuerynameComparator, RawSortKey, SortOrder};
+use crate::sort::memory_probe::{
+    BufferProbeStats, ConsumerProbeStats, MergeProbe, SpillProbe, force_mi_collect, log_snapshot,
+};
 use crate::sort::pooled_chunk_writer::PooledChunkWriter;
 use crate::sort::read_ahead::{RawReadAheadReader, RecordSource};
 use crate::sort::worker_pool::SortWorkerPool;
@@ -1013,6 +1018,30 @@ impl<K: RawSortKey + 'static> MainThreadChunkConsumer<K> {
             Err(e) => Err(anyhow::anyhow!("error reading key from source {source_id}: {e}")),
         }
     }
+
+    /// Gather probe statistics from the per-file Phase 2 state.
+    fn probe_consumer_stats(&self) -> ConsumerProbeStats {
+        let mut pending_blocks: u64 = 0;
+        let mut pending_bytes: u64 = 0;
+        let mut active_sources: u64 = 0;
+
+        for file in self.files.iter() {
+            let (blocks, bytes, active) = file.probe_stats();
+            pending_blocks += blocks;
+            pending_bytes += bytes;
+            if active {
+                active_sources += 1;
+            }
+        }
+
+        ConsumerProbeStats {
+            current_bytes: 0,
+            current_capacity: 0,
+            pending_blocks,
+            pending_bytes,
+            active_sources,
+        }
+    }
 }
 
 /// Adapter that implements `std::io::Read` over a `MainThreadChunkConsumer` source.
@@ -1085,6 +1114,17 @@ impl<'a> ChunkNamer<'a> {
 struct PendingSpill {
     handle: crate::sort::pooled_chunk_writer::SpillWriteHandle,
     chunk_path: PathBuf,
+}
+
+/// Build `BufferProbeStats` from any buffer implementing `ProbeableBuffer`.
+#[allow(clippy::cast_possible_truncation)]
+fn probe_stats(buf: &impl ProbeableBuffer) -> BufferProbeStats {
+    BufferProbeStats {
+        usage: buf.memory_usage() as u64,
+        capacity: buf.allocated_capacity() as u64,
+        records: buf.len() as u64,
+        segments: buf.num_segments() as u64,
+    }
 }
 
 /// Raw-bytes external sorter for BAM files.
@@ -1661,6 +1701,7 @@ impl RawExternalSorter {
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
+        let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
@@ -1669,9 +1710,16 @@ impl RawExternalSorter {
             // Push directly to buffer - key extracted inline from raw bytes
             buffer.push_coordinate(record.as_ref())?;
 
+            if probe.should_sample_read(stats.total_records) {
+                probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
+            }
+
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
                 timer.end_read_span();
+                let bstats = probe_stats(&buffer);
+                let depths = Some(pool.phase1_queue_depths());
+                probe.pre_spill(bstats, depths);
 
                 // Wait for any previous spill to complete before starting a new one
                 self.drain_pending_spill::<RawCoordinateKey>(
@@ -1682,6 +1730,7 @@ impl RawExternalSorter {
                     &mut namer,
                     &pool,
                 )?;
+                probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
                 let chunk_path = namer.next_chunk_path();
 
@@ -1706,6 +1755,8 @@ impl RawExternalSorter {
                 pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 buffer.clear();
+                force_mi_collect();
+                probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
@@ -1725,6 +1776,7 @@ impl RawExternalSorter {
             &mut namer,
             &pool,
         )?;
+        probe.phase1_end(buffer.memory_usage() as u64);
 
         if chunk_files.is_empty() {
             // All records fit in memory - no merge needed
@@ -1832,13 +1884,21 @@ impl RawExternalSorter {
         let rayon_pool = self.build_sort_rayon_pool()?;
 
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
+        let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
             buffer.push_coordinate(record.as_ref())?;
 
+            if probe.should_sample_read(stats.total_records) {
+                probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
+            }
+
             if buffer.memory_usage() >= self.memory_limit {
                 timer.end_read_span();
+                let bstats = probe_stats(&buffer);
+                let depths = Some(pool.phase1_queue_depths());
+                probe.pre_spill(bstats, depths);
 
                 // Wait for any previous spill to complete
                 self.drain_pending_spill::<RawCoordinateKey>(
@@ -1849,6 +1909,7 @@ impl RawExternalSorter {
                     &mut namer,
                     &pool,
                 )?;
+                probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
                 let chunk_path = namer.next_chunk_path();
 
@@ -1870,6 +1931,8 @@ impl RawExternalSorter {
                 pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 buffer.clear();
+                force_mi_collect();
+                probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
@@ -1889,6 +1952,7 @@ impl RawExternalSorter {
             &mut namer,
             &pool,
         )?;
+        probe.phase1_end(buffer.memory_usage() as u64);
 
         let output_header = self.create_output_header(header);
 
@@ -2037,6 +2101,7 @@ impl RawExternalSorter {
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (keyed output)...");
+        let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
@@ -2052,9 +2117,17 @@ impl RawExternalSorter {
 
             entries.push((key, bam_bytes.to_vec()));
 
+            if probe.should_sample_read(stats.total_records) {
+                let bstats = BufferProbeStats::simple(memory_used as u64, entries.len() as u64);
+                probe.log_mid_read(bstats, Some(pool.phase1_queue_depths()));
+            }
+
             // Check if we need to spill to disk
             if memory_used >= self.memory_limit {
                 timer.end_read_span();
+                let bstats = BufferProbeStats::simple(memory_used as u64, entries.len() as u64);
+                let depths = Some(pool.phase1_queue_depths());
+                probe.pre_spill(bstats, depths);
 
                 // Wait for any previous spill to complete
                 self.drain_pending_spill::<K>(
@@ -2065,6 +2138,7 @@ impl RawExternalSorter {
                     &mut namer,
                     &pool,
                 )?;
+                probe.post_drain(bstats, Some(pool.phase1_queue_depths()));
 
                 let chunk_path = namer.next_chunk_path();
 
@@ -2085,6 +2159,8 @@ impl RawExternalSorter {
                 pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 memory_used = 0;
+                force_mi_collect();
+                probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
@@ -2104,6 +2180,7 @@ impl RawExternalSorter {
             &mut namer,
             &pool,
         )?;
+        probe.phase1_end(memory_used as u64);
 
         if chunk_files.is_empty() {
             // All records fit in memory
@@ -2237,6 +2314,7 @@ impl RawExternalSorter {
 
         let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer)...");
+        let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
@@ -2252,9 +2330,16 @@ impl RawExternalSorter {
             );
             buffer.push(bam_bytes, key)?;
 
+            if probe.should_sample_read(stats.total_records) {
+                probe.log_mid_read(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
+            }
+
             // Check memory usage
             if buffer.memory_usage() >= self.memory_limit {
                 timer.end_read_span();
+                let bstats = probe_stats(&buffer);
+                let depths = Some(pool.phase1_queue_depths());
+                probe.pre_spill(bstats, depths);
 
                 // Wait for any previous spill to complete
                 self.drain_pending_spill::<TemplateKey>(
@@ -2265,6 +2350,7 @@ impl RawExternalSorter {
                     &mut namer,
                     &pool,
                 )?;
+                probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
                 let chunk_path = namer.next_chunk_path();
 
@@ -2285,6 +2371,8 @@ impl RawExternalSorter {
                 pending_spill = Some(PendingSpill { handle, chunk_path });
 
                 buffer.clear();
+                force_mi_collect();
+                probe.post_spill(Some(pool.phase1_queue_depths()));
                 timer.begin_read_span();
             }
         }
@@ -2304,6 +2392,7 @@ impl RawExternalSorter {
             &mut namer,
             &pool,
         )?;
+        probe.phase1_end(buffer.memory_usage() as u64);
 
         if chunk_files.is_empty() {
             // All records fit in memory
@@ -2530,6 +2619,8 @@ impl RawExternalSorter {
             .with_interval(1_000_000)
             .with_total(total_records);
 
+        let mut merge_probe = MergeProbe::new();
+
         // Sub-phase timing: only paid when debug logging is enabled.
         let debug_timing = log::log_enabled!(log::Level::Debug);
         let merge_sample_interval: u64 = 1024;
@@ -2553,6 +2644,12 @@ impl RawExternalSorter {
 
             records_merged += 1;
             merge_progress.log_if_needed(1);
+
+            if merge_probe.should_sample(records_merged) {
+                let depths = pool.phase1_queue_depths();
+                let consumer_stats = guard.consumer_mut().map(|c| c.probe_consumer_stats());
+                merge_probe.log_mid_with_depths(depths, consumer_stats);
+            }
 
             let src_idx = source_map[winner];
 
@@ -2601,6 +2698,7 @@ impl RawExternalSorter {
 
         writer.finish()?;
         merge_progress.log_final();
+        log_snapshot("phase2.end", 0);
 
         Ok(records_merged)
     }
