@@ -17,6 +17,27 @@ use std::cmp::Ordering;
 use std::io::{Read, Write};
 
 // ============================================================================
+// Buffer Probe Trait
+// ============================================================================
+
+/// Common metrics shared by `RecordBuffer` and `TemplateRecordBuffer` for
+/// memory-probe instrumentation.
+pub trait ProbeableBuffer {
+    /// Logical bytes stored (data + refs).
+    fn memory_usage(&self) -> usize;
+    /// Total allocated capacity (segments + refs Vec).
+    fn allocated_capacity(&self) -> usize;
+    /// Number of records in the buffer.
+    fn len(&self) -> usize;
+    /// Whether the buffer is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Number of data segments.
+    fn num_segments(&self) -> usize;
+}
+
+// ============================================================================
 // Packed Sort Keys
 // ============================================================================
 
@@ -352,6 +373,24 @@ impl RecordBuffer {
     #[must_use]
     pub fn nref(&self) -> u32 {
         self.nref
+    }
+}
+
+impl ProbeableBuffer for RecordBuffer {
+    fn memory_usage(&self) -> usize {
+        self.memory_usage()
+    }
+
+    fn allocated_capacity(&self) -> usize {
+        self.allocated_capacity()
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn num_segments(&self) -> usize {
+        self.num_segments()
     }
 }
 
@@ -881,6 +920,24 @@ impl TemplateRecordBuffer {
             radix_sort_template_refs,
             |r: &TemplateRecordRef| r.key
         )
+    }
+}
+
+impl ProbeableBuffer for TemplateRecordBuffer {
+    fn memory_usage(&self) -> usize {
+        self.memory_usage()
+    }
+
+    fn allocated_capacity(&self) -> usize {
+        self.allocated_capacity()
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn num_segments(&self) -> usize {
+        self.num_segments()
     }
 }
 

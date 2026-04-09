@@ -454,6 +454,30 @@ impl Phase2FileState {
         }
     }
 
+    /// Mark the disk reader as having reached EOF. Updates both the
+    /// reader-internal flag and the lock-free atomic copy. Must be called
+    /// while holding the reader `Mutex` (pass the guard to prove it).
+    pub(crate) fn mark_reader_eof(&self, reader_guard: &mut Phase2Reader) {
+        reader_guard.eof = true;
+        self.reader_eof.store(true, Ordering::Release);
+    }
+
+    /// Gather probe statistics for this file: `(pending_blocks, pending_bytes, active)`.
+    ///
+    /// `pending_blocks` counts raw + decompressed blocks in flight.
+    /// `pending_bytes` sums the byte length of decompressed blocks.
+    /// `active` is true if the disk reader has not yet reached EOF.
+    pub(crate) fn probe_stats(&self) -> (u64, u64, bool) {
+        let raw_len =
+            self.raw_blocks.lock().expect("phase2 raw_blocks mutex poisoned").len() as u64;
+        let decomp_guard = self.decompressed.lock().expect("phase2 decompressed mutex poisoned");
+        let decomp_len = decomp_guard.len() as u64;
+        let decomp_bytes: u64 = decomp_guard.iter().map(|buf| buf.len() as u64).sum();
+        drop(decomp_guard);
+        let active = !self.reader_eof.load(Ordering::Relaxed);
+        (raw_len + decomp_len, decomp_bytes, active)
+    }
+
     /// Returns true when this file has produced all its data: disk reader at
     /// EOF, no raw blocks waiting, no decompressed blocks waiting, and no
     /// decompression in progress.
@@ -1421,8 +1445,7 @@ impl SortWorkerPool {
                 Err(e) => {
                     log::error!("I/O error reading chunk file (source {i}): {e}");
                     shared.chunk_read_error.store(true, Ordering::Release);
-                    reader_guard.eof = true;
-                    file.reader_eof.store(true, Ordering::Release);
+                    file.mark_reader_eof(&mut reader_guard);
                     drop(reader_guard);
                     shared.main_thread_handle.unpark();
                     Self::maybe_mark_all_eof(shared);
@@ -1432,8 +1455,7 @@ impl SortWorkerPool {
             };
 
             if blocks.is_empty() {
-                reader_guard.eof = true;
-                file.reader_eof.store(true, Ordering::Release);
+                file.mark_reader_eof(&mut reader_guard);
                 drop(reader_guard);
                 shared.main_thread_handle.unpark();
                 Self::maybe_mark_all_eof(shared);
@@ -2160,8 +2182,7 @@ mod tests {
     fn test_is_drained_respects_in_flight_counter() {
         let file = empty_phase2_file();
         // Mark reader as EOF and ensure both queues are empty.
-        file.reader.lock().expect("reader lock").eof = true;
-        file.reader_eof.store(true, Ordering::Release);
+        file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
         assert!(file.is_drained(), "reader_eof + empty queues + no in-flight should be drained");
 
         // Simulate a worker mid-decompression: in_flight > 0 must hide drain.
@@ -2176,8 +2197,7 @@ mod tests {
     #[test]
     fn test_is_drained_blocks_on_pending_raw() {
         let file = empty_phase2_file();
-        file.reader.lock().expect("reader lock").eof = true;
-        file.reader_eof.store(true, Ordering::Release);
+        file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
         file.raw_blocks.lock().expect("raw lock").push_back((0, dummy_raw_block(0)));
         assert!(!file.is_drained(), "raw blocks pending must keep is_drained=false");
     }
@@ -2185,8 +2205,7 @@ mod tests {
     #[test]
     fn test_is_drained_blocks_on_pending_decompressed() {
         let file = empty_phase2_file();
-        file.reader.lock().expect("reader lock").eof = true;
-        file.reader_eof.store(true, Ordering::Release);
+        file.mark_reader_eof(&mut file.reader.lock().expect("reader lock"));
         file.decompressed.lock().expect("dec lock").insert(0, vec![1, 2, 3]);
         assert!(!file.is_drained(), "decompressed blocks pending must keep is_drained=false");
     }

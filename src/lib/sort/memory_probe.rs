@@ -38,91 +38,97 @@
 //! log_snapshot("phase2.end", 0);
 //! ```
 
+use bytesize::ByteSize;
 use log::{Level, info, log_enabled};
 
-/// Force mimalloc to release retained arena segments back to the OS.
-///
-/// `mi_collect(true)` is a "force" collect that triggers cross-thread free
-/// list draining and arena purging. Used by the probe to distinguish
-/// "mimalloc is hoarding pages" from "real live allocations" — if
-/// `phys_footprint` drops sharply after a collect, the gap was retained
-/// arena memory.
-#[allow(unsafe_code)] // mimalloc FFI
-pub fn force_mi_collect() {
-    // SAFETY: mi_collect(true) is a thread-safe arena maintenance call.
-    unsafe {
-        libmimalloc_sys::mi_collect(true);
-    }
-}
+pub use platform_ffi::{force_mi_collect, process_rss_bytes};
 
 /// Log target for the memory probe. Enable with
 /// `RUST_LOG=fgumi_lib::sort::memory_probe=info`.
 const TARGET: &str = "fgumi_lib::sort::memory_probe";
 
-/// Read the current process resident-set size in bytes.
-///
-/// Returns `None` if the platform sampler is unavailable (e.g. `/proc` is not
-/// mounted on a non-Linux host and the `sysinfo` fallback fails).
-///
-/// # Implementation
-///
-/// - **Linux**: reads `VmRSS` from `/proc/self/status`. One short file read,
-///   no allocations on the hot path beyond the status string itself.
-/// - **macOS**: reads `phys_footprint` from `task_info(TASK_VM_INFO)`. This is
-///   what Activity Monitor reports as "Memory" and excludes purgeable
-///   `MADV_FREE` pages, unlike `task_basic_info::resident_size` (which sysinfo
-///   uses). For sort memory diagnosis we need this metric — Darwin keeps
-///   freed pages in `resident_size` until kernel pressure forces eviction,
-///   which produces a misleading ~30 GiB peak when mimalloc has actually
-///   already purged them.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)] // mach task_info FFI; required for phys_footprint metric
-#[must_use]
-pub fn process_rss_bytes() -> Option<u64> {
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::task::task_info;
-    use mach2::task_info::{TASK_VM_INFO, task_vm_info};
-    use mach2::traps::mach_task_self;
-    use mach2::vm_types::natural_t;
-
-    let mut info = task_vm_info::default();
-    let mut count: mach_msg_type_number_t = mach_msg_type_number_t::try_from(
-        std::mem::size_of::<task_vm_info>() / std::mem::size_of::<natural_t>(),
-    )
-    .ok()?;
-    // SAFETY: mach task_info FFI; passes a properly-sized output buffer and count.
-    let kr = unsafe {
-        task_info(
-            mach_task_self(),
-            TASK_VM_INFO,
-            std::ptr::addr_of_mut!(info).cast(),
-            std::ptr::addr_of_mut!(count),
-        )
-    };
-    if kr != 0 {
-        return None;
+/// Platform-specific FFI helpers isolated from the main module to contain the
+/// `#[allow(unsafe_code)]` surface to the smallest possible scope.
+#[allow(unsafe_code)]
+mod platform_ffi {
+    /// Force mimalloc to release retained arena segments back to the OS.
+    ///
+    /// `mi_collect(true)` is a "force" collect that triggers cross-thread free
+    /// list draining and arena purging. Used by the probe to distinguish
+    /// "mimalloc is hoarding pages" from "real live allocations" — if
+    /// `phys_footprint` drops sharply after a collect, the gap was retained
+    /// arena memory.
+    pub fn force_mi_collect() {
+        // SAFETY: mi_collect(true) is a thread-safe arena maintenance call.
+        unsafe {
+            libmimalloc_sys::mi_collect(true);
+        }
     }
-    Some(info.phys_footprint)
-}
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[must_use]
-pub fn process_rss_bytes() -> Option<u64> {
-    None
-}
+    /// Read the current process resident-set size in bytes.
+    ///
+    /// Returns `None` if the platform sampler is unavailable (e.g. `/proc` is not
+    /// mounted on a non-Linux host and the `sysinfo` fallback fails).
+    ///
+    /// # Implementation
+    ///
+    /// - **Linux**: reads `VmRSS` from `/proc/self/status`. One short file read,
+    ///   no allocations on the hot path beyond the status string itself.
+    /// - **macOS**: reads `phys_footprint` from `task_info(TASK_VM_INFO)`. This is
+    ///   what Activity Monitor reports as "Memory" and excludes purgeable
+    ///   `MADV_FREE` pages, unlike `task_basic_info::resident_size` (which sysinfo
+    ///   uses). For sort memory diagnosis we need this metric — Darwin keeps
+    ///   freed pages in `resident_size` until kernel pressure forces eviction,
+    ///   which produces a misleading ~30 GiB peak when mimalloc has actually
+    ///   already purged them.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn process_rss_bytes() -> Option<u64> {
+        use mach2::message::mach_msg_type_number_t;
+        use mach2::task::task_info;
+        use mach2::task_info::{TASK_VM_INFO, task_vm_info};
+        use mach2::traps::mach_task_self;
+        use mach2::vm_types::natural_t;
 
-#[cfg(target_os = "linux")]
-#[must_use]
-pub fn process_rss_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status
-        .lines()
-        .find(|line| line.starts_with("VmRSS:"))?
-        .split_whitespace()
-        .nth(1)?
-        .parse::<u64>()
-        .ok()
-        .map(|kb| kb * 1024)
+        let mut info = task_vm_info::default();
+        let mut count: mach_msg_type_number_t = mach_msg_type_number_t::try_from(
+            std::mem::size_of::<task_vm_info>() / std::mem::size_of::<natural_t>(),
+        )
+        .ok()?;
+        // SAFETY: mach task_info FFI; passes a properly-sized output buffer and count.
+        let kr = unsafe {
+            task_info(
+                mach_task_self(),
+                TASK_VM_INFO,
+                std::ptr::addr_of_mut!(info).cast(),
+                std::ptr::addr_of_mut!(count),
+            )
+        };
+        if kr != 0 {
+            return None;
+        }
+        Some(info.phys_footprint)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[must_use]
+    pub fn process_rss_bytes() -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn process_rss_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb * 1024)
+    }
 }
 
 /// Whether the probe is currently enabled. Callers can short-circuit their
@@ -133,22 +139,36 @@ pub fn enabled() -> bool {
     log_enabled!(target: TARGET, Level::Info)
 }
 
-/// Format a byte count as a human-readable value with two-decimal precision.
-#[allow(clippy::cast_precision_loss)]
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.2}G", b / GIB)
-    } else if b >= MIB {
-        format!("{:.2}M", b / MIB)
-    } else if b >= KIB {
-        format!("{:.2}K", b / KIB)
-    } else {
-        format!("{bytes}B")
-    }
+/// Format a byte count as a human-readable value using the `bytesize` crate.
+fn fmt_bytes(bytes: u64) -> String {
+    ByteSize(bytes).to_string()
+}
+
+/// RSS snapshot taken before and after a mimalloc arena collect.
+///
+/// Pre-formatted strings are stored so callers can splice them into log lines
+/// without repeating the sample → collect → re-sample sequence.
+struct RssSnapshot {
+    rss_str: String,
+    post_collect_str: String,
+    collected_str: String,
+    rss: Option<u64>,
+}
+
+/// Sample RSS, force-collect mimalloc arenas, re-sample, and return the
+/// pre-formatted snapshot. This is the single place the triple-sample
+/// pattern lives; every probe function delegates here.
+fn collect_rss_snapshot() -> RssSnapshot {
+    let rss = process_rss_bytes();
+    let rss_str = rss.map_or_else(|| "?".to_string(), fmt_bytes);
+    force_mi_collect();
+    let rss_after = process_rss_bytes();
+    let post_collect_str = rss_after.map_or_else(|| "?".to_string(), fmt_bytes);
+    let collected_str = match (rss, rss_after) {
+        (Some(a), Some(b)) => fmt_bytes(a.saturating_sub(b)),
+        _ => "?".to_string(),
+    };
+    RssSnapshot { rss_str, post_collect_str, collected_str, rss }
 }
 
 /// Sample process RSS and log a single memory snapshot under `label`.
@@ -156,7 +176,7 @@ fn format_bytes(bytes: u64) -> String {
 /// The log line has the form
 ///
 /// ```text
-/// MEM[label] rss=8.20G tracked=0.70G residual=7.50G residual_pct=91%
+/// MEM[label] rss=8.2 GiB tracked=716.8 MiB residual=7.5 GiB residual_pct=91%
 /// ```
 ///
 /// `tracked` is the caller's estimate of accounted-for bytes (typically
@@ -170,25 +190,17 @@ pub fn log_snapshot(label: &str, tracked_bytes: u64) {
     if !enabled() {
         return;
     }
-    let rss = process_rss_bytes();
-    let rss_str = rss.map_or_else(|| "?".to_string(), format_bytes);
-    let tracked_str = format_bytes(tracked_bytes);
-    // Force mimalloc arena collection so we can compare retained vs live.
-    force_mi_collect();
-    let rss_after = process_rss_bytes();
-    let rss_after_str = rss_after.map_or_else(|| "?".to_string(), format_bytes);
-    let collected = match (rss, rss_after) {
-        (Some(a), Some(b)) => format_bytes(a.saturating_sub(b)),
-        _ => "?".to_string(),
-    };
-    match rss {
+    let snap = collect_rss_snapshot();
+    let tracked_str = fmt_bytes(tracked_bytes);
+    match snap.rss {
         Some(r) => {
             let residual = r.saturating_sub(tracked_bytes);
-            let residual_str = format_bytes(residual);
+            let residual_str = fmt_bytes(residual);
             let pct = if r == 0 { 0 } else { (residual * 100) / r };
             info!(
                 target: TARGET,
-                "MEM[{label}] rss={rss_str} post_collect={rss_after_str} collected={collected} tracked={tracked_str} residual={residual_str} residual_pct={pct}%"
+                "MEM[{label}] rss={} post_collect={} collected={} tracked={tracked_str} residual={residual_str} residual_pct={pct}%",
+                snap.rss_str, snap.post_collect_str, snap.collected_str,
             );
         }
         None => {
@@ -213,6 +225,15 @@ pub struct BufferProbeStats {
     pub segments: u64,
 }
 
+impl BufferProbeStats {
+    /// Construct stats for a simple (non-segmented) buffer where only usage
+    /// and record count are meaningful.
+    #[must_use]
+    pub fn simple(usage: u64, records: u64) -> Self {
+        Self { usage, capacity: 0, records, segments: 0 }
+    }
+}
+
 /// Log a Phase 1 snapshot with buffer stats and optional pool queue depths.
 ///
 /// Format: `MEM[label] rss=... buf_use=... buf_cap=... recs=... segs=... [raw_q=... decomp_q=... buf_q=...]`
@@ -224,20 +245,12 @@ fn log_phase1_snapshot(
     if !enabled() {
         return;
     }
-    let rss = process_rss_bytes();
-    let rss_str = rss.map_or_else(|| "?".to_string(), format_bytes);
-    force_mi_collect();
-    let rss_after = process_rss_bytes();
-    let rss_after_str = rss_after.map_or_else(|| "?".to_string(), format_bytes);
-    let collected = match (rss, rss_after) {
-        (Some(a), Some(b)) => format_bytes(a.saturating_sub(b)),
-        _ => "?".to_string(),
-    };
+    let snap = collect_rss_snapshot();
     let buf_str = match buf_stats {
         Some(s) => format!(
             " buf_use={} buf_cap={} recs={} segs={}",
-            format_bytes(s.usage),
-            format_bytes(s.capacity),
+            fmt_bytes(s.usage),
+            fmt_bytes(s.capacity),
             s.records,
             s.segments,
         ),
@@ -250,17 +263,18 @@ fn log_phase1_snapshot(
         None => String::new(),
     };
     let tracked = buf_stats.map_or(0, |s| s.usage);
-    let residual_str = match rss {
+    let residual_str = match snap.rss {
         Some(r) => {
             let residual = r.saturating_sub(tracked);
             let pct = if r == 0 { 0 } else { (residual * 100) / r };
-            format!(" residual={} residual_pct={pct}%", format_bytes(residual))
+            format!(" residual={} residual_pct={pct}%", fmt_bytes(residual))
         }
         None => " residual=? residual_pct=?".to_string(),
     };
     info!(
         target: TARGET,
-        "MEM[{label}] rss={rss_str} post_collect={rss_after_str} collected={collected}{buf_str}{pool_str}{residual_str}"
+        "MEM[{label}] rss={} post_collect={} collected={}{buf_str}{pool_str}{residual_str}",
+        snap.rss_str, snap.post_collect_str, snap.collected_str,
     );
 }
 
@@ -360,8 +374,6 @@ impl SpillProbe {
         self.spill_idx += 1;
         // Reset mid-read counter for next fill cycle.
         self.read_sample_idx = 0;
-        self.next_read_threshold =
-            self.next_read_threshold.saturating_add(Self::READ_SAMPLE_INTERVAL);
     }
 
     /// Log a snapshot marking the end of phase 1 (before merge).
@@ -370,6 +382,7 @@ impl SpillProbe {
     }
 
     /// Number of spill cycles observed so far.
+    #[cfg(test)]
     #[must_use]
     pub fn spill_count(&self) -> usize {
         self.spill_idx
@@ -415,6 +428,7 @@ impl MergeProbe {
 
     /// Called once per merged record with the running total. Samples RSS
     /// when `records_merged` crosses the next threshold.
+    #[cfg(test)]
     #[inline]
     pub fn record(&mut self, records_merged: u64) {
         if records_merged < self.next_threshold {
@@ -428,6 +442,7 @@ impl MergeProbe {
     }
 
     /// Number of mid-merge samples logged so far.
+    #[cfg(test)]
     #[must_use]
     pub fn sample_count(&self) -> usize {
         self.sample_idx
@@ -442,7 +457,7 @@ impl MergeProbe {
     #[inline]
     #[must_use]
     pub fn should_sample(&self, records_merged: u64) -> bool {
-        records_merged >= self.next_threshold
+        enabled() && records_merged >= self.next_threshold
     }
 
     /// Log a mid-merge sample with per-component queue depths.
@@ -451,43 +466,31 @@ impl MergeProbe {
     /// `records_merged` count. Advances the sample counter and the next
     /// threshold.
     ///
-    /// The log line extends the standard `MEM[...]` format with additional
-    /// `raw_q=` `decomp_q=` `buf_q=` fields so a single snapshot captures
-    /// both the process RSS and the pool plumbing state at the same instant.
+    /// `pool_depths` is the `(raw_input, decompressed_input, buffer_pool)`
+    /// triple from [`SortWorkerPool::phase1_queue_depths`].
     pub fn log_mid_with_depths(
         &mut self,
-        raw_chunk_q: usize,
-        decompressed_chunk_q: usize,
-        buffer_pool_available: usize,
+        pool_depths: (usize, usize, usize),
         consumer_stats: Option<ConsumerProbeStats>,
     ) {
         if enabled() {
-            let rss = process_rss_bytes();
-            let rss_str = rss.map_or_else(|| "?".to_string(), format_bytes);
-            // Force mimalloc arena collection and re-sample. The delta
-            // (rss - rss_after_collect) is the retained-arena footprint.
-            force_mi_collect();
-            let rss_after = process_rss_bytes();
-            let rss_after_str = rss_after.map_or_else(|| "?".to_string(), format_bytes);
-            let collected = match (rss, rss_after) {
-                (Some(a), Some(b)) => format_bytes(a.saturating_sub(b)),
-                _ => "?".to_string(),
-            };
+            let snap = collect_rss_snapshot();
+            let (raw_q, decomp_q, buf_q) = pool_depths;
             let consumer_str = match consumer_stats {
                 Some(s) => format!(
                     " cur_bytes={} cur_cap={} pend_blocks={} pend_bytes={} active_src={}",
-                    format_bytes(s.current_bytes),
-                    format_bytes(s.current_capacity),
+                    fmt_bytes(s.current_bytes),
+                    fmt_bytes(s.current_capacity),
                     s.pending_blocks,
-                    format_bytes(s.pending_bytes),
+                    fmt_bytes(s.pending_bytes),
                     s.active_sources,
                 ),
                 None => String::new(),
             };
             info!(
                 target: TARGET,
-                "MEM[phase2.mid_{}] rss={rss_str} post_collect={rss_after_str} collected={collected} raw_q={raw_chunk_q} decomp_q={decompressed_chunk_q} buf_q={buffer_pool_available}{consumer_str}",
-                self.sample_idx,
+                "MEM[phase2.mid_{}] rss={} post_collect={} collected={} raw_q={raw_q} decomp_q={decomp_q} buf_q={buf_q}{consumer_str}",
+                self.sample_idx, snap.rss_str, snap.post_collect_str, snap.collected_str,
             );
         }
         self.sample_idx += 1;
@@ -506,14 +509,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_bytes_units() {
-        assert_eq!(format_bytes(0), "0B");
-        assert_eq!(format_bytes(512), "512B");
-        assert_eq!(format_bytes(1024), "1.00K");
-        assert_eq!(format_bytes(1536), "1.50K");
-        assert_eq!(format_bytes(1024 * 1024), "1.00M");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00G");
-        assert_eq!(format_bytes(2u64 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "2.50G");
+    fn test_fmt_bytes_units() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KiB");
+        assert_eq!(fmt_bytes(1536), "1.5 KiB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(fmt_bytes(2u64 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "2.5 GiB");
     }
 
     #[test]
