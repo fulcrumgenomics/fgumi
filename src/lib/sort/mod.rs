@@ -38,6 +38,7 @@ pub mod bgzf_io;
 pub mod inline_buffer;
 pub mod keys;
 pub mod loser_tree;
+pub(crate) mod memory_probe;
 pub mod pipeline;
 pub mod pooled_bam_writer;
 pub mod pooled_chunk_writer;

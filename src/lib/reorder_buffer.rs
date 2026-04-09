@@ -224,6 +224,11 @@ impl<T> ReorderBuffer<T> {
         self.can_pop
     }
 
+    /// Iterate over all buffered items (skipping empty slots).
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.buffer.iter().filter_map(|opt| opt.as_ref().map(|(item, _)| item))
+    }
+
     /// Get the tracked heap memory in bytes.
     ///
     /// This returns the sum of sizes passed to `insert_with_size`.

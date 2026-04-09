@@ -307,6 +307,18 @@ impl BufferPool {
         self.rx.try_recv().unwrap_or_default()
     }
 
+    /// Returns the number of buffers currently available in the pool.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Returns true if no buffers are currently available in the pool.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+
     /// Return a buffer to the pool for reuse.
     /// If the pool is full, the buffer is dropped.
     pub fn checkin(&self, mut buf: Vec<u8>) {
@@ -1534,6 +1546,15 @@ impl SortWorkerPool {
     /// Number of worker threads in the pool.
     pub fn num_workers(&self) -> usize {
         self.num_workers
+    }
+
+    /// Phase 1 input pipeline queue depths: `(raw_input_blocks, decompressed_input, buffer_pool)`.
+    pub(crate) fn phase1_queue_depths(&self) -> (usize, usize, usize) {
+        (
+            self.shared.raw_input_blocks.len(),
+            self.shared.decompressed_input.len(),
+            self.buffer_pool.len(),
+        )
     }
 
     /// Get a clone of the decompressed input `ArrayQueue` for `PooledInputStream`.
