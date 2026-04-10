@@ -86,7 +86,7 @@ use std::time::{Duration, Instant};
 
 use crate::progress::ProgressTracker;
 
-use super::deadlock::{DeadlockState, QueueSnapshot, check_deadlock_and_restore};
+use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 
 use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
 use crate::read_info::LibraryIndex;
@@ -2260,7 +2260,16 @@ pub fn run_monitor_loop<S, F>(
             if deadlock_counter >= deadlock_check_samples {
                 deadlock_counter = 0;
                 let snapshot = state.build_queue_snapshot();
-                check_deadlock_and_restore(state.deadlock_state(), &snapshot);
+                if let DeadlockAction::Detected =
+                    check_deadlock_and_restore(state.deadlock_state(), &snapshot)
+                {
+                    state.set_error(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "pipeline deadlock detected with recovery disabled; \
+                         use --deadlock-recover to enable automatic recovery",
+                    ));
+                    break;
+                }
             }
         }
     }
