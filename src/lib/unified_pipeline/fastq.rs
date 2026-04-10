@@ -1904,6 +1904,10 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipe
         self.output.write_reorder_state.can_proceed(serial)
     }
 
+    fn write_reorder_is_memory_high(&self) -> bool {
+        self.output.write_reorder_state.is_memory_high()
+    }
+
     fn stats(&self) -> Option<&PipelineStats> {
         self.output.stats.as_deref()
     }
@@ -3559,8 +3563,9 @@ where
             output_high: self.state.output.compressed.len() > cap * 3 / 4,
             input_low: self.state.q0_chunks.len() < cap / 4,
             read_done,
-            memory_high: false, // Per-stream pipeline uses bounded queues for backpressure
-            memory_drained: true,
+            memory_high: !self.state.is_draining()
+                && self.state.output.write_reorder_state.is_memory_high(),
+            memory_drained: self.state.output.write_reorder_state.is_memory_drained(),
         }
     }
 
@@ -5348,5 +5353,76 @@ mod tests {
         assert!(state.r1_suffix_bytes.is_empty());
         assert!(state.r2_suffix_bytes.is_empty());
         assert_eq!(state.serial_out, 0);
+    }
+
+    /// Helper to create a minimal FASTQ pipeline state for backpressure tests.
+    fn make_fastq_state() -> FastqPipelineState<Cursor<Vec<u8>>, Vec<u8>> {
+        let config = FastqPipelineConfig::new(2, false, 6);
+        let readers = vec![StreamReader::Decompressed(Cursor::new(Vec::new()))];
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        FastqPipelineState::new(config, readers, output)
+    }
+
+    /// Verify that the FASTQ pipeline's scheduler backpressure reports memory
+    /// state from the write reorder buffer, matching the BAM pipeline's behavior.
+    ///
+    /// When the write reorder buffer is above its memory threshold, the scheduler
+    /// must see `memory_high: true` so it can redirect threads to drain Compress→Write.
+    /// Without this, threads pile up on upstream steps while nobody does output work.
+    #[test]
+    fn test_fastq_backpressure_reports_write_reorder_memory() {
+        let state = make_fastq_state();
+        let header = Header::default();
+        let process_fn = |_t: FastqTemplate| -> io::Result<Vec<u8>> { Ok(Vec::new()) };
+        let serialize_fn =
+            |_p: Vec<u8>, _h: &Header, _buf: &mut Vec<u8>| -> io::Result<u64> { Ok(0) };
+
+        let ctx = FastqStepContext {
+            state: &state,
+            header: &header,
+            process_fn: &process_fn,
+            serialize_fn: &serialize_fn,
+            is_reader: false,
+        };
+
+        let active = ActiveSteps::all();
+        let worker = FastqWorkerState::new(6, 0, 2, SchedulerStrategy::default(), active);
+
+        // Initially: memory should not be high
+        let bp = ctx.get_backpressure(&worker);
+        assert!(!bp.memory_high, "memory_high should be false when write reorder buffer is empty");
+        assert!(
+            bp.memory_drained,
+            "memory_drained should be true when write reorder buffer is empty"
+        );
+
+        // Push write reorder buffer above its threshold (512 MB default)
+        let threshold = BACKPRESSURE_THRESHOLD_BYTES;
+        state.output.write_reorder_state.add_heap_bytes(threshold + 1);
+
+        let bp = ctx.get_backpressure(&worker);
+        assert!(
+            bp.memory_high,
+            "memory_high should be true when write reorder buffer exceeds limit"
+        );
+        assert!(
+            !bp.memory_drained,
+            "memory_drained should be false when write reorder buffer exceeds limit"
+        );
+
+        // When draining, memory_high should be suppressed (same as BAM pipeline)
+        state.output.set_draining(true);
+        let bp = ctx.get_backpressure(&worker);
+        assert!(!bp.memory_high, "memory_high should be false during drain even with high memory");
+
+        // Drain memory below low-water mark (50% of threshold)
+        state.output.write_reorder_state.sub_heap_bytes(threshold + 1);
+        state.output.set_draining(false);
+        let bp = ctx.get_backpressure(&worker);
+        assert!(!bp.memory_high, "memory_high should be false after draining memory");
+        assert!(
+            bp.memory_drained,
+            "memory_drained should be true after draining below low-water mark"
+        );
     }
 }

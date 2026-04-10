@@ -2568,6 +2568,10 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> OutputPipelineState
         // Deadlock tracking handled by caller if needed
     }
 
+    fn write_reorder_is_memory_high(&self) -> bool {
+        self.write_reorder_state.is_memory_high()
+    }
+
     fn stats(&self) -> Option<&PipelineStats> {
         self.stats.as_deref()
     }
@@ -4210,16 +4214,39 @@ pub trait OutputPipelineState: Send + Sync {
     /// Record progress when pushing to compressed queue (Q7).
     fn record_q7_push_progress(&self) {}
 
-    /// Check whether the compress step can push a batch with the given serial to Q6.
+    /// Serial-aware admission check for the write reorder buffer.
     ///
-    /// Delegates to the write reorder buffer's admission control state. Returns
-    /// `false` when the write reorder buffer is over its memory threshold and the
-    /// serial is not the one the write step is currently waiting for. Workers that
-    /// receive `false` should hold the batch and retry (same pattern as Q2/Q3).
+    /// Returns `false` when the write reorder buffer is over its memory
+    /// threshold and the given `serial` is not the one Write is currently
+    /// waiting for.
+    ///
+    /// **Scheduler-only signal — NOT a per-step gate on Compress/Serialize.**
+    /// Q5 is fed by parallel Serialize workers and is not serial-ordered, so
+    /// blocking Compress on this check can trap the missing `next_seq` in Q5
+    /// and deadlock Write: the batch Write needs may still be sitting in Q5
+    /// awaiting compression. Compress is gated only on physical Q6 capacity;
+    /// see also [`write_reorder_is_memory_high`](Self::write_reorder_is_memory_high),
+    /// which is consulted at the scheduler level to redirect threads toward
+    /// draining Compress/Write under memory pressure.
     ///
     /// Default implementation always returns `true` (no backpressure).
     fn write_reorder_can_proceed(&self, _serial: u64) -> bool {
         true
+    }
+
+    /// Check if the write reorder buffer memory is at the backpressure threshold.
+    ///
+    /// Used by the scheduler (not the Compress step) to signal that it should
+    /// redirect threads toward draining Compress/Write. This is NOT safe to use
+    /// as a per-step gate on Compress because Q5 is fed by parallel Serialize
+    /// workers and is not serial-ordered: blocking Q5 pops on memory-high alone
+    /// can trap the missing `next_seq` in Q5 and deadlock Write. See also
+    /// [`write_reorder_can_proceed`](Self::write_reorder_can_proceed), which
+    /// carries the same scheduler-only caveat.
+    ///
+    /// Default implementation returns `false` (no backpressure).
+    fn write_reorder_is_memory_high(&self) -> bool {
+        false
     }
 
     // Stats access (optional, with default no-op implementation)
@@ -4619,17 +4646,10 @@ pub trait HasHeldBoundaries<B> {
 /// It takes data from Q5, compresses it using the worker's compressor,
 /// and pushes the resulting blocks to Q6.
 ///
-/// # Non-Blocking Behavior
+/// # Non-Blocking Design
 ///
-/// Instead of blocking when Q6 is full, this function:
-/// 1. First tries to advance any held compressed batch from a previous attempt
-/// 2. If held batch can't be advanced, **continues** to process new work
-///    (the next-seq batch may be in Q5 and must be compressed to unblock Write)
-/// 3. Pushes the result or holds it for the next attempt
-///
-/// This prevents deadlock by ensuring workers can always compress the
-/// next-in-sequence batch even when holding an out-of-order batch that
-/// is blocked by write reorder buffer backpressure.
+/// Uses the held-item pattern to prevent deadlock. If the output queue is full,
+/// the batch is stored in the worker's held slot and the function returns immediately.
 pub fn shared_try_step_compress<S, W>(state: &S, worker: &mut W) -> StepResult
 where
     S: OutputPipelineState,
@@ -4638,40 +4658,38 @@ where
     // =========================================================================
     // Priority 1: Try to advance any held compressed batch
     // =========================================================================
-    let held_blocked = if let Some((serial, held, heap_size)) = worker.held_compressed_mut().take()
-    {
-        if state.write_reorder_can_proceed(serial) {
-            match state.q6_push((serial, held)) {
-                Ok(()) => {
-                    // Successfully advanced held item, continue to process more
-                    state.record_q7_push_progress();
-                    false
-                }
-                Err((serial, held)) => {
-                    // Q6 physically full — hold and return, nothing more we can do
-                    let heap_size = held.estimate_heap_size();
-                    *worker.held_compressed_mut() = Some((serial, held, heap_size));
-                    return StepResult::OutputFull;
-                }
+    // Push unconditionally — only physical queue capacity can block.
+    // See Decompress Priority 1 in bam.rs for rationale.
+    let mut advanced_held = false;
+    if let Some((serial, held, _heap_size)) = worker.held_compressed_mut().take() {
+        match state.q6_push((serial, held)) {
+            Ok(()) => {
+                state.record_q7_push_progress();
+                advanced_held = true;
             }
-        } else {
-            // Can't advance — put it back but do NOT return early.
-            // We must continue to Priority 3 so the next-seq batch in Q5
-            // can still be popped and compressed, breaking the deadlock.
-            *worker.held_compressed_mut() = Some((serial, held, heap_size));
-            true
+            Err((serial, held)) => {
+                let heap_size = held.estimate_heap_size();
+                *worker.held_compressed_mut() = Some((serial, held, heap_size));
+                return StepResult::OutputFull;
+            }
         }
-    } else {
-        false
-    };
+    }
 
     // =========================================================================
-    // Priority 2: Check if output queue has space (soft check)
+    // Priority 2: Check physical capacity
     // =========================================================================
-    // When we're holding a blocked item, skip this check — we must still
-    // try to compress the next-seq batch to break the deadlock.
-    if !held_blocked && state.q6_is_full() {
-        return StepResult::OutputFull;
+    // Only gate on Q6's physical capacity. We intentionally do NOT gate on
+    // `write_reorder_is_memory_high()` here: unlike Decompress/Decode (which
+    // consume the FIFO Q1), Q5 is fed by parallel Serialize workers and is
+    // NOT serial-ordered. If the write reorder buffer is memory-high because
+    // later serials are buffered waiting for a missing `next_seq`, that
+    // missing serial may still be sitting in Q5 awaiting compression — and
+    // blocking Q5 pops would trap it there, deadlocking Write. Memory
+    // backpressure on the write side is applied at the scheduler level
+    // (`BackpressureState::memory_high`), which redirects threads to drain
+    // Compress/Write rather than stopping them.
+    if state.q6_is_full() {
+        return if advanced_held { StepResult::Success } else { StepResult::OutputFull };
     }
 
     // =========================================================================
@@ -4681,7 +4699,7 @@ where
         if let Some(stats) = state.stats() {
             stats.record_queue_empty(6);
         }
-        return if held_blocked { StepResult::OutputFull } else { StepResult::InputEmpty };
+        return if advanced_held { StepResult::Success } else { StepResult::InputEmpty };
     };
     state.record_q6_pop_progress();
 
@@ -4723,34 +4741,20 @@ where
     // =========================================================================
     // Priority 5: Try to push result
     // =========================================================================
-    if !held_blocked && !state.write_reorder_can_proceed(serial) {
-        let heap_size = batch.estimate_heap_size();
-        *worker.held_compressed_mut() = Some((serial, batch, heap_size));
-        return StepResult::OutputFull;
-    }
-    // When held_blocked is true, we bypass the can_proceed check for the new
-    // batch — we must push it to Q6 to avoid deadlock. The held item already
-    // occupies the worker's slot, so the only way to make progress is to push
-    // this freshly compressed batch directly to Q6.
     match state.q6_push((serial, batch)) {
         Ok(()) => {
             state.record_q7_push_progress();
             StepResult::Success
         }
         Err((serial, batch)) => {
-            if held_blocked {
-                // Already holding a blocked batch — cannot store two batches.
-                // This means Q6 is physically full despite bypassing the soft
-                // check, which shouldn't happen with adequate queue sizing.
-                state.set_error(io::Error::other(
-                    "compress: output queue full while holding a blocked batch",
-                ));
-                return StepResult::OutputFull;
-            }
-            // Output full - hold the result for next attempt
+            // Output full - hold the result for next attempt. If Priority 1
+            // already pushed a held batch earlier in this iteration, report
+            // Success so the scheduler credits the forward progress; the
+            // fresh batch lost a TOCTOU race against Q6 but the held-batch
+            // drain did happen.
             let heap_size = batch.estimate_heap_size();
             *worker.held_compressed_mut() = Some((serial, batch, heap_size));
-            StepResult::OutputFull
+            if advanced_held { StepResult::Success } else { StepResult::OutputFull }
         }
     }
 }
@@ -5135,7 +5139,9 @@ pub trait WritePipelineState: Send + Sync {
     /// Get reference to the write reorder buffer admission-control state.
     ///
     /// Used by `shared_try_step_write_new` to track heap bytes and `next_seq`
-    /// so that `write_reorder_can_proceed` in the compress step stays accurate.
+    /// so that the scheduler-level `write_reorder_is_memory_high` signal (and
+    /// the `write_reorder_can_proceed` helper — both scheduler-only, not
+    /// consumed by Compress/Serialize) stay accurate.
     fn write_reorder_state(&self) -> &ReorderBufferState;
 
     /// Check if an error has occurred.
@@ -6140,6 +6146,9 @@ mod tests {
         fn write_reorder_can_proceed(&self, serial: u64) -> bool {
             self.reorder.can_proceed(serial)
         }
+        fn write_reorder_is_memory_high(&self) -> bool {
+            self.reorder.is_memory_high()
+        }
     }
 
     /// Mock worker for testing `shared_try_step_compress`.
@@ -6184,50 +6193,47 @@ mod tests {
 
     /// Regression test: held out-of-order batch must not prevent compressing
     /// the next-in-sequence batch from Q5.
+    /// Held batch pushes unconditionally at Priority 1, then the worker
+    /// processes new input. Both batches end up in Q6.
     ///
     /// Scenario:
-    /// 1. Write reorder buffer expects serial 0 (`next_seq`=0)
-    /// 2. Worker holds serial 5 (blocked by backpressure — `heap_bytes` over 50%)
-    /// 3. Q5 contains serial 0 (the one Write needs)
+    /// 1. Worker holds serial 5 (would have been blocked by memory backpressure)
+    /// 2. Q5 contains serial 0
+    /// 3. Q6 has room for both
     ///
-    /// Before fix: returns `OutputFull` immediately at Priority 1 — serial 0
-    /// sits in Q5 forever, causing deadlock.
-    ///
-    /// After fix: continues past Priority 1, pops serial 0, compresses it,
-    /// and pushes it to Q6 (since `write_reorder_can_proceed(0)` == true).
+    /// Result: serial 5 pushed at Priority 1, serial 0 compressed and pushed
+    /// at Priority 5. Worker's held slot is empty.
     #[test]
-    fn test_compress_held_item_does_not_block_next_seq() {
-        // memory_limit=1000 → backpressure at 500
+    fn test_compress_held_pushes_unconditionally() {
         let state = MockCompressState::new(8, 1000);
 
-        // Push heap_bytes over 50% threshold so non-next-seq serials are blocked
+        // Push heap_bytes over 50% threshold (would have blocked non-next-seq)
         state.reorder.add_heap_bytes(600);
 
-        // Put the next-seq batch (serial 0) in Q5
+        // Put serial 0 in Q5
         let batch_0 =
             SerializedBatch { data: vec![0u8; 10], record_count: 1, secondary_data: None };
         assert!(state.q5.push((0, batch_0)).is_ok());
 
         let mut worker = MockCompressWorker::new();
-
-        // Worker holds serial 5 — blocked because 5 != next_seq(0) and heap > 500
         let held_batch = CompressedBlockBatch::new();
         worker.held_compressed = Some((5, held_batch, 100));
 
-        // Call compress — this MUST process serial 0 from Q5 even though serial 5 is stuck
         let result = shared_try_step_compress(&state, &mut worker);
 
-        // The function should have made progress (compressed serial 0)
-        assert_eq!(result, StepResult::Success, "should compress serial 0 despite held serial 5");
+        assert_eq!(result, StepResult::Success, "should succeed");
 
-        // Serial 0 should now be in Q6
-        let popped = state.q6.pop();
-        assert!(popped.is_some(), "serial 0 should be in Q6");
-        assert_eq!(popped.unwrap().0, 0, "the batch in Q6 should be serial 0");
+        // Serial 5 was pushed first (Priority 1), then serial 0 (Priority 5)
+        let first = state.q6.pop();
+        assert!(first.is_some(), "Q6 should have serial 5");
+        assert_eq!(first.unwrap().0, 5);
 
-        // Worker should still hold serial 5 (it couldn't be advanced)
-        assert!(worker.held_compressed.is_some(), "serial 5 should still be held");
-        assert_eq!(worker.held_compressed.as_ref().unwrap().0, 5);
+        let second = state.q6.pop();
+        assert!(second.is_some(), "Q6 should have serial 0");
+        assert_eq!(second.unwrap().0, 0);
+
+        // Worker's held slot should be empty
+        assert!(worker.held_compressed.is_none(), "held slot should be empty");
     }
 
     /// Verify that when the held item IS the `next_seq`, it gets advanced normally.
@@ -6270,41 +6276,249 @@ mod tests {
         assert_eq!(result, StepResult::InputEmpty);
     }
 
-    /// Regression test: when `held_blocked` is true and Q6 is physically full,
-    /// the original held batch must NOT be overwritten by the freshly compressed
-    /// batch. Instead, the function should set an error (we can't hold two batches).
+    /// When Q6 is physically full and the worker holds a compressed batch,
+    /// Priority 1 fails to push and the function returns `OutputFull` without
+    /// popping Q5.
     #[test]
-    fn test_compress_held_blocked_q6_full_no_data_loss() {
+    fn test_compress_held_blocked_by_full_q6() {
         // capacity=1 → Q6 will be full after one push
         let state = MockCompressState::new(1, 1000);
 
-        // Push heap_bytes over 50% threshold so non-next-seq serials are blocked
-        state.reorder.add_heap_bytes(600);
-
-        // Fill Q6 with a dummy batch so the push at Priority 5 will fail
+        // Fill Q6 so it is physically full
         let dummy = CompressedBlockBatch::new();
         assert!(state.q6.push((99, dummy)).is_ok());
 
-        // Put the next-seq batch (serial 0) in Q5
+        // Put a batch in Q5
         let batch_0 =
             SerializedBatch { data: vec![0u8; 10], record_count: 1, secondary_data: None };
         assert!(state.q5.push((0, batch_0)).is_ok());
 
         let mut worker = MockCompressWorker::new();
-        // Worker holds serial 5 — blocked because 5 != next_seq(0) and heap > 500
         let held_batch = CompressedBlockBatch::new();
         worker.held_compressed = Some((5, held_batch, 100));
 
         let result = shared_try_step_compress(&state, &mut worker);
 
-        // Should set an error — Q6 is full and we can't hold two batches
-        assert!(state.has_error(), "should set error when Q6 full and held_blocked");
+        assert!(!state.has_error(), "should NOT set error");
 
-        // Original held batch (serial 5) must still be there — not overwritten
-        assert!(worker.held_compressed.is_some(), "original held batch should be preserved");
+        // Held batch should still be there — Priority 1 push failed
+        assert!(worker.held_compressed.is_some(), "held batch should be preserved");
         assert_eq!(worker.held_compressed.as_ref().unwrap().0, 5, "serial 5 should still be held");
 
-        // Return value should indicate output full
+        // Q5 should NOT have been drained
+        assert!(!state.q5.is_empty(), "Q5 should not have been popped");
+
         assert_eq!(result, StepResult::OutputFull);
+    }
+
+    /// Regression test: Compress must pop Q5 even when the write reorder
+    /// buffer is memory-high. Q5 is fed by parallel Serialize workers so it is
+    /// NOT serial-ordered; blocking pops based on write reorder memory alone
+    /// can trap `next_seq` in Q5 forever — Write can't drain the reorder heap
+    /// because the missing serial is still sitting in Q5 waiting to be
+    /// compressed.
+    ///
+    /// Scenario:
+    /// 1. `write_reorder_state.heap_bytes` is over the memory-high threshold
+    ///    (simulating later serials buffered in the write reorder heap).
+    /// 2. `next_seq = 0` — Write is waiting for serial 0 to drain the heap.
+    /// 3. Q5 contains serial 0 (produced by a Serialize worker, not yet
+    ///    compressed).
+    /// 4. Worker has no held batch; Q6 has plenty of room.
+    ///
+    /// Required behavior: Compress must pop serial 0 from Q5, compress it,
+    /// and push it to Q6 so Write can eventually make progress. The previous
+    /// implementation returned `OutputFull` here and deadlocked.
+    #[test]
+    fn test_compress_memory_high_does_not_block_new_work() {
+        let state = MockCompressState::new(8, 1000);
+
+        // Drive heap_bytes over the is_memory_high threshold (>= memory_limit).
+        // This simulates the write reorder buffer holding later serials while
+        // waiting for the missing next_seq.
+        state.reorder.add_heap_bytes(1200);
+        assert!(state.write_reorder_is_memory_high(), "precondition: reorder must be memory-high");
+
+        // next_seq = 0 (Write is waiting for serial 0).
+        assert_eq!(state.reorder.next_seq.load(Ordering::SeqCst), 0);
+
+        // Q5 contains the missing next_seq. Q5 is unordered across parallel
+        // Serialize workers, so this is the only path by which Compress can
+        // produce serial 0.
+        let batch_0 =
+            SerializedBatch { data: vec![0u8; 32], record_count: 1, secondary_data: None };
+        assert!(state.q5.push((0, batch_0)).is_ok());
+
+        // No held batch, Q6 has capacity.
+        let mut worker = MockCompressWorker::new();
+        assert!(worker.held_compressed.is_none());
+
+        let result = shared_try_step_compress(&state, &mut worker);
+
+        assert!(!state.has_error(), "should NOT set error");
+        assert_eq!(
+            result,
+            StepResult::Success,
+            "Compress must proceed past memory-high; Q5 is not serial-ordered so \
+             blocking here deadlocks Write"
+        );
+        assert!(state.q5.is_empty(), "Q5 should have been drained");
+
+        let pushed = state.q6.pop();
+        assert!(pushed.is_some(), "serial 0 should have been compressed into Q6");
+        assert_eq!(pushed.unwrap().0, 0, "pushed serial should be 0 (the waited-for next_seq)");
+    }
+
+    // ========================================================================
+    // shared_try_step_compress TOCTOU race regression tests
+    // ========================================================================
+
+    /// Mock state that can simulate a TOCTOU race between Priority 2's
+    /// `q6_is_full` check and Priority 5's `q6_push`: `q6_is_full` always
+    /// reports `false` so the function reaches P5, and `q6_push` accepts a
+    /// bounded number of pushes before returning `Err` to simulate another
+    /// thread filling Q6 mid-iteration.
+    struct MockToctouCompressState {
+        q5: ArrayQueue<(u64, SerializedBatch)>,
+        q6_items: std::sync::Mutex<Vec<(u64, CompressedBlockBatch)>>,
+        q6_push_budget: std::sync::atomic::AtomicUsize,
+        reorder: ReorderBufferState,
+        error: std::sync::Mutex<Option<io::Error>>,
+    }
+
+    impl MockToctouCompressState {
+        fn new(q5_capacity: usize, q6_push_budget: usize) -> Self {
+            Self {
+                q5: ArrayQueue::new(q5_capacity),
+                q6_items: std::sync::Mutex::new(Vec::new()),
+                q6_push_budget: std::sync::atomic::AtomicUsize::new(q6_push_budget),
+                reorder: ReorderBufferState::new(1024),
+                error: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl OutputPipelineState for MockToctouCompressState {
+        type Processed = Vec<u8>;
+
+        fn has_error(&self) -> bool {
+            self.error.lock().unwrap().is_some()
+        }
+        fn set_error(&self, error: io::Error) {
+            *self.error.lock().unwrap() = Some(error);
+        }
+        fn q5_pop(&self) -> Option<(u64, SerializedBatch)> {
+            self.q5.pop()
+        }
+        fn q5_push(&self, item: (u64, SerializedBatch)) -> Result<(), (u64, SerializedBatch)> {
+            self.q5.push(item)
+        }
+        fn q5_is_full(&self) -> bool {
+            self.q5.is_full()
+        }
+        fn q6_pop(&self) -> Option<(u64, CompressedBlockBatch)> {
+            self.q6_items.lock().unwrap().pop()
+        }
+        fn q6_push(
+            &self,
+            item: (u64, CompressedBlockBatch),
+        ) -> Result<(), (u64, CompressedBlockBatch)> {
+            let decremented =
+                self.q6_push_budget.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                    if x > 0 { Some(x - 1) } else { None }
+                });
+            if decremented.is_ok() {
+                self.q6_items.lock().unwrap().push(item);
+                Ok(())
+            } else {
+                Err(item)
+            }
+        }
+        fn q6_is_full(&self) -> bool {
+            // Always report capacity available — this is the TOCTOU snapshot
+            // that lets the function proceed past Priority 2 to Priority 5.
+            false
+        }
+        fn q6_reorder_insert(&self, _serial: u64, _batch: CompressedBlockBatch) {}
+        fn q6_reorder_try_pop_next(&self) -> Option<CompressedBlockBatch> {
+            None
+        }
+        fn output_try_lock(
+            &self,
+        ) -> Option<parking_lot::MutexGuard<'_, Option<Box<dyn Write + Send>>>> {
+            None
+        }
+        fn increment_written(&self) -> u64 {
+            0
+        }
+        fn write_reorder_can_proceed(&self, serial: u64) -> bool {
+            self.reorder.can_proceed(serial)
+        }
+        fn write_reorder_is_memory_high(&self) -> bool {
+            self.reorder.is_memory_high()
+        }
+    }
+
+    /// Regression test: `shared_try_step_compress` must preserve Priority 1
+    /// progress when Priority 5 loses a TOCTOU race against Q6.
+    ///
+    /// Scenario:
+    /// 1. Worker holds compressed serial 5 — P1 pushes it successfully
+    ///    (consuming the mock's single-push budget).
+    /// 2. `q6_is_full()` reports false so P2 proceeds.
+    /// 3. P3 pops serial 0 from Q5 and P4 compresses it.
+    /// 4. P5's `q6_push` fails (budget exhausted — simulating another
+    ///    thread filling Q6 between the P2 snapshot and the P5 push).
+    ///
+    /// Required: the function returns `StepResult::Success` because P1 made
+    /// forward progress. Before the fix, the P5 `Err` branch unconditionally
+    /// returned `OutputFull`, which `try_step_compress` collapsed via
+    /// `is_success()` to `false`, telling the scheduler the iteration was
+    /// idle and discarding P1's progress signal.
+    #[test]
+    fn test_compress_advanced_held_survives_p5_toctou_failure() {
+        let state = MockToctouCompressState::new(8, 1);
+
+        // Q5 has the fresh batch that P3 will pop.
+        let batch_0 =
+            SerializedBatch { data: vec![0u8; 32], record_count: 1, secondary_data: None };
+        assert!(state.q5.push((0, batch_0)).is_ok());
+
+        // Worker holds a compressed batch (non-next-seq serial 5) that P1
+        // will drain into the mock Q6, consuming the budget.
+        let mut worker = MockCompressWorker::new();
+        let held_batch = CompressedBlockBatch::new();
+        worker.held_compressed = Some((5, held_batch, 100));
+
+        let result = shared_try_step_compress(&state, &mut worker);
+
+        assert!(!state.has_error(), "should NOT set error");
+
+        // P1 successfully pushed serial 5 into Q6.
+        let pushes = state.q6_items.lock().unwrap();
+        assert_eq!(pushes.len(), 1, "P1 should have pushed exactly one item into Q6");
+        assert_eq!(pushes[0].0, 5, "P1 should have pushed the held serial 5");
+        drop(pushes);
+
+        // Q5 was drained (P3 popped serial 0).
+        assert!(state.q5.is_empty(), "Q5 should have been drained at P3");
+
+        // P5's push of the fresh serial 0 lost the simulated race → it is
+        // now sitting in the worker's held slot for the next iteration.
+        let held = worker
+            .held_compressed
+            .as_ref()
+            .expect("fresh batch must be held after P5 TOCTOU failure");
+        assert_eq!(held.0, 0, "the held fresh batch should be serial 0");
+
+        // The key assertion: the iteration must report Success, not
+        // OutputFull. P1 made forward progress (drained a held batch into
+        // Q6) and the scheduler must see that, or it will treat the
+        // iteration as idle and lose the signal.
+        assert_eq!(
+            result,
+            StepResult::Success,
+            "P1's successful held-batch push must survive a P5 TOCTOU failure"
+        );
     }
 }
