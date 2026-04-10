@@ -975,9 +975,9 @@ impl Extract {
 
                 // Validate read names match (synchronized mode defers this from Group step)
                 if template.records.len() >= 2 {
-                    let base_name = strip_read_suffix_extract(&template.records[0].name);
+                    let base_name = strip_read_suffix_extract(template.records[0].name());
                     for (i, record) in template.records.iter().enumerate().skip(1) {
-                        let other_base = strip_read_suffix_extract(&record.name);
+                        let other_base = strip_read_suffix_extract(record.name());
                         if base_name != other_base {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -995,9 +995,9 @@ impl Extract {
                 let mut fastq_sets: Vec<FastqSet> = Vec::with_capacity(template.records.len());
                 for (record, rs) in template.records.iter().zip(read_structures.iter()) {
                     let fastq_set = FastqSet::from_record_with_structure(
-                        &record.name,
-                        &record.sequence,
-                        &record.quality,
+                        record.name(),
+                        record.sequence(),
+                        record.quality(),
                         rs,
                         &[], // No skip reasons
                     )
