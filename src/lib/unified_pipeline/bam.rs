@@ -1784,6 +1784,10 @@ fn try_step_read<G: Send, P: Send + MemoryEstimate>(
 /// Before pushing to `q2_decompressed`, checks if the Q2 reorder buffer would accept
 /// this serial number. This prevents unbounded memory growth in the reorder buffer
 /// while avoiding deadlock by always accepting the serial that `FindBoundaries` needs.
+///
+/// When a held item is blocked by backpressure, the function continues to
+/// Priority 3 so the next-in-sequence batch can still be popped and processed,
+/// breaking potential deadlocks where every thread holds an out-of-order batch.
 fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
     state: &BamPipelineState<G, P>,
     worker: &mut WorkerState<P>,
@@ -1792,36 +1796,44 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
     // Priority 1: Try to advance any held decompressed batch first
     // =========================================================================
     // Held items had their heap_size released when held. Re-reserve before checking.
-    if let Some((serial, held, heap_size)) = worker.held_decompressed.take() {
+    let held_blocked = if let Some((serial, held, heap_size)) = worker.held_decompressed.take() {
         // Re-reserve memory for this held batch
         state.q2_reorder_state.add_heap_bytes(heap_size as u64);
 
         // Check memory-based backpressure before trying to push
-        if !state.can_decompress_proceed(serial) {
-            // Reorder buffer is over limit - release reservation and hold again
+        if state.can_decompress_proceed(serial) {
+            match state.q2_decompressed.push((serial, held)) {
+                Ok(()) => {
+                    // Successfully pushed - keep reservation (released by FindBoundaries when popping)
+                    state.batches_decompressed.fetch_add(1, Ordering::Release);
+                    state.deadlock_state.record_q2_push();
+                    false
+                }
+                Err((serial, held)) => {
+                    // Q2 physically full - release reservation and hold
+                    state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
+                    worker.held_decompressed = Some((serial, held, heap_size));
+                    return false;
+                }
+            }
+        } else {
+            // Reorder buffer is over limit - release reservation and hold again,
+            // but do NOT return early. Continue to Priority 3 so the next-seq
+            // batch in Q1 can still be popped and decompressed.
             state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
             worker.held_decompressed = Some((serial, held, heap_size));
-            return false;
+            true
         }
-        match state.q2_decompressed.push((serial, held)) {
-            Ok(()) => {
-                // Successfully pushed - keep reservation (released by FindBoundaries when popping)
-                state.batches_decompressed.fetch_add(1, Ordering::Release);
-                state.deadlock_state.record_q2_push();
-            }
-            Err((serial, held)) => {
-                // Can't push - release reservation and hold
-                state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
-                worker.held_decompressed = Some((serial, held, heap_size));
-                return false;
-            }
-        }
-    }
+    } else {
+        false
+    };
 
     // =========================================================================
     // Priority 2: Check if output queue has space (soft check)
     // =========================================================================
-    if state.q2_decompressed.is_full() {
+    // When holding a blocked item, skip this check — we must still try to
+    // decompress the next-seq batch to break the deadlock.
+    if !held_blocked && state.q2_decompressed.is_full() {
         return false;
     }
 
@@ -1881,7 +1893,10 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
     // =========================================================================
     // Priority 5: Check memory backpressure and try to push result
     // =========================================================================
-    if !state.can_decompress_proceed(serial) {
+    // When held_blocked is true, bypass the can_proceed check — we must push
+    // this batch to Q2 to avoid deadlock. The held item already occupies the
+    // worker's slot, so the only way to make progress is to push directly.
+    if !held_blocked && !state.can_decompress_proceed(serial) {
         // Over limit - release reservation and hold
         state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
         worker.held_decompressed = Some((serial, batch, heap_size));
@@ -1894,6 +1909,15 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
             state.batches_decompressed.fetch_add(1, Ordering::Release);
             state.deadlock_state.record_q2_push();
             true
+        }
+        Err((_serial, _batch)) if held_blocked => {
+            // Already holding a blocked batch — cannot store two batches.
+            // Release the memory reservation for the new batch and set an error.
+            state.q2_reorder_state.sub_heap_bytes(heap_size as u64);
+            state.set_error(std::io::Error::other(
+                "decompress: output queue full while holding a blocked batch",
+            ));
+            false
         }
         Err((serial, batch)) => {
             // Output full - release reservation and hold
@@ -2108,6 +2132,10 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
 /// Before pushing to `q3_decoded`, checks if the Q3 reorder buffer would accept
 /// this serial number. This prevents unbounded memory growth in the reorder buffer
 /// while avoiding deadlock by always accepting the serial that Group is waiting for.
+///
+/// When a held item is blocked by backpressure, the function continues to
+/// Priority 3 so the next-in-sequence batch can still be popped and decoded,
+/// breaking potential deadlocks where every thread holds an out-of-order batch.
 fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     state: &BamPipelineState<G, P>,
     worker: &mut WorkerState<P>,
@@ -2116,36 +2144,44 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
     // Priority 1: Try to advance any held decoded batch first
     // =========================================================================
     // Held items had their heap_size released when held. Re-reserve before checking.
-    if let Some((serial, held, heap_size)) = worker.held_decoded.take() {
+    let held_blocked = if let Some((serial, held, heap_size)) = worker.held_decoded.take() {
         // Re-reserve memory for this held batch
         state.q3_reorder_state.add_heap_bytes(heap_size as u64);
 
         // Check memory-based backpressure before trying to push
-        if !state.can_decode_proceed(serial) {
-            // Reorder buffer is over limit - release reservation and hold again
+        if state.can_decode_proceed(serial) {
+            match state.q3_decoded.push((serial, held)) {
+                Ok(()) => {
+                    // Successfully pushed - keep reservation (released by Group when popping)
+                    state.batches_decoded.fetch_add(1, Ordering::Release);
+                    state.deadlock_state.record_q3_push();
+                    false
+                }
+                Err((serial, held)) => {
+                    // Q3 physically full - release reservation and hold
+                    state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
+                    worker.held_decoded = Some((serial, held, heap_size));
+                    return false;
+                }
+            }
+        } else {
+            // Reorder buffer is over limit - release reservation and hold again,
+            // but do NOT return early. Continue to Priority 3 so the next-seq
+            // batch in Q2b can still be popped and decoded.
             state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
             worker.held_decoded = Some((serial, held, heap_size));
-            return false;
+            true
         }
-        match state.q3_decoded.push((serial, held)) {
-            Ok(()) => {
-                // Successfully pushed - keep reservation (released by Group when popping)
-                state.batches_decoded.fetch_add(1, Ordering::Release);
-                state.deadlock_state.record_q3_push();
-            }
-            Err((serial, held)) => {
-                // Can't push - release reservation and hold
-                state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
-                worker.held_decoded = Some((serial, held, heap_size));
-                return false;
-            }
-        }
-    }
+    } else {
+        false
+    };
 
     // =========================================================================
     // Priority 2: Check if output queue has space
     // =========================================================================
-    if state.q3_decoded.is_full() {
+    // When holding a blocked item, skip this check — we must still try to
+    // decode the next-seq batch to break the deadlock.
+    if !held_blocked && state.q3_decoded.is_full() {
         return false;
     }
 
@@ -2184,7 +2220,10 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
             // =========================================================================
             // Priority 5: Check memory backpressure and try to push result
             // =========================================================================
-            if !state.can_decode_proceed(serial) {
+            // When held_blocked is true, bypass the can_proceed check — we must push
+            // this batch to Q3 to avoid deadlock. The held item already occupies the
+            // worker's slot, so the only way to make progress is to push directly.
+            if !held_blocked && !state.can_decode_proceed(serial) {
                 // Over limit - release reservation and hold
                 state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
                 worker.held_decoded = Some((serial, records, heap_size));
@@ -2197,6 +2236,15 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
                     state.batches_decoded.fetch_add(1, Ordering::Release);
                     state.deadlock_state.record_q3_push();
                     true
+                }
+                Err((_serial, _records)) if held_blocked => {
+                    // Already holding a blocked batch — cannot store two batches.
+                    // Release the memory reservation for the new batch and set an error.
+                    state.q3_reorder_state.sub_heap_bytes(heap_size as u64);
+                    state.set_error(std::io::Error::other(
+                        "decode: output queue full while holding a blocked batch",
+                    ));
+                    false
                 }
                 Err((serial, records)) => {
                     // Output full - release reservation and hold
