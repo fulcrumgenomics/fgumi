@@ -5,7 +5,7 @@
 [![codecov](https://codecov.io/gh/fulcrumgenomics/fgumi/graph/badge.svg)](https://codecov.io/gh/fulcrumgenomics/fgumi)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/fgumi.svg?label=bioconda)](https://bioconda.github.io/recipes/fgumi/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/fgumi/blob/main/LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18702474.svg)](https://doi.org/10.5281/zenodo.18702474)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18702470.svg)](https://doi.org/10.5281/zenodo.18702470)
 
 # fgumi
 
