@@ -35,7 +35,9 @@ use super::base::{
     generic_worker_loop, handle_worker_panic, join_monitor_thread, join_worker_threads,
     shared_try_step_compress,
 };
-use super::deadlock::{DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
+use super::deadlock::{
+    DeadlockAction, DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore,
+};
 use super::scheduler::{BackpressureState, SchedulerStrategy};
 use crate::read_info::{LibraryIndex, compute_group_key};
 use crate::sort::bam_fields;
@@ -3479,7 +3481,16 @@ where
                     if deadlock_check_counter >= 10 {
                         deadlock_check_counter = 0;
                         let snapshot = state_clone.build_queue_snapshot();
-                        check_deadlock_and_restore(&state_clone.deadlock_state, &snapshot);
+                        if let DeadlockAction::Detected =
+                            check_deadlock_and_restore(&state_clone.deadlock_state, &snapshot)
+                        {
+                            state_clone.set_error(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "pipeline deadlock detected with recovery disabled; \
+                                 use --deadlock-recover to enable automatic recovery",
+                            ));
+                            break;
+                        }
                     }
                 }
             }
