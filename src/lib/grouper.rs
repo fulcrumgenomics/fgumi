@@ -716,154 +716,7 @@ pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<V
     }
 }
 
-// ============================================================================
-// FASTQ Record Parsing Utilities
-// ============================================================================
-
-/// A parsed FASTQ record.
-#[derive(Debug, Clone)]
-pub struct FastqRecord {
-    /// Read name (without @ prefix).
-    pub name: Vec<u8>,
-    /// Sequence bases.
-    pub sequence: Vec<u8>,
-    /// Quality scores (Phred+33 encoded).
-    pub quality: Vec<u8>,
-}
-
-/// Result of parsing a FASTQ record.
-#[derive(Debug)]
-enum FastqParseResult {
-    /// Record incomplete - need more data.
-    Incomplete,
-    /// Parse error.
-    Error(io::Error),
-}
-
-/// Parse FASTQ records from a byte buffer.
-///
-/// FASTQ format:
-/// ```text
-/// @read_name
-/// SEQUENCE
-/// +
-/// QUALITY
-/// ```
-///
-/// Returns parsed records and leftover bytes for incomplete records.
-///
-/// # Errors
-///
-/// Returns an error if a record has mismatched sequence and quality lengths.
-pub fn parse_fastq_records(data: &[u8]) -> io::Result<(Vec<FastqRecord>, Vec<u8>)> {
-    let mut records = Vec::new();
-    let mut pos = 0;
-
-    while pos < data.len() {
-        // Find the start of a record (@ character at start of line)
-        if data[pos] != b'@' {
-            // Skip until we find @ at start of line or run out of data
-            while pos < data.len() && data[pos] != b'@' {
-                pos += 1;
-            }
-            if pos >= data.len() {
-                return Ok((records, Vec::new()));
-            }
-        }
-
-        // Try to parse a complete record
-        match parse_single_fastq_record(&data[pos..]) {
-            Ok((record, consumed)) => {
-                records.push(record);
-                pos += consumed;
-            }
-            Err(FastqParseResult::Incomplete) => {
-                // Not enough data for a complete record
-                return Ok((records, data[pos..].to_vec()));
-            }
-            Err(FastqParseResult::Error(e)) => {
-                return Err(e);
-            }
-        }
-    }
-
-    Ok((records, Vec::new()))
-}
-
-/// Parse a single FASTQ record from the beginning of a buffer.
-/// Returns (record, `bytes_consumed`) or an error.
-fn parse_single_fastq_record(data: &[u8]) -> Result<(FastqRecord, usize), FastqParseResult> {
-    let mut pos = 0;
-
-    // Line 1: @name
-    if data.is_empty() || data[0] != b'@' {
-        return Err(FastqParseResult::Error(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "FASTQ record must start with @",
-        )));
-    }
-    pos += 1; // Skip @
-
-    let name_end = find_newline(&data[pos..]).ok_or(FastqParseResult::Incomplete)?;
-    let name = data[pos..pos + name_end].to_vec();
-    pos += name_end + 1; // +1 for newline
-
-    // Line 2: sequence
-    if pos >= data.len() {
-        return Err(FastqParseResult::Incomplete);
-    }
-    let seq_end = find_newline(&data[pos..]).ok_or(FastqParseResult::Incomplete)?;
-    let sequence = data[pos..pos + seq_end].to_vec();
-    pos += seq_end + 1;
-
-    // Line 3: + (separator)
-    if pos >= data.len() {
-        return Err(FastqParseResult::Incomplete);
-    }
-    let plus_end = find_newline(&data[pos..]).ok_or(FastqParseResult::Incomplete)?;
-    if data[pos] != b'+' {
-        return Err(FastqParseResult::Error(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "FASTQ separator line must start with +",
-        )));
-    }
-    pos += plus_end + 1;
-
-    // Line 4: quality
-    if pos >= data.len() {
-        return Err(FastqParseResult::Incomplete);
-    }
-    let qual_end = find_newline(&data[pos..]).ok_or(FastqParseResult::Incomplete)?;
-    let quality = data[pos..pos + qual_end].to_vec();
-    pos += qual_end + 1;
-
-    // Validate lengths match
-    if sequence.len() != quality.len() {
-        return Err(FastqParseResult::Error(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Sequence length ({}) != quality length ({})", sequence.len(), quality.len()),
-        )));
-    }
-
-    Ok((FastqRecord { name, sequence, quality }, pos))
-}
-
-/// Find the position of the next newline character.
-fn find_newline(data: &[u8]) -> Option<usize> {
-    data.iter().position(|&b| b == b'\n')
-}
-
-/// Strip /1 or /2 suffix from read name for comparison.
-#[must_use]
-pub fn strip_read_suffix(name: &[u8]) -> &[u8] {
-    if name.len() >= 2 {
-        let suffix = &name[name.len() - 2..];
-        if suffix == b"/1" || suffix == b"/2" {
-            return &name[..name.len() - 2];
-        }
-    }
-    name
-}
+use crate::fastq_parse::{FastqRecord, parse_fastq_records, strip_read_suffix};
 
 // ============================================================================
 // FastqGrouper - Groups FASTQ records from multiple input streams
@@ -877,12 +730,6 @@ pub struct FastqTemplate {
     pub records: Vec<FastqRecord>,
     /// The common read name (should match across all records).
     pub name: Vec<u8>,
-}
-
-impl MemoryEstimate for FastqRecord {
-    fn estimate_heap_size(&self) -> usize {
-        self.name.capacity() + self.sequence.capacity() + self.quality.capacity()
-    }
 }
 
 impl MemoryEstimate for FastqTemplate {
@@ -1021,13 +868,13 @@ impl FastqGrouper {
             // Validate names match and get base_name (in block so names is dropped before pop)
             let base_name = {
                 // Peek at the first record from each stream
-                let names: Vec<_> = self
+                let names: Vec<&[u8]> = self
                     .pending_records
                     .iter()
                     .map(|q| {
-                        &q.front()
+                        q.front()
                             .expect("pending queue must be non-empty inside all-non-empty loop")
-                            .name
+                            .name()
                     })
                     .collect();
 
@@ -1035,7 +882,7 @@ impl FastqGrouper {
                 let base_name = strip_read_suffix(names[0]).to_vec();
 
                 // Validate all names match (strip /1, /2 suffixes for comparison)
-                for (i, name) in names.iter().enumerate().skip(1) {
+                for (i, &name) in names.iter().enumerate().skip(1) {
                     let other_base = strip_read_suffix(name);
                     if base_name != other_base {
                         return Err(io::Error::new(
@@ -1169,54 +1016,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // FASTQ parsing tests
-    #[test]
-    fn test_parse_single_fastq_record() {
-        let data = b"@read1\nACGT\n+\nIIII\n";
-        let (record, consumed) =
-            parse_single_fastq_record(data).expect("parse single FASTQ record");
-        assert_eq!(record.name, b"read1");
-        assert_eq!(record.sequence, b"ACGT");
-        assert_eq!(record.quality, b"IIII");
-        assert_eq!(consumed, data.len());
-    }
-
-    #[test]
-    fn test_parse_fastq_records_multiple() {
-        let data = b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nJJJJ\n";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].name, b"read1");
-        assert_eq!(records[1].name, b"read2");
-        assert!(leftover.is_empty());
-    }
-
-    #[test]
-    fn test_parse_fastq_incomplete_record() {
-        let data = b"@read1\nACGT\n+\n";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
-        assert!(records.is_empty());
-        assert_eq!(leftover, data);
-    }
-
-    #[test]
-    fn test_parse_fastq_with_leftover() {
-        let data = b"@read1\nACGT\n+\nIIII\n@read2\nTG";
-        let (records, leftover) = parse_fastq_records(data).expect("failed to parse FASTQ records");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].name, b"read1");
-        assert_eq!(leftover, b"@read2\nTG");
-    }
-
-    #[test]
-    fn test_strip_read_suffix() {
-        assert_eq!(strip_read_suffix(b"read1/1"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1/2"), b"read1");
-        assert_eq!(strip_read_suffix(b"read1"), b"read1");
-        assert_eq!(strip_read_suffix(b"a"), b"a");
-        assert_eq!(strip_read_suffix(b""), b"" as &[u8]);
-    }
-
     // FastqGrouper tests
     #[test]
     fn test_fastq_grouper_paired() {
@@ -1236,8 +1035,8 @@ mod tests {
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].name, b"read1");
         assert_eq!(templates[0].records.len(), 2);
-        assert_eq!(templates[0].records[0].sequence, b"ACGT");
-        assert_eq!(templates[0].records[1].sequence, b"TGCA");
+        assert_eq!(templates[0].records[0].sequence(), b"ACGT");
+        assert_eq!(templates[0].records[1].sequence(), b"TGCA");
     }
 
     #[test]

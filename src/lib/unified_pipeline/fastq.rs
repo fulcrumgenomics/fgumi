@@ -33,7 +33,8 @@ use crate::bgzf_reader::{
     BGZF_EOF, BGZF_FOOTER_SIZE, BGZF_HEADER_SIZE, decompress_block_slice_into, read_raw_blocks,
 };
 use crate::bgzf_writer::InlineBgzfCompressor;
-use crate::grouper::{FastqRecord, FastqTemplate};
+use crate::fastq_parse::FastqRecord;
+use crate::grouper::FastqTemplate;
 use crate::progress::ProgressTracker;
 use crate::reorder_buffer::ReorderBuffer;
 use libdeflater::Decompressor;
@@ -239,11 +240,7 @@ impl MemoryEstimate for FastqParsedBatch {
         self.streams
             .iter()
             .map(|stream| {
-                stream
-                    .records
-                    .iter()
-                    .map(|r| r.name.capacity() + r.sequence.capacity() + r.quality.capacity())
-                    .sum::<usize>()
+                stream.records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
                     + stream.records.capacity() * std::mem::size_of::<FastqRecord>()
             })
             .sum::<usize>()
@@ -510,47 +507,265 @@ fn parse_fastq_records_from_boundaries(
 /// IIII...
 /// ```
 fn parse_single_fastq_record(data: &[u8]) -> io::Result<FastqRecord> {
-    // Line 1: @name
-    if data.is_empty() || data[0] != b'@' {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "FASTQ record must start with @"));
+    FastqRecord::from_slice(data)
+}
+
+// ============================================================================
+// BlockParseFast / BlockMerge — Parallel BGZF Boundary Detection
+/// Max blocks processed per lock acquisition in `BlockMerge` / `FindBoundaries` steps.
+const MAX_BATCHES_PER_LOCK: usize = 8;
+// ============================================================================
+
+/// Result of parallel per-chunk parsing in the `BlockParseFast` step.
+///
+/// Each decompressed BGZF chunk is split into:
+/// - `prefix_bytes`: incomplete record fragment at the start (belongs to previous block)
+/// - `records`: fully-parsed complete records from the middle
+/// - `suffix_bytes`: incomplete record fragment at the end (belongs to next block)
+#[derive(Debug)]
+pub struct BlockParsed {
+    /// Monotonically increasing block index (per stream), used for ordering.
+    pub block_idx: u64,
+    /// Which stream this block came from (0=R1, 1=R2, etc.).
+    pub stream_idx: usize,
+    /// Fully parsed complete records from the middle of the block.
+    pub records: Vec<FastqRecord>,
+    /// Incomplete prefix bytes (start of the block, part of the previous record).
+    pub prefix_bytes: Vec<u8>,
+    /// Incomplete suffix bytes (end of the block, part of the next record).
+    pub suffix_bytes: Vec<u8>,
+    // is_eof reserved for future use (EOF signalling between steps).
+}
+
+impl MemoryEstimate for BlockParsed {
+    fn estimate_heap_size(&self) -> usize {
+        self.records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
+            + self.records.capacity() * std::mem::size_of::<FastqRecord>()
+            + self.prefix_bytes.capacity()
+            + self.suffix_bytes.capacity()
+    }
+}
+
+/// Mutable state owned by the serial `BlockMerge` step.
+///
+/// The merge step pairs corresponding R1 and R2 blocks (by `block_idx`), stitches
+/// the suffix bytes of block N with the prefix bytes of block N+1 to recover
+/// cross-block records, and zips R1/R2 records into `FastqTemplate`s.
+pub(crate) struct BlockMergeState {
+    /// Received R1 blocks not yet processed, keyed by `block_idx`.
+    r1_pending: BTreeMap<u64, BlockParsed>,
+    /// Received R2 blocks not yet processed, keyed by `block_idx`.
+    r2_pending: BTreeMap<u64, BlockParsed>,
+    /// Next R1 block index expected by the merge step.
+    r1_next: u64,
+    /// Next R2 block index expected by the merge step.
+    r2_next: u64,
+    /// Trailing suffix bytes from the last R1 block (cross-block record fragment).
+    r1_suffix_bytes: Vec<u8>,
+    /// Trailing suffix bytes from the last R2 block (cross-block record fragment).
+    r2_suffix_bytes: Vec<u8>,
+    /// Excess R1 records left over from the previous round (R1 had more than R2).
+    r1_surplus: Vec<FastqRecord>,
+    /// Excess R2 records left over from the previous round (R2 had more than R1).
+    r2_surplus: Vec<FastqRecord>,
+    /// Monotonically increasing output serial for the template queue.
+    serial_out: u64,
+    /// Estimated heap bytes held in `r1_pending` + `r2_pending` maps.
+    ///
+    /// Used for local backpressure: when this exceeds [`PENDING_BACKPRESSURE_BYTES`]
+    /// and the merge step *can* process in-order blocks, we skip draining `q2` so
+    /// the queue fills up and naturally throttles `BlockParseFast` workers.
+    pending_heap_bytes: u64,
+}
+
+impl BlockMergeState {
+    fn new() -> Self {
+        Self {
+            r1_pending: BTreeMap::new(),
+            r2_pending: BTreeMap::new(),
+            r1_next: 0,
+            r2_next: 0,
+            r1_suffix_bytes: Vec::new(),
+            r2_suffix_bytes: Vec::new(),
+            r1_surplus: Vec::new(),
+            r2_surplus: Vec::new(),
+            serial_out: 0,
+            pending_heap_bytes: 0,
+        }
     }
 
-    let mut lines = data.split(|&b| b == b'\n');
+    fn is_empty(&self) -> bool {
+        let empty = self.r1_pending.is_empty()
+            && self.r2_pending.is_empty()
+            && self.r1_surplus.is_empty()
+            && self.r2_surplus.is_empty()
+            && self.r1_suffix_bytes.is_empty()
+            && self.r2_suffix_bytes.is_empty();
+        debug_assert!(
+            !empty || self.pending_heap_bytes == 0,
+            "pending_heap_bytes={} but maps are empty",
+            self.pending_heap_bytes
+        );
+        empty
+    }
+}
 
-    // Line 1: name (skip @)
-    let name_line = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing name line"))?;
-    let name = name_line[1..].to_vec(); // Skip @
-
-    // Line 2: sequence
-    let sequence = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing sequence line"))?
-        .to_vec();
-
-    // Line 3: + line (skip it)
-    let plus_line =
-        lines.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing + line"))?;
-    if plus_line.is_empty() || plus_line[0] != b'+' {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Third line must start with +"));
+/// Detect where the first complete FASTQ record begins in `data`.
+///
+/// Scans forward collecting newline positions and tests sliding windows of 4
+/// consecutive lines against the FASTQ invariants (`@` prefix, `+` separator,
+/// equal seq/qual lengths). Returns the byte offset at which the first
+/// complete record starts.
+///
+/// Returns `0` if the first complete record starts at the beginning (including
+/// after validating all four FASTQ lines). Returns `data.len()` if no complete
+/// record boundary can be detected.
+///
+/// Note: does NOT use a `data[0] == b'@'` fast-path because FASTQ quality
+/// strings can legally contain `@` bytes (Phred+33 quality ≥ 31).
+fn detect_prefix_end(data: &[u8]) -> usize {
+    if data.is_empty() {
+        return 0;
     }
 
-    // Line 4: quality
-    let quality = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing quality line"))?
-        .to_vec();
-
-    // Validate lengths match
-    if sequence.len() != quality.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Sequence length ({}) != quality length ({})", sequence.len(), quality.len()),
-        ));
+    // Collect the first 8 newline positions.
+    let mut newlines = [0usize; 8];
+    let mut count = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            newlines[count] = i;
+            count += 1;
+            if count == 8 {
+                break;
+            }
+        }
     }
 
-    Ok(FastqRecord { name, sequence, quality })
+    // Need at least 4 newlines to form a complete FASTQ record.
+    if count < 4 {
+        return data.len(); // No complete record found — entire buffer is prefix.
+    }
+
+    // Try each sliding window of 4 consecutive newlines.
+    for start in 0..count.saturating_sub(3) {
+        let line0_start = if start == 0 { 0 } else { newlines[start - 1] + 1 };
+        let line0_end = newlines[start]; // end of "@name" line (newline pos)
+        let line1_end = newlines[start + 1]; // end of sequence line
+        let line2_end = newlines[start + 2]; // end of "+" line
+        let line3_end = newlines[start + 3]; // end of quality line
+
+        // Line 0 must start with '@'
+        if data[line0_start] != b'@' {
+            continue;
+        }
+
+        // Line 2 must start with '+'
+        let line2_start = line1_end + 1;
+        if line2_start >= data.len() || data[line2_start] != b'+' {
+            continue;
+        }
+
+        // Sequence and quality lengths must match.
+        let seq_len = line1_end - (line0_end + 1);
+        let qual_len = line3_end - (line2_end + 1);
+        if seq_len != qual_len {
+            continue;
+        }
+
+        // Valid record found at line0_start.
+        return line0_start;
+    }
+
+    // Could not detect boundary.
+    data.len()
+}
+
+/// Detect where the last complete FASTQ record ends in `data`.
+///
+/// Scans backward collecting newline positions and tests the last 4 newlines
+/// against FASTQ invariants. Returns the byte offset of the end of the last
+/// complete record (i.e., `data[..suffix_start]` contains all complete records
+/// and `data[suffix_start..]` is an incomplete trailing fragment).
+/// Returns `data.len()` if all data forms complete records.
+fn detect_suffix_start(data: &[u8]) -> usize {
+    if data.is_empty() {
+        return 0;
+    }
+
+    // Collect the last 8 newline positions scanning backward.
+    let mut newlines = [0usize; 8];
+    let mut count = 0;
+    let mut i = data.len();
+    while i > 0 {
+        i -= 1;
+        if data[i] == b'\n' {
+            // Store in reverse order, then reverse at end.
+            newlines[count] = i;
+            count += 1;
+            if count == 8 {
+                break;
+            }
+        }
+    }
+
+    if count < 4 {
+        // Not enough newlines to form a complete record.
+        return 0;
+    }
+
+    // Reverse so newlines are in ascending order.
+    newlines[..count].reverse();
+
+    // Try windows from the last 4 newlines backward.
+    // We want the latest valid window (rightmost complete record).
+    let window_start = count.saturating_sub(4);
+    for start in (0..=window_start).rev() {
+        if start + 3 >= count {
+            continue;
+        }
+        let line0_start = if start == 0 { 0 } else { newlines[start - 1] + 1 };
+        let line0_end = newlines[start];
+        let line1_end = newlines[start + 1];
+        let line2_end = newlines[start + 2];
+        let line3_end = newlines[start + 3];
+
+        if data[line0_start] != b'@' {
+            continue;
+        }
+        let line2_start = line1_end + 1;
+        if line2_start >= data.len() || data[line2_start] != b'+' {
+            continue;
+        }
+        let seq_len = line1_end - (line0_end + 1);
+        let qual_len = line3_end - (line2_end + 1);
+        if seq_len != qual_len {
+            continue;
+        }
+
+        // Valid: the record ends at line3_end + 1.
+        return line3_end + 1;
+    }
+
+    0
+}
+
+/// Stitch `suffix_bytes` from the previous block with `prefix_bytes` from the
+/// current block to recover the cross-block FASTQ record (if any).
+///
+/// Returns `None` if both slices are empty or the combined data is not a valid record.
+/// Any error is propagated as an `io::Error`.
+fn stitch_cross_block_record(
+    suffix_bytes: &[u8],
+    prefix_bytes: &[u8],
+) -> io::Result<Option<FastqRecord>> {
+    if suffix_bytes.is_empty() && prefix_bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut combined = Vec::with_capacity(suffix_bytes.len() + prefix_bytes.len());
+    combined.extend_from_slice(suffix_bytes);
+    combined.extend_from_slice(prefix_bytes);
+    let record = FastqRecord::from_slice(&combined)?;
+    Ok(Some(record))
 }
 
 /// Configuration for FASTQ 7-step pipeline.
@@ -712,6 +927,26 @@ impl FastqPipelineConfig {
 
 /// Default number of BGZF blocks to read per stream per batch.
 const DEFAULT_BLOCKS_PER_BATCH: usize = 4;
+
+/// Memory backpressure threshold for `q2_block_parsed` (128 MB).
+///
+/// When the total heap bytes in the parsed-block queue exceeds this threshold,
+/// `BlockParseFast` workers stop pulling new decompressed chunks, giving the
+/// serial `BlockMerge` step time to drain. This prevents unbounded RSS growth
+/// when workers parse faster than the single-threaded merge can consume.
+const Q2_BLOCK_PARSED_BACKPRESSURE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Memory backpressure threshold for the `BlockMerge` pending maps (256 MB).
+///
+/// When the total heap bytes sitting in `r1_pending` + `r2_pending` exceeds
+/// this threshold **and** the merge step can process the next in-order blocks,
+/// we skip draining `q2_block_parsed` so the queue fills up, creating natural
+/// backpressure on `BlockParseFast` workers via `ArrayQueue::is_full()`.
+///
+/// When the next in-order blocks are *not* available, we always drain regardless
+/// of this threshold — ensuring the needed blocks can reach the pending maps
+/// and preventing deadlock.
+const PENDING_BACKPRESSURE_BYTES: u64 = 256 * 1024 * 1024;
 
 // ============================================================================
 // Helper functions (used by per-stream pipeline steps)
@@ -919,6 +1154,8 @@ pub struct FastqWorkerState<P: Send> {
     pub held_decompressed_chunk: Option<(u64, PerStreamChunk)>,
     /// Held boundary batch from `FindBoundaries` step (couldn't push to `q2_5_boundaries`).
     pub held_boundaries: Option<(u64, FastqBoundaryBatch)>,
+    /// Held `BlockParsed` item from `BlockParseFast` step (couldn't push to `q2_block_parsed`).
+    pub held_block_parsed: Option<BlockParsed>,
     /// Held parsed templates from Parse step (couldn't push to `output.groups`).
     /// Includes template count for metrics tracking on successful push.
     pub held_parsed: Option<(u64, Vec<FastqTemplate>, usize)>,
@@ -956,6 +1193,7 @@ impl<P: Send> FastqWorkerState<P> {
             held_chunk: None,
             held_decompressed_chunk: None,
             held_boundaries: None,
+            held_block_parsed: None,
             held_parsed: None,
             held_processed: None,
             held_serialized: None,
@@ -971,6 +1209,7 @@ impl<P: Send> FastqWorkerState<P> {
         self.held_chunk.is_some()
             || self.held_decompressed_chunk.is_some()
             || self.held_boundaries.is_some()
+            || self.held_block_parsed.is_some()
             || self.held_parsed.is_some()
             || self.held_processed.is_some()
             || self.held_serialized.is_some()
@@ -982,6 +1221,7 @@ impl<P: Send> FastqWorkerState<P> {
         self.held_chunk = None;
         self.held_decompressed_chunk = None;
         self.held_boundaries = None;
+        self.held_block_parsed = None;
         self.held_parsed = None;
         self.held_processed = None;
         self.held_serialized = None;
@@ -1086,24 +1326,39 @@ pub struct FastqPipelineState<R: BufRead + Send, P: Send + MemoryEstimate> {
     /// Per-stream chunks waiting to be decompressed.
     pub q0_chunks: ArrayQueue<(u64, PerStreamChunk)>,
 
-    // ========== Q1: Decompress → Pair (FindBoundaries) ==========
-    /// Decompressed per-stream chunks waiting for pair assembly.
+    // ========== Q1: Decompress → BlockParseFast (parallel) ==========
+    /// Decompressed per-stream chunks waiting for parallel block parsing.
     pub q1_decompressed: ArrayQueue<(u64, PerStreamChunk)>,
 
-    // ========== Pair (FindBoundaries) → Decode ==========
-    /// Count of per-stream chunks consumed by the Pair step from q1.
+    // ========== BlockParseFast → BlockMerge ==========
+    /// Count of per-stream chunks consumed by `BlockParseFast` from q1.
+    pub chunks_block_parsed: AtomicU64,
+    /// Parsed blocks waiting for the serial `BlockMerge` step.
+    /// Each element is a `BlockParsed` from one per-stream chunk.
+    pub q2_block_parsed: ArrayQueue<BlockParsed>,
+    /// Current heap bytes in `q2_block_parsed` (for memory backpressure).
+    pub q2_block_parsed_heap_bytes: AtomicU64,
+    /// Serial `BlockMerge` step state (locked via `try_lock` for serial execution).
+    pub(crate) block_merge_state: Mutex<BlockMergeState>,
+    /// Flag indicating all blocks have been merged and templates emitted.
+    pub block_merge_done: AtomicBool,
+    /// Count of `BlockParsed` items consumed by `BlockMerge`.
+    pub blocks_merged: AtomicU64,
+
+    // ========== Legacy: Pair (FindBoundaries) → Decode (gzip path) ==========
+    /// Count of per-stream chunks consumed by the Pair step from q1 (gzip path).
     pub chunks_paired: AtomicU64,
-    /// Pair state: accumulates per-stream chunks by `batch_num`.
+    /// Pair state: accumulates per-stream chunks by `batch_num` (gzip path).
     pub(crate) pair_state: Mutex<PairState>,
-    /// State for finding FASTQ record boundaries.
+    /// State for finding FASTQ record boundaries (gzip path).
     pub boundary_state: FastqBoundaryState,
-    /// Flag indicating pair assembly / boundary finding is complete.
+    /// Flag indicating pair assembly / boundary finding is complete (gzip path).
     pub boundaries_done: AtomicBool,
-    /// Count of multi-stream batches assembled by Pair step.
+    /// Count of multi-stream batches assembled by Pair step (gzip path).
     pub batches_boundaries_found: AtomicU64,
-    /// Batches with boundaries found, waiting to be parsed.
+    /// Batches with boundaries found, waiting to be parsed (gzip path).
     pub q2_5_boundaries: ArrayQueue<(u64, FastqBoundaryBatch)>,
-    /// Current heap bytes in Q2.5 boundaries queue.
+    /// Current heap bytes in Q2.5 boundaries queue (gzip path).
     pub q2_5_boundaries_heap_bytes: AtomicU64,
 
     // ========== Decode → Process ==========
@@ -1168,6 +1423,12 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             batches_read: AtomicU64::new(0),
             q0_chunks: ArrayQueue::new(cap),
             q1_decompressed: ArrayQueue::new(cap),
+            chunks_block_parsed: AtomicU64::new(0),
+            q2_block_parsed: ArrayQueue::new(cap),
+            q2_block_parsed_heap_bytes: AtomicU64::new(0),
+            block_merge_state: Mutex::new(BlockMergeState::new()),
+            block_merge_done: AtomicBool::new(false),
+            blocks_merged: AtomicU64::new(0),
             chunks_paired: AtomicU64::new(0),
             pair_state: Mutex::new(PairState::new(num_streams)),
             boundary_state: FastqBoundaryState::new(num_streams),
@@ -1195,6 +1456,16 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
     /// Check if an error has occurred.
     pub fn has_error(&self) -> bool {
         self.output.has_error()
+    }
+
+    /// Check if `q2_block_parsed` memory exceeds the backpressure threshold.
+    ///
+    /// Used by `BlockParseFast` to avoid piling up parsed data faster than
+    /// the serial `BlockMerge` can drain it.
+    #[must_use]
+    pub fn is_q2_block_parsed_memory_high(&self) -> bool {
+        self.q2_block_parsed_heap_bytes.load(Ordering::Acquire)
+            >= Q2_BLOCK_PARSED_BACKPRESSURE_BYTES
     }
 
     /// Check if Q4 processed queue memory is high (for backpressure in Process step).
@@ -1230,25 +1501,45 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             return false;
         }
 
-        // Check intermediate flags
-        let boundaries_done = self.boundaries_done.load(Ordering::Acquire);
-        let parse_done = self.parse_done.load(Ordering::Acquire);
-        if !boundaries_done || !parse_done {
-            log::debug!(
-                "is_complete: flags not done: boundaries_done={boundaries_done}, parse_done={parse_done}"
-            );
-            return false;
-        }
-
-        // Check input-half ArrayQueues are empty (lock-free checks)
-        if !self.q0_chunks.is_empty() || !self.q1_decompressed.is_empty() {
-            return false;
-        }
-
-        // Check intermediate queues
-        if !self.q2_5_boundaries.is_empty() {
-            log::trace!("is_complete: q2_5_boundaries not empty: {}", self.q2_5_boundaries.len());
-            return false;
+        if self.config.inputs_are_bgzf {
+            // BGZF path: check block_merge_done and parse_done
+            let block_merge_done = self.block_merge_done.load(Ordering::Acquire);
+            let parse_done = self.parse_done.load(Ordering::Acquire);
+            if !block_merge_done || !parse_done {
+                log::debug!(
+                    "is_complete: BGZF flags not done: block_merge_done={block_merge_done}, parse_done={parse_done}"
+                );
+                return false;
+            }
+            // Check BGZF-specific queues
+            if !self.q0_chunks.is_empty()
+                || !self.q1_decompressed.is_empty()
+                || !self.q2_block_parsed.is_empty()
+            {
+                return false;
+            }
+        } else {
+            // Gzip/plain path: check boundaries_done and parse_done
+            let boundaries_done = self.boundaries_done.load(Ordering::Acquire);
+            let parse_done = self.parse_done.load(Ordering::Acquire);
+            if !boundaries_done || !parse_done {
+                log::debug!(
+                    "is_complete: gzip flags not done: boundaries_done={boundaries_done}, parse_done={parse_done}"
+                );
+                return false;
+            }
+            // Check input-half ArrayQueues are empty (lock-free checks)
+            if !self.q0_chunks.is_empty() || !self.q1_decompressed.is_empty() {
+                return false;
+            }
+            // Check intermediate queues
+            if !self.q2_5_boundaries.is_empty() {
+                log::trace!(
+                    "is_complete: q2_5_boundaries not empty: {}",
+                    self.q2_5_boundaries.len()
+                );
+                return false;
+            }
         }
 
         // Delegate output-half check
@@ -1319,8 +1610,35 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             non_empty_queues.push(format!("q1_decompressed ({})", self.q1_decompressed.len()));
         }
 
-        if !self.q2_5_boundaries.is_empty() {
-            non_empty_queues.push(format!("q2_5_boundaries ({})", self.q2_5_boundaries.len()));
+        if self.config.inputs_are_bgzf {
+            if !self.q2_block_parsed.is_empty() {
+                non_empty_queues.push(format!("q2_block_parsed ({})", self.q2_block_parsed.len()));
+            }
+            // Check BlockMerge state is empty
+            {
+                let merge = self.block_merge_state.lock();
+                if !merge.is_empty() {
+                    non_empty_queues.push("block_merge_state (non-empty)".to_string());
+                }
+            }
+        } else {
+            if !self.q2_5_boundaries.is_empty() {
+                non_empty_queues.push(format!("q2_5_boundaries ({})", self.q2_5_boundaries.len()));
+            }
+            // Check pair state is empty
+            {
+                let pair = self.pair_state.lock();
+                if !pair.is_empty() {
+                    non_empty_queues.push("pair_state (non-empty)".to_string());
+                }
+            }
+            // Check boundary state has no leftover bytes
+            for (idx, stream_state) in self.boundary_state.stream_states.iter().enumerate() {
+                let leftover_len = stream_state.lock().leftover.len();
+                if leftover_len > 0 {
+                    non_empty_queues.push(format!("boundary_leftover[{idx}] ({leftover_len})"));
+                }
+            }
         }
 
         // Check output-half queues are empty
@@ -1345,27 +1663,9 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             }
         }
 
-        // Check pair state is empty
-        {
-            let pair = self.pair_state.lock();
-            if !pair.is_empty() {
-                non_empty_queues.push("pair_state (non-empty)".to_string());
-            }
-        }
-
-        // Check boundary state has no leftover bytes
-        for (idx, stream_state) in self.boundary_state.stream_states.iter().enumerate() {
-            let leftover_len = stream_state.lock().leftover.len();
-            if leftover_len > 0 {
-                non_empty_queues.push(format!("boundary_leftover[{idx}] ({leftover_len})"));
-            }
-        }
-
-        // Check batch counter invariants
-        let batches_grouped = self.batches_grouped.load(Ordering::Acquire);
-
-        // Batches flow: Pair (FindBoundaries) -> Parse -> Group
-        {
+        // Check batch counter invariants (gzip path only — BGZF uses different counters)
+        if !self.config.inputs_are_bgzf {
+            let batches_grouped = self.batches_grouped.load(Ordering::Acquire);
             let batches_boundaries_found = self.batches_boundaries_found.load(Ordering::Acquire);
             let batches_parsed = self.batches_parsed.load(Ordering::Acquire);
 
@@ -1463,16 +1763,36 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> Monitorabl
     }
 
     fn build_queue_snapshot(&self) -> QueueSnapshot {
-        let boundaries_done = self.boundaries_done.load(Ordering::Relaxed);
         let parse_done = self.parse_done.load(Ordering::Relaxed);
         let batches_read = self.batches_read.load(Ordering::Relaxed);
-        let chunks_paired = self.chunks_paired.load(Ordering::Relaxed);
-        let batches_found = self.batches_boundaries_found.load(Ordering::Relaxed);
-        let batches_parsed = self.batches_parsed.load(Ordering::Relaxed);
+        let (q2b_len, extra_state) = if self.config.inputs_are_bgzf {
+            let block_merge_done = self.block_merge_done.load(Ordering::Relaxed);
+            let chunks_bp = self.chunks_block_parsed.load(Ordering::Relaxed);
+            let blocks_merged = self.blocks_merged.load(Ordering::Relaxed);
+            let q2_heap_mb =
+                self.q2_block_parsed_heap_bytes.load(Ordering::Relaxed) / (1024 * 1024);
+            (
+                self.q2_block_parsed.len(),
+                Some(format!(
+                    "block_merge_done={block_merge_done}, parse_done={parse_done}, batches: read={batches_read} block_parsed={chunks_bp} merged={blocks_merged}, q2_heap={q2_heap_mb}MB"
+                )),
+            )
+        } else {
+            let boundaries_done = self.boundaries_done.load(Ordering::Relaxed);
+            let chunks_paired = self.chunks_paired.load(Ordering::Relaxed);
+            let batches_found = self.batches_boundaries_found.load(Ordering::Relaxed);
+            let batches_parsed = self.batches_parsed.load(Ordering::Relaxed);
+            (
+                self.q2_5_boundaries.len(),
+                Some(format!(
+                    "boundaries_done={boundaries_done}, parse_done={parse_done}, batches: read={batches_read} paired={chunks_paired} found={batches_found} parsed={batches_parsed}"
+                )),
+            )
+        };
         QueueSnapshot {
             q1_len: self.q0_chunks.len(),
             q2_len: self.q1_decompressed.len(),
-            q2b_len: self.q2_5_boundaries.len(),
+            q2b_len,
             q3_len: self.output.groups.len(),
             q4_len: self.output.processed.len(),
             q5_len: self.output.serialized.len(),
@@ -1484,9 +1804,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> Monitorabl
             read_done: self.read_done.load(Ordering::Relaxed),
             group_done: self.group_done.load(Ordering::Relaxed),
             draining: self.output.draining.load(Ordering::Relaxed),
-            extra_state: Some(format!(
-                "boundaries_done={boundaries_done}, parse_done={parse_done}, batches: read={batches_read} paired={chunks_paired} found={batches_found} parsed={batches_parsed}"
-            )),
+            extra_state,
         }
     }
 }
@@ -1897,6 +2215,583 @@ fn fastq_try_step_decompress<R: BufRead + Send, P: Send + MemoryEstimate>(
 }
 
 // ============================================================================
+// BlockParseFast Step (parallel, BGZF path)
+// ============================================================================
+
+/// `BlockParseFast` step: in parallel, parse all complete records from a single
+/// decompressed BGZF chunk and emit a `BlockParsed` item to `q2_block_parsed`.
+///
+/// Each worker independently pops one `PerStreamChunk` from `q1_decompressed`,
+/// detects where the chunk's phase boundary lies (using `detect_prefix_end` /
+/// `detect_suffix_start`), runs SIMD-accelerated `find_record_offsets` on the
+/// middle portion, parses those records, and pushes a `BlockParsed` item.
+///
+/// The cross-block records (prefix + suffix fragments) are forwarded to the
+/// serial `BlockMerge` step rather than parsed here, because they depend on
+/// data from the adjacent block.
+fn fastq_try_step_block_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    worker: &mut FastqWorkerState<P>,
+) -> bool {
+    if state.has_error() {
+        return false;
+    }
+
+    // Priority 1: Try to push any held BlockParsed item.
+    if let Some(held) = worker.held_block_parsed.take() {
+        match state.q2_block_parsed.push(held) {
+            Ok(()) => {
+                // Count here: the item is now in Q2b (was held from a previous call).
+                // Heap bytes were already added when the item was created.
+                state.chunks_block_parsed.fetch_add(1, Ordering::Release);
+                state.deadlock_state.record_q2_5_push();
+            }
+            Err(held) => {
+                worker.held_block_parsed = Some(held);
+                return false;
+            }
+        }
+    }
+
+    // Check if BlockMerge is already done (all chunks processed).
+    if state.block_merge_done.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    // Priority 2: Check output queue capacity and memory backpressure.
+    if state.q2_block_parsed.is_full() || state.is_q2_block_parsed_memory_high() {
+        return false;
+    }
+
+    // Priority 3: Pop a decompressed chunk from q1.
+    let Some((serial, chunk)) = state.q1_decompressed.pop() else {
+        return false;
+    };
+    state.deadlock_state.record_q2_pop();
+    let _ = serial; // serial is not used for ordering in the BGZF path (block_idx is used)
+
+    let stream_idx = chunk.stream_idx;
+    let block_idx = chunk.batch_num;
+
+    // For gzip/plain chunks (offsets pre-computed), delegate to the existing logic.
+    // BGZF chunks have offsets=None.
+    if chunk.offsets.is_some() {
+        // Should not happen in BGZF mode, but guard against it.
+        state.set_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BlockParseFast received a gzip/plain chunk in BGZF mode",
+        ));
+        return false;
+    }
+
+    let data = &chunk.data;
+
+    // Detect phase: where does the first complete record start and the last end?
+    let prefix_end = detect_prefix_end(data);
+    let suffix_start = if prefix_end >= data.len() {
+        data.len() // entire buffer is prefix (no complete records)
+    } else {
+        detect_suffix_start(&data[prefix_end..]) + prefix_end
+    };
+
+    let prefix_bytes = data[..prefix_end].to_vec();
+    let suffix_bytes = data[suffix_start..].to_vec();
+    let middle = &data[prefix_end..suffix_start];
+
+    // Parse complete records from the middle using SIMD-accelerated offset detection.
+    let offsets = fgumi_simd_fastq::find_record_offsets(middle);
+    let num_records = offsets.len().saturating_sub(1);
+    let mut records = Vec::with_capacity(num_records);
+    for i in 0..num_records {
+        let start = offsets[i];
+        let end = offsets[i + 1];
+        if start >= end || start >= middle.len() {
+            continue;
+        }
+        match FastqRecord::from_slice(&middle[start..end.min(middle.len())]) {
+            Ok(rec) => records.push(rec),
+            Err(e) => {
+                state.set_error(e);
+                return false;
+            }
+        }
+    }
+
+    let block_parsed = BlockParsed { block_idx, stream_idx, records, prefix_bytes, suffix_bytes };
+
+    // Track heap bytes at creation time. BlockMerge subtracts when it pops.
+    let heap_bytes = block_parsed.estimate_heap_size() as u64;
+    state.q2_block_parsed_heap_bytes.fetch_add(heap_bytes, Ordering::Release);
+
+    match state.q2_block_parsed.push(block_parsed) {
+        Ok(()) => {
+            // Count here: the item is now in Q2b.
+            state.chunks_block_parsed.fetch_add(1, Ordering::Release);
+            state.deadlock_state.record_q2_5_push();
+            true
+        }
+        Err(held) => {
+            // Don't count yet — item is held. It will be counted when pushed in Priority 1.
+            // Heap bytes already tracked above.
+            worker.held_block_parsed = Some(held);
+            true // did work (parsed the block)
+        }
+    }
+}
+
+// ============================================================================
+// BlockMerge Step (serial via try_lock, BGZF path)
+// ============================================================================
+
+/// Result of [`drain_exhausted_stream`].
+enum DrainResult {
+    /// All available blocks drained successfully.
+    Ok { did_work: bool, batches_this_call: usize },
+    /// Output queue is full; caller must store the held data in `worker.held_parsed`.
+    HeldParsed(u64, Vec<FastqTemplate>, usize),
+    /// A stitching error occurred.
+    Error(io::Error),
+}
+
+/// Drain remaining blocks from a single stream when the other stream is exhausted.
+///
+/// This is the shared implementation for both "R1 exhausted, drain R2" and
+/// "R2 exhausted, drain R1" paths. The `drain_r1` flag selects which stream
+/// to drain: `true` drains R1 blocks (pairing with R2 surplus), `false` drains
+/// R2 blocks (pairing with R1 surplus).
+///
+/// Returns [`DrainResult::HeldParsed`] if the output queue is full (caller stores
+/// it in `worker.held_parsed`), [`DrainResult::Error`] if a stitching error
+/// occurs, or [`DrainResult::Ok`] with updated counters.
+fn drain_exhausted_stream<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    merge: &mut BlockMergeState,
+    drain_r1: bool,
+    mut did_work: bool,
+    mut batches_this_call: usize,
+) -> DrainResult {
+    let (pending, suffix, surplus, other_surplus, next) = if drain_r1 {
+        (
+            &mut merge.r1_pending,
+            &mut merge.r1_suffix_bytes,
+            &mut merge.r1_surplus,
+            &mut merge.r2_surplus,
+            &mut merge.r1_next,
+        )
+    } else {
+        (
+            &mut merge.r2_pending,
+            &mut merge.r2_suffix_bytes,
+            &mut merge.r2_surplus,
+            &mut merge.r1_surplus,
+            &mut merge.r2_next,
+        )
+    };
+
+    while batches_this_call < MAX_BATCHES_PER_LOCK {
+        let block_next = *next;
+        let Some(block) = pending.remove(&block_next) else {
+            break;
+        };
+        merge.pending_heap_bytes =
+            merge.pending_heap_bytes.saturating_sub(block.estimate_heap_size() as u64);
+        *next += 1;
+
+        let cross = match stitch_cross_block_record(suffix, &block.prefix_bytes) {
+            Ok(rec) => rec,
+            Err(e) => return DrainResult::Error(e),
+        };
+
+        let mut all_this: Vec<FastqRecord> = std::mem::take(surplus);
+        if let Some(rec) = cross {
+            all_this.push(rec);
+        }
+        all_this.extend(block.records);
+        *suffix = block.suffix_bytes;
+
+        // Pair with any available surplus from the other stream.
+        let all_other: Vec<FastqRecord> = std::mem::take(other_surplus);
+        let pair_count = all_this.len().min(all_other.len());
+        if pair_count > 0 {
+            // Ensure R1 is always first in the template regardless of which stream
+            // we're draining.
+            let (mut r1_vec, mut r2_vec) =
+                if drain_r1 { (all_this, all_other) } else { (all_other, all_this) };
+
+            let templates: Vec<FastqTemplate> = r1_vec
+                .drain(..pair_count)
+                .zip(r2_vec.drain(..pair_count))
+                .map(|(r1, r2)| {
+                    let name = r1.name().to_vec();
+                    FastqTemplate { name, records: vec![r1, r2] }
+                })
+                .collect();
+
+            // Restore surplus to the correct fields.
+            if drain_r1 {
+                *surplus = r1_vec;
+                *other_surplus = r2_vec;
+            } else {
+                *surplus = r2_vec;
+                *other_surplus = r1_vec;
+            }
+
+            let serial = merge.serial_out;
+            merge.serial_out += 1;
+            let count = templates.len();
+
+            match state.output.groups.push((serial, templates)) {
+                Ok(()) => {
+                    state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
+                    if let Some(stats) = state.stats() {
+                        stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
+                    }
+                    state.deadlock_state.record_q4_push();
+                    did_work = true;
+                }
+                Err((_serial, returned)) => {
+                    return DrainResult::HeldParsed(serial, returned, count);
+                }
+            }
+        } else {
+            *surplus = all_this;
+            *other_surplus = all_other;
+        }
+        batches_this_call += 1;
+    }
+
+    DrainResult::Ok { did_work, batches_this_call }
+}
+
+/// `BlockMerge` step: serial step that assembles `BlockParsed` items into
+/// `FastqTemplate`s and pushes them to the output groups queue.
+///
+/// This step uses `try_lock` so only one worker runs it at a time, matching
+/// the serial semantics needed for in-order cross-block record stitching and
+/// R1/R2 pairing.
+///
+/// Returns `(did_work, had_contention)`.
+#[allow(clippy::too_many_lines)]
+fn fastq_try_step_block_merge<R: BufRead + Send, P: Send + MemoryEstimate>(
+    state: &FastqPipelineState<R, P>,
+    worker: &mut FastqWorkerState<P>,
+) -> (bool, bool) {
+    if state.has_error() {
+        return (false, false);
+    }
+
+    // Priority 1: Advance held templates first (same pattern as FindBoundaries).
+    let mut did_work = false;
+    if let Some((serial, held_templates, count)) = worker.held_parsed.take() {
+        match state.output.groups.push((serial, held_templates)) {
+            Ok(()) => {
+                state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
+                if let Some(stats) = state.stats() {
+                    stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
+                }
+                state.deadlock_state.record_q4_push();
+                // In the BGZF path, we don't use batches_parsed/batches_grouped.
+                did_work = true;
+            }
+            Err(returned) => {
+                worker.held_parsed = Some((serial, returned.1, count));
+                return (false, false);
+            }
+        }
+    }
+
+    // Check if already done.
+    if state.block_merge_done.load(Ordering::Relaxed) {
+        return (did_work, false);
+    }
+
+    // Check output capacity.
+    if state.output.groups.is_full() {
+        return (did_work, false);
+    }
+
+    // Acquire the merge state lock (try_lock for serial execution).
+    let Some(mut merge) = state.block_merge_state.try_lock() else {
+        return (did_work, true); // contention
+    };
+
+    let num_streams = state.num_streams;
+
+    // Determine whether to drain q2 into the pending maps.
+    //
+    // When the pending maps are large AND we can already process the next
+    // in-order blocks, we SKIP draining.  This lets q2 fill up, creating
+    // natural backpressure on BlockParseFast workers via queue fullness —
+    // bounding total memory without risking deadlock.
+    //
+    // When we CANNOT process (next in-order blocks missing), we ALWAYS
+    // drain so the needed blocks can reach the pending maps.
+    let can_process = if num_streams == 1 {
+        merge.r1_pending.contains_key(&merge.r1_next)
+    } else {
+        merge.r1_pending.contains_key(&merge.r1_next)
+            && merge.r2_pending.contains_key(&merge.r2_next)
+    };
+    let within_limit = merge.pending_heap_bytes < PENDING_BACKPRESSURE_BYTES;
+
+    let mut drained = 0;
+    if within_limit || !can_process {
+        while let Some(block) = state.q2_block_parsed.pop() {
+            let heap_bytes = block.estimate_heap_size() as u64;
+            state.q2_block_parsed_heap_bytes.fetch_sub(heap_bytes, Ordering::Release);
+            merge.pending_heap_bytes += heap_bytes;
+            state.deadlock_state.record_q2_5_pop();
+            state.blocks_merged.fetch_add(1, Ordering::Release);
+            if block.stream_idx == 0 {
+                merge.r1_pending.insert(block.block_idx, block);
+            } else {
+                merge.r2_pending.insert(block.block_idx, block);
+            }
+            drained += 1;
+        }
+    }
+    if drained == 0 && merge.r1_pending.is_empty() && merge.r2_pending.is_empty() {
+        // Nothing to do. Check for completion.
+        let all_chunks_block_parsed = state.read_done.load(Ordering::Acquire)
+            && state.chunks_block_parsed.load(Ordering::Acquire)
+                == state.batches_read.load(Ordering::Acquire);
+        if all_chunks_block_parsed && merge.is_empty() {
+            state.block_merge_done.store(true, Ordering::Release);
+            state.parse_done.store(true, Ordering::Release);
+            state.group_done.store(true, Ordering::Release);
+        }
+        return (did_work, false);
+    }
+
+    let mut batches_this_call = 0;
+
+    if num_streams == 1 {
+        // Single-stream (R1 only): process R1 blocks independently.
+        while batches_this_call < MAX_BATCHES_PER_LOCK {
+            let r1_next = merge.r1_next;
+            let Some(r1_block) = merge.r1_pending.remove(&r1_next) else {
+                break;
+            };
+            merge.pending_heap_bytes =
+                merge.pending_heap_bytes.saturating_sub(r1_block.estimate_heap_size() as u64);
+            merge.r1_next += 1;
+
+            // Stitch cross-block record.
+            let cross =
+                match stitch_cross_block_record(&merge.r1_suffix_bytes, &r1_block.prefix_bytes) {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        state.set_error(e);
+                        return (true, false);
+                    }
+                };
+
+            // Build full record list for this block.
+            let mut all_records: Vec<FastqRecord> = std::mem::take(&mut merge.r1_surplus);
+            if let Some(rec) = cross {
+                all_records.push(rec);
+            }
+            all_records.extend(r1_block.records);
+            merge.r1_suffix_bytes = r1_block.suffix_bytes;
+
+            // Emit templates (single-stream: each record is its own template).
+            let templates: Vec<FastqTemplate> = all_records
+                .into_iter()
+                .map(|r| {
+                    let name = r.name().to_vec();
+                    FastqTemplate { name, records: vec![r] }
+                })
+                .collect();
+
+            let serial = merge.serial_out;
+            merge.serial_out += 1;
+            let count = templates.len();
+
+            match state.output.groups.push((serial, templates)) {
+                Ok(()) => {
+                    state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
+                    if let Some(stats) = state.stats() {
+                        stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
+                    }
+                    state.deadlock_state.record_q4_push();
+                    did_work = true;
+                }
+                Err((serial, returned)) => {
+                    worker.held_parsed = Some((serial, returned, count));
+                    did_work = true;
+                    break;
+                }
+            }
+            batches_this_call += 1;
+        }
+    } else {
+        // Paired-end: pair R1 and R2 blocks by block_idx.
+        while batches_this_call < MAX_BATCHES_PER_LOCK {
+            let r1_next = merge.r1_next;
+            let r2_next = merge.r2_next;
+            if !merge.r1_pending.contains_key(&r1_next) || !merge.r2_pending.contains_key(&r2_next)
+            {
+                break;
+            }
+
+            let r1_block = merge.r1_pending.remove(&r1_next).expect("just checked");
+            let r2_block = merge.r2_pending.remove(&r2_next).expect("just checked");
+            merge.pending_heap_bytes = merge.pending_heap_bytes.saturating_sub(
+                (r1_block.estimate_heap_size() + r2_block.estimate_heap_size()) as u64,
+            );
+            merge.r1_next += 1;
+            merge.r2_next += 1;
+
+            // Stitch cross-block records.
+            let r1_cross =
+                match stitch_cross_block_record(&merge.r1_suffix_bytes, &r1_block.prefix_bytes) {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        state.set_error(e);
+                        return (true, false);
+                    }
+                };
+            let r2_cross =
+                match stitch_cross_block_record(&merge.r2_suffix_bytes, &r2_block.prefix_bytes) {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        state.set_error(e);
+                        return (true, false);
+                    }
+                };
+
+            // Build full record lists for this round.
+            let mut all_r1: Vec<FastqRecord> = std::mem::take(&mut merge.r1_surplus);
+            if let Some(rec) = r1_cross {
+                all_r1.push(rec);
+            }
+            all_r1.extend(r1_block.records);
+
+            let mut all_r2: Vec<FastqRecord> = std::mem::take(&mut merge.r2_surplus);
+            if let Some(rec) = r2_cross {
+                all_r2.push(rec);
+            }
+            all_r2.extend(r2_block.records);
+
+            merge.r1_suffix_bytes = r1_block.suffix_bytes;
+            merge.r2_suffix_bytes = r2_block.suffix_bytes;
+
+            // Zip min(r1, r2) pairs into templates, moving records (no clone).
+            let pair_count = all_r1.len().min(all_r2.len());
+            let templates: Vec<FastqTemplate> = all_r1
+                .drain(..pair_count)
+                .zip(all_r2.drain(..pair_count))
+                .map(|(r1, r2)| {
+                    let name = r1.name().to_vec();
+                    FastqTemplate { name, records: vec![r1, r2] }
+                })
+                .collect();
+
+            // Save surplus for the next round (drain left the remainder).
+            merge.r1_surplus = all_r1;
+            merge.r2_surplus = all_r2;
+
+            let serial = merge.serial_out;
+            merge.serial_out += 1;
+            let count = templates.len();
+
+            match state.output.groups.push((serial, templates)) {
+                Ok(()) => {
+                    state.total_templates_pushed.fetch_add(count as u64, Ordering::Release);
+                    if let Some(stats) = state.stats() {
+                        stats.groups_produced.fetch_add(count as u64, Ordering::Relaxed);
+                    }
+                    state.deadlock_state.record_q4_push();
+                    did_work = true;
+                }
+                Err((serial, returned)) => {
+                    worker.held_parsed = Some((serial, returned, count));
+                    did_work = true;
+                    break;
+                }
+            }
+            batches_this_call += 1;
+        }
+
+        // Drain remaining blocks when one stream is exhausted.
+        //
+        // R1 and R2 BGZF files can have different numbers of blocks (different
+        // compressed sizes), so after the paired loop above one stream may have
+        // blocks left in its pending map. Once the shorter stream is fully
+        // consumed (EOF + all its blocks have been block-parsed and merged), we
+        // drain the longer stream's remaining blocks here so the pipeline can
+        // complete.
+        if worker.held_parsed.is_none() && batches_this_call < MAX_BATCHES_PER_LOCK {
+            let r1_total = state.batch_counters[0].load(Ordering::Acquire);
+            let r2_total = state.batch_counters[1].load(Ordering::Acquire);
+            let r1_exhausted = state.stream_eof[0].load(Ordering::Acquire)
+                && merge.r1_next == r1_total
+                && !merge.r1_pending.contains_key(&merge.r1_next);
+            let r2_exhausted = state.stream_eof[1].load(Ordering::Acquire)
+                && merge.r2_next == r2_total
+                && !merge.r2_pending.contains_key(&merge.r2_next);
+
+            // Drain extra R2 blocks when R1 is exhausted.
+            if r1_exhausted && !merge.r2_pending.is_empty() {
+                match drain_exhausted_stream(state, &mut merge, false, did_work, batches_this_call)
+                {
+                    DrainResult::Ok { did_work: dw, batches_this_call: bc } => {
+                        did_work = dw;
+                        batches_this_call = bc;
+                    }
+                    DrainResult::HeldParsed(serial, templates, count) => {
+                        worker.held_parsed = Some((serial, templates, count));
+                        did_work = true;
+                    }
+                    DrainResult::Error(e) => {
+                        state.set_error(e);
+                        return (true, false);
+                    }
+                }
+            }
+
+            // Drain extra R1 blocks when R2 is exhausted.
+            if worker.held_parsed.is_none() && r2_exhausted && !merge.r1_pending.is_empty() {
+                match drain_exhausted_stream(state, &mut merge, true, did_work, batches_this_call) {
+                    DrainResult::Ok { did_work: dw, batches_this_call: _bc } => {
+                        did_work = dw;
+                    }
+                    DrainResult::HeldParsed(serial, templates, count) => {
+                        worker.held_parsed = Some((serial, templates, count));
+                        did_work = true;
+                    }
+                    DrainResult::Error(e) => {
+                        state.set_error(e);
+                        return (true, false);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for completion: all chunks processed, queue drained, and merge state empty.
+    let all_chunks_block_parsed = state.read_done.load(Ordering::Acquire)
+        && state.chunks_block_parsed.load(Ordering::Acquire)
+            == state.batches_read.load(Ordering::Acquire);
+    if all_chunks_block_parsed
+        && state.q2_block_parsed.is_empty()
+        && merge.r1_pending.is_empty()
+        && merge.r2_pending.is_empty()
+        && merge.r1_surplus.is_empty()
+        && merge.r2_surplus.is_empty()
+        && merge.r1_suffix_bytes.is_empty()
+        && merge.r2_suffix_bytes.is_empty()
+        && worker.held_parsed.is_none()
+    {
+        state.block_merge_done.store(true, Ordering::Release);
+        state.parse_done.store(true, Ordering::Release);
+        state.group_done.store(true, Ordering::Release);
+    }
+
+    (did_work, false)
+}
+
+// ============================================================================
 // Pair Step (FindBoundaries)
 // ============================================================================
 
@@ -1968,7 +2863,10 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
             == state.batches_read.load(Ordering::Acquire);
 
     // Priority 5: Try to emit complete batches.
-    while let Some(chunks) = pair.try_pop_complete(all_arrived) {
+    // Cap batches processed per lock hold to avoid starving other workers (mirrors BAM pipeline).
+    let mut batches_this_call = 0;
+    while batches_this_call < MAX_BATCHES_PER_LOCK {
+        let Some(chunks) = pair.try_pop_complete(all_arrived) else { break };
         // Atomically assign a unique serial. This must be fetch_add (not load)
         // because the held_boundaries path can race: Worker A creates a batch
         // but push fails (goes to held_boundaries without incrementing), then
@@ -2021,6 +2919,7 @@ fn fastq_try_step_find_boundaries<R: BufRead + Send, P: Send + MemoryEstimate>(
                 break; // output queue full, stop emitting
             }
         }
+        batches_this_call += 1;
     }
 
     // Completion: all chunks paired and all batches emitted.
@@ -2178,7 +3077,7 @@ fn create_templates_from_streams(
             Ok(records
                 .into_iter()
                 .map(|r| {
-                    let name = r.name.clone();
+                    let name = r.name().to_vec();
                     FastqTemplate { name, records: vec![r] }
                 })
                 .collect())
@@ -2209,7 +3108,7 @@ fn create_templates_from_streams(
                 .into_iter()
                 .zip(r2_records)
                 .map(|(r1, r2)| {
-                    let name = r1.name.clone();
+                    let name = r1.name().to_vec();
                     FastqTemplate { name, records: vec![r1, r2] }
                 })
                 .collect();
@@ -2562,20 +3461,28 @@ where
         PipelineStep::Read => (fastq_try_step_read(state, worker), false),
         PipelineStep::Decompress => (fastq_try_step_decompress(state, worker), false),
         PipelineStep::FindBoundaries => {
-            // Uses held-boundaries pattern for parallelism (see base.rs HasHeldBoundaries)
-            fastq_try_step_find_boundaries(state, worker)
+            if state.config.inputs_are_bgzf {
+                // BGZF path: BlockMerge is the serial stitch+pair step.
+                fastq_try_step_block_merge(state, worker)
+            } else {
+                // Gzip/plain path: original serial boundary-finding + pair assembly.
+                fastq_try_step_find_boundaries(state, worker)
+            }
         }
         PipelineStep::Decode => {
-            // Decode step parses FASTQ records and creates templates directly.
-            // Uses held-item pattern (held_parsed) like all other steps —
-            // returns immediately if output queue is full, allowing the thread
-            // to drain downstream steps and prevent deadlocks.
-            let success = fastq_try_step_parse(state, worker);
-            (success, false)
+            if state.config.inputs_are_bgzf {
+                // BGZF path: BlockParseFast is the parallel per-chunk parse step.
+                let success = fastq_try_step_block_parse(state, worker);
+                (success, false)
+            } else {
+                // Gzip/plain path: original parallel parse step.
+                let success = fastq_try_step_parse(state, worker);
+                (success, false)
+            }
         }
         PipelineStep::Group => {
             // Group step is never active — synchronized mode creates templates
-            // directly in the Decode (Parse) step
+            // directly in the Decode/BlockMerge step
             (false, false)
         }
         PipelineStep::Process => (fastq_try_step_process(state, process_fn, worker), false),
@@ -3130,11 +4037,11 @@ mod tests {
         assert_eq!(parsed_batch.streams[1].records.len(), 2);
 
         // Verify record contents
-        assert_eq!(parsed_batch.streams[0].records[0].name, b"read1");
-        assert_eq!(parsed_batch.streams[0].records[0].sequence, b"ACGT");
-        assert_eq!(parsed_batch.streams[0].records[1].name, b"read2");
-        assert_eq!(parsed_batch.streams[1].records[0].name, b"read1");
-        assert_eq!(parsed_batch.streams[1].records[0].sequence, b"TTTT");
+        assert_eq!(parsed_batch.streams[0].records[0].name(), b"read1");
+        assert_eq!(parsed_batch.streams[0].records[0].sequence(), b"ACGT");
+        assert_eq!(parsed_batch.streams[0].records[1].name(), b"read2");
+        assert_eq!(parsed_batch.streams[1].records[0].name(), b"read1");
+        assert_eq!(parsed_batch.streams[1].records[0].sequence(), b"TTTT");
     }
 
     #[test]
@@ -3173,9 +4080,9 @@ mod tests {
         let parsed2 = FastqFormat::parse_records(boundary_batch2).expect("parse_records failed");
 
         assert_eq!(parsed1.streams[0].records.len(), 1);
-        assert_eq!(parsed1.streams[0].records[0].name, b"read1");
+        assert_eq!(parsed1.streams[0].records[0].name(), b"read1");
         assert_eq!(parsed2.streams[0].records.len(), 1);
-        assert_eq!(parsed2.streams[0].records[0].name, b"read2");
+        assert_eq!(parsed2.streams[0].records[0].name(), b"read2");
     }
 
     #[test]
@@ -3211,7 +4118,7 @@ mod tests {
                         assert_eq!(parsed.streams[0].stream_idx, 0);
                         assert_eq!(parsed.streams[0].records.len(), 1);
                         assert_eq!(
-                            String::from_utf8_lossy(&parsed.streams[0].records[0].name),
+                            String::from_utf8_lossy(parsed.streams[0].records[0].name()),
                             name
                         );
                         records_parsed += 1;
@@ -3339,10 +4246,11 @@ mod tests {
         // Parse and verify record names
         let parsed = FastqFormat::parse_records(boundary_batch2).expect("parse_records failed");
         assert_eq!(
-            parsed.streams[0].records[0].name, b"r3",
+            parsed.streams[0].records[0].name(),
+            b"r3",
             "First record should be r3 from leftover"
         );
-        assert_eq!(parsed.streams[0].records[1].name, b"r4", "Second record should be r4");
+        assert_eq!(parsed.streams[0].records[1].name(), b"r4", "Second record should be r4");
     }
 
     #[test]
@@ -3533,8 +4441,8 @@ mod tests {
             parsed.streams[1].stream_idx, 0,
             "Second parsed stream should be R1 (stream_idx=0)"
         );
-        assert_eq!(parsed.streams[0].records[0].sequence, b"TTTT");
-        assert_eq!(parsed.streams[1].records[0].sequence, b"ACGT");
+        assert_eq!(parsed.streams[0].records[0].sequence(), b"TTTT");
+        assert_eq!(parsed.streams[1].records[0].sequence(), b"ACGT");
     }
 
     #[test]
@@ -3548,19 +4456,15 @@ mod tests {
         let streams = vec![
             FastqParsedStream {
                 stream_idx: 1, // R2 comes first in the Vec (reversed!)
-                records: vec![FastqRecord {
-                    name: b"read1".to_vec(),
-                    sequence: b"TTTT".to_vec(), // R2 sequence
-                    quality: b"JJJJ".to_vec(),
-                }],
+                records: vec![
+                    FastqRecord::from_slice(b"@read1\nTTTT\n+\nJJJJ\n").unwrap(), // R2 sequence
+                ],
             },
             FastqParsedStream {
                 stream_idx: 0, // R1 comes second
-                records: vec![FastqRecord {
-                    name: b"read1".to_vec(),
-                    sequence: b"ACGT".to_vec(), // R1 sequence
-                    quality: b"IIII".to_vec(),
-                }],
+                records: vec![
+                    FastqRecord::from_slice(b"@read1\nACGT\n+\nIIII\n").unwrap(), // R1 sequence
+                ],
             },
         ];
 
@@ -3571,11 +4475,13 @@ mod tests {
         assert_eq!(templates[0].records.len(), 2);
         // Critical: R1 must be first (records[0]), R2 must be second (records[1])
         assert_eq!(
-            templates[0].records[0].sequence, b"ACGT",
+            templates[0].records[0].sequence(),
+            b"ACGT",
             "First record in template must be R1 (ACGT), not R2"
         );
         assert_eq!(
-            templates[0].records[1].sequence, b"TTTT",
+            templates[0].records[1].sequence(),
+            b"TTTT",
             "Second record in template must be R2 (TTTT), not R1"
         );
     }
@@ -3586,19 +4492,11 @@ mod tests {
         let streams = vec![
             FastqParsedStream {
                 stream_idx: 0,
-                records: vec![FastqRecord {
-                    name: b"read1".to_vec(),
-                    sequence: b"ACGT".to_vec(),
-                    quality: b"IIII".to_vec(),
-                }],
+                records: vec![FastqRecord::from_slice(b"@read1\nACGT\n+\nIIII\n").unwrap()],
             },
             FastqParsedStream {
                 stream_idx: 1,
-                records: vec![FastqRecord {
-                    name: b"read1".to_vec(),
-                    sequence: b"TTTT".to_vec(),
-                    quality: b"JJJJ".to_vec(),
-                }],
+                records: vec![FastqRecord::from_slice(b"@read1\nTTTT\n+\nJJJJ\n").unwrap()],
             },
         ];
 
@@ -3606,8 +4504,8 @@ mod tests {
             create_templates_from_streams(streams).expect("create templates from streams");
 
         assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].records[0].sequence, b"ACGT", "R1 should be first");
-        assert_eq!(templates[0].records[1].sequence, b"TTTT", "R2 should be second");
+        assert_eq!(templates[0].records[0].sequence(), b"ACGT", "R1 should be first");
+        assert_eq!(templates[0].records[1].sequence(), b"TTTT", "R2 should be second");
     }
 
     #[test]
@@ -3676,11 +4574,13 @@ mod tests {
         // THE KEY ASSERTION: R1 data (GGGG from leftover) must be records[0],
         // R2 data (CCCC from new chunk) must be records[1].
         assert_eq!(
-            templates[0].records[0].sequence, b"GGGG",
+            templates[0].records[0].sequence(),
+            b"GGGG",
             "records[0] must be R1 (stream 0) data, not R2"
         );
         assert_eq!(
-            templates[0].records[1].sequence, b"CCCC",
+            templates[0].records[1].sequence(),
+            b"CCCC",
             "records[1] must be R2 (stream 1) data, not R1"
         );
     }
@@ -3977,16 +4877,11 @@ mod tests {
 
     #[test]
     fn test_fastq_parsed_batch_memory_estimate() {
-        use crate::grouper::FastqRecord;
+        use crate::fastq_parse::FastqRecord;
 
-        let mut name = Vec::with_capacity(64);
-        name.extend_from_slice(b"read1");
-        let mut seq = Vec::with_capacity(256);
-        seq.extend_from_slice(b"ACGT");
-        let mut qual = Vec::with_capacity(256);
-        qual.extend_from_slice(b"IIII");
-
-        let record = FastqRecord { name, sequence: seq, quality: qual };
+        // Single-allocation record: data = "@read1\nACGT\n+\nIIII\n"
+        let record =
+            FastqRecord::from_slice(b"@read1\nACGT\n+\nIIII\n").expect("valid FASTQ record");
         let mut records = Vec::with_capacity(8);
         records.push(record);
 
@@ -3996,13 +4891,444 @@ mod tests {
         let batch = FastqParsedBatch { streams, serial: 0 };
         let estimate = batch.estimate_heap_size();
 
-        let record_data = 64 + 256 + 256; // capacities of name, seq, qual
+        // Estimate should include at least the data allocation + struct overheads
         let records_overhead = 8 * std::mem::size_of::<FastqRecord>();
         let streams_overhead = 4 * std::mem::size_of::<FastqParsedStream>();
-        let expected_min = record_data + records_overhead + streams_overhead;
+        let expected_min = b"@read1\nACGT\n+\nIIII\n".len() + records_overhead + streams_overhead;
         assert!(
             estimate >= expected_min,
-            "estimate {estimate} should be >= {expected_min} (capacities + overhead)"
+            "estimate {estimate} should be >= {expected_min} (data capacity + overhead)"
         );
+    }
+
+    // ========================================================================
+    // FastqRecord::from_slice Tests
+    // ========================================================================
+
+    #[test]
+    fn test_fastq_record_from_slice_normal() {
+        use crate::fastq_parse::FastqRecord;
+        let data = b"@read1\nACGT\n+\nIIII\n";
+        let rec = FastqRecord::from_slice(data).expect("valid FASTQ record");
+        assert_eq!(rec.name(), b"read1");
+        assert_eq!(rec.sequence(), b"ACGT");
+        assert_eq!(rec.quality(), b"IIII");
+    }
+
+    #[test]
+    fn test_fastq_record_from_slice_at_in_quality() {
+        // '@' and '+' characters in quality scores must not confuse the parser.
+        use crate::fastq_parse::FastqRecord;
+        let data = b"@read1\nACGT\n+\n@+!I\n";
+        let rec = FastqRecord::from_slice(data).expect("record with @ in quality");
+        assert_eq!(rec.name(), b"read1");
+        assert_eq!(rec.sequence(), b"ACGT");
+        assert_eq!(rec.quality(), b"@+!I");
+    }
+
+    #[test]
+    fn test_fastq_record_from_slice_mismatched_lengths() {
+        use crate::fastq_parse::FastqRecord;
+        // seq=4 bases but qual=3 chars — should error.
+        let data = b"@read1\nACGT\n+\nIII\n";
+        let result = FastqRecord::from_slice(data);
+        assert!(result.is_err(), "mismatched seq/qual lengths must return an error");
+    }
+
+    #[test]
+    fn test_fastq_record_from_slice_empty_data() {
+        use crate::fastq_parse::FastqRecord;
+        let result = FastqRecord::from_slice(b"");
+        assert!(result.is_err(), "empty data must return an error");
+    }
+
+    #[test]
+    fn test_fastq_record_from_slice_no_leading_at() {
+        use crate::fastq_parse::FastqRecord;
+        let data = b"read1\nACGT\n+\nIIII\n";
+        let result = FastqRecord::from_slice(data);
+        assert!(result.is_err(), "missing @ prefix must return an error");
+    }
+
+    #[test]
+    fn test_fastq_record_from_slice_no_trailing_newline() {
+        // Quality without trailing newline should still parse (trimmed).
+        use crate::fastq_parse::FastqRecord;
+        let data = b"@read1\nACGT\n+\nIIII";
+        let rec = FastqRecord::from_slice(data).expect("record without trailing newline");
+        assert_eq!(rec.quality(), b"IIII");
+    }
+
+    // ========================================================================
+    // detect_prefix_end Tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_prefix_end_empty() {
+        // Empty data → 0 (no prefix).
+        assert_eq!(detect_prefix_end(b""), 0);
+    }
+
+    #[test]
+    fn test_detect_prefix_end_starts_on_boundary() {
+        // Data begins with '@' → record boundary immediately, prefix_end = 0.
+        let data = b"@read1\nACGT\n+\nIIII\n";
+        assert_eq!(detect_prefix_end(data), 0);
+    }
+
+    #[test]
+    fn test_detect_prefix_end_mid_record() {
+        // Data starts mid-sequence; the first '@' appears after the partial sequence.
+        // prefix is "CGT\n+\nIIII\n", then '@read2\n...' begins.
+        let suffix = b"@read2\nGGGG\n+\nJJJJ\n";
+        let prefix = b"CGT\n+\nIIII\n";
+        let mut data = prefix.to_vec();
+        data.extend_from_slice(suffix);
+        let end = detect_prefix_end(&data);
+        // The returned offset should point to the '@' of read2.
+        assert_eq!(&data[end..=end], b"@");
+        assert!(end > 0, "prefix_end must be > 0 when data starts mid-record");
+    }
+
+    #[test]
+    fn test_detect_prefix_end_single_record() {
+        // Data is exactly one complete record that starts on a boundary.
+        let data = b"@r\nA\n+\nI\n";
+        assert_eq!(detect_prefix_end(data), 0);
+    }
+
+    #[test]
+    fn test_detect_prefix_end_insufficient_data() {
+        // Fewer than 4 newlines → cannot determine boundary, return data.len().
+        let data = b"partial_no_newlines";
+        assert_eq!(detect_prefix_end(data), data.len());
+    }
+
+    #[test]
+    fn test_detect_prefix_end_at_in_quality_is_not_boundary() {
+        // A '@' in quality scores must not be treated as a record boundary.
+        // Layout: partial quality "!@\n" then a real record "@r2\nAA\n+\nII\n".
+        // The prefix is "!@\n" (3 bytes), so prefix_end should be 3.
+        //
+        // We must construct data that starts mid-quality (after seq+plus lines).
+        // Full record: @r1\nAA\n+\n!@\n => but we start mid-quality at '!'
+        // So data = "!@\n" + "@r2\nAA\n+\nII\n"
+        let data = b"!@\n@r2\nAA\n+\nII\n";
+        let end = detect_prefix_end(data);
+        // Should skip the '!@\n' prefix and land on '@r2'.
+        assert_eq!(&data[end..=end], b"@");
+    }
+
+    // ========================================================================
+    // detect_suffix_start Tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_suffix_start_empty() {
+        assert_eq!(detect_suffix_start(b""), 0);
+    }
+
+    #[test]
+    fn test_detect_suffix_start_ends_on_boundary() {
+        // Data ends exactly on a record boundary (trailing '\n') → data.len().
+        let data = b"@read1\nACGT\n+\nIIII\n";
+        assert_eq!(detect_suffix_start(data), data.len());
+    }
+
+    #[test]
+    fn test_detect_suffix_start_ends_mid_record() {
+        // Data has one complete record followed by an incomplete one.
+        // The complete record is "@r1\nACGT\n+\nIIII\n" (18 bytes).
+        // Then "@r2\nGG" is incomplete (only 6 bytes with no quality).
+        let complete = b"@r1\nACGT\n+\nIIII\n";
+        let partial = b"@r2\nGG";
+        let mut data = complete.to_vec();
+        data.extend_from_slice(partial);
+        let suffix_start = detect_suffix_start(&data);
+        // Everything from suffix_start onwards is the incomplete fragment.
+        assert_eq!(suffix_start, complete.len());
+    }
+
+    #[test]
+    fn test_detect_suffix_start_single_record_whole_buffer() {
+        // A single complete record → suffix_start = data.len() (no suffix).
+        let data = b"@r\nA\n+\nI\n";
+        assert_eq!(detect_suffix_start(data), data.len());
+    }
+
+    #[test]
+    fn test_detect_suffix_start_insufficient_data() {
+        // Fewer than 4 newlines → cannot confirm a full record, return 0.
+        let data = b"@r1\nAC";
+        assert_eq!(detect_suffix_start(data), 0);
+    }
+
+    #[test]
+    fn test_detect_suffix_start_multiple_records() {
+        // Two complete records; suffix_start should be data.len().
+        let data = b"@r1\nACGT\n+\nIIII\n@r2\nGGGG\n+\nJJJJ\n";
+        assert_eq!(detect_suffix_start(data), data.len());
+    }
+
+    // ========================================================================
+    // detect_prefix_end / detect_suffix_start Round-trip
+    // ========================================================================
+
+    #[test]
+    fn test_prefix_suffix_round_trip() {
+        // Simulate a BGZF chunk that has a partial record at start and end.
+        // Layout: "GT\n+\nIIII\n" (suffix of previous record)
+        //       + "@r2\nACGT\n+\nJJJJ\n" (complete middle record)
+        //       + "@r3\nAA" (prefix of next record)
+        let prefix_bytes = b"GT\n+\nIIII\n";
+        let middle_bytes = b"@r2\nACGT\n+\nJJJJ\n";
+        let suffix_bytes = b"@r3\nAA";
+        let mut data = prefix_bytes.to_vec();
+        data.extend_from_slice(middle_bytes);
+        data.extend_from_slice(suffix_bytes);
+
+        let prefix_end = detect_prefix_end(&data);
+        let suffix_start = detect_suffix_start(&data[prefix_end..]) + prefix_end;
+
+        // prefix_end should skip "GT\n+\nIIII\n" (10 bytes) to land on '@r2'.
+        assert_eq!(prefix_end, prefix_bytes.len());
+        // suffix_start (relative to start of data) should be where '@r3' begins.
+        assert_eq!(suffix_start, prefix_bytes.len() + middle_bytes.len());
+        // Middle slice should be exactly middle_bytes.
+        assert_eq!(&data[prefix_end..suffix_start], middle_bytes);
+    }
+
+    // ========================================================================
+    // stitch_cross_block_record Tests
+    // ========================================================================
+
+    #[test]
+    fn test_stitch_cross_block_record_both_empty() {
+        let result = stitch_cross_block_record(b"", b"").expect("no error for empty slices");
+        assert!(result.is_none(), "both empty → None");
+    }
+
+    #[test]
+    fn test_stitch_cross_block_record_valid() {
+        // The record "@r1\nACGT\n+\nIIII\n" split across two blocks.
+        let suffix = b"@r1\nACGT\n+\n";
+        let prefix = b"IIII\n";
+        let result = stitch_cross_block_record(suffix, prefix)
+            .expect("valid cross-block record")
+            .expect("record should be Some");
+        assert_eq!(result.name(), b"r1");
+        assert_eq!(result.sequence(), b"ACGT");
+        assert_eq!(result.quality(), b"IIII");
+    }
+
+    // ========================================================================
+    // BlockParseFast Integration Tests
+    // ========================================================================
+
+    /// Verify that `detect_prefix_end` + `detect_suffix_start` + SIMD offsets correctly
+    /// split a decompressed chunk into prefix, middle records, and suffix.
+    #[test]
+    fn test_block_parse_split_prefix_middle_suffix() {
+        // Simulate a decompressed chunk starting mid-record and ending mid-record.
+        // Previous block ended with: "@r1\nACGT\n+" (partial)
+        // This chunk continues:      "IIII\n" (completes r1)
+        //                       then "@r2\nGGGG\n+\nJJJJ\n" (complete)
+        //                       then "@r3\nTT" (starts r3, incomplete)
+        let prefix_frag = b"\nIIII\n"; // completes r1 (name+seq+plus already in prev block)
+        let complete_r2 = b"@r2\nGGGG\n+\nJJJJ\n";
+        let suffix_frag = b"@r3\nTT";
+
+        // Build mock "previous suffix" + "current block" data.
+        // For the block parse step the data is just the decompressed chunk.
+        // We arrange it so that prefix = "\nIIII\n" (6 bytes starting with \n, not @).
+        let mut data = prefix_frag.to_vec();
+        data.extend_from_slice(complete_r2);
+        data.extend_from_slice(suffix_frag);
+
+        let prefix_end = detect_prefix_end(&data);
+        let suffix_start = if prefix_end >= data.len() {
+            data.len()
+        } else {
+            detect_suffix_start(&data[prefix_end..]) + prefix_end
+        };
+
+        let prefix_bytes = &data[..prefix_end];
+        let suffix_bytes = &data[suffix_start..];
+        let middle = &data[prefix_end..suffix_start];
+
+        // prefix is the partial fragment before the first complete record.
+        assert_eq!(prefix_bytes, prefix_frag);
+        // suffix is the incomplete trailing fragment.
+        assert_eq!(suffix_bytes, suffix_frag);
+        // middle is exactly the complete r2 record.
+        assert_eq!(middle, complete_r2);
+
+        // Verify SIMD offsets on middle.
+        let offsets = fgumi_simd_fastq::find_record_offsets(middle);
+        assert_eq!(offsets.len(), 2, "one complete record → two offsets (start + end)");
+
+        // Parse the middle record.
+        let rec =
+            FastqRecord::from_slice(&middle[offsets[0]..offsets[1]]).expect("valid r2 record");
+        assert_eq!(rec.name(), b"r2");
+        assert_eq!(rec.sequence(), b"GGGG");
+        assert_eq!(rec.quality(), b"JJJJ");
+    }
+
+    #[test]
+    fn test_block_parse_starts_on_boundary() {
+        // Chunk starts exactly on a record boundary → prefix_end = 0.
+        let data = b"@r1\nACGT\n+\nIIII\n@r2\nGGGG\n+\nJJJJ\n";
+        let prefix_end = detect_prefix_end(data);
+        assert_eq!(prefix_end, 0, "no prefix when data starts on @");
+
+        let suffix_start = detect_suffix_start(&data[prefix_end..]) + prefix_end;
+        assert_eq!(suffix_start, data.len(), "no suffix when data ends on record boundary");
+
+        let offsets = fgumi_simd_fastq::find_record_offsets(data);
+        assert_eq!(offsets.len(), 3, "two complete records → three offsets");
+    }
+
+    #[test]
+    fn test_block_parse_entire_buffer_is_prefix() {
+        // Chunk has no complete records (all data is a partial record fragment).
+        let data = b"only_partial_no_newlines";
+        let prefix_end = detect_prefix_end(data);
+        // Should return data.len() — entire buffer is prefix.
+        assert_eq!(prefix_end, data.len());
+    }
+
+    // ========================================================================
+    // BlockMerge Integration Tests
+    // ========================================================================
+
+    /// Helper: build a `BlockParsed` for stream 0 (R1) with given records.
+    fn make_block_parsed(
+        block_idx: u64,
+        stream_idx: usize,
+        records: Vec<FastqRecord>,
+        prefix_bytes: Vec<u8>,
+        suffix_bytes: Vec<u8>,
+    ) -> BlockParsed {
+        BlockParsed { block_idx, stream_idx, records, prefix_bytes, suffix_bytes }
+    }
+
+    fn make_record(name: &str, seq: &str, qual: &str) -> FastqRecord {
+        let raw = format!("@{name}\n{seq}\n+\n{qual}\n");
+        FastqRecord::from_slice(raw.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn test_block_merge_state_single_stream_basic() {
+        // Single-stream (R1 only): 2 records across two blocks, no cross-block record.
+        let mut state = BlockMergeState::new();
+        assert!(state.is_empty());
+
+        let r1 = make_record("r1", "ACGT", "IIII");
+        let r2 = make_record("r2", "GGGG", "JJJJ");
+
+        // Block 0: 1 record, no prefix/suffix.
+        let block0 = make_block_parsed(0, 0, vec![r1.clone()], vec![], vec![]);
+        // Block 1: 1 record, no prefix/suffix.
+        let block1 = make_block_parsed(1, 0, vec![r2.clone()], vec![], vec![]);
+
+        state.r1_pending.insert(0, block0);
+        state.r1_pending.insert(1, block1);
+
+        // Process block 0.
+        let r1_next = state.r1_next;
+        let r1_block = state.r1_pending.remove(&r1_next).unwrap();
+        state.r1_next += 1;
+
+        let cross0 =
+            stitch_cross_block_record(&state.r1_suffix_bytes, &r1_block.prefix_bytes).unwrap();
+        assert!(cross0.is_none(), "no cross-block record in block 0");
+
+        let mut all_r1: Vec<FastqRecord> = std::mem::take(&mut state.r1_surplus);
+        if let Some(rec) = cross0 {
+            all_r1.push(rec);
+        }
+        all_r1.extend(r1_block.records);
+        state.r1_suffix_bytes = r1_block.suffix_bytes;
+
+        assert_eq!(all_r1.len(), 1);
+        assert_eq!(all_r1[0].name(), b"r1");
+        assert_eq!(all_r1[0].sequence(), b"ACGT");
+    }
+
+    #[test]
+    fn test_block_merge_cross_block_record() {
+        // The record "@r1\nACGT\n+\nIIII\n" is split: "@r1\nACGT\n+\n" in block 0's suffix,
+        // "IIII\n" in block 1's prefix.
+        let suffix_bytes = b"@r1\nACGT\n+\n".to_vec();
+        let prefix_bytes = b"IIII\n".to_vec();
+
+        let cross = stitch_cross_block_record(&suffix_bytes, &prefix_bytes)
+            .expect("valid cross-block record")
+            .expect("should be Some");
+
+        assert_eq!(cross.name(), b"r1");
+        assert_eq!(cross.sequence(), b"ACGT");
+        assert_eq!(cross.quality(), b"IIII");
+    }
+
+    #[test]
+    fn test_block_merge_r1_surplus_carries() {
+        // R1 block has 3 records, R2 block has 2 records → 1 R1 surplus.
+        let r1_records = [
+            make_record("r1", "AAAA", "IIII"),
+            make_record("r2", "CCCC", "IIII"),
+            make_record("r3", "GGGG", "IIII"),
+        ];
+        let r2_records = [make_record("r1", "TTTT", "JJJJ"), make_record("r2", "CCCC", "JJJJ")];
+
+        let pair_count = r1_records.len().min(r2_records.len()); // 2
+        let surplus: Vec<FastqRecord> = r1_records[pair_count..].to_vec();
+
+        assert_eq!(pair_count, 2);
+        assert_eq!(surplus.len(), 1);
+        assert_eq!(surplus[0].name(), b"r3");
+    }
+
+    #[test]
+    fn test_block_merge_r2_surplus_carries() {
+        // R2 block has more records than R1 block → R2 surplus.
+        let r1_records = [make_record("r1", "AAAA", "IIII")];
+        let r2_records = [make_record("r1", "TTTT", "JJJJ"), make_record("r2", "CCCC", "JJJJ")];
+
+        let pair_count = r1_records.len().min(r2_records.len()); // 1
+        let r2_surplus: Vec<FastqRecord> = r2_records[pair_count..].to_vec();
+
+        assert_eq!(pair_count, 1);
+        assert_eq!(r2_surplus.len(), 1);
+        assert_eq!(r2_surplus[0].name(), b"r2");
+    }
+
+    #[test]
+    fn test_block_merge_state_out_of_order_insertion() {
+        // Insert block 1 before block 0; verify r1_next ordering.
+        let mut state = BlockMergeState::new();
+        let r1 = make_record("r1", "ACGT", "IIII");
+        let r2 = make_record("r2", "GGGG", "JJJJ");
+
+        state.r1_pending.insert(1, make_block_parsed(1, 0, vec![r2], vec![], vec![]));
+        state.r1_pending.insert(0, make_block_parsed(0, 0, vec![r1], vec![], vec![]));
+
+        // Block 0 must be processed first (BTreeMap ordering by key).
+        let first_key = *state.r1_pending.keys().next().unwrap();
+        assert_eq!(first_key, 0, "BTreeMap must yield block 0 first");
+    }
+
+    #[test]
+    fn test_block_merge_state_empty() {
+        let state = BlockMergeState::new();
+        assert!(state.is_empty());
+        assert!(state.r1_pending.is_empty());
+        assert!(state.r2_pending.is_empty());
+        assert!(state.r1_surplus.is_empty());
+        assert!(state.r2_surplus.is_empty());
+        assert!(state.r1_suffix_bytes.is_empty());
+        assert!(state.r2_suffix_bytes.is_empty());
+        assert_eq!(state.serial_out, 0);
     }
 }

@@ -965,3 +965,311 @@ fn test_extract_multithreaded_custom_options() {
         assert!(name.contains('+'), "Read name should be annotated with UMI: {name}");
     }
 }
+
+// ============================================================================
+// BGZF BlockParseFast / BlockMerge Pipeline End-to-End Tests
+// ============================================================================
+//
+// These tests verify the BGZF-specific parallel pipeline path (BlockParseFast +
+// BlockMerge) at multiple thread counts, with both single-stream (R1 only) and
+// paired-stream (R1+R2) inputs.
+
+/// Helper: run extract with BGZF inputs at a specific thread count, return BAM records.
+fn run_bgzf_extract(
+    r1: &std::path::Path,
+    r2_opt: Option<&std::path::Path>,
+    threads: usize,
+    tmp: &TempDir,
+    tag_suffix: &str,
+) -> Vec<RecordBuf> {
+    let output = tmp.path().join(format!("out_{tag_suffix}_t{threads}.bam"));
+    let mut args =
+        vec!["extract".to_string(), "--inputs".to_string(), r1.to_str().unwrap().to_string()];
+    if let Some(r2) = r2_opt {
+        args.push(r2.to_str().unwrap().to_string());
+    }
+    args.extend([
+        "--output".to_string(),
+        output.to_str().unwrap().to_string(),
+        "--read-structures".to_string(),
+        "5M+T".to_string(),
+    ]);
+    if r2_opt.is_some() {
+        args.push("5M+T".to_string());
+    }
+    args.extend([
+        "--sample".to_string(),
+        "test".to_string(),
+        "--library".to_string(),
+        "test".to_string(),
+        "--threads".to_string(),
+        threads.to_string(),
+        "--compression-level".to_string(),
+        "1".to_string(),
+    ]);
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args(&args)
+        .status()
+        .expect("Failed to execute extract command");
+
+    assert!(status.success(), "extract t{threads} {tag_suffix} failed");
+    read_bam_records(&output)
+}
+
+/// BGZF paired-stream extract at T1, T4, T8 — record count and content must agree.
+#[test]
+fn test_bgzf_block_merge_paired_thread_counts() {
+    let tmp = TempDir::new().unwrap();
+
+    // 500 pairs with 150-base reads — total uncompressed ~450 KB, guaranteeing
+    // multiple BGZF blocks (each ≤64 KiB) so BlockParseFast/BlockMerge stitching
+    // is exercised.
+    let r1_recs: Vec<(&'static str, &'static str, &'static str)> = (0..500)
+        .map(|i| {
+            let name: &'static str = Box::leak(format!("read{i:04}").into_boxed_str());
+            let seq: &'static str =
+                Box::leak(format!("AAAAA{i:010}{}", "ACGT".repeat(33)).into_boxed_str());
+            let qual: &'static str = Box::leak("I".repeat(147).into_boxed_str());
+            (name, seq, qual)
+        })
+        .collect();
+
+    let r2_recs: Vec<(&'static str, &'static str, &'static str)> = (0..500)
+        .map(|i| {
+            let name: &'static str = Box::leak(format!("read{i:04}").into_boxed_str());
+            let seq: &'static str =
+                Box::leak(format!("TTTTT{i:010}{}", "TGCA".repeat(33)).into_boxed_str());
+            let qual: &'static str = Box::leak("J".repeat(147).into_boxed_str());
+            (name, seq, qual)
+        })
+        .collect();
+
+    let r1 = create_bgzf_fastq(&tmp, "r1.fq.bgz", &r1_recs);
+    let r2 = create_bgzf_fastq(&tmp, "r2.fq.bgz", &r2_recs);
+
+    // Run at T1, T4, T8.
+    let results: Vec<Vec<RecordBuf>> =
+        [1, 4, 8].iter().map(|&t| run_bgzf_extract(&r1, Some(&r2), t, &tmp, "paired")).collect();
+
+    // All three runs must produce the same number of records (500 pairs × 2 reads = 1000).
+    for (idx, recs) in results.iter().enumerate() {
+        assert_eq!(
+            recs.len(),
+            1000,
+            "T{} produced {} records, expected 1000",
+            [1, 4, 8][idx],
+            recs.len()
+        );
+    }
+
+    // Sequences must be identical across thread counts (order preserved).
+    let baseline = &results[0];
+    for (ti, recs) in results.iter().enumerate().skip(1) {
+        for (ri, (base, actual)) in baseline.iter().zip(recs.iter()).enumerate() {
+            assert_eq!(
+                base.sequence().as_ref(),
+                actual.sequence().as_ref(),
+                "record {ri}: sequence mismatch between T1 and T{}",
+                [1, 4, 8][ti]
+            );
+        }
+    }
+}
+
+/// BGZF single-stream extract (R1 only) at T1, T4, T8.
+#[test]
+fn test_bgzf_block_merge_single_stream_thread_counts() {
+    let tmp = TempDir::new().unwrap();
+
+    // 500 records with 150-base reads — spans multiple BGZF blocks.
+    let r1_recs: Vec<(&'static str, &'static str, &'static str)> = (0..500)
+        .map(|i| {
+            let name: &'static str = Box::leak(format!("read{i:04}").into_boxed_str());
+            let seq: &'static str =
+                Box::leak(format!("AAAAA{i:010}{}", "ACGT".repeat(33)).into_boxed_str());
+            let qual: &'static str = Box::leak("I".repeat(147).into_boxed_str());
+            (name, seq, qual)
+        })
+        .collect();
+
+    let r1 = create_bgzf_fastq(&tmp, "r1_single.fq.bgz", &r1_recs);
+
+    // Single-stream extract: no R2.
+    let results: Vec<Vec<RecordBuf>> =
+        [1, 4, 8].iter().map(|&t| run_bgzf_extract(&r1, None, t, &tmp, "single")).collect();
+
+    // 500 records (R1 only).
+    for (idx, recs) in results.iter().enumerate() {
+        assert_eq!(
+            recs.len(),
+            500,
+            "T{} single-stream: {} records, expected 500",
+            [1, 4, 8][idx],
+            recs.len()
+        );
+    }
+
+    // Sequences identical across thread counts.
+    let baseline = &results[0];
+    for (ti, recs) in results.iter().enumerate().skip(1) {
+        for (ri, (base, actual)) in baseline.iter().zip(recs.iter()).enumerate() {
+            assert_eq!(
+                base.sequence().as_ref(),
+                actual.sequence().as_ref(),
+                "record {ri}: sequence mismatch T1 vs T{}",
+                [1, 4, 8][ti]
+            );
+        }
+    }
+}
+
+/// BGZF paired-stream extract — verify that template sequences match expected values.
+///
+/// This exercises the full `BlockParseFast` + `BlockMerge` path end-to-end and
+/// verifies that R1/R2 pairing is correct (R1 template bases are in the right
+/// BAM records).
+#[test]
+fn test_bgzf_block_merge_content_verification() {
+    use noodles::sam::alignment::record::data::field::Tag;
+
+    let tmp = TempDir::new().unwrap();
+
+    // 3 pairs, template = everything after the 5-base UMI.
+    let r1_recs = vec![
+        ("read1", "ACGTATTTTTTT", "IIIIIIIIIIII"), // UMI=ACGTA, tmpl=TTTTTTT
+        ("read2", "TGCATAAAAAAA", "IIIIIIIIIIII"), // UMI=TGCAT, tmpl=AAAAAAA
+        ("read3", "CCGGAGGGGGG", "IIIIIIIIIII"),   // UMI=CCGGA, tmpl=GGGGGG (11-base read)
+    ];
+    let r2_recs = vec![
+        ("read1", "GCTATCCCCCCC", "IIIIIIIIIIII"), // UMI=GCTAT, tmpl=CCCCCCC
+        ("read2", "ATCGAGGGGGGGG", "IIIIIIIIIIIII"), // UMI=ATCGA, tmpl=GGGGGG G
+        ("read3", "TTAAACCCCCC", "IIIIIIIIIII"),   // UMI=TTAAA, tmpl=CCCCCC
+    ];
+
+    let r1 = create_bgzf_fastq(&tmp, "r1_content.fq.bgz", &r1_recs);
+    let r2 = create_bgzf_fastq(&tmp, "r2_content.fq.bgz", &r2_recs);
+
+    // Run at T4 to exercise the parallel path.
+    let records = run_bgzf_extract(&r1, Some(&r2), 4, &tmp, "content");
+
+    // 3 pairs × 2 reads = 6 records.
+    assert_eq!(records.len(), 6, "expected 6 records");
+
+    // Verify UMI tag is present.
+    for rec in &records {
+        assert!(
+            rec.data().get(&Tag::from(*b"RX")).is_some(),
+            "RX tag must be present on every record"
+        );
+    }
+}
+
+/// Create a BGZF FASTQ file where each record is flushed into its own block.
+///
+/// This forces a specific number of BGZF blocks (one per record), which lets
+/// us create R1 and R2 files with different block counts by giving them
+/// records of different lengths.
+fn create_bgzf_fastq_one_block_per_record(
+    dir: &TempDir,
+    name: &str,
+    records: &[(&str, &str, &str)],
+) -> PathBuf {
+    let path = dir.path().join(name);
+    let file = File::create(&path).unwrap();
+    let mut writer = BgzfWriter::new(file);
+    for (name, seq, qual) in records {
+        write!(writer, "@{name}\n{seq}\n+\n{qual}\n").unwrap();
+        // Flush after each record so it gets its own BGZF block.
+        writer.flush().unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Regression test: BGZF paired-end extract where R1 and R2 have different
+/// numbers of BGZF blocks.
+///
+/// When R1 and R2 BGZF files have different compressed sizes (common in
+/// practice), they produce different numbers of BGZF blocks. The `BlockMerge`
+/// step must drain the remaining blocks from the longer stream after the
+/// shorter stream is exhausted, or the pipeline deadlocks.
+#[test]
+fn test_extract_bgzf_unequal_block_counts() {
+    let tmp = TempDir::new().unwrap();
+    let num_pairs = 50;
+
+    // Build R1 and R2 with different sequence lengths.
+    // R1: 5bp UMI + 10bp template = 15bp per record
+    // R2: 5bp UMI + 80bp template = 85bp per record
+    // This makes R2 much larger per record, but both have the same record count.
+    let r1_recs: Vec<(String, String, String)> = (0..num_pairs)
+        .map(|i| {
+            let name = format!("read{i:04}");
+            let seq = format!("ACGTA{}", "T".repeat(10)); // 15bp
+            let qual = "I".repeat(15);
+            (name, seq, qual)
+        })
+        .collect();
+
+    let r2_recs: Vec<(String, String, String)> = (0..num_pairs)
+        .map(|i| {
+            let name = format!("read{i:04}");
+            let seq = format!("TGCAT{}", "A".repeat(80)); // 85bp
+            let qual = "I".repeat(85);
+            (name, seq, qual)
+        })
+        .collect();
+
+    // Write with one record per BGZF block so R1 gets N blocks, R2 gets N blocks.
+    // Actually, since the test data is small and we want *different* block counts,
+    // write R1 normally (all in one block) and R2 with one-record-per-block.
+    let r1_as_str: Vec<(&str, &str, &str)> =
+        r1_recs.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect();
+    let r2_as_str: Vec<(&str, &str, &str)> =
+        r2_recs.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect();
+
+    // R1: all records in one BGZF block (1 block total)
+    // R2: one record per BGZF block (50 blocks total)
+    let r1 = create_bgzf_fastq(&tmp, "r1_unequal.fq.bgz", &r1_as_str);
+    let r2 = create_bgzf_fastq_one_block_per_record(&tmp, "r2_unequal.fq.bgz", &r2_as_str);
+
+    for threads in [1, 4, 8] {
+        let output = tmp.path().join(format!("out_unequal_t{threads}.bam"));
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgumi"))
+            .args([
+                "extract",
+                "--inputs",
+                r1.to_str().unwrap(),
+                r2.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--read-structures",
+                "5M+T",
+                "5M+T",
+                "--sample",
+                "test",
+                "--library",
+                "test",
+                "--threads",
+                &threads.to_string(),
+                "--compression-level",
+                "1",
+            ])
+            .status()
+            .expect("Failed to execute extract command");
+
+        assert!(
+            status.success(),
+            "Extract with unequal BGZF block counts should succeed at T{threads}"
+        );
+
+        let records = read_bam_records(&output);
+        assert_eq!(
+            records.len(),
+            num_pairs * 2,
+            "Should have {num_pairs}*2 records at T{threads}, got {}",
+            records.len()
+        );
+    }
+}

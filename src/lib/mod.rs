@@ -138,6 +138,7 @@ pub mod consensus;
 pub use fgumi_dna::dna;
 pub mod errors;
 pub mod fastq;
+pub mod fastq_parse;
 pub mod grouper;
 pub mod header;
 pub mod logging;
