@@ -84,6 +84,70 @@ fgumi filter --queue-memory 4096 --queue-memory-per-thread false
 - **Override**: `--compression-threads N`
 - **Best practice**: Usually leave at default
 
+## I/O and Storage Tuning
+
+For sequential workloads like BAM and FASTQ processing, I/O throughput is often the
+bottleneck — not CPU. Two areas to check: OS readahead and volume throughput.
+
+### OS Readahead
+
+The Linux kernel prefetches file data into the page cache ahead of the application.
+The default readahead window is typically 128 KB, which fgumi's decompression threads
+can easily outpace. When that happens the processing thread stalls waiting on disk.
+
+Check the current readahead (in 512-byte sectors):
+
+```bash
+blockdev --getra /dev/nvme1n1    # e.g. 256 = 128 KB
+```
+
+For sequential BAM/FASTQ workloads, increasing to 4 MB eliminates most I/O stalls:
+
+```bash
+# 4 MB = 8192 sectors (requires root)
+sudo blockdev --setra 8192 /dev/nvme1n1
+```
+
+This setting does not persist across reboots. Add it to a startup script or udev rule
+if needed.
+
+### `--async-reader` (Experimental)
+
+When you cannot tune OS readahead — containers, managed cloud instances, network
+mounts — `--async-reader` provides a similar benefit from userspace. It spawns a
+dedicated I/O thread that reads raw bytes into a bounded queue ahead of the
+decompression step, so processing threads do not block on disk.
+
+```bash
+fgumi group \
+  --async-reader \
+  --threads 8 \
+  --input reads.bam \
+  --output grouped.bam
+```
+
+`--async-reader` works with all input types: BAM files, BGZF/gzip/plain FASTQs,
+and piped stdin. It is most effective when I/O latency is high (network storage,
+cold page cache, small OS readahead). On systems where you can already set 4 MB+
+readahead, the additional benefit is modest.
+
+### AWS EBS Volume Throughput
+
+On AWS, `gp3` volumes default to 125 MB/s throughput regardless of size. For BAM
+processing this is often the binding constraint. Increasing to 300-500 MB/s is
+inexpensive and has a large impact:
+
+```bash
+# Increase throughput on an existing volume (takes effect within minutes)
+aws ec2 modify-volume \
+  --volume-id vol-0123456789abcdef0 \
+  --throughput 500
+```
+
+For sustained sequential I/O, also consider increasing IOPS (default 3000) if your
+reads are small. Monitor with `iostat -x 1` to confirm the volume is the bottleneck
+before spending on higher provisioned throughput.
+
 ## Scenario-Based Configurations
 
 ### High-Throughput Server
@@ -142,6 +206,7 @@ fgumi filter \
 
 ```bash
 fgumi filter \
+  --async-reader \
   --threads 4 \
   --queue-memory 512 \
   --compression-level 9 \
@@ -150,6 +215,7 @@ fgumi filter \
 ```
 
 **Rationale**:
+- `--async-reader` hides network I/O latency (see [I/O and Storage Tuning](#io-and-storage-tuning))
 - Moderate threading to avoid overwhelming network
 - Conservative memory usage
 - Maximum compression to reduce network transfer
@@ -235,7 +301,8 @@ With `--deadlock-recover`, the pipeline progressively doubles queue memory limit
 - Consider reducing threads if not fully utilized
 
 ### I/O Patterns
-- Monitor disk I/O with `iotop`
+- Monitor disk I/O with `iotop` or `iostat -x 1`
+- If threads are idle waiting on I/O, increase OS readahead or try `--async-reader` (see [I/O and Storage Tuning](#io-and-storage-tuning))
 - Network storage may benefit from lower thread counts
 - SSD storage can handle higher thread counts
 
@@ -250,6 +317,7 @@ With `--deadlock-recover`, the pipeline progressively doubles queue memory limit
 1. Increase `--threads` if CPU usage is low
 2. Increase `--queue-memory` if I/O bound
 3. Reduce `--compression-level` if CPU bound
+4. Check OS readahead and EBS throughput if disk I/O is the bottleneck (see [I/O and Storage Tuning](#io-and-storage-tuning))
 
 ### Pipeline Appears Stuck
 If a command hangs without producing output:

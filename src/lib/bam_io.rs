@@ -48,9 +48,9 @@ const MAX_BLOCK_SIZE: usize = 65280;
 /// This allows functions to accept either reader type through a unified interface.
 pub enum BgzfReaderEnum {
     /// Single-threaded BGZF reader (lower overhead for small files)
-    SingleThreaded(BgzfReader<File>),
+    SingleThreaded(BgzfReader<Box<dyn Read + Send>>),
     /// Multi-threaded BGZF reader (noodles built-in threading)
-    MultiThreaded(MultithreadedReader<File>),
+    MultiThreaded(MultithreadedReader<Box<dyn Read + Send>>),
 }
 
 impl Read for BgzfReaderEnum {
@@ -133,12 +133,12 @@ impl BgzfWriterEnum {
 pub type BamWriter = noodles::bam::io::Writer<BgzfWriterEnum>;
 
 /// Create a [`BgzfReaderEnum`] from a file, selecting single- or multi-threaded based on `threads`.
-fn make_bgzf_reader(file: File, threads: usize) -> BgzfReaderEnum {
+fn make_bgzf_reader(reader: Box<dyn Read + Send>, threads: usize) -> BgzfReaderEnum {
     if threads > 1 {
         let worker_count = NonZero::new(threads).expect("threads > 1 checked above");
-        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, file))
+        BgzfReaderEnum::MultiThreaded(MultithreadedReader::with_worker_count(worker_count, reader))
     } else {
-        BgzfReaderEnum::SingleThreaded(BgzfReader::new(file))
+        BgzfReaderEnum::SingleThreaded(BgzfReader::new(reader))
     }
 }
 
@@ -689,11 +689,38 @@ pub fn create_bam_reader<P: AsRef<Path>>(
     path: P,
     threads: usize,
 ) -> Result<(BamReaderAuto, Header)> {
+    create_bam_reader_with_opts(path, threads, PipelineReaderOpts::default())
+}
+
+/// Variant of [`create_bam_reader`] that accepts [`PipelineReaderOpts`].
+///
+/// When `opts.async_reader` is true the file is wrapped in a
+/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the BGZF
+/// decompression layer, overlapping disk I/O with BGZF decoding.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or the BAM header cannot be parsed.
+pub fn create_bam_reader_with_opts<P: AsRef<Path>>(
+    path: P,
+    threads: usize,
+    opts: PipelineReaderOpts,
+) -> Result<(BamReaderAuto, Header)> {
     let path_ref = path.as_ref();
     let file = File::open(path_ref)
         .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-    let bgzf_reader = make_bgzf_reader(file, threads);
+    crate::os_hints::advise_sequential(&file);
+    let reader: Box<dyn Read + Send> = if opts.async_reader {
+        log::info!(
+            "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
+            path_ref.display()
+        );
+        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
+    } else {
+        Box::new(file)
+    };
+    let bgzf_reader = make_bgzf_reader(reader, threads);
 
     let mut reader = noodles::bam::io::Reader::from(bgzf_reader);
     let header = reader
@@ -727,11 +754,38 @@ pub fn create_raw_bam_reader<P: AsRef<Path>>(
     path: P,
     threads: usize,
 ) -> Result<(RawBamReaderAuto, Header)> {
+    create_raw_bam_reader_with_opts(path, threads, PipelineReaderOpts::default())
+}
+
+/// Variant of [`create_raw_bam_reader`] that accepts [`PipelineReaderOpts`].
+///
+/// When `opts.async_reader` is true the file is wrapped in a
+/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the BGZF
+/// decompression layer, overlapping disk I/O with BGZF decoding.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or the BAM header cannot be parsed.
+pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
+    path: P,
+    threads: usize,
+    opts: PipelineReaderOpts,
+) -> Result<(RawBamReaderAuto, Header)> {
     let path_ref = path.as_ref();
     let file = File::open(path_ref)
         .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
 
-    let bgzf_reader = make_bgzf_reader(file, threads);
+    crate::os_hints::advise_sequential(&file);
+    let reader: Box<dyn Read + Send> = if opts.async_reader {
+        log::info!(
+            "async raw BAM reader enabled: spawning fgumi-prefetch thread for {}",
+            path_ref.display()
+        );
+        Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
+    } else {
+        Box::new(file)
+    };
+    let bgzf_reader = make_bgzf_reader(reader, threads);
 
     // Use noodles to read the header, then extract the BGZF reader
     let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);
@@ -1079,6 +1133,9 @@ impl<R: Read> Read for ChainedReader<R> {
 /// For stdin: Buffers all bytes read while parsing header, returns a chained reader
 ///            that first yields the buffered bytes then continues from stdin.
 ///
+/// This is a convenience wrapper that disables the async prefetch reader. Use
+/// [`create_bam_reader_for_pipeline_with_opts`] to opt in.
+///
 /// # Arguments
 /// * `path` - Path to the input BAM file, or "-" / "/dev/stdin" for stdin
 ///
@@ -1103,6 +1160,34 @@ impl<R: Read> Read for ChainedReader<R> {
 pub fn create_bam_reader_for_pipeline<P: AsRef<Path>>(
     path: P,
 ) -> Result<(Box<dyn Read + Send>, Header)> {
+    create_bam_reader_for_pipeline_with_opts(path, PipelineReaderOpts::default())
+}
+
+/// Options controlling how [`create_bam_reader_for_pipeline_with_opts`] opens
+/// and wraps its input file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PipelineReaderOpts {
+    /// If true, wrap inputs in a [`crate::prefetch_reader::PrefetchReader`]
+    /// so that disk reads happen on a dedicated I/O thread.
+    pub async_reader: bool,
+}
+
+/// Variant of [`create_bam_reader_for_pipeline`] that accepts tuning options.
+///
+/// For regular files, `POSIX_FADV_SEQUENTIAL` is applied to the file descriptor
+/// on Linux (a no-op elsewhere). If `opts.async_reader` is true the input is
+/// wrapped in a [`crate::prefetch_reader::PrefetchReader`] — for regular files
+/// using [`from_file`](crate::prefetch_reader::PrefetchReader::from_file) (with
+/// kernel WILLNEED hints), for stdin via the generic
+/// [`new`](crate::prefetch_reader::PrefetchReader::new) constructor.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or the header cannot be read.
+pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
+    path: P,
+    opts: PipelineReaderOpts,
+) -> Result<(Box<dyn Read + Send>, Header)> {
     use std::io::{Seek, SeekFrom};
 
     let path_ref = path.as_ref();
@@ -1126,11 +1211,21 @@ pub fn create_bam_reader_for_pipeline<P: AsRef<Path>>(
         // Create a chained reader: buffered bytes first, then remaining stdin
         let chained = ChainedReader::new(buffered_bytes, stdin);
 
-        Ok((Box::new(chained), header))
+        if opts.async_reader {
+            log::info!("async BAM reader enabled: spawning fgumi-prefetch thread for stdin");
+            let prefetch = crate::prefetch_reader::PrefetchReader::new(chained);
+            Ok((Box::new(prefetch), header))
+        } else {
+            Ok((Box::new(chained), header))
+        }
     } else {
         // Read from file - we can seek back
         let mut file = File::open(path_ref)
             .with_context(|| format!("Failed to open input BAM: {}", path_ref.display()))?;
+
+        // Tell the kernel to grow the per-fd read-ahead window. Best-effort;
+        // failure is logged and ignored. On non-Linux targets this is a no-op.
+        crate::os_hints::advise_sequential(&file);
 
         // Read header using noodles
         let bgzf_reader = BgzfReader::new(&file);
@@ -1143,7 +1238,16 @@ pub fn create_bam_reader_for_pipeline<P: AsRef<Path>>(
         file.seek(SeekFrom::Start(0))
             .with_context(|| format!("Failed to seek in file: {}", path_ref.display()))?;
 
-        Ok((Box::new(file), header))
+        if opts.async_reader {
+            log::info!(
+                "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
+                path_ref.display()
+            );
+            let prefetch = crate::prefetch_reader::PrefetchReader::from_file(file);
+            Ok((Box::new(prefetch), header))
+        } else {
+            Ok((Box::new(file), header))
+        }
     }
 }
 
@@ -1680,5 +1784,33 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().expect("result should be Err");
         assert!(err.to_string().contains("stdout"));
+    }
+
+    #[test]
+    fn test_create_bam_reader_for_pipeline_with_async_reader() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let header = create_test_header();
+
+        // Write a BAM file first
+        {
+            let _writer = create_bam_writer(temp_file.path(), &header, 1, 6)?;
+        }
+
+        // Read using async reader opts — exercises the PrefetchReader branch
+        let opts = PipelineReaderOpts { async_reader: true };
+        let (mut reader, read_header) =
+            create_bam_reader_for_pipeline_with_opts(temp_file.path(), opts)?;
+        assert_eq!(read_header.reference_sequences().len(), 1);
+
+        // The reader returns raw bytes; verify it is usable
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf)?;
+        assert!(n > 0, "Should read some bytes from the async reader");
+
+        // Ensure read_to_end works through the PrefetchReader
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest)?;
+
+        Ok(())
     }
 }

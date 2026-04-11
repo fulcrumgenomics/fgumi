@@ -1,7 +1,7 @@
 //! Groups reads by UMI to identify reads from the same original molecule.
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
+use crate::bam_io::{create_bam_reader_for_pipeline_with_opts, create_bam_writer, is_stdin_path};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -955,7 +955,10 @@ impl Command for GroupReadsByUmi {
 
         // Open input BAM using streaming-capable reader for pipeline use
         info!("Reading input BAM");
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Check sort order - template-coordinate sorted is required,
         // but queryname-sorted is also accepted when --allow-unmapped is set
@@ -1864,10 +1867,10 @@ mod tests {
     /// Tests override specific fields as needed via struct update syntax.
     fn test_group_cmd(strategy: Strategy, edits: u32) -> GroupReadsByUmi {
         GroupReadsByUmi {
-            io: BamIoOptions {
-                input: std::path::PathBuf::from("/dev/null"),
-                output: std::path::PathBuf::from("/dev/null"),
-            },
+            io: BamIoOptions::new(
+                std::path::PathBuf::from("/dev/null"),
+                std::path::PathBuf::from("/dev/null"),
+            ),
             family_size_histogram: None,
             grouping_metrics: None,
             metrics: None,
@@ -2222,7 +2225,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -2264,7 +2267,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2301,7 +2304,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2335,7 +2338,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -2379,7 +2382,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             family_size_histogram: Some(paths.histogram.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2473,7 +2476,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             metrics: Some(paths.metrics_prefix.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2582,7 +2585,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             family_size_histogram: Some(paths.histogram.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             metrics: Some(paths.metrics_prefix.clone()),
@@ -2648,7 +2651,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             metrics: Some(paths.metrics_prefix.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2702,7 +2705,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -2740,7 +2743,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             min_umi_length: Some(6),
             ..test_group_cmd(Strategy::Edit, 0)
@@ -2782,7 +2785,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             min_umi_length: Some(5),
             ..test_group_cmd(Strategy::Edit, 0)
         };
@@ -2844,7 +2847,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -2962,7 +2965,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -2998,7 +3001,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3036,7 +3039,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = test_group_cmd(Strategy::Identity, 0);
-        cmd.io = BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() };
+        cmd.io = BamIoOptions::new(input.path().to_path_buf(), paths.output.clone());
         cmd.no_umi = true;
 
         cmd.execute("test")?;
@@ -3073,7 +3076,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = test_group_cmd(Strategy::Adjacency, 1);
-        cmd.io = BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() };
+        cmd.io = BamIoOptions::new(input.path().to_path_buf(), paths.output.clone());
         cmd.no_umi = true; // Will be overridden to identity
 
         cmd.execute("test")?;
@@ -3104,7 +3107,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = test_group_cmd(Strategy::Identity, 0);
-        cmd.io = BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() };
+        cmd.io = BamIoOptions::new(input.path().to_path_buf(), paths.output.clone());
         cmd.no_umi = true;
 
         cmd.execute("test")?;
@@ -3172,7 +3175,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3233,7 +3236,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3294,7 +3297,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3378,7 +3381,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3462,7 +3465,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Adjacency, 2)
         };
 
@@ -3525,7 +3528,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             threading: ThreadingOptions::new(4), // Use 4 threads
             ..test_group_cmd(Strategy::Adjacency, 2)
         };
@@ -3570,7 +3573,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -3610,7 +3613,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             threading: ThreadingOptions::new(4), // Use 4 threads
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -3656,7 +3659,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -3702,7 +3705,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3735,7 +3738,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3771,7 +3774,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -3807,7 +3810,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -3844,7 +3847,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -3873,7 +3876,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -3908,7 +3911,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             min_umi_length: Some(8), // Require at least 8 bases
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -3944,7 +3947,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -3980,7 +3983,7 @@ mod tests {
 
         // With edits=2, all should group together
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 2)
         };
 
@@ -4013,7 +4016,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -4043,7 +4046,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Adjacency, 0) // No edits allowed
         };
 
@@ -4078,7 +4081,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Edit, 3) // Allow up to 3 edits
         };
 
@@ -4108,7 +4111,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -4143,7 +4146,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             family_size_histogram: Some(paths.histogram.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4169,7 +4172,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4201,7 +4204,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             min_map_q: Some(20), // Filter reads with mapq < 20
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4229,7 +4232,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4261,7 +4264,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4291,7 +4294,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4334,7 +4337,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             min_map_q: Some(30), // Threshold is 30, "bad" pair has MAPQ=10
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4483,7 +4486,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4540,7 +4543,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -4598,7 +4601,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             threading,
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -4653,7 +4656,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             threading: ThreadingOptions::new(4),
             ..test_group_cmd(strategy, edits)
         };
@@ -4697,7 +4700,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             threading: ThreadingOptions::new(4),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -4740,7 +4743,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             threading: ThreadingOptions::new(4),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5140,7 +5143,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5173,7 +5176,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -5208,7 +5211,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             allow_unmapped: false,
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5240,7 +5243,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5275,7 +5278,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             allow_unmapped: true,
             threading,
             ..test_group_cmd(Strategy::Identity, 0)

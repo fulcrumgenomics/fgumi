@@ -6,6 +6,7 @@
 //! ensuring that module interactions work correctly.
 
 mod helpers;
+mod test_async_reader;
 mod test_bam_pipeline;
 mod test_bgzf_eof;
 mod test_clip_command;

@@ -7,8 +7,8 @@
 //! allowing even a single read-pair to generate duplex consensus.
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader,
+    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader_with_opts,
 };
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
@@ -263,7 +263,10 @@ impl Command for Codec {
         // (matching fgbio's CallCodecConsensusReads which has no such option).
 
         // Open input BAM using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Create output header for unmapped consensus reads
         let output_header = create_unmapped_consensus_header(
@@ -354,7 +357,8 @@ impl Command for Codec {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         // Create the MI group iterator for single-threaded streaming (raw bytes)
-        let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
+        let (mut raw_reader, _) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
         let raw_record_iter = std::iter::from_fn(move || {
             let mut record = RawRecord::new();
             match raw_reader.read_record(&mut record) {
@@ -689,7 +693,7 @@ mod tests {
     /// Helper to create a Codec with specified input/output paths
     fn create_codec_with_paths(input: PathBuf, output: PathBuf) -> Codec {
         Codec {
-            io: BamIoOptions { input, output },
+            io: BamIoOptions::new(input, output),
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions::default(),
