@@ -4,6 +4,27 @@ use crate::fields::{
     l_read_name, n_cigar_op, pos,
 };
 
+/// Converts a raw BAM CIGAR u32 op word to a noodles `Kind`.
+///
+/// Extracts the 4-bit op type from the raw u32 and maps it to the corresponding
+/// `Kind` variant. Returns `Kind::Pad` for unknown op types.
+#[inline]
+#[must_use]
+pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op::Kind {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    match raw_op & 0xF {
+        0 => Kind::Match,
+        1 => Kind::Insertion,
+        2 => Kind::Deletion,
+        3 => Kind::Skip,
+        4 => Kind::SoftClip,
+        5 => Kind::HardClip,
+        7 => Kind::SequenceMatch,
+        8 => Kind::SequenceMismatch,
+        _ => Kind::Pad,
+    }
+}
+
 /// Returns true if the CIGAR op type consumes the reference (M, D, N, =, X).
 #[inline]
 #[must_use]
@@ -1984,5 +2005,34 @@ mod tests {
     fn test_cigar_to_string_no_cigar() {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
         assert_eq!(cigar_to_string_from_raw(&rec), "");
+    }
+
+    #[test]
+    fn test_cigar_op_kind_all_ops() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        assert_eq!(cigar_op_kind(0), Kind::Match);
+        assert_eq!(cigar_op_kind(1), Kind::Insertion);
+        assert_eq!(cigar_op_kind(2), Kind::Deletion);
+        assert_eq!(cigar_op_kind(3), Kind::Skip);
+        assert_eq!(cigar_op_kind(4), Kind::SoftClip);
+        assert_eq!(cigar_op_kind(5), Kind::HardClip);
+        assert_eq!(cigar_op_kind(7), Kind::SequenceMatch);
+        assert_eq!(cigar_op_kind(8), Kind::SequenceMismatch);
+        // Unknown ops (6 = Pad, 9+ = Pad fallback)
+        assert_eq!(cigar_op_kind(6), Kind::Pad);
+        assert_eq!(cigar_op_kind(9), Kind::Pad);
+        assert_eq!(cigar_op_kind(15), Kind::Pad);
+    }
+
+    #[test]
+    fn test_cigar_op_kind_with_length_bits() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        // Raw BAM encodes op_type in low 4 bits, length in upper 28 bits
+        // Verify cigar_op_kind masks correctly: 50M = (50 << 4) | 0
+        assert_eq!(cigar_op_kind(50 << 4), Kind::Match);
+        // 10I = (10 << 4) | 1
+        assert_eq!(cigar_op_kind(10 << 4 | 1), Kind::Insertion);
+        // 5D = (5 << 4) | 2
+        assert_eq!(cigar_op_kind(5 << 4 | 2), Kind::Deletion);
     }
 }
