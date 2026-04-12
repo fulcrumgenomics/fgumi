@@ -88,6 +88,7 @@ jobs:
           CRATES=(
             fgumi-dna
             fgumi-bgzf
+            fgumi-simd-fastq
             fgumi-raw-bam
             fgumi-umi
             fgumi-sam
@@ -95,6 +96,26 @@ jobs:
             fgumi-consensus
             fgumi
           )
+
+          # Verify every workspace crate is in the publish list
+          WORKSPACE_CRATES=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].name' | sort)
+          LISTED_CRATES=$(printf '%s\n' "${CRATES[@]}" | sort)
+          MISSING=$(comm -23 <(echo "$WORKSPACE_CRATES") <(echo "$LISTED_CRATES"))
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: workspace crates missing from CRATES publish list:"
+            echo "$MISSING"
+            echo "Add them to the CRATES array in the correct dependency order."
+            exit 1
+          fi
+
+          EXTRA=$(comm -13 <(echo "$WORKSPACE_CRATES") <(echo "$LISTED_CRATES"))
+          if [ -n "$EXTRA" ]; then
+            echo "ERROR: CRATES publish list contains entries not in workspace:"
+            echo "$EXTRA"
+            echo "Remove or rename stale entries before publishing."
+            exit 1
+          fi
 
           for crate in "${CRATES[@]}"; do
             CRATE_MAX_VERSION=$(curl -sS \
