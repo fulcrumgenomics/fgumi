@@ -970,16 +970,15 @@ impl DuplexConsensusCaller {
                     bases.push(final_base);
                     quals.push(final_qual);
 
-                    // Calculate errors
-                    let error_count = if let Some(source_reads) = source_reads {
+                    // Calculate errors — conversion artifacts are not counted
+                    let error_count = if is_conversion_artifact {
+                        // Conversion artifacts: treat as agreement, no errors
+                        0u16
+                    } else if let Some(source_reads) = source_reads {
                         // Exact method: count disagreements with source reads
                         let mut num_errors = 0i32;
                         for sr in source_reads {
-                            if sr.bases.len() > i
-                                && Self::is_error(sr.bases[i], raw_base)
-                                && !(is_conversion_artifact
-                                    && Self::is_conversion_pair(sr.bases[i], raw_base))
-                            {
+                            if sr.bases.len() > i && Self::is_error(sr.bases[i], raw_base) {
                                 num_errors += 1;
                             }
                         }
@@ -991,8 +990,7 @@ impl DuplexConsensusCaller {
                         let a_dep = i32::from(a.depths[i]);
                         let b_dep = i32::from(b.depths[i]);
 
-                        let err = if is_conversion_artifact || a_base == b_base {
-                            // Agreement (or conversion artifact treated as agreement)
+                        let err = if a_base == b_base {
                             a_err + b_err
                         } else if raw_base == a_base {
                             a_err + (b_dep - b_err)
@@ -5813,14 +5811,16 @@ mod tests {
     fn test_duplex_em_seq_bottom_strand_conversion_artifact() {
         // Bottom strand: ref=G (complement of C on bottom strand)
         // AB shows G (unconverted), BA shows A (converted after RC)
-        // This is also a conversion artifact on the bottom strand
+        // This is a conversion artifact on the bottom strand.
+        // AB (top strand) does not see this as a ref-C position.
+        // BA (bottom strand) sees it as ref-C (is_ref_c=true).
         let ab = make_ss_consensus_with_methylation(
             vec![b'G'],
             vec![30],
             vec![5],
             vec![crate::methylation::MethylationEvidence {
-                is_ref_c: true,
-                unconverted_count: 5,
+                is_ref_c: false,
+                unconverted_count: 0,
                 converted_count: 0,
             }],
         );
@@ -5842,6 +5842,8 @@ mod tests {
         assert_eq!(duplex.bases[0], b'G');
         // Quality summed (conversion artifact path)
         assert_eq!(duplex.quals[0], 55);
+        // Conversion artifacts should not be counted as duplex errors
+        assert_eq!(duplex.errors[0], 0);
     }
 
     #[test]
