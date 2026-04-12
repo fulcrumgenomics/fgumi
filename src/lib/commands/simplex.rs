@@ -48,6 +48,8 @@ use crate::commands::consensus_runner::{
     ConsensusStatsOps, create_unmapped_consensus_header, log_overlapping_stats,
 };
 
+use super::common::{EmSeqOptions, EmSeqRef, load_em_seq_reference};
+
 // ============================================================================
 // Types for 7-step pipeline processing
 // ============================================================================
@@ -207,6 +209,10 @@ pub struct Simplex {
     /// Queue memory options.
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
+
+    /// EM-Seq methylation-aware consensus options.
+    #[command(flatten)]
+    pub em_seq_opts: EmSeqOptions,
 }
 
 impl Command for Simplex {
@@ -255,6 +261,10 @@ impl Command for Simplex {
         // Enable rejects tracking if rejects file is specified
         let track_rejects = self.rejects_opts.is_enabled();
 
+        // Load reference for EM-Seq methylation-aware consensus calling
+        let em_seq_ref: EmSeqRef =
+            load_em_seq_reference(self.em_seq_opts.em_seq, &self.em_seq_opts.reference, &header)?;
+
         // Track overlapping consensus settings (callers created per-thread in threaded mode)
         let overlapping_enabled = self.overlapping.is_enabled();
         if overlapping_enabled {
@@ -278,6 +288,7 @@ impl Command for Simplex {
                 output_header.clone(),
                 read_name_prefix.clone(),
                 track_rejects,
+                em_seq_ref.clone(),
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
             return result;
@@ -318,6 +329,7 @@ impl Command for Simplex {
             trim: self.consensus.trim,
             min_consensus_base_quality: self.consensus.min_consensus_base_quality,
             cell_tag: Some(cell_tag),
+            em_seq: self.em_seq_opts.em_seq,
         };
 
         // Create a single-threaded caller for stats collection
@@ -327,6 +339,11 @@ impl Command for Simplex {
             options.clone(),
             track_rejects,
         );
+
+        // Set reference for EM-Seq if enabled
+        if let Some((ref reference, ref ref_names)) = em_seq_ref {
+            caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+        }
 
         // Accumulator for overlapping stats from parallel processing
         let mut merged_overlapping_stats = CorrectionStats::new();
@@ -441,6 +458,7 @@ impl Simplex {
     ///
     /// This method is called when `--threads N` is specified with N > 1.
     /// It uses the lock-free 7-step unified pipeline for maximum performance.
+    #[expect(clippy::too_many_arguments, reason = "pipeline setup needs all configuration")]
     fn execute_threads_mode(
         &self,
         num_threads: usize,
@@ -449,6 +467,7 @@ impl Simplex {
         output_header: Header,
         read_name_prefix: String,
         track_rejects: bool,
+        em_seq_ref: EmSeqRef,
     ) -> Result<()> {
         // Configure pipeline
         let mut pipeline_config = build_pipeline_config(
@@ -490,6 +509,7 @@ impl Simplex {
             trim,
             min_consensus_base_quality,
             cell_tag: Some(cell_tag),
+            em_seq: self.em_seq_opts.em_seq,
         };
 
         // Clone input_header before pipeline (needed for rejects writing)
@@ -520,6 +540,11 @@ impl Simplex {
                     options.clone(),
                     track_rejects,
                 );
+
+                // Set reference for EM-Seq if enabled
+                if let Some((ref reference, ref ref_names)) = em_seq_ref {
+                    caller.set_reference(Arc::clone(reference), Arc::clone(ref_names));
+                }
 
                 // Create overlapping caller if enabled
                 let mut overlapping_caller = if overlapping_enabled {
@@ -728,6 +753,7 @@ mod tests {
             min_reads: 1,
             max_reads: None,
             scheduler_opts: SchedulerOptions::default(),
+            em_seq_opts: EmSeqOptions::default(),
         }
     }
 
@@ -1578,5 +1604,76 @@ mod tests {
         assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
         // Should also include Vec<Vec<u8>> overhead
         assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
+    }
+
+    #[rstest]
+    #[case::single_threaded(ThreadingOptions::none())]
+    #[case::multi_threaded(ThreadingOptions::new(2))]
+    fn test_simplex_em_seq_command(#[case] threading: ThreadingOptions) -> Result<()> {
+        use crate::sam::builder::{Strand, create_test_fasta};
+
+        // Create a FASTA with chr1 containing C bases at positions 0..20
+        let ref_seq = "C".repeat(200);
+        let ref_fasta = create_test_fasta(&[("chr1", &ref_seq)])?;
+
+        // Create mapped reads with MI tag showing C bases (methylated) at ref-C positions
+        let mut builder = SamBuilder::with_single_ref("chr1", 200);
+        let mut attrs = HashMap::new();
+        attrs.insert("MI", BufValue::from("1"));
+
+        // Add 3 fragment reads at position 1 (1-based), all showing C (methylated)
+        for i in 0..3 {
+            let _ = builder
+                .add_frag()
+                .name(&format!("r{i}"))
+                .start(1)
+                .strand(Strand::Plus)
+                .bases("CCCCCCCCCC")
+                .attr("MI", BufValue::from("1"))
+                .build();
+        }
+
+        let paths = TestPaths::new()?;
+        builder.write(&paths.input)?;
+
+        let mut cmd = create_simplex_with_paths(paths.input.clone(), paths.output.clone());
+        cmd.em_seq_opts.em_seq = true;
+        cmd.em_seq_opts.reference = Some(ref_fasta.path().to_path_buf());
+        cmd.threading = threading;
+        cmd.execute("test")?;
+
+        let records = read_bam_records(&paths.output)?;
+        assert_eq!(records.len(), 1, "Should have 1 consensus read");
+
+        // Verify methylation tags are present and correct
+        use noodles::sam::alignment::record_buf::data::field::value::{
+            Array as BufArray, Value as BufValue,
+        };
+        let record = &records[0];
+        let cu_tag = Tag::from([b'c', b'u']);
+        let cu_value = record.data().get(&cu_tag).expect("cu tag should be present with EM-Seq");
+        // All 3 reads show C at ref-C positions → unconverted counts should be non-zero
+        if let BufValue::Array(BufArray::Int16(cu_vals)) = cu_value {
+            assert!(
+                cu_vals.iter().any(|&v| v > 0),
+                "cu should have non-zero values for methylated reads"
+            );
+        } else {
+            panic!("cu tag should be an i16 array");
+        }
+
+        let ct_tag = Tag::from([b'c', b't']);
+        let ct_value = record.data().get(&ct_tag).expect("ct tag should be present with EM-Seq");
+        // All reads show C (not T) → converted counts should be 0
+        if let BufValue::Array(BufArray::Int16(ct_vals)) = ct_value {
+            assert!(
+                ct_vals.iter().all(|&v| v == 0),
+                "ct should be all zeros for fully methylated reads"
+            );
+        } else {
+            panic!("ct tag should be an i16 array");
+        }
+
+        Ok(())
     }
 }

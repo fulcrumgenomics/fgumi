@@ -4,13 +4,59 @@
 //! command structs using `#[command(flatten)]`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::bam_io::is_stdin_path;
+use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use crate::validation::validate_file_exists;
 use bytesize::ByteSize;
 use clap::Args;
+use fgumi_consensus::methylation::RefBaseProvider;
+use log::info;
 use noodles::sam::Header;
+
+/// EM-Seq reference pair: reference base provider + contig name mapping.
+pub type EmSeqRef = Option<(
+    Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
+    Arc<Vec<String>>,
+)>;
+
+/// Loads the reference FASTA and builds contig name mapping for EM-Seq mode.
+///
+/// Returns `None` if `em_seq` is false. Errors if `em_seq` is true but `reference` is `None`.
+pub fn load_em_seq_reference(
+    em_seq: bool,
+    reference: &Option<PathBuf>,
+    header: &Header,
+) -> anyhow::Result<EmSeqRef> {
+    if !em_seq {
+        return Ok(None);
+    }
+    let ref_path = reference
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--ref is required when --em-seq is enabled"))?;
+    let ref_timer = OperationTimer::new("Loading reference FASTA");
+    let reference = Arc::new(crate::reference::ReferenceReader::new(ref_path)?);
+    ref_timer.log_completion(0);
+
+    let ref_names: Vec<String> =
+        header.reference_sequences().keys().map(|name| name.to_string()).collect();
+
+    // Fail fast if any BAM header contigs are missing from the reference FASTA
+    let missing_contigs: Vec<&String> =
+        ref_names.iter().filter(|name| reference.sequence_for(name).is_none()).collect();
+    if !missing_contigs.is_empty() {
+        anyhow::bail!(
+            "Reference FASTA is missing {} contig(s) from the BAM header: {}",
+            missing_contigs.len(),
+            missing_contigs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    info!("EM-Seq mode enabled with {} reference contigs", ref_names.len());
+    Ok(Some((reference, Arc::new(ref_names))))
+}
 
 /// Add a @PG record to an existing header, using the current fgumi version.
 ///
@@ -27,6 +73,21 @@ pub fn add_pg_to_builder(
     command_line: &str,
 ) -> anyhow::Result<noodles::sam::header::Builder> {
     crate::header::add_pg_to_builder(builder, crate::version::VERSION.as_str(), command_line)
+}
+
+/// EM-Seq methylation-aware consensus calling options.
+#[derive(Debug, Clone, Default, Args)]
+pub struct EmSeqOptions {
+    /// Enable EM-Seq (enzymatic methyl-seq) methylation-aware consensus calling.
+    /// Requires --ref. C→T conversions at reference cytosine positions are treated
+    /// as bisulfite/enzymatic conversion, and cu/ct per-base count tags
+    /// and MM/ML methylation tags are emitted on consensus reads.
+    #[arg(long = "em-seq", default_value_t = false, requires = "reference")]
+    pub em_seq: bool,
+
+    /// Path to the reference FASTA file (required when --em-seq is enabled)
+    #[arg(long = "ref")]
+    pub reference: Option<PathBuf>,
 }
 
 /// Common input/output options for commands that read a BAM and write a BAM.
