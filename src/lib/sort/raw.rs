@@ -1160,6 +1160,8 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
+    /// When true, wrap input in a `PrefetchReader` for async I/O.
+    async_reader: bool,
 }
 
 /// RAII guard that ensures Phase 2 teardown runs on every exit path between
@@ -1211,6 +1213,7 @@ impl RawExternalSorter {
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
+            async_reader: false,
         }
     }
 
@@ -1300,6 +1303,13 @@ impl RawExternalSorter {
     #[must_use]
     pub fn initial_capacity(mut self, bytes: usize) -> Self {
         self.initial_capacity = Some(bytes);
+        self
+    }
+
+    /// Enable async prefetch reader for input I/O.
+    #[must_use]
+    pub fn async_reader(mut self, enabled: bool) -> Self {
+        self.async_reader = enabled;
         self
     }
 
@@ -1478,8 +1488,11 @@ impl RawExternalSorter {
         // main thread reads records directly from PooledInputStream.
         info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
         let (record_source, header) = {
-            let (reader, header) =
-                crate::bam_io::create_raw_bam_reader_pool_integrated(input, &pool)?;
+            let (reader, header) = crate::bam_io::create_raw_bam_reader_pool_integrated(
+                input,
+                &pool,
+                self.async_reader,
+            )?;
             (RecordSource::direct(reader), header)
         };
 

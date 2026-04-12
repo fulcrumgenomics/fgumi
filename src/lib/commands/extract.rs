@@ -2441,6 +2441,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");

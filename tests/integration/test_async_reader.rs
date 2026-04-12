@@ -93,8 +93,24 @@ fn read_bam_records(path: &Path) -> Vec<RecordBuf> {
     reader.record_bufs(&header).map(|r| r.expect("Failed to read BAM record")).collect()
 }
 
-/// Assert that two BAM files contain identical records (ignoring header @PG differences).
+/// Read the BAM header from a file.
+fn read_bam_header(path: &Path) -> noodles::sam::Header {
+    let mut reader = File::open(path).map(bam::io::Reader::new).unwrap();
+    reader.read_header().unwrap()
+}
+
+/// Assert that two BAM files contain identical records and identical headers
+/// (ignoring `@PG` entries, which differ by command line).
 fn assert_bam_records_equal(path1: &Path, path2: &Path) {
+    // Compare headers with @PG entries stripped: those differ by command line
+    // (--async-reader is in one and not the other) but everything else —
+    // @HD, @SQ, @RG, @CO, sort order — must match.
+    let mut header1 = read_bam_header(path1);
+    let mut header2 = read_bam_header(path2);
+    header1.programs_mut().as_mut().clear();
+    header2.programs_mut().as_mut().clear();
+    assert_eq!(header1, header2, "BAM headers differ (excluding @PG)");
+
     let records1 = read_bam_records(path1);
     let records2 = read_bam_records(path2);
 
@@ -484,5 +500,170 @@ fn test_simplex_async_reader_stdin() {
         true,
         Some(Stdio::from(File::open(&input).unwrap())),
     );
+    assert_bam_records_equal(&baseline, &async_out);
+}
+
+// ============================================================================
+// Sort: async-reader regression tests
+// ============================================================================
+
+/// Check if samtools is available for sort tests.
+fn samtools_available() -> bool {
+    Command::new("samtools").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Create an unsorted BAM with many records spread across chromosomes using samtools.
+fn create_unsorted_bam(dir: &Path, num_reads: usize) -> PathBuf {
+    use std::fmt::Write as _;
+
+    let bam_path = dir.join("unsorted.bam");
+    let mut sam_content = String::new();
+    sam_content.push_str("@HD\tVN:1.6\tSO:unsorted\n");
+    sam_content.push_str("@SQ\tSN:chr1\tLN:100000\n");
+    sam_content.push_str("@SQ\tSN:chr2\tLN:100000\n");
+    sam_content.push_str("@SQ\tSN:chr3\tLN:100000\n");
+    sam_content.push_str("@RG\tID:rg1\tSM:sample1\tLB:lib1\n");
+
+    let seq = "ACGTACGTAC";
+    let qual = "IIIIIIIIII";
+
+    for i in 0..num_reads {
+        let chrom = match i % 3 {
+            0 => "chr2",
+            1 => "chr1",
+            _ => "chr3",
+        };
+        let pos = 50000 - (i % 1000) * 50 + 1;
+        let name = format!("read_{i}");
+        let mate_pos = pos + 200;
+        let cell = format!("cell{}", i % 4);
+
+        // R1
+        writeln!(
+            sam_content,
+            "{name}\t99\t{chrom}\t{pos}\t60\t10M\t=\t{mate_pos}\t210\t{seq}\t{qual}\tRG:Z:rg1\tMI:Z:umi_{i}\tCB:Z:{cell}"
+        )
+        .unwrap();
+        // R2
+        writeln!(
+            sam_content,
+            "{name}\t147\t{chrom}\t{mate_pos}\t60\t10M\t=\t{pos}\t-210\t{seq}\t{qual}\tRG:Z:rg1\tMI:Z:umi_{i}\tCB:Z:{cell}"
+        )
+        .unwrap();
+    }
+
+    // Add unmapped reads
+    for i in 0..10 {
+        let name = format!("unmapped_{i:04}");
+        writeln!(sam_content, "{name}\t77\t*\t0\t0\t*\t*\t0\t0\t{seq}\t{qual}\tRG:Z:rg1").unwrap();
+        writeln!(sam_content, "{name}\t141\t*\t0\t0\t*\t*\t0\t0\t{seq}\t{qual}\tRG:Z:rg1").unwrap();
+    }
+
+    let sam_path = dir.join("unsorted.sam");
+    std::fs::write(&sam_path, sam_content).expect("write SAM");
+
+    let status = Command::new("samtools")
+        .args(["view", "-b", "-o", bam_path.to_str().unwrap(), sam_path.to_str().unwrap()])
+        .status()
+        .expect("samtools view");
+    assert!(status.success(), "samtools view failed");
+    bam_path
+}
+
+/// Run `fgumi sort` and return the output BAM path.
+fn run_sort(
+    tmp: &TempDir,
+    input: &Path,
+    output_name: &str,
+    order: &str,
+    threads: usize,
+    max_memory: &str,
+    async_reader: bool,
+) -> PathBuf {
+    let output = tmp.path().join(output_name);
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "sort".into(),
+        "-i".into(),
+        input.as_os_str().to_owned(),
+        "-o".into(),
+        output.as_os_str().to_owned(),
+        "--order".into(),
+        order.into(),
+        "--threads".into(),
+        threads.to_string().into(),
+        "-m".into(),
+        max_memory.into(),
+        "--temp-compression".into(),
+        "1".into(),
+        "--compression-level".into(),
+        "1".into(),
+    ];
+    if async_reader {
+        args.push("--async-reader".into());
+    }
+
+    let result =
+        Command::new(env!("CARGO_BIN_EXE_fgumi")).args(&args).output().expect("fgumi sort");
+    assert!(
+        result.status.success(),
+        "fgumi sort failed (order={order}, threads={threads}, async={async_reader}):\n{}",
+        String::from_utf8_lossy(&result.stderr),
+    );
+    output
+}
+
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_coordinate_async_reader_single_threaded() {
+    if !samtools_available() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let input = create_unsorted_bam(tmp.path(), 500);
+
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "coordinate", 1, "100M", false);
+    let async_out = run_sort(&tmp, &input, "async.bam", "coordinate", 1, "100M", true);
+    assert_bam_records_equal(&baseline, &async_out);
+}
+
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_coordinate_async_reader_multithreaded() {
+    if !samtools_available() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let input = create_unsorted_bam(tmp.path(), 2000);
+
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "coordinate", 4, "50K", false);
+    let async_out = run_sort(&tmp, &input, "async.bam", "coordinate", 4, "50K", true);
+    assert_bam_records_equal(&baseline, &async_out);
+}
+
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_queryname_async_reader_multithreaded() {
+    if !samtools_available() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let input = create_unsorted_bam(tmp.path(), 2000);
+
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "queryname", 4, "50K", false);
+    let async_out = run_sort(&tmp, &input, "async.bam", "queryname", 4, "50K", true);
+    assert_bam_records_equal(&baseline, &async_out);
+}
+
+#[test]
+#[ignore = "requires samtools"]
+fn test_sort_template_coordinate_async_reader_multithreaded() {
+    if !samtools_available() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let input = create_unsorted_bam(tmp.path(), 2000);
+
+    let baseline = run_sort(&tmp, &input, "baseline.bam", "template-coordinate", 4, "50K", false);
+    let async_out = run_sort(&tmp, &input, "async.bam", "template-coordinate", 4, "50K", true);
     assert_bam_records_equal(&baseline, &async_out);
 }
