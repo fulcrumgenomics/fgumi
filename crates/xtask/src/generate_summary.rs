@@ -59,6 +59,18 @@ pub fn generate(
         }
     }
 
+    // Methylation sub-group
+    let methylation = [("EM-Seq", "guide/em-seq.md")];
+    let methylation_exists = methylation.iter().any(|(_, p)| docs_src.join(p).exists());
+    if methylation_exists {
+        md.push_str("- [Methylation]()\n");
+        for (title, path) in &methylation {
+            if docs_src.join(path).exists() {
+                let _ = writeln!(md, "  - [{title}]({path})");
+            }
+        }
+    }
+
     // Advanced Topics sub-group
     let advanced = [
         ("Best Practices", "guide/best-practices.md"),
