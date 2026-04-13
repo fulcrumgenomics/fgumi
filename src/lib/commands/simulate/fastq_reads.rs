@@ -3,7 +3,8 @@
 use crate::commands::command::Command;
 use crate::commands::common::parse_bool;
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, QualityArgs, SimulationCommon, generate_random_sequence,
+    FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
+    ReferenceGenome, SimulationCommon, apply_methylation_conversion, generate_random_sequence,
 };
 use crate::progress::ProgressTracker;
 use crate::simulate::{FastqWriter, create_rng};
@@ -12,7 +13,6 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_dna::dna::complement_base;
 use log::{info, warn};
-use noodles::fasta;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use std::fs::File;
@@ -88,6 +88,9 @@ pub struct FastqReads {
 
     #[command(flatten)]
     pub insert_size: InsertSizeArgs,
+
+    #[command(flatten)]
+    pub methylation: MethylationArgs,
 }
 
 /// A single read record ready for output.
@@ -107,97 +110,6 @@ struct ReadRecord {
     pos: Option<usize>,
 }
 
-/// Loaded reference genome for sampling template sequences.
-struct ReferenceGenome {
-    /// Chromosome names
-    names: Vec<String>,
-    /// Chromosome sequences (uppercase)
-    sequences: Vec<Vec<u8>>,
-    /// Cumulative lengths for weighted random selection
-    cumulative_lengths: Vec<usize>,
-    /// Total genome length
-    total_length: usize,
-}
-
-impl ReferenceGenome {
-    /// Load a reference genome from a FASTA file.
-    fn load(path: &PathBuf) -> Result<Self> {
-        info!("Loading reference from {}", path.display());
-
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open reference: {}", path.display()))?;
-        let reader = BufReader::new(file);
-        let mut fasta_reader = fasta::io::Reader::new(reader);
-
-        let mut names = Vec::new();
-        let mut sequences = Vec::new();
-        let mut cumulative_lengths = Vec::new();
-        let mut total_length = 0usize;
-
-        for result in fasta_reader.records() {
-            let record = result.with_context(|| "Failed to read FASTA record")?;
-            let name = std::str::from_utf8(record.name())
-                .with_context(|| "Invalid chromosome name")?
-                .to_string();
-            let seq: Vec<u8> =
-                record.sequence().as_ref().iter().map(|&b| b.to_ascii_uppercase()).collect();
-
-            if seq.len() >= 1000 {
-                // Only include chromosomes with sufficient length
-                total_length += seq.len();
-                cumulative_lengths.push(total_length);
-                names.push(name);
-                sequences.push(seq);
-            }
-        }
-
-        if sequences.is_empty() {
-            bail!("No valid sequences found in reference FASTA");
-        }
-
-        info!("Loaded {} chromosomes, total {} bp", sequences.len(), total_length);
-
-        Ok(Self { names, sequences, cumulative_lengths, total_length })
-    }
-
-    /// Sample a random position and return (`chrom_idx`, position, sequence).
-    /// Returns None if the position contains N bases.
-    fn sample_sequence(
-        &self,
-        length: usize,
-        rng: &mut impl Rng,
-    ) -> Option<(usize, usize, Vec<u8>)> {
-        // Try up to 10 times to find a valid position without N bases
-        for _ in 0..10 {
-            // Pick a random position in the genome
-            let genome_pos = rng.random_range(0..self.total_length.saturating_sub(length));
-
-            // Find which chromosome this falls in
-            let chrom_idx =
-                self.cumulative_lengths.iter().position(|&cum| cum > genome_pos).unwrap_or(0);
-
-            let chrom_start =
-                if chrom_idx == 0 { 0 } else { self.cumulative_lengths[chrom_idx - 1] };
-            let local_pos = genome_pos - chrom_start;
-
-            let seq = &self.sequences[chrom_idx];
-            if local_pos + length > seq.len() {
-                continue;
-            }
-
-            let template = &seq[local_pos..local_pos + length];
-
-            // Check for N bases
-            if template.iter().any(|&b| b == b'N' || b == b'n') {
-                continue;
-            }
-
-            return Some((chrom_idx, local_pos, template.to_vec()));
-        }
-        None
-    }
-}
-
 /// Parameters needed for parallel molecule generation.
 #[derive(Clone)]
 struct GenerationParams {
@@ -208,6 +120,7 @@ struct GenerationParams {
     r2_quality_offset: i8,
     /// When set, UMIs are sampled from this list instead of generated randomly.
     includelist: Option<Vec<Vec<u8>>>,
+    methylation: MethylationConfig,
 }
 
 /// Load UMI sequences from an includelist file (one UMI per line).
@@ -292,6 +205,13 @@ impl Command for FastqReads {
             self.common.umi_length
         };
 
+        // Validate methylation args
+        let methylation = self.methylation.resolve();
+        self.methylation.validate()?;
+        if methylation.mode.is_enabled() && self.reference.is_none() {
+            bail!("--methylation-mode requires --reference");
+        }
+
         info!("Generating FASTQ reads");
         info!("  Output R1: {}", self.r1_output.display());
         info!("  Output R2: {}", self.r2_output.display());
@@ -306,6 +226,11 @@ impl Command for FastqReads {
         info!("  Threads: {}", self.threads);
         if let Some(ref path) = self.reference {
             info!("  Reference: {}", path.display());
+        }
+        if methylation.mode.is_enabled() {
+            info!("  Methylation mode: {:?}", methylation.mode);
+            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
+            info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
         let reference = if let Some(ref path) = self.reference {
@@ -331,6 +256,7 @@ impl Command for FastqReads {
             min_family_size: self.family_size.min_family_size,
             r2_quality_offset: self.quality.r2_quality_offset,
             includelist,
+            methylation,
         });
 
         // Generate molecule IDs with seeds for reproducibility
@@ -498,7 +424,7 @@ fn generate_molecule_reads(
         if let Some((chrom_idx, local_pos, seq)) =
             ref_genome.sample_sequence(template_len, &mut rng)
         {
-            let chrom_name = ref_genome.names[chrom_idx].clone();
+            let chrom_name = ref_genome.name(chrom_idx).to_string();
             (seq, Some(chrom_name), Some(local_pos))
         } else {
             // Fallback to random if sampling failed (e.g., all N regions)
@@ -510,9 +436,8 @@ fn generate_molecule_reads(
     };
 
     // Pre-calculate template slicing bounds (both reads have UMI prefix)
-    let r1_template_len = params.read_length.saturating_sub(params.umi_length);
-    let r2_template_len = params.read_length.saturating_sub(params.umi_length);
-    let r2_start = template.len().saturating_sub(r2_template_len);
+    let template_len = params.read_length.saturating_sub(params.umi_length);
+    let r2_start = template.len().saturating_sub(template_len);
     let r2_end = template.len();
 
     // Reusable buffers for sequence building
@@ -559,14 +484,32 @@ fn generate_molecule_reads(
 
         if strand == "A" {
             // A strand: standard forward orientation
-            // R1 = UMI + template start (maps forward)
+            // R1 reads the top strand (forward) — apply C→T conversion
             r1_seq_buf.extend_from_slice(r1_umi);
-            let r1_template_end = r1_template_len.min(template.len());
-            r1_seq_buf.extend_from_slice(&template[..r1_template_end]);
+            let r1_template_end = template_len.min(template.len());
+            let mut r1_template = template[..r1_template_end].to_vec();
+            apply_methylation_conversion(
+                &mut r1_template,
+                &template,
+                0,
+                true, // top strand
+                &params.methylation,
+                &mut rng,
+            );
+            r1_seq_buf.extend_from_slice(&r1_template);
 
-            // R2 = UMI + revcomp(template end) (maps reverse)
+            // R2 reads the bottom strand (reverse) — apply G→A conversion, then RC
             r2_seq_buf.extend_from_slice(r2_umi);
-            reverse_complement_into(&template[r2_start..r2_end], &mut r2_seq_buf);
+            let mut r2_template = template[r2_start..r2_end].to_vec();
+            apply_methylation_conversion(
+                &mut r2_template,
+                &template,
+                r2_start,
+                false, // bottom strand
+                &params.methylation,
+                &mut rng,
+            );
+            reverse_complement_into(&r2_template, &mut r2_seq_buf);
         } else {
             // B strand: comes from the complementary DNA strand of the same molecule
             // For duplex sequencing, A and B strand reads should align to the SAME positions
@@ -579,14 +522,32 @@ fn generate_molecule_reads(
             // - B R1 covers the same region as A R2 (template end), sequenced from revcomp
             // - B R2 covers the same region as A R1 (template start), sequenced forward
 
-            // B R1 = UMI + revcomp(template end) - same region as A R2
+            // B R1 reads the bottom strand (template end, reverse) — apply G→A, then RC
             r1_seq_buf.extend_from_slice(r1_umi);
-            reverse_complement_into(&template[r2_start..r2_end], &mut r1_seq_buf);
+            let mut r1_template = template[r2_start..r2_end].to_vec();
+            apply_methylation_conversion(
+                &mut r1_template,
+                &template,
+                r2_start,
+                false, // bottom strand
+                &params.methylation,
+                &mut rng,
+            );
+            reverse_complement_into(&r1_template, &mut r1_seq_buf);
 
-            // B R2 = UMI + template start - same region as A R1
+            // B R2 reads the top strand (template start, forward) — apply C→T
             r2_seq_buf.extend_from_slice(r2_umi);
-            let r1_template_end = r1_template_len.min(template.len());
-            r2_seq_buf.extend_from_slice(&template[..r1_template_end]);
+            let r1_template_end = template_len.min(template.len());
+            let mut r2_template = template[..r1_template_end].to_vec();
+            apply_methylation_conversion(
+                &mut r2_template,
+                &template,
+                0,
+                true, // top strand
+                &params.methylation,
+                &mut rng,
+            );
+            r2_seq_buf.extend_from_slice(&r2_template);
         }
 
         // Introduce UMI errors directly into buffer
@@ -1078,6 +1039,11 @@ mod tests {
             min_family_size: 1,
             r2_quality_offset: 0,
             includelist: Some(umis.clone()),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
         };
 
         let quality_model =
@@ -1118,5 +1084,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_execute_methylation_requires_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let r1 = dir.path().join("r1.fq.gz");
+        let r2 = dir.path().join("r2.fq.gz");
+        let truth = dir.path().join("truth.tsv");
+
+        let cmd = FastqReads {
+            r1_output: r1,
+            r2_output: r2,
+            truth_output: truth,
+            read_structure_r1: "8M+T".to_string(),
+            read_structure_r2: "+T".to_string(),
+            duplex: false,
+            reference: None,
+            includelist: None,
+            threads: 1,
+            common: SimulationCommon {
+                seed: Some(42),
+                num_molecules: 10,
+                read_length: 100,
+                umi_length: 8,
+            },
+            quality: QualityArgs {
+                warmup_bases: 5,
+                warmup_quality: 25,
+                peak_quality: 37,
+                decay_start: 80,
+                decay_rate: 0.08,
+                quality_noise: 2.0,
+                r2_quality_offset: 0,
+            },
+            family_size: FamilySizeArgs {
+                family_size_dist: "lognormal".to_string(),
+                family_size_mean: 3.0,
+                family_size_stddev: 1.0,
+                family_size_r: 2.0,
+                family_size_p: 0.5,
+                min_family_size: 1,
+            },
+            insert_size: InsertSizeArgs {
+                insert_size_mean: 150.0,
+                insert_size_stddev: 30.0,
+                insert_size_min: 50,
+                insert_size_max: 500,
+            },
+            methylation: MethylationArgs {
+                methylation_mode: Some(crate::commands::common::MethylationModeArg::EmSeq),
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+        };
+
+        let result = cmd.execute("test");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("--methylation-mode requires --reference")
+        );
+    }
+
+    #[test]
+    fn test_emseq_fastq_reads_converts_non_cpg_c() {
+        // With EM-Seq, non-CpG C should be converted to T (on top strand R1)
+        // Use a reference that has a known pattern: all C's with no adjacent G
+        // Template: "CACACACACA..." (no CpG dinucleotides)
+        use crate::commands::simulate::common::apply_methylation_conversion;
+
+        let template = b"CACACACACACACACACACAC".to_vec();
+        let mut r1 = template.clone();
+        let mut rng = create_rng(Some(42));
+
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
+
+        // All C's should be converted to T (non-CpG in EM-Seq)
+        for (i, &b) in r1.iter().enumerate() {
+            if template[i] == b'C' {
+                assert_eq!(b, b'T', "position {i}: non-CpG C should be converted to T in EM-Seq");
+            } else {
+                assert_eq!(b, template[i], "position {i}: A should remain unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn test_taps_fastq_reads_preserves_non_cpg_c() {
+        // With TAPs, non-CpG C should NOT be converted
+        use crate::commands::simulate::common::apply_methylation_conversion;
+
+        let template = b"CACACACACACACACACACAC".to_vec();
+        let mut r1 = template.clone();
+        let mut rng = create_rng(Some(42));
+
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::Taps,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
+
+        // No changes — non-CpG C is not a target in TAPs
+        assert_eq!(r1, template);
+    }
+
+    #[test]
+    fn test_reads_in_same_family_differ_with_methylation() {
+        // Each read independently samples conversion, so two reads from
+        // the same molecule should (usually) differ when rates are partial
+        use crate::commands::simulate::common::apply_methylation_conversion;
+
+        // Template with CpG sites
+        let template = b"ACGTCGATCGACGTCGATCG".to_vec();
+        let mut different_count = 0;
+
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.5,
+            conversion_rate: 0.5,
+        };
+
+        for seed in 0..50u64 {
+            let mut r1_a = template.clone();
+            let mut r1_b = template.clone();
+            let mut rng_a = create_rng(Some(seed * 2));
+            let mut rng_b = create_rng(Some(seed * 2 + 1));
+
+            apply_methylation_conversion(&mut r1_a, &template, 0, true, &config, &mut rng_a);
+            apply_methylation_conversion(&mut r1_b, &template, 0, true, &config, &mut rng_b);
+
+            if r1_a != r1_b {
+                different_count += 1;
+            }
+        }
+
+        // With 50% CpG methylation rate, most pairs should differ
+        assert!(different_count > 10, "Expected most read pairs to differ, got {different_count}");
     }
 }

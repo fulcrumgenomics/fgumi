@@ -101,7 +101,7 @@ memory-debug = []
 # Enable compare subcommand with bams and metrics (developer tools)
 compare = []
 # Enable simulate commands for generating synthetic test data
-simulate = []
+simulate = ["simplex"]
 # Enable profiling output for adjacency UMI assigner
 profile-adjacency = []
 # Enable slow stress tests for concurrency testing

@@ -9,8 +9,9 @@ use crate::bam_io::create_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, MoleculeInfo, PositionDistArgs, QualityArgs, ReferenceArgs,
-    SimulationCommon, compute_position, generate_random_sequence, pad_sequence,
+    FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
+    PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
+    apply_methylation_conversion, compute_position, generate_random_sequence, pad_sequence,
 };
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
@@ -88,6 +89,9 @@ pub struct MappedReads {
 
     #[command(flatten)]
     pub position_dist: PositionDistArgs,
+
+    #[command(flatten)]
+    pub methylation: MethylationArgs,
 }
 
 /// Parameters needed for molecule generation.
@@ -102,10 +106,18 @@ struct GenerationParams {
     quality_bias: ReadPairQualityBias,
     family_dist: FamilySizeDistribution,
     insert_model: InsertSizeModel,
+    methylation: MethylationConfig,
 }
 
 impl Command for MappedReads {
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Validate methylation args
+        let methylation = self.methylation.resolve();
+        self.methylation.validate()?;
+        if methylation.mode.is_enabled() && self.reference.reference.is_none() {
+            anyhow::bail!("--methylation-mode requires --reference");
+        }
+
         info!("Generating mapped reads");
         info!("  Output: {}", self.output.display());
         info!("  Truth: {}", self.truth_output.display());
@@ -113,6 +125,18 @@ impl Command for MappedReads {
         info!("  Read length: {}", self.common.read_length);
         info!("  UMI length: {}", self.common.umi_length);
         info!("  Threads: {}", self.threads);
+        if methylation.mode.is_enabled() {
+            info!("  Methylation mode: {:?}", methylation.mode);
+            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
+            info!("  Conversion rate: {}", methylation.conversion_rate);
+        }
+
+        // Load reference genome if provided
+        let ref_genome = if let Some(ref path) = self.reference.reference {
+            Some(ReferenceGenome::load(path)?)
+        } else {
+            None
+        };
 
         // Determine positions
         let num_positions = self.position_dist.num_positions.unwrap_or(self.common.num_molecules);
@@ -156,6 +180,7 @@ impl Command for MappedReads {
             quality_bias: self.quality.to_quality_bias(),
             family_dist: self.family_size.to_family_size_distribution()?,
             insert_model: self.insert_size.to_insert_size_model(),
+            methylation,
         };
 
         // Generate seeds for reproducibility
@@ -223,7 +248,12 @@ impl Command for MappedReads {
             progress.log_if_needed(1);
 
             // Generate all read pairs for this molecule
-            let pairs = generate_molecule_reads(mol_info.mol_id, mol_info.seed, &params);
+            let pairs = generate_molecule_reads(
+                mol_info.mol_id,
+                mol_info.seed,
+                &params,
+                ref_genome.as_ref(),
+            );
 
             for (r1, r2, read_name, umi_str) in pairs {
                 writer.write_alignment_record(&header, &r1)?;
@@ -249,10 +279,12 @@ impl Command for MappedReads {
 
 /// Generate all read pairs for a single molecule.
 /// Returns Vec of (`r1_record`, `r2_record`, `read_name`, `umi_str`) tuples.
+#[allow(clippy::too_many_arguments)]
 fn generate_molecule_reads(
     mol_id: usize,
     seed: u64,
     params: &GenerationParams,
+    ref_genome: Option<&ReferenceGenome>,
 ) -> Vec<(RecordBuf, RecordBuf, String, String)> {
     let mut rng = create_rng(Some(seed));
 
@@ -270,22 +302,53 @@ fn generate_molecule_reads(
     // Generate insert size
     let insert_size = params.insert_model.sample(&mut rng);
 
+    // When reference is available, generate template once from reference (shared by all reads)
+    // When no reference, each read gets an independent random template (existing behavior)
+    let shared_template = ref_genome.and_then(|g| {
+        g.sequence_at_genome_pos(position, insert_size)
+            .or_else(|| g.sample_sequence(insert_size, &mut rng).map(|(_, _, seq)| seq))
+    });
+
     let mut pairs = Vec::with_capacity(family_size);
 
     for read_idx in 0..family_size {
         let read_name = format!("mol{mol_id:08}_read{read_idx:04}");
 
-        // Generate template sequence
-        let template = generate_random_sequence(insert_size, &mut rng);
+        // Use shared reference template or generate random per-read.
+        // Avoid cloning the shared template — only borrow it.
+        let random_template;
+        let template: &[u8] = if let Some(ref shared) = shared_template {
+            shared
+        } else {
+            random_template = generate_random_sequence(insert_size, &mut rng);
+            &random_template
+        };
 
-        // R1: forward strand at position
-        let r1_seq: Vec<u8> = template.iter().take(params.read_length).copied().collect();
+        // R1: forward strand (top strand) at position
+        let r1_end = params.read_length.min(template.len());
+        let mut r1_seq: Vec<u8> = template[..r1_end].to_vec();
+        apply_methylation_conversion(
+            &mut r1_seq,
+            template,
+            0,
+            true, // top strand
+            &params.methylation,
+            &mut rng,
+        );
         let r1_seq = pad_sequence(r1_seq, params.read_length, &mut rng);
 
-        // R2: reverse strand at position + insert_size - read_length
+        // R2: reverse strand (bottom strand) at position + insert_size - read_length
         let r2_start = insert_size.saturating_sub(params.read_length);
-        let r2_template: Vec<u8> =
-            template.iter().skip(r2_start).take(params.read_length).copied().collect();
+        let r2_end = params.read_length.min(template.len().saturating_sub(r2_start));
+        let mut r2_template: Vec<u8> = template[r2_start..r2_start + r2_end].to_vec();
+        apply_methylation_conversion(
+            &mut r2_template,
+            template,
+            r2_start,
+            false, // bottom strand
+            &params.methylation,
+            &mut rng,
+        );
         let r2_seq = reverse_complement(&r2_template);
         let r2_seq = pad_sequence(r2_seq, params.read_length, &mut rng);
 
@@ -631,5 +694,70 @@ mod tests {
             build_record("read", seq, &quals, 0, 200, 60, false, true, 100, -150, "AAA", "4M", 60);
 
         assert_eq!(record.template_length(), -150);
+    }
+
+    // ========================================================================
+    // Methylation tests
+    // ========================================================================
+
+    #[test]
+    fn test_emseq_mapped_reads_conversion() {
+        // Template with non-CpG Cs that should convert C->T in EM-Seq
+        let template = b"CACACACACACACACAC".to_vec(); // no CpG dinucleotides
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+
+        let mut r1 = template[..8].to_vec();
+        let mut rng = create_rng(Some(42));
+        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
+
+        // All non-CpG Cs should convert to T
+        for (i, &b) in r1.iter().enumerate() {
+            if template[i] == b'C' {
+                assert_eq!(b, b'T', "position {i}: non-CpG C should convert");
+            }
+        }
+    }
+
+    #[test]
+    fn test_reads_in_family_share_template_with_reference() {
+        // With a reference, all reads in a family should start from the same template
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        let seq = b"ACGT".repeat(500); // 2000 bp
+        fasta.write_all(&seq).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            min_family_size: 3,
+            num_positions: 100,
+            ref_length: 2000,
+            quality_model: crate::simulate::PositionQualityModel::new(
+                10, 25, 37, 100, 0.08, 2, 0.0,
+            ),
+            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
+            family_dist: crate::simulate::FamilySizeDistribution::log_normal(5.0, 1.0),
+            insert_model: crate::simulate::InsertSizeModel::new(100.0, 10.0, 80, 120),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+        };
+
+        let pairs = generate_molecule_reads(0, 42, &params, Some(&ref_genome));
+        // Multiple reads should be generated (family_size >= 3)
+        assert!(pairs.len() >= 3, "Expected at least 3 reads, got {}", pairs.len());
     }
 }
