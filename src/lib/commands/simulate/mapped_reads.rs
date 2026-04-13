@@ -11,7 +11,7 @@ use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
-    apply_methylation_conversion, compute_position, generate_random_sequence, pad_sequence,
+    apply_methylation_conversion, generate_random_sequence, pad_sequence,
 };
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
@@ -100,8 +100,6 @@ struct GenerationParams {
     umi_length: usize,
     mapq: u8,
     min_family_size: usize,
-    num_positions: usize,
-    ref_length: usize,
     quality_model: PositionQualityModel,
     quality_bias: ReadPairQualityBias,
     family_dist: FamilySizeDistribution,
@@ -110,6 +108,7 @@ struct GenerationParams {
 }
 
 impl Command for MappedReads {
+    #[allow(unreachable_code, unused_variables, unused_mut, clippy::diverging_sub_expression)] // todo!() stubs pending position-table lookup
     fn execute(&self, command_line: &str) -> Result<()> {
         // Validate methylation args
         let methylation = self.methylation.resolve();
@@ -168,8 +167,6 @@ impl Command for MappedReads {
             umi_length: self.common.umi_length,
             mapq: self.mapq,
             min_family_size: self.family_size.min_family_size,
-            num_positions,
-            ref_length,
             quality_model: self.quality.to_quality_model(),
             quality_bias: self.quality.to_quality_bias(),
             family_dist: self.family_size.to_family_size_distribution()?,
@@ -189,7 +186,7 @@ impl Command for MappedReads {
         let mut molecules: Vec<MoleculeInfo> = (0..self.common.num_molecules)
             .map(|mol_id| {
                 let seed: u64 = seed_rng.random();
-                let pos1 = compute_position(mol_id, num_positions, ref_length);
+                let pos1 = todo!("position table lookup");
 
                 // Pre-compute insert_size using the molecule's seed (same RNG sequence as generation)
                 let mut mol_rng = create_rng(Some(seed));
@@ -273,7 +270,13 @@ impl Command for MappedReads {
 
 /// Generate all read pairs for a single molecule.
 /// Returns Vec of (`r1_record`, `r2_record`, `read_name`, `umi_str`) tuples.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)] // todo!() stubs pending position-table lookup
 fn generate_molecule_reads(
     mol_id: usize,
     seed: u64,
@@ -282,9 +285,8 @@ fn generate_molecule_reads(
 ) -> Vec<(RecordBuf, RecordBuf, String, String)> {
     let mut rng = create_rng(Some(seed));
 
-    // Note: position is computed externally and passed via mol_id for reproducibility
-    // We need to recompute it here for the record generation
-    let position = compute_position(mol_id, params.num_positions, params.ref_length);
+    // TODO: replace with position table lookup
+    let position = todo!("position table lookup");
 
     // Generate UMI
     let umi = generate_random_sequence(params.umi_length, &mut rng);
@@ -735,8 +737,6 @@ mod tests {
             umi_length: 8,
             mapq: 60,
             min_family_size: 3,
-            num_positions: 100,
-            ref_length: 2000,
             quality_model: crate::simulate::PositionQualityModel::new(
                 10, 25, 37, 100, 0.08, 2, 0.0,
             ),

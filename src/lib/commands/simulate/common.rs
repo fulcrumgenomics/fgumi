@@ -585,21 +585,6 @@ fn is_conversion_target(
     }
 }
 
-/// Compute the genomic position for a molecule based on its ID.
-#[inline]
-pub(super) fn compute_position(mol_id: usize, num_positions: usize, ref_length: usize) -> usize {
-    let fallback = ref_length.saturating_sub(1).min(100);
-    if num_positions == 0 {
-        return fallback;
-    }
-    let usable_span = ref_length.saturating_sub(1000);
-    if usable_span == 0 {
-        return fallback;
-    }
-    let position_idx = mol_id % num_positions;
-    ((position_idx as f64 / num_positions as f64) * usable_span as f64) as usize + fallback
-}
-
 /// Lightweight molecule info for position-first sorting.
 #[derive(Debug)]
 pub(super) struct MoleculeInfo {
@@ -1033,31 +1018,6 @@ mod tests {
         let _ = args_lower
             .to_family_size_distribution()
             .expect("lowercase distribution name should be accepted");
-    }
-
-    #[rstest]
-    // num_positions == 0 should not panic
-    #[case(5, 0, 250_000_000, 0, 250_000_000)]
-    // ref_length < 1000 should not underflow
-    #[case(0, 10, 500, 0, 500)]
-    // Very small reference (ref_length <= 100) — fallback must stay within bounds
-    #[case(0, 10, 50, 0, 50)]
-    // Normal: first position
-    #[case(0, 10, 10_000, 0, 10_000)]
-    // Normal: last position in range
-    #[case(9, 10, 10_000, 101, 10_000)]
-    fn test_compute_position(
-        #[case] mol_id: usize,
-        #[case] num_positions: usize,
-        #[case] ref_length: usize,
-        #[case] min_expected: usize,
-        #[case] max_expected: usize,
-    ) {
-        let pos = compute_position(mol_id, num_positions, ref_length);
-        assert!(
-            pos >= min_expected && pos < max_expected,
-            "compute_position({mol_id}, {num_positions}, {ref_length}) = {pos}, expected [{min_expected}, {max_expected})"
-        );
     }
 
     fn make_molecule_info(mol_id: usize, tid1: i32, pos1: i64) -> MoleculeInfo {
