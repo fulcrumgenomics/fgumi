@@ -113,6 +113,10 @@ pub struct ConsensusReads {
     /// Stddev is set to half the mean.
     #[arg(long = "methylation-depth-mean", default_value = "5.0")]
     pub methylation_depth_mean: f64,
+
+    /// Reference FASTA file for sampling template sequences and building BAM headers.
+    #[arg(short = 'r', long = "reference", required = true)]
+    pub reference: PathBuf,
 }
 
 /// A generated consensus read pair ready for output.
@@ -1275,6 +1279,7 @@ mod tests {
                 conversion_rate: 0.98,
             },
             methylation_depth_mean: 0.0,
+            reference: PathBuf::from("dummy.fa"),
         };
         let result = cmd.execute("test");
         assert!(result.is_err());
@@ -1310,6 +1315,7 @@ mod tests {
                 conversion_rate: 0.98,
             },
             methylation_depth_mean: -1.0,
+            reference: PathBuf::from("dummy.fa"),
         };
         let result = cmd.execute("test");
         assert!(result.is_err());
@@ -1340,6 +1346,7 @@ mod tests {
                 conversion_rate: 0.98,
             },
             methylation_depth_mean: f64::NAN,
+            reference: PathBuf::from("dummy.fa"),
         };
         let result = cmd.execute("test");
         assert!(result.is_err());
@@ -1371,6 +1378,7 @@ mod tests {
                 conversion_rate: 0.98,
             },
             methylation_depth_mean: 0.0,
+            reference: PathBuf::from("dummy.fa"),
         };
         // Should succeed since methylation is disabled
         let result = cmd.execute("test");

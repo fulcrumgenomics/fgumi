@@ -254,21 +254,12 @@ fn validate_rate(value: f64, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reference options for mapped reads.
+/// Reference options for simulate commands.
 #[derive(Args, Debug, Clone)]
 pub struct ReferenceArgs {
-    /// Reference FASTA file (sequences sampled from here)
-    #[arg(short = 'r', long = "reference")]
-    pub reference: Option<PathBuf>,
-
-    /// Synthetic reference name (only used if no --reference)
-    #[arg(long = "ref-name", default_value = "chr1")]
-    pub ref_name: String,
-
-    /// Synthetic reference length (only used if no --reference).
-    /// A larger value prevents position collisions with many molecules.
-    #[arg(long = "ref-length", default_value = "250000000")]
-    pub ref_length: usize,
+    /// Reference FASTA file for sampling template sequences and building BAM headers.
+    #[arg(short = 'r', long = "reference", required = true)]
+    pub reference: PathBuf,
 }
 
 /// Loaded reference genome for sampling template sequences.
@@ -367,7 +358,6 @@ impl ReferenceGenome {
     }
 
     /// Returns the total genome length (sum of all loaded chromosome sequences).
-    #[cfg(test)]
     pub fn total_length(&self) -> usize {
         self.total_length
     }

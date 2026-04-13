@@ -114,9 +114,6 @@ impl Command for MappedReads {
         // Validate methylation args
         let methylation = self.methylation.resolve();
         self.methylation.validate()?;
-        if methylation.mode.is_enabled() && self.reference.reference.is_none() {
-            anyhow::bail!("--methylation-mode requires --reference");
-        }
 
         info!("Generating mapped reads");
         info!("  Output: {}", self.output.display());
@@ -131,19 +128,16 @@ impl Command for MappedReads {
             info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
-        // Load reference genome if provided
-        let ref_genome = if let Some(ref path) = self.reference.reference {
-            Some(ReferenceGenome::load(path)?)
-        } else {
-            None
-        };
+        // Load reference genome
+        let ref_genome = Some(ReferenceGenome::load(&self.reference.reference)?);
 
         // Determine positions
         let num_positions = self.position_dist.num_positions.unwrap_or(self.common.num_molecules);
 
         // Build header with template-coordinate sort order
-        let ref_name = self.reference.ref_name.clone();
-        let ref_length = self.reference.ref_length;
+        let ref_genome_inner = ref_genome.as_ref().expect("reference genome always loaded");
+        let ref_name = ref_genome_inner.name(0).to_string();
+        let ref_length = ref_genome_inner.total_length();
         let mut header = Header::builder();
 
         // Add sort order tags: SO:unsorted, GO:query, SS:template-coordinate

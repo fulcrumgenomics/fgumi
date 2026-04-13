@@ -121,9 +121,6 @@ impl Command for GroupedReads {
         // Validate methylation args
         let methylation = self.methylation.resolve();
         self.methylation.validate()?;
-        if methylation.mode.is_enabled() && self.reference.reference.is_none() {
-            anyhow::bail!("--methylation-mode requires --reference");
-        }
 
         info!("Generating grouped reads");
         info!("  Output: {}", self.output.display());
@@ -139,35 +136,30 @@ impl Command for GroupedReads {
             info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
-        // Load reference genome if provided
-        let ref_genome = if let Some(ref path) = self.reference.reference {
-            Some(ReferenceGenome::load(path)?)
-        } else {
-            None
-        };
+        // Load reference genome
+        let ref_genome = Some(ReferenceGenome::load(&self.reference.reference)?);
 
         // Determine positions
         let num_positions = self.position_dist.num_positions.unwrap_or(self.common.num_molecules);
-        let ref_length = self.reference.ref_length;
+        let ref_genome_inner = ref_genome.as_ref().expect("reference genome always loaded");
+        let ref_length = ref_genome_inner.total_length();
 
         // Check for position collisions that would cause UMI conflicts
         let usable_bases = ref_length.saturating_sub(1000);
         let bases_per_position = usable_bases as f64 / num_positions as f64;
         if bases_per_position < 1.0 {
-            let suggested_ref_length = num_positions * 2;
             anyhow::bail!(
                 "Position collision: {num_positions} positions cannot fit in {ref_length} bp reference ({bases_per_position:.2} bp/position). \
-                 Increase --ref-length to at least {suggested_ref_length} or reduce --num-molecules."
+                 Increase the reference size or reduce --num-molecules."
             );
         } else if bases_per_position < 10.0 {
             log::warn!(
-                "Low position spacing ({bases_per_position:.1} bp/position) may cause UMI collisions. \
-                 Consider increasing --ref-length."
+                "Low position spacing ({bases_per_position:.1} bp/position) may cause UMI collisions."
             );
         }
 
         // Build header with template-coordinate sort order
-        let ref_name = self.reference.ref_name.clone();
+        let ref_name = ref_genome_inner.name(0).to_string();
         let mut header = Header::builder();
 
         // Add sort order tags: SO:unsorted, GO:query, SS:template-coordinate

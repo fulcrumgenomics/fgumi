@@ -62,10 +62,8 @@ pub struct FastqReads {
     pub duplex: bool,
 
     /// Reference FASTA file for sampling template sequences.
-    /// If provided, templates are sampled from this reference instead of random bases.
-    /// This produces reads that will map back to the reference.
-    #[arg(short = 'r', long = "reference")]
-    pub reference: Option<PathBuf>,
+    #[arg(short = 'r', long = "reference", required = true)]
+    pub reference: PathBuf,
 
     /// UMI includelist file (one UMI per line).
     /// When provided, UMIs are sampled from this list instead of generated randomly.
@@ -208,9 +206,6 @@ impl Command for FastqReads {
         // Validate methylation args
         let methylation = self.methylation.resolve();
         self.methylation.validate()?;
-        if methylation.mode.is_enabled() && self.reference.is_none() {
-            bail!("--methylation-mode requires --reference");
-        }
 
         info!("Generating FASTQ reads");
         info!("  Output R1: {}", self.r1_output.display());
@@ -224,20 +219,14 @@ impl Command for FastqReads {
         }
         info!("  Duplex: {}", self.duplex);
         info!("  Threads: {}", self.threads);
-        if let Some(ref path) = self.reference {
-            info!("  Reference: {}", path.display());
-        }
+        info!("  Reference: {}", self.reference.display());
         if methylation.mode.is_enabled() {
             info!("  Methylation mode: {:?}", methylation.mode);
             info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
             info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
-        let reference = if let Some(ref path) = self.reference {
-            Some(Arc::new(ReferenceGenome::load(path)?))
-        } else {
-            None
-        };
+        let reference = Some(Arc::new(ReferenceGenome::load(&self.reference)?));
 
         // Use at least 2 threads for generation if multi-threaded
         // Reserve some threads for gzip compression
@@ -982,6 +971,8 @@ mod tests {
             r2.to_str().expect("path should be valid UTF-8"),
             "--truth",
             truth.to_str().expect("path should be valid UTF-8"),
+            "-r",
+            "dummy.fa",
             "-i",
             includelist_path.to_str().expect("path should be valid UTF-8"),
             "--read-length",
@@ -1013,6 +1004,8 @@ mod tests {
             r2.to_str().expect("path should be valid UTF-8"),
             "--truth",
             truth.to_str().expect("path should be valid UTF-8"),
+            "-r",
+            "dummy.fa",
             "--umi-length",
             "100",
             "--read-length",
@@ -1084,66 +1077,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_execute_methylation_requires_reference() {
-        let dir = tempfile::tempdir().unwrap();
-        let r1 = dir.path().join("r1.fq.gz");
-        let r2 = dir.path().join("r2.fq.gz");
-        let truth = dir.path().join("truth.tsv");
-
-        let cmd = FastqReads {
-            r1_output: r1,
-            r2_output: r2,
-            truth_output: truth,
-            read_structure_r1: "8M+T".to_string(),
-            read_structure_r2: "+T".to_string(),
-            duplex: false,
-            reference: None,
-            includelist: None,
-            threads: 1,
-            common: SimulationCommon {
-                seed: Some(42),
-                num_molecules: 10,
-                read_length: 100,
-                umi_length: 8,
-            },
-            quality: QualityArgs {
-                warmup_bases: 5,
-                warmup_quality: 25,
-                peak_quality: 37,
-                decay_start: 80,
-                decay_rate: 0.08,
-                quality_noise: 2.0,
-                r2_quality_offset: 0,
-            },
-            family_size: FamilySizeArgs {
-                family_size_dist: "lognormal".to_string(),
-                family_size_mean: 3.0,
-                family_size_stddev: 1.0,
-                family_size_r: 2.0,
-                family_size_p: 0.5,
-                min_family_size: 1,
-            },
-            insert_size: InsertSizeArgs {
-                insert_size_mean: 150.0,
-                insert_size_stddev: 30.0,
-                insert_size_min: 50,
-                insert_size_max: 500,
-            },
-            methylation: MethylationArgs {
-                methylation_mode: Some(crate::commands::common::MethylationModeArg::EmSeq),
-                cpg_methylation_rate: 0.75,
-                conversion_rate: 0.98,
-            },
-        };
-
-        let result = cmd.execute("test");
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("--methylation-mode requires --reference")
-        );
     }
 
     #[test]
