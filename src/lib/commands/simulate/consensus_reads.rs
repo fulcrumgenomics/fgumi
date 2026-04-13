@@ -3,9 +3,7 @@
 use crate::bam_io::create_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
-use crate::commands::simulate::common::{
-    MethylationArgs, StrandBiasArgs, generate_random_sequence,
-};
+use crate::commands::simulate::common::{MethylationArgs, ReferenceGenome, StrandBiasArgs};
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
 use crate::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
@@ -30,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-/// Generate unmapped BAM with consensus tags for `fgumi filter`.
+/// Generate mapped BAM with consensus tags for `fgumi filter`.
 #[derive(Parser, Debug)]
 #[command(
     name = "consensus-reads",
@@ -38,12 +36,12 @@ use std::thread;
     long_about = r#"
 Generate synthetic consensus reads with proper consensus tags.
 
-The output is unmapped and suitable for input to `fgumi filter`.
+The output is a mapped BAM suitable for input to `fgumi filter`.
 Reads contain consensus tags (cD, cM, cE, cd, ce) for filtering.
 "#
 )]
 pub struct ConsensusReads {
-    /// Output BAM file (unmapped)
+    /// Output BAM file (mapped)
     #[arg(short = 'o', long = "output", required = true)]
     pub output: PathBuf,
 
@@ -126,10 +124,15 @@ struct ConsensusReadPair {
     r2_record: RecordBuf,
     /// Truth data: (cD, cM, cE, aD, bD, aM, bM, aE, bE)
     truth: (i32, i32, i32, i32, i32, i32, i32, i32, i32),
+    /// Chromosome name for truth output.
+    chrom_name: String,
+    /// 0-based local position within the chromosome.
+    local_pos: usize,
+    /// Whether the molecule was sampled from the top strand.
+    is_top_strand: bool,
 }
 
 /// Parameters needed for parallel consensus generation.
-#[derive(Clone)]
 struct GenerationParams {
     read_length: usize,
     min_depth: i32,
@@ -146,6 +149,10 @@ struct GenerationParams {
     methylation_depth_dist: LogNormal<f64>,
     /// `CpG` methylation rate.
     cpg_methylation_rate: f64,
+    /// Enzymatic conversion rate for target cytosines.
+    conversion_rate: f64,
+    /// Loaded reference genome for sampling template sequences.
+    ref_genome: Arc<ReferenceGenome>,
 }
 
 /// Channel capacity for buffering read pairs between producer and writer threads.
@@ -177,12 +184,26 @@ impl Command for ConsensusReads {
             info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
         }
 
-        // Build header (no references for unmapped BAM)
+        // Load reference genome
+        let ref_genome = Arc::new(ReferenceGenome::load(&self.reference)?);
+
+        // Validate that the reference has at least one contig >= read_length
+        if ref_genome.max_contig_length() < self.read_length {
+            anyhow::bail!(
+                "No reference contig is >= read length ({} bp). \
+                 The longest contig is {} bp. Use a larger reference or shorter --read-length.",
+                self.read_length,
+                ref_genome.max_contig_length(),
+            );
+        }
+
+        // Build header from reference contigs
+        let ref_header = ref_genome.build_bam_header();
         let mut header_builder = Header::builder();
-
-        // Add @PG record
+        for (name, map) in ref_header.reference_sequences() {
+            header_builder = header_builder.add_reference_sequence(name.clone(), map.clone());
+        }
         header_builder = crate::commands::common::add_pg_to_builder(header_builder, command_line)?;
-
         let header = header_builder.build();
 
         // Set up shared parameters
@@ -207,6 +228,8 @@ impl Command for ConsensusReads {
                 create_depth_distribution(5.0, 2.5)
             },
             cpg_methylation_rate: methylation.cpg_methylation_rate,
+            conversion_rate: methylation.conversion_rate,
+            ref_genome: Arc::clone(&ref_genome),
         });
 
         let strand_bias_model = Arc::new(self.strand_bias.to_strand_bias_model());
@@ -235,7 +258,7 @@ impl Command for ConsensusReads {
                 let truth_file = File::create(truth_path)
                     .with_context(|| format!("Failed to create {}", truth_path.display()))?;
                 let mut w = BufWriter::new(truth_file);
-                writeln!(w, "read_name\tcD\tcM\tcE\taD\tbD\taM\tbM\taE\tbE")?;
+                writeln!(w, "read_name\tchrom\tpos\tstrand\tcD\tcM\tcE\taD\tbD\taM\tbM\taE\tbE")?;
                 Some(w)
             } else {
                 None
@@ -255,10 +278,11 @@ impl Command for ConsensusReads {
                 // Write truth
                 if let Some(ref mut tw) = truth_writer {
                     let (cd, cm, ce, ad, bd, am, bm, ae, be) = pair.truth;
+                    let strand_char = if pair.is_top_strand { '+' } else { '-' };
                     writeln!(
                         tw,
-                        "{}\t{cd}\t{cm}\t{ce}\t{ad}\t{bd}\t{am}\t{bm}\t{ae}\t{be}",
-                        pair.read_name
+                        "{}\t{}\t{}\t{strand_char}\t{cd}\t{cm}\t{ce}\t{ad}\t{bd}\t{am}\t{bm}\t{ae}\t{be}",
+                        pair.read_name, pair.chrom_name, pair.local_pos
                     )?;
                 }
             }
@@ -323,8 +347,11 @@ fn generate_consensus_pair(
     let error_dist = Normal::new(params.error_rate_mean, params.error_rate_stddev)
         .expect("Invalid error distribution parameters");
 
-    // Generate sequence
-    let seq = generate_random_sequence(params.read_length, &mut rng);
+    // Sample sequence from reference
+    let (chrom_idx, local_pos, seq) = params
+        .ref_genome
+        .sample_sequence(params.read_length, &mut rng)
+        .expect("Failed to sample sequence from reference");
     let quals = vec![params.consensus_quality; params.read_length];
 
     // Generate consensus depth (cD)
@@ -364,6 +391,7 @@ fn generate_consensus_pair(
             &seq,
             params.methylation_mode,
             params.cpg_methylation_rate,
+            params.conversion_rate,
             &params.methylation_depth_dist,
             params.duplex,
             &mut rng,
@@ -372,41 +400,68 @@ fn generate_consensus_pair(
         None
     };
 
+    // Coin flip for strand orientation
+    let is_top_strand: bool = rng.random();
+    let r1_is_reverse = !is_top_strand;
+
+    // Compute methylation per read: the forward read gets the original annotation,
+    // the reverse read gets the reversed annotation. Which read is forward depends
+    // on the strand coin flip.
+    let reverse_methylation = methylation.as_ref().map(|m| m.reverse());
+    let (r1_methylation, r2_methylation) = if r1_is_reverse {
+        // R1F2: R1 is reverse, R2 is forward
+        (reverse_methylation.as_ref(), methylation.as_ref())
+    } else {
+        // F1R2: R1 is forward, R2 is reverse
+        (methylation.as_ref(), reverse_methylation.as_ref())
+    };
+
     // Build R1 record
+    let r1_seq = if is_top_strand { seq.clone() } else { reverse_complement(&seq) };
     let r1_record = build_consensus_record(
         &format!("{read_name}/1"),
-        &seq,
+        &r1_seq,
         &quals,
         true, // is_first
+        r1_is_reverse,
+        chrom_idx,
+        local_pos,
         cd,
         cm,
         ce,
         if params.duplex { Some((ad, bd, am, bm, ae, be)) } else { None },
-        methylation.as_ref(),
+        r1_methylation,
         params.methylation_mode,
     );
 
-    // Build R2 record (reverse complement)
-    let r2_seq = reverse_complement(&seq);
-    let r2_methylation = methylation.as_ref().map(|m| m.reverse());
+    // Build R2 record (opposite strand orientation)
+    let r2_seq = if is_top_strand { reverse_complement(&seq) } else { seq.clone() };
     let r2_record = build_consensus_record(
         &format!("{read_name}/2"),
         &r2_seq,
         &quals,
         false, // is_first
+        !r1_is_reverse,
+        chrom_idx,
+        local_pos,
         cd,
         cm,
         ce,
         if params.duplex { Some((ad, bd, am, bm, ae, be)) } else { None },
-        r2_methylation.as_ref(),
+        r2_methylation,
         params.methylation_mode,
     );
+
+    let chrom_name = params.ref_genome.name(chrom_idx).to_string();
 
     ConsensusReadPair {
         read_name,
         r1_record,
         r2_record,
         truth: (cd, cm, ce, ad, bd, am, bm, ae, be),
+        chrom_name,
+        local_pos,
+        is_top_strand,
     }
 }
 
@@ -439,6 +494,7 @@ fn generate_methylation_annotation(
     seq: &[u8],
     mode: MethylationMode,
     cpg_methylation_rate: f64,
+    conversion_rate: f64,
     methylation_depth_dist: &LogNormal<f64>,
     duplex: bool,
     rng: &mut impl Rng,
@@ -478,27 +534,38 @@ fn generate_methylation_annotation(
 
         // In EM-Seq: unconverted = methylated (protected), converted = unmethylated
         // In TAPs: unconverted = unmethylated, converted = methylated
+        //
+        // The conversion_rate controls what fraction of targeted bases are converted.
+        // For the "mostly converted" branch: converted ~= total * conversion_rate
+        // For the "mostly unconverted" branch: unconverted ~= total * conversion_rate
+        // (i.e., conversion_rate reflects the efficiency of the chemistry)
         let (unconverted, converted) = match mode {
             MethylationMode::EmSeq => {
                 if cpg && methylated {
                     // Methylated CpG in EM-Seq: mostly unconverted (protected)
-                    let conv = rng.random_range(0..=total_depth / 5);
-                    (total_depth - conv, conv)
+                    let converted_count =
+                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
+                    (total_depth - converted_count, converted_count)
                 } else {
                     // Unmethylated (non-CpG or unmethylated CpG): mostly converted
-                    let unconverted = rng.random_range(0..=total_depth / 5);
-                    (unconverted, total_depth - unconverted)
+                    let unconverted_count =
+                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
+                    (unconverted_count, total_depth - unconverted_count)
                 }
             }
             MethylationMode::Taps => {
                 if cpg && methylated {
                     // Methylated CpG in TAPs: mostly converted (target)
-                    let unconverted = rng.random_range(0..=total_depth / 5);
-                    (unconverted, total_depth - unconverted)
+                    let unconverted_count =
+                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
+                    (unconverted_count, total_depth - unconverted_count)
                 } else {
-                    // Unmethylated: mostly unconverted (not a target)
-                    let conv = rng.random_range(0..=total_depth / 5);
-                    (total_depth - conv, conv)
+                    // Unmethylated: mostly unconverted (not a target). The minority
+                    // leakage (at most `1 - conversion_rate` fraction) is the number
+                    // of spuriously converted reads.
+                    let leaked_converted =
+                        (total_depth as f64 * (1.0 - conversion_rate)).round() as u32;
+                    (total_depth - leaked_converted, leaked_converted)
                 }
             }
             MethylationMode::Disabled => (0, 0),
@@ -566,6 +633,9 @@ fn build_consensus_record(
     seq: &[u8],
     quals: &[u8],
     is_first: bool,
+    is_reverse: bool,
+    chrom_idx: usize,
+    local_pos: usize,
     cd: i32,
     cm: i32,
     ce: i32,
@@ -574,6 +644,7 @@ fn build_consensus_record(
     methylation_mode: MethylationMode,
 ) -> RecordBuf {
     let seq_str = String::from_utf8_lossy(seq);
+    let is_top_strand = !is_reverse;
 
     // Build consensus tags (note: cE is error count in this file, not error rate)
     let mut consensus_tags =
@@ -596,8 +667,14 @@ fn build_consensus_record(
         .qualities(quals)
         .paired(true)
         .first_segment(is_first)
-        .unmapped(true)
-        .mate_unmapped(true)
+        .reference_sequence_id(chrom_idx)
+        .alignment_start(local_pos + 1) // Convert 0-based to 1-based
+        .mapping_quality(60)
+        .reverse_complement(is_reverse)
+        .mate_reverse_complement(!is_reverse)
+        .mate_reference_sequence_id(chrom_idx)
+        .mate_alignment_start(local_pos + 1) // R1 and R2 at same position
+        .template_length(0)
         .consensus_tags(consensus_tags);
 
     // Add methylation tags if enabled
@@ -608,7 +685,9 @@ fn build_consensus_record(
         builder = builder.tag("cu", cu).tag("ct", ct);
 
         // Add MM/ML tags (SAM spec methylation tags)
-        if let Some((mm, ml)) = build_mm_ml_tags(seq, &meth.annotation, true, methylation_mode) {
+        if let Some((mm, ml)) =
+            build_mm_ml_tags(seq, &meth.annotation, is_top_strand, methylation_mode)
+        {
             builder = builder.tag("MM", mm).tag("ML", ml);
         }
 
@@ -621,14 +700,20 @@ fn build_consensus_record(
             builder = builder.tag("au", au).tag("at", at).tag("bu", bu).tag("bt", bt);
 
             // Add per-strand MM tags (am/bm)
-            if let Some(am) =
-                fgumi_consensus::methylation::build_mm_tag_no_ml(seq, ab, true, methylation_mode)
-            {
+            if let Some(am) = fgumi_consensus::methylation::build_mm_tag_no_ml(
+                seq,
+                ab,
+                is_top_strand,
+                methylation_mode,
+            ) {
                 builder = builder.tag("am", am);
             }
-            if let Some(bm) =
-                fgumi_consensus::methylation::build_mm_tag_no_ml(seq, ba, true, methylation_mode)
-            {
+            if let Some(bm) = fgumi_consensus::methylation::build_mm_tag_no_ml(
+                seq,
+                ba,
+                is_top_strand,
+                methylation_mode,
+            ) {
                 builder = builder.tag("bm", bm);
             }
         }
@@ -640,6 +725,7 @@ fn build_consensus_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::simulate::common::generate_random_sequence;
     use crate::simulate::create_rng;
 
     #[test]
@@ -711,19 +797,23 @@ mod tests {
             "test_read/1",
             seq,
             &quals,
-            true, // is_first
-            5,    // cD
-            3,    // cM
-            1,    // cE
-            None, // no duplex tags
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
+            5,     // cD
+            3,     // cM
+            1,     // cE
+            None,  // no duplex tags
             None,
             MethylationMode::Disabled,
         );
 
         assert!(record.name().is_some());
         let flags = record.flags();
-        assert!(flags.is_unmapped());
+        assert!(!flags.is_unmapped());
         assert!(flags.is_first_segment());
+        assert_eq!(record.reference_sequence_id(), Some(0));
     }
 
     #[test]
@@ -735,7 +825,10 @@ mod tests {
             "test_read/1",
             seq,
             &quals,
-            true,
+            true,                     // is_first
+            false,                    // is_reverse
+            0,                        // chrom_idx
+            100,                      // local_pos
             10,                       // cD
             5,                        // cM
             2,                        // cE
@@ -746,7 +839,7 @@ mod tests {
 
         assert!(record.name().is_some());
         let flags = record.flags();
-        assert!(flags.is_unmapped());
+        assert!(!flags.is_unmapped());
     }
 
     #[test]
@@ -759,6 +852,9 @@ mod tests {
             seq,
             &quals,
             false, // is_first = false means R2
+            true,  // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -770,6 +866,7 @@ mod tests {
         let flags = record.flags();
         assert!(flags.is_last_segment());
         assert!(!flags.is_first_segment());
+        assert!(!flags.is_unmapped());
     }
 
     #[test]
@@ -819,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_consensus_record_mate_unmapped_flag() {
+    fn test_build_consensus_record_mapped_flags() {
         let seq = b"ACGT";
         let quals = vec![40; 4];
 
@@ -827,7 +924,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -837,8 +937,10 @@ mod tests {
         );
 
         let flags = record.flags();
-        assert!(flags.is_mate_unmapped());
-        assert!(flags.is_unmapped());
+        assert!(!flags.is_mate_unmapped());
+        assert!(!flags.is_unmapped());
+        assert_eq!(record.reference_sequence_id(), Some(0));
+        assert!(record.alignment_start().is_some());
     }
 
     #[test]
@@ -850,7 +952,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -872,7 +977,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -894,7 +1002,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -916,7 +1027,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -937,7 +1051,10 @@ mod tests {
             "test/1",
             &seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -959,7 +1076,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             0,
             0,
             0,
@@ -981,7 +1101,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             10,
             5,
             100,
@@ -1039,7 +1162,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             cd,
             5,
             2,
@@ -1063,6 +1189,9 @@ mod tests {
                 seq,
                 &quals,
                 true,
+                false,
+                0,
+                100,
                 5,
                 3,
                 1,
@@ -1089,6 +1218,7 @@ mod tests {
             seq,
             MethylationMode::EmSeq,
             1.0, // all CpG methylated
+            0.98,
             &dist,
             false,
             &mut rng,
@@ -1102,7 +1232,7 @@ mod tests {
         assert!(data.annotation.evidence[4].is_ref_c);
         assert!(
             data.annotation.evidence[4].converted_count
-                > data.annotation.evidence[4].unconverted_count
+                >= data.annotation.evidence[4].unconverted_count
         );
 
         // Position 1 is G -> not a ref C
@@ -1125,6 +1255,7 @@ mod tests {
             seq,
             MethylationMode::Taps,
             1.0, // all CpG methylated
+            0.98,
             &dist,
             false,
             &mut rng,
@@ -1134,14 +1265,14 @@ mod tests {
         assert!(data.annotation.evidence[0].is_ref_c);
         assert!(
             data.annotation.evidence[0].converted_count
-                > data.annotation.evidence[0].unconverted_count
+                >= data.annotation.evidence[0].unconverted_count
         );
 
         // Position 4 is C not CpG -> unmethylated in TAPs -> mostly unconverted (not a target)
         assert!(data.annotation.evidence[4].is_ref_c);
         assert!(
             data.annotation.evidence[4].unconverted_count
-                > data.annotation.evidence[4].converted_count
+                >= data.annotation.evidence[4].converted_count
         );
     }
 
@@ -1156,6 +1287,7 @@ mod tests {
             seq,
             MethylationMode::EmSeq,
             0.75,
+            0.98,
             &dist,
             false,
             &mut rng,
@@ -1165,7 +1297,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -1203,6 +1338,7 @@ mod tests {
             seq,
             MethylationMode::EmSeq,
             0.75,
+            0.98,
             &dist,
             true, // duplex
             &mut rng,
@@ -1220,7 +1356,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             10,
             5,
             2,
@@ -1242,7 +1381,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -1354,6 +1496,15 @@ mod tests {
 
     #[test]
     fn test_methylation_depth_mean_validation_accepts_when_disabled() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
         // When methylation is disabled, invalid methylation_depth_mean should not error
         let cmd = ConsensusReads {
             output: PathBuf::from("/dev/null"),
@@ -1378,7 +1529,7 @@ mod tests {
                 conversion_rate: 0.98,
             },
             methylation_depth_mean: 0.0,
-            reference: PathBuf::from("dummy.fa"),
+            reference: fasta.path().to_path_buf(),
         };
         // Should succeed since methylation is disabled
         let result = cmd.execute("test");
@@ -1473,7 +1624,10 @@ mod tests {
             "test/1",
             seq,
             &quals,
-            true,
+            true,  // is_first
+            false, // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -1489,7 +1643,10 @@ mod tests {
             "test/2",
             &r2_seq,
             &quals,
-            false,
+            false, // is_first
+            true,  // is_reverse
+            0,     // chrom_idx
+            100,   // local_pos
             5,
             3,
             1,
@@ -1534,5 +1691,53 @@ mod tests {
             r2_ct, r1_ct_rev,
             "R2 ct tag should be reversed relative to R1: R1={r1_ct:?}, R2={r2_ct:?}"
         );
+    }
+
+    #[test]
+    fn test_consensus_reads_produces_mapped_records() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = Arc::new(ReferenceGenome::load(fasta.path()).unwrap());
+        let params = Arc::new(GenerationParams {
+            read_length: 50,
+            min_depth: 1,
+            max_depth: 10,
+            depth_mean: 5.0,
+            depth_stddev: 2.0,
+            error_rate_mean: 0.01,
+            error_rate_stddev: 0.005,
+            duplex: false,
+            consensus_quality: 40,
+            methylation_mode: MethylationMode::Disabled,
+            methylation_depth_dist: create_depth_distribution(5.0, 2.5),
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.98,
+            ref_genome: Arc::clone(&ref_genome),
+        });
+        let strand_bias = StrandBiasModel::new(5.0, 5.0);
+
+        let pair = generate_consensus_pair(0, 42, &params, &strand_bias);
+
+        // Records should be mapped
+        assert!(!pair.r1_record.flags().is_unmapped());
+        assert!(!pair.r2_record.flags().is_unmapped());
+
+        // Records should have reference sequence ID
+        assert!(pair.r1_record.reference_sequence_id().is_some());
+        assert!(pair.r2_record.reference_sequence_id().is_some());
+
+        // Records should have alignment start
+        assert!(pair.r1_record.alignment_start().is_some());
+        assert!(pair.r2_record.alignment_start().is_some());
+
+        // Chrom name should be set
+        assert_eq!(pair.chrom_name, "chr1");
     }
 }

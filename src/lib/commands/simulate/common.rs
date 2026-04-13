@@ -373,7 +373,7 @@ impl ReferenceGenome {
     /// Return the subsequence at a genome-wide position, mapping to the correct
     /// chromosome automatically. The position wraps around the total genome length.
     /// Returns None if out of bounds or if the sequence contains N bases.
-    #[allow(dead_code)] // used by consensus-reads (upcoming tasks)
+    #[allow(dead_code)] // used only in tests
     pub fn sequence_at_genome_pos(&self, genome_pos: usize, length: usize) -> Option<Vec<u8>> {
         if self.total_length == 0 {
             return None;
@@ -425,13 +425,13 @@ impl ReferenceGenome {
     }
 
     /// Returns the number of loaded chromosomes.
-    #[allow(dead_code)] // used by grouped-reads and consensus-reads (upcoming tasks)
+    #[allow(dead_code)] // used only in tests
     pub(super) fn num_chromosomes(&self) -> usize {
         self.sequences.len()
     }
 
     /// Returns the length of the chromosome at the given index.
-    #[allow(dead_code)] // used by grouped-reads and consensus-reads (upcoming tasks)
+    #[allow(dead_code)] // used only in tests
     pub(super) fn chromosome_length(&self, chrom_idx: usize) -> usize {
         self.sequences[chrom_idx].len()
     }
