@@ -262,6 +262,11 @@ pub struct ReferenceArgs {
     pub reference: PathBuf,
 }
 
+/// Minimum contig length (bp) considered usable for sampling. Contigs shorter than this
+/// are skipped when loading the reference so that the 1000-bp N-check window and typical
+/// insert sizes have room to fit.
+const MIN_CONTIG_LENGTH: usize = 1000;
+
 /// Loaded reference genome for sampling template sequences.
 pub(super) struct ReferenceGenome {
     names: Vec<String>,
@@ -294,7 +299,7 @@ impl ReferenceGenome {
             let seq: Vec<u8> =
                 record.sequence().as_ref().iter().map(|&b| b.to_ascii_uppercase()).collect();
 
-            if seq.len() >= 1000 {
+            if seq.len() >= MIN_CONTIG_LENGTH {
                 // Only include chromosomes with sufficient length
                 total_length += seq.len();
                 cumulative_lengths.push(total_length);
@@ -318,20 +323,23 @@ impl ReferenceGenome {
     }
 
     /// Sample a random position and return (`chrom_idx`, position, sequence).
-    /// Returns None if the position contains N bases or if `length` exceeds `total_length`.
+    /// Returns None if the position contains N bases or if `length` is zero or
+    /// exceeds `total_length`.
     pub fn sample_sequence(
         &self,
         length: usize,
         rng: &mut impl Rng,
     ) -> Option<(usize, usize, Vec<u8>)> {
-        if length > self.total_length {
+        if length == 0 || length > self.total_length {
             return None;
         }
-        let max_start = self.total_length - length;
+        // Exclusive upper bound keeps `genome_pos < total_length`, which guarantees
+        // `partition_point` returns a valid index into `cumulative_lengths`.
+        let start_bound = self.total_length - length + 1;
         // Try up to 10 times to find a valid position without N bases
         for _ in 0..10 {
             // Pick a random position in the genome
-            let genome_pos = rng.random_range(0..=max_start);
+            let genome_pos = rng.random_range(0..start_bound);
 
             // Find which chromosome this falls in (binary search on sorted cumulative lengths)
             let chrom_idx = self.cumulative_lengths.partition_point(|&cum| cum <= genome_pos);
@@ -391,6 +399,86 @@ impl ReferenceGenome {
             return None;
         }
         Some(subseq.to_vec())
+    }
+
+    /// Build a BAM [`Header`] with `@SQ` lines for every loaded contig.
+    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
+    pub(super) fn build_bam_header(&self) -> noodles::sam::header::Header {
+        use bstr::BString;
+        use noodles::sam::header::Header;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let mut builder = Header::builder();
+        for (name, seq) in self.names.iter().zip(self.sequences.iter()) {
+            let length = NonZeroUsize::try_from(seq.len()).expect("chromosome length must be > 0");
+            let ref_seq = Map::<ReferenceSequence>::new(length);
+            builder = builder.add_reference_sequence(BString::from(name.as_str()), ref_seq);
+        }
+        builder.build()
+    }
+
+    /// Returns the length of the longest loaded chromosome.
+    pub(super) fn max_contig_length(&self) -> usize {
+        self.sequences.iter().map(|s| s.len()).max().unwrap_or(0)
+    }
+
+    /// Returns the number of loaded chromosomes.
+    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
+    pub(super) fn num_chromosomes(&self) -> usize {
+        self.sequences.len()
+    }
+
+    /// Returns the length of the chromosome at the given index.
+    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
+    pub(super) fn chromosome_length(&self, chrom_idx: usize) -> usize {
+        self.sequences[chrom_idx].len()
+    }
+
+    /// Pre-sample `num_positions` random loci as `(chrom_idx, local_pos)` tuples.
+    ///
+    /// Positions are drawn uniformly across the genome and are checked against
+    /// a `MIN_CONTIG_LENGTH` bp window for N bases. Sampling retries internally up to
+    /// `num_positions * 100` attempts before panicking.
+    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
+    pub(super) fn sample_positions(
+        &self,
+        num_positions: usize,
+        rng: &mut impl Rng,
+    ) -> Vec<(usize, usize)> {
+        const WINDOW: usize = MIN_CONTIG_LENGTH;
+        let max_attempts = num_positions.saturating_mul(100).max(1);
+        let mut positions = Vec::with_capacity(num_positions);
+        let mut attempts = 0usize;
+
+        while positions.len() < num_positions {
+            assert!(
+                attempts < max_attempts,
+                "sample_positions: exhausted {max_attempts} attempts to find \
+                 {num_positions} N-free positions in the reference"
+            );
+            attempts += 1;
+
+            // Pick a genome-wide position and map to (chrom_idx, local_pos)
+            let genome_pos = rng.random_range(0..self.total_length);
+            let chrom_idx = self.cumulative_lengths.partition_point(|&cum| cum <= genome_pos);
+            let chrom_start =
+                if chrom_idx == 0 { 0 } else { self.cumulative_lengths[chrom_idx - 1] };
+            let local_pos = genome_pos - chrom_start;
+
+            // Check a 1000bp window for N bases
+            let seq = &self.sequences[chrom_idx];
+            let window_end = (local_pos + WINDOW).min(seq.len());
+            let window_start = local_pos.min(window_end);
+            let window = &seq[window_start..window_end];
+            if window.iter().any(|&b| b == b'N' || b == b'n') {
+                continue;
+            }
+
+            positions.push((chrom_idx, local_pos));
+        }
+        positions
     }
 }
 
@@ -1192,6 +1280,17 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn test_reference_genome_sample_sequence_zero_length() {
+        // length == 0 must not panic and must return None (no valid 0-length sample)
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let result = genome.sample_sequence(0, &mut rng);
+        assert!(result.is_none());
+    }
+
     // ========================================================================
     // MethylationArgs tests
     // ========================================================================
@@ -1511,5 +1610,116 @@ mod tests {
         let mut read = ref_seq.to_vec();
         convert(&mut read, ref_seq, 0, true, MethylationMode::Disabled, 0.75, 1.0, 42);
         assert_eq!(read, ref_seq, "Disabled mode should never modify bases");
+    }
+
+    // ========================================================================
+    // ReferenceGenome::build_bam_header, num_chromosomes, chromosome_length,
+    // and sample_positions tests
+    // ========================================================================
+
+    /// Create a temp FASTA with four contigs: chr1 (2000bp), chr2 (1500bp),
+    /// chr3 (1800bp), and `short_contig` (500bp, below the 1000bp minimum).
+    fn write_multi_contig_fasta() -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, ">chr1").unwrap();
+        f.write_all(&b"ACGT".repeat(500)).unwrap(); // 2000bp
+        writeln!(f).unwrap();
+        writeln!(f, ">chr2").unwrap();
+        f.write_all(&b"CCGG".repeat(375)).unwrap(); // 1500bp
+        writeln!(f).unwrap();
+        writeln!(f, ">chr3").unwrap();
+        f.write_all(&b"AATT".repeat(450)).unwrap(); // 1800bp
+        writeln!(f).unwrap();
+        writeln!(f, ">short_contig").unwrap();
+        f.write_all(&b"ACGT".repeat(125)).unwrap(); // 500bp, should be skipped
+        writeln!(f).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn test_build_bam_header_has_all_contigs() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let header = genome.build_bam_header();
+
+        let ref_seqs: Vec<_> = header.reference_sequences().keys().collect();
+        assert_eq!(ref_seqs.len(), 3, "short_contig should be excluded");
+        let names: Vec<&str> =
+            ref_seqs.iter().map(|k| std::str::from_utf8(k.as_ref()).unwrap()).collect();
+        assert!(names.contains(&"chr1"));
+        assert!(names.contains(&"chr2"));
+        assert!(names.contains(&"chr3"));
+        assert!(!names.contains(&"short_contig"));
+    }
+
+    #[test]
+    fn test_build_bam_header_contig_lengths() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let header = genome.build_bam_header();
+
+        let ref_seqs = header.reference_sequences();
+        let chr1_len: usize = ref_seqs.get(&bstr::BString::from("chr1")).unwrap().length().get();
+        let chr2_len: usize = ref_seqs.get(&bstr::BString::from("chr2")).unwrap().length().get();
+        let chr3_len: usize = ref_seqs.get(&bstr::BString::from("chr3")).unwrap().length().get();
+        assert_eq!(chr1_len, 2000);
+        assert_eq!(chr2_len, 1500);
+        assert_eq!(chr3_len, 1800);
+    }
+
+    #[test]
+    fn test_num_chromosomes() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert_eq!(genome.num_chromosomes(), 3);
+    }
+
+    #[test]
+    fn test_chromosome_length() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert_eq!(genome.chromosome_length(0), 2000);
+        assert_eq!(genome.chromosome_length(1), 1500);
+        assert_eq!(genome.chromosome_length(2), 1800);
+    }
+
+    #[test]
+    fn test_sample_positions_count_and_bounds() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let positions = genome.sample_positions(20, &mut rng);
+        assert_eq!(positions.len(), 20);
+        for (chrom_idx, local_pos) in &positions {
+            assert!(*chrom_idx < genome.num_chromosomes());
+            assert!(*local_pos < genome.chromosome_length(*chrom_idx));
+        }
+    }
+
+    #[test]
+    fn test_sample_positions_deterministic() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng1 = create_rng(Some(99));
+        let mut rng2 = create_rng(Some(99));
+        let pos1 = genome.sample_positions(10, &mut rng1);
+        let pos2 = genome.sample_positions(10, &mut rng2);
+        assert_eq!(pos1, pos2);
+    }
+
+    #[test]
+    fn test_sample_positions_spans_chromosomes() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(7));
+        let positions = genome.sample_positions(100, &mut rng);
+        let unique_chroms: std::collections::HashSet<usize> =
+            positions.iter().map(|(c, _)| *c).collect();
+        assert!(
+            unique_chroms.len() >= 2,
+            "100 positions should span at least 2 chromosomes, got {}",
+            unique_chroms.len()
+        );
     }
 }
