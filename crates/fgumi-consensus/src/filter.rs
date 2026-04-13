@@ -1593,26 +1593,38 @@ pub fn check_conversion_fraction_raw(
     min_fraction: f64,
     reference: &dyn crate::methylation::RefBaseProvider,
     ref_names: &[String],
+    methylation_mode: crate::MethylationMode,
 ) -> bool {
     let ref_base_map = resolve_ref_bases_for_record(record, reference, ref_names);
-    let tags = MethylationTags::from_record(record);
+    let meth_tags = MethylationTags::from_record(record);
     check_conversion_fraction_raw_with_ref_bases_and_tags(
         record,
         min_fraction,
         ref_base_map.as_deref(),
-        &tags,
+        &meth_tags,
+        methylation_mode,
     )
 }
 
 /// Like [`check_conversion_fraction_raw`] but accepts both pre-resolved reference bases
 /// and pre-parsed methylation tags, avoiding all redundant work.
+///
+/// For EM-Seq, checks `ct / (cu + ct) >= threshold` at non-CpG ref-C positions.
+/// For TAPs, checks `cu / (cu + ct) >= threshold` instead, since
+/// non-CpG Cs should NOT be converted in TAPs.
 #[must_use]
 pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
     record: &[u8],
     min_fraction: f64,
     ref_base_map: Option<&[Option<u8>]>,
-    tags: &MethylationTags,
+    methylation_tags: &MethylationTags,
+    methylation_mode: crate::MethylationMode,
 ) -> bool {
+    // Conversion fraction is meaningless without a methylation mode — pass through
+    if methylation_mode == crate::MethylationMode::Disabled {
+        return true;
+    }
+
     let Some(ref_base_map) = ref_base_map else {
         return true; // unmapped reads pass
     };
@@ -1620,11 +1632,11 @@ pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
     let len = bam_fields::l_seq(record) as usize;
 
     // If no methylation tags, pass
-    if tags.cu.is_none() && tags.ct.is_none() {
+    if methylation_tags.cu.is_none() && methylation_tags.ct.is_none() {
         return true;
     }
 
-    let mut total_converted: u64 = 0;
+    let mut total_numerator: u64 = 0;
     let mut total_evidence: u64 = 0;
 
     for i in 0..len {
@@ -1639,11 +1651,19 @@ pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
             continue;
         }
 
-        let cu = tags.cu.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
-        let ct = tags.ct.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let cu = methylation_tags.cu.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
+        let ct = methylation_tags.ct.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
         let evidence = u64::from(cu) + u64::from(ct);
         if evidence > 0 {
-            total_converted += u64::from(ct);
+            // For EM-Seq: count converted (ct) — high conversion = good library quality
+            // For TAPs: count unconverted (cu) — high non-conversion at non-CpG = good specificity
+            // Safety: Disabled is handled by the early return at the top of this function
+            let numerator = match methylation_mode {
+                crate::MethylationMode::Taps => u64::from(cu),
+                crate::MethylationMode::EmSeq => u64::from(ct),
+                crate::MethylationMode::Disabled => return true,
+            };
+            total_numerator += numerator;
             total_evidence += evidence;
         }
     }
@@ -1657,7 +1677,7 @@ pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
         clippy::cast_precision_loss,
         reason = "precision loss is acceptable for fraction calculation"
     )]
-    let fraction = total_converted as f64 / total_evidence as f64;
+    let fraction = total_numerator as f64 / total_evidence as f64;
     fraction >= min_fraction
 }
 
@@ -3122,7 +3142,13 @@ mod tests {
         let raw = build_raw_with_methylation_tags(&sam.header, &record);
         // 18 converted out of 20 = 90% conversion (positions 1 and 5)
         assert!(
-            check_conversion_fraction_raw(&raw, 0.8, &reference, &ref_names),
+            check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::EmSeq
+            ),
             "Should pass with high conversion fraction"
         );
     }
@@ -3150,7 +3176,13 @@ mod tests {
         let raw = build_raw_with_methylation_tags(&sam.header, &record);
         // 2 converted out of 20 = 10% conversion (positions 1 and 5)
         assert!(
-            !check_conversion_fraction_raw(&raw, 0.8, &reference, &ref_names),
+            !check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::EmSeq
+            ),
             "Should fail with low conversion fraction"
         );
     }
@@ -3179,7 +3211,13 @@ mod tests {
 
         let raw = build_raw_with_methylation_tags(&sam.header, &record);
         assert!(
-            check_conversion_fraction_raw(&raw, 0.9, &reference, &ref_names),
+            check_conversion_fraction_raw(
+                &raw,
+                0.9,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::EmSeq
+            ),
             "Should pass because CpG sites are excluded from conversion check"
         );
     }
@@ -3203,7 +3241,13 @@ mod tests {
         // No cu/ct tags
         let raw = build_raw_with_methylation_tags(&sam.header, &record);
         assert!(
-            check_conversion_fraction_raw(&raw, 0.9, &reference, &ref_names),
+            check_conversion_fraction_raw(
+                &raw,
+                0.9,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::EmSeq
+            ),
             "Should pass with no methylation tags"
         );
     }
@@ -3219,8 +3263,165 @@ mod tests {
         // Unmapped record (no ref_id, no cigar)
         let raw = build_raw_with_methylation_tags(&noodles::sam::Header::default(), &record);
         assert!(
-            check_conversion_fraction_raw(&raw, 0.9, &reference, &ref_names),
+            check_conversion_fraction_raw(
+                &raw,
+                0.9,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::EmSeq
+            ),
             "Unmapped reads should pass"
+        );
+    }
+
+    // -- TAPs conversion fraction tests --
+
+    #[test]
+    fn test_conversion_fraction_taps_passes_high_non_conversion() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // Non-CpG C at positions 1 and 5: high unconverted (cu >> ct) = good TAPs specificity
+        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        // TAPs numerator = cu: 18 out of 20 = 90%
+        assert!(
+            check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::Taps
+            ),
+            "TAPs should pass with high non-conversion fraction"
+        );
+    }
+
+    #[test]
+    fn test_conversion_fraction_taps_fails_low_non_conversion() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // Non-CpG C at positions 1 and 5: low unconverted (ct >> cu) = poor TAPs specificity
+        add_i16_array_tag(&mut record, "cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        // TAPs numerator = cu: 2 out of 20 = 10%
+        assert!(
+            !check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::Taps
+            ),
+            "TAPs should fail with low non-conversion fraction"
+        );
+    }
+
+    #[test]
+    fn test_conversion_fraction_taps_vs_emseq_inverted() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // Non-CpG C at positions 1 and 5: cu=9, ct=1 at each
+        // EM-Seq numerator = ct: 2/20 = 10%, TAPs numerator = cu: 18/20 = 90%
+        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        // EM-Seq should fail (10% < 80%), TAPs should pass (90% >= 80%)
+        assert!(
+            !check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::EmSeq
+            ),
+            "EM-Seq should fail with high unconverted fraction"
+        );
+        assert!(
+            check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::Taps
+            ),
+            "TAPs should pass with same data (inverted numerator)"
+        );
+    }
+
+    // -- Disabled mode tests --
+
+    #[test]
+    fn test_conversion_fraction_disabled_mode_passes() {
+        use crate::methylation::tests::TestRef;
+        let ref_seq = b"ACATACATA";
+        let reference = TestRef::new(&[("chr1", ref_seq)]);
+        let ref_names = vec!["chr1".to_string()];
+
+        let sam = sam_builder_for_methylation();
+        let mut record = RecordBuilder::new()
+            .sequence("ACATACATA")
+            .qualities(&[30; 9])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .mapping_quality(60)
+            .cigar("9M")
+            .build();
+        // Data that would fail EM-Seq at 80% threshold
+        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+
+        let raw = build_raw_with_methylation_tags(&sam.header, &record);
+        // Disabled mode should always pass regardless of data
+        assert!(
+            check_conversion_fraction_raw(
+                &raw,
+                0.8,
+                &reference,
+                &ref_names,
+                crate::MethylationMode::Disabled
+            ),
+            "Disabled mode should always pass conversion fraction check"
         );
     }
 
