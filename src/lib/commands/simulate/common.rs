@@ -373,6 +373,7 @@ impl ReferenceGenome {
     /// Return the subsequence at a genome-wide position, mapping to the correct
     /// chromosome automatically. The position wraps around the total genome length.
     /// Returns None if out of bounds or if the sequence contains N bases.
+    #[allow(dead_code)] // used by consensus-reads (upcoming tasks)
     pub fn sequence_at_genome_pos(&self, genome_pos: usize, length: usize) -> Option<Vec<u8>> {
         if self.total_length == 0 {
             return None;
