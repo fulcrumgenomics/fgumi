@@ -102,10 +102,10 @@ struct ReadRecord {
     mol_id: usize,
     family_id: usize,
     strand: &'static str,
-    /// Chromosome name (if reference-based)
-    chrom: Option<String>,
-    /// 1-based start position (if reference-based)
-    pos: Option<usize>,
+    /// Chromosome name.
+    chrom: String,
+    /// 0-based start position.
+    pos: usize,
 }
 
 /// Parameters needed for parallel molecule generation.
@@ -113,9 +113,10 @@ struct ReadRecord {
 struct GenerationParams {
     umi_length: usize,
     read_length: usize,
-    duplex: bool,
     min_family_size: usize,
     r2_quality_offset: i8,
+    /// Generate duplex-style reads (A/B strand pairs).
+    duplex: bool,
     /// When set, UMIs are sampled from this list instead of generated randomly.
     includelist: Option<Vec<Vec<u8>>>,
     methylation: MethylationConfig,
@@ -226,7 +227,17 @@ impl Command for FastqReads {
             info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
-        let reference = Some(Arc::new(ReferenceGenome::load(&self.reference)?));
+        let reference = Arc::new(ReferenceGenome::load(&self.reference)?);
+
+        // Validate that the reference has at least one contig >= read_length
+        if reference.max_contig_length() < self.common.read_length {
+            bail!(
+                "No reference contig is >= read length ({} bp). \
+                 The longest contig is {} bp. Use a larger reference or shorter --read-length.",
+                self.common.read_length,
+                reference.max_contig_length(),
+            );
+        }
 
         // Use at least 2 threads for generation if multi-threaded
         // Reserve some threads for gzip compression
@@ -241,9 +252,9 @@ impl Command for FastqReads {
         let params = Arc::new(GenerationParams {
             umi_length,
             read_length: self.common.read_length,
-            duplex: self.duplex,
             min_family_size: self.family_size.min_family_size,
             r2_quality_offset: self.quality.r2_quality_offset,
+            duplex: self.duplex,
             includelist,
             methylation,
         });
@@ -261,8 +272,6 @@ impl Command for FastqReads {
         let r1_path = self.r1_output.clone();
         let r2_path = self.r2_output.clone();
         let truth_path = self.truth_output.clone();
-        let has_reference = reference.is_some();
-
         // Spawn writer thread with multi-threaded gzip compression
         let writer_handle = thread::spawn(move || -> Result<u64> {
             let mut r1_writer = FastqWriter::with_threads(&r1_path, compress_threads)?;
@@ -271,15 +280,10 @@ impl Command for FastqReads {
                 .with_context(|| format!("Failed to create {}", truth_path.display()))?;
             let mut truth_writer = BufWriter::new(truth_file);
 
-            // Write truth header (include chrom/pos if reference-based)
-            if has_reference {
-                writeln!(
-                    truth_writer,
-                    "read_name\ttrue_umi\tmolecule_id\tfamily_id\tstrand\tchrom\tpos"
-                )?;
-            } else {
-                writeln!(truth_writer, "read_name\ttrue_umi\tmolecule_id\tfamily_id\tstrand")?;
-            }
+            writeln!(
+                truth_writer,
+                "read_name\ttrue_umi\tmolecule_id\tfamily_id\tstrand\tchrom\tpos"
+            )?;
 
             let mut read_count = 0u64;
             let progress = ProgressTracker::new("Generated read pairs").with_interval(100_000);
@@ -293,29 +297,17 @@ impl Command for FastqReads {
                     r2_writer.write_record(&record.read_name, &record.r2_seq, &record.r2_quals)?;
 
                     // Write truth
-                    if has_reference {
-                        writeln!(
-                            truth_writer,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            record.read_name,
-                            String::from_utf8_lossy(&record.umi),
-                            record.mol_id,
-                            record.family_id,
-                            record.strand,
-                            record.chrom.as_deref().unwrap_or("."),
-                            record.pos.map_or_else(|| ".".to_string(), |p| (p + 1).to_string())
-                        )?;
-                    } else {
-                        writeln!(
-                            truth_writer,
-                            "{}\t{}\t{}\t{}\t{}",
-                            record.read_name,
-                            String::from_utf8_lossy(&record.umi),
-                            record.mol_id,
-                            record.family_id,
-                            record.strand
-                        )?;
-                    }
+                    writeln!(
+                        truth_writer,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        record.read_name,
+                        String::from_utf8_lossy(&record.umi),
+                        record.mol_id,
+                        record.family_id,
+                        record.strand,
+                        record.chrom,
+                        record.pos
+                    )?;
                 }
             }
 
@@ -345,7 +337,7 @@ impl Command for FastqReads {
                         &quality_bias,
                         &family_dist,
                         &insert_model,
-                        reference.as_deref(),
+                        &reference,
                     );
                     sender.send(batch)
                 })
@@ -380,7 +372,7 @@ fn generate_molecule_reads(
     quality_bias: &crate::simulate::ReadPairQualityBias,
     family_dist: &crate::simulate::FamilySizeDistribution,
     insert_model: &crate::simulate::InsertSizeModel,
-    reference: Option<&ReferenceGenome>,
+    reference: &ReferenceGenome,
 ) -> Vec<ReadRecord> {
     let mut rng = create_rng(Some(seed));
     let mut records = Vec::new();
@@ -406,23 +398,11 @@ fn generate_molecule_reads(
     let insert_size = insert_model.sample(&mut rng);
 
     // Generate template sequence (shared by all reads in family)
-    // Either sample from reference or generate random
     let template_len = insert_size.saturating_sub(params.umi_length);
-    let (template, chrom, pos) = if let Some(ref_genome) = reference {
-        // Sample from reference
-        if let Some((chrom_idx, local_pos, seq)) =
-            ref_genome.sample_sequence(template_len, &mut rng)
-        {
-            let chrom_name = ref_genome.name(chrom_idx).to_string();
-            (seq, Some(chrom_name), Some(local_pos))
-        } else {
-            // Fallback to random if sampling failed (e.g., all N regions)
-            (generate_random_sequence(template_len, &mut rng), None, None)
-        }
-    } else {
-        // Generate random template
-        (generate_random_sequence(template_len, &mut rng), None, None)
-    };
+    let (chrom_idx, pos, template) = reference
+        .sample_sequence(template_len, &mut rng)
+        .expect("Failed to sample sequence from reference");
+    let chrom = reference.name(chrom_idx).to_string();
 
     // Pre-calculate template slicing bounds (both reads have UMI prefix)
     let template_len = params.read_length.saturating_sub(params.umi_length);
@@ -436,11 +416,9 @@ fn generate_molecule_reads(
     let mut read_counter = 0usize;
 
     // For duplex mode, each read pair is independently assigned to A or B strand (coin flip)
-    // For non-duplex mode, all reads are A strand
+    // For non-duplex mode, all reads are A strand (no UMI swapping or orientation change)
     for read_idx in 0..family_size {
-        // Determine strand for this read pair
         let (strand, family_idx): (&'static str, usize) = if params.duplex {
-            // 50/50 coin flip for A or B strand
             if rng.random_bool(0.5) { ("A", 0) } else { ("B", 1) }
         } else {
             ("A", 0)
@@ -1024,13 +1002,23 @@ mod tests {
 
     #[test]
     fn test_generate_molecule_reads_with_includelist() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+
         let umis = vec![b"AAAAA".to_vec(), b"CCCCC".to_vec(), b"GGGGG".to_vec()];
         let params = GenerationParams {
             umi_length: 5,
             read_length: 50,
-            duplex: false,
             min_family_size: 1,
             r2_quality_offset: 0,
+            duplex: false,
             includelist: Some(umis.clone()),
             methylation: MethylationConfig {
                 mode: fgumi_consensus::MethylationMode::Disabled,
@@ -1055,7 +1043,7 @@ mod tests {
                 &quality_bias,
                 &family_dist,
                 &insert_model,
-                None,
+                &ref_genome,
             );
             for record in &records {
                 // The truth UMI (before errors) should be from the includelist
