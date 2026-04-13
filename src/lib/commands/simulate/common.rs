@@ -402,7 +402,6 @@ impl ReferenceGenome {
     }
 
     /// Build a BAM [`Header`] with `@SQ` lines for every loaded contig.
-    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
     pub(super) fn build_bam_header(&self) -> noodles::sam::header::Header {
         use bstr::BString;
         use noodles::sam::header::Header;
@@ -425,13 +424,13 @@ impl ReferenceGenome {
     }
 
     /// Returns the number of loaded chromosomes.
-    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
+    #[allow(dead_code)] // used by grouped-reads and consensus-reads (upcoming tasks)
     pub(super) fn num_chromosomes(&self) -> usize {
         self.sequences.len()
     }
 
     /// Returns the length of the chromosome at the given index.
-    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
+    #[allow(dead_code)] // used by grouped-reads and consensus-reads (upcoming tasks)
     pub(super) fn chromosome_length(&self, chrom_idx: usize) -> usize {
         self.sequences[chrom_idx].len()
     }
@@ -441,7 +440,6 @@ impl ReferenceGenome {
     /// Positions are drawn uniformly across the genome and are checked against
     /// a `MIN_CONTIG_LENGTH` bp window for N bases. Sampling retries internally up to
     /// `num_positions * 100` attempts before panicking.
-    #[allow(dead_code)] // will be wired into callers when position-table lookup replaces todo!()
     pub(super) fn sample_positions(
         &self,
         num_positions: usize,
