@@ -39,10 +39,7 @@
     var FOOTER_HTML =
         '<div class="fg-visit-us fg-page-footer">' +
         '<a href="https://www.fulcrumgenomics.com" target="_blank" rel="noopener">' +
-        '<picture>' +
-        '<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/fulcrumgenomics/fgumi/main/.github/logos/fulcrumgenomics-light.svg">' +
         '<img alt="Fulcrum Genomics" src="https://raw.githubusercontent.com/fulcrumgenomics/fgumi/main/.github/logos/fulcrumgenomics-dark.svg" height="50">' +
-        '</picture>' +
         '</a>' +
         '<p>Visit us at <a href="https://www.fulcrumgenomics.com" target="_blank" rel="noopener">Fulcrum Genomics</a> to learn more about how we can power your Bioinformatics with fgumi and beyond.</p>' +
         '<div class="fg-visit-buttons">' +

@@ -35,8 +35,8 @@ Steps marked with EM-Seq-specific flags:
 
 | Step | Flag | Purpose |
 |------|------|---------|
-| `simplex` | `--em-seq --ref` | Methylation-aware consensus |
-| `duplex` | `--em-seq --ref` | Methylation-aware consensus |
+| `simplex` | `--methylation-mode em-seq --ref` | Methylation-aware consensus |
+| `duplex` | `--methylation-mode em-seq --ref` | Methylation-aware consensus |
 | `filter` | `--min-methylation-depth`, `--require-strand-methylation-agreement`, `--min-conversion-fraction` | Methylation-specific filtering |
 
 ---
@@ -121,7 +121,7 @@ fgumi group \
 
 ### Step 5: Consensus Calling
 
-Use `--em-seq` and `--ref` to enable methylation-aware consensus.
+Use `--methylation-mode em-seq` and `--ref` to enable methylation-aware consensus.
 
 **Simplex:**
 
@@ -132,7 +132,7 @@ fgumi simplex \
   --min-reads 1 \
   --min-input-base-quality 20 \
   --output-per-base-tags \
-  --em-seq \
+  --methylation-mode em-seq \
   --ref ref.fa \
   --threads 8
 ```
@@ -146,7 +146,7 @@ fgumi duplex \
   --min-reads 1 \
   --min-input-base-quality 20 \
   --output-per-base-tags \
-  --em-seq \
+  --methylation-mode em-seq \
   --ref ref.fa \
   --threads 8
 ```
@@ -251,7 +251,7 @@ After correction, the remaining steps are the same as Workflow A (steps 2–8).
 
 ## EM-Seq Output Tags
 
-When `--em-seq` is enabled, consensus reads carry additional BAM tags for methylation evidence.
+When `--methylation-mode em-seq` is enabled, consensus reads carry additional BAM tags for methylation evidence.
 
 ### Simplex Output Tags
 
@@ -281,7 +281,7 @@ The `MM`/`ML` tags follow the [SAM-spec methylation format](https://samtools.git
 
 ## EM-Seq Filter Options
 
-The `filter` command provides three methylation-specific options. These operate on the `cu`/`ct`/`au`/`at`/`bu`/`bt` count tags emitted by `--em-seq` consensus calling.
+The `filter` command provides three methylation-specific options. These operate on the `cu`/`ct`/`au`/`at`/`bu`/`bt` count tags emitted by `--methylation-mode em-seq` consensus calling.
 
 ### `--min-methylation-depth`
 
@@ -320,14 +320,14 @@ CpG positions are excluded from this calculation because they may be methylated 
 ### EM-Seq Simplex (Moderate Stringency)
 
 ```bash
-fgumi simplex --min-reads 1 --min-input-base-quality 20 --output-per-base-tags --em-seq --ref ref.fa
+fgumi simplex --min-reads 1 --min-input-base-quality 20 --output-per-base-tags --methylation-mode em-seq --ref ref.fa
 fgumi filter --ref ref.fa --min-reads 3 --max-base-error-rate 0.1 --min-methylation-depth 3 --min-conversion-fraction 0.9
 ```
 
 ### EM-Seq Duplex (High Specificity)
 
 ```bash
-fgumi duplex --min-reads 1 --min-input-base-quality 20 --output-per-base-tags --em-seq --ref ref.fa
+fgumi duplex --min-reads 1 --min-input-base-quality 20 --output-per-base-tags --methylation-mode em-seq --ref ref.fa
 fgumi filter --ref ref.fa --min-reads 10,5,3 --max-base-error-rate 0.1 --min-methylation-depth 10,5,3 \
   --require-single-strand-agreement --require-strand-methylation-agreement --min-conversion-fraction 0.9
 ```
@@ -357,7 +357,7 @@ If family size histograms show many singletons:
 
 ### Missing MM/ML Tags on Output
 
-Ensure both `--em-seq` and `--ref` are provided to the consensus caller. The reference FASTA must have an accompanying `.dict` file (generate with `samtools dict` if missing).
+Ensure both `--methylation-mode em-seq` and `--ref` are provided to the consensus caller. The reference FASTA must have an accompanying `.dict` file (generate with `samtools dict` if missing).
 
 ### Unexpected Masking from Strand Methylation Agreement
 
