@@ -6,6 +6,7 @@
 //! output is generated fresh each run.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -42,8 +43,26 @@ macro_rules! args {
 // Helpers: simulate
 // ---------------------------------------------------------------------------
 
+/// Create a test reference FASTA file with a single chromosome.
+fn create_test_reference(dir: &Path) -> PathBuf {
+    let ref_path = dir.join("ref.fa");
+    let mut f = std::fs::File::create(&ref_path).expect("failed to create ref FASTA");
+    writeln!(f, ">chr1").unwrap();
+    // 10 kb of repeating ACGT — large enough for any simulated insert size
+    f.write_all(&b"ACGT".repeat(2500)).unwrap();
+    writeln!(f).unwrap();
+    f.flush().unwrap();
+    ref_path
+}
+
 /// Generate grouped-reads BAM using simulate with deterministic seed.
-fn simulate_grouped_reads(output: &Path, truth: &Path, seed: u32, num_molecules: u32) {
+fn simulate_grouped_reads(
+    output: &Path,
+    truth: &Path,
+    reference: &Path,
+    seed: u32,
+    num_molecules: u32,
+) {
     fgumi_ok(args![
         "simulate",
         "grouped-reads",
@@ -51,6 +70,8 @@ fn simulate_grouped_reads(output: &Path, truth: &Path, seed: u32, num_molecules:
         output,
         "--truth",
         truth,
+        "--reference",
+        reference,
         "--num-molecules",
         &num_molecules.to_string(),
         "--seed",
@@ -65,7 +86,14 @@ fn simulate_grouped_reads(output: &Path, truth: &Path, seed: u32, num_molecules:
 }
 
 /// Generate FASTQ reads using simulate with deterministic seed.
-fn simulate_fastq_reads(r1: &Path, r2: &Path, truth: &Path, seed: u32, num_molecules: u32) {
+fn simulate_fastq_reads(
+    r1: &Path,
+    r2: &Path,
+    truth: &Path,
+    reference: &Path,
+    seed: u32,
+    num_molecules: u32,
+) {
     fgumi_ok(args![
         "simulate",
         "fastq-reads",
@@ -75,6 +103,8 @@ fn simulate_fastq_reads(r1: &Path, r2: &Path, truth: &Path, seed: u32, num_molec
         r2,
         "--truth",
         truth,
+        "--reference",
+        reference,
         "--num-molecules",
         &num_molecules.to_string(),
         "--seed",
@@ -158,9 +188,10 @@ fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
 /// Create a `TempDir` and simulate grouped reads, returning (tmpdir, grouped bam path).
 fn setup_grouped_reads(seed: u32, num_molecules: u32) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
     let grouped = tmp.path().join("grouped.bam");
     let truth = tmp.path().join("truth.tsv");
-    simulate_grouped_reads(&grouped, &truth, seed, num_molecules);
+    simulate_grouped_reads(&grouped, &truth, &reference, seed, num_molecules);
     (tmp, grouped)
 }
 
@@ -171,13 +202,14 @@ fn setup_grouped_reads(seed: u32, num_molecules: u32) -> (TempDir, PathBuf) {
 #[test]
 fn test_simulate_grouped_reads_deterministic() {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
     let bam1 = tmp.path().join("grouped1.bam");
     let bam2 = tmp.path().join("grouped2.bam");
     let truth1 = tmp.path().join("truth1.tsv");
     let truth2 = tmp.path().join("truth2.tsv");
 
-    simulate_grouped_reads(&bam1, &truth1, 42, 100);
-    simulate_grouped_reads(&bam2, &truth2, 42, 100);
+    simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
+    simulate_grouped_reads(&bam2, &truth2, &reference, 42, 100);
 
     assert_bams_identical(
         &bam1,
@@ -239,12 +271,13 @@ fn test_simplex_filter_pipeline_deterministic() {
 #[test]
 fn test_full_pipeline_extract_to_filter() {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
 
     // Generate synthetic FASTQ
     let r1 = tmp.path().join("r1.fq.gz");
     let r2 = tmp.path().join("r2.fq.gz");
     let truth = tmp.path().join("truth.tsv");
-    simulate_fastq_reads(&r1, &r2, &truth, 42, 200);
+    simulate_fastq_reads(&r1, &r2, &truth, &reference, 42, 200);
 
     // Run the full pipeline twice to verify determinism
     for suffix in ["a", "b"] {
@@ -322,13 +355,14 @@ fn test_dedup_pipeline_deterministic() {
 #[test]
 fn test_different_seeds_produce_different_output() {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
     let bam1 = tmp.path().join("seed1.bam");
     let bam2 = tmp.path().join("seed2.bam");
     let truth1 = tmp.path().join("truth1.tsv");
     let truth2 = tmp.path().join("truth2.tsv");
 
-    simulate_grouped_reads(&bam1, &truth1, 42, 100);
-    simulate_grouped_reads(&bam2, &truth2, 99, 100);
+    simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
+    simulate_grouped_reads(&bam2, &truth2, &reference, 99, 100);
 
     let output = compare_bams(&bam1, &bam2, "content");
     assert_eq!(
