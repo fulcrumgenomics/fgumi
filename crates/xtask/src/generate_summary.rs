@@ -60,7 +60,7 @@ pub fn generate(
     }
 
     // Methylation sub-group
-    let methylation = [("EM-Seq", "guide/em-seq.md")];
+    let methylation = [("Pipeline Guide", "guide/methylation.md")];
     let methylation_exists = methylation.iter().any(|(_, p)| docs_src.join(p).exists());
     if methylation_exists {
         md.push_str("- [Methylation]()\n");
