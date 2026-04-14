@@ -3,7 +3,8 @@
 use crate::commands::command::Command;
 use crate::commands::common::parse_bool;
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, QualityArgs, SimulationCommon, generate_random_sequence,
+    FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
+    ReferenceGenome, SimulationCommon, apply_methylation_conversion, generate_random_sequence,
 };
 use crate::progress::ProgressTracker;
 use crate::simulate::{FastqWriter, create_rng};
@@ -12,7 +13,6 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_dna::dna::complement_base;
 use log::{info, warn};
-use noodles::fasta;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use std::fs::File;
@@ -62,10 +62,8 @@ pub struct FastqReads {
     pub duplex: bool,
 
     /// Reference FASTA file for sampling template sequences.
-    /// If provided, templates are sampled from this reference instead of random bases.
-    /// This produces reads that will map back to the reference.
-    #[arg(short = 'r', long = "reference")]
-    pub reference: Option<PathBuf>,
+    #[arg(short = 'r', long = "reference", required = true)]
+    pub reference: PathBuf,
 
     /// UMI includelist file (one UMI per line).
     /// When provided, UMIs are sampled from this list instead of generated randomly.
@@ -88,6 +86,9 @@ pub struct FastqReads {
 
     #[command(flatten)]
     pub insert_size: InsertSizeArgs,
+
+    #[command(flatten)]
+    pub methylation: MethylationArgs,
 }
 
 /// A single read record ready for output.
@@ -101,101 +102,10 @@ struct ReadRecord {
     mol_id: usize,
     family_id: usize,
     strand: &'static str,
-    /// Chromosome name (if reference-based)
-    chrom: Option<String>,
-    /// 1-based start position (if reference-based)
-    pos: Option<usize>,
-}
-
-/// Loaded reference genome for sampling template sequences.
-struct ReferenceGenome {
-    /// Chromosome names
-    names: Vec<String>,
-    /// Chromosome sequences (uppercase)
-    sequences: Vec<Vec<u8>>,
-    /// Cumulative lengths for weighted random selection
-    cumulative_lengths: Vec<usize>,
-    /// Total genome length
-    total_length: usize,
-}
-
-impl ReferenceGenome {
-    /// Load a reference genome from a FASTA file.
-    fn load(path: &PathBuf) -> Result<Self> {
-        info!("Loading reference from {}", path.display());
-
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open reference: {}", path.display()))?;
-        let reader = BufReader::new(file);
-        let mut fasta_reader = fasta::io::Reader::new(reader);
-
-        let mut names = Vec::new();
-        let mut sequences = Vec::new();
-        let mut cumulative_lengths = Vec::new();
-        let mut total_length = 0usize;
-
-        for result in fasta_reader.records() {
-            let record = result.with_context(|| "Failed to read FASTA record")?;
-            let name = std::str::from_utf8(record.name())
-                .with_context(|| "Invalid chromosome name")?
-                .to_string();
-            let seq: Vec<u8> =
-                record.sequence().as_ref().iter().map(|&b| b.to_ascii_uppercase()).collect();
-
-            if seq.len() >= 1000 {
-                // Only include chromosomes with sufficient length
-                total_length += seq.len();
-                cumulative_lengths.push(total_length);
-                names.push(name);
-                sequences.push(seq);
-            }
-        }
-
-        if sequences.is_empty() {
-            bail!("No valid sequences found in reference FASTA");
-        }
-
-        info!("Loaded {} chromosomes, total {} bp", sequences.len(), total_length);
-
-        Ok(Self { names, sequences, cumulative_lengths, total_length })
-    }
-
-    /// Sample a random position and return (`chrom_idx`, position, sequence).
-    /// Returns None if the position contains N bases.
-    fn sample_sequence(
-        &self,
-        length: usize,
-        rng: &mut impl Rng,
-    ) -> Option<(usize, usize, Vec<u8>)> {
-        // Try up to 10 times to find a valid position without N bases
-        for _ in 0..10 {
-            // Pick a random position in the genome
-            let genome_pos = rng.random_range(0..self.total_length.saturating_sub(length));
-
-            // Find which chromosome this falls in
-            let chrom_idx =
-                self.cumulative_lengths.iter().position(|&cum| cum > genome_pos).unwrap_or(0);
-
-            let chrom_start =
-                if chrom_idx == 0 { 0 } else { self.cumulative_lengths[chrom_idx - 1] };
-            let local_pos = genome_pos - chrom_start;
-
-            let seq = &self.sequences[chrom_idx];
-            if local_pos + length > seq.len() {
-                continue;
-            }
-
-            let template = &seq[local_pos..local_pos + length];
-
-            // Check for N bases
-            if template.iter().any(|&b| b == b'N' || b == b'n') {
-                continue;
-            }
-
-            return Some((chrom_idx, local_pos, template.to_vec()));
-        }
-        None
-    }
+    /// Chromosome name.
+    chrom: String,
+    /// 0-based start position.
+    pos: usize,
 }
 
 /// Parameters needed for parallel molecule generation.
@@ -203,11 +113,13 @@ impl ReferenceGenome {
 struct GenerationParams {
     umi_length: usize,
     read_length: usize,
-    duplex: bool,
     min_family_size: usize,
     r2_quality_offset: i8,
+    /// Generate duplex-style reads (A/B strand pairs).
+    duplex: bool,
     /// When set, UMIs are sampled from this list instead of generated randomly.
     includelist: Option<Vec<Vec<u8>>>,
+    methylation: MethylationConfig,
 }
 
 /// Load UMI sequences from an includelist file (one UMI per line).
@@ -292,6 +204,10 @@ impl Command for FastqReads {
             self.common.umi_length
         };
 
+        // Validate methylation args
+        let methylation = self.methylation.resolve();
+        self.methylation.validate()?;
+
         info!("Generating FASTQ reads");
         info!("  Output R1: {}", self.r1_output.display());
         info!("  Output R2: {}", self.r2_output.display());
@@ -304,15 +220,24 @@ impl Command for FastqReads {
         }
         info!("  Duplex: {}", self.duplex);
         info!("  Threads: {}", self.threads);
-        if let Some(ref path) = self.reference {
-            info!("  Reference: {}", path.display());
+        info!("  Reference: {}", self.reference.display());
+        if methylation.mode.is_enabled() {
+            info!("  Methylation mode: {:?}", methylation.mode);
+            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
+            info!("  Conversion rate: {}", methylation.conversion_rate);
         }
 
-        let reference = if let Some(ref path) = self.reference {
-            Some(Arc::new(ReferenceGenome::load(path)?))
-        } else {
-            None
-        };
+        let reference = Arc::new(ReferenceGenome::load(&self.reference)?);
+
+        // Validate that the reference has at least one contig >= read_length
+        if reference.max_contig_length() < self.common.read_length {
+            bail!(
+                "No reference contig is >= read length ({} bp). \
+                 The longest contig is {} bp. Use a larger reference or shorter --read-length.",
+                self.common.read_length,
+                reference.max_contig_length(),
+            );
+        }
 
         // Use at least 2 threads for generation if multi-threaded
         // Reserve some threads for gzip compression
@@ -327,10 +252,11 @@ impl Command for FastqReads {
         let params = Arc::new(GenerationParams {
             umi_length,
             read_length: self.common.read_length,
-            duplex: self.duplex,
             min_family_size: self.family_size.min_family_size,
             r2_quality_offset: self.quality.r2_quality_offset,
+            duplex: self.duplex,
             includelist,
+            methylation,
         });
 
         // Generate molecule IDs with seeds for reproducibility
@@ -346,8 +272,6 @@ impl Command for FastqReads {
         let r1_path = self.r1_output.clone();
         let r2_path = self.r2_output.clone();
         let truth_path = self.truth_output.clone();
-        let has_reference = reference.is_some();
-
         // Spawn writer thread with multi-threaded gzip compression
         let writer_handle = thread::spawn(move || -> Result<u64> {
             let mut r1_writer = FastqWriter::with_threads(&r1_path, compress_threads)?;
@@ -356,15 +280,10 @@ impl Command for FastqReads {
                 .with_context(|| format!("Failed to create {}", truth_path.display()))?;
             let mut truth_writer = BufWriter::new(truth_file);
 
-            // Write truth header (include chrom/pos if reference-based)
-            if has_reference {
-                writeln!(
-                    truth_writer,
-                    "read_name\ttrue_umi\tmolecule_id\tfamily_id\tstrand\tchrom\tpos"
-                )?;
-            } else {
-                writeln!(truth_writer, "read_name\ttrue_umi\tmolecule_id\tfamily_id\tstrand")?;
-            }
+            writeln!(
+                truth_writer,
+                "read_name\ttrue_umi\tmolecule_id\tfamily_id\tstrand\tchrom\tpos"
+            )?;
 
             let mut read_count = 0u64;
             let progress = ProgressTracker::new("Generated read pairs").with_interval(100_000);
@@ -378,29 +297,17 @@ impl Command for FastqReads {
                     r2_writer.write_record(&record.read_name, &record.r2_seq, &record.r2_quals)?;
 
                     // Write truth
-                    if has_reference {
-                        writeln!(
-                            truth_writer,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            record.read_name,
-                            String::from_utf8_lossy(&record.umi),
-                            record.mol_id,
-                            record.family_id,
-                            record.strand,
-                            record.chrom.as_deref().unwrap_or("."),
-                            record.pos.map_or_else(|| ".".to_string(), |p| (p + 1).to_string())
-                        )?;
-                    } else {
-                        writeln!(
-                            truth_writer,
-                            "{}\t{}\t{}\t{}\t{}",
-                            record.read_name,
-                            String::from_utf8_lossy(&record.umi),
-                            record.mol_id,
-                            record.family_id,
-                            record.strand
-                        )?;
-                    }
+                    writeln!(
+                        truth_writer,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        record.read_name,
+                        String::from_utf8_lossy(&record.umi),
+                        record.mol_id,
+                        record.family_id,
+                        record.strand,
+                        record.chrom,
+                        record.pos
+                    )?;
                 }
             }
 
@@ -430,7 +337,7 @@ impl Command for FastqReads {
                         &quality_bias,
                         &family_dist,
                         &insert_model,
-                        reference.as_deref(),
+                        &reference,
                     );
                     sender.send(batch)
                 })
@@ -465,7 +372,7 @@ fn generate_molecule_reads(
     quality_bias: &crate::simulate::ReadPairQualityBias,
     family_dist: &crate::simulate::FamilySizeDistribution,
     insert_model: &crate::simulate::InsertSizeModel,
-    reference: Option<&ReferenceGenome>,
+    reference: &ReferenceGenome,
 ) -> Vec<ReadRecord> {
     let mut rng = create_rng(Some(seed));
     let mut records = Vec::new();
@@ -491,28 +398,15 @@ fn generate_molecule_reads(
     let insert_size = insert_model.sample(&mut rng);
 
     // Generate template sequence (shared by all reads in family)
-    // Either sample from reference or generate random
     let template_len = insert_size.saturating_sub(params.umi_length);
-    let (template, chrom, pos) = if let Some(ref_genome) = reference {
-        // Sample from reference
-        if let Some((chrom_idx, local_pos, seq)) =
-            ref_genome.sample_sequence(template_len, &mut rng)
-        {
-            let chrom_name = ref_genome.names[chrom_idx].clone();
-            (seq, Some(chrom_name), Some(local_pos))
-        } else {
-            // Fallback to random if sampling failed (e.g., all N regions)
-            (generate_random_sequence(template_len, &mut rng), None, None)
-        }
-    } else {
-        // Generate random template
-        (generate_random_sequence(template_len, &mut rng), None, None)
-    };
+    let (chrom_idx, pos, template) = reference
+        .sample_sequence(template_len, &mut rng)
+        .expect("Failed to sample sequence from reference");
+    let chrom = reference.name(chrom_idx).to_string();
 
     // Pre-calculate template slicing bounds (both reads have UMI prefix)
-    let r1_template_len = params.read_length.saturating_sub(params.umi_length);
-    let r2_template_len = params.read_length.saturating_sub(params.umi_length);
-    let r2_start = template.len().saturating_sub(r2_template_len);
+    let template_len = params.read_length.saturating_sub(params.umi_length);
+    let r2_start = template.len().saturating_sub(template_len);
     let r2_end = template.len();
 
     // Reusable buffers for sequence building
@@ -522,11 +416,9 @@ fn generate_molecule_reads(
     let mut read_counter = 0usize;
 
     // For duplex mode, each read pair is independently assigned to A or B strand (coin flip)
-    // For non-duplex mode, all reads are A strand
+    // For non-duplex mode, all reads are A strand (no UMI swapping or orientation change)
     for read_idx in 0..family_size {
-        // Determine strand for this read pair
         let (strand, family_idx): (&'static str, usize) = if params.duplex {
-            // 50/50 coin flip for A or B strand
             if rng.random_bool(0.5) { ("A", 0) } else { ("B", 1) }
         } else {
             ("A", 0)
@@ -559,14 +451,32 @@ fn generate_molecule_reads(
 
         if strand == "A" {
             // A strand: standard forward orientation
-            // R1 = UMI + template start (maps forward)
+            // R1 reads the top strand (forward) — apply C→T conversion
             r1_seq_buf.extend_from_slice(r1_umi);
-            let r1_template_end = r1_template_len.min(template.len());
-            r1_seq_buf.extend_from_slice(&template[..r1_template_end]);
+            let r1_template_end = template_len.min(template.len());
+            let mut r1_template = template[..r1_template_end].to_vec();
+            apply_methylation_conversion(
+                &mut r1_template,
+                &template,
+                0,
+                true, // top strand
+                &params.methylation,
+                &mut rng,
+            );
+            r1_seq_buf.extend_from_slice(&r1_template);
 
-            // R2 = UMI + revcomp(template end) (maps reverse)
+            // R2 reads the bottom strand (reverse) — apply G→A conversion, then RC
             r2_seq_buf.extend_from_slice(r2_umi);
-            reverse_complement_into(&template[r2_start..r2_end], &mut r2_seq_buf);
+            let mut r2_template = template[r2_start..r2_end].to_vec();
+            apply_methylation_conversion(
+                &mut r2_template,
+                &template,
+                r2_start,
+                false, // bottom strand
+                &params.methylation,
+                &mut rng,
+            );
+            reverse_complement_into(&r2_template, &mut r2_seq_buf);
         } else {
             // B strand: comes from the complementary DNA strand of the same molecule
             // For duplex sequencing, A and B strand reads should align to the SAME positions
@@ -579,14 +489,32 @@ fn generate_molecule_reads(
             // - B R1 covers the same region as A R2 (template end), sequenced from revcomp
             // - B R2 covers the same region as A R1 (template start), sequenced forward
 
-            // B R1 = UMI + revcomp(template end) - same region as A R2
+            // B R1 reads the bottom strand (template end, reverse) — apply G→A, then RC
             r1_seq_buf.extend_from_slice(r1_umi);
-            reverse_complement_into(&template[r2_start..r2_end], &mut r1_seq_buf);
+            let mut r1_template = template[r2_start..r2_end].to_vec();
+            apply_methylation_conversion(
+                &mut r1_template,
+                &template,
+                r2_start,
+                false, // bottom strand
+                &params.methylation,
+                &mut rng,
+            );
+            reverse_complement_into(&r1_template, &mut r1_seq_buf);
 
-            // B R2 = UMI + template start - same region as A R1
+            // B R2 reads the top strand (template start, forward) — apply C→T
             r2_seq_buf.extend_from_slice(r2_umi);
-            let r1_template_end = r1_template_len.min(template.len());
-            r2_seq_buf.extend_from_slice(&template[..r1_template_end]);
+            let r1_template_end = template_len.min(template.len());
+            let mut r2_template = template[..r1_template_end].to_vec();
+            apply_methylation_conversion(
+                &mut r2_template,
+                &template,
+                0,
+                true, // top strand
+                &params.methylation,
+                &mut rng,
+            );
+            r2_seq_buf.extend_from_slice(&r2_template);
         }
 
         // Introduce UMI errors directly into buffer
@@ -1021,6 +949,8 @@ mod tests {
             r2.to_str().expect("path should be valid UTF-8"),
             "--truth",
             truth.to_str().expect("path should be valid UTF-8"),
+            "-r",
+            "dummy.fa",
             "-i",
             includelist_path.to_str().expect("path should be valid UTF-8"),
             "--read-length",
@@ -1052,6 +982,8 @@ mod tests {
             r2.to_str().expect("path should be valid UTF-8"),
             "--truth",
             truth.to_str().expect("path should be valid UTF-8"),
+            "-r",
+            "dummy.fa",
             "--umi-length",
             "100",
             "--read-length",
@@ -1070,14 +1002,29 @@ mod tests {
 
     #[test]
     fn test_generate_molecule_reads_with_includelist() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+
         let umis = vec![b"AAAAA".to_vec(), b"CCCCC".to_vec(), b"GGGGG".to_vec()];
         let params = GenerationParams {
             umi_length: 5,
             read_length: 50,
-            duplex: false,
             min_family_size: 1,
             r2_quality_offset: 0,
+            duplex: false,
             includelist: Some(umis.clone()),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
         };
 
         let quality_model =
@@ -1096,7 +1043,7 @@ mod tests {
                 &quality_bias,
                 &family_dist,
                 &insert_model,
-                None,
+                &ref_genome,
             );
             for record in &records {
                 // The truth UMI (before errors) should be from the includelist
@@ -1118,5 +1065,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_emseq_fastq_reads_converts_non_cpg_c() {
+        // With EM-Seq, non-CpG C should be converted to T (on top strand R1)
+        // Use a reference that has a known pattern: all C's with no adjacent G
+        // Template: "CACACACACA..." (no CpG dinucleotides)
+        use crate::commands::simulate::common::apply_methylation_conversion;
+
+        let template = b"CACACACACACACACACACAC".to_vec();
+        let mut r1 = template.clone();
+        let mut rng = create_rng(Some(42));
+
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
+
+        // All C's should be converted to T (non-CpG in EM-Seq)
+        for (i, &b) in r1.iter().enumerate() {
+            if template[i] == b'C' {
+                assert_eq!(b, b'T', "position {i}: non-CpG C should be converted to T in EM-Seq");
+            } else {
+                assert_eq!(b, template[i], "position {i}: A should remain unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn test_taps_fastq_reads_preserves_non_cpg_c() {
+        // With TAPs, non-CpG C should NOT be converted
+        use crate::commands::simulate::common::apply_methylation_conversion;
+
+        let template = b"CACACACACACACACACACAC".to_vec();
+        let mut r1 = template.clone();
+        let mut rng = create_rng(Some(42));
+
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::Taps,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+        apply_methylation_conversion(&mut r1, &template, 0, true, &config, &mut rng);
+
+        // No changes — non-CpG C is not a target in TAPs
+        assert_eq!(r1, template);
+    }
+
+    #[test]
+    fn test_reads_in_same_family_differ_with_methylation() {
+        // Each read independently samples conversion, so two reads from
+        // the same molecule should (usually) differ when rates are partial
+        use crate::commands::simulate::common::apply_methylation_conversion;
+
+        // Template with CpG sites
+        let template = b"ACGTCGATCGACGTCGATCG".to_vec();
+        let mut different_count = 0;
+
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.5,
+            conversion_rate: 0.5,
+        };
+
+        for seed in 0..50u64 {
+            let mut r1_a = template.clone();
+            let mut r1_b = template.clone();
+            let mut rng_a = create_rng(Some(seed * 2));
+            let mut rng_b = create_rng(Some(seed * 2 + 1));
+
+            apply_methylation_conversion(&mut r1_a, &template, 0, true, &config, &mut rng_a);
+            apply_methylation_conversion(&mut r1_b, &template, 0, true, &config, &mut rng_b);
+
+            if r1_a != r1_b {
+                different_count += 1;
+            }
+        }
+
+        // With 50% CpG methylation rate, most pairs should differ
+        assert!(different_count > 10, "Expected most read pairs to differ, got {different_count}");
     }
 }

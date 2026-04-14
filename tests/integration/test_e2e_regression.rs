@@ -5,7 +5,10 @@
 //! verifying outputs with `compare`.  No golden files are checked in — expected
 //! output is generated fresh each run.
 
+use noodles::bam;
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -42,8 +45,26 @@ macro_rules! args {
 // Helpers: simulate
 // ---------------------------------------------------------------------------
 
+/// Create a test reference FASTA file with a single chromosome.
+fn create_test_reference(dir: &Path) -> PathBuf {
+    let ref_path = dir.join("ref.fa");
+    let mut f = std::fs::File::create(&ref_path).expect("failed to create ref FASTA");
+    writeln!(f, ">chr1").unwrap();
+    // 10 kb of repeating ACGT — large enough for any simulated insert size
+    f.write_all(&b"ACGT".repeat(2500)).unwrap();
+    writeln!(f).unwrap();
+    f.flush().unwrap();
+    ref_path
+}
+
 /// Generate grouped-reads BAM using simulate with deterministic seed.
-fn simulate_grouped_reads(output: &Path, truth: &Path, seed: u32, num_molecules: u32) {
+fn simulate_grouped_reads(
+    output: &Path,
+    truth: &Path,
+    reference: &Path,
+    seed: u32,
+    num_molecules: u32,
+) {
     fgumi_ok(args![
         "simulate",
         "grouped-reads",
@@ -51,6 +72,8 @@ fn simulate_grouped_reads(output: &Path, truth: &Path, seed: u32, num_molecules:
         output,
         "--truth",
         truth,
+        "--reference",
+        reference,
         "--num-molecules",
         &num_molecules.to_string(),
         "--seed",
@@ -65,7 +88,14 @@ fn simulate_grouped_reads(output: &Path, truth: &Path, seed: u32, num_molecules:
 }
 
 /// Generate FASTQ reads using simulate with deterministic seed.
-fn simulate_fastq_reads(r1: &Path, r2: &Path, truth: &Path, seed: u32, num_molecules: u32) {
+fn simulate_fastq_reads(
+    r1: &Path,
+    r2: &Path,
+    truth: &Path,
+    reference: &Path,
+    seed: u32,
+    num_molecules: u32,
+) {
     fgumi_ok(args![
         "simulate",
         "fastq-reads",
@@ -75,6 +105,8 @@ fn simulate_fastq_reads(r1: &Path, r2: &Path, truth: &Path, seed: u32, num_molec
         r2,
         "--truth",
         truth,
+        "--reference",
+        reference,
         "--num-molecules",
         &num_molecules.to_string(),
         "--seed",
@@ -158,9 +190,10 @@ fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
 /// Create a `TempDir` and simulate grouped reads, returning (tmpdir, grouped bam path).
 fn setup_grouped_reads(seed: u32, num_molecules: u32) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
     let grouped = tmp.path().join("grouped.bam");
     let truth = tmp.path().join("truth.tsv");
-    simulate_grouped_reads(&grouped, &truth, seed, num_molecules);
+    simulate_grouped_reads(&grouped, &truth, &reference, seed, num_molecules);
     (tmp, grouped)
 }
 
@@ -171,13 +204,14 @@ fn setup_grouped_reads(seed: u32, num_molecules: u32) -> (TempDir, PathBuf) {
 #[test]
 fn test_simulate_grouped_reads_deterministic() {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
     let bam1 = tmp.path().join("grouped1.bam");
     let bam2 = tmp.path().join("grouped2.bam");
     let truth1 = tmp.path().join("truth1.tsv");
     let truth2 = tmp.path().join("truth2.tsv");
 
-    simulate_grouped_reads(&bam1, &truth1, 42, 100);
-    simulate_grouped_reads(&bam2, &truth2, 42, 100);
+    simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
+    simulate_grouped_reads(&bam2, &truth2, &reference, 42, 100);
 
     assert_bams_identical(
         &bam1,
@@ -239,12 +273,13 @@ fn test_simplex_filter_pipeline_deterministic() {
 #[test]
 fn test_full_pipeline_extract_to_filter() {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
 
     // Generate synthetic FASTQ
     let r1 = tmp.path().join("r1.fq.gz");
     let r2 = tmp.path().join("r2.fq.gz");
     let truth = tmp.path().join("truth.tsv");
-    simulate_fastq_reads(&r1, &r2, &truth, 42, 200);
+    simulate_fastq_reads(&r1, &r2, &truth, &reference, 42, 200);
 
     // Run the full pipeline twice to verify determinism
     for suffix in ["a", "b"] {
@@ -322,13 +357,14 @@ fn test_dedup_pipeline_deterministic() {
 #[test]
 fn test_different_seeds_produce_different_output() {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    let reference = create_test_reference(tmp.path());
     let bam1 = tmp.path().join("seed1.bam");
     let bam2 = tmp.path().join("seed2.bam");
     let truth1 = tmp.path().join("truth1.tsv");
     let truth2 = tmp.path().join("truth2.tsv");
 
-    simulate_grouped_reads(&bam1, &truth1, 42, 100);
-    simulate_grouped_reads(&bam2, &truth2, 99, 100);
+    simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
+    simulate_grouped_reads(&bam2, &truth2, &reference, 99, 100);
 
     let output = compare_bams(&bam1, &bam2, "content");
     assert_eq!(
@@ -339,4 +375,117 @@ fn test_different_seeds_produce_different_output() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Methylation pipeline: grouped-reads --methylation-mode em-seq ->
+//                       simplex --methylation-mode em-seq --ref
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_e2e_methylation_pipeline() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+
+    // Build a reference with CpG sites (ACGTCCGG pattern has CpG at positions 2-3 and 5-6)
+    let ref_path = tmp.path().join("ref.fa");
+    let mut f = std::fs::File::create(&ref_path).expect("failed to create ref FASTA");
+    writeln!(f, ">chr1").unwrap();
+    f.write_all(&b"ACGTCCGG".repeat(1250)).unwrap(); // 10 kb
+    writeln!(f).unwrap();
+    f.flush().unwrap();
+
+    // Generate grouped reads with EM-Seq methylation
+    let grouped = tmp.path().join("grouped.bam");
+    let truth = tmp.path().join("truth.tsv");
+    fgumi_ok(args![
+        "simulate",
+        "grouped-reads",
+        "-o",
+        &grouped,
+        "--truth",
+        &truth,
+        "--reference",
+        &ref_path,
+        "--num-molecules",
+        "50",
+        "--seed",
+        "42",
+        "--read-length",
+        "100",
+        "--umi-length",
+        "6",
+        "--min-family-size",
+        "3",
+        "--methylation-mode",
+        "em-seq"
+    ]);
+
+    // Run simplex consensus with methylation mode
+    let simplex = tmp.path().join("simplex.bam");
+    fgumi_ok(args![
+        "simplex",
+        "-i",
+        &grouped,
+        "-o",
+        &simplex,
+        "--threads",
+        "1",
+        "--min-reads",
+        "1",
+        "--methylation-mode",
+        "em-seq",
+        "--ref",
+        &ref_path
+    ]);
+
+    // Verify the simplex output actually carries methylation emission.
+    // The simplex BAM should contain at least one consensus record with the
+    // MM/ML methylation tag pair and the cu/ct TAPS-specific count arrays.
+    assert_simplex_has_methylation_tags(&simplex);
+}
+
+/// Assert that a simplex BAM contains non-empty MM/ML and cu/ct tags on at
+/// least one record.
+///
+/// MM is a string tag (hex 'MM'), ML is a byte-array tag (hex 'ML').
+/// cu and ct are i16-array tags added by the EM-Seq/TAPS methylation caller.
+#[allow(clippy::similar_names)] // MM/ML and cu/ct are the natural tag names.
+fn assert_simplex_has_methylation_tags(bam_path: &Path) {
+    let file = File::open(bam_path).expect("failed to open simplex BAM");
+    let mut reader = bam::io::Reader::new(file);
+    let _header = reader.read_header().expect("failed to read BAM header");
+
+    let mm_tag = [b'M', b'M'];
+    let ml_tag = [b'M', b'L'];
+    let cu_tag = [b'c', b'u'];
+    let ct_tag = [b'c', b't'];
+
+    let mut total = 0usize;
+    let mut with_mm = 0usize;
+    let mut with_ml = 0usize;
+    let mut with_cu = 0usize;
+    let mut with_ct = 0usize;
+    for result in reader.records() {
+        let record = result.expect("failed to read simplex record");
+        let data = record.data();
+        total += 1;
+        if data.get(&mm_tag).is_some() {
+            with_mm += 1;
+        }
+        if data.get(&ml_tag).is_some() {
+            with_ml += 1;
+        }
+        if data.get(&cu_tag).is_some() {
+            with_cu += 1;
+        }
+        if data.get(&ct_tag).is_some() {
+            with_ct += 1;
+        }
+    }
+
+    assert!(total > 0, "Simplex BAM should contain at least one record");
+    assert!(with_mm > 0, "Expected at least one record with an MM tag; got {total} records");
+    assert!(with_ml > 0, "Expected at least one record with an ML tag; got {total} records");
+    assert!(with_cu > 0, "Expected at least one record with a cu tag; got {total} records");
+    assert!(with_ct > 0, "Expected at least one record with a ct tag; got {total} records");
 }

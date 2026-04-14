@@ -9,8 +9,9 @@ use crate::bam_io::create_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{
-    FamilySizeArgs, InsertSizeArgs, MoleculeInfo, PositionDistArgs, QualityArgs, ReferenceArgs,
-    SimulationCommon, StrandBiasArgs, compute_position, generate_random_sequence, pad_sequence,
+    FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
+    PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
+    StrandBiasArgs, apply_methylation_conversion, generate_random_sequence, pad_sequence,
 };
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
@@ -20,19 +21,15 @@ use crate::simulate::{
     StrandBiasModel, create_rng,
 };
 use anyhow::{Context, Result};
-use bstr::BString;
 use clap::Parser;
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
-use noodles::sam::header::record::value::Map;
-use noodles::sam::header::record::value::map::ReferenceSequence;
 use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
 use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 /// Generate template-coordinate sorted BAM with MI tags for consensus callers.
@@ -92,6 +89,9 @@ pub struct GroupedReads {
 
     #[command(flatten)]
     pub strand_bias: StrandBiasArgs,
+
+    #[command(flatten)]
+    pub methylation: MethylationArgs,
 }
 
 /// Parameters needed for molecule generation.
@@ -101,17 +101,20 @@ struct GenerationParams {
     mapq: u8,
     duplex: bool,
     min_family_size: usize,
-    num_positions: usize,
-    ref_length: usize,
     quality_model: PositionQualityModel,
     quality_bias: ReadPairQualityBias,
     family_dist: FamilySizeDistribution,
     insert_model: InsertSizeModel,
     strand_bias_model: StrandBiasModel,
+    methylation: MethylationConfig,
 }
 
 impl Command for GroupedReads {
     fn execute(&self, command_line: &str) -> Result<()> {
+        // Validate methylation args
+        let methylation = self.methylation.resolve();
+        self.methylation.validate()?;
+
         info!("Generating grouped reads");
         info!("  Output: {}", self.output.display());
         info!("  Truth: {}", self.truth_output.display());
@@ -120,52 +123,50 @@ impl Command for GroupedReads {
         info!("  Read length: {}", self.common.read_length);
         info!("  UMI length: {}", self.common.umi_length);
         info!("  Threads: {}", self.threads);
+        if methylation.mode.is_enabled() {
+            info!("  Methylation mode: {:?}", methylation.mode);
+            info!("  CpG methylation rate: {}", methylation.cpg_methylation_rate);
+            info!("  Conversion rate: {}", methylation.conversion_rate);
+        }
 
-        // Determine positions
-        let num_positions = self.position_dist.num_positions.unwrap_or(self.common.num_molecules);
-        let ref_length = self.reference.ref_length;
+        // Load reference genome
+        let ref_genome = ReferenceGenome::load(&self.reference.reference)?;
 
-        // Check for position collisions that would cause UMI conflicts
-        let usable_bases = ref_length.saturating_sub(1000);
-        let bases_per_position = usable_bases as f64 / num_positions as f64;
-        if bases_per_position < 1.0 {
-            let suggested_ref_length = num_positions * 2;
+        // Validate that the reference has at least one contig >= read_length
+        if ref_genome.max_contig_length() < self.common.read_length {
             anyhow::bail!(
-                "Position collision: {num_positions} positions cannot fit in {ref_length} bp reference ({bases_per_position:.2} bp/position). \
-                 Increase --ref-length to at least {suggested_ref_length} or reduce --num-molecules."
-            );
-        } else if bases_per_position < 10.0 {
-            log::warn!(
-                "Low position spacing ({bases_per_position:.1} bp/position) may cause UMI collisions. \
-                 Consider increasing --ref-length."
+                "No reference contig is >= read length ({} bp). \
+                 The longest contig is {} bp. Use a larger reference or shorter --read-length.",
+                self.common.read_length,
+                ref_genome.max_contig_length(),
             );
         }
 
-        // Build header with template-coordinate sort order
-        let ref_name = self.reference.ref_name.clone();
-        let mut header = Header::builder();
+        // Build header from reference contigs + sort order tags + @PG
+        let ref_header = ref_genome.build_bam_header();
+        let mut header_builder = Header::builder();
 
         // Add sort order tags: SO:unsorted, GO:query, SS:template-coordinate
         let HeaderTag::Other(so_tag) = HeaderTag::from([b'S', b'O']) else { unreachable!() };
         let HeaderTag::Other(go_tag) = HeaderTag::from([b'G', b'O']) else { unreachable!() };
         let HeaderTag::Other(ss_tag) = HeaderTag::from([b'S', b'S']) else { unreachable!() };
 
-        let header_map = Map::<HeaderRecord::Header>::builder()
-            .insert(so_tag, "unsorted")
-            .insert(go_tag, "query")
-            .insert(ss_tag, "template-coordinate")
-            .build()
-            .expect("header map with valid SO/GO/SS tags");
-        header = header.set_header(header_map);
+        let header_map =
+            noodles::sam::header::record::value::Map::<HeaderRecord::Header>::builder()
+                .insert(so_tag, "unsorted")
+                .insert(go_tag, "query")
+                .insert(ss_tag, "template-coordinate")
+                .build()
+                .expect("header map with valid SO/GO/SS tags");
+        header_builder = header_builder.set_header(header_map);
 
-        let length = NonZeroUsize::try_from(ref_length).expect("Reference length must be > 0");
-        let ref_seq: Map<ReferenceSequence> = Map::<ReferenceSequence>::new(length);
-        header = header.add_reference_sequence(BString::from(&*ref_name), ref_seq);
+        for (name, map) in ref_header.reference_sequences() {
+            header_builder = header_builder.add_reference_sequence(name.clone(), map.clone());
+        }
 
-        // Add @PG record
-        header = crate::commands::common::add_pg_to_builder(header, command_line)?;
+        header_builder = crate::commands::common::add_pg_to_builder(header_builder, command_line)?;
 
-        let header = header.build();
+        let header = header_builder.build();
 
         // Set up generation parameters
         let params = GenerationParams {
@@ -174,17 +175,41 @@ impl Command for GroupedReads {
             mapq: self.mapq,
             duplex: self.duplex,
             min_family_size: self.family_size.min_family_size,
-            num_positions,
-            ref_length,
             quality_model: self.quality.to_quality_model(),
             quality_bias: self.quality.to_quality_bias(),
             family_dist: self.family_size.to_family_size_distribution()?,
             insert_model: self.insert_size.to_insert_size_model(),
             strand_bias_model: self.strand_bias.to_strand_bias_model(),
+            methylation,
         };
 
-        // Generate seeds for reproducibility
-        let mut seed_rng = create_rng(self.common.seed);
+        // Pre-sample positions from reference (use a dedicated RNG so molecule seeds
+        // stay deterministic and uncorrelated with position sampling)
+        let num_positions = self.position_dist.num_positions.unwrap_or(self.common.num_molecules);
+        if num_positions == 0 {
+            anyhow::bail!("--num-positions must be greater than 0");
+        }
+
+        // Collision check using total_length
+        let usable_bases = ref_genome.total_length().saturating_sub(1000);
+        let bases_per_position = usable_bases as f64 / num_positions as f64;
+        if bases_per_position < 1.0 {
+            anyhow::bail!(
+                "Too many positions ({num_positions}) for reference of size {} bp. \
+                 Reduce --num-positions or use a larger reference.",
+                ref_genome.total_length()
+            );
+        } else if bases_per_position < 10.0 {
+            log::warn!(
+                "Low position spacing ({bases_per_position:.1} bp/position) may cause UMI collisions."
+            );
+        }
+
+        let mut pos_rng = create_rng(self.common.seed);
+        let position_table = ref_genome.sample_positions(num_positions, &mut pos_rng);
+
+        // Use a different seed for molecule generation to avoid correlation with positions
+        let mut seed_rng = create_rng(self.common.seed.map(|s| s.wrapping_add(1)));
 
         // MEMORY-EFFICIENT APPROACH: Sort molecule IDs by template-coordinate key first,
         // then generate records in sorted order (streaming).
@@ -195,9 +220,11 @@ impl Command for GroupedReads {
         let mut molecules: Vec<MoleculeInfo> = (0..self.common.num_molecules)
             .map(|mol_id| {
                 let seed: u64 = seed_rng.random();
-                let pos1 = compute_position(mol_id, num_positions, ref_length);
+                let pos_idx = mol_id % num_positions;
+                let (chrom_idx, local_pos) = position_table[pos_idx];
 
-                // Pre-compute insert_size using the molecule's seed (same RNG sequence as generation)
+                // Pre-compute insert_size using the molecule's seed (same RNG sequence
+                // as generation)
                 let mut mol_rng = create_rng(Some(seed));
                 // Skip UMI generation RNG calls
                 for _ in 0..params.umi_length {
@@ -208,11 +235,12 @@ impl Command for GroupedReads {
                 // Get insert_size
                 let insert_size = params.insert_model.sample(&mut mol_rng);
 
-                // Build template-coordinate sort key using the shared sort module.
-                // MI tag is mol_id.to_string() (or "{mol_id}/A" for duplex, but /A /B suffix is stripped)
+                // Sort key — for_f1r2_pair gives the canonical template-coordinate sort
+                // key. This works for both F1R2 and R1F2 orientations because the
+                // template covers the same genomic positions regardless of strand.
                 let sort_key = TemplateCoordKey::for_f1r2_pair(
-                    0, // tid - all simulated reads on reference 0
-                    pos1,
+                    chrom_idx as i32, // real tid
+                    local_pos,
                     insert_size,
                     mol_id.to_string(), // MI tag (stripped suffix matches this)
                     format!("mol{mol_id:08}"),
@@ -250,18 +278,29 @@ impl Command for GroupedReads {
         for mol_info in molecules {
             progress.log_if_needed(1);
 
-            // Generate all read pairs for this molecule
-            let pairs = generate_molecule_reads(mol_info.mol_id, mol_info.seed, &params);
+            let pos_idx = mol_info.mol_id % num_positions;
+            let (pos_chrom_idx, pos_local_pos) = position_table[pos_idx];
 
-            for (r1, r2, read_name, umi_str, mi_tag, strand, insert_size) in pairs {
+            // Generate all read pairs for this molecule. If the pre-sampled locus
+            // could not provide a valid template, `generate_molecule_reads` falls
+            // back to sampling a new locus and returns the effective coordinates
+            // so BAM records and truth rows stay in sync with the emitted sequence.
+            let (pairs, chrom_idx, local_pos) = generate_molecule_reads(
+                mol_info.mol_id,
+                mol_info.seed,
+                pos_chrom_idx,
+                pos_local_pos,
+                &params,
+                &ref_genome,
+            );
+
+            for (r1, r2, read_name, umi_str, mi_tag, is_top_strand, insert_size) in pairs {
                 // Write reads in template-coordinate order (earlier 5' position first).
-                // For A strand (F1R2): R1 forward at pos, R2 reverse at pos+insert-read_len
+                // For F1R2 (top strand): R1 forward at pos, R2 reverse at pos+insert-read_len
                 //   R1's 5' = pos, R2's 5' = pos+insert-1 → R1 first (always)
-                // For B strand (R1F2): R1 reverse at pos, R2 forward at pos+insert-read_len
-                //   R1's 5' = pos+read_len-1, R2's 5' = pos+insert-read_len
-                //   R2 first if insert <= 2*read_len-1, else R1 first
-                //   (When equal, samtools puts forward strand first)
-                let r2_first = strand == 'B' && insert_size < 2 * params.read_length;
+                // For R1F2 (!top strand): R1 reverse at end, R2 forward at start
+                //   R2 first if insert < 2*read_len, else R1 first
+                let r2_first = !is_top_strand && insert_size < 2 * params.read_length;
                 if r2_first {
                     writer.write_alignment_record(&header, &r2)?;
                     writer.write_alignment_record(&header, &r1)?;
@@ -269,6 +308,7 @@ impl Command for GroupedReads {
                     writer.write_alignment_record(&header, &r1)?;
                     writer.write_alignment_record(&header, &r2)?;
                 }
+                let strand_char = if is_top_strand { '+' } else { '-' };
                 writeln!(
                     truth_writer,
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -276,9 +316,9 @@ impl Command for GroupedReads {
                     umi_str,
                     mol_info.mol_id,
                     mi_tag,
-                    ref_name,
-                    mol_info.sort_key.pos1,
-                    strand
+                    ref_genome.name(chrom_idx),
+                    local_pos,
+                    strand_char,
                 )?;
                 total_pairs += 1;
             }
@@ -295,16 +335,29 @@ impl Command for GroupedReads {
 }
 
 /// Generate all read pairs for a single molecule.
-/// Returns Vec of (`r1_record`, `r2_record`, `read_name`, `umi_str`, `mi_tag`, strand, `insert_size`) tuples.
+///
+/// A single R1/R2 pair plus identifiers used for truth/metadata:
+/// `(r1, r2, read_name, umi_str, mi, is_top_strand, family_size)`.
+type MoleculeReadPair = (RecordBuf, RecordBuf, String, String, String, bool, usize);
+
+/// Result of generating all read pairs for a molecule: the pairs plus the
+/// effective `(chrom_idx, local_pos)` at which the template actually lives.
+type MoleculeReadsResult = (Vec<MoleculeReadPair>, usize, usize);
+
+/// Returns the pair vector together with the effective `(chrom_idx, local_pos)` —
+/// the fallback may re-sample a different locus when the pre-sampled one doesn't
+/// yield a valid template, and callers must propagate those coordinates to BAM
+/// records and the truth TSV so reported positions match the emitted sequence.
+#[allow(clippy::too_many_arguments)]
 fn generate_molecule_reads(
     mol_id: usize,
     seed: u64,
+    chrom_idx: usize,
+    local_pos: usize,
     params: &GenerationParams,
-) -> Vec<(RecordBuf, RecordBuf, String, String, String, char, usize)> {
+    ref_genome: &ReferenceGenome,
+) -> MoleculeReadsResult {
     let mut rng = create_rng(Some(seed));
-
-    // Compute position for this molecule
-    let position = compute_position(mol_id, params.num_positions, params.ref_length);
 
     // Generate UMI
     let umi = generate_random_sequence(params.umi_length, &mut rng);
@@ -316,13 +369,32 @@ fn generate_molecule_reads(
     // Generate insert size
     let insert_size = params.insert_model.sample(&mut rng);
 
+    // 50/50 strand coin flip: determines genomic strand of origin
+    let is_top_strand: bool = rng.random();
+
+    // Get template from reference at the pre-sampled position, falling back to a
+    // random position if the exact location doesn't yield a valid sequence. When
+    // falling back, adopt the new locus so records and truth stay aligned with the
+    // sequence actually emitted.
+    let (eff_chrom_idx, eff_local_pos, shared_template) =
+        match ref_genome.sequence_at(chrom_idx, local_pos, insert_size) {
+            Some(seq) => (chrom_idx, local_pos, Some(seq)),
+            None => match ref_genome.sample_sequence(insert_size, &mut rng) {
+                Some((c, p, seq)) => (c, p, Some(seq)),
+                None => (chrom_idx, local_pos, None),
+            },
+        };
+    let chrom_idx = eff_chrom_idx;
+    let local_pos = eff_local_pos;
+
     let mut pairs = Vec::new();
 
     if params.duplex {
         // Split reads between A and B strands
         let (a_count, b_count) = params.strand_bias_model.split_reads(family_size, &mut rng);
 
-        // Generate A strand reads
+        // A reads: orientation follows the coin flip
+        let a_is_top = is_top_strand;
         for read_idx in 0..a_count {
             let read_name = format!("mol{mol_id:08}_readA{read_idx:04}");
             let mi_tag = format!("{mol_id}/A");
@@ -331,13 +403,16 @@ fn generate_molecule_reads(
                 &read_name,
                 &umi_str,
                 &mi_tag,
-                position,
+                chrom_idx,
+                local_pos,
                 insert_size,
                 params.read_length,
                 params.mapq,
-                'A',
+                a_is_top,
                 &params.quality_model,
                 &params.quality_bias,
+                &params.methylation,
+                shared_template.as_deref(),
                 &mut rng,
             );
 
@@ -347,12 +422,13 @@ fn generate_molecule_reads(
                 read_name,
                 umi_str.clone(),
                 mi_tag,
-                'A',
+                a_is_top,
                 insert_size,
             ));
         }
 
-        // Generate B strand reads
+        // B reads: opposite orientation of A
+        let b_is_top = !is_top_strand;
         for read_idx in 0..b_count {
             let read_name = format!("mol{mol_id:08}_readB{read_idx:04}");
             let mi_tag = format!("{mol_id}/B");
@@ -361,13 +437,16 @@ fn generate_molecule_reads(
                 &read_name,
                 &umi_str,
                 &mi_tag,
-                position,
+                chrom_idx,
+                local_pos,
                 insert_size,
                 params.read_length,
                 params.mapq,
-                'B',
+                b_is_top,
                 &params.quality_model,
                 &params.quality_bias,
+                &params.methylation,
+                shared_template.as_deref(),
                 &mut rng,
             );
 
@@ -377,7 +456,7 @@ fn generate_molecule_reads(
                 read_name,
                 umi_str.clone(),
                 mi_tag,
-                'B',
+                b_is_top,
                 insert_size,
             ));
         }
@@ -392,13 +471,16 @@ fn generate_molecule_reads(
                 &read_name,
                 &umi_str,
                 &mi_tag,
-                position,
+                chrom_idx,
+                local_pos,
                 insert_size,
                 params.read_length,
                 params.mapq,
-                '+',
+                is_top_strand,
                 &params.quality_model,
                 &params.quality_bias,
+                &params.methylation,
+                shared_template.as_deref(),
                 &mut rng,
             );
 
@@ -408,13 +490,13 @@ fn generate_molecule_reads(
                 read_name,
                 umi_str.clone(),
                 mi_tag.clone(),
-                '+',
+                is_top_strand,
                 insert_size,
             ));
         }
     }
 
-    pairs
+    (pairs, chrom_idx, local_pos)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -422,74 +504,104 @@ fn generate_read_pair_records(
     read_name: &str,
     umi_str: &str,
     mi_tag: &str,
-    position: usize,
+    chrom_idx: usize,
+    local_pos: usize,
     insert_size: usize,
     read_length: usize,
     mapq: u8,
-    strand: char,
+    is_top_strand: bool,
     quality_model: &PositionQualityModel,
     quality_bias: &ReadPairQualityBias,
+    methylation: &MethylationConfig,
+    shared_template: Option<&[u8]>,
     rng: &mut impl Rng,
 ) -> (RecordBuf, RecordBuf) {
-    // Generate template sequence
-    let template = generate_random_sequence(insert_size, rng);
+    // Use shared reference template or generate random per-read.
+    // Avoid copying the shared template — only borrow it.
+    let random_template;
+    let template: &[u8] = if let Some(shared) = shared_template {
+        shared
+    } else {
+        random_template = generate_random_sequence(insert_size, rng);
+        &random_template
+    };
 
-    // R1: forward strand at position
-    let r1_seq: Vec<u8> = template.iter().take(read_length).copied().collect();
-    let r1_seq = pad_sequence(r1_seq, read_length, rng);
+    // Compute forward-read sequence (from start of template, top strand)
+    let fwd_end = read_length.min(template.len());
+    let mut fwd_seq: Vec<u8> = template[..fwd_end].to_vec();
+    apply_methylation_conversion(
+        &mut fwd_seq,
+        template,
+        0,
+        true, // top strand
+        methylation,
+        rng,
+    );
+    let fwd_seq = pad_sequence(fwd_seq, read_length, rng);
 
-    // R2: reverse strand at position + insert_size - read_length
-    let r2_start = insert_size.saturating_sub(read_length);
-    let r2_template: Vec<u8> = template.iter().skip(r2_start).take(read_length).copied().collect();
-    let r2_seq = reverse_complement(&r2_template);
-    let r2_seq = pad_sequence(r2_seq, read_length, rng);
+    // Compute reverse-read sequence (from end of template, bottom strand, revcomped)
+    let rev_start = insert_size.saturating_sub(read_length);
+    let rev_end = read_length.min(template.len().saturating_sub(rev_start));
+    let mut rev_template: Vec<u8> = template[rev_start..rev_start + rev_end].to_vec();
+    apply_methylation_conversion(
+        &mut rev_template,
+        template,
+        rev_start,
+        false, // bottom strand
+        methylation,
+        rng,
+    );
+    let rev_seq = reverse_complement(&rev_template);
+    let rev_seq = pad_sequence(rev_seq, read_length, rng);
 
     // Quality scores
     let r1_quals = quality_model.generate_qualities(read_length, rng);
     let r2_quals_raw = quality_model.generate_qualities(read_length, rng);
     let r2_quals = quality_bias.apply_to_vec(&r2_quals_raw, true);
 
-    // Mate cigar is based on the mate's read length (same for both reads)
     let mate_cigar = format!("{read_length}M");
 
-    // Strand orientation: A strand is normal (R1 forward, R2 reverse),
-    // B strand is opposite (R1 reverse, R2 forward) to represent the
-    // complementary DNA strand in duplex sequencing.
-    let (r1_is_reverse, r2_is_reverse) = match strand {
-        'B' => (true, false), // B strand: R1 reverse, R2 forward
-        _ => (false, true),   // A strand/simplex: R1 forward, R2 reverse
+    // Assign to R1/R2 based on strand coin flip.
+    // tlen sign convention: positive for the leftmost read, negative for the rightmost.
+    // When insert_size < read_length the reverse read starts at local_pos (mirroring
+    // rev_start's `saturating_sub`), so use `saturating_sub` to avoid a usize underflow.
+    let rev_pos = local_pos + insert_size.saturating_sub(read_length);
+    let (r1_seq, r2_seq, r1_is_reverse, r1_pos, r2_pos, r1_tlen) = if is_top_strand {
+        // F1R2: R1=forward at start, R2=reverse at end
+        (fwd_seq, rev_seq, false, local_pos, rev_pos, insert_size as i32)
+    } else {
+        // R1F2: R1=reverse at end, R2=forward at start
+        (rev_seq, fwd_seq, true, rev_pos, local_pos, -(insert_size as i32))
     };
 
-    // Build R1 record
     let r1_record = build_record(
         read_name,
         &r1_seq,
         &r1_quals,
-        0, // ref_id
-        position,
+        chrom_idx,
+        r1_pos,
         mapq,
-        true, // is_first
-        r1_is_reverse,
-        position + insert_size - read_length,
-        insert_size as i32,
+        true,          // is_first
+        r1_is_reverse, // is_reverse
+        r2_pos,
+        r1_tlen,
         umi_str,
         mi_tag,
         &mate_cigar,
         mapq,
     );
 
-    // Build R2 record
     let r2_record = build_record(
         read_name,
         &r2_seq,
         &r2_quals,
-        0,
-        position + insert_size - read_length,
+        chrom_idx,
+        r2_pos,
         mapq,
-        false, // is_first
-        r2_is_reverse,
-        position,
-        -(insert_size as i32),
+        false,          // is_first
+        !r1_is_reverse, // is_reverse (opposite of R1)
+        r1_pos,
+        -r1_tlen,
         umi_str,
         mi_tag,
         &mate_cigar,
@@ -543,6 +655,12 @@ fn build_record(
 mod tests {
     use super::*;
     use crate::simulate::create_rng;
+
+    const DISABLED_METHYLATION: MethylationConfig = MethylationConfig {
+        mode: fgumi_consensus::MethylationMode::Disabled,
+        cpg_methylation_rate: 0.75,
+        conversion_rate: 0.98,
+    };
 
     #[test]
     fn test_generate_random_sequence_length() {
@@ -662,13 +780,16 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "0/A",
-            1000,
+            0,    // chrom_idx
+            1000, // local_pos
             300,
             150,
             60,
-            'A',
+            true, // is_top_strand
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng,
         );
 
@@ -691,17 +812,20 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "5/B",
-            1000,
+            0,    // chrom_idx
+            1000, // local_pos
             300,
             150,
             60,
-            'B',
+            false, // is_top_strand (B strand = bottom)
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng,
         );
 
-        // B strand has opposite orientation: R1 reverse, R2 forward
+        // Bottom strand has opposite orientation: R1 reverse, R2 forward
         assert!(r1.flags().is_first_segment());
         assert!(r1.flags().is_reverse_complemented());
         assert!(r2.flags().is_last_segment());
@@ -718,17 +842,20 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "10",
-            1000,
+            0,    // chrom_idx
+            1000, // local_pos
             300,
             150,
             60,
-            '+',
+            true, // is_top_strand (simplex top)
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng,
         );
 
-        // Simplex has same orientation as A strand
+        // Simplex top strand has same orientation as F1R2
         assert!(r1.flags().is_first_segment());
         assert!(!r1.flags().is_reverse_complemented());
         assert!(r2.flags().is_last_segment());
@@ -746,13 +873,16 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "0/A",
-            1000,
-            50, // insert_size < read_length
+            0,    // chrom_idx
+            1000, // local_pos
+            50,   // insert_size < read_length
             150,
             60,
-            'A',
+            true, // is_top_strand
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng,
         );
 
@@ -773,13 +903,16 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "0/A",
-            1000,
+            0,    // chrom_idx
+            1000, // local_pos
             300,
             150,
             60,
-            'A',
+            true, // is_top_strand
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng1,
         );
 
@@ -787,13 +920,16 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "0/A",
-            1000,
+            0,    // chrom_idx
+            1000, // local_pos
             300,
             150,
             60,
-            'A',
+            true, // is_top_strand
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng2,
         );
 
@@ -959,20 +1095,254 @@ mod tests {
             "read_001",
             "ACGTACGT",
             "1/A",
-            1000,
+            0,    // chrom_idx
+            1000, // local_pos
             300,
             150,
             60,
-            'A',
+            true, // is_top_strand
             &quality_model,
             &quality_bias,
+            &DISABLED_METHYLATION,
+            None,
             &mut rng,
         );
 
-        // A strand: R1 forward, R2 reverse
+        // Top strand: R1 forward, R2 reverse
         assert!(r1.flags().is_first_segment());
         assert!(!r1.flags().is_reverse_complemented());
         assert!(r2.flags().is_last_segment());
         assert!(r2.flags().is_reverse_complemented());
+    }
+
+    // ========================================================================
+    // Methylation tests
+    // ========================================================================
+
+    #[test]
+    fn test_emseq_grouped_reads_strand_conversion() {
+        // Top strand: R1=top (C->T), R2=bottom (G->A then RC)
+        // Template: non-CpG Cs at known positions
+        let template = b"CACACACACACACACAC"; // no CpG
+        let config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+
+        let quality_model = PositionQualityModel::default();
+        let quality_bias = ReadPairQualityBias::default();
+        let mut rng = create_rng(Some(42));
+
+        let (r1, _r2) = generate_read_pair_records(
+            "test_meth",
+            "AAAAAAAA",
+            "1/A",
+            0, // chrom_idx
+            0, // local_pos
+            template.len(),
+            template.len(),
+            60,
+            true, // is_top_strand
+            &quality_model,
+            &quality_bias,
+            &config,
+            Some(template),
+            &mut rng,
+        );
+
+        // R1 (top strand, forward) should have C->T conversions at non-CpG C positions
+        let r1_seq: Vec<u8> = r1.sequence().as_ref().to_vec();
+        for (i, &b) in template.iter().enumerate() {
+            if i >= r1_seq.len() {
+                break;
+            }
+            if b == b'C' {
+                assert_eq!(r1_seq[i], b'T', "R1 position {i}: non-CpG C should convert to T");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bottom_strand_flips_conversion_orientation() {
+        // Bottom strand: R1 gets reverse-complemented sequence from end of template
+        // Top strand: R1 gets forward sequence from start of template
+        // Template needs both C and G (non-CpG) so both strands have convertible bases
+        let template = b"CATAGATAGATAGATA"; // has C and G, no CpG dinucleotides
+        let emseq_config = MethylationConfig {
+            mode: fgumi_consensus::MethylationMode::EmSeq,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 1.0,
+        };
+        let disabled_config = DISABLED_METHYLATION;
+
+        let quality_model = PositionQualityModel::default();
+        let quality_bias = ReadPairQualityBias::default();
+
+        // Generate top strand pair (F1R2)
+        let mut rng_a = create_rng(Some(42));
+        let (r1_a, _) = generate_read_pair_records(
+            "test",
+            "AAAAAAAA",
+            "1/A",
+            0, // chrom_idx
+            0, // local_pos
+            template.len(),
+            template.len(),
+            60,
+            true, // is_top_strand
+            &quality_model,
+            &quality_bias,
+            &emseq_config,
+            Some(template),
+            &mut rng_a,
+        );
+
+        // Generate bottom strand pair with disabled methylation to check it differs
+        let mut rng_b = create_rng(Some(42));
+        let (r1_b_no_meth, _) = generate_read_pair_records(
+            "test",
+            "AAAAAAAA",
+            "1/B",
+            0, // chrom_idx
+            0, // local_pos
+            template.len(),
+            template.len(),
+            60,
+            false, // is_top_strand (bottom strand)
+            &quality_model,
+            &quality_bias,
+            &disabled_config,
+            Some(template),
+            &mut rng_b,
+        );
+
+        // Generate bottom strand pair with EM-Seq
+        let mut rng_b2 = create_rng(Some(42));
+        let (r1_b_meth, _) = generate_read_pair_records(
+            "test",
+            "AAAAAAAA",
+            "1/B",
+            0, // chrom_idx
+            0, // local_pos
+            template.len(),
+            template.len(),
+            60,
+            false, // is_top_strand (bottom strand)
+            &quality_model,
+            &quality_bias,
+            &emseq_config,
+            Some(template),
+            &mut rng_b2,
+        );
+
+        // Top strand R1 (forward, top) should differ from bottom strand R1 (reverse, revcomped)
+        let r1_a_seq: Vec<u8> = r1_a.sequence().as_ref().to_vec();
+        let r1_b_seq: Vec<u8> = r1_b_meth.sequence().as_ref().to_vec();
+        // Bottom strand R1 is reverse-complemented from end of template with bottom-strand
+        // methylation, so conversion pattern should differ from top strand R1
+        assert_ne!(r1_a_seq, r1_b_seq, "Top and bottom strand R1 should differ");
+
+        // Bottom strand with methylation should differ from bottom strand without
+        let r1_b_no_meth_seq: Vec<u8> = r1_b_no_meth.sequence().as_ref().to_vec();
+        assert_ne!(
+            r1_b_seq, r1_b_no_meth_seq,
+            "Bottom strand with/without methylation should differ"
+        );
+    }
+
+    // ========================================================================
+    // Real reference coordinate tests
+    // ========================================================================
+
+    #[test]
+    fn test_grouped_reads_uses_real_ref_coordinates() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        writeln!(fasta, ">chr2").unwrap();
+        fasta.write_all(&b"CCGG".repeat(375)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let positions = ref_genome.sample_positions(10, &mut rng);
+
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            duplex: false,
+            min_family_size: 1,
+            quality_model: PositionQualityModel::default(),
+            quality_bias: ReadPairQualityBias::default(),
+            family_dist: FamilySizeDistribution::log_normal(1.0, 0.1),
+            insert_model: InsertSizeModel::new(100.0, 5.0, 80, 120),
+            strand_bias_model: StrandBiasModel::no_bias(),
+            methylation: DISABLED_METHYLATION,
+        };
+
+        let (chrom_idx, local_pos) = positions[0];
+        let (pairs, eff_chrom, _eff_pos) =
+            generate_molecule_reads(0, 42, chrom_idx, local_pos, &params, &ref_genome);
+        assert!(!pairs.is_empty());
+
+        for (r1, r2, _, _, _, _, _) in &pairs {
+            assert_eq!(r1.reference_sequence_id(), Some(eff_chrom));
+            assert_eq!(r2.reference_sequence_id(), Some(eff_chrom));
+        }
+    }
+
+    #[test]
+    fn test_duplex_strand_coin_flip_produces_both_orientations_for_a_reads() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            duplex: true,
+            min_family_size: 2,
+            quality_model: PositionQualityModel::default(),
+            quality_bias: ReadPairQualityBias::default(),
+            family_dist: FamilySizeDistribution::log_normal(2.0, 0.5),
+            insert_model: InsertSizeModel::new(100.0, 5.0, 80, 120),
+            strand_bias_model: StrandBiasModel::no_bias(),
+            methylation: DISABLED_METHYLATION,
+        };
+
+        let mut a_saw_top = false;
+        let mut a_saw_bottom = false;
+
+        for seed in 0u64..100 {
+            let (pairs, _chrom, _pos) =
+                generate_molecule_reads(seed as usize, seed, 0, 500, &params, &ref_genome);
+
+            for (_, _, _, _, mi_tag, is_top, _) in &pairs {
+                if mi_tag.ends_with("/A") {
+                    if *is_top {
+                        a_saw_top = true;
+                    } else {
+                        a_saw_bottom = true;
+                    }
+                }
+            }
+        }
+
+        assert!(a_saw_top, "A reads should sometimes be F1R2 (top strand)");
+        assert!(a_saw_bottom, "A reads should sometimes be R1F2 (bottom strand)");
     }
 }

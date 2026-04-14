@@ -1,8 +1,16 @@
 //! Shared CLI arguments and utilities for simulation commands.
 
 use super::sort::TemplateCoordKey;
+use crate::commands::common::MethylationModeArg;
+use anyhow::{Context, Result, bail};
 use clap::Args;
+use fgumi_consensus::MethylationMode;
+use fgumi_consensus::methylation::is_cpg_context;
+use log::info;
+use noodles::fasta;
 use rand::{Rng, RngExt};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 
 /// Common simulation options shared across all simulate subcommands.
@@ -187,21 +195,290 @@ impl StrandBiasArgs {
     }
 }
 
-/// Reference options for mapped reads.
+/// Methylation simulation options shared across simulate subcommands.
+#[derive(Args, Debug, Clone)]
+pub struct MethylationArgs {
+    /// Methylation chemistry mode. When set, enables methylation-aware base
+    /// conversion in simulated reads. Requires --reference for commands that
+    /// generate read bases (fastq-reads, mapped-reads, grouped-reads).
+    #[arg(long = "methylation-mode", value_enum)]
+    pub methylation_mode: Option<MethylationModeArg>,
+
+    /// Fraction of `CpG` cytosines that are methylated [0.0-1.0].
+    /// Methylated `CpG`s are protected from conversion in EM-Seq and are
+    /// targets for conversion in TAPs.
+    #[arg(long = "cpg-methylation-rate", default_value = "0.75")]
+    pub cpg_methylation_rate: f64,
+
+    /// Enzymatic conversion efficiency for target cytosines [0.0-1.0].
+    /// In EM-Seq, this is the probability that an unmethylated C is converted to T.
+    /// In TAPs, this is the probability that a methylated C is converted to T.
+    #[arg(long = "conversion-rate", default_value = "0.98")]
+    pub conversion_rate: f64,
+}
+
+impl MethylationArgs {
+    /// Resolves the optional CLI arg to a [`MethylationConfig`].
+    pub fn resolve(&self) -> MethylationConfig {
+        MethylationConfig {
+            mode: crate::commands::common::resolve_methylation_mode(self.methylation_mode),
+            cpg_methylation_rate: self.cpg_methylation_rate,
+            conversion_rate: self.conversion_rate,
+        }
+    }
+
+    /// Validates that rate parameters are in [0.0, 1.0] and finite.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_rate(self.cpg_methylation_rate, "cpg-methylation-rate")?;
+        validate_rate(self.conversion_rate, "conversion-rate")?;
+        Ok(())
+    }
+}
+
+/// Resolved methylation simulation parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct MethylationConfig {
+    /// Methylation chemistry mode.
+    pub mode: MethylationMode,
+    /// Fraction of `CpG` cytosines that are methylated.
+    pub cpg_methylation_rate: f64,
+    /// Enzymatic conversion efficiency.
+    pub conversion_rate: f64,
+}
+
+/// Validates that a rate is a finite value in [0.0, 1.0].
+fn validate_rate(value: f64, name: &str) -> anyhow::Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        anyhow::bail!("--{name} must be a finite value between 0.0 and 1.0, got {value}");
+    }
+    Ok(())
+}
+
+/// Reference options for simulate commands.
 #[derive(Args, Debug, Clone)]
 pub struct ReferenceArgs {
-    /// Reference FASTA file (sequences sampled from here)
-    #[arg(short = 'r', long = "reference")]
-    pub reference: Option<PathBuf>,
+    /// Reference FASTA file for sampling template sequences and building BAM headers.
+    #[arg(short = 'r', long = "reference", required = true)]
+    pub reference: PathBuf,
+}
 
-    /// Synthetic reference name (only used if no --reference)
-    #[arg(long = "ref-name", default_value = "chr1")]
-    pub ref_name: String,
+/// Minimum contig length (bp) considered usable for sampling. Contigs shorter than this
+/// are skipped when loading the reference so that the 1000-bp N-check window and typical
+/// insert sizes have room to fit.
+const MIN_CONTIG_LENGTH: usize = 1000;
 
-    /// Synthetic reference length (only used if no --reference).
-    /// A larger value prevents position collisions with many molecules.
-    #[arg(long = "ref-length", default_value = "250000000")]
-    pub ref_length: usize,
+/// Loaded reference genome for sampling template sequences.
+pub(super) struct ReferenceGenome {
+    names: Vec<String>,
+    sequences: Vec<Vec<u8>>,
+    cumulative_lengths: Vec<usize>,
+    total_length: usize,
+}
+
+impl ReferenceGenome {
+    /// Load a reference genome from a FASTA file.
+    pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        info!("Loading reference from {}", path.display());
+
+        let file = File::open(path)
+            .with_context(|| format!("Failed to open reference: {}", path.display()))?;
+        let reader = BufReader::new(file);
+        let mut fasta_reader = fasta::io::Reader::new(reader);
+
+        let mut names = Vec::new();
+        let mut sequences = Vec::new();
+        let mut cumulative_lengths = Vec::new();
+        let mut total_length = 0usize;
+
+        for result in fasta_reader.records() {
+            let record = result.with_context(|| "Failed to read FASTA record")?;
+            let name = std::str::from_utf8(record.name())
+                .with_context(|| "Invalid chromosome name")?
+                .to_string();
+            let seq: Vec<u8> =
+                record.sequence().as_ref().iter().map(|&b| b.to_ascii_uppercase()).collect();
+
+            if seq.len() >= MIN_CONTIG_LENGTH {
+                // Only include chromosomes with sufficient length
+                total_length += seq.len();
+                cumulative_lengths.push(total_length);
+                names.push(name);
+                sequences.push(seq);
+            }
+        }
+
+        if sequences.is_empty() {
+            bail!("No valid sequences found in reference FASTA");
+        }
+
+        info!("Loaded {} chromosomes, total {} bp", sequences.len(), total_length);
+
+        Ok(Self { names, sequences, cumulative_lengths, total_length })
+    }
+
+    /// Returns the chromosome name at the given index.
+    pub fn name(&self, chrom_idx: usize) -> &str {
+        &self.names[chrom_idx]
+    }
+
+    /// Sample a random position and return (`chrom_idx`, position, sequence).
+    /// Returns None if the position contains N bases or if `length` is zero or
+    /// exceeds `total_length`.
+    pub fn sample_sequence(
+        &self,
+        length: usize,
+        rng: &mut impl Rng,
+    ) -> Option<(usize, usize, Vec<u8>)> {
+        if length == 0 || length > self.total_length {
+            return None;
+        }
+        // Exclusive upper bound keeps `genome_pos < total_length`, which guarantees
+        // `partition_point` returns a valid index into `cumulative_lengths`.
+        let start_bound = self.total_length - length + 1;
+        // Try up to 10 times to find a valid position without N bases
+        for _ in 0..10 {
+            // Pick a random position in the genome
+            let genome_pos = rng.random_range(0..start_bound);
+
+            // Find which chromosome this falls in (binary search on sorted cumulative lengths)
+            let chrom_idx = self.cumulative_lengths.partition_point(|&cum| cum <= genome_pos);
+
+            let chrom_start =
+                if chrom_idx == 0 { 0 } else { self.cumulative_lengths[chrom_idx - 1] };
+            let local_pos = genome_pos - chrom_start;
+
+            let seq = &self.sequences[chrom_idx];
+            if local_pos + length > seq.len() {
+                continue;
+            }
+
+            let template = &seq[local_pos..local_pos + length];
+
+            // Check for N bases
+            if template.iter().any(|&b| b == b'N' || b == b'n') {
+                continue;
+            }
+
+            return Some((chrom_idx, local_pos, template.to_vec()));
+        }
+        None
+    }
+
+    /// Returns the total genome length (sum of all loaded chromosome sequences).
+    pub fn total_length(&self) -> usize {
+        self.total_length
+    }
+
+    /// Return the subsequence at a genome-wide position, mapping to the correct
+    /// chromosome automatically. The position wraps around the total genome length.
+    /// Returns None if out of bounds or if the sequence contains N bases.
+    #[allow(dead_code)] // used only in tests
+    pub fn sequence_at_genome_pos(&self, genome_pos: usize, length: usize) -> Option<Vec<u8>> {
+        if self.total_length == 0 {
+            return None;
+        }
+        let genome_pos = genome_pos % self.total_length;
+        let chrom_idx = self.cumulative_lengths.partition_point(|&cum| cum <= genome_pos);
+        let chrom_start = if chrom_idx == 0 { 0 } else { self.cumulative_lengths[chrom_idx - 1] };
+        let local_pos = genome_pos - chrom_start;
+        self.sequence_at(chrom_idx, local_pos, length)
+    }
+
+    /// Return the subsequence at a specific chromosome and position.
+    /// Returns None if out of bounds or if the sequence contains N bases.
+    pub fn sequence_at(&self, chrom_idx: usize, pos: usize, length: usize) -> Option<Vec<u8>> {
+        if chrom_idx >= self.sequences.len() {
+            return None;
+        }
+        let seq = &self.sequences[chrom_idx];
+        if pos + length > seq.len() {
+            return None;
+        }
+        let subseq = &seq[pos..pos + length];
+        if subseq.iter().any(|&b| b == b'N' || b == b'n') {
+            return None;
+        }
+        Some(subseq.to_vec())
+    }
+
+    /// Build a BAM [`Header`] with `@SQ` lines for every loaded contig.
+    pub(super) fn build_bam_header(&self) -> noodles::sam::header::Header {
+        use bstr::BString;
+        use noodles::sam::header::Header;
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let mut builder = Header::builder();
+        for (name, seq) in self.names.iter().zip(self.sequences.iter()) {
+            let length = NonZeroUsize::try_from(seq.len()).expect("chromosome length must be > 0");
+            let ref_seq = Map::<ReferenceSequence>::new(length);
+            builder = builder.add_reference_sequence(BString::from(name.as_str()), ref_seq);
+        }
+        builder.build()
+    }
+
+    /// Returns the length of the longest loaded chromosome.
+    pub(super) fn max_contig_length(&self) -> usize {
+        self.sequences.iter().map(|s| s.len()).max().unwrap_or(0)
+    }
+
+    /// Returns the number of loaded chromosomes.
+    #[allow(dead_code)] // used only in tests
+    pub(super) fn num_chromosomes(&self) -> usize {
+        self.sequences.len()
+    }
+
+    /// Returns the length of the chromosome at the given index.
+    #[allow(dead_code)] // used only in tests
+    pub(super) fn chromosome_length(&self, chrom_idx: usize) -> usize {
+        self.sequences[chrom_idx].len()
+    }
+
+    /// Pre-sample `num_positions` random loci as `(chrom_idx, local_pos)` tuples.
+    ///
+    /// Positions are drawn uniformly across the genome and are checked against
+    /// a `MIN_CONTIG_LENGTH` bp window for N bases. Sampling retries internally up to
+    /// `num_positions * 100` attempts before panicking.
+    pub(super) fn sample_positions(
+        &self,
+        num_positions: usize,
+        rng: &mut impl Rng,
+    ) -> Vec<(usize, usize)> {
+        const WINDOW: usize = MIN_CONTIG_LENGTH;
+        let max_attempts = num_positions.saturating_mul(100).max(1);
+        let mut positions = Vec::with_capacity(num_positions);
+        let mut attempts = 0usize;
+
+        while positions.len() < num_positions {
+            assert!(
+                attempts < max_attempts,
+                "sample_positions: exhausted {max_attempts} attempts to find \
+                 {num_positions} N-free positions in the reference"
+            );
+            attempts += 1;
+
+            // Pick a genome-wide position and map to (chrom_idx, local_pos)
+            let genome_pos = rng.random_range(0..self.total_length);
+            let chrom_idx = self.cumulative_lengths.partition_point(|&cum| cum <= genome_pos);
+            let chrom_start =
+                if chrom_idx == 0 { 0 } else { self.cumulative_lengths[chrom_idx - 1] };
+            let local_pos = genome_pos - chrom_start;
+
+            // Check a 1000bp window for N bases
+            let seq = &self.sequences[chrom_idx];
+            let window_end = (local_pos + WINDOW).min(seq.len());
+            let window_start = local_pos.min(window_end);
+            let window = &seq[window_start..window_end];
+            if window.iter().any(|&b| b == b'N' || b == b'n') {
+                continue;
+            }
+
+            positions.push((chrom_idx, local_pos));
+        }
+        positions
+    }
 }
 
 /// Position distribution options for mapped reads.
@@ -235,19 +512,76 @@ pub(super) fn pad_sequence(mut seq: Vec<u8>, target_len: usize, rng: &mut impl R
     seq
 }
 
-/// Compute the genomic position for a molecule based on its ID.
-#[inline]
-pub(super) fn compute_position(mol_id: usize, num_positions: usize, ref_length: usize) -> usize {
-    let fallback = ref_length.saturating_sub(1).min(100);
-    if num_positions == 0 {
-        return fallback;
+/// Apply methylation conversion to a read sequence in-place.
+///
+/// For each position in `read_seq` that aligns to a reference C (top strand) or G
+/// (bottom strand), determines the `CpG` context and applies stochastic conversion
+/// based on the methylation mode and rates.
+pub(super) fn apply_methylation_conversion(
+    read_seq: &mut [u8],
+    ref_seq: &[u8],
+    ref_offset: usize,
+    is_top_strand: bool,
+    config: &MethylationConfig,
+    rng: &mut impl Rng,
+) {
+    if !config.mode.is_enabled() {
+        return;
     }
-    let usable_span = ref_length.saturating_sub(1000);
-    if usable_span == 0 {
-        return fallback;
+
+    for (i, base) in read_seq.iter_mut().enumerate() {
+        let ref_pos = ref_offset + i;
+        if ref_pos >= ref_seq.len() {
+            break;
+        }
+
+        let ref_base = ref_seq[ref_pos].to_ascii_uppercase();
+
+        if is_top_strand && ref_base == b'C' {
+            let cpg = is_cpg_context(ref_seq, ref_pos, true);
+            if is_conversion_target(config.mode, cpg, config.cpg_methylation_rate, rng)
+                && rng.random::<f64>() < config.conversion_rate
+            {
+                *base = b'T';
+            }
+        } else if !is_top_strand && ref_base == b'G' {
+            let cpg = is_cpg_context(ref_seq, ref_pos, false);
+            if is_conversion_target(config.mode, cpg, config.cpg_methylation_rate, rng)
+                && rng.random::<f64>() < config.conversion_rate
+            {
+                *base = b'A';
+            }
+        }
     }
-    let position_idx = mol_id % num_positions;
-    ((position_idx as f64 / num_positions as f64) * usable_span as f64) as usize + fallback
+}
+
+/// Determines whether a cytosine at this position is a conversion target.
+///
+/// Returns true if the base should be converted (subject to `conversion_rate`).
+///
+/// - EM-Seq converts **unmethylated** C: non-`CpG` always, `CpG` when not methylated
+/// - TAPs converts **methylated** C: `CpG` when methylated, non-`CpG` never
+fn is_conversion_target(
+    mode: MethylationMode,
+    is_cpg: bool,
+    cpg_methylation_rate: f64,
+    rng: &mut impl Rng,
+) -> bool {
+    if is_cpg {
+        let methylated = rng.random::<f64>() < cpg_methylation_rate;
+        match mode {
+            MethylationMode::EmSeq => !methylated, // convert unmethylated
+            MethylationMode::Taps => methylated,   // convert methylated
+            MethylationMode::Disabled => false,
+        }
+    } else {
+        // Non-CpG cytosines are unmethylated
+        match mode {
+            MethylationMode::EmSeq => true, // unmethylated = target
+            MethylationMode::Taps => false, // unmethylated = not a target
+            MethylationMode::Disabled => false,
+        }
+    }
 }
 
 /// Lightweight molecule info for position-first sorting.
@@ -685,31 +1019,6 @@ mod tests {
             .expect("lowercase distribution name should be accepted");
     }
 
-    #[rstest]
-    // num_positions == 0 should not panic
-    #[case(5, 0, 250_000_000, 0, 250_000_000)]
-    // ref_length < 1000 should not underflow
-    #[case(0, 10, 500, 0, 500)]
-    // Very small reference (ref_length <= 100) — fallback must stay within bounds
-    #[case(0, 10, 50, 0, 50)]
-    // Normal: first position
-    #[case(0, 10, 10_000, 0, 10_000)]
-    // Normal: last position in range
-    #[case(9, 10, 10_000, 101, 10_000)]
-    fn test_compute_position(
-        #[case] mol_id: usize,
-        #[case] num_positions: usize,
-        #[case] ref_length: usize,
-        #[case] min_expected: usize,
-        #[case] max_expected: usize,
-    ) {
-        let pos = compute_position(mol_id, num_positions, ref_length);
-        assert!(
-            pos >= min_expected && pos < max_expected,
-            "compute_position({mol_id}, {num_positions}, {ref_length}) = {pos}, expected [{min_expected}, {max_expected})"
-        );
-    }
-
     fn make_molecule_info(mol_id: usize, tid1: i32, pos1: i64) -> MoleculeInfo {
         MoleculeInfo {
             mol_id,
@@ -747,5 +1056,629 @@ mod tests {
         let a2 = make_molecule_info(99, 1, 100);
         assert_eq!(a, a2);
         assert_eq!(a.cmp(&a2), std::cmp::Ordering::Equal);
+    }
+
+    // ========================================================================
+    // ReferenceGenome tests
+    // ========================================================================
+
+    /// Create a temp FASTA file with a single chromosome of the given sequence.
+    fn write_test_fasta(seq: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, ">chr1").unwrap();
+        f.write_all(seq).unwrap();
+        writeln!(f).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn test_reference_genome_load_and_sample() {
+        // 1500 bases to exceed the 1000-bp minimum
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert_eq!(genome.name(0), "chr1");
+        assert!(genome.sequence_at(0, 0, 1500).is_some());
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_valid() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let subseq = genome.sequence_at(0, 4, 8).unwrap();
+        assert_eq!(subseq, b"ACGTACGT");
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_out_of_bounds() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert!(genome.sequence_at(0, 1495, 10).is_none());
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_invalid_chrom() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert!(genome.sequence_at(99, 0, 10).is_none());
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_n_bases() {
+        let mut seq = b"ACGT".repeat(375);
+        seq[10] = b'N';
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        // Region containing the N should return None
+        assert!(genome.sequence_at(0, 8, 4).is_none());
+        // Region before the N should succeed
+        assert!(genome.sequence_at(0, 0, 4).is_some());
+    }
+
+    #[test]
+    fn test_reference_genome_skips_short_sequences() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, ">short").unwrap();
+        // 500 bases - below 1000 minimum
+        let short = b"ACGT".repeat(125);
+        f.write_all(&short).unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, ">long").unwrap();
+        let long = b"ACGT".repeat(375);
+        f.write_all(&long).unwrap();
+        writeln!(f).unwrap();
+        f.flush().unwrap();
+
+        let genome = ReferenceGenome::load(f.path()).unwrap();
+        assert_eq!(genome.name(0), "long");
+        assert!(genome.sequence_at(1, 0, 1).is_none()); // only one chromosome loaded
+    }
+
+    #[test]
+    fn test_reference_genome_total_length() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert_eq!(genome.total_length(), 1500);
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_genome_pos_single_chrom() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        // Position 4 should map to chr1:4
+        let subseq = genome.sequence_at_genome_pos(4, 8).unwrap();
+        assert_eq!(subseq, b"ACGTACGT");
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_genome_pos_wraps_around() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        // Position beyond total_length should wrap
+        let direct = genome.sequence_at_genome_pos(4, 8).unwrap();
+        let wrapped = genome.sequence_at_genome_pos(4 + genome.total_length(), 8).unwrap();
+        assert_eq!(direct, wrapped);
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_genome_pos_multi_chrom() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, ">chr1").unwrap();
+        let chr1 = b"AAAA".repeat(375); // 1500 bp of A's
+        f.write_all(&chr1).unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, ">chr2").unwrap();
+        let chr2 = b"CCCC".repeat(375); // 1500 bp of C's
+        f.write_all(&chr2).unwrap();
+        writeln!(f).unwrap();
+        f.flush().unwrap();
+
+        let genome = ReferenceGenome::load(f.path()).unwrap();
+        assert_eq!(genome.total_length(), 3000);
+
+        // Position 0 -> chr1, should be A's
+        let from_chr1 = genome.sequence_at_genome_pos(0, 4).unwrap();
+        assert_eq!(from_chr1, b"AAAA");
+
+        // Position 1500 -> chr2, should be C's
+        let from_chr2 = genome.sequence_at_genome_pos(1500, 4).unwrap();
+        assert_eq!(from_chr2, b"CCCC");
+    }
+
+    #[test]
+    fn test_reference_genome_sequence_at_genome_pos_boundary() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        // Request that spans past end of chromosome should fail
+        assert!(genome.sequence_at_genome_pos(1490, 20).is_none());
+    }
+
+    #[test]
+    fn test_reference_genome_sample_sequence_returns_valid() {
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let result = genome.sample_sequence(100, &mut rng);
+        assert!(result.is_some());
+        let (chrom_idx, _pos, subseq) = result.unwrap();
+        assert_eq!(chrom_idx, 0);
+        assert_eq!(subseq.len(), 100);
+    }
+
+    #[test]
+    fn test_reference_genome_sample_sequence_exact_fit() {
+        // length == total_length should succeed (not panic from empty range)
+        let seq = b"ACGT".repeat(375); // 1500 bp
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let result = genome.sample_sequence(genome.total_length(), &mut rng);
+        assert!(result.is_some());
+        let (_chrom_idx, pos, subseq) = result.unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(subseq.len(), genome.total_length());
+    }
+
+    #[test]
+    fn test_reference_genome_sample_sequence_too_large() {
+        // length > total_length should return None (not panic)
+        let seq = b"ACGT".repeat(375); // 1500 bp
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let result = genome.sample_sequence(genome.total_length() + 1, &mut rng);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_reference_genome_sample_sequence_zero_length() {
+        // length == 0 must not panic and must return None (no valid 0-length sample)
+        let seq = b"ACGT".repeat(375);
+        let fasta = write_test_fasta(&seq);
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let result = genome.sample_sequence(0, &mut rng);
+        assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // MethylationArgs tests
+    // ========================================================================
+
+    #[test]
+    fn test_methylation_args_defaults() {
+        let args = MethylationArgs {
+            methylation_mode: None,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.98,
+        };
+        assert!((args.cpg_methylation_rate - 0.75).abs() < f64::EPSILON);
+        assert!((args.conversion_rate - 0.98).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_methylation_args_resolve_disabled() {
+        let args = MethylationArgs {
+            methylation_mode: None,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.98,
+        };
+        assert_eq!(args.resolve().mode, MethylationMode::Disabled);
+    }
+
+    #[test]
+    fn test_methylation_args_resolve_emseq() {
+        let args = MethylationArgs {
+            methylation_mode: Some(MethylationModeArg::EmSeq),
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.98,
+        };
+        let config = args.resolve();
+        assert_eq!(config.mode, MethylationMode::EmSeq);
+        assert!((config.cpg_methylation_rate - 0.75).abs() < f64::EPSILON);
+        assert!((config.conversion_rate - 0.98).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_methylation_args_resolve_taps() {
+        let args = MethylationArgs {
+            methylation_mode: Some(MethylationModeArg::Taps),
+            cpg_methylation_rate: 0.75,
+            conversion_rate: 0.98,
+        };
+        assert_eq!(args.resolve().mode, MethylationMode::Taps);
+    }
+
+    #[test]
+    fn test_methylation_args_validate_valid_rates() {
+        for rate in [0.0, 0.5, 1.0] {
+            let args = MethylationArgs {
+                methylation_mode: None,
+                cpg_methylation_rate: rate,
+                conversion_rate: rate,
+            };
+            assert!(args.validate().is_ok(), "rate {rate} should be valid");
+        }
+    }
+
+    #[rstest]
+    #[case(-0.1)]
+    #[case(1.1)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(f64::NEG_INFINITY)]
+    fn test_methylation_args_validate_invalid_cpg_rate(#[case] rate: f64) {
+        let args = MethylationArgs {
+            methylation_mode: None,
+            cpg_methylation_rate: rate,
+            conversion_rate: 0.98,
+        };
+        assert!(args.validate().is_err(), "cpg rate {rate} should be invalid");
+    }
+
+    #[rstest]
+    #[case(-0.1)]
+    #[case(1.1)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    fn test_methylation_args_validate_invalid_conversion_rate(#[case] rate: f64) {
+        let args = MethylationArgs {
+            methylation_mode: None,
+            cpg_methylation_rate: 0.75,
+            conversion_rate: rate,
+        };
+        assert!(args.validate().is_err(), "conversion rate {rate} should be invalid");
+    }
+
+    // ========================================================================
+    // apply_methylation_conversion tests
+    // ========================================================================
+
+    /// Helper to apply conversion with deterministic rates.
+    #[allow(clippy::too_many_arguments)]
+    fn convert(
+        seq: &mut [u8],
+        ref_seq: &[u8],
+        ref_offset: usize,
+        is_top: bool,
+        mode: MethylationMode,
+        cpg_rate: f64,
+        conv_rate: f64,
+        seed: u64,
+    ) {
+        let config =
+            MethylationConfig { mode, cpg_methylation_rate: cpg_rate, conversion_rate: conv_rate };
+        let mut rng = create_rng(Some(seed));
+        apply_methylation_conversion(seq, ref_seq, ref_offset, is_top, &config, &mut rng);
+    }
+
+    #[test]
+    fn test_emseq_cpg_all_methylated_no_conversion() {
+        // EM-Seq: methylated CpG = protected, should NOT convert
+        // cpg_methylation_rate=1.0 means all CpGs are methylated
+        let ref_seq = b"ACGTACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 1.0, 1.0, 42);
+        // CpG Cs (at positions 1 and 5) should stay as C (methylated = protected in EM-Seq)
+        assert_eq!(read[1], b'C', "CpG C should be protected when methylated");
+        assert_eq!(read[5], b'C', "CpG C should be protected when methylated");
+    }
+
+    #[test]
+    fn test_emseq_cpg_all_unmethylated_full_conversion() {
+        // EM-Seq: unmethylated CpG = target, should convert C->T
+        // cpg_methylation_rate=0.0 means all CpGs are unmethylated
+        let ref_seq = b"ACGTACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        // CpG Cs should convert to T
+        assert_eq!(read[1], b'T', "unmethylated CpG C should convert to T");
+        assert_eq!(read[5], b'T', "unmethylated CpG C should convert to T");
+    }
+
+    #[test]
+    fn test_emseq_non_cpg_c_always_converts() {
+        // Non-CpG Cs are unmethylated, always targets in EM-Seq
+        // ref = "ACCTA" -> C at pos 1 (non-CpG, followed by C), C at pos 2 (non-CpG, followed by T)
+        let ref_seq = b"ACCTA";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.75, 1.0, 42);
+        assert_eq!(read[1], b'T', "non-CpG C should convert to T in EM-Seq");
+        assert_eq!(read[2], b'T', "non-CpG C should convert to T in EM-Seq");
+    }
+
+    #[test]
+    fn test_taps_cpg_all_methylated_full_conversion() {
+        // TAPs: methylated CpG = target, should convert C->T
+        let ref_seq = b"ACGTACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::Taps, 1.0, 1.0, 42);
+        assert_eq!(read[1], b'T', "methylated CpG C should convert in TAPs");
+        assert_eq!(read[5], b'T', "methylated CpG C should convert in TAPs");
+    }
+
+    #[test]
+    fn test_taps_cpg_all_unmethylated_no_conversion() {
+        // TAPs: unmethylated CpG = not a target, should stay as C
+        let ref_seq = b"ACGTACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::Taps, 0.0, 1.0, 42);
+        assert_eq!(read[1], b'C', "unmethylated CpG C should not convert in TAPs");
+        assert_eq!(read[5], b'C', "unmethylated CpG C should not convert in TAPs");
+    }
+
+    #[test]
+    fn test_taps_non_cpg_c_never_converts() {
+        // Non-CpG Cs are unmethylated, never targets in TAPs
+        let ref_seq = b"ACCTA";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::Taps, 0.75, 1.0, 42);
+        assert_eq!(read[1], b'C', "non-CpG C should not convert in TAPs");
+        assert_eq!(read[2], b'C', "non-CpG C should not convert in TAPs");
+    }
+
+    #[test]
+    fn test_bottom_strand_emseq_converts_g_to_a() {
+        // Bottom strand: G at CpG context = unmethylated target in EM-Seq
+        // ref = "ACGT" -> G at pos 2, preceded by C -> CpG context
+        let ref_seq = b"ACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, false, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        assert_eq!(read[2], b'A', "bottom strand unmethylated CpG G should convert to A");
+    }
+
+    #[test]
+    fn test_bottom_strand_taps_converts_g_to_a() {
+        // Bottom strand: G at CpG context = methylated target in TAPs
+        let ref_seq = b"ACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, false, MethylationMode::Taps, 1.0, 1.0, 42);
+        assert_eq!(read[2], b'A', "bottom strand methylated CpG G should convert to A in TAPs");
+    }
+
+    #[test]
+    fn test_non_target_bases_unchanged_top_strand() {
+        let ref_seq = b"AGTAGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        // No Cs in this sequence, nothing should change
+        assert_eq!(read, b"AGTAGT");
+    }
+
+    #[test]
+    fn test_non_target_bases_unchanged_bottom_strand() {
+        let ref_seq = b"ACTACT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, false, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        // No Gs in this sequence, nothing should change on bottom strand
+        assert_eq!(read, b"ACTACT");
+    }
+
+    #[test]
+    fn test_disabled_mode_no_conversion() {
+        let ref_seq = b"ACGTACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::Disabled, 0.0, 1.0, 42);
+        assert_eq!(read, ref_seq, "Disabled mode should not modify any bases");
+    }
+
+    #[test]
+    fn test_empty_sequence() {
+        let ref_seq = b"";
+        let mut read: Vec<u8> = vec![];
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.75, 0.98, 42);
+        assert!(read.is_empty());
+    }
+
+    #[test]
+    fn test_ref_offset_nonzero() {
+        // Read starts at offset 2 in the reference
+        let ref_seq = b"AACGTAA";
+        //                  ^ offset 2 = C, CpG context
+        let mut read = b"CGT".to_vec();
+        convert(&mut read, ref_seq, 2, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        assert_eq!(read[0], b'T', "C at ref_offset=2 (CpG) should convert");
+    }
+
+    #[test]
+    fn test_conversion_rate_zero_no_conversion() {
+        // Even with unmethylated non-CpG C, conversion_rate=0 means no conversion
+        let ref_seq = b"ACCTA";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 0.0, 42);
+        assert_eq!(read[1], b'C', "conversion_rate=0 should prevent conversion");
+        assert_eq!(read[2], b'C', "conversion_rate=0 should prevent conversion");
+    }
+
+    #[test]
+    fn test_probabilistic_emseq_cpg_partial_methylation() {
+        // With cpg_methylation_rate=0.5, roughly half of CpG Cs should convert
+        let ref_seq = b"CG"; // single CpG
+        let mut converted_count = 0;
+        let trials = 10_000;
+        for seed in 0..trials {
+            let mut read = ref_seq.to_vec();
+            convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.5, 1.0, seed);
+            if read[0] == b'T' {
+                converted_count += 1;
+            }
+        }
+        // Expected: ~50% convert (unmethylated) with conversion_rate=1.0
+        let fraction = converted_count as f64 / trials as f64;
+        assert!(
+            (fraction - 0.5).abs() < 0.05,
+            "Expected ~50% conversion at CpG with methylation_rate=0.5, got {fraction:.3}"
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_emseq_non_cpg_partial_conversion_rate() {
+        // Non-CpG C with conversion_rate=0.5 should convert ~50% of the time
+        let ref_seq = b"ACT"; // C at pos 1, non-CpG (followed by T)
+        let mut converted_count = 0;
+        let trials = 10_000;
+        for seed in 0..trials {
+            let mut read = ref_seq.to_vec();
+            convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.75, 0.5, seed);
+            if read[1] == b'T' {
+                converted_count += 1;
+            }
+        }
+        let fraction = converted_count as f64 / trials as f64;
+        assert!(
+            (fraction - 0.5).abs() < 0.05,
+            "Expected ~50% conversion with conversion_rate=0.5, got {fraction:.3}"
+        );
+    }
+
+    #[test]
+    fn test_conversion_rate_zero_leaves_bases_unchanged() {
+        let ref_seq = b"CACACACACACACACAC"; // non-CpG Cs
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 0.0, 42);
+        assert_eq!(read, ref_seq, "conversion_rate=0 should leave all bases unchanged");
+    }
+
+    #[test]
+    fn test_conversion_rate_one_converts_all_targets() {
+        // EM-Seq, cpg_methylation_rate=0 means all CpGs unmethylated -> all Cs are targets
+        let ref_seq = b"CACACACACACACACAC"; // all non-CpG Cs
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::EmSeq, 0.0, 1.0, 42);
+        for (i, &b) in read.iter().enumerate() {
+            if ref_seq[i] == b'C' {
+                assert_eq!(b, b'T', "position {i}: C should be converted with rate=1.0");
+            } else {
+                assert_eq!(b, ref_seq[i], "position {i}: non-C should be unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn test_disabled_mode_never_converts() {
+        let ref_seq = b"CACGTCACGTCACGT";
+        let mut read = ref_seq.to_vec();
+        convert(&mut read, ref_seq, 0, true, MethylationMode::Disabled, 0.75, 1.0, 42);
+        assert_eq!(read, ref_seq, "Disabled mode should never modify bases");
+    }
+
+    // ========================================================================
+    // ReferenceGenome::build_bam_header, num_chromosomes, chromosome_length,
+    // and sample_positions tests
+    // ========================================================================
+
+    /// Create a temp FASTA with four contigs: chr1 (2000bp), chr2 (1500bp),
+    /// chr3 (1800bp), and `short_contig` (500bp, below the 1000bp minimum).
+    fn write_multi_contig_fasta() -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, ">chr1").unwrap();
+        f.write_all(&b"ACGT".repeat(500)).unwrap(); // 2000bp
+        writeln!(f).unwrap();
+        writeln!(f, ">chr2").unwrap();
+        f.write_all(&b"CCGG".repeat(375)).unwrap(); // 1500bp
+        writeln!(f).unwrap();
+        writeln!(f, ">chr3").unwrap();
+        f.write_all(&b"AATT".repeat(450)).unwrap(); // 1800bp
+        writeln!(f).unwrap();
+        writeln!(f, ">short_contig").unwrap();
+        f.write_all(&b"ACGT".repeat(125)).unwrap(); // 500bp, should be skipped
+        writeln!(f).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn test_build_bam_header_has_all_contigs() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let header = genome.build_bam_header();
+
+        let ref_seqs: Vec<_> = header.reference_sequences().keys().collect();
+        assert_eq!(ref_seqs.len(), 3, "short_contig should be excluded");
+        let names: Vec<&str> =
+            ref_seqs.iter().map(|k| std::str::from_utf8(k.as_ref()).unwrap()).collect();
+        assert!(names.contains(&"chr1"));
+        assert!(names.contains(&"chr2"));
+        assert!(names.contains(&"chr3"));
+        assert!(!names.contains(&"short_contig"));
+    }
+
+    #[test]
+    fn test_build_bam_header_contig_lengths() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let header = genome.build_bam_header();
+
+        let ref_seqs = header.reference_sequences();
+        let chr1_len: usize = ref_seqs.get(&bstr::BString::from("chr1")).unwrap().length().get();
+        let chr2_len: usize = ref_seqs.get(&bstr::BString::from("chr2")).unwrap().length().get();
+        let chr3_len: usize = ref_seqs.get(&bstr::BString::from("chr3")).unwrap().length().get();
+        assert_eq!(chr1_len, 2000);
+        assert_eq!(chr2_len, 1500);
+        assert_eq!(chr3_len, 1800);
+    }
+
+    #[test]
+    fn test_num_chromosomes() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert_eq!(genome.num_chromosomes(), 3);
+    }
+
+    #[test]
+    fn test_chromosome_length() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        assert_eq!(genome.chromosome_length(0), 2000);
+        assert_eq!(genome.chromosome_length(1), 1500);
+        assert_eq!(genome.chromosome_length(2), 1800);
+    }
+
+    #[test]
+    fn test_sample_positions_count_and_bounds() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(42));
+        let positions = genome.sample_positions(20, &mut rng);
+        assert_eq!(positions.len(), 20);
+        for (chrom_idx, local_pos) in &positions {
+            assert!(*chrom_idx < genome.num_chromosomes());
+            assert!(*local_pos < genome.chromosome_length(*chrom_idx));
+        }
+    }
+
+    #[test]
+    fn test_sample_positions_deterministic() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng1 = create_rng(Some(99));
+        let mut rng2 = create_rng(Some(99));
+        let pos1 = genome.sample_positions(10, &mut rng1);
+        let pos2 = genome.sample_positions(10, &mut rng2);
+        assert_eq!(pos1, pos2);
+    }
+
+    #[test]
+    fn test_sample_positions_spans_chromosomes() {
+        let fasta = write_multi_contig_fasta();
+        let genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let mut rng = create_rng(Some(7));
+        let positions = genome.sample_positions(100, &mut rng);
+        let unique_chroms: std::collections::HashSet<usize> =
+            positions.iter().map(|(c, _)| *c).collect();
+        assert!(
+            unique_chroms.len() >= 2,
+            "100 positions should span at least 2 chromosomes, got {}",
+            unique_chroms.len()
+        );
     }
 }

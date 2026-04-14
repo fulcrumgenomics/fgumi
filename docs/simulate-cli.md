@@ -8,13 +8,13 @@ Generate synthetic sequencing data for testing and benchmarking the fgumi pipeli
 
 | Command | Output | Pipeline Stage | Reference FASTA |
 |---------|--------|----------------|-----------------|
-| `fgumi simulate fastq-reads` | R1/R2 FASTQ.gz | Input for `extract` | Not used |
-| `fgumi simulate mapped-reads` | Template-coord sorted BAM | Input for `group` | Optional |
-| `fgumi simulate grouped-reads` | Template-coord sorted BAM with MI tags | Input for `simplex`/`duplex`/`codec` | Optional |
-| `fgumi simulate consensus-reads` | Unmapped BAM with consensus tags | Input for `filter` | Not used |
+| `fgumi simulate fastq-reads` | R1/R2 FASTQ.gz | Input for `extract` | Required |
+| `fgumi simulate mapped-reads` | Template-coord sorted BAM | Input for `group` | Required |
+| `fgumi simulate grouped-reads` | Template-coord sorted BAM with MI tags | Input for `simplex`/`duplex`/`codec` | Required |
+| `fgumi simulate consensus-reads` | Mapped BAM with consensus tags | Input for `filter` | Required |
 | `fgumi simulate correct-reads` | Unmapped BAM + includelist | Input for `correct` | Not used |
 
-**Note:** Commands that support `--reference` will sample positions from real chromosomes and extract actual genomic sequences. Without a reference, synthetic random sequences are generated.
+**Note:** All simulate subcommands (except `correct-reads`) require `--reference` / `-r` pointing to a reference FASTA file. Positions are sampled from real chromosomes, template sequences are extracted from the reference, and BAM headers contain actual contig names and lengths. Read orientations are a 50/50 mix of F1R2 and R1F2 (strand coin flip per molecule).
 
 ---
 
@@ -38,6 +38,7 @@ fgumi simulate fastq-reads \
 | `-1, --r1` | PATH | Output R1 FASTQ.gz file |
 | `-2, --r2` | PATH | Output R2 FASTQ.gz file |
 | `--truth` | PATH | Output truth TSV file (for validation) |
+| `-r, --reference` | PATH | Reference FASTA file (sequences sampled from here) |
 
 ### Simulation Options
 
@@ -82,6 +83,14 @@ fgumi simulate fastq-reads \
 | `--insert-size-min` | INT | 50 | Minimum insert size |
 | `--insert-size-max` | INT | 800 | Maximum insert size |
 
+### Methylation Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--methylation-mode` | `em-seq` or `taps` | (disabled) | Methylation chemistry mode; disabled by default |
+| `--cpg-methylation-rate` | FLOAT | 0.75 | Fraction of CpG cytosines that are methylated [0.0-1.0] |
+| `--conversion-rate` | FLOAT | 0.98 | Enzymatic conversion efficiency for target cytosines [0.0-1.0] |
+
 ### Truth File Format
 
 The truth TSV file contains ground truth for validation:
@@ -92,7 +101,9 @@ The truth TSV file contains ground truth for validation:
 | `true_umi` | The true UMI sequence (before any errors) |
 | `molecule_id` | Unique molecule identifier |
 | `family_id` | Family within the molecule |
-| `strand` | Strand (A or B for duplex) |
+| `strand` | Strand (A or B) |
+| `chrom` | Chromosome/contig name |
+| `pos` | 0-based genomic position |
 
 ### Example
 
@@ -102,6 +113,7 @@ fgumi simulate fastq-reads \
     --r1 sim_R1.fastq.gz \
     --r2 sim_R2.fastq.gz \
     --truth sim_truth.tsv \
+    --reference hg38.fa \
     --num-molecules 10000 \
     --umi-length 8 \
     --read-structure-r1 "8M142T" \
@@ -129,6 +141,7 @@ fgumi simulate mapped-reads \
 |--------|------|-------------|
 | `-o, --output` | PATH | Output BAM file (template-coordinate sorted) |
 | `--truth` | PATH | Output truth TSV file (for validation) |
+| `-r, --reference` | PATH | Reference FASTA file (sequences sampled from here) |
 
 ### Simulation Options
 
@@ -140,24 +153,7 @@ fgumi simulate mapped-reads \
 | `--seed` | INT | (random) | Random seed for reproducibility |
 | `-t, --threads` | INT | 1 | Number of writer threads |
 
-### Reference Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `-r, --reference` | PATH | (none) | Reference FASTA file (sequences sampled from here) |
-| `--ref-name` | STRING | `chr1` | Synthetic reference name (only used if no --reference) |
-| `--ref-length` | INT | 10000000 | Synthetic reference length (only used if no --reference) |
-
-When `--reference` is provided:
-- Positions are sampled from real chromosomes (weighted by length)
-- Read sequences are extracted from the reference
-- BAM header contains actual contig names and lengths
-- Reads will map correctly if used with an aligner
-
-When `--reference` is not provided:
-- A synthetic single-contig reference is used
-- Random sequences are generated
-- Useful for quick testing without a reference file
+Positions are sampled from real chromosomes (weighted by length), read sequences are extracted from the reference, and the BAM header contains actual contig names and lengths.
 
 ### Alignment Options
 
@@ -197,6 +193,10 @@ By default, each molecule gets a unique position. For high-depth benchmarking (t
 
 (Same as fastq-reads)
 
+### Methylation Options
+
+(Same as fastq-reads)
+
 ### Output Tags
 
 | Tag | Type | Description |
@@ -212,8 +212,8 @@ By default, each molecule gets a unique position. For high-depth benchmarking (t
 | `true_umi` | The true UMI sequence (before any errors) |
 | `molecule_id` | Unique molecule identifier |
 | `chrom` | Chromosome/contig name |
-| `position` | 1-based genomic position |
-| `strand` | Strand (A or B for duplex) |
+| `position` | 0-based genomic position |
+| `strand` | Strand (`+` or `-`) |
 
 ### Example
 
@@ -227,19 +227,11 @@ fgumi simulate mapped-reads \
     --seed 42 \
     --threads 4
 
-# Generate mapped reads with synthetic reference (no FASTA needed)
-fgumi simulate mapped-reads \
-    --output sim_mapped.bam \
-    --truth sim_truth.tsv \
-    --ref-name chr1 \
-    --ref-length 50000000 \
-    --num-molecules 5000 \
-    --seed 42
-
 # High-depth mode: many UMIs at few positions (for MIH/group benchmarking)
 fgumi simulate mapped-reads \
     --output sim_high_depth.bam \
     --truth sim_truth.tsv \
+    --reference hg38.fa \
     --num-molecules 50000 \
     --num-positions 100 \
     --umis-per-position 500 \
@@ -266,6 +258,7 @@ fgumi simulate grouped-reads \
 |--------|------|-------------|
 | `-o, --output` | PATH | Output BAM file (template-coordinate sorted) |
 | `--truth` | PATH | Output truth TSV file (for validation) |
+| `-r, --reference` | PATH | Reference FASTA file (sequences sampled from here) |
 
 ### Simulation Options
 
@@ -285,16 +278,6 @@ fgumi simulate grouped-reads \
 | `--strand-alpha` | FLOAT | 5.0 | Beta distribution alpha for A/B strand ratio |
 | `--strand-beta` | FLOAT | 5.0 | Beta distribution beta for A/B strand ratio |
 
-### Reference Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `-r, --reference` | PATH | (none) | Reference FASTA file (sequences sampled from here) |
-| `--ref-name` | STRING | `chr1` | Synthetic reference name (only used if no --reference) |
-| `--ref-length` | INT | 10000000 | Synthetic reference length (only used if no --reference) |
-
-See `mapped-reads` for details on reference vs. synthetic mode.
-
 ### Quality Model Options
 
 (Same as fastq-reads)
@@ -304,6 +287,10 @@ See `mapped-reads` for details on reference vs. synthetic mode.
 (Same as fastq-reads)
 
 ### Insert Size Options
+
+(Same as fastq-reads)
+
+### Methylation Options
 
 (Same as fastq-reads)
 
@@ -324,13 +311,13 @@ See `mapped-reads` for details on reference vs. synthetic mode.
 | `molecule_id` | Unique molecule identifier |
 | `expected_mi` | Expected MI tag value after grouping |
 | `chrom` | Chromosome/contig name |
-| `position` | 1-based genomic position |
-| `strand` | Strand (A or B for duplex) |
+| `position` | 0-based genomic position |
+| `strand` | Strand (`+` or `-`) |
 
 ### Example
 
 ```bash
-# Generate simplex grouped reads with reference
+# Generate simplex grouped reads
 fgumi simulate grouped-reads \
     --output sim_grouped.bam \
     --truth sim_truth.tsv \
@@ -338,10 +325,11 @@ fgumi simulate grouped-reads \
     --num-molecules 5000 \
     --seed 42
 
-# Generate duplex grouped reads with strand bias (synthetic reference)
+# Generate duplex grouped reads with strand bias
 fgumi simulate grouped-reads \
     --output sim_duplex_grouped.bam \
     --truth sim_truth.tsv \
+    --reference hg38.fa \
     --num-molecules 5000 \
     --duplex \
     --strand-alpha 5.0 \
@@ -353,13 +341,14 @@ fgumi simulate grouped-reads \
 
 ## fgumi simulate consensus-reads
 
-Generate unmapped BAM with consensus tags (cD, cM, cE, etc.) for input to `fgumi filter`.
+Generate mapped BAM with consensus tags (cD, cM, cE, etc.) for input to `fgumi filter`.
 
 ### Usage
 
 ```bash
 fgumi simulate consensus-reads \
     --output output.bam \
+    --reference ref.fa \
     [OPTIONS]
 ```
 
@@ -367,7 +356,8 @@ fgumi simulate consensus-reads \
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `-o, --output` | PATH | Output BAM file (unmapped) |
+| `-o, --output` | PATH | Output BAM file (mapped) |
+| `-r, --reference` | PATH | Reference FASTA file (sequences sampled from here) |
 
 ### Simulation Options
 
@@ -403,6 +393,15 @@ fgumi simulate consensus-reads \
 |--------|------|---------|-------------|
 | `--consensus-quality` | INT | 40 | Base quality for consensus reads |
 
+### Methylation Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--methylation-mode` | `em-seq` or `taps` | (disabled) | Methylation chemistry mode; disabled by default |
+| `--cpg-methylation-rate` | FLOAT | 0.75 | Fraction of CpG cytosines that are methylated [0.0-1.0] |
+| `--conversion-rate` | FLOAT | 0.98 | Enzymatic conversion efficiency for target cytosines [0.0-1.0] |
+| `--methylation-depth-mean` | FLOAT | 5.0 | Mean depth for methylation count sampling (cu + ct per position) |
+
 ### Output Tags (Simplex)
 
 | Tag | Type | Description |
@@ -432,6 +431,7 @@ fgumi simulate consensus-reads \
 # Generate simplex consensus reads
 fgumi simulate consensus-reads \
     --output sim_consensus.bam \
+    --reference hg38.fa \
     --num-reads 10000 \
     --min-depth 2 \
     --max-depth 20 \
@@ -440,6 +440,7 @@ fgumi simulate consensus-reads \
 # Generate duplex consensus reads
 fgumi simulate consensus-reads \
     --output sim_duplex_consensus.bam \
+    --reference hg38.fa \
     --num-reads 10000 \
     --duplex \
     --seed 42
@@ -598,6 +599,7 @@ To benchmark the MIH (Multiple Identical Hits) optimization in `fgumi group`, us
 fgumi simulate mapped-reads \
     --output high_depth.bam \
     --truth high_depth_truth.tsv \
+    --reference hg38.fa \
     --num-molecules 500000 \
     --num-positions 100 \
     --umis-per-position 500 \

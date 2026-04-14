@@ -66,6 +66,38 @@ impl MethylationAnnotation {
     pub fn truncate(&self, len: usize) -> Self {
         Self { evidence: self.evidence[..len.min(self.evidence.len())].to_vec() }
     }
+
+    /// Returns a copy of this annotation with the evidence vector reversed.
+    ///
+    /// Used when building R2 records: the sequence is reverse-complemented, so
+    /// the per-position methylation evidence must be reversed to match.
+    #[must_use]
+    pub fn reverse(&self) -> Self {
+        let mut rev = self.evidence.clone();
+        rev.reverse();
+        Self { evidence: rev }
+    }
+}
+
+/// Determines if a position in the reference is in a `CpG` dinucleotide context.
+///
+/// For top strand: checks if `ref_seq[pos]` is C and `ref_seq[pos+1]` is G.
+/// For bottom strand: checks if `ref_seq[pos]` is G and `ref_seq[pos-1]` is C.
+#[inline]
+#[must_use]
+pub fn is_cpg_context(ref_seq: &[u8], pos: usize, is_top_strand: bool) -> bool {
+    if pos >= ref_seq.len() {
+        return false;
+    }
+    if is_top_strand {
+        pos + 1 < ref_seq.len()
+            && ref_seq[pos].eq_ignore_ascii_case(&b'C')
+            && ref_seq[pos + 1].eq_ignore_ascii_case(&b'G')
+    } else {
+        pos > 0
+            && ref_seq[pos].eq_ignore_ascii_case(&b'G')
+            && ref_seq[pos - 1].eq_ignore_ascii_case(&b'C')
+    }
 }
 
 /// Maps each query position to a reference position using a simplified CIGAR.
@@ -821,6 +853,73 @@ pub(crate) mod tests {
         let result = build_mm_ml_tags(&bases, &annotation, true, crate::MethylationMode::EmSeq);
         let (_, ml) = result.unwrap();
         assert_eq!(ml, vec![255u8; 5]); // EM-seq: 3/3 unconverted = 255
+    }
+
+    // ========================================================================
+    // is_cpg_context tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_cpg_top_strand_cg_dinucleotide() {
+        assert!(is_cpg_context(b"ACGT", 1, true)); // C at pos 1, G at pos 2
+    }
+
+    #[test]
+    fn test_is_cpg_top_strand_not_cpg() {
+        assert!(!is_cpg_context(b"ACAT", 1, true)); // C at pos 1, A at pos 2
+        assert!(!is_cpg_context(b"ACCT", 1, true)); // C at pos 1, C at pos 2
+        assert!(!is_cpg_context(b"ACTT", 1, true)); // C at pos 1, T at pos 2
+    }
+
+    #[test]
+    fn test_is_cpg_top_strand_c_at_last_position() {
+        assert!(!is_cpg_context(b"AAC", 2, true)); // C at end, no following base
+    }
+
+    #[test]
+    fn test_is_cpg_top_strand_not_c() {
+        assert!(!is_cpg_context(b"AGGT", 1, true)); // G at pos 1, not a C
+    }
+
+    #[test]
+    fn test_is_cpg_bottom_strand_cg_dinucleotide() {
+        assert!(is_cpg_context(b"ACGT", 2, false)); // G at pos 2, C at pos 1
+    }
+
+    #[test]
+    fn test_is_cpg_bottom_strand_not_cpg() {
+        assert!(!is_cpg_context(b"AAGT", 2, false)); // G at pos 2, A at pos 1
+        assert!(!is_cpg_context(b"AGGT", 2, false)); // G at pos 2, G at pos 1
+        assert!(!is_cpg_context(b"ATGT", 2, false)); // G at pos 2, T at pos 1
+    }
+
+    #[test]
+    fn test_is_cpg_bottom_strand_g_at_first_position() {
+        assert!(!is_cpg_context(b"GAC", 0, false)); // G at start, no preceding base
+    }
+
+    #[test]
+    fn test_is_cpg_bottom_strand_not_g() {
+        assert!(!is_cpg_context(b"ACAT", 1, false)); // C at pos 1, not a G
+    }
+
+    #[test]
+    fn test_is_cpg_case_insensitive() {
+        assert!(is_cpg_context(b"acgt", 1, true));
+        assert!(is_cpg_context(b"acgt", 2, false));
+    }
+
+    #[test]
+    fn test_is_cpg_pos_out_of_range() {
+        // pos >= ref_seq.len() should return false, not panic
+        let ref_seq = b"CG";
+        assert!(!is_cpg_context(ref_seq, 2, true));
+        assert!(!is_cpg_context(ref_seq, 2, false));
+        assert!(!is_cpg_context(ref_seq, 100, true));
+        assert!(!is_cpg_context(ref_seq, 100, false));
+        // Empty ref_seq
+        assert!(!is_cpg_context(b"", 0, true));
+        assert!(!is_cpg_context(b"", 0, false));
     }
 
     /// Helper to create a `SourceRead` for testing.
