@@ -1058,7 +1058,9 @@ fn restore_unconverted_bases_in_record(
         .reference_sequences()
         .get_index(ref_id)
         .context("reference sequence ID not found in header")?;
-    let ref_name = ref_name.to_string();
+    // Borrow the contig name as &str rather than allocating a fresh String per
+    // record; `fetch_slice` only needs &str for its HashMap lookup.
+    let ref_name: &str = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
 
     // Get alignment start (1-based)
     let alignment_start = match record.alignment_start().map(usize::from) {
@@ -1073,10 +1075,12 @@ fn restore_unconverted_bases_in_record(
         return Ok(());
     }
 
-    // Fetch the entire aligned reference region at once
+    // Fetch the entire aligned reference region at once. Use the borrowed-slice
+    // API so we don't allocate a fresh `Vec<u8>` per record (~2 GB of churn over
+    // a 13M template run).
     let ref_start = Position::try_from(alignment_start)?;
     let ref_end = Position::try_from(alignment_start + ref_span - 1)?;
-    let ref_bases = reference.fetch(&ref_name, ref_start, ref_end)?;
+    let ref_bases = reference.fetch_slice(ref_name, ref_start, ref_end)?;
 
     // Determine replacement parameters, accounting for reverse-complemented SEQ.
     // SAM stores SEQ reverse-complemented when 0x10 is set, so the base to find
@@ -1086,10 +1090,24 @@ fn restore_unconverted_bases_in_record(
         (true, false) | (false, true) => (b'C', b'T', b'C'),
         (true, true) | (false, false) => (b'G', b'A', b'G'),
     };
+    // Precompute lowercase variants once per record so the inner loop just does
+    // two byte equality checks instead of `to_ascii_uppercase()` per byte.
+    let ref_target_lower = ref_target.to_ascii_lowercase();
+    let converted_base_lower = converted_base.to_ascii_lowercase();
 
-    // Walk CIGAR and replace converted bases
-    let mut seq: Vec<u8> = record.sequence().as_ref().to_vec();
-    let mut modified = false;
+    // Fast path: if no candidate reference base appears in the aligned span,
+    // the read can't have any bases to restore — skip the SEQ allocation and
+    // CIGAR walk entirely. `memchr2` is SIMD-accelerated.
+    if memchr::memchr2(ref_target, ref_target_lower, ref_bases).is_none() {
+        return Ok(());
+    }
+
+    // Walk CIGAR and replace converted bases. Defer allocating the mutable SEQ
+    // buffer until we hit the first base we actually need to change — many reads
+    // (highly methylated CpGs in EM-Seq) align to ref-C positions but already
+    // carry C in the read, so no allocation is needed.
+    let read_seq = record.sequence().as_ref();
+    let mut seq: Option<Vec<u8>> = None;
     let mut read_pos: usize = 0;
     let mut ref_offset: usize = 0; // 0-based offset into ref_bases
 
@@ -1103,13 +1121,16 @@ fn restore_unconverted_bases_in_record(
                     if ref_offset + i >= ref_bases.len() {
                         break;
                     }
-                    let rb = ref_bases[ref_offset + i].to_ascii_uppercase();
-                    if rb == ref_target
-                        && read_pos + i < seq.len()
-                        && seq[read_pos + i].to_ascii_uppercase() == converted_base
+                    let rb = ref_bases[ref_offset + i];
+                    if (rb == ref_target || rb == ref_target_lower) && read_pos + i < read_seq.len()
                     {
-                        seq[read_pos + i] = unconverted_base;
-                        modified = true;
+                        // Consult the (possibly already-modified) SEQ buffer if present,
+                        // otherwise the original read sequence.
+                        let sb = seq.as_ref().map_or(read_seq[read_pos + i], |s| s[read_pos + i]);
+                        if sb == converted_base || sb == converted_base_lower {
+                            let s = seq.get_or_insert_with(|| read_seq.to_vec());
+                            s[read_pos + i] = unconverted_base;
+                        }
                     }
                 }
                 read_pos += len;
@@ -1125,13 +1146,13 @@ fn restore_unconverted_bases_in_record(
         }
     }
 
-    if modified {
+    if let Some(seq) = seq {
         *record.sequence_mut() = seq.into();
         // NM/MD tags are now stale since SEQ changed; remove them so downstream
         // tools don't trust incorrect mismatch counts.
         let data = record.data_mut();
-        data.remove(&Tag::new(b'N', b'M'));
-        data.remove(&Tag::new(b'M', b'D'));
+        data.remove(&Tag::from(SamTag::NM));
+        data.remove(&Tag::from(SamTag::MD));
     }
 
     Ok(())
@@ -4021,6 +4042,47 @@ mod tests {
         let seq: Vec<u8> = record.sequence().as_ref().to_vec();
         // C stays C, T→C, C stays C, A stays A (not T→C), C stays C, T→C, G stays G, C stays C
         assert_eq!(seq, b"CCCACCGC");
+
+        Ok(())
+    }
+
+    /// Top-strand read aligned to a span with no reference Cs: nothing to restore.
+    /// Exercises the `memchr2` early-exit fast path — record must come through
+    /// byte-for-byte unchanged (including any T's, which would only be candidates
+    /// where the reference is C).
+    #[test]
+    fn test_restore_unconverted_bases_no_target_in_span() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        // Reference is all A/T/G — no C anywhere in the aligned span.
+        let fasta = create_test_fasta(&[("chr1", "ATGTATGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
+
+        // SEQ contains T's but they cannot be restoration candidates because
+        // the reference span has no C positions for them to align to.
+        let original_seq = b"ATGTATGT";
+        let mut record = RecordBuilder::new()
+            .name("q1")
+            .sequence(std::str::from_utf8(original_seq)?)
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .tag("NM", 0i32)
+            .tag("MD", "8")
+            .build();
+
+        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+
+        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
+        assert_eq!(seq, original_seq);
+        // No SEQ change => NM/MD must remain present.
+        assert!(record.data().get(&Tag::from(SamTag::NM)).is_some());
+        assert!(record.data().get(&Tag::from(SamTag::MD)).is_some());
 
         Ok(())
     }

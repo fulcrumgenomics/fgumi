@@ -274,6 +274,21 @@ impl ReferenceReader {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn fetch(&self, chrom: &str, start: Position, end: Position) -> Result<Vec<u8>> {
+        Ok(self.fetch_slice(chrom, start, end)?.to_vec())
+    }
+
+    /// Borrowed-slice variant of [`fetch`] that returns a reference into the
+    /// in-memory sequence — same lookup semantics, no allocation.
+    ///
+    /// Prefer this over [`fetch`] in hot loops (e.g., per-record reference
+    /// access in `fgumi zipper`'s `--restore-unconverted-bases` path) where
+    /// allocating a fresh `Vec<u8>` per call adds up to gigabytes of churn.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`fetch`]: returns an error if the chromosome is missing or the
+    /// requested region exceeds the sequence length.
+    pub fn fetch_slice(&self, chrom: &str, start: Position, end: Position) -> Result<&[u8]> {
         let sequence = self
             .sequences
             .get(chrom)
@@ -283,7 +298,7 @@ impl ReferenceReader {
         let start_idx = usize::from(start) - 1;
         let end_idx = usize::from(end);
 
-        if end_idx > sequence.len() || start_idx > end_idx {
+        if end_idx > sequence.len() || start_idx >= end_idx {
             return Err(FgumiError::InvalidParameter {
                 parameter: "region".to_string(),
                 reason: format!(
@@ -297,7 +312,7 @@ impl ReferenceReader {
             .into());
         }
 
-        Ok(sequence[start_idx..end_idx].to_vec())
+        Ok(&sequence[start_idx..end_idx])
     }
 
     /// Gets a single base from the reference at the specified position.
@@ -392,6 +407,37 @@ mod tests {
         // Fetch from chr2
         let seq = reader.fetch("chr2", Position::try_from(5)?, Position::try_from(8)?)?;
         assert_eq!(seq, b"CCCC");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fetch_slice_returns_borrowed_bytes() -> Result<()> {
+        let fasta = create_default_test_fasta()?;
+        let reader = ReferenceReader::new(fasta.path())?;
+
+        // Borrowed alternative to `fetch` — same bytes, no allocation.
+        let slice: &[u8] =
+            reader.fetch_slice("chr1", Position::try_from(1)?, Position::try_from(4)?)?;
+        assert_eq!(slice, b"ACGT");
+
+        // Same bytes as `fetch` would return.
+        let owned = reader.fetch("chr1", Position::try_from(1)?, Position::try_from(4)?)?;
+        assert_eq!(slice, owned.as_slice());
+
+        // Bounds errors propagate just like `fetch`.
+        assert!(
+            reader
+                .fetch_slice("chr1", Position::try_from(1)?, Position::try_from(10_000)?)
+                .is_err()
+        );
+        assert!(
+            reader.fetch_slice("nope", Position::try_from(1)?, Position::try_from(2)?).is_err()
+        );
+        // Inverted interval (start > end) must also error.
+        assert!(
+            reader.fetch_slice("chr1", Position::try_from(5)?, Position::try_from(4)?).is_err()
+        );
 
         Ok(())
     }
