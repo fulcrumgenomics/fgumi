@@ -3397,6 +3397,7 @@ fn fastq_try_step_compress<R: BufRead + Send + 'static, P: Send + MemoryEstimate
 /// consecutive batches in serial order.
 ///
 /// Returns true if any data was actually written to the output file.
+#[allow(clippy::cast_possible_truncation)]
 fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static>(
     state: &FastqPipelineState<R, P>,
 ) -> bool {
@@ -3416,11 +3417,20 @@ fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 
         return false;
     };
 
-    // Drain Q6 into reorder buffer AND write all ready batches in single lock scope.
+    // Drain Q6 into the reorder buffer once up front (briefly under reorder lock),
+    // then loop: re-acquire reorder briefly to pop the next ready batch, release
+    // the reorder lock, then perform the disk write. Holding `output` keeps writes
+    // serial; we don't need to hold `write_reorder` across the I/O — releasing it
+    // lets other threads drain Q6 into the reorder buffer in parallel with our
+    // disk writes, preventing Q7 backpressure from cascading upstream into
+    // Compress.
     let mut wrote_any = false;
-    let q7_truly_empty;
     {
+        let wait_start = std::time::Instant::now();
         let mut reorder = state.output.write_reorder.lock();
+        if let Some(stats) = state.stats() {
+            stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+        }
 
         // Drain Q6 into reorder buffer.
         while let Some((serial, batch)) = state.output.compressed.pop() {
@@ -3431,30 +3441,55 @@ fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 
             state.output.write_reorder_state.add_heap_bytes(q7_heap);
             state.deadlock_state.record_q7_pop();
         }
-
-        // Write in-order batches.
-        while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
-            let mut batch_bytes: u64 = 0;
-            for block in &batch.blocks {
-                batch_bytes += block.data.len() as u64;
-                if let Err(e) = output.write_all(&block.data) {
-                    state.set_error(e);
-                    return false;
-                }
-            }
-            state.output.write_reorder_state.sub_heap_bytes(heap_size as u64);
-            state.output.write_reorder_state.update_next_seq(reorder.next_seq());
-            if let Some(stats) = state.stats() {
-                stats.bytes_written.fetch_add(batch_bytes, Ordering::Relaxed);
-            }
-            let records_in_batch = batch.record_count;
-            state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
-            state.output.progress.log_if_needed(records_in_batch);
-            wrote_any = true;
-        }
-
-        q7_truly_empty = reorder.is_empty();
     }
+    // Reorder lock released here.
+
+    // Per-iteration: re-acquire reorder briefly to pop the next ready batch,
+    // then release before the disk write.
+    loop {
+        let next = {
+            let wait_start = std::time::Instant::now();
+            let mut reorder = state.output.write_reorder.lock();
+            if let Some(stats) = state.stats() {
+                stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+            }
+            let popped = reorder.try_pop_next_with_size();
+            if popped.is_some() {
+                state.output.write_reorder_state.update_next_seq(reorder.next_seq());
+            }
+            popped
+        };
+        // Reorder lock released here.
+
+        let Some((batch, heap_size)) = next else { break };
+
+        // Write all blocks (reorder lock NOT held).
+        let mut batch_bytes: u64 = 0;
+        for block in &batch.blocks {
+            batch_bytes += block.data.len() as u64;
+            if let Err(e) = output.write_all(&block.data) {
+                state.set_error(e);
+                return false;
+            }
+        }
+        state.output.write_reorder_state.sub_heap_bytes(heap_size as u64);
+        if let Some(stats) = state.stats() {
+            stats.bytes_written.fetch_add(batch_bytes, Ordering::Relaxed);
+        }
+        let records_in_batch = batch.record_count;
+        state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
+        state.output.progress.log_if_needed(records_in_batch);
+        wrote_any = true;
+    }
+
+    let q7_truly_empty = {
+        let wait_start = std::time::Instant::now();
+        let reorder = state.output.write_reorder.lock();
+        if let Some(stats) = state.stats() {
+            stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+        }
+        reorder.is_empty()
+    };
 
     if !wrote_any && q7_truly_empty {
         if let Some(stats) = state.stats() {

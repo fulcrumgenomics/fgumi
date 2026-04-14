@@ -5166,6 +5166,7 @@ pub trait WritePipelineState: Send + Sync {
 ///   Re-drains under both locks to catch items arriving between phases.
 ///
 /// Returns `Success` if any data was written, `InputEmpty` otherwise.
+#[allow(clippy::cast_possible_truncation)]
 pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult {
     if state.has_error() {
         return StepResult::InputEmpty;
@@ -5173,7 +5174,11 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
 
     // Phase 1: Drain Q7 into reorder buffer (only needs reorder lock)
     {
+        let wait_start = std::time::Instant::now();
         let mut reorder = state.write_reorder_buffer().lock();
+        if let Some(stats) = state.stats() {
+            stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+        }
         let queue = state.write_input_queue();
         while let Some((serial, batch)) = queue.pop() {
             let heap_size = batch.estimate_heap_size();
@@ -5197,31 +5202,54 @@ pub fn shared_try_step_write_new<S: WritePipelineState>(state: &S) -> StepResult
         return StepResult::InputEmpty;
     };
 
-    let mut wrote_any = false;
+    // Drain any additional items that arrived since phase 1, briefly under
+    // the reorder lock. Then loop: re-acquire reorder briefly to pop the
+    // next ready batch, release the reorder lock, then perform the disk
+    // write. Holding `output` keeps writes serial; we don't need to hold
+    // `write_reorder` across the I/O — releasing it lets other threads
+    // drain Q7 into the reorder buffer in parallel with our disk writes.
     {
+        let wait_start = std::time::Instant::now();
         let mut reorder = state.write_reorder_buffer().lock();
+        if let Some(stats) = state.stats() {
+            stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+        }
         let queue = state.write_input_queue();
-
-        // Drain any additional items that arrived since phase 1
         while let Some((serial, batch)) = queue.pop() {
             let heap_size = batch.estimate_heap_size();
             reorder.insert_with_size(serial, batch, heap_size);
             state.write_reorder_state().add_heap_bytes(heap_size as u64);
         }
+    }
+    // Reorder lock released here.
 
-        // Write all ready batches in sequence order
-        while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
-            for block in &batch.blocks {
-                if let Err(e) = output.write_all(&block.data) {
-                    state.set_error(e);
-                    return StepResult::InputEmpty;
-                }
+    let mut wrote_any = false;
+    loop {
+        let next = {
+            let wait_start = std::time::Instant::now();
+            let mut reorder = state.write_reorder_buffer().lock();
+            if let Some(stats) = state.stats() {
+                stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
             }
-            state.write_reorder_state().sub_heap_bytes(heap_size as u64);
-            state.write_reorder_state().update_next_seq(reorder.next_seq());
-            state.record_written(batch.record_count);
-            wrote_any = true;
+            let popped = reorder.try_pop_next_with_size();
+            if popped.is_some() {
+                state.write_reorder_state().update_next_seq(reorder.next_seq());
+            }
+            popped
+        };
+        // Reorder lock released here.
+
+        let Some((batch, heap_size)) = next else { break };
+
+        for block in &batch.blocks {
+            if let Err(e) = output.write_all(&block.data) {
+                state.set_error(e);
+                return StepResult::InputEmpty;
+            }
         }
+        state.write_reorder_state().sub_heap_bytes(heap_size as u64);
+        state.record_written(batch.record_count);
+        wrote_any = true;
     }
 
     if wrote_any { StepResult::Success } else { StepResult::InputEmpty }

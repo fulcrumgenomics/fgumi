@@ -1915,7 +1915,7 @@ fn try_step_decompress<G: Send, P: Send + MemoryEstimate>(
 ///
 /// Uses the held-item pattern to prevent deadlock. If the output queue is full,
 /// the batch is stored in `worker.held_boundaries` and the function returns immediately.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
     state: &BamPipelineState<G, P>,
     worker: &mut WorkerState<P>,
@@ -1968,7 +1968,14 @@ fn try_step_find_boundaries<G: Send, P: Send + MemoryEstimate>(
 
         // Drain Q2 into reorder buffer AND get next in-order batch
         let batch_with_size = {
+            let wait_start = std::time::Instant::now();
             let mut reorder = state.q2_reorder.lock();
+            if let Some(stats) = state.stats() {
+                stats.record_wait_time(
+                    PipelineStep::FindBoundaries,
+                    wait_start.elapsed().as_nanos() as u64,
+                );
+            }
 
             // Insert all pending decompressed batches into reorder buffer.
             // Memory was already reserved by Decompress - just insert for ordering.
@@ -2200,7 +2207,7 @@ fn try_step_decode<G: Send, P: Send + MemoryEstimate>(
 /// Batching mode depends on configuration:
 /// - `target_templates_per_batch > 0`: Weight-based batching using `BatchWeight::batch_weight()`
 /// - `target_templates_per_batch == 0`: Count-based batching using `batch_size`
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + MemoryEstimate>(
     state: &BamPipelineState<G, P>,
     group_state: &Mutex<GroupState<G>>,
@@ -2344,7 +2351,11 @@ fn try_step_group<G: Send + BatchWeight + MemoryEstimate + 'static, P: Send + Me
 
         // Now take the reorder lock and insert all pending batches
         let records = {
+            let wait_start = std::time::Instant::now();
             let mut reorder = state.q3_reorder.lock();
+            if let Some(stats) = state.stats() {
+                stats.record_wait_time(PipelineStep::Group, wait_start.elapsed().as_nanos() as u64);
+            }
 
             // Insert all pre-drained batches into reorder buffer
             for (serial, batch, heap_size) in pending.drain(..) {
@@ -2756,6 +2767,7 @@ fn try_step_compress<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
 /// Try to execute Step 9: Write blocks to output.
 ///
 /// This step is exclusive - only one thread at a time.
+#[allow(clippy::cast_possible_truncation)]
 fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     state: &BamPipelineState<G, P>,
 ) -> (bool, bool) {
@@ -2773,11 +2785,20 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
         return (false, false); // File already closed, not contention
     };
 
-    // Drain Q7 into reorder buffer AND write all ready batches in single lock scope
+    // Drain Q7 into reorder buffer once up front (briefly under reorder lock),
+    // then loop: re-acquire reorder briefly to pop the next ready batch, release
+    // the reorder lock, then perform the disk write(s). Holding `output` keeps
+    // writes serial; we don't need to hold `write_reorder` across the I/O —
+    // releasing it lets other threads drain Q7 into the reorder buffer in
+    // parallel with our disk writes, preventing Q7 backpressure from
+    // cascading upstream into Compress.
     let mut wrote_any = false;
-    let q7_truly_empty;
     {
+        let wait_start = std::time::Instant::now();
         let mut reorder = state.output.write_reorder.lock();
+        if let Some(stats) = state.stats() {
+            stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+        }
 
         // Drain Q7 into reorder buffer, tracking heap bytes for admission control.
         while let Some((serial, batch)) = state.output.compressed.pop() {
@@ -2788,55 +2809,80 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
             reorder.insert_with_size(serial, batch, heap_size);
             state.output.write_reorder_state.add_heap_bytes(heap_size as u64);
         }
+    }
+    // Reorder lock released here.
 
-        // Write all ready batches
-        while let Some((batch, heap_size)) = reorder.try_pop_next_with_size() {
-            // Write all blocks in the batch
-            let mut batch_bytes: u64 = 0;
-            for block in &batch.blocks {
-                if let Err(e) = writer.write_all(&block.data) {
-                    state.set_error(e);
-                    return (false, false); // Error, not contention
-                }
-                batch_bytes += block.data.len() as u64;
+    // Per-iteration: re-acquire reorder briefly to pop the next ready batch,
+    // then release before the disk write.
+    loop {
+        let next = {
+            let wait_start = std::time::Instant::now();
+            let mut reorder = state.output.write_reorder.lock();
+            if let Some(stats) = state.stats() {
+                stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
             }
+            let popped = reorder.try_pop_next_with_size();
+            if popped.is_some() {
+                state.output.write_reorder_state.update_next_seq(reorder.next_seq());
+            }
+            popped
+        };
+        // Reorder lock released here.
 
-            // Write secondary data (e.g., rejects) in the same serial order
-            if let Some(ref secondary_data) = batch.secondary_data {
-                if !secondary_data.is_empty() {
-                    if let Some(ref secondary_mutex) = state.output.secondary_output {
-                        let mut sw_guard = secondary_mutex.lock();
-                        if let Some(ref mut sw) = *sw_guard {
-                            if let Err(e) = sw.write_raw_bytes(secondary_data) {
-                                state.set_error(e);
-                                return (false, false);
-                            }
+        let Some((batch, heap_size)) = next else { break };
+
+        // Write all blocks in the batch (reorder lock NOT held).
+        let mut batch_bytes: u64 = 0;
+        for block in &batch.blocks {
+            if let Err(e) = writer.write_all(&block.data) {
+                state.set_error(e);
+                return (false, false); // Error, not contention
+            }
+            batch_bytes += block.data.len() as u64;
+        }
+
+        // Write secondary data (e.g., rejects) in the same serial order
+        // (reorder lock NOT held).
+        if let Some(ref secondary_data) = batch.secondary_data {
+            if !secondary_data.is_empty() {
+                if let Some(ref secondary_mutex) = state.output.secondary_output {
+                    let mut sw_guard = secondary_mutex.lock();
+                    if let Some(ref mut sw) = *sw_guard {
+                        if let Err(e) = sw.write_raw_bytes(secondary_data) {
+                            state.set_error(e);
+                            return (false, false);
                         }
                     }
                 }
             }
-
-            // Update admission-control state so the scheduler-level
-            // write_reorder_is_memory_high signal stays accurate. (Compress
-            // does not consume this gate — see WritePipelineState docs.)
-            state.output.write_reorder_state.sub_heap_bytes(heap_size as u64);
-            state.output.write_reorder_state.update_next_seq(reorder.next_seq());
-
-            // Record bytes written for throughput metrics
-            if let Some(stats) = state.stats() {
-                stats.bytes_written.fetch_add(batch_bytes, Ordering::Relaxed);
-            }
-
-            // Use actual record count from the batch
-            let records_in_batch = batch.record_count;
-            state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
-            state.output.progress.log_if_needed(records_in_batch);
-            wrote_any = true;
         }
 
-        // Check if truly empty (queue drained and reorder buffer has no pending items)
-        q7_truly_empty = reorder.is_empty();
+        // Update admission-control state so the scheduler-level
+        // write_reorder_is_memory_high signal stays accurate. (Compress
+        // does not consume this gate — see WritePipelineState docs.)
+        state.output.write_reorder_state.sub_heap_bytes(heap_size as u64);
+
+        // Record bytes written for throughput metrics
+        if let Some(stats) = state.stats() {
+            stats.bytes_written.fetch_add(batch_bytes, Ordering::Relaxed);
+        }
+
+        // Use actual record count from the batch
+        let records_in_batch = batch.record_count;
+        state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
+        state.output.progress.log_if_needed(records_in_batch);
+        wrote_any = true;
     }
+
+    // Check if truly empty (queue drained and reorder buffer has no pending items).
+    let q7_truly_empty = {
+        let wait_start = std::time::Instant::now();
+        let reorder = state.output.write_reorder.lock();
+        if let Some(stats) = state.stats() {
+            stats.record_wait_time(PipelineStep::Write, wait_start.elapsed().as_nanos() as u64);
+        }
+        reorder.is_empty()
+    };
 
     // Record queue empty only if both Q7 queue AND reorder buffer are empty
     // (not when items are waiting out-of-order in the reorder buffer)
