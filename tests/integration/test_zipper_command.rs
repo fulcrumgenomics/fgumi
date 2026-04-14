@@ -5,6 +5,7 @@
 //! 2. Tag removal via `--tags-to-remove`
 //! 3. Error on missing input files
 
+use fgumi_lib::sam::SamTag;
 use fgumi_lib::sam::builder::RecordBuilder;
 use noodles::bam;
 use noodles::sam;
@@ -12,8 +13,9 @@ use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference};
@@ -131,7 +133,7 @@ fn test_zipper_basic_merge() {
     let records: Vec<RecordBuf> = reader.record_bufs(&header).map(|r| r.unwrap()).collect();
     assert_eq!(records.len(), 2, "Should have 2 records in output");
 
-    let rx_tag = Tag::from([b'R', b'X']);
+    let rx_tag = Tag::from(SamTag::RX);
     for record in &records {
         assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
     }
@@ -200,8 +202,8 @@ fn test_zipper_tag_removal() {
     let records: Vec<RecordBuf> = reader.record_bufs(&header).map(|r| r.unwrap()).collect();
     assert_eq!(records.len(), 1);
 
-    let rx_tag = Tag::from([b'R', b'X']);
-    let xy_tag = Tag::from([b'X', b'Y']);
+    let rx_tag = Tag::from(SamTag::RX);
+    let xy_tag = Tag::from(SamTag::new(b'X', b'Y'));
     assert!(records[0].data().get(&rx_tag).is_some(), "RX tag should be present");
     assert!(records[0].data().get(&xy_tag).is_none(), "XY tag should have been removed");
 }
@@ -316,7 +318,7 @@ fn test_zipper_bam_mapped_input() {
     let records: Vec<RecordBuf> = reader.record_bufs(&header).map(|r| r.unwrap()).collect();
     assert_eq!(records.len(), 2, "Should have 2 records in output");
 
-    let rx_tag = Tag::from([b'R', b'X']);
+    let rx_tag = Tag::from(SamTag::RX);
     for record in &records {
         assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
     }
@@ -324,4 +326,111 @@ fn test_zipper_bam_mapped_input() {
     // Verify warning about BAM input was emitted
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("BAM input detected"), "Should warn about BAM input. stderr: {stderr}");
+}
+
+/// Test zipper accepts BAM piped to stdin (auto-detected via BGZF magic bytes).
+///
+/// Common in nf-core / Galaxy pipelines that produce BAM from intermediate steps
+/// (e.g. `bwameth.py | samtools view -b | fgumi zipper`). Without auto-detection,
+/// fgumi treats stdin as SAM text and crashes with a confusing
+/// "invalid flags / lexical parse error" error from the SAM parser misreading
+/// BGZF binary bytes.
+#[test]
+fn test_zipper_bam_stdin_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let unmapped_bam = temp_dir.path().join("unmapped.bam");
+    let mapped_bam = temp_dir.path().join("mapped.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let ref_path = create_test_reference(temp_dir.path());
+
+    let unmapped_records = vec![
+        RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .unmapped(true)
+            .tag("RX", "AACCGGTT")
+            .tag("QX", "IIIIIIII")
+            .build(),
+        RecordBuilder::new()
+            .name("read2")
+            .sequence("TGCATGCA")
+            .qualities(&[30; 8])
+            .unmapped(true)
+            .tag("RX", "GGTTCCAA")
+            .tag("QX", "IIIIIIII")
+            .build(),
+    ];
+    create_unmapped_bam(&unmapped_bam, &unmapped_records);
+
+    let mapped_header = create_minimal_header("chr1", 10000);
+    let mapped_records = vec![
+        RecordBuilder::new()
+            .name("read1")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .mapping_quality(60)
+            .cigar("8M")
+            .build(),
+        RecordBuilder::new()
+            .name("read2")
+            .sequence("TGCATGCA")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(200)
+            .mapping_quality(60)
+            .cigar("8M")
+            .build(),
+    ];
+    create_mapped_bam(&mapped_bam, &mapped_header, &mapped_records);
+
+    // Pipe the BAM bytes into the child's stdin; do NOT pass --input so that
+    // the default ("-") triggers the stdin code path.
+    let bam_bytes = fs::read(&mapped_bam).expect("read mapped BAM bytes");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "zipper",
+            "--unmapped",
+            unmapped_bam.to_str().unwrap(),
+            "--reference",
+            ref_path.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--compression-level",
+            "1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn zipper command");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("Failed to open child stdin")
+        .write_all(&bam_bytes)
+        .expect("Failed to write BAM bytes to stdin");
+
+    let output = child.wait_with_output().expect("Failed to wait for zipper");
+
+    assert!(
+        output.status.success(),
+        "Zipper command failed with BAM on stdin: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_bam.exists(), "Output BAM not created");
+
+    // Verify output records have UMI tags transferred
+    let mut reader = bam::io::Reader::new(fs::File::open(&output_bam).unwrap());
+    let header = reader.read_header().unwrap();
+    let records: Vec<RecordBuf> = reader.record_bufs(&header).map(|r| r.unwrap()).collect();
+    assert_eq!(records.len(), 2, "Should have 2 records in output");
+
+    let rx_tag = Tag::from(SamTag::RX);
+    for record in &records {
+        assert!(record.data().get(&rx_tag).is_some(), "Output record should have RX tag");
+    }
 }
