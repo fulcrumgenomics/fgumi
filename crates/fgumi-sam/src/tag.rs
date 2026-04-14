@@ -116,6 +116,10 @@ impl SamTag {
     pub const PG: SamTag = SamTag::new(b'P', b'G');
     /// Adapter clipping position (e.g. from Picard `MarkIlluminaAdapters`).
     pub const XT: SamTag = SamTag::new(b'X', b'T');
+    /// Bisulfite strand (written by `bwameth` and related tools): `Z:f` for the
+    /// forward/top strand, `Z:r` for the reverse/bottom strand. Used by `fgumi
+    /// zipper --restore-unconverted-bases` to decide which bases to restore.
+    pub const YD: SamTag = SamTag::new(b'Y', b'D');
 
     // ── fgumi-internal tags ─────────────────────────────────────────────────
 
