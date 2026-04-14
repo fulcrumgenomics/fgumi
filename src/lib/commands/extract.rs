@@ -368,10 +368,15 @@ values.
 
 UMIs may be extracted from the read sequences, the read names, or both. If
 `--extract-umis-from-read-names` is specified, any UMIs present in the read names are extracted;
-read names are expected to be `:` -separated with any UMIs present in the 8th field. If UMI
-segments are present in the read structures those will also be extracted. If UMIs are present in
-both, the final UMIs are constructed by first taking the UMIs from the read names, then adding a
-hyphen, then the UMIs extracted from the reads.
+read names are expected to be `:`-separated and the UMI is taken from the **last** field. At
+least 8 fields must be present — the standard Illumina shape
+`@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>:<UMI>`. Names with 9+ fields (e.g.
+produced by demultiplexers that fold the sample index into the colon-separated portion) are
+also handled, with the UMI still coming from the last field. Any `+` characters in the
+extracted UMI are normalized to `-`. If UMI segments are present in the read structures those
+will also be extracted. If UMIs are present in both, the final UMIs are constructed by first
+taking the UMIs from the read names, then adding a hyphen, then the UMIs extracted from the
+reads.
 "#
 )]
 #[command(verbatim_doc_comment)]
@@ -635,7 +640,26 @@ impl Extract {
         BString::from(result)
     }
 
-    /// Extracts read name, optionally extracting UMI from the 8th colon-delimited field
+    /// Extracts the read name and, if requested, the UMI from the read name.
+    ///
+    /// The standard Illumina FASTQ read name shape with a UMI present is:
+    ///
+    ///   `@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>:<UMI>`
+    ///
+    /// (8 `:`-separated fields; the trailing space-separated comment such as
+    /// `1:N:0:<index>` is not counted, as it is stripped before parsing). See
+    /// <https://support.illumina.com/help/BaseSpace_OLH_009008/Content/Source/Informatics/BS/FileFormat_FASTQ-files_swBS.htm>.
+    ///
+    /// Some demultiplexers fold additional information (e.g. the sample index) into
+    /// the colon-separated portion of the read name, producing names with 9+ fields
+    /// where the UMI is the **last** field rather than the 8th. To handle both
+    /// shapes uniformly — matching the behavior of fgbio's
+    /// `Umis.extractUmisFromReadName` — this function returns the **last**
+    /// `:`-separated field as the UMI when at least 8 fields are present.
+    ///
+    /// Names with fewer than 8 fields are treated as not containing a UMI and
+    /// produce `None`. Any `+` characters in the extracted UMI (used by some
+    /// demultiplexers to delimit dual UMIs) are normalized to `-`.
     fn extract_read_name_and_umi(
         header: &Vec<u8>,
         extract_umis: bool,
@@ -650,19 +674,25 @@ impl Extract {
             return (name_part.to_vec(), None);
         }
 
-        // Count colons to find 8th field (UMI)
+        // The UMI is the last `:`-separated field, but only if the name has at
+        // least 8 fields (matching the standard Illumina read-name layout). This
+        // works for both 8-field names (UMI in field 8) and 9+ field names where
+        // a demultiplexer has appended additional fields (e.g. a sample index)
+        // before the UMI.
         let parts: Vec<&[u8]> = name_part.split(|&b| b == b':').collect();
 
         if parts.len() >= 8 {
-            let mut umi = parts[7].to_vec();
-            if !umi.is_empty() {
-                // Normalize '+' to '-' in UMI
-                for byte in &mut umi {
-                    if *byte == b'+' {
-                        *byte = b'-';
+            if let Some(last) = parts.last() {
+                if !last.is_empty() {
+                    let mut umi = last.to_vec();
+                    // Normalize '+' to '-' in UMI
+                    for byte in &mut umi {
+                        if *byte == b'+' {
+                            *byte = b'-';
+                        }
                     }
+                    return (name_part.to_vec(), Some(umi));
                 }
-                return (name_part.to_vec(), Some(umi));
             }
         }
 
@@ -2229,6 +2259,147 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(get_tag_string(&recs[0], "RX"), Some("ACGT-CGTA-GG-CC".to_string()));
         assert_eq!(get_tag_string(&recs[1], "RX"), Some("TTGA-TAAT-TA-AA".to_string()));
+    }
+
+    /// Tests for [`Extract::extract_read_name_and_umi`].
+    ///
+    /// fgumi previously hard-coded the 8th `:`-separated field (`parts[7]`) as the UMI,
+    /// matching the standard Illumina FASTQ read name shape with UMI present:
+    ///
+    ///   `@<instr>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>:<UMI>`
+    ///
+    /// However, some demultiplexers (e.g. ones that also fold the sample index into the
+    /// `:`-separated portion) produce read names with 9+ fields where the UMI is the *last*
+    /// field, not the 8th. That matches the behavior of fgbio's
+    /// `Umis.extractUmisFromReadName`, which always returns the last `:`-separated field
+    /// as the UMI. These tests pin the expected behavior:
+    ///
+    /// - 7 fields → no UMI (fgbio's strict-mode behavior, preserved for backward compat).
+    /// - 8 fields → last field as UMI.
+    /// - 9+ fields → last field as UMI (was broken; previously returned `parts[7]`).
+    /// - `+` in the UMI is normalized to `-`.
+    /// - `extract=false` returns `None` regardless of read name shape.
+    #[test]
+    fn test_extract_read_name_and_umi_nine_fields_takes_last() {
+        // Real-world example: BCL Convert / external demux that places the sample index
+        // in field 8 and the UMI in field 9 (here, "TCNGCG" is a 6 bp duplex UMI).
+        let header =
+            b"@LH00620:304:23LLHJLT4:7:1101:2578:1070:CAATCTATAA+rTTACATAGTT:TCNGCG".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(
+            name,
+            b"LH00620:304:23LLHJLT4:7:1101:2578:1070:CAATCTATAA+rTTACATAGTT:TCNGCG".to_vec()
+        );
+        assert_eq!(umi, Some(b"TCNGCG".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_eight_fields_takes_last() {
+        let header = b"@q1:2:3:4:5:6:7:ACGT".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
+        assert_eq!(umi, Some(b"ACGT".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_seven_fields_returns_none() {
+        let header = b"@q1:2:3:4:5:6:7".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(name, b"q1:2:3:4:5:6:7".to_vec());
+        assert_eq!(umi, None);
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_normalizes_plus_to_hyphen() {
+        let header = b"@q1:2:3:4:5:6:7:ACGT+CGTA".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(umi, Some(b"ACGT-CGTA".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_normalizes_plus_in_nine_fields() {
+        // 9-field name with duplex-style UMI containing '+'.
+        let header = b"@A:B:C:D:E:F:G:CAATCTATAA+TTACATAGTT:ACGT+CGTA".to_vec();
+        let (_name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(umi, Some(b"ACGT-CGTA".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_strips_space_comment() {
+        // Standard Illumina header with space-separated comment after the name.
+        let header = b"@q1:2:3:4:5:6:7:ACGT 1:N:0:NNNN".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, true);
+        assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
+        assert_eq!(umi, Some(b"ACGT".to_vec()));
+    }
+
+    #[test]
+    fn test_extract_read_name_and_umi_extract_false_returns_none() {
+        let header = b"@q1:2:3:4:5:6:7:ACGT".to_vec();
+        let (name, umi) = Extract::extract_read_name_and_umi(&header, false);
+        assert_eq!(name, b"q1:2:3:4:5:6:7:ACGT".to_vec());
+        assert_eq!(umi, None);
+    }
+
+    #[test]
+    fn test_extract_umis_from_read_names_nine_fields_via_execute() {
+        // End-to-end: 9-field read names (sample index in field 8, UMI in field 9) must
+        // produce RX tags equal to the *last* field — not the 8th (sample index).
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let r1 = create_fastq(
+            &tmp,
+            "r1.fq",
+            &[
+                (
+                    "LH00620:304:23LLHJLT4:7:1101:2578:1070:CAATCTATAA+rTTACATAGTT:TCNGCG",
+                    "AAAAAAAAAA",
+                    "==========",
+                ),
+                (
+                    "LH00620:304:23LLHJLT4:7:1101:3565:1070:CAATCTATAA+rTTACATAGTT:TTNCCT",
+                    "TAAAAAAAAA",
+                    "==========",
+                ),
+            ],
+        );
+        let output = tmp.path().join("output.bam");
+
+        let extract = Extract {
+            inputs: vec![r1],
+            output: output.clone(),
+            read_structures: vec![],
+            store_umi_quals: false,
+            store_cell_quals: false,
+            store_sample_barcode_qualities: false,
+            extract_umis_from_read_names: true,
+            annotate_read_names: false,
+            single_tag: None,
+            clipping_attribute: None,
+            read_group_id: "A".to_string(),
+            sample: "s".to_string(),
+            library: "l".to_string(),
+            barcode: None,
+            platform: "illumina".to_string(),
+            platform_unit: None,
+            platform_model: None,
+            sequencing_center: None,
+            predicted_insert_size: None,
+            description: None,
+            comment: vec![],
+            run_date: None,
+            threading: ThreadingOptions::none(),
+            compression: CompressionOptions { compression_level: 1 },
+            scheduler_opts: SchedulerOptions::default(),
+            queue_memory: QueueMemoryOptions::default(),
+        };
+
+        extract.execute("test").expect("execute should succeed");
+
+        let recs = read_bam_records(&output);
+        assert_eq!(recs.len(), 2);
+        // Must be the 9th (last) field, NOT the 8th (sample index "CAATCTATAA-rTTACATAGTT").
+        assert_eq!(get_tag_string(&recs[0], "RX"), Some("TCNGCG".to_string()));
+        assert_eq!(get_tag_string(&recs[1], "RX"), Some("TTNCCT".to_string()));
     }
 
     #[test]
