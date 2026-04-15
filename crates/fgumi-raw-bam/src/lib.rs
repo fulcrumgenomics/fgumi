@@ -17,11 +17,42 @@ pub mod noodles_compat;
 
 // Re-exports — callers use fgumi_raw_bam::FooBar etc.
 //
-// fields uses a wildcard because it defines both a `flags` free-function and a
-// `flags` module (flag-bit constants); explicit re-export of the same name is
-// ambiguous, so the wildcard is the cleanest option for that module. Items
-// demoted to pub(crate) are not re-exported by the wildcard.
-pub use fields::*;
+// Explicit named list now that fn flags() has been demoted to pub(crate).
+// The `flags` entry below re-exports the pub mod (flag-bit constants).
+pub use fields::{
+    // -- constants --
+    BAM_MAGIC,
+    MIN_BAM_RECORD_LEN,
+    // -- types --
+    RawRecordMut,
+    RawRecordView,
+    TemplateCoordFields,
+    TemplateCoordFlags,
+    // -- field accessors (free functions) --
+    aux_data_offset,
+    aux_data_offset_from_record,
+    aux_data_slice,
+    // -- flag-bit constants module (pub mod, not fn) --
+    flags,
+    l_seq,
+    mapq,
+    mate_pos,
+    mate_ref_id,
+    pos,
+    qual_offset,
+    read_name,
+    ref_id,
+    seq_offset,
+    // -- field mutators (free functions) --
+    set_flags,
+    set_mate_pos,
+    set_mate_ref_id,
+    set_pos,
+    set_ref_id,
+    set_template_length,
+    tag_value_size,
+    template_length,
+};
 
 // -- builder --
 pub use builder::UnmappedBamRecordBuilder;
