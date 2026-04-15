@@ -120,6 +120,10 @@ fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 name = "core_functions"
 harness = false
 
+[[bench]]
+name = "reorder_buffer"
+harness = false
+
 [build-dependencies]
 built = { version = "0", features = ["git2"] }
 
