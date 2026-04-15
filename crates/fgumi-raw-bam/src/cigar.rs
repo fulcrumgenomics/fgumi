@@ -30,18 +30,38 @@ pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op:
     }
 }
 
+/// BAM CIGAR op-type -> (`consume_query`, `consume_ref`) packed bitmask.
+///
+/// Encodes both properties for every op type (0..8) in a single u32. Bit
+/// `(op << 1)` is `consume_query`; bit `(op << 1 | 1)` is `consume_ref`. Bits
+/// for op values >= 9 are zero. Matches htslib's `BAM_CIGAR_TYPE` in
+/// `sam.h`, giving branchless `consumes_*` queries.
+///
+/// | op | mnemonic | consume_query | consume_ref |
+/// |----|----------|---------------|-------------|
+/// | 0  | M        | yes           | yes         |
+/// | 1  | I        | yes           | no          |
+/// | 2  | D        | no            | yes         |
+/// | 3  | N        | no            | yes         |
+/// | 4  | S        | yes           | no          |
+/// | 5  | H        | no            | no          |
+/// | 6  | P        | no            | no          |
+/// | 7  | =        | yes           | yes         |
+/// | 8  | X        | yes           | yes         |
+const BAM_CIGAR_TYPE: u32 = 0x3C1A7;
+
 /// Returns true if the CIGAR op type consumes the reference (M, D, N, =, X).
 #[inline]
 #[must_use]
 pub const fn consumes_ref(op_type: u32) -> bool {
-    matches!(op_type, 0 | 2 | 3 | 7 | 8)
+    (BAM_CIGAR_TYPE >> (op_type << 1)) & 2 != 0
 }
 
 /// Returns true if the CIGAR op type consumes the query including soft clips (M, I, S, =, X).
 #[inline]
 #[must_use]
 pub const fn consumes_query(op_type: u32) -> bool {
-    matches!(op_type, 0 | 1 | 4 | 7 | 8)
+    (BAM_CIGAR_TYPE >> (op_type << 1)) & 1 != 0
 }
 
 /// Returns true if the CIGAR op type consumes the read/query excluding soft clips (M, I, =, X).
@@ -880,6 +900,31 @@ impl<'a> RawRecordView<'a> {
             .sum()
     }
 
+    /// Compute reference-consuming and query-consuming lengths in one pass.
+    ///
+    /// Equivalent to `(self.reference_length(), self.query_length())` but
+    /// walks the CIGAR only once. Use this when both values are needed
+    /// (e.g. record validation, alignment-end computation).
+    ///
+    /// Returns `(ref_length, query_length)`.
+    #[inline]
+    #[must_use]
+    pub fn cigar_lengths(&self) -> (i32, usize) {
+        let mut ref_len = 0i32;
+        let mut q_len = 0usize;
+        for op in self.cigar_ops_iter() {
+            let ty = op & 0xF;
+            let len_u32 = op >> 4;
+            if consumes_ref(ty) {
+                ref_len += len_u32.cast_signed();
+            }
+            if consumes_query(ty) {
+                q_len += len_u32 as usize;
+            }
+        }
+        (ref_len, q_len)
+    }
+
     /// Compute 1-based alignment end position.
     #[inline]
     #[must_use]
@@ -913,6 +958,36 @@ impl<'a> RawRecordView<'a> {
 mod tests {
     use super::*;
     use crate::testutil::*;
+
+    // ========================================================================
+    // BAM_CIGAR_TYPE bitmask tests
+    // ========================================================================
+
+    #[test]
+    fn test_cigar_type_bitmask_matches_spec() {
+        // Spec: (consumes_query, consumes_ref) for each op type 0..8
+        let expected = [
+            (true, true),   // 0: M
+            (true, false),  // 1: I
+            (false, true),  // 2: D
+            (false, true),  // 3: N
+            (true, false),  // 4: S
+            (false, false), // 5: H
+            (false, false), // 6: P
+            (true, true),   // 7: =
+            (true, true),   // 8: X
+        ];
+        for (op, &(eq, er)) in expected.iter().enumerate() {
+            let op = u32::try_from(op).unwrap();
+            assert_eq!(consumes_query(op), eq, "consumes_query({op})");
+            assert_eq!(consumes_ref(op), er, "consumes_ref({op})");
+        }
+        // Op values >= 9 should return false for both
+        for op in 9u32..=15 {
+            assert!(!consumes_query(op), "consumes_query({op}) should be false");
+            assert!(!consumes_ref(op), "consumes_ref({op}) should be false");
+        }
+    }
 
     // ========================================================================
     // unclipped_start_from_cigar / unclipped_end_from_cigar tests
@@ -1965,5 +2040,47 @@ mod tests {
         assert_eq!(v.query_length(), 100);
         assert_eq!(v.cigar_raw_bytes().len(), 12);
         assert_eq!(v.cigar_ops_iter().count(), 3);
+    }
+
+    // ========================================================================
+    // cigar_lengths tests
+    // ========================================================================
+
+    #[test]
+    fn test_cigar_lengths_matches_separate_calls() {
+        use crate::fields::RawRecordView;
+
+        // Record with mixed CIGAR: 50M 5D 10I 35M = ref 90, query 95
+        let rec = make_bam_bytes(
+            0,
+            100,
+            0,
+            b"r",
+            &[
+                encode_op(0, 50), // 50M
+                encode_op(2, 5),  // 5D (ref only)
+                encode_op(1, 10), // 10I (query only)
+                encode_op(0, 35), // 35M
+            ],
+            95,
+            -1,
+            -1,
+            &[],
+        );
+        let v = RawRecordView::new(&rec);
+        let (ref_len, q_len) = v.cigar_lengths();
+        assert_eq!(ref_len, 90);
+        assert_eq!(q_len, 95);
+        // Agree with the single-purpose methods
+        assert_eq!(ref_len, v.reference_length());
+        assert_eq!(q_len, v.query_length());
+    }
+
+    #[test]
+    fn test_cigar_lengths_empty_cigar() {
+        use crate::fields::RawRecordView;
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.cigar_lengths(), (0, 0));
     }
 }

@@ -379,6 +379,15 @@ impl RawRecord {
         RawRecordView::new(&self.0).query_length()
     }
 
+    /// Compute reference-consuming and query-consuming lengths in one pass.
+    ///
+    /// Returns `(ref_length, query_length)`. See [`RawRecordView::cigar_lengths`].
+    #[inline]
+    #[must_use]
+    pub fn cigar_lengths(&self) -> (i32, usize) {
+        self.view().cigar_lengths()
+    }
+
     /// Return the 1-based alignment end position, or `None` if unmapped.
     #[inline]
     #[must_use]
