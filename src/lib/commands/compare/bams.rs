@@ -41,25 +41,48 @@ use std::thread;
 use crate::commands::command::Command;
 use crate::commands::common::parse_bool;
 
-use super::raw_compare::{raw_compare_structured, raw_records_byte_equal};
+use super::raw_compare::{raw_compare_structured_except, raw_records_byte_equal};
 
-/// Comparison mode for BAM files
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-pub enum CompareMode {
-    /// Full comparison: verify MI groupings AND compare all BAM content
-    /// Both files must be in the same order (e.g., query-name sorted).
-    /// This combines grouping equivalence check with full content comparison.
-    #[default]
-    Full,
-    /// Content comparison: all fields and tags must match exactly
-    /// This is a pure record-by-record comparison without MI grouping analysis.
-    Content,
-    /// Grouping comparison: verify MI groupings are equivalent (for grouped BAMs)
-    /// Both files must be in the same order (e.g., query-name sorted).
-    /// Validates read names and R1/R2 flags match, then verifies that reads
-    /// with the same MI in one file have the same MI in the other.
-    /// Does NOT compare other BAM content (sequence, quality, other tags).
-    Grouping,
+/// Preset comparison settings for a specific fgumi command.
+///
+/// Each variant encodes the canonical `--check-grouping` and `--ignore-order` defaults
+/// for comparing BAM output from that pipeline stage. Explicit flags override the
+/// preset.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CommandPreset {
+    /// No MI tags; exact content comparison
+    Extract,
+    /// No MI tags; exact content comparison
+    Zipper,
+    /// No MI tags; exact content comparison
+    Sort,
+    /// No MI tags; exact content comparison
+    Correct,
+    /// No MI tags; exact content comparison
+    Dedup,
+    /// MI values differ between tools; grouping equivalence check only (records may be reordered)
+    Group,
+    /// Has MI tags; content comparison excluding MI + MI grouping equivalence
+    Simplex,
+    /// Has MI tags; content comparison excluding MI + MI grouping equivalence
+    Duplex,
+    /// Has MI tags; content comparison excluding MI + MI grouping equivalence
+    Codec,
+    /// Has MI tags; content comparison excluding MI + MI grouping equivalence
+    Filter,
+}
+
+impl CommandPreset {
+    /// Returns the default `(check_grouping, ignore_order)` for this preset.
+    fn defaults(self) -> (bool, bool) {
+        match self {
+            Self::Group => (true, true),
+            Self::Simplex | Self::Duplex | Self::Codec | Self::Filter => (true, false),
+            Self::Extract | Self::Zipper | Self::Sort | Self::Correct | Self::Dedup => {
+                (false, false)
+            }
+        }
+    }
 }
 
 /// Compare two BAM files for equality.
@@ -81,69 +104,51 @@ Tags are compared by value only - the order of tags within a record does not mat
 This allows comparing BAM files produced by different tools that may serialize tags
 in different orders.
 
-MODES:
+COMPARISON BEHAVIOR:
 
-  full (default):
-    Combines grouping equivalence check with full content comparison.
-    Both files must be in the same order (e.g., query-name sorted).
-    Verifies MI groupings are equivalent AND all other fields match.
+  By default, records are compared exactly (all fields and tags must match,
+  including MI). Two optional flags adjust this for stages where MI values
+  legitimately differ between tools:
 
-  content:
-    Pure record-by-record comparison of all fields and tags.
-    Does not analyze MI groupings - just compares raw content.
+  --check-grouping (default: false):
+    Verifies that MI groupings are semantically equivalent between the files
+    (reads sharing an MI in one file also share an MI in the other), and
+    excludes MI from the tag comparison so differing MI values don't fail
+    content checks. Records must be in the same order (e.g., queryname
+    sorted) unless --ignore-order is also set.
 
-  grouping:
-    For comparing grouped BAM files where MI assignment order may differ.
-    Both files MUST be in the same order (e.g., query-name sorted with `fgumi sort --order queryname`).
-    Validates that:
-    1. Read names and R1/R2 flags match between files
-    2. Reads with the same MI in file 1 have the same MI in file 2 (and vice versa)
-    Does NOT compare other BAM content (sequence, quality, other tags).
-    This proves the grouping is semantically equivalent even if MI values differ.
+  --ignore-order (default: false):
+    Allows records to appear in different order between the two files. Only
+    valid with --check-grouping, because content comparison is inherently
+    record-by-record and needs ordering to pair records up. With both flags,
+    only MI grouping equivalence is verified (content is not compared).
 
-RECOMMENDED SETTINGS BY COMMAND:
+COMMAND PRESETS (--command):
 
-  When comparing output from different fgumi commands, use these settings:
+  The --command flag sets --check-grouping and --ignore-order to the canonical
+  defaults for comparing output from a specific fgumi pipeline stage. Explicit
+  flags override the preset.
 
-  Command         --mode      --ignore-order   Notes
+  Command         --check-grouping   --ignore-order   Notes
   ─────────────────────────────────────────────────────────────────────────
-  extract         content     false            No MI tags; deterministic
-  zipper          content     false            Preserves MI tags unchanged
-  group           full        false            Has MI tags; deterministic
-  simplex         grouping    true             Non-deterministic with --threads
-  duplex          grouping    true             Non-deterministic with --threads
-  codec           grouping    true             Non-deterministic with --threads
-  filter          content     false            Passes through MI tags unchanged
-  clip            content     false            Does not modify MI tags
-  correct         content     false            Modifies RX tag only, not MI
-  downsample      content     false            Deterministic with seed
-  review          content     false            Preserves MI tags
-
-  For simulate subcommands:
-  mapped-reads    content     false            Template-coordinate sorted
-  grouped-reads   full        false            Has MI tags; deterministic
-  consensus-reads content     false            Unmapped with consensus tags
-
-  Examples for each command:
-
-    # extract output (no MI tags)
-    fgumi compare bams extracted1.bam extracted2.bam --mode content
-
-    # group output (has MI tags)
-    fgumi compare bams grouped1.bam grouped2.bam --mode full
-
-    # simplex/duplex/codec output (MI grouping, non-deterministic order)
-    fgumi compare bams consensus1.bam consensus2.bam --mode grouping --ignore-order
-
-    # filter/clip/correct/downsample output (preserves content)
-    fgumi compare bams filtered1.bam filtered2.bam --mode content
+  extract         false              false            No MI tags
+  zipper          false              false            No MI tags
+  sort            false              false            No MI tags
+  correct         false              false            No MI tags (modifies RX only)
+  dedup           false              false            No MI tags
+  group           true               true             MI values differ between tools
+  simplex         true               false            Has MI tags (carried from group)
+  duplex          true               false            Has MI tags (carried from group)
+  codec           true               false            Has MI tags (carried from group)
+  filter          true               false            Has MI tags (carried from consensus)
 
 Example usage:
-  fgumi compare bams bam1.bam bam2.bam                    # full mode (default)
-  fgumi compare bams bam1.bam bam2.bam --mode content    # content only
-  fgumi compare bams bam1.bam bam2.bam --mode grouping   # grouping only
-  fgumi compare bams bam1.bam bam2.bam --mode grouping --ignore-order  # consensus output
-  fgumi compare bams bam1.bam bam2.bam --max-diffs 20
+  fgumi compare bams --command group a.bam b.bam              # preset for group stage
+  fgumi compare bams --command simplex a.bam b.bam            # preset for simplex stage
+  fgumi compare bams a.bam b.bam                              # exact content comparison
+  fgumi compare bams a.bam b.bam --check-grouping             # MI equivalence + content (excl. MI)
+  fgumi compare bams a.bam b.bam --check-grouping --ignore-order  # MI equivalence only, unordered
+  fgumi compare bams a.bam b.bam --max-diffs 20
 "#
 )]
 pub struct CompareBams {
@@ -155,11 +160,27 @@ pub struct CompareBams {
     #[arg(index = 2)]
     pub bam2: PathBuf,
 
-    /// Comparison mode: 'full' (MI grouping + content, for group output),
-    /// 'content' (all fields, for extract/filter/clip/correct/downsample output),
-    /// 'grouping' (MI equivalence only, for simplex/duplex/codec output)
-    #[arg(long = "mode", default_value = "full")]
-    pub mode: CompareMode,
+    /// Use preset comparison settings for a specific fgumi command.
+    /// Sets --check-grouping and --ignore-order to the canonical defaults for
+    /// comparing BAM output from that pipeline stage. Explicit flags override
+    /// the preset.
+    #[arg(long = "command", short = 'c')]
+    pub command: Option<CommandPreset>,
+
+    /// Check that MI groupings are semantically equivalent, and exclude MI from
+    /// the tag comparison. Use for stages where MI values may legitimately differ
+    /// between tools (group) or where MI carries through deterministic consensus
+    /// (simplex/duplex/codec/filter). Overrides --command preset if both given.
+    #[arg(long = "check-grouping", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub check_grouping: Option<bool>,
+
+    /// Allow records to appear in different order between the two files.
+    /// Only valid with --check-grouping. With both flags set, only MI grouping
+    /// equivalence is verified (content is not compared, because records can't
+    /// be paired up without a shared ordering).
+    /// Overrides --command preset if both given.
+    #[arg(long = "ignore-order", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub ignore_order: Option<bool>,
 
     /// Maximum number of differences to report in detail
     #[arg(short = 'm', long = "max-diffs", default_value = "10")]
@@ -168,13 +189,6 @@ pub struct CompareBams {
     /// Quiet mode - only exit code indicates result (0=equal, 1=different)
     #[arg(short = 'q', long = "quiet", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub quiet: bool,
-
-    /// Ignore record order when comparing in grouping mode.
-    /// Required for comparing output from consensus commands (simplex/duplex/codec)
-    /// when run with --threads, as parallel processing causes non-deterministic ordering.
-    /// Only valid with --mode grouping.
-    #[arg(long = "ignore-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub ignore_order: bool,
 
     /// Initial buffer size for --ignore-order mode (number of records)
     #[arg(long = "buffer-size", default_value = "1000")]
@@ -219,8 +233,6 @@ enum DiffType {
     CountMismatch,
     CoreDiff,
     TagDiff,
-    ReadNameMismatch,
-    FlagMismatch,
 }
 
 impl std::fmt::Display for DiffType {
@@ -229,8 +241,6 @@ impl std::fmt::Display for DiffType {
             DiffType::CountMismatch => write!(f, "count_mismatch"),
             DiffType::CoreDiff => write!(f, "core_diff"),
             DiffType::TagDiff => write!(f, "tag_diff"),
-            DiffType::ReadNameMismatch => write!(f, "read_name_mismatch"),
-            DiffType::FlagMismatch => write!(f, "flag_mismatch"),
         }
     }
 }
@@ -387,20 +397,6 @@ struct RecordCompareResult {
     diff_detail: Option<DiffDetail>,
 }
 
-/// Result of comparing a single pair of records in grouping mode
-#[derive(Debug)]
-struct GroupingCompareResult {
-    record_num: u64,
-    key_hash: ReadKeyHash,
-    /// Read name as String, only populated when needed for error reporting
-    read_name_for_display: Option<String>,
-    mi1: Option<i64>,
-    mi2: Option<i64>,
-    name_match: bool,
-    flag_match: bool,
-    diff_detail: Option<DiffDetail>,
-}
-
 // ============================================================================
 // Types and MI map helpers (using ahash)
 // ============================================================================
@@ -497,11 +493,7 @@ fn build_mi_map_parallel(
 struct GroupingStats {
     total_records: u64,
     order_mismatches: u64,
-    missing_mi_bam1: u64,
-    missing_mi_bam2: u64,
     grouping_mismatches: u64,
-    unique_groups_bam1: usize,
-    unique_groups_bam2: usize,
 }
 
 /// Statistics for unordered grouping comparison mode.
@@ -615,6 +607,7 @@ fn compare_raw_batch_parallel(
     header1: &Header,
     header2: &Header,
     start_index: u64,
+    skip: &[[u8; 2]],
 ) -> (Vec<RecordCompareResult>, usize, usize, usize, usize, usize) {
     let results: Vec<_> = batch1
         .par_iter()
@@ -634,15 +627,12 @@ fn compare_raw_batch_parallel(
             }
 
             // Tier 2: Structured raw comparison — avoids full deserialization
-            // Note: RawCompareResult.tags_match = byte-identical tags,
-            //       RawCompareResult.tag_order_match = semantically equal (order-independent)
-            // RecordCompareResult.tags_match = semantic match, .tag_order_match = byte-identical
-            let raw_result = raw_compare_structured(r1, r2);
+            let raw_result = raw_compare_structured_except(r1, r2, skip);
             if raw_result.core_match && raw_result.tag_order_match {
                 return RecordCompareResult {
                     core_match: true,
                     tags_match: true,
-                    tag_order_match: raw_result.tags_match,
+                    tag_order_match: raw_result.filtered_tags_match,
                     diff_detail: None,
                 };
             }
@@ -692,6 +682,10 @@ fn compare_raw_batch_parallel(
                 all_tags.dedup();
                 let diffs: Vec<String> = all_tags
                     .iter()
+                    .filter(|tag| {
+                        let bytes = tag.as_bytes();
+                        bytes.len() != 2 || !skip.contains(&[bytes[0], bytes[1]])
+                    })
                     .filter_map(|tag| {
                         let v1 = tags1.get(*tag);
                         let v2 = tags2.get(*tag);
@@ -749,7 +743,7 @@ fn compare_raw_batch_parallel(
             RecordCompareResult {
                 core_match: raw_result.core_match,
                 tags_match: raw_result.tag_order_match,
-                tag_order_match: raw_result.tags_match,
+                tag_order_match: raw_result.filtered_tags_match,
                 diff_detail,
             }
         })
@@ -781,102 +775,37 @@ fn compare_raw_batch_parallel(
     (results, core_matches, core_diffs, tag_matches, tag_diffs, tag_order_diffs)
 }
 
-/// Compare a batch of raw records for grouping data (read name, R1/R2 flag, MI tag).
-///
-/// Uses zero-copy field accessors on raw BAM bytes instead of decoded `RecordBuf`.
-/// Read names are compared as raw bytes; String conversion only happens for error reporting.
-fn compare_raw_batch_grouping_parallel(
-    batch1: &[RawRecord],
-    batch2: &[RawRecord],
-    start_index: u64,
-    max_diffs: usize,
-    existing_diffs: usize,
-) -> Vec<GroupingCompareResult> {
-    batch1
-        .par_iter()
-        .zip(batch2.par_iter())
-        .enumerate()
-        .map(|(i, (r1, r2))| {
-            let record_num = start_index + i as u64 + 1;
-            let name1_bytes = raw_fields::read_name(r1.as_ref());
-            let name2_bytes = raw_fields::read_name(r2.as_ref());
-            let is_read1_r1 = is_first_segment_raw(r1);
-            let is_read1_r2 = is_first_segment_raw(r2);
-
-            let name_match = name1_bytes == name2_bytes;
-            let flag_match = is_read1_r1 == is_read1_r2;
-
-            let key_hash = hash_read_key_raw(name1_bytes, is_read1_r1);
-            let mi1 = get_mi_tag_raw_i64(r1);
-            let mi2 = get_mi_tag_raw_i64(r2);
-
-            let within_diff_budget = existing_diffs + i < max_diffs;
-            let needs_detail = within_diff_budget && (!name_match || !flag_match);
-            let diff_detail = if needs_detail {
-                // Only allocate Strings when we actually need them for error reporting
-                let qname1 = String::from_utf8_lossy(name1_bytes).into_owned();
-                if name_match {
-                    Some(DiffDetail {
-                        record_num,
-                        qname: qname1,
-                        flags: raw_fields::flags(r1.as_ref()).to_string(),
-                        diff_type: DiffType::FlagMismatch,
-                        diffs: vec![format!(
-                            "R1/R2 flags differ: is_read1={} vs is_read1={}",
-                            is_read1_r1, is_read1_r2
-                        )],
-                    })
-                } else {
-                    let qname2 = String::from_utf8_lossy(name2_bytes).into_owned();
-                    Some(DiffDetail {
-                        record_num,
-                        qname: qname1,
-                        flags: raw_fields::flags(r1.as_ref()).to_string(),
-                        diff_type: DiffType::ReadNameMismatch,
-                        diffs: vec![format!(
-                            "Read names differ: '{}' vs '{}'",
-                            String::from_utf8_lossy(name1_bytes),
-                            qname2
-                        )],
-                    })
-                }
-            } else {
-                None
-            };
-
-            // Populate read name for display when we need it for missing-MI error reporting
-            let needs_name = within_diff_budget && (mi1.is_none() ^ mi2.is_none());
-            let read_name_for_display = if needs_name {
-                Some(String::from_utf8_lossy(name1_bytes).into_owned())
-            } else {
-                None
-            };
-
-            GroupingCompareResult {
-                record_num,
-                key_hash,
-                read_name_for_display,
-                mi1,
-                mi2,
-                name_match,
-                flag_match,
-                diff_detail,
-            }
-        })
-        .collect()
-}
-
 impl Command for CompareBams {
     fn execute(&self, _command_line: &str) -> Result<()> {
         validate_file_exists(&self.bam1, "First BAM")?;
         validate_file_exists(&self.bam2, "Second BAM")?;
 
+        let (check_grouping, ignore_order) = self.effective_settings();
+
+        if ignore_order && !check_grouping {
+            bail!("--ignore-order requires --check-grouping");
+        }
+
+        if let Some(preset) = self.command {
+            info!(
+                "Using --command {:?} preset: check-grouping={}, ignore-order={}{}",
+                preset,
+                check_grouping,
+                ignore_order,
+                if self.check_grouping.is_some() || self.ignore_order.is_some() {
+                    " (with explicit overrides)"
+                } else {
+                    ""
+                }
+            );
+        }
+
         let timer = OperationTimer::new("Comparing BAMs");
 
-        let total_records = match self.mode {
-            CompareMode::Full => self.execute_full()?,
-            CompareMode::Content => self.execute_content()?,
-            CompareMode::Grouping => self.execute_grouping()?,
+        let total_records = match (check_grouping, ignore_order) {
+            (false, _) => self.execute_content()?,
+            (true, false) => self.execute_full()?,
+            (true, true) => self.execute_grouping_unordered()?,
         };
 
         timer.log_completion(total_records);
@@ -885,6 +814,16 @@ impl Command for CompareBams {
 }
 
 impl CompareBams {
+    /// Returns the effective `(check_grouping, ignore_order)`, resolving:
+    /// explicit flag > preset default > false.
+    fn effective_settings(&self) -> (bool, bool) {
+        let preset_defaults = self.command.map(|p| p.defaults());
+        let check_grouping =
+            self.check_grouping.or(preset_defaults.map(|(cg, _)| cg)).unwrap_or(false);
+        let ignore_order = self.ignore_order.or(preset_defaults.map(|(_, io)| io)).unwrap_or(false);
+        (check_grouping, ignore_order)
+    }
+
     fn format_diff(left: String, right: String, leading: &str) -> String {
         let left_vec: Vec<char> = left.chars().collect();
         let right_vec: Vec<char> = right.chars().collect();
@@ -1023,13 +962,14 @@ impl CompareBams {
             let (cmp_batch1, remainder1) = batch1.split_at(min_len);
             let (cmp_batch2, remainder2) = batch2.split_at(min_len);
 
-            // Compare the aligned portions in parallel
+            // Compare the aligned portions in parallel (strict: MI included in tag comparison)
             let (results, core_m, core_d, tag_m, tag_d, tag_ord) = compare_raw_batch_parallel(
                 cmp_batch1,
                 cmp_batch2,
                 &header1,
                 &header2,
                 current_index,
+                &[],
             );
 
             stats.core_matches += core_m as u64;
@@ -1209,13 +1149,15 @@ impl CompareBams {
             let (cmp_batch1, remainder1) = batch1.split_at(min_len);
             let (cmp_batch2, remainder2) = batch2.split_at(min_len);
 
-            // Compare batches in parallel and collect MI data
+            // Compare batches in parallel, excluding MI from tag comparison
+            // (MI grouping equivalence is checked separately below).
             let (results, core_m, core_d, tag_m, tag_d, tag_ord) = compare_raw_batch_parallel(
                 cmp_batch1,
                 cmp_batch2,
                 &header1,
                 &header2,
                 current_index,
+                &[*SamTag::MI],
             );
 
             // Process grouping data from the batch (sequential for MI map building)
@@ -1380,284 +1322,6 @@ impl CompareBams {
             Ok(stats.bam1_count)
         } else {
             info!("BAM files differ");
-            std::process::exit(1);
-        }
-    }
-
-    /// Execute grouping comparison mode
-    ///
-    /// This mode compares grouped BAM files where MI assignment order may differ.
-    /// Both files must be in the same order (e.g., query-name sorted), unless
-    /// --ignore-order is specified.
-    /// We validate read names and R1/R2 flags match, then verify that reads
-    /// with the same MI in one file have the same MI in the other.
-    /// Uses parallel batch processing with double buffering for performance.
-    fn execute_grouping(&self) -> Result<u64> {
-        if self.ignore_order {
-            return self.execute_grouping_unordered();
-        }
-
-        let mut stats = GroupingStats::default();
-        let mut diff_details: Vec<DiffDetail> = Vec::new();
-        let batch_size = self.batch_size;
-
-        info!(
-            "Starting grouping comparison with {} threads, batch size {}",
-            self.threads, batch_size
-        );
-
-        // Maps: read_key_hash -> MI value for each BAM (compact representation)
-        // Using u64 hash for keys and i64 for MI values saves ~80% memory
-        let mut mi_map1: AHashMap<ReadKeyHash, i64> = AHashMap::new();
-        let mut mi_map2: AHashMap<ReadKeyHash, i64> = AHashMap::new();
-
-        // Start double-buffered raw readers for both BAM files
-        let (rx1, _header1) = start_raw_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
-        let (rx2, _header2) = start_raw_batch_reader(self.bam2.clone(), self.threads, batch_size)?;
-
-        // Progress tracking
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
-
-        // Process batches
-        let mut bam1_eof = false;
-        let mut bam2_eof = false;
-        let mut pending_batch1: Option<Vec<RawRecord>> = None;
-        let mut pending_batch2: Option<Vec<RawRecord>> = None;
-        let mut current_index = 0u64;
-
-        loop {
-            // Get next batch from BAM1 if needed
-            if pending_batch1.is_none() && !bam1_eof {
-                match rx1.recv() {
-                    Ok(RawBatchMessage::Batch(batch)) => {
-                        pending_batch1 = Some(batch);
-                    }
-                    Ok(RawBatchMessage::Eof) => bam1_eof = true,
-                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM1: {e}"),
-                    Err(_) => bam1_eof = true,
-                }
-            }
-
-            // Get next batch from BAM2 if needed
-            if pending_batch2.is_none() && !bam2_eof {
-                match rx2.recv() {
-                    Ok(RawBatchMessage::Batch(batch)) => {
-                        pending_batch2 = Some(batch);
-                    }
-                    Ok(RawBatchMessage::Eof) => bam2_eof = true,
-                    Ok(RawBatchMessage::Error(e)) => bail!("Error reading BAM2: {e}"),
-                    Err(_) => bam2_eof = true,
-                }
-            }
-
-            // Check for completion
-            match (&pending_batch1, &pending_batch2) {
-                (None, None) => break,
-                (Some(_), None) | (None, Some(_)) => {
-                    if diff_details.len() < self.max_diffs {
-                        diff_details.push(DiffDetail {
-                            record_num: current_index,
-                            qname: "N/A".to_string(),
-                            flags: "N/A".to_string(),
-                            diff_type: DiffType::CountMismatch,
-                            diffs: vec!["BAM files have different number of records".to_string()],
-                        });
-                    }
-                    bail!("BAM files have different record counts");
-                }
-                (Some(_), Some(_)) => {}
-            }
-
-            let batch1 = pending_batch1.take().expect("guarded by (Some, Some) match above");
-            let batch2 = pending_batch2.take().expect("guarded by (Some, Some) match above");
-
-            let min_len = batch1.len().min(batch2.len());
-            let (cmp_batch1, remainder1) = batch1.split_at(min_len);
-            let (cmp_batch2, remainder2) = batch2.split_at(min_len);
-
-            // Compare batches in parallel for grouping data
-            let results = compare_raw_batch_grouping_parallel(
-                cmp_batch1,
-                cmp_batch2,
-                current_index,
-                self.max_diffs,
-                diff_details.len(),
-            );
-
-            // Process results and build MI maps
-            for r in results {
-                stats.total_records += 1;
-
-                if !r.name_match {
-                    stats.order_mismatches += 1;
-                    if let Some(detail) = r.diff_detail {
-                        if diff_details.len() < self.max_diffs {
-                            diff_details.push(detail);
-                        }
-                    }
-                    continue;
-                }
-
-                if !r.flag_match {
-                    stats.order_mismatches += 1;
-                    if let Some(detail) = r.diff_detail {
-                        if diff_details.len() < self.max_diffs {
-                            diff_details.push(detail);
-                        }
-                    }
-                    continue;
-                }
-
-                match (r.mi1, r.mi2) {
-                    (Some(mi1_val), Some(mi2_val)) => {
-                        mi_map1.insert(r.key_hash, mi1_val);
-                        mi_map2.insert(r.key_hash, mi2_val);
-                    }
-                    (None, Some(_)) => {
-                        stats.missing_mi_bam1 += 1;
-                        if diff_details.len() < self.max_diffs {
-                            diff_details.push(DiffDetail {
-                                record_num: r.record_num,
-                                qname: r.read_name_for_display.unwrap_or_else(|| "?".to_string()),
-                                flags: "N/A".to_string(),
-                                diff_type: DiffType::TagDiff,
-                                diffs: vec!["MI tag missing in BAM1".to_string()],
-                            });
-                        }
-                    }
-                    (Some(_), None) => {
-                        stats.missing_mi_bam2 += 1;
-                        if diff_details.len() < self.max_diffs {
-                            diff_details.push(DiffDetail {
-                                record_num: r.record_num,
-                                qname: r.read_name_for_display.unwrap_or_else(|| "?".to_string()),
-                                flags: "N/A".to_string(),
-                                diff_type: DiffType::TagDiff,
-                                diffs: vec!["MI tag missing in BAM2".to_string()],
-                            });
-                        }
-                    }
-                    (None, None) => {}
-                }
-            }
-
-            current_index += min_len as u64;
-            progress.log_if_needed(min_len as u64);
-
-            if !remainder1.is_empty() {
-                pending_batch1 = Some(remainder1.to_vec());
-            }
-            if !remainder2.is_empty() {
-                pending_batch2 = Some(remainder2.to_vec());
-            }
-        }
-
-        progress.log_final();
-        info!("Phase 2: Verifying grouping equivalence...");
-
-        // Phase 2: Verify grouping equivalence (using compact representation)
-        let bam1_groups = build_mi_groups_compact(&mi_map1);
-        let bam2_groups = build_mi_groups_compact(&mi_map2);
-
-        stats.unique_groups_bam1 = bam1_groups.len();
-        stats.unique_groups_bam2 = bam2_groups.len();
-
-        // Check BAM1 groups -> BAM2
-        let mut grouping_errors: Vec<String> = Vec::new();
-        for (mi1, read_hashes) in &bam1_groups {
-            let mi2_values: AHashSet<i64> =
-                read_hashes.iter().filter_map(|key_hash| mi_map2.get(key_hash).copied()).collect();
-
-            if mi2_values.len() > 1 {
-                stats.grouping_mismatches += 1;
-                if grouping_errors.len() < self.max_diffs {
-                    grouping_errors.push(format!(
-                        "MI group '{}' in BAM1 ({} reads) maps to {} different MIs in BAM2: {:?}",
-                        mi1,
-                        read_hashes.len(),
-                        mi2_values.len(),
-                        mi2_values.iter().take(5).collect::<Vec<_>>()
-                    ));
-                }
-            }
-        }
-
-        // Check BAM2 groups -> BAM1
-        for (mi2, read_hashes) in &bam2_groups {
-            let mi1_values: AHashSet<i64> =
-                read_hashes.iter().filter_map(|key_hash| mi_map1.get(key_hash).copied()).collect();
-
-            if mi1_values.len() > 1 {
-                stats.grouping_mismatches += 1;
-                if grouping_errors.len() < self.max_diffs {
-                    grouping_errors.push(format!(
-                        "MI group '{}' in BAM2 ({} reads) maps to {} different MIs in BAM1: {:?}",
-                        mi2,
-                        read_hashes.len(),
-                        mi1_values.len(),
-                        mi1_values.iter().take(5).collect::<Vec<_>>()
-                    ));
-                }
-            }
-        }
-
-        // Determine result
-        let is_equivalent = stats.order_mismatches == 0
-            && stats.missing_mi_bam1 == 0
-            && stats.missing_mi_bam2 == 0
-            && stats.grouping_mismatches == 0;
-
-        if !self.quiet {
-            println!("=== BAM Comparison Results (grouping mode) ===");
-            println!("BAM1: {}", self.bam1.display());
-            println!("BAM2: {}", self.bam2.display());
-            println!();
-            println!("Total records compared: {}", stats.total_records);
-            println!("Order/name mismatches: {}", stats.order_mismatches);
-            println!("Missing MI in BAM1: {}", stats.missing_mi_bam1);
-            println!("Missing MI in BAM2: {}", stats.missing_mi_bam2);
-            println!("Unique MI groups in BAM1: {}", stats.unique_groups_bam1);
-            println!("Unique MI groups in BAM2: {}", stats.unique_groups_bam2);
-            println!("Grouping mismatches: {}", stats.grouping_mismatches);
-            println!();
-
-            if is_equivalent {
-                println!("RESULT: BAM groupings are EQUIVALENT");
-                println!("  Reads with the same MI in one file have the same MI in the other.");
-                if stats.unique_groups_bam1 != stats.unique_groups_bam2 {
-                    println!(
-                        "  Note: Different number of unique MI values ({} vs {}), but groupings match.",
-                        stats.unique_groups_bam1, stats.unique_groups_bam2
-                    );
-                }
-            } else {
-                println!("RESULT: BAM groupings DIFFER");
-
-                if !diff_details.is_empty() {
-                    println!("\nOrder/tag differences (first {}):", diff_details.len());
-                    for detail in &diff_details {
-                        println!("  Record {}: {}", detail.record_num, detail.qname);
-                        println!("    Type: {}", detail.diff_type);
-                        for d in &detail.diffs {
-                            println!("      {d}");
-                        }
-                    }
-                }
-
-                if !grouping_errors.is_empty() {
-                    println!("\nGrouping mismatches (first {}):", grouping_errors.len());
-                    for err in &grouping_errors {
-                        println!("  {err}");
-                    }
-                }
-            }
-        }
-
-        if is_equivalent {
-            info!("BAM groupings are equivalent");
-            Ok(stats.total_records)
-        } else {
-            info!("BAM groupings differ");
             std::process::exit(1);
         }
     }
