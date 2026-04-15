@@ -10,6 +10,8 @@ license.workspace = true
 [dependencies]
 noodles = { version = "0.106.0", features = ["bam", "sam"], optional = true }
 anyhow = { version = "1.0.102", optional = true }
+bytemuck = { workspace = true }
+wide = { workspace = true }
 
 [features]
 default = []

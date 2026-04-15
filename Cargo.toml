@@ -18,6 +18,8 @@ fgumi-raw-bam = { version = "0.1.3", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.1.3", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.1.3", path = "crates/fgumi-simd-fastq" }
 fgumi-umi = { version = "0.1.3", path = "crates/fgumi-umi" }
+bytemuck = { version = "1.14", features = ["derive"] }
+wide = "1.3"
 
 [package]
 name = "fgumi"
@@ -71,10 +73,10 @@ num_cpus = "1.16"
 rayon = "1.10"
 approx = "0.5.1"
 ahash = "0.8"
-bytemuck = { version = "1.14", features = ["derive"] }
+bytemuck = { workspace = true }
 noodles-csi = "0.54.0"
 bgzf = "0.3.0"
-wide = "1.1"
+wide = { workspace = true }
 rand_distr = "0.6"
 flate2 = "1.1"
 dhat = { version = "0.3", optional = true }
