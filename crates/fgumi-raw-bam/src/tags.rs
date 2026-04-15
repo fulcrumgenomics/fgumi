@@ -9,12 +9,16 @@ use crate::fields::{
 /// (the first byte of the 2-byte tag identifier). Returns `None` if not found.
 #[must_use]
 fn find_tag_position(aux_data: &[u8], tag: [u8; 2]) -> Option<(usize, u8)> {
+    // Compare as u16 — a single integer compare instead of a slice compare.
+    // LE byte order is preserved: both values are built from the same two bytes
+    // in the same order, so equality is equivalent to the byte-slice compare.
+    let tag_u16 = u16::from_le_bytes(tag);
     let mut p = 0;
     while p + 3 <= aux_data.len() {
-        let t = &aux_data[p..p + 2];
+        let entry_u16 = u16::from_le_bytes([aux_data[p], aux_data[p + 1]]);
         let val_type = aux_data[p + 2];
 
-        if t == tag {
+        if entry_u16 == tag_u16 {
             return Some((p, val_type));
         }
 
