@@ -30,6 +30,45 @@ pub const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
 /// `ref_id`, `pos`, etc.) require at least this many bytes.
 pub const MIN_BAM_RECORD_LEN: usize = 32;
 
+/// Borrowed read-only view over a complete BAM record's bytes.
+///
+/// Wraps `&'a [u8]`. All BAM-spec accessors (`flags`, `pos`, `cigar`, `sequence`,
+/// `tags`, …) are inherent methods on this type.
+///
+/// All accessors assume `bytes.len() >= MIN_BAM_RECORD_LEN`. Use [`RawRecordView::new`]
+/// when the caller can vouch for that (hot path); use [`RawRecordView::try_new`] for
+/// untrusted input.
+#[derive(Copy, Clone, Debug)]
+pub struct RawRecordView<'a>(&'a [u8]);
+
+impl<'a> RawRecordView<'a> {
+    /// Wrap raw BAM bytes without validation.
+    ///
+    /// In debug builds, asserts `bytes.len() >= MIN_BAM_RECORD_LEN`. In release
+    /// builds, accessor methods on a too-short slice will panic on out-of-bounds
+    /// indexing.
+    #[inline]
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        debug_assert!(bytes.len() >= MIN_BAM_RECORD_LEN);
+        Self(bytes)
+    }
+
+    /// Wrap raw BAM bytes, returning `None` if too short for the fixed header.
+    #[inline]
+    #[must_use]
+    pub const fn try_new(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() >= MIN_BAM_RECORD_LEN { Some(Self(bytes)) } else { None }
+    }
+
+    /// Returns the underlying byte slice.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
 /// BAM flag bits.
 pub mod flags {
     /// Read is paired in sequencing.
@@ -930,5 +969,24 @@ mod tests {
         assert_eq!(pos(&rec), 0);
         set_pos(&mut rec, 9999);
         assert_eq!(pos(&rec), 9999);
+    }
+
+    #[test]
+    fn test_raw_record_view_new_and_as_bytes() {
+        let bytes = vec![0u8; 32];
+        let view = RawRecordView::new(&bytes);
+        assert_eq!(view.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_raw_record_view_try_new_too_short_returns_none() {
+        let bytes = vec![0u8; 31];
+        assert!(RawRecordView::try_new(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_raw_record_view_try_new_min_length_succeeds() {
+        let bytes = vec![0u8; MIN_BAM_RECORD_LEN];
+        assert!(RawRecordView::try_new(&bytes).is_some());
     }
 }
