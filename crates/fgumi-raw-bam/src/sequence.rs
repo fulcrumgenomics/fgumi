@@ -1,3 +1,6 @@
+use bytemuck::cast;
+use wide::{u8x16, u16x8};
+
 use crate::fields::{l_seq, qual_offset, seq_offset};
 
 /// BAM 4-bit base encoding -> ASCII lookup table.
@@ -75,12 +78,93 @@ pub fn is_base_n(bam: &[u8], seq_off: usize, position: usize) -> bool {
     get_base(bam, seq_off, position) == 0xF
 }
 
+/// BAM nibble (0–15) → ASCII base, as a SIMD lookup table.
+///
+/// Used by `decode_chunk_32` via `swizzle_relaxed` (portable `pshufb`).
+const NIBBLE_ASCII_LUT: u8x16 = u8x16::new([
+    b'=', b'A', b'C', b'M', b'G', b'R', b'S', b'V', b'T', b'W', b'Y', b'H', b'K', b'D', b'B', b'N',
+]);
+
+/// Decode 16 packed bytes (= 32 bases) into ASCII, using SIMD.
+///
+/// Writes 32 bytes starting at `out[out_off]`. The caller guarantees the
+/// buffers are large enough.
+#[inline]
+fn decode_chunk_32(packed: &[u8], packed_off: usize, out: &mut [u8], out_off: usize) {
+    debug_assert!(packed.len() >= packed_off + 16);
+    debug_assert!(out.len() >= out_off + 32);
+
+    // Load 16 packed bytes.
+    let bytes_arr: [u8; 16] = packed[packed_off..packed_off + 16].try_into().unwrap();
+    let bytes = u8x16::new(bytes_arr);
+
+    // Low nibbles: direct per-lane mask.
+    let lo_nibbles = bytes & u8x16::new([0x0F; 16]);
+
+    // High nibbles via u16 shift + mask trick.
+    //
+    // For packed byte pair [b0, b1] viewed as u16 LE = (b1 << 8) | b0,
+    // (u16 >> 4) produces:
+    //   low byte  = (lo_nibble(b1) << 4) | hi_nibble(b0)
+    //   high byte = hi_nibble(b1)
+    // After &0x0F per byte:
+    //   low byte  = hi_nibble(b0)   ← wanted at even byte index
+    //   high byte = hi_nibble(b1)   ← wanted at odd byte index
+    let as_u16: u16x8 = cast(bytes);
+    let shifted: u16x8 = as_u16 >> 4u32;
+    let hi_nibbles: u8x16 = cast::<u16x8, u8x16>(shifted) & u8x16::new([0x0F; 16]);
+
+    // Parallel table lookup: nibble (0..15) → ASCII base.
+    let hi_ascii = NIBBLE_ASCII_LUT.swizzle_relaxed(hi_nibbles);
+    let lo_ascii = NIBBLE_ASCII_LUT.swizzle_relaxed(lo_nibbles);
+
+    // Output order: [hi(b0), lo(b0), hi(b1), lo(b1), ..., hi(b15), lo(b15)].
+    // u8x16::unpack_low(a, b)  → [a[0], b[0], a[1], b[1], ..., a[7], b[7]]
+    // u8x16::unpack_high(a, b) → [a[8], b[8], a[9], b[9], ..., a[15], b[15]]
+    let first_16 = u8x16::unpack_low(hi_ascii, lo_ascii);
+    let last_16 = u8x16::unpack_high(hi_ascii, lo_ascii);
+
+    out[out_off..out_off + 16].copy_from_slice(first_16.as_array());
+    out[out_off + 16..out_off + 32].copy_from_slice(last_16.as_array());
+}
+
+/// SIMD-accelerated sequence extraction.
+///
+/// Kept `pub(crate)` for benchmarking; external callers go through
+/// `extract_sequence`, which dispatches based on read length.
+#[inline]
+#[must_use]
+pub(crate) fn extract_sequence_simd(bam: &[u8]) -> Vec<u8> {
+    let l = l_seq(bam) as usize;
+    let off = seq_offset(bam);
+    let mut bases = vec![0u8; l];
+
+    // Process 16 packed bytes = 32 bases at a time.
+    let full_chunks = l / 32;
+    for c in 0..full_chunks {
+        decode_chunk_32(bam, off + c * 16, &mut bases, c * 32);
+    }
+
+    // Scalar tail for the remaining (l % 32) bases.
+    let processed = full_chunks * 32;
+    for (slot, i) in bases[processed..].iter_mut().zip(processed..l) {
+        *slot = BAM_BASE_TO_ASCII[get_base(bam, off, i) as usize];
+    }
+    bases
+}
+
 /// Bulk-extract the full sequence from a BAM record as ASCII bases.
 ///
 /// Decodes the packed 4-bit sequence data into a `Vec<u8>` of ASCII bases.
+/// Uses SIMD for reads of 32 bp or longer; falls back to scalar for shorter
+/// reads where SIMD startup cost dominates.
 #[must_use]
 pub fn extract_sequence(bam: &[u8]) -> Vec<u8> {
     let l = l_seq(bam) as usize;
+    if l >= 32 {
+        return extract_sequence_simd(bam);
+    }
+    // Scalar path for short sequences.
     let off = seq_offset(bam);
     let mut bases = Vec::with_capacity(l);
     for i in 0..l {
@@ -675,6 +759,30 @@ mod tests {
         let v = RawRecordView::new(&rec);
         assert_eq!(v.sequence_vec(), b"ACNT".to_vec());
         assert_eq!(v.quality_scores(), &[25, 10, 10, 99]);
+    }
+
+    // ========================================================================
+    // SIMD / scalar equivalence tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sequence_simd_matches_scalar_over_lengths() {
+        // Test a range of lengths that exercise the SIMD path (>=32) and the
+        // scalar tail (length % 32 != 0).
+        for l in [0usize, 1, 15, 31, 32, 33, 63, 64, 150, 200, 255] {
+            // Build a record with a deterministic sequence pattern.
+            let seq: Vec<u8> = (0..l).map(|i| b"ACGTN"[i % 5]).collect();
+            let mut packed = Vec::new();
+            pack_sequence_into(&mut packed, &seq);
+            // Build a BAM record with the packed sequence in place.
+            let mut bam = make_bam_bytes(0, 0, 0, b"r", &[], l, -1, -1, &[]);
+            let so = seq_offset(&bam);
+            let packed_len = l.div_ceil(2);
+            bam[so..so + packed_len].copy_from_slice(&packed);
+
+            let got = extract_sequence(&bam);
+            assert_eq!(got, seq, "mismatch at l={l}");
+        }
     }
 
     #[test]
