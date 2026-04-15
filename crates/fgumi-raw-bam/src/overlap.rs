@@ -2,8 +2,8 @@ use crate::cigar::{
     consumes_query, get_cigar_ops, reference_length_from_cigar, reference_length_from_raw_bam,
     unclipped_other_end, unclipped_other_start,
 };
-use crate::fields::{aux_data_slice, flags, mate_pos, mate_ref_id, pos, ref_id, template_length};
-use crate::tags::find_string_tag;
+use crate::fields::{RawRecordView, aux_data_slice, flags, mate_pos, mate_ref_id, template_length};
+use crate::tags::RawTagsView;
 
 /// Check if a single read is part of an FR (forward-reverse) pair using raw BAM bytes.
 ///
@@ -12,7 +12,8 @@ use crate::tags::find_string_tag;
 /// on the same reference, and in FR orientation (positive strand 5' < negative strand 5').
 #[must_use]
 pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
-    let flg = flags(bam);
+    let v = RawRecordView::new(bam);
+    let flg = v.flags();
 
     // Must be paired
     if flg & flags::PAIRED == 0 {
@@ -25,7 +26,7 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
     }
 
     // Must be on the same reference
-    let this_ref_id = ref_id(bam);
+    let this_ref_id = v.ref_id();
     let m_ref_id = mate_ref_id(bam);
     if this_ref_id != m_ref_id {
         return false;
@@ -41,7 +42,7 @@ pub fn is_fr_pair_raw(bam: &[u8]) -> bool {
     // Determine if FR or RF using htsjdk's logic:
     // positiveStrandFivePrimePos = readIsOnReverseStrand ? mateStart : alignmentStart
     // negativeStrandFivePrimePos = readIsOnReverseStrand ? alignmentEnd : alignmentStart + insertSize
-    let alignment_start = pos(bam) + 1; // 1-based
+    let alignment_start = v.pos() + 1; // 1-based
     let m_start = mate_pos(bam) + 1; // 1-based
     let insert_size = template_length(bam);
 
@@ -66,19 +67,20 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
         return 0;
     }
 
-    let flg = flags(bam);
+    let v = RawRecordView::new(bam);
+    let flg = v.flags();
     let is_reverse = flg & flags::REVERSE != 0;
 
     // Need MC tag for mate CIGAR information
     let aux = aux_data_slice(bam);
-    let Some(mc_bytes) = find_string_tag(aux, b"MC") else {
+    let Some(mc_bytes) = RawTagsView::new(aux).find_string(b"MC") else {
         return 0;
     };
     let Ok(mc_cigar) = std::str::from_utf8(mc_bytes) else {
         return 0;
     };
 
-    let this_pos_0based = pos(bam);
+    let this_pos_0based = v.pos();
     let m_pos_0based = mate_pos(bam);
     // Convert to 1-based for coordinate calculations
     let this_pos = this_pos_0based + 1;
