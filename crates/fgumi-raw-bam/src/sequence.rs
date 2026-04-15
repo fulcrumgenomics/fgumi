@@ -221,6 +221,38 @@ impl<'a> RawRecordView<'a> {
     }
 }
 
+use crate::fields::RawRecordMut;
+
+impl RawRecordMut<'_> {
+    /// Set the base at `position` (ASCII input -> 4-bit BAM encoding).
+    /// Unknown bases encode as `N` (0xF).
+    #[inline]
+    pub fn set_base(&mut self, position: usize, base: u8) {
+        let off = seq_offset(self.as_bytes());
+        set_base(self.as_bytes_mut(), off, position, base);
+    }
+
+    /// Set the base at `position` to `N`.
+    #[inline]
+    pub fn mask_base(&mut self, position: usize) {
+        let off = seq_offset(self.as_bytes());
+        mask_base(self.as_bytes_mut(), off, position);
+    }
+
+    /// Set the raw Phred quality score at `position`.
+    #[inline]
+    pub fn set_qual(&mut self, position: usize, value: u8) {
+        let off = qual_offset(self.as_bytes());
+        set_qual(self.as_bytes_mut(), off, position, value);
+    }
+
+    /// Mutable zero-allocation slice over raw Phred quality scores.
+    #[inline]
+    pub fn quality_scores_mut(&mut self) -> &mut [u8] {
+        quality_scores_slice_mut(self.as_bytes_mut())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +612,30 @@ mod tests {
     // ========================================================================
     // RawRecordView sequence/quality method tests
     // ========================================================================
+
+    #[test]
+    fn test_raw_record_mut_seq_qual_writes() {
+        use crate::fields::{RawRecordMut, RawRecordView};
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 4, -1, -1, &[]);
+        {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.set_base(0, b'A');
+            m.set_base(1, b'C');
+            m.set_base(2, b'G');
+            m.set_base(3, b'T');
+            m.set_qual(0, 25);
+            m.set_qual(3, 99);
+            m.mask_base(2);
+            for q in m.quality_scores_mut() {
+                if *q == 0 {
+                    *q = 10;
+                }
+            }
+        }
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.sequence_vec(), b"ACNT".to_vec());
+        assert_eq!(v.quality_scores(), &[25, 10, 10, 99]);
+    }
 
     #[test]
     fn test_view_sequence_quality_methods() {
