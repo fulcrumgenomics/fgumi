@@ -580,6 +580,53 @@ impl RawRecord {
         self.0[12..14].copy_from_slice(&new_n.to_le_bytes());
     }
 
+    /// Replace both the sequence and the quality scores.
+    ///
+    /// `seq` is ASCII (`A`/`C`/`G`/`T`/`N`/IUPAC); `qual` is raw Phred (not +33).
+    /// `seq.len()` and `qual.len()` must match (BAM spec).
+    ///
+    /// Updates `l_seq`; read name, CIGAR, and aux tags are preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seq.len() != qual.len()` or if `seq.len() > u32::MAX as usize`.
+    pub fn set_sequence_and_qualities(&mut self, seq: &[u8], qual: &[u8]) {
+        assert_eq!(seq.len(), qual.len(), "sequence and quality must have equal length");
+        let new_l = u32::try_from(seq.len()).expect("seq length overflows u32");
+        let l_rn = self.0[8] as usize;
+        let n_co = u16::from_le_bytes([self.0[12], self.0[13]]) as usize;
+        let old_l = u32::from_le_bytes([self.0[16], self.0[17], self.0[18], self.0[19]]) as usize;
+
+        let body_start = 32 + l_rn + n_co * 4;
+        let old_packed = old_l.div_ceil(2);
+        let body_end = body_start + old_packed + old_l;
+
+        let new_packed_len = seq.len().div_ceil(2);
+        let mut new_body = Vec::with_capacity(new_packed_len + qual.len());
+        crate::sequence::pack_sequence_into(&mut new_body, seq);
+        new_body.extend_from_slice(qual);
+
+        self.0.splice(body_start..body_end, new_body);
+        self.0[16..20].copy_from_slice(&new_l.to_le_bytes());
+    }
+
+    /// Convenience: replace quality scores when their length matches `l_seq`.
+    ///
+    /// For length-changing replacement, use [`RawRecord::set_sequence_and_qualities`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `qual.len() != l_seq`.
+    pub fn set_qualities(&mut self, qual: &[u8]) {
+        let l = self.l_seq() as usize;
+        assert_eq!(
+            l,
+            qual.len(),
+            "qualities length must match l_seq; use set_sequence_and_qualities to resize"
+        );
+        self.quality_scores_mut().copy_from_slice(qual);
+    }
+
     /// Replace the read name. Updates `l_read_name` and splices the name +
     /// NUL terminator into the record.
     ///
@@ -829,6 +876,64 @@ mod tests {
         assert_eq!(rec.sequence_vec(), pre_seq);
         assert_eq!(rec.quality_scores(), pre_qual.as_slice());
         assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+    }
+
+    #[test]
+    fn test_set_sequence_and_qualities_grow() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, b"NMc\x05");
+        let mut rec = RawRecord::from(bytes);
+        let pre_name = rec.read_name().to_vec();
+        let pre_cigar = rec.cigar_ops_vec();
+        let pre_nm = rec.tags().find_int(b"NM");
+
+        let new_seq = b"ACGTACGTACGT";
+        let new_qual = vec![30u8; 12];
+        rec.set_sequence_and_qualities(new_seq, &new_qual);
+
+        assert_eq!(rec.l_seq() as usize, 12);
+        assert_eq!(rec.sequence_vec(), new_seq.to_vec());
+        assert_eq!(rec.quality_scores(), new_qual.as_slice());
+        assert_eq!(rec.read_name(), pre_name.as_slice());
+        assert_eq!(rec.cigar_ops_vec(), pre_cigar);
+        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+    }
+
+    #[test]
+    fn test_set_sequence_and_qualities_shrink_with_odd_length() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        rec.set_sequence_and_qualities(b"ACG", &[20, 21, 22]);
+        assert_eq!(rec.l_seq(), 3);
+        assert_eq!(rec.sequence_vec(), b"ACG".to_vec());
+        assert_eq!(rec.quality_scores(), &[20u8, 21, 22]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must have equal length")]
+    fn test_set_sequence_and_qualities_mismatch_panics() {
+        use crate::testutil::*;
+        let mut rec = RawRecord::from(make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]));
+        rec.set_sequence_and_qualities(b"AC", &[20]);
+    }
+
+    #[test]
+    fn test_set_qualities_fixed_length() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        rec.set_qualities(&[10, 20, 30, 40]);
+        assert_eq!(rec.quality_scores(), &[10u8, 20, 30, 40]);
+    }
+
+    #[test]
+    #[should_panic(expected = "qualities length must match l_seq")]
+    fn test_set_qualities_wrong_length_panics() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        rec.set_qualities(&[10, 20]);
     }
 
     #[test]
