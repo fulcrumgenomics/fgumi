@@ -314,7 +314,7 @@ pub fn tag_value_size(val_type: u8, data: &[u8]) -> Option<usize> {
 /// Extract flags (u16) from a BAM record.
 #[inline]
 #[must_use]
-pub fn flags(bam: &[u8]) -> u16 {
+pub(crate) fn flags(bam: &[u8]) -> u16 {
     u16::from_le_bytes([bam[14], bam[15]])
 }
 
