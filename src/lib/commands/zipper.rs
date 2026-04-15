@@ -68,6 +68,7 @@ use clap::Parser;
 use log::{debug, info, warn};
 use noodles::core::Position;
 use noodles::sam::Header;
+#[cfg(test)]
 use noodles::sam::alignment::record::Cigar as CigarTrait;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -1004,21 +1005,28 @@ fn encode_unmapped_template_records(template: &Template, header: &Header) -> Res
     Ok(raw)
 }
 
-/// YD tag used by bwameth to indicate the bisulfite conversion strand.
-const YD_TAG: Tag = Tag::new(b'Y', b'D');
 /// YD value for the forward (top) bisulfite strand.
 const YD_FORWARD: &[u8] = b"f";
 /// YD value for the reverse (bottom) bisulfite strand.
 const YD_REVERSE: &[u8] = b"r";
 
-/// Restore unconverted bases in EM-seq reads after bwameth re-alignment.
+/// YD tag used by bwameth to indicate the bisulfite conversion strand.
+/// Only consumed by the cfg(test) `RecordBuf` reference implementation; the
+/// raw-byte production path looks up the tag bytes directly.
+#[cfg(test)]
+const YD_TAG: Tag = Tag::new(b'Y', b'D');
+
+/// `RecordBuf`-based reference implementation kept around as an oracle for
+/// the test suite; the raw-byte path is used in production.
 ///
-/// For each mapped record in the template, walks the CIGAR alignment and replaces
-/// converted bases back to their unconverted reference form:
-/// - Top strand (`YD:Z:f`): at reference-C positions, T→C
-/// - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
+/// Walks the CIGAR alignment for each record and replaces converted bases back
+/// to their unconverted reference form:
+///   - Top strand (`YD:Z:f`): at reference-C positions, T→C
+///   - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
 ///
 /// Skips unmapped reads and reads without a `YD` tag.
+#[cfg(test)]
+#[allow(dead_code)]
 fn restore_unconverted_bases_in_template(
     template: &mut Template,
     reference: &ReferenceReader,
@@ -1030,7 +1038,9 @@ fn restore_unconverted_bases_in_template(
     Ok(())
 }
 
-/// Restore unconverted bases in a single EM-seq record after bwameth re-alignment.
+/// `RecordBuf`-based reference implementation kept as an oracle for the test
+/// suite; the raw-byte path is used in production.
+#[cfg(test)]
 fn restore_unconverted_bases_in_record(
     record: &mut RecordBuf,
     reference: &ReferenceReader,
@@ -1158,6 +1168,163 @@ fn restore_unconverted_bases_in_record(
     Ok(())
 }
 
+/// Raw-byte equivalent of `restore_unconverted_bases_in_template`.
+///
+/// Iterates the template's `raw_records` (populated by
+/// `convert_template_to_raw`) and applies the unconverted-base restoration
+/// directly to the BAM bytes — no `RecordBuf` round-trip. Lets the methylation
+/// path stay on the same streaming raw-byte fast path TAPs uses.
+fn restore_unconverted_bases_in_raw_template(
+    template: &mut Template,
+    reference: &ReferenceReader,
+    header: &Header,
+) -> Result<()> {
+    let raw_records = template.raw_records.as_mut().ok_or_else(|| {
+        anyhow::anyhow!("restore_unconverted_bases_in_raw_template: template not in raw-byte mode")
+    })?;
+    for record in raw_records.iter_mut() {
+        restore_unconverted_bases_in_raw_record(record, reference, header)?;
+    }
+    Ok(())
+}
+
+/// Raw-byte equivalent of `restore_unconverted_bases_in_record`.
+///
+/// Operates on the packed BAM bytes for a single record (the body, with no
+/// `block_size` prefix) without inflating to a `RecordBuf`. Reads the CIGAR,
+/// SEQ, and `YD` tag via the `fgumi-raw-bam` accessors, walks the alignment,
+/// then rewrites converted bases via `bam_fields::set_base`. SEQ stays the
+/// same length so no record resizing is needed; only `NM` / `MD` may be
+/// removed when SEQ is actually modified.
+///
+/// Skips unmapped records and records without a `YD` tag, just like the
+/// `RecordBuf` path.
+fn restore_unconverted_bases_in_raw_record(
+    record: &mut Vec<u8>,
+    reference: &ReferenceReader,
+    header: &Header,
+) -> Result<()> {
+    // Skip unmapped reads
+    let flag = bam_fields::flags(record);
+    if (flag & bam_fields::flags::UNMAPPED) != 0 {
+        return Ok(());
+    }
+
+    // YD tag tells us the bisulfite strand (forward = top, reverse = bottom).
+    // Anything else (missing or unexpected value) means "skip".
+    let yd_bytes = bam_fields::find_string_tag_in_record(record, &SamTag::YD);
+    let is_top = match yd_bytes {
+        Some(YD_FORWARD) => true,
+        Some(YD_REVERSE) => false,
+        _ => return Ok(()),
+    };
+
+    // Reference contig + alignment start.
+    let ref_id = bam_fields::ref_id(record);
+    if ref_id < 0 {
+        return Ok(());
+    }
+    let (ref_name, _) = header
+        .reference_sequences()
+        .get_index(ref_id as usize)
+        .context("reference sequence ID not found in header")?;
+    let ref_name = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
+
+    let pos = bam_fields::pos(record);
+    if pos < 0 {
+        return Ok(());
+    }
+    // BAM stores `pos` 0-based; ReferenceReader::fetch_slice expects 1-based.
+    let alignment_start = (pos as usize) + 1;
+
+    // Reference span from the CIGAR. The raw helper returns it as i32; clamp
+    // to non-negative usize since negative spans don't make sense.
+    let cigar_ops = bam_fields::get_cigar_ops(record);
+    let ref_span = bam_fields::reference_length_from_cigar(&cigar_ops);
+    if ref_span <= 0 {
+        return Ok(());
+    }
+    let ref_span = ref_span as usize;
+
+    // Fetch the aligned reference span (borrowed slice, no per-record alloc).
+    let ref_start = Position::try_from(alignment_start)?;
+    let ref_end = Position::try_from(alignment_start + ref_span - 1)?;
+    let ref_bases = reference.fetch_slice(ref_name, ref_start, ref_end)?;
+
+    // Determine replacement parameters, accounting for reverse-complemented SEQ.
+    // Same logic as the `RecordBuf` path; pre-encode the converted base to its
+    // 4-bit BAM nibble so the inner loop compares nibbles directly.
+    let is_reverse = (flag & bam_fields::flags::REVERSE) != 0;
+    let (ref_target, converted_ascii, unconverted_ascii) = match (is_top, is_reverse) {
+        (true, false) | (false, true) => (b'C', b'T', b'C'),
+        (true, true) | (false, false) => (b'G', b'A', b'G'),
+    };
+    let ref_target_lower = ref_target.to_ascii_lowercase();
+    // BAM 4-bit nibble codes: A=1, C=2, G=4, T=8. SEQ codes are case-insensitive
+    // by construction (the encode table maps both cases to the same nibble),
+    // so a single nibble compare is enough.
+    let converted_nibble = match converted_ascii {
+        b'T' => 0x8u8,
+        b'A' => 0x1u8,
+        _ => unreachable!(),
+    };
+
+    // Fast path: if no candidate reference base appears in the aligned span,
+    // there's nothing to restore. `memchr2` is SIMD-accelerated.
+    if memchr::memchr2(ref_target, ref_target_lower, ref_bases).is_none() {
+        return Ok(());
+    }
+
+    // Walk CIGAR and replace converted bases in place. We don't allocate a
+    // SEQ buffer at all — `set_base` rewrites the relevant 4-bit nibble in
+    // the existing record bytes.
+    let l_seq = bam_fields::l_seq(record) as usize;
+    let seq_off = bam_fields::seq_offset(record);
+    let mut modified = false;
+    let mut read_pos: usize = 0;
+    let mut ref_offset: usize = 0; // 0-based into ref_bases
+
+    for raw_op in cigar_ops {
+        let kind = bam_fields::cigar_op_kind(raw_op);
+        let len = (raw_op >> 4) as usize;
+
+        match kind {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for i in 0..len {
+                    if ref_offset + i >= ref_bases.len() {
+                        break;
+                    }
+                    let rb = ref_bases[ref_offset + i];
+                    if (rb == ref_target || rb == ref_target_lower) && read_pos + i < l_seq {
+                        let nibble = bam_fields::get_base(record, seq_off, read_pos + i);
+                        if nibble == converted_nibble {
+                            bam_fields::set_base(record, seq_off, read_pos + i, unconverted_ascii);
+                            modified = true;
+                        }
+                    }
+                }
+                read_pos += len;
+                ref_offset += len;
+            }
+            Kind::Insertion | Kind::SoftClip => {
+                read_pos += len;
+            }
+            Kind::Deletion | Kind::Skip => {
+                ref_offset += len;
+            }
+            Kind::HardClip | Kind::Pad => {}
+        }
+    }
+
+    // NM/MD only become stale when SEQ was actually modified.
+    if modified {
+        bam_fields::remove_tag(record, &SamTag::NM);
+        bam_fields::remove_tag(record, &SamTag::MD);
+    }
+
+    Ok(())
+}
+
 impl Zipper {
     /// Process templates using raw-byte merge path with BGZF compression.
     ///
@@ -1194,23 +1361,16 @@ impl Zipper {
 
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
+                    // Both branches now stream raw BAM bytes; the methylation
+                    // case adds a per-record `restore_unconverted_bases` step
+                    // that mutates SEQ in place via `fgumi-raw-bam` primitives.
+                    convert_template_to_raw(mapped_template, output_header)?;
+                    merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_tc_tags)?;
                     if let Some(ref_reader) = reference {
-                        // RecordBuf path: merge tags, restore bases, then encode to raw
-                        merge(&unmapped_template, mapped_template, tag_info, self.skip_tc_tags)?;
-                        restore_unconverted_bases_in_template(
+                        restore_unconverted_bases_in_raw_template(
                             mapped_template,
                             ref_reader,
                             output_header,
-                        )?;
-                        convert_template_to_raw(mapped_template, output_header)?;
-                    } else {
-                        // Fast raw-byte path
-                        convert_template_to_raw(mapped_template, output_header)?;
-                        merge_raw(
-                            &unmapped_template,
-                            mapped_template,
-                            tag_info,
-                            self.skip_tc_tags,
                         )?;
                     }
                     let rr = mapped_template.raw_records.as_ref().unwrap();
@@ -3992,6 +4152,273 @@ mod tests {
     fn test_restore_unconverted_bases_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.restore_unconverted_bases, expected);
+    }
+
+    /// Helper for the raw-byte restore tests: encode a `RecordBuf` to BAM
+    /// bytes, run the raw-byte restore, and return the resulting SEQ as ASCII.
+    /// Mirrors the assertion shape of the `RecordBuf` tests so equivalence is
+    /// obvious at a glance.
+    fn run_restore_raw(
+        record: &RecordBuf,
+        reference: &ReferenceReader,
+        header: &Header,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut raw = Vec::with_capacity(256);
+        encode_record_buf(&mut raw, header, record)
+            .map_err(|e| anyhow::anyhow!("encode_record_buf failed: {e}"))?;
+        restore_unconverted_bases_in_raw_record(&mut raw, reference, header)?;
+        let seq = bam_fields::extract_sequence(&raw);
+        Ok((raw, seq))
+    }
+
+    /// Raw-byte equivalent of `test_restore_unconverted_bases_top_strand` —
+    /// asserts the new `restore_unconverted_bases_in_raw_record` (which operates
+    /// on packed BAM bytes without round-tripping through `RecordBuf`) produces
+    /// the same SEQ as the `RecordBuf` path for the canonical top-strand case.
+    #[test]
+    fn test_restore_unconverted_bases_in_raw_record_top_strand() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        // Reference: ACGTACGTACGT (chr1) — C positions: 2, 6, 10
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        // Same record as test_restore_unconverted_bases_top_strand
+        let record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ATGTATGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .build();
+
+        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
+        assert_eq!(seq, b"ACGTACGT");
+
+        Ok(())
+    }
+
+    /// Raw-byte equivalent of `test_restore_unconverted_bases_bottom_strand` —
+    /// bottom strand restores A→G at ref-G positions.
+    #[test]
+    fn test_restore_unconverted_bases_in_raw_record_bottom_strand() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        // A at positions 3,7 = ref-G → restore to G
+        let record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACATACAT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2))
+            .tag("YD", "r")
+            .build();
+
+        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
+        assert_eq!(seq, b"ACGTACGT");
+
+        Ok(())
+    }
+
+    /// Raw-byte equivalent of `test_restore_unconverted_bases_top_strand_reverse` —
+    /// reverse-strand top-strand reads restore A→G (the complement of T→C) at
+    /// ref-G positions (the complement of ref-C).
+    #[test]
+    fn test_restore_unconverted_bases_in_raw_record_top_strand_reverse() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        let record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ACATACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE))
+            .tag("YD", "f")
+            .build();
+
+        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
+        assert_eq!(seq, b"ACGTACGT");
+
+        Ok(())
+    }
+
+    /// Raw-byte equivalent of `test_restore_unconverted_bases_skips_no_yd_tag` —
+    /// records without a YD tag come through unchanged.
+    #[test]
+    fn test_restore_unconverted_bases_in_raw_record_skips_no_yd_tag() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
+
+        // No YD tag — function must early-exit and leave SEQ untouched.
+        let record = RecordBuilder::new()
+            .name("q1")
+            .sequence("TTTTTTTT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .build();
+
+        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
+        assert_eq!(seq, b"TTTTTTTT");
+
+        Ok(())
+    }
+
+    /// Raw-byte equivalent of `test_restore_unconverted_bases_skips_unmapped` —
+    /// unmapped records come through unchanged.
+    #[test]
+    fn test_restore_unconverted_bases_in_raw_record_skips_unmapped() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
+
+        let record = RecordBuilder::new()
+            .name("q1")
+            .sequence("TTTTTTTT")
+            .qualities(&[30; 8])
+            .flags(Flags::UNMAPPED)
+            .tag("YD", "f")
+            .build();
+
+        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
+        assert_eq!(seq, b"TTTTTTTT");
+
+        Ok(())
+    }
+
+    /// Raw-byte path with NM/MD tags present: removed only when SEQ is modified.
+    /// Mirrors the implicit contract of the `RecordBuf` path's stale-tag clearing.
+    #[test]
+    fn test_restore_unconverted_bases_in_raw_record_clears_nm_md_when_modified() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        // SEQ modified case: T at ref-C should restore, NM/MD should be removed.
+        let modified_record = RecordBuilder::new()
+            .name("q1")
+            .sequence("ATGTATGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .tag("NM", 2i32)
+            .tag("MD", "1C3C2")
+            .build();
+        let (raw, _seq) = run_restore_raw(&modified_record, &reference, &header)?;
+        let aux = bam_fields::aux_data_slice(&raw);
+        assert!(bam_fields::find_tag_bounds(aux, &SamTag::NM).is_none(), "NM should be removed");
+        assert!(bam_fields::find_tag_bounds(aux, &SamTag::MD).is_none(), "MD should be removed");
+
+        // SEQ unchanged case: read already matches ref, NM/MD must be preserved.
+        let unchanged_record = RecordBuilder::new()
+            .name("q2")
+            .sequence("ACGTACGT")
+            .qualities(&[30; 8])
+            .reference_sequence_id(0)
+            .alignment_start(1)
+            .cigar("8M")
+            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
+            .tag("YD", "f")
+            .tag("NM", 0i32)
+            .tag("MD", "8")
+            .build();
+        let (raw, _seq) = run_restore_raw(&unchanged_record, &reference, &header)?;
+        let aux = bam_fields::aux_data_slice(&raw);
+        assert!(bam_fields::find_tag_bounds(aux, &SamTag::NM).is_some(), "NM should be kept");
+        assert!(bam_fields::find_tag_bounds(aux, &SamTag::MD).is_some(), "MD should be kept");
+
+        Ok(())
+    }
+
+    /// Parity test: the raw-byte path's own `read_pos` / `ref_offset` bookkeeping
+    /// must match the `RecordBuf` oracle across nontrivial CIGARs (`I`, `D`, `N`).
+    /// The straight-`M` raw tests wouldn't catch an off-by-one in the indel arms.
+    #[rstest]
+    #[case::match_insert_delete_match("2M1I2M1D3M", "TTNATTGT", "f", FLAG_READ1)]
+    #[case::match_insert_match("4M1I3M", "ATGTNATG", "f", FLAG_READ1)]
+    #[case::match_delete_match("4M1D3M", "ATGTATG", "f", FLAG_READ1)]
+    #[case::match_skip_match("4M1N3M", "ATGTATG", "f", FLAG_READ1)]
+    #[case::bottom_strand_indels("2M1I2M1D3M", "ACNTAGAT", "r", FLAG_READ2)]
+    fn test_restore_unconverted_bases_in_raw_record_indels_parity(
+        #[case] cigar: &str,
+        #[case] sequence: &str,
+        #[case] yd: &str,
+        #[case] flag_mate: u16,
+    ) -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
+
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
+
+        let quals = vec![30u8; sequence.len()];
+        let build = || {
+            RecordBuilder::new()
+                .name("q1")
+                .sequence(sequence)
+                .qualities(&quals)
+                .reference_sequence_id(0)
+                .alignment_start(1)
+                .cigar(cigar)
+                .flags(Flags::from(FLAG_PAIRED | flag_mate))
+                .tag("YD", yd)
+                .tag("NM", 1i32)
+                .tag("MD", "8")
+                .build()
+        };
+
+        // Oracle: RecordBuf path produces the expected SEQ.
+        let mut oracle = build();
+        restore_unconverted_bases_in_record(&mut oracle, &reference, &header)?;
+        let oracle_seq: Vec<u8> = oracle.sequence().as_ref().to_vec();
+        let oracle_modified = oracle_seq != sequence.as_bytes();
+
+        // Raw-byte path: SEQ must match the oracle byte-for-byte, and stale NM/MD
+        // must be cleared iff the oracle modified the SEQ.
+        let (raw, raw_seq) = run_restore_raw(&build(), &reference, &header)?;
+        assert_eq!(raw_seq, oracle_seq, "raw SEQ mismatch for CIGAR {cigar}");
+
+        let aux = bam_fields::aux_data_slice(&raw);
+        let nm_present = bam_fields::find_tag_bounds(aux, &SamTag::NM).is_some();
+        let md_present = bam_fields::find_tag_bounds(aux, &SamTag::MD).is_some();
+        if oracle_modified {
+            assert!(!nm_present, "NM should be removed when SEQ modified (CIGAR {cigar})");
+            assert!(!md_present, "MD should be removed when SEQ modified (CIGAR {cigar})");
+        } else {
+            assert!(nm_present, "NM should be preserved when SEQ unchanged (CIGAR {cigar})");
+            assert!(md_present, "MD should be preserved when SEQ unchanged (CIGAR {cigar})");
+        }
+
+        Ok(())
     }
 
     /// Tests that `restore_unconverted_bases_in_record` replaces T→C at ref-C positions
