@@ -167,14 +167,14 @@ fn run_dedup(input: &Path, output: &Path) {
 // Helpers: compare
 // ---------------------------------------------------------------------------
 
-/// Compare two BAM files using the given mode, returning the full output.
-fn compare_bams(bam1: &Path, bam2: &Path, mode: &str) -> Output {
-    fgumi(args!["compare", "bams", bam1, bam2, "--mode", mode])
+/// Compare two BAM files, returning the full output.
+fn compare_bams(bam1: &Path, bam2: &Path) -> Output {
+    fgumi(args!["compare", "bams", bam1, bam2])
 }
 
-/// Assert that two BAM files are identical according to the given compare mode.
-fn assert_bams_identical(bam1: &Path, bam2: &Path, mode: &str, context: &str) {
-    let output = compare_bams(bam1, bam2, mode);
+/// Assert that two BAM files are identical.
+fn assert_bams_identical(bam1: &Path, bam2: &Path, context: &str) {
+    let output = compare_bams(bam1, bam2);
     assert!(
         output.status.success(),
         "{context}:\nstdout: {}\nstderr: {}",
@@ -213,12 +213,7 @@ fn test_simulate_grouped_reads_deterministic() {
     simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
     simulate_grouped_reads(&bam2, &truth2, &reference, 42, 100);
 
-    assert_bams_identical(
-        &bam1,
-        &bam2,
-        "full",
-        "Two runs with same seed should produce identical BAMs",
-    );
+    assert_bams_identical(&bam1, &bam2, "Two runs with same seed should produce identical BAMs");
 }
 
 // ---------------------------------------------------------------------------
@@ -234,12 +229,7 @@ fn test_simplex_pipeline_deterministic() {
     run_simplex(&grouped, &simplex1, 1);
     run_simplex(&grouped, &simplex2, 1);
 
-    assert_bams_identical(
-        &simplex1,
-        &simplex2,
-        "content",
-        "Two simplex runs should produce identical BAMs",
-    );
+    assert_bams_identical(&simplex1, &simplex2, "Two simplex runs should produce identical BAMs");
 }
 
 // ---------------------------------------------------------------------------
@@ -258,12 +248,7 @@ fn test_simplex_filter_pipeline_deterministic() {
     run_filter(&simplex, &filtered1, 2, 10);
     run_filter(&simplex, &filtered2, 2, 10);
 
-    assert_bams_identical(
-        &filtered1,
-        &filtered2,
-        "content",
-        "Two filter runs should produce identical BAMs",
-    );
+    assert_bams_identical(&filtered1, &filtered2, "Two filter runs should produce identical BAMs");
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +309,6 @@ fn test_full_pipeline_extract_to_filter() {
     assert_bams_identical(
         &tmp.path().join("filtered_a.bam"),
         &tmp.path().join("filtered_b.bam"),
-        "content",
         "Two full pipeline runs should produce identical BAMs",
     );
 }
@@ -342,12 +326,7 @@ fn test_dedup_pipeline_deterministic() {
     run_dedup(&grouped, &dedup1);
     run_dedup(&grouped, &dedup2);
 
-    assert_bams_identical(
-        &dedup1,
-        &dedup2,
-        "content",
-        "Two dedup runs should produce identical BAMs",
-    );
+    assert_bams_identical(&dedup1, &dedup2, "Two dedup runs should produce identical BAMs");
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +345,7 @@ fn test_different_seeds_produce_different_output() {
     simulate_grouped_reads(&bam1, &truth1, &reference, 42, 100);
     simulate_grouped_reads(&bam2, &truth2, &reference, 99, 100);
 
-    let output = compare_bams(&bam1, &bam2, "content");
+    let output = compare_bams(&bam1, &bam2);
     assert_eq!(
         output.status.code(),
         Some(1),
