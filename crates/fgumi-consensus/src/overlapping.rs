@@ -10,7 +10,7 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER};
-use fgumi_raw_bam;
+use fgumi_raw_bam::{self, RawRecordView};
 
 /// Check if a base is a no-call (N, n, or .)
 /// Matches htsjdk's SequenceUtil.isNoCall behavior
@@ -474,7 +474,7 @@ impl ReadAndRefPosIterator {
     ) -> Self {
         let rec_start_i32 = rec_start as i32;
         let rec_end_i32 = rec_end as i32;
-        let rec_len = fgumi_raw_bam::l_seq(bam) as i32;
+        let rec_len = RawRecordView::new(bam).l_seq() as i32;
 
         let min_ref_pos = rec_start_i32.max(mate_start as i32);
         let max_ref_pos = rec_end_i32.min(mate_end as i32);
@@ -756,14 +756,14 @@ impl OverlappingBasesConsensusCaller {
     /// Returns an error if raw BAM field extraction or CIGAR parsing fails.
     pub fn call_raw(&mut self, r1: &mut [u8], r2: &mut [u8]) -> Result<bool> {
         // Only process paired reads where both are mapped
-        if fgumi_raw_bam::flags(r1) & fgumi_raw_bam::flags::UNMAPPED != 0
-            || fgumi_raw_bam::flags(r2) & fgumi_raw_bam::flags::UNMAPPED != 0
+        if RawRecordView::new(r1).flags() & fgumi_raw_bam::flags::UNMAPPED != 0
+            || RawRecordView::new(r2).flags() & fgumi_raw_bam::flags::UNMAPPED != 0
         {
             return Ok(false);
         }
 
         // Must be on the same reference sequence
-        if fgumi_raw_bam::ref_id(r1) != fgumi_raw_bam::ref_id(r2) {
+        if RawRecordView::new(r1).ref_id() != RawRecordView::new(r2).ref_id() {
             return Ok(false);
         }
 
@@ -788,10 +788,10 @@ impl OverlappingBasesConsensusCaller {
         }
 
         // Extract sequences and qualities for modification
-        let mut r1_seq = fgumi_raw_bam::extract_sequence(r1);
-        let mut r2_seq = fgumi_raw_bam::extract_sequence(r2);
-        let mut r1_quals: Vec<u8> = fgumi_raw_bam::quality_scores_slice(r1).to_vec();
-        let mut r2_quals: Vec<u8> = fgumi_raw_bam::quality_scores_slice(r2).to_vec();
+        let mut r1_seq = RawRecordView::new(r1).sequence_vec();
+        let mut r2_seq = RawRecordView::new(r2).sequence_vec();
+        let mut r1_quals: Vec<u8> = RawRecordView::new(r1).quality_scores().to_vec();
+        let mut r2_quals: Vec<u8> = RawRecordView::new(r2).quality_scores().to_vec();
         let mut modified = false;
 
         for pos in overlapping_positions {
@@ -874,8 +874,8 @@ pub fn apply_overlapping_consensus_raw(
     let mut read_pairs: AHashMap<Vec<u8>, (Option<usize>, Option<usize>)> = AHashMap::new();
 
     for (idx, record) in records.iter().enumerate() {
-        let name = fgumi_raw_bam::read_name(record).to_vec();
-        let flg = fgumi_raw_bam::flags(record);
+        let name = RawRecordView::new(record).read_name().to_vec();
+        let flg = RawRecordView::new(record).flags();
 
         if flg & fgumi_raw_bam::flags::FIRST_SEGMENT != 0 {
             read_pairs.entry(name).or_insert((None, None)).0 = Some(idx);
@@ -1523,8 +1523,8 @@ mod tests {
         assert!(result);
 
         // Check that qualities were summed (30 + 20 = 50)
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 50);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 50);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 50);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 50);
     }
 
     #[test]
@@ -1542,8 +1542,8 @@ mod tests {
         assert!(result);
 
         // Max quality used (max(30, 20) = 30)
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 30);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 30);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 30);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 30);
     }
 
     #[test]
@@ -1561,8 +1561,8 @@ mod tests {
         assert!(result);
 
         // Qualities unchanged
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 30);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 20);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 30);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 20);
     }
 
     #[test]
@@ -1580,12 +1580,12 @@ mod tests {
         assert!(result);
 
         // Higher quality base (A from r1) chosen, qual = 30 - 20 = 10
-        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
-        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
+        let r1_seq = RawRecordView::new(&r1).sequence_vec();
+        let r2_seq = RawRecordView::new(&r2).sequence_vec();
         assert_eq!(r1_seq[0], b'A');
         assert_eq!(r2_seq[0], b'A');
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 10);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 10);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 10);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 10);
     }
 
     #[test]
@@ -1603,12 +1603,12 @@ mod tests {
         assert!(result);
 
         // Both bases masked to N with quality 2
-        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
-        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
+        let r1_seq = RawRecordView::new(&r1).sequence_vec();
+        let r2_seq = RawRecordView::new(&r2).sequence_vec();
         assert_eq!(r1_seq[0], b'N');
         assert_eq!(r2_seq[0], b'N');
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 2);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 2);
     }
 
     #[test]
@@ -1626,12 +1626,12 @@ mod tests {
         assert!(result);
 
         // Only lower quality base (r2) masked
-        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
-        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
+        let r1_seq = RawRecordView::new(&r1).sequence_vec();
+        let r2_seq = RawRecordView::new(&r2).sequence_vec();
         assert_eq!(r1_seq[0], b'A'); // Unchanged
         assert_eq!(r2_seq[0], b'N'); // Masked
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 30); // Unchanged
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2); // Masked
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 30); // Unchanged
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 2); // Masked
     }
 
     #[test]
@@ -1649,8 +1649,8 @@ mod tests {
         assert!(result);
 
         // Only lower quality base (r1) masked
-        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
-        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
+        let r1_seq = RawRecordView::new(&r1).sequence_vec();
+        let r2_seq = RawRecordView::new(&r2).sequence_vec();
         assert_eq!(r1_seq[0], b'N'); // Masked
         assert_eq!(r2_seq[0], b'G'); // Unchanged
     }
@@ -1670,12 +1670,12 @@ mod tests {
         assert!(result);
 
         // Both masked when qualities are equal
-        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
-        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
+        let r1_seq = RawRecordView::new(&r1).sequence_vec();
+        let r2_seq = RawRecordView::new(&r2).sequence_vec();
         assert_eq!(r1_seq[0], b'N');
         assert_eq!(r2_seq[0], b'N');
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 2);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 2);
     }
 
     #[test]
@@ -1693,12 +1693,12 @@ mod tests {
         assert!(result);
 
         // Both masked when qualities are equal
-        let r1_seq = fgumi_raw_bam::extract_sequence(&r1);
-        let r2_seq = fgumi_raw_bam::extract_sequence(&r2);
+        let r1_seq = RawRecordView::new(&r1).sequence_vec();
+        let r2_seq = RawRecordView::new(&r2).sequence_vec();
         assert_eq!(r1_seq[0], b'N');
         assert_eq!(r2_seq[0], b'N');
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 2);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 2);
     }
 
     #[test]
@@ -1772,7 +1772,7 @@ mod tests {
         assert!(result);
 
         // Quality capped at 93
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 93);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 93);
     }
 
     #[test]
@@ -1833,8 +1833,8 @@ mod tests {
         assert_eq!(caller.stats().bases_agreeing, 2); // GT == GT
 
         // Check quality sums at overlapping positions
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[2], 50); // 30 + 20
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[3], 50);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[2], 50); // 30 + 20
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[3], 50);
     }
 
     #[test]
@@ -1856,10 +1856,10 @@ mod tests {
         assert_eq!(caller.stats().bases_agreeing, 4); // ACGT == ACGT
 
         // Check quality sums at overlapping positions
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[2], 50); // 30 + 20
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[3], 50);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[4], 50);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[5], 50);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[2], 50); // 30 + 20
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[3], 50);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[4], 50);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[5], 50);
     }
 
     #[test]
@@ -1911,8 +1911,8 @@ mod tests {
         assert!(result);
 
         // Quality difference is 1, but minimum is 2
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r1)[0], 2);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&r2)[0], 2);
+        assert_eq!(RawRecordView::new(&r1).quality_scores()[0], 2);
+        assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 2);
     }
 
     /// Verify that `call_raw` produces the same results as `call` for agreement.
@@ -1939,8 +1939,8 @@ mod tests {
         caller_raw.call_raw(&mut raw_r1, &mut raw_r2).expect("call_raw should succeed");
 
         // Compare results
-        assert_eq!(rb_r1.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r1));
-        assert_eq!(rb_r2.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r2));
+        assert_eq!(rb_r1.quality_scores().as_ref(), RawRecordView::new(&raw_r1).quality_scores());
+        assert_eq!(rb_r2.quality_scores().as_ref(), RawRecordView::new(&raw_r2).quality_scores());
         assert_eq!(caller_buf.stats().overlapping_bases, caller_raw.stats().overlapping_bases);
         assert_eq!(caller_buf.stats().bases_agreeing, caller_raw.stats().bases_agreeing);
         assert_eq!(caller_buf.stats().bases_corrected, caller_raw.stats().bases_corrected);
@@ -1972,14 +1972,14 @@ mod tests {
         // Compare sequences
         let buf_r1_seq: Vec<u8> = rb_r1.sequence().as_ref().to_vec();
         let buf_r2_seq: Vec<u8> = rb_r2.sequence().as_ref().to_vec();
-        let raw_r1_seq = fgumi_raw_bam::extract_sequence(&raw_r1);
-        let raw_r2_seq = fgumi_raw_bam::extract_sequence(&raw_r2);
+        let raw_r1_seq = RawRecordView::new(&raw_r1).sequence_vec();
+        let raw_r2_seq = RawRecordView::new(&raw_r2).sequence_vec();
         assert_eq!(buf_r1_seq, raw_r1_seq);
         assert_eq!(buf_r2_seq, raw_r2_seq);
 
         // Compare qualities
-        assert_eq!(rb_r1.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r1));
-        assert_eq!(rb_r2.quality_scores().as_ref(), fgumi_raw_bam::quality_scores_slice(&raw_r2));
+        assert_eq!(rb_r1.quality_scores().as_ref(), RawRecordView::new(&raw_r1).quality_scores());
+        assert_eq!(rb_r2.quality_scores().as_ref(), RawRecordView::new(&raw_r2).quality_scores());
 
         // Compare stats
         assert_eq!(caller_buf.stats().overlapping_bases, caller_raw.stats().overlapping_bases);
@@ -2011,8 +2011,8 @@ mod tests {
             .expect("apply_overlapping_consensus_raw should succeed");
 
         // Check that qualities were summed (30 + 20 = 50)
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[0])[0], 50);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[1])[0], 50);
+        assert_eq!(RawRecordView::new(&records[0]).quality_scores()[0], 50);
+        assert_eq!(RawRecordView::new(&records[1]).quality_scores()[0], 50);
         assert!(caller.stats().overlapping_bases > 0);
     }
 
@@ -2036,8 +2036,8 @@ mod tests {
             .expect("apply_overlapping_consensus_raw should succeed");
 
         // Qualities unchanged because no matching pair
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[0])[0], 30);
-        assert_eq!(fgumi_raw_bam::quality_scores_slice(&records[1])[0], 20);
+        assert_eq!(RawRecordView::new(&records[0]).quality_scores()[0], 30);
+        assert_eq!(RawRecordView::new(&records[1]).quality_scores()[0], 20);
         assert_eq!(caller.stats().overlapping_bases, 0);
     }
 
@@ -2063,8 +2063,8 @@ mod tests {
         // Both should have been consensus-called
         assert!(caller.stats().overlapping_bases > 0);
         assert_eq!(
-            fgumi_raw_bam::quality_scores_slice(&records[0])[0],
-            fgumi_raw_bam::quality_scores_slice(&records[1])[0]
+            RawRecordView::new(&records[0]).quality_scores()[0],
+            RawRecordView::new(&records[1]).quality_scores()[0]
         );
     }
 
