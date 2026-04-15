@@ -75,7 +75,7 @@ use noodles::sam::alignment::record_buf::Data;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 /// Command-line arguments for `zipper`
@@ -119,8 +119,8 @@ workflows like:
 )]
 #[command(verbatim_doc_comment)]
 pub struct Zipper {
-    /// Input mapped SAM or BAM file (or `-` for stdin, SAM only). BAM input is
-    /// discouraged; prefer piping SAM directly from the aligner for best performance.
+    /// Input mapped SAM or BAM file (or `-` for stdin; SAM or BAM is auto-detected).
+    /// BAM input is discouraged; prefer piping SAM directly from the aligner for best performance.
     #[arg(short = 'i', long, default_value = "-")]
     pub input: PathBuf,
 
@@ -1270,11 +1270,52 @@ impl Zipper {
     }
 }
 
+/// BAM reader for stdin: single-threaded BGZF over a buffered `Box<dyn Read + Send>`.
+///
+/// Stdin is non-seekable, so we use a single-threaded BGZF reader (the multi-threaded
+/// variant in [`BamReaderAuto`] requires `Seek`). `BufReader` wraps stdin so we can peek
+/// the BGZF magic bytes for format auto-detection without consuming them.
+type BamStdinReader =
+    noodles::bam::io::Reader<noodles::bgzf::io::Reader<BufReader<Box<dyn Read + Send>>>>;
+
 /// Wraps SAM and BAM readers so the mapped-reader thread can handle either format.
 /// Moved into the thread where `record_bufs()` is called, since it borrows `&self`.
 enum MappedReader {
     Sam(noodles::sam::io::Reader<Box<dyn BufRead + Send>>),
     Bam(BamReaderAuto),
+    StdinBam(BamStdinReader),
+}
+
+/// First four bytes of a BGZF stream (gzip magic + extra-flag byte unique to BGZF).
+const BGZF_MAGIC: [u8; 4] = [0x1f, 0x8b, 0x08, 0x04];
+
+/// Peeks up to [`BGZF_MAGIC.len()`] bytes from `stdin` to classify it as BGZF (BAM) vs SAM text.
+///
+/// A single `read()` on a pipe may return fewer bytes than requested even when more
+/// data is coming (e.g. the aligner hasn't flushed its first block yet), so this loops
+/// until the peek buffer is full or EOF is reached. The peeked bytes are then chained
+/// back onto the stream so downstream parsers see the complete input.
+///
+/// # Returns
+///
+/// `(is_bgzf, reader)` where `reader` yields the peeked bytes followed by the rest of
+/// the original stream.
+fn peek_stdin_bgzf(mut stdin: Box<dyn Read + Send>) -> Result<(bool, Box<dyn Read + Send>)> {
+    let mut prefix = [0u8; BGZF_MAGIC.len()];
+    let mut filled = 0usize;
+    while filled < prefix.len() {
+        match stdin.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("Failed to peek stdin"),
+        }
+    }
+    let is_bgzf = filled == BGZF_MAGIC.len() && prefix == BGZF_MAGIC;
+    // Prepend the peeked bytes back onto the stream so the chosen reader sees them.
+    let restored: Box<dyn Read + Send> =
+        Box::new(std::io::Cursor::new(prefix[..filled].to_vec()).chain(stdin));
+    Ok((is_bgzf, restored))
 }
 
 impl Command for Zipper {
@@ -1327,13 +1368,37 @@ impl Command for Zipper {
         // The reader and header are separated here; record_bufs() is called inside
         // the spawned thread (it borrows &self, so the reader must live there).
         let (mapped_reader, mapped_header) = if is_stdin_path(&self.input) {
-            // Stdin is always SAM (streaming from aligner)
-            info!("Reading SAM from stdin with adaptive buffer (bwa -K {})", self.bwa_chunk_size);
-            let reader: Box<dyn BufRead + Send> =
-                Box::new(BatchedSamReader::new(std::io::stdin(), self.bwa_chunk_size));
-            let mut sam_reader = noodles::sam::io::Reader::new(reader);
-            let header = sam_reader.read_header()?;
-            (MappedReader::Sam(sam_reader), header)
+            // Auto-detect BAM (BGZF magic) vs SAM text on stdin so callers can pipe either,
+            // matching the file-input path. Without this, piping `samtools view -b ...` to
+            // zipper crashes with a confusing "invalid flags / lexical parse error" because
+            // the SAM text parser misreads the binary BGZF stream.
+            //
+            // `peek_stdin_bgzf` reads up to the magic length in a loop (a single `read()` on
+            // a pipe may return fewer bytes than requested) and returns a reader that prepends
+            // the peeked bytes back onto the stream for the chosen downstream reader.
+            let stdin: Box<dyn Read + Send> = Box::new(std::io::stdin());
+            let (is_bgzf, stdin) = peek_stdin_bgzf(stdin)?;
+            let buffered = BufReader::with_capacity(64 * 1024, stdin);
+            if is_bgzf {
+                warn!(
+                    "BAM input detected on stdin. For best performance, pipe SAM directly \
+                     from the aligner (e.g. bwa mem ... | fgumi zipper ...)."
+                );
+                let bgzf = noodles::bgzf::io::Reader::new(buffered);
+                let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
+                let header = bam_reader.read_header()?;
+                (MappedReader::StdinBam(bam_reader), header)
+            } else {
+                info!(
+                    "Reading SAM from stdin with adaptive buffer (bwa -K {})",
+                    self.bwa_chunk_size
+                );
+                let reader: Box<dyn BufRead + Send> =
+                    Box::new(BatchedSamReader::new(buffered, self.bwa_chunk_size));
+                let mut sam_reader = noodles::sam::io::Reader::new(reader);
+                let header = sam_reader.read_header()?;
+                (MappedReader::Sam(sam_reader), header)
+            }
         } else if self.input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bam")) {
             // BAM file input — functional but discouraged
             warn!(
@@ -1433,6 +1498,17 @@ impl Command for Zipper {
                         }
                     }
                 }
+                MappedReader::StdinBam(mut r) => {
+                    let mapped_iter = TemplateIterator::new(
+                        r.record_bufs(&mapped_header_for_reader)
+                            .map(|rec| rec.map_err(anyhow::Error::from)),
+                    );
+                    for template in mapped_iter {
+                        if mapped_tx.send(template).is_err() {
+                            break;
+                        }
+                    }
+                }
             }
         });
         let mapped_iter = std::iter::from_fn(move || mapped_rx.recv().ok());
@@ -1465,7 +1541,83 @@ mod tests {
     use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::io::Read;
     use tempfile::TempDir;
+
+    /// A `Read` implementation that returns at most one byte per `read` call,
+    /// mimicking the behavior of a slow pipe or small kernel buffer. Used to
+    /// regression-test `peek_stdin_bgzf`, which must tolerate short reads.
+    struct TrickleReader(std::collections::VecDeque<u8>);
+
+    impl Read for TrickleReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            match self.0.pop_front() {
+                Some(b) => {
+                    buf[0] = b;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn trickle(bytes: &[u8]) -> Box<dyn Read + Send> {
+        Box::new(TrickleReader(bytes.iter().copied().collect()))
+    }
+
+    /// Regression: `BufReader::fill_buf` can return fewer than `BGZF_MAGIC.len()`
+    /// bytes on a pipe even when more data is coming. Before the fix, that caused
+    /// BAM-on-stdin to be misclassified as SAM. Simulate it with a reader that
+    /// returns one byte per `read` call and confirm classification + stream
+    /// reconstruction both work.
+    #[test]
+    fn test_peek_stdin_bgzf_classifies_bam_under_short_reads() -> Result<()> {
+        let mut stream = BGZF_MAGIC.to_vec();
+        stream.extend_from_slice(b"rest-of-bgzf-stream");
+        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
+        assert!(is_bgzf);
+        let mut round_trip = Vec::new();
+        restored.read_to_end(&mut round_trip)?;
+        assert_eq!(round_trip, stream);
+        Ok(())
+    }
+
+    #[test]
+    fn test_peek_stdin_bgzf_classifies_sam_text() -> Result<()> {
+        let stream = b"@HD\tVN:1.6\tSO:queryname\n".to_vec();
+        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
+        assert!(!is_bgzf);
+        let mut round_trip = Vec::new();
+        restored.read_to_end(&mut round_trip)?;
+        assert_eq!(round_trip, stream);
+        Ok(())
+    }
+
+    #[test]
+    fn test_peek_stdin_bgzf_handles_stream_shorter_than_magic() -> Result<()> {
+        // Fewer bytes than BGZF_MAGIC.len() — must not be misclassified as BAM,
+        // and the short prefix must still be recoverable from the returned reader.
+        let stream = b"@H".to_vec();
+        let (is_bgzf, mut restored) = peek_stdin_bgzf(trickle(&stream))?;
+        assert!(!is_bgzf);
+        let mut round_trip = Vec::new();
+        restored.read_to_end(&mut round_trip)?;
+        assert_eq!(round_trip, stream);
+        Ok(())
+    }
+
+    #[test]
+    fn test_peek_stdin_bgzf_handles_empty_stream() -> Result<()> {
+        let (is_bgzf, mut restored) = peek_stdin_bgzf(Box::new(std::io::empty()))?;
+        assert!(!is_bgzf);
+        let mut round_trip = Vec::new();
+        restored.read_to_end(&mut round_trip)?;
+        assert!(round_trip.is_empty());
+        Ok(())
+    }
 
     /// Runs `zipper-bams` and returns the output records
     ///
