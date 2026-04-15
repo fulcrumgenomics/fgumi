@@ -552,6 +552,30 @@ impl RawRecord {
 
     // -- Length-changing edits --
 
+    /// Replace the CIGAR operation array.
+    ///
+    /// Updates `n_cigar_op` and splices the new ops in. Each op is a `u32` in
+    /// the standard BAM packing (`(op_len << 4) | op_type`).
+    ///
+    /// All other fields (sequence, quality, aux tags) are preserved.
+    ///
+    /// # Panics
+    /// Panics if `new_ops.len() > u16::MAX as usize`.
+    pub fn set_cigar_ops(&mut self, new_ops: &[u32]) {
+        let new_n = u16::try_from(new_ops.len())
+            .unwrap_or_else(|_| panic!("CIGAR op count {} overflows u16", new_ops.len()));
+        let l_rn = self.0[8] as usize;
+        let old_n = u16::from_le_bytes([self.0[12], self.0[13]]) as usize;
+        let start = 32 + l_rn;
+        let end = start + old_n * 4;
+        let mut bytes = Vec::with_capacity(new_ops.len() * 4);
+        for &op in new_ops {
+            bytes.extend_from_slice(&op.to_le_bytes());
+        }
+        self.0.splice(start..end, bytes);
+        self.0[12..14].copy_from_slice(&new_n.to_le_bytes());
+    }
+
     /// Replace the read name. Updates `l_read_name` and splices the name +
     /// NUL terminator into the record.
     ///
@@ -752,6 +776,27 @@ mod tests {
         rec.set_read_name(b"");
         assert_eq!(rec.read_name(), b"");
         assert_eq!(rec.l_read_name(), 1);
+    }
+
+    #[test]
+    fn test_set_cigar_ops_resize() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 10)], 10, -1, -1, b"NMc\x05");
+        let mut rec = RawRecord::from(bytes);
+        let pre_name = rec.read_name().to_vec();
+        let pre_seq = rec.sequence_vec();
+        let pre_qual = rec.quality_scores().to_vec();
+        let pre_nm = rec.tags().find_int(b"NM");
+
+        let new_ops = vec![encode_op(0, 4), encode_op(2, 1), encode_op(0, 6)];
+        rec.set_cigar_ops(&new_ops);
+        assert_eq!(rec.cigar_ops_vec(), new_ops);
+        assert_eq!(rec.n_cigar_op() as usize, new_ops.len());
+
+        assert_eq!(rec.read_name(), pre_name.as_slice());
+        assert_eq!(rec.sequence_vec(), pre_seq);
+        assert_eq!(rec.quality_scores(), pre_qual.as_slice());
+        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
     }
 
     #[test]
