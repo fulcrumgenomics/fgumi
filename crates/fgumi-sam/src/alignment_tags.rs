@@ -230,7 +230,7 @@ pub fn regenerate_alignment_tags(
 // Raw-byte alignment tag regeneration
 // ============================================================================
 
-use fgumi_raw_bam;
+use fgumi_raw_bam::{self, RawRecordView, RawTagsEditor};
 
 /// Regenerates NM, UQ, and MD tags for a raw BAM record after base masking.
 ///
@@ -262,18 +262,17 @@ pub fn regenerate_alignment_tags_raw(
             fgumi_raw_bam::MIN_BAM_RECORD_LEN
         );
     }
-    let flg = fgumi_raw_bam::flags(record);
-
     // For unmapped reads, remove alignment tags
-    if (flg & fgumi_raw_bam::flags::UNMAPPED) != 0 {
-        fgumi_raw_bam::remove_tag(record, b"NM");
-        fgumi_raw_bam::remove_tag(record, b"UQ");
-        fgumi_raw_bam::remove_tag(record, b"MD");
+    if RawRecordView::new(record).is_unmapped() {
+        let mut editor = RawTagsEditor::from_vec(record);
+        editor.remove(b"NM");
+        editor.remove(b"UQ");
+        editor.remove(b"MD");
         return Ok(false);
     }
 
     // Get reference sequence ID and look up name in header
-    let ref_seq_id = fgumi_raw_bam::ref_id(record);
+    let ref_seq_id = RawRecordView::new(record).ref_id();
     if ref_seq_id < 0 {
         return Ok(false);
     }
@@ -283,7 +282,7 @@ pub fn regenerate_alignment_tags_raw(
         .context("Reference sequence ID not found in header")?;
     let ref_name = std::str::from_utf8(ref_name_bytes.as_ref())?;
 
-    let alignment_start_0based = fgumi_raw_bam::pos(record);
+    let alignment_start_0based = RawRecordView::new(record).pos();
     if alignment_start_0based < 0 {
         anyhow::bail!("Invalid alignment start position: {alignment_start_0based}");
     }
@@ -299,9 +298,10 @@ pub fn regenerate_alignment_tags_raw(
 
     // Handle edge case: CIGAR with no reference-consuming operations
     if ref_span == 0 {
-        fgumi_raw_bam::update_int_tag(record, b"NM", 0);
-        fgumi_raw_bam::update_int_tag(record, b"UQ", 0);
-        fgumi_raw_bam::update_string_tag(record, b"MD", b"0");
+        let mut editor = RawTagsEditor::from_vec(record);
+        editor.update_int(b"NM", 0);
+        editor.update_int(b"UQ", 0);
+        editor.update_string(b"MD", b"0");
         return Ok(false);
     }
 
@@ -410,9 +410,10 @@ pub fn regenerate_alignment_tags_raw(
     write!(md_string, "{match_count}").expect("write to String is infallible");
 
     // Update tags
-    fgumi_raw_bam::update_int_tag(record, b"NM", nm);
-    fgumi_raw_bam::update_int_tag(record, b"UQ", uq.min(i32::MAX as u32) as i32);
-    fgumi_raw_bam::update_string_tag(record, b"MD", md_string.as_bytes());
+    let mut editor = RawTagsEditor::from_vec(record);
+    editor.update_int(b"NM", nm);
+    editor.update_int(b"UQ", uq.min(i32::MAX as u32) as i32);
+    editor.update_string(b"MD", md_string.as_bytes());
 
     Ok(true)
 }
