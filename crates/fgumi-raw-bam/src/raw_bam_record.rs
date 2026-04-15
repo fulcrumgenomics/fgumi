@@ -596,13 +596,30 @@ impl RawRecord {
         let body_start = 32 + l_rn + n_co * 4;
         let old_packed = old_l.div_ceil(2);
         let body_end = body_start + old_packed + old_l;
-
         let new_packed_len = seq.len().div_ceil(2);
-        let mut new_body = Vec::with_capacity(new_packed_len + qual.len());
-        crate::sequence::pack_sequence_into(&mut new_body, seq);
-        new_body.extend_from_slice(qual);
+        let new_body_len = new_packed_len + qual.len();
+        let old_body_len = body_end - body_start;
 
-        self.0.splice(body_start..body_end, new_body);
+        // Resize in place by shifting aux data to its new position, then write
+        // packed seq and qual directly into the record buffer. This avoids the
+        // intermediate Vec allocation and extra memcpy that the splice approach
+        // required.
+        if new_body_len > old_body_len {
+            let grow = new_body_len - old_body_len;
+            let old_len = self.0.len();
+            self.0.resize(old_len + grow, 0);
+            self.0.copy_within(body_end..old_len, body_end + grow);
+        } else if new_body_len < old_body_len {
+            let shrink = old_body_len - new_body_len;
+            self.0.copy_within(body_end.., body_end - shrink);
+            self.0.truncate(self.0.len() - shrink);
+        }
+
+        let (seq_slot, qual_slot) =
+            self.0[body_start..body_start + new_body_len].split_at_mut(new_packed_len);
+        crate::sequence::pack_sequence_into_slice(seq_slot, seq);
+        qual_slot.copy_from_slice(qual);
+
         self.0[16..20].copy_from_slice(&new_l.to_le_bytes());
     }
 

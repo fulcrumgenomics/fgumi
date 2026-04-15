@@ -126,6 +126,46 @@ pub fn pack_sequence_into(dst: &mut Vec<u8>, bases: &[u8]) {
     }
 }
 
+/// Pack ASCII bases into BAM 4-bit-per-base format, writing into a mutable slice.
+///
+/// `dst` must have length `>= bases.len().div_ceil(2)`. Writes exactly
+/// `bases.len().div_ceil(2)` bytes, zero-padding the last nibble when
+/// `bases.len()` is odd.
+///
+/// Mirrors [`pack_sequence_into`] but targets an existing `&mut [u8]` slot
+/// instead of appending to a `Vec`, avoiding an intermediate allocation when
+/// the destination buffer is already sized.
+#[inline]
+pub fn pack_sequence_into_slice(dst: &mut [u8], bases: &[u8]) {
+    if bases.is_empty() {
+        return;
+    }
+    let packed_len = bases.len().div_ceil(2);
+    debug_assert!(dst.len() >= packed_len);
+    let mut i = 0usize;
+    let mut chunks = bases.chunks_exact(PACK_CHUNK);
+    for chunk in chunks.by_ref() {
+        dst[i] = (SEQ_CODES[chunk[0] as usize] << 4) | SEQ_CODES[chunk[1] as usize];
+        dst[i + 1] = (SEQ_CODES[chunk[2] as usize] << 4) | SEQ_CODES[chunk[3] as usize];
+        dst[i + 2] = (SEQ_CODES[chunk[4] as usize] << 4) | SEQ_CODES[chunk[5] as usize];
+        dst[i + 3] = (SEQ_CODES[chunk[6] as usize] << 4) | SEQ_CODES[chunk[7] as usize];
+        dst[i + 4] = (SEQ_CODES[chunk[8] as usize] << 4) | SEQ_CODES[chunk[9] as usize];
+        dst[i + 5] = (SEQ_CODES[chunk[10] as usize] << 4) | SEQ_CODES[chunk[11] as usize];
+        dst[i + 6] = (SEQ_CODES[chunk[12] as usize] << 4) | SEQ_CODES[chunk[13] as usize];
+        dst[i + 7] = (SEQ_CODES[chunk[14] as usize] << 4) | SEQ_CODES[chunk[15] as usize];
+        i += 8;
+    }
+    let remainder = chunks.remainder();
+    let mut pairs = remainder.chunks_exact(2);
+    for pair in pairs.by_ref() {
+        dst[i] = (SEQ_CODES[pair[0] as usize] << 4) | SEQ_CODES[pair[1] as usize];
+        i += 1;
+    }
+    if let Some(&last) = pairs.remainder().first() {
+        dst[i] = SEQ_CODES[last as usize] << 4;
+    }
+}
+
 /// Extract a quality score at a given position.
 #[inline]
 #[must_use]
