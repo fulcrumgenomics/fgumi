@@ -649,6 +649,107 @@ impl<'a> RawRecordView<'a> {
     }
 }
 
+/// Borrowed fixed-length mutable view over a complete BAM record's bytes.
+///
+/// Wraps `&'a mut [u8]`. Provides every fixed-offset setter plus per-base /
+/// per-quality writes, but cannot change the record's byte length.
+///
+/// Read methods are accessed via [`RawRecordMut::view`].
+#[derive(Debug)]
+pub struct RawRecordMut<'a>(&'a mut [u8]);
+
+impl<'a> RawRecordMut<'a> {
+    /// Wrap raw BAM bytes mutably without validation.
+    ///
+    /// In debug builds, asserts `bytes.len() >= MIN_BAM_RECORD_LEN`. In release
+    /// builds, setter methods on a too-short slice will panic on out-of-bounds
+    /// indexing.
+    #[inline]
+    #[must_use]
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        debug_assert!(bytes.len() >= MIN_BAM_RECORD_LEN);
+        Self(bytes)
+    }
+
+    /// Wrap raw BAM bytes mutably, returning `None` if too short for the fixed header.
+    #[inline]
+    #[must_use]
+    pub fn try_new(bytes: &'a mut [u8]) -> Option<Self> {
+        if bytes.len() >= MIN_BAM_RECORD_LEN { Some(Self(bytes)) } else { None }
+    }
+
+    /// Borrow as a read-only view (lifetime tied to `&self`).
+    #[inline]
+    #[must_use]
+    pub fn view(&self) -> RawRecordView<'_> {
+        RawRecordView(self.0)
+    }
+
+    /// Returns the underlying byte slice as a shared reference.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0
+    }
+
+    /// Returns the underlying byte slice as a mutable reference.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.0
+    }
+
+    // -- header (fixed-offset) setters --
+
+    /// Set the reference sequence ID.
+    #[inline]
+    pub fn set_ref_id(&mut self, v: i32) {
+        set_ref_id(self.0, v);
+    }
+
+    /// Set the 0-based leftmost position.
+    #[inline]
+    pub fn set_pos(&mut self, v: i32) {
+        set_pos(self.0, v);
+    }
+
+    /// Set the mapping quality.
+    #[inline]
+    pub fn set_mapq(&mut self, v: u8) {
+        set_mapq(self.0, v);
+    }
+
+    /// Set the bitwise flags.
+    #[inline]
+    pub fn set_flags(&mut self, v: u16) {
+        set_flags(self.0, v);
+    }
+
+    /// Set the mate reference sequence ID.
+    #[inline]
+    pub fn set_mate_ref_id(&mut self, v: i32) {
+        set_mate_ref_id(self.0, v);
+    }
+
+    /// Set the mate 0-based position.
+    #[inline]
+    pub fn set_mate_pos(&mut self, v: i32) {
+        set_mate_pos(self.0, v);
+    }
+
+    /// Set the template length (TLEN).
+    #[inline]
+    pub fn set_template_length(&mut self, v: i32) {
+        set_template_length(self.0, v);
+    }
+
+    /// Set the BAM bin field (bytes 10–11, little-endian u16).
+    #[inline]
+    pub fn set_bin(&mut self, v: u16) {
+        self.0[10..12].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::identity_op)]
 mod tests {
@@ -1221,5 +1322,40 @@ mod tests {
         let f = v.template_coordinate_fields();
         assert_eq!(f.tid, 3);
         assert!(f.flags.reverse());
+    }
+
+    // ========================================================================
+    // RawRecordMut tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_record_mut_constructors_and_view() {
+        let mut bytes = vec![0u8; 32];
+        let m = RawRecordMut::new(&mut bytes);
+        assert_eq!(m.view().as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_raw_record_mut_setters() {
+        use crate::testutil::*;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        let mut m = RawRecordMut::new(&mut rec);
+        m.set_ref_id(7);
+        m.set_pos(123);
+        m.set_mapq(40);
+        m.set_flags(flags::PAIRED | flags::REVERSE);
+        m.set_bin(4680);
+        m.set_mate_ref_id(8);
+        m.set_mate_pos(456);
+        m.set_template_length(300);
+        let v = m.view();
+        assert_eq!(v.ref_id(), 7);
+        assert_eq!(v.pos(), 123);
+        assert_eq!(v.mapq(), 40);
+        assert_eq!(v.flags(), flags::PAIRED | flags::REVERSE);
+        assert_eq!(v.bin(), 4680);
+        assert_eq!(v.mate_ref_id(), 8);
+        assert_eq!(v.mate_pos(), 456);
+        assert_eq!(v.template_length(), 300);
     }
 }
