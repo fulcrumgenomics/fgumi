@@ -632,6 +632,23 @@ pub fn extract_template_coordinate_fields(bam_bytes: &[u8]) -> TemplateCoordFiel
     }
 }
 
+impl<'a> RawRecordView<'a> {
+    /// Extract `(tid, pos, reverse, name)` for coordinate-key sorting.
+    /// Unmapped reads return `(i32::MAX, i32::MAX, false, name)`.
+    #[inline]
+    #[must_use]
+    pub fn coordinate_fields(&self) -> (i32, i32, bool, &'a [u8]) {
+        extract_coordinate_fields(self.0)
+    }
+
+    /// Extract template-coordinate sort fields in a single pass.
+    #[inline]
+    #[must_use]
+    pub fn template_coordinate_fields(&self) -> TemplateCoordFields<'a> {
+        extract_template_coordinate_fields(self.0)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::identity_op)]
 mod tests {
@@ -1190,5 +1207,19 @@ mod tests {
         assert!(v.is_paired());
         assert!(v.is_reverse());
         assert!(!v.is_unmapped());
+    }
+
+    #[test]
+    fn test_view_batched_coord_helpers() {
+        use crate::testutil::*;
+        let rec = make_bam_bytes(3, 200, flags::REVERSE, b"r", &[], 0, -1, -1, &[]);
+        let v = RawRecordView::new(&rec);
+        let (tid, pos, reverse, name) = v.coordinate_fields();
+        assert_eq!((tid, pos, reverse), (3, 200, true));
+        assert_eq!(name, b"r");
+
+        let f = v.template_coordinate_fields();
+        assert_eq!(f.tid, 3);
+        assert!(f.flags.reverse());
     }
 }
