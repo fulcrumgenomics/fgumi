@@ -913,6 +913,53 @@ impl<'a> RawTagsView<'a> {
     }
 }
 
+/// Forward-only iterator over aux tag entries.
+///
+/// Yields `TagEntry` values containing the 2-byte tag, the type byte, and
+/// the raw value bytes (whose length is determined by the type per BAM spec).
+/// Stops at the first malformed entry.
+pub struct AuxTagsIter<'a> {
+    aux: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for AuxTagsIter<'a> {
+    type Item = TagEntry<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + 3 > self.aux.len() {
+            return None;
+        }
+        let tag = [self.aux[self.pos], self.aux[self.pos + 1]];
+        let type_byte = self.aux[self.pos + 2];
+        let value_start = self.pos + 3;
+        let size = tag_value_size(type_byte, &self.aux[value_start..])?;
+        let end = value_start.checked_add(size)?;
+        if end > self.aux.len() {
+            return None;
+        }
+        let entry = TagEntry { tag, type_byte, value_bytes: &self.aux[value_start..end] };
+        self.pos = end;
+        Some(entry)
+    }
+}
+
+impl<'a> RawTagsView<'a> {
+    /// Iterate over aux tag entries without allocating.
+    #[inline]
+    #[must_use]
+    pub fn iter(&self) -> AuxTagsIter<'a> {
+        AuxTagsIter { aux: self.0, pos: 0 }
+    }
+}
+
+impl<'a> IntoIterator for &RawTagsView<'a> {
+    type Item = TagEntry<'a>;
+    type IntoIter = AuxTagsIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 impl<'a> RawRecordView<'a> {
     /// Returns a read-only view over this record's auxiliary tag section.
     #[inline]
@@ -2597,5 +2644,32 @@ mod tests {
         assert!(!tags.is_empty());
         assert!(tags.contains(b"RG"));
         assert!(!tags.contains(b"NM"));
+    }
+
+    #[test]
+    fn test_raw_tags_iter_basic() {
+        use crate::fields::RawRecordView;
+        // RG:Z:rg1\0 NM:i:5 (4 bytes LE)
+        let mut aux: Vec<u8> = b"RGZrg1\0".to_vec();
+        aux.extend_from_slice(b"NMi");
+        aux.extend_from_slice(&5i32.to_le_bytes());
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux);
+
+        let v = RawRecordView::new(&rec);
+        let mut entries: Vec<(String, u8, Vec<u8>)> = v
+            .tags()
+            .iter()
+            .map(|e| {
+                (String::from_utf8(e.tag.to_vec()).unwrap(), e.type_byte, e.value_bytes.to_vec())
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                ("NM".into(), b'i', 5i32.to_le_bytes().to_vec()),
+                ("RG".into(), b'Z', b"rg1\0".to_vec()),
+            ]
+        );
     }
 }
