@@ -729,6 +729,46 @@ pub fn append_i32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i32])
     }
 }
 
+/// Append a `u16` array (`B:S`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 'S', count_u32_le, values_u16_le...]`
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`.
+pub fn append_u16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u16]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b'S');
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
+    for &v in values {
+        record.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Append an `f32` array (`B:f`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 'f', count_u32_le, values_f32_le...]`
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`.
+pub fn append_f32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[f32]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b'f');
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
+    for &v in values {
+        record.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
 /// Normalize an integer tag to the smallest signed type that fits its value.
 ///
 /// If the tag exists and is an integer type, it is re-encoded using
@@ -1307,6 +1347,165 @@ impl<'a> RawTagsEditor<'a> {
     #[inline]
     pub fn update_string(&mut self, tag: &[u8; 2], value: &[u8]) {
         update_string_tag(self.record, tag, value);
+    }
+
+    /// Update an existing `f`-type tag in place, or remove + append if the existing tag has a
+    /// different type or is absent.
+    pub fn update_float(&mut self, tag: &[u8; 2], value: f32) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'f' && abs + 7 <= self.record.len() {
+                self.record[abs + 3..abs + 7].copy_from_slice(&value.to_le_bytes());
+                return;
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_float_tag(self.record, tag, value);
+    }
+
+    /// Update an existing `B:C` (u8 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_u8(&mut self, tag: &[u8; 2], values: &[u8]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b'C' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    self.record[body..body + values.len()].copy_from_slice(values);
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_u8_array_tag(self.record, tag, values);
+    }
+
+    /// Update an existing `B:S` (u16 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_u16(&mut self, tag: &[u8; 2], values: &[u16]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b'S' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    for (i, &v) in values.iter().enumerate() {
+                        let dst = body + i * 2;
+                        self.record[dst..dst + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_u16_array_tag(self.record, tag, values);
+    }
+
+    /// Update an existing `B:s` (i16 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_i16(&mut self, tag: &[u8; 2], values: &[i16]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b's' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    for (i, &v) in values.iter().enumerate() {
+                        let dst = body + i * 2;
+                        self.record[dst..dst + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_i16_array_tag(self.record, tag, values);
+    }
+
+    /// Update an existing `B:i` (i32 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_i32(&mut self, tag: &[u8; 2], values: &[i32]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b'i' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    for (i, &v) in values.iter().enumerate() {
+                        let dst = body + i * 4;
+                        self.record[dst..dst + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_i32_array_tag(self.record, tag, values);
+    }
+
+    /// Update an existing `B:f` (f32 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_f32(&mut self, tag: &[u8; 2], values: &[f32]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b'f' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    for (i, &v) in values.iter().enumerate() {
+                        let dst = body + i * 4;
+                        self.record[dst..dst + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_f32_array_tag(self.record, tag, values);
     }
 
     /// Remove a tag from the record. No-op if the tag is not found.
@@ -3279,5 +3478,114 @@ mod tests {
         assert_eq!(dst.tags().find_string(b"RG"), Some(b"mygrp".as_slice()));
         assert_eq!(dst.tags().find_int(b"NM"), None); // skipped
         assert_eq!(dst.tags().find_int(b"AS"), Some(10));
+    }
+
+    // ========================================================================
+    // update_float + update_array_* tests
+    // ========================================================================
+
+    #[test]
+    fn test_editor_update_float() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.append_float(b"AS", 12.5);
+            ed.update_float(b"AS", 99.25);
+        }
+        assert!((RawRecordView::new(&rec).tags().find_float(b"AS").unwrap() - 99.25).abs() < 1e-6);
+
+        // Updating a non-existent float tag inserts it
+        let mut rec2 = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec2);
+            ed.update_float(b"BB", 1.5);
+        }
+        assert!((RawRecordView::new(&rec2).tags().find_float(b"BB").unwrap() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_editor_update_array_u16_same_length() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_u16(b"bq", &[0u16, 1, 2, 3]); // not present -> append
+            ed.update_array_u16(b"bq", &[10, 20, 30, 40]); // same length -> in-place
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"bq").expect("present");
+        let vals = array_tag_to_vec_u16(&arr);
+        assert_eq!(vals, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_editor_update_array_u16_different_length_splices() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_u16(b"bq", &[1u16, 2, 3]); // not present -> append
+            ed.update_array_u16(b"bq", &[7u16, 8, 9, 10, 11]); // grows
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"bq").expect("present");
+        let vals = array_tag_to_vec_u16(&arr);
+        assert_eq!(vals, vec![7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn test_editor_update_array_i32_grow_then_in_place() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_i32(b"sc", &[100, 200, 300]);
+            // Same-length in-place
+            ed.update_array_i32(b"sc", &[-1, -2, -3]);
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"sc").expect("present");
+        assert_eq!(arr.elem_type, b'i');
+        assert_eq!(arr.count, 3);
+    }
+
+    #[test]
+    fn test_editor_update_array_f32() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_f32(b"fa", &[1.0, 2.0, 3.0]);
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"fa").expect("present");
+        assert_eq!(arr.elem_type, b'f');
+        assert_eq!(arr.count, 3);
+    }
+
+    #[test]
+    fn test_editor_update_array_u8_same_length() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_u8(b"ML", &[10u8, 20, 30]); // not present -> append
+            ed.update_array_u8(b"ML", &[40u8, 50, 60]); // same length -> in-place
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"ML").expect("present");
+        assert_eq!(arr.elem_type, b'C');
+        assert_eq!(arr.count, 3);
+        assert_eq!(arr.data, &[40u8, 50, 60]);
+    }
+
+    #[test]
+    fn test_editor_update_array_i16_same_length() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_i16(b"sq", &[-100i16, 0, 100]); // not present -> append
+            ed.update_array_i16(b"sq", &[-200i16, 0, 200]); // same length -> in-place
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"sq").expect("present");
+        assert_eq!(arr.elem_type, b's');
+        assert_eq!(arr.count, 3);
     }
 }
