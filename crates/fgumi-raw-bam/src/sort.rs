@@ -1,17 +1,20 @@
 use std::cmp::Ordering;
 
-use crate::fields::{self, flags, pos, read_name, ref_id};
+use crate::fields::{RawRecordView, flags};
 
 #[must_use]
 pub fn compare_coordinate_raw(a: &[u8], b: &[u8]) -> Ordering {
-    let a_tid = ref_id(a);
-    let b_tid = ref_id(b);
+    let av = RawRecordView::new(a);
+    let bv = RawRecordView::new(b);
 
-    let a_pos = pos(a);
-    let b_pos = pos(b);
+    let a_tid = av.ref_id();
+    let b_tid = bv.ref_id();
 
-    let a_flag = fields::flags(a);
-    let b_flag = fields::flags(b);
+    let a_pos = av.pos();
+    let b_pos = bv.pos();
+
+    let a_flag = av.flags();
+    let b_flag = bv.flags();
 
     // Handle reads with no reference (tid = -1) - sort last
     // Unmapped reads with a valid tid (mate's position) sort by that position
@@ -41,14 +44,15 @@ pub fn compare_coordinate_raw(a: &[u8], b: &[u8]) -> Ordering {
 #[inline]
 #[must_use]
 pub fn compare_names_raw(a: &[u8], b: &[u8]) -> Ordering {
-    read_name(a).cmp(read_name(b))
+    RawRecordView::new(a).read_name().cmp(RawRecordView::new(b).read_name())
 }
 
 /// Compare for queryname ordering using raw bytes.
 #[inline]
 #[must_use]
 pub fn compare_queryname_raw(a: &[u8], b: &[u8]) -> Ordering {
-    compare_names_raw(a, b).then_with(|| fields::flags(a).cmp(&fields::flags(b)))
+    compare_names_raw(a, b)
+        .then_with(|| RawRecordView::new(a).flags().cmp(&RawRecordView::new(b).flags()))
 }
 
 // ============================================================================
