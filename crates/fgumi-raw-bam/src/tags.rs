@@ -63,7 +63,8 @@ pub fn find_string_tag_in_record<'a>(bam: &'a [u8], tag: &[u8; 2]) -> Option<&'a
 /// Returns offsets relative to the start of `aux_data`.
 /// Returns `None` if the tag is not found.
 #[must_use]
-pub fn find_tag_bounds(aux_data: &[u8], tag: &[u8; 2]) -> Option<(usize, usize)> {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn find_tag_bounds(aux_data: &[u8], tag: &[u8; 2]) -> Option<(usize, usize)> {
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     let size = tag_value_size(val_type, &aux_data[p + 3..])?;
     Some((p, p + 3 + size))
@@ -137,7 +138,7 @@ fn extract_int_value(aux_data: &[u8], p: usize, val_type: u8) -> Option<i64> {
 /// - For integer values, returns `(value, true)`
 /// - Returns `None` if MI tag not found.
 #[must_use]
-pub fn find_mi_tag(aux_data: &[u8]) -> Option<(u64, bool)> {
+pub(crate) fn find_mi_tag(aux_data: &[u8]) -> Option<(u64, bool)> {
     let (pos, val_type) = find_tag_position(aux_data, *b"MI")?;
     if val_type == b'Z' {
         // String type - parse "12345" or "12345/A" or "12345/B"
@@ -191,19 +192,11 @@ fn parse_mi_bytes(s: &[u8]) -> Option<(u64, bool)> {
     Some((value, is_a))
 }
 
-/// Find MI tag in a complete BAM record.
-///
-/// Returns `(integer_value, is_A_suffix)` or `(0, true)` if not found.
-#[must_use]
-pub fn find_mi_tag_in_record(bam: &[u8]) -> (u64, bool) {
-    find_mi_tag(aux_data_slice(bam)).unwrap_or((0, true))
-}
-
 /// Find the MC (mate CIGAR) tag in auxiliary data.
 ///
 /// Returns the CIGAR string, or None if not found.
 #[must_use]
-pub fn find_mc_tag(aux_data: &[u8]) -> Option<&str> {
+pub(crate) fn find_mc_tag(aux_data: &[u8]) -> Option<&str> {
     find_string_tag(aux_data, b"MC").and_then(|v| std::str::from_utf8(v).ok())
 }
 
@@ -454,7 +447,8 @@ pub fn array_tag_to_vec_u16(tag_ref: &ArrayTagRef) -> Vec<u16> {
 /// Append a string (Z-type) tag to a BAM record.
 ///
 /// The tag is appended at the end of the record: `[tag_byte_1, tag_byte_2, 'Z', value..., NUL]`.
-pub fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8]) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8]) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'Z');
@@ -473,7 +467,8 @@ pub fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8]) {
 /// - `i16` (type `'s'`): if value in `[-32768, -129]`
 /// - `u16` (type `'S'`): if value in `[256, 65535]`
 /// - `i32` (type `'i'`): otherwise
-pub fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
     record.push(tag[0]);
     record.push(tag[1]);
     if let Ok(v) = i8::try_from(value) {
@@ -495,7 +490,8 @@ pub fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
 }
 
 /// Append a float (`f`-type) tag to a BAM record.
-pub fn append_float_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: f32) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_float_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: f32) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'f');
@@ -509,7 +505,8 @@ pub fn append_float_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: f32) {
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-pub fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16]) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16]) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -529,7 +526,8 @@ pub fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16])
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-pub fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u8]) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u8]) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -544,7 +542,8 @@ pub fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u8]) {
 ///
 /// Converts raw Phred scores (0-93) to ASCII (Phred+33) and writes
 /// directly as a null-terminated string tag. Avoids intermediate String allocation.
-pub fn append_phred33_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], quals: &[u8]) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_phred33_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], quals: &[u8]) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'Z');
@@ -736,7 +735,8 @@ pub fn append_i32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i32])
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-pub fn append_u16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u16]) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_u16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u16]) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -756,7 +756,8 @@ pub fn append_u16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u16])
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-pub fn append_f32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[f32]) {
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_f32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[f32]) {
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -818,7 +819,7 @@ pub fn append_signed_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
 ///
 /// Iterates all tags in `src_aux` and appends each tag entry (tag + type + value bytes)
 /// to `dest`, unless the tag's two-byte key is in `skip_tags`.
-pub fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[&[u8; 2]]) {
+pub(crate) fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[&[u8; 2]]) {
     let mut offset = 0;
     while offset + 3 <= src_aux.len() {
         let tag_key = [src_aux[offset], src_aux[offset + 1]];
@@ -1647,16 +1648,6 @@ mod tests {
         // MI:Z:/B -> num_part is empty after stripping suffix, should return None
         let aux = b"MIZ/B\x00";
         assert_eq!(find_mi_tag(aux), None);
-    }
-
-    // ========================================================================
-    // find_mi_tag_in_record tests
-    // ========================================================================
-
-    #[test]
-    fn test_find_mi_tag_in_record_no_aux() {
-        let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        assert_eq!(find_mi_tag_in_record(&rec), (0, true));
     }
 
     // ========================================================================

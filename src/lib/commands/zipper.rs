@@ -1206,7 +1206,7 @@ fn restore_unconverted_bases_in_raw_record(
     header: &Header,
 ) -> Result<()> {
     // Skip unmapped reads
-    let flag = bam_fields::flags(record);
+    let flag = RawRecordView::new(record).flags();
     if (flag & bam_fields::flags::UNMAPPED) != 0 {
         return Ok(());
     }
@@ -4336,8 +4336,8 @@ mod tests {
             .build();
         let (raw, _seq) = run_restore_raw(&modified_record, &reference, &header)?;
         let aux = bam_fields::aux_data_slice(&raw);
-        assert!(bam_fields::find_tag_bounds(aux, &SamTag::NM).is_none(), "NM should be removed");
-        assert!(bam_fields::find_tag_bounds(aux, &SamTag::MD).is_none(), "MD should be removed");
+        assert!(bam_fields::find_tag_type(aux, &SamTag::NM).is_none(), "NM should be removed");
+        assert!(bam_fields::find_tag_type(aux, &SamTag::MD).is_none(), "MD should be removed");
 
         // SEQ unchanged case: read already matches ref, NM/MD must be preserved.
         let unchanged_record = RecordBuilder::new()
@@ -4354,8 +4354,8 @@ mod tests {
             .build();
         let (raw, _seq) = run_restore_raw(&unchanged_record, &reference, &header)?;
         let aux = bam_fields::aux_data_slice(&raw);
-        assert!(bam_fields::find_tag_bounds(aux, &SamTag::NM).is_some(), "NM should be kept");
-        assert!(bam_fields::find_tag_bounds(aux, &SamTag::MD).is_some(), "MD should be kept");
+        assert!(bam_fields::find_tag_type(aux, &SamTag::NM).is_some(), "NM should be kept");
+        assert!(bam_fields::find_tag_type(aux, &SamTag::MD).is_some(), "MD should be kept");
 
         Ok(())
     }
@@ -4409,8 +4409,8 @@ mod tests {
         assert_eq!(raw_seq, oracle_seq, "raw SEQ mismatch for CIGAR {cigar}");
 
         let aux = bam_fields::aux_data_slice(&raw);
-        let nm_present = bam_fields::find_tag_bounds(aux, &SamTag::NM).is_some();
-        let md_present = bam_fields::find_tag_bounds(aux, &SamTag::MD).is_some();
+        let nm_present = bam_fields::find_tag_type(aux, &SamTag::NM).is_some();
+        let md_present = bam_fields::find_tag_type(aux, &SamTag::MD).is_some();
         if oracle_modified {
             assert!(!nm_present, "NM should be removed when SEQ modified (CIGAR {cigar})");
             assert!(!md_present, "MD should be removed when SEQ modified (CIGAR {cigar})");

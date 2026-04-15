@@ -167,104 +167,6 @@ pub fn query_length_from_cigar(cigar_ops: &[u32]) -> usize {
     len
 }
 
-/// Calculate unclipped start position from BAM record.
-///
-/// For forward strand reads, this is the 5' position.
-/// Returns: `pos - leading_clips` (0-based like the input position).
-#[inline]
-#[must_use]
-pub fn unclipped_start_from_cigar(pos: i32, cigar_ops: &[u32]) -> i32 {
-    let mut clipped = 0i32;
-
-    for &op in cigar_ops {
-        let op_len = (op >> 4).cast_signed();
-        let op_type = op & 0xF;
-
-        match op_type {
-            4 | 5 => clipped += op_len, // S (4) or H (5)
-            _ => break,                 // Non-clip operation
-        }
-    }
-
-    pos - clipped
-}
-
-/// Calculate unclipped end position from BAM record.
-///
-/// For reverse strand reads, this is the 5' position.
-/// Returns: `pos + ref_length + trailing_clips - 1` (0-based).
-#[inline]
-#[must_use]
-pub fn unclipped_end_from_cigar(pos: i32, cigar_ops: &[u32]) -> i32 {
-    let mut ref_len = 0i32;
-    let mut trailing_clips = 0i32;
-    let mut saw_ref_op = false;
-
-    for &op in cigar_ops {
-        let op_len = (op >> 4).cast_signed();
-        let op_type = op & 0xF;
-
-        match op_type {
-            _ if consumes_ref(op_type) => {
-                ref_len += op_len;
-                trailing_clips = 0;
-                saw_ref_op = true;
-            }
-            4 | 5 if saw_ref_op => {
-                // S (4) or H (5) after ref-consuming ops
-                trailing_clips += op_len;
-            }
-            _ => {}
-        }
-    }
-
-    pos + ref_len + trailing_clips - 1
-}
-
-/// Calculate unclipped 5' coordinate for this read.
-///
-/// For forward strand: `unclipped_start` (leftmost including clips)
-/// For reverse strand: `unclipped_end` (rightmost including clips)
-#[inline]
-#[must_use]
-pub fn unclipped_5prime(pos: i32, reverse: bool, cigar_ops: &[u32]) -> i32 {
-    if reverse {
-        unclipped_end_from_cigar(pos, cigar_ops)
-    } else {
-        unclipped_start_from_cigar(pos, cigar_ops)
-    }
-}
-
-/// Calculate unclipped 5' coordinate using 1-based positions (matching noodles).
-///
-/// Adds 1 to the 0-based BAM position before applying clip adjustment,
-/// producing values identical to `record_utils::unclipped_five_prime_position()`.
-///
-/// Returns 0 for unmapped reads (matching `get_unclipped_position_for_groupkey`).
-/// Returns `i32::MAX` for mapped reads with no CIGAR operations.
-#[inline]
-#[must_use]
-pub fn unclipped_5prime_1based(
-    pos_0based: i32,
-    reverse: bool,
-    unmapped: bool,
-    cigar_ops: &[u32],
-) -> i32 {
-    if unmapped {
-        return 0;
-    }
-    if cigar_ops.is_empty() {
-        return i32::MAX;
-    }
-    // Convert to 1-based, then apply clip adjustment
-    let pos_1based = pos_0based + 1;
-    if reverse {
-        unclipped_end_from_cigar(pos_1based, cigar_ops)
-    } else {
-        unclipped_start_from_cigar(pos_1based, cigar_ops)
-    }
-}
-
 /// Compute unclipped 5' position directly from raw BAM bytes (zero allocation).
 ///
 /// This is the primary entry point for raw-byte callers, replacing the pattern:
@@ -364,7 +266,7 @@ pub fn mate_unclipped_5prime_1based(
 /// For forward strand mates, this is the 5' position.
 #[inline]
 #[must_use]
-pub fn unclipped_other_start(mate_pos: i32, mc_cigar: &str) -> i32 {
+pub(crate) fn unclipped_other_start(mate_pos: i32, mc_cigar: &str) -> i32 {
     mate_pos - parse_leading_clips(mc_cigar)
 }
 
@@ -373,7 +275,7 @@ pub fn unclipped_other_start(mate_pos: i32, mc_cigar: &str) -> i32 {
 /// For reverse strand mates, this is the 5' position.
 #[inline]
 #[must_use]
-pub fn unclipped_other_end(mate_pos: i32, mc_cigar: &str) -> i32 {
+pub(crate) fn unclipped_other_end(mate_pos: i32, mc_cigar: &str) -> i32 {
     let (ref_len, trailing_clips) = parse_ref_len_and_trailing_clips(mc_cigar);
     mate_pos + ref_len + trailing_clips - 1
 }
@@ -1133,87 +1035,6 @@ mod tests {
         let cigar = &[encode_op(2, 2), encode_op(0, 5)];
         // Position 100 is in the deletion with no prior query bases
         assert_eq!(read_pos_at_ref_pos_raw(cigar, 100, 100, true), Some(1));
-    }
-
-    // ========================================================================
-    // unclipped_start_from_cigar / unclipped_end_from_cigar tests
-    // ========================================================================
-
-    #[test]
-    fn test_unclipped_start_from_cigar_no_clips() {
-        // 10M = (10 << 4)
-        let cigar = &[(10 << 4)];
-        assert_eq!(unclipped_start_from_cigar(100, cigar), 100);
-    }
-
-    #[test]
-    fn test_unclipped_start_from_cigar_soft_clip() {
-        // 5S10M: soft clip (op type 4), then match
-        let cigar = &[(5 << 4) | 4, (10 << 4)];
-        assert_eq!(unclipped_start_from_cigar(100, cigar), 95);
-    }
-
-    #[test]
-    fn test_unclipped_start_from_cigar_hard_clip() {
-        // 3H10M: hard clip (op type 5), then match
-        let cigar = &[(3 << 4) | 5, (10 << 4)];
-        assert_eq!(unclipped_start_from_cigar(100, cigar), 97);
-    }
-
-    #[test]
-    fn test_unclipped_end_from_cigar_no_clips() {
-        // 10M: end = pos + 10 - 1 = 109
-        let cigar = &[(10 << 4)];
-        assert_eq!(unclipped_end_from_cigar(100, cigar), 109);
-    }
-
-    #[test]
-    fn test_unclipped_end_from_cigar_trailing_clips() {
-        // 10M5S3H: end = 100 + 10 + 5 + 3 - 1 = 117
-        let cigar = &[(10 << 4), (5 << 4) | 4, (3 << 4) | 5];
-        assert_eq!(unclipped_end_from_cigar(100, cigar), 117);
-    }
-
-    // ========================================================================
-    // unclipped_5prime tests
-    // ========================================================================
-
-    #[test]
-    fn test_unclipped_5prime_forward_vs_reverse() {
-        // 5S10M3S: forward uses start, reverse uses end
-        let cigar = &[(5 << 4) | 4, (10 << 4), (3 << 4) | 4];
-        // Forward: unclipped_start = 100 - 5 = 95
-        assert_eq!(unclipped_5prime(100, false, cigar), 95);
-        // Reverse: unclipped_end = 100 + 10 + 3 - 1 = 112
-        assert_eq!(unclipped_5prime(100, true, cigar), 112);
-    }
-
-    // ========================================================================
-    // unclipped_5prime_1based tests
-    // ========================================================================
-
-    #[test]
-    fn test_unclipped_5prime_1based_unmapped() {
-        assert_eq!(unclipped_5prime_1based(100, false, true, &[(10 << 4)]), 0);
-    }
-
-    #[test]
-    fn test_unclipped_5prime_1based_no_cigar() {
-        assert_eq!(unclipped_5prime_1based(100, false, false, &[]), i32::MAX);
-    }
-
-    #[test]
-    fn test_unclipped_5prime_1based_forward() {
-        // 5S10M: forward 5' = pos+1 - 5 = 96
-        let cigar = &[(5 << 4) | 4, (10 << 4)];
-        assert_eq!(unclipped_5prime_1based(100, false, false, cigar), 96);
-    }
-
-    #[test]
-    fn test_unclipped_5prime_1based_reverse() {
-        // 10M5S: reverse 5' = pos+1 + 10 + 5 - 1 = 115
-        let cigar = &[(10 << 4), (5 << 4) | 4];
-        assert_eq!(unclipped_5prime_1based(100, true, false, cigar), 115);
     }
 
     // ========================================================================

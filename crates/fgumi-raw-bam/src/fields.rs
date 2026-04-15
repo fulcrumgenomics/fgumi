@@ -342,14 +342,14 @@ pub fn pos(bam: &[u8]) -> i32 {
 /// Extract `l_read_name` (length of read name + NUL) from a BAM record.
 #[inline]
 #[must_use]
-pub fn l_read_name(bam: &[u8]) -> u8 {
+pub(crate) fn l_read_name(bam: &[u8]) -> u8 {
     bam[8]
 }
 
 /// Extract number of CIGAR operations from a BAM record.
 #[inline]
 #[must_use]
-pub fn n_cigar_op(bam: &[u8]) -> u16 {
+pub(crate) fn n_cigar_op(bam: &[u8]) -> u16 {
     u16::from_le_bytes([bam[12], bam[13]])
 }
 
@@ -401,7 +401,7 @@ pub fn set_flags(bam: &mut [u8], new_flags: u16) {
 
 /// Set the mapping quality in a BAM record.
 #[inline]
-pub fn set_mapq(bam: &mut [u8], new_mapq: u8) {
+pub(crate) fn set_mapq(bam: &mut [u8], new_mapq: u8) {
     bam[9] = new_mapq;
 }
 
@@ -496,7 +496,7 @@ pub fn qual_offset(bam: &[u8]) -> usize {
 /// Returns (tid, pos, reverse, name).
 #[inline]
 #[must_use]
-pub fn extract_coordinate_fields(bam_bytes: &[u8]) -> (i32, i32, bool, &[u8]) {
+pub(crate) fn extract_coordinate_fields(bam_bytes: &[u8]) -> (i32, i32, bool, &[u8]) {
     debug_assert!(
         bam_bytes.len() >= MIN_BAM_RECORD_LEN,
         "BAM record too short ({} < {MIN_BAM_RECORD_LEN})",
@@ -601,7 +601,7 @@ pub struct TemplateCoordFields<'a> {
 /// Extract template-coordinate key fields directly from BAM bytes.
 #[inline]
 #[must_use]
-pub fn extract_template_coordinate_fields(bam_bytes: &[u8]) -> TemplateCoordFields<'_> {
+pub(crate) fn extract_template_coordinate_fields(bam_bytes: &[u8]) -> TemplateCoordFields<'_> {
     debug_assert!(
         bam_bytes.len() >= MIN_BAM_RECORD_LEN,
         "BAM record too short ({} < {MIN_BAM_RECORD_LEN})",
