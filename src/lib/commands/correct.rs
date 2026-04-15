@@ -16,10 +16,10 @@
 //! };
 //!
 //! let corrector = CorrectUmis {
-//!     io: BamIoOptions {
-//!         input: PathBuf::from("input.bam"),
-//!         output: PathBuf::from("corrected.bam"),
-//!     },
+//!     io: BamIoOptions::new(
+//!         PathBuf::from("input.bam"),
+//!         PathBuf::from("corrected.bam"),
+//!     ),
 //!     rejects_opts: RejectsOptions { rejects: Some(PathBuf::from("rejects.bam")) },
 //!     metrics: Some(PathBuf::from("metrics.txt")),
 //!     max_mismatches: 2,
@@ -40,8 +40,8 @@
 //! ```
 
 use crate::bam_io::{
-    BamWriter, create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader,
+    BamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts,
 };
 use crate::bitenc::BitEnc;
 use crate::dna::reverse_complement_str;
@@ -119,10 +119,10 @@ pub struct UmiMatch {
 /// # };
 /// # use std::path::PathBuf;
 /// let corrector = CorrectUmis {
-///     io: BamIoOptions {
-///         input: PathBuf::from("input.bam"),
-///         output: PathBuf::from("corrected.bam"),
-///     },
+///     io: BamIoOptions::new(
+///         PathBuf::from("input.bam"),
+///         PathBuf::from("corrected.bam"),
+///     ),
 ///     rejects_opts: RejectsOptions { rejects: Some(PathBuf::from("rejects.bam")) },
 ///     metrics: Some(PathBuf::from("metrics.txt")),
 ///     max_mismatches: 2,
@@ -373,7 +373,7 @@ impl Command for CorrectUmis {
     /// # use crate::commands::command::Command;
     /// let corrector = CorrectUmis {
     ///     /* ... field initialization ... */
-    /// #   io: BamIoOptions { input: PathBuf::new(), output: PathBuf::new() },
+    /// #   io: BamIoOptions::new(PathBuf::new(), PathBuf::new()),
     /// #   rejects_opts: RejectsOptions::default(),
     /// #   metrics: None,
     /// #   max_mismatches: 2,
@@ -404,7 +404,10 @@ impl Command for CorrectUmis {
         self.check_umi_distances(&umi_sequences);
 
         // Open input using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -1113,7 +1116,8 @@ impl CorrectUmis {
         info!("Using single-threaded mode with template-level UMI correction");
 
         // Open input BAM reader (raw-byte reader for zero-copy processing)
-        let (mut bam_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
+        let (mut bam_reader, _) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
 
         // Open output writer (single-threaded)
         let mut writer =
@@ -1788,10 +1792,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions {
-                input: input_file.path().to_path_buf(),
-                output: paths.output.clone(),
-            },
+            io: BamIoOptions::new(input_file.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
             max_mismatches: 2,
@@ -1822,10 +1823,10 @@ mod tests {
         let temp_output = NamedTempFile::new().expect("failed to create temp file");
 
         let corrector = CorrectUmis {
-            io: BamIoOptions {
-                input: temp_input.path().to_path_buf(),
-                output: temp_output.path().to_path_buf(),
-            },
+            io: BamIoOptions::new(
+                temp_input.path().to_path_buf(),
+                temp_output.path().to_path_buf(),
+            ),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -1853,7 +1854,7 @@ mod tests {
         let rejects = dir.path().join("rejects.bam");
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
             metrics: None,
             max_mismatches: 2,
@@ -1899,7 +1900,7 @@ mod tests {
         let metrics = dir.path().join("metrics.txt");
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
             metrics: Some(metrics.clone()),
             max_mismatches: 3,
@@ -1961,7 +1962,7 @@ mod tests {
         let rejects = dir.path().join("rejects.bam");
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(rejects.clone()) },
             metrics: None,
             max_mismatches: 3,
@@ -2017,7 +2018,7 @@ mod tests {
 
         // Run with command line UMIs
         let corrector1 = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output1.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output1.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: Some(metrics1.clone()),
             max_mismatches: 3,
@@ -2042,7 +2043,7 @@ mod tests {
 
         // Run with UMI file
         let corrector2 = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output2.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output2.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: Some(metrics2.clone()),
             max_mismatches: 3,
@@ -2083,7 +2084,7 @@ mod tests {
 
         // Test with original UMI storage (default)
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -2122,7 +2123,7 @@ mod tests {
         // Test with original UMI storage disabled
         let output2 = dir.path().join("output2.bam");
         let corrector2 = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output2.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output2.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -2162,7 +2163,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -2215,7 +2216,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
             max_mismatches: 0, // Exact match only
@@ -2259,7 +2260,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: Some(paths.metrics.clone()),
             max_mismatches: 2,
@@ -2314,7 +2315,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
             max_mismatches: 2,
@@ -2355,7 +2356,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
             max_mismatches: 2,
@@ -2395,7 +2396,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: None,
             max_mismatches: 1,
@@ -2434,7 +2435,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 1,
@@ -2467,7 +2468,7 @@ mod tests {
         let output2 = paths.output_n(2);
 
         let corrector2 = CorrectUmis {
-            io: BamIoOptions { input: input2.path().to_path_buf(), output: output2.clone() },
+            io: BamIoOptions::new(input2.path().to_path_buf(), output2.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 1,
@@ -2504,7 +2505,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 0, // Exact match
@@ -2552,7 +2553,7 @@ mod tests {
 
         // Run with 4 threads to test parallel processing order
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -2610,7 +2611,7 @@ mod tests {
         let output = dir.path().join("output.bam");
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -2768,7 +2769,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
             max_mismatches: 1, // Strict matching
@@ -2823,7 +2824,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
             max_mismatches: 1,
@@ -2908,7 +2909,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions::default(),
             metrics: Some(paths.metrics.clone()),
             max_mismatches: 1,
@@ -2976,10 +2977,7 @@ mod tests {
         let output = NamedTempFile::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions {
-                input: input.path().to_path_buf(),
-                output: output.path().to_path_buf(),
-            },
+            io: BamIoOptions::new(input.path().to_path_buf(), output.path().to_path_buf()),
             rejects_opts: RejectsOptions::default(),
             metrics: None,
             max_mismatches: 2,
@@ -3220,7 +3218,7 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let corrector = CorrectUmis {
-            io: BamIoOptions { input: input.path().to_path_buf(), output: paths.output.clone() },
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
             rejects_opts: RejectsOptions { rejects: Some(paths.rejects.clone()) },
             metrics: Some(paths.metrics.clone()),
             max_mismatches: 2,

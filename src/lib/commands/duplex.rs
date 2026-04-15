@@ -6,8 +6,8 @@
 //! 2. Duplex consensus from paired single-strand consensuses
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader,
+    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader_with_opts,
 };
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -246,10 +246,10 @@ impl Command for Duplex {
     /// # };
     /// # use std::path::PathBuf;
     /// let duplex = Duplex {
-    ///     io: BamIoOptions {
-    ///         input: PathBuf::from("grouped.bam"),
-    ///         output: PathBuf::from("duplex.bam"),
-    ///     },
+    ///     io: BamIoOptions::new(
+    ///         PathBuf::from("grouped.bam"),
+    ///         PathBuf::from("duplex.bam"),
+    ///     ),
     ///     rejects_opts: RejectsOptions::default(),
     ///     stats_opts: StatsOptions::default(),
     ///     read_group: ReadGroupOptions {
@@ -302,7 +302,10 @@ impl Command for Duplex {
         );
 
         // Open input BAM using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -411,7 +414,8 @@ impl Command for Duplex {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         // Create the MI group iterator for single-threaded streaming (raw bytes)
-        let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
+        let (mut raw_reader, _) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
         // Create raw byte iterator, filtering out secondary/supplementary and keeping
         // only mapped or mate-mapped reads
         let raw_record_iter = std::iter::from_fn(move || {
@@ -898,7 +902,7 @@ mod tests {
     /// Uses sensible test defaults: disabled per-base tags, disabled overlapping consensus.
     fn create_duplex_with_paths(input: PathBuf, output: PathBuf) -> Duplex {
         Duplex {
-            io: BamIoOptions { input, output },
+            io: BamIoOptions::new(input, output),
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions {

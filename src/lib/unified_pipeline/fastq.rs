@@ -66,7 +66,11 @@ use super::scheduler::{BackpressureState, SchedulerStrategy};
 /// to allow multiple threads to read different streams concurrently.
 pub enum StreamReader<R: BufRead + Send> {
     /// Raw BGZF file — Read step produces raw blocks, Decompress step decompresses.
-    Bgzf(BufReader<File>),
+    ///
+    /// Boxed to allow wrapping the underlying file in optional helpers such as
+    /// the userspace async prefetch reader (`PrefetchReader`) without changing
+    /// the enum signature.
+    Bgzf(Box<dyn BufRead + Send>),
     /// Pre-decompressed reader (gzip/plain) — Read step produces record-aligned data.
     Decompressed(R),
 }
@@ -804,6 +808,9 @@ pub struct FastqPipelineConfig {
     /// Scales with thread count to reduce queue contention at higher parallelism.
     /// Default: 200 (auto-scaled in `new()` based on thread count).
     pub records_per_batch: usize,
+    /// Wrap BGZF FASTQ inputs in a userspace async prefetch reader (opt-in).
+    /// Only applies when `inputs_are_bgzf` is true; ignored otherwise.
+    pub async_reader: bool,
 }
 
 impl FastqPipelineConfig {
@@ -835,6 +842,7 @@ impl FastqPipelineConfig {
             deadlock_recover_enabled: false,
             shared_stats: None, // No shared stats by default
             records_per_batch,
+            async_reader: false,
         }
     }
 
@@ -893,6 +901,13 @@ impl FastqPipelineConfig {
     #[must_use]
     pub fn with_deadlock_recovery(mut self, enabled: bool) -> Self {
         self.deadlock_recover_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable the userspace async prefetch reader for BGZF FASTQ inputs.
+    #[must_use]
+    pub fn with_async_reader(mut self, enabled: bool) -> Self {
+        self.async_reader = enabled;
         self
     }
 
@@ -3681,13 +3696,30 @@ where
             log::debug!("run_fastq_pipeline: using {num_readers} Decompressed readers");
             readers.into_iter().map(StreamReader::Decompressed).collect()
         } else {
-            // BGZF: open each file as StreamReader::Bgzf
-            log::debug!("run_fastq_pipeline: using {} BGZF readers", fastq_paths.len());
+            // BGZF: open each file as StreamReader::Bgzf. Apply POSIX_FADV_SEQUENTIAL
+            // unconditionally on Linux to enlarge the per-fd read-ahead window, and
+            // optionally wrap in a userspace async prefetch reader when enabled.
+            log::debug!(
+                "run_fastq_pipeline: using {} BGZF readers (async_reader={})",
+                fastq_paths.len(),
+                config.async_reader,
+            );
             fastq_paths
                 .iter()
                 .map(|p| {
                     let file = File::open(p)?;
-                    Ok(StreamReader::Bgzf(BufReader::with_capacity(256 * 1024, file)))
+                    crate::os_hints::advise_sequential(&file);
+                    let inner: Box<dyn BufRead + Send> = if config.async_reader {
+                        // PrefetchReader dedicates one OS thread per input file to
+                        // issue reads ahead of the consumer, overlapping I/O with
+                        // processing. For paired/indexed inputs this adds 2-4 extra
+                        // threads beyond the pipeline worker count.
+                        let prefetch = crate::prefetch_reader::PrefetchReader::from_file(file);
+                        Box::new(BufReader::with_capacity(256 * 1024, prefetch))
+                    } else {
+                        Box::new(BufReader::with_capacity(256 * 1024, file))
+                    };
+                    Ok(StreamReader::Bgzf(inner))
                 })
                 .collect::<io::Result<Vec<_>>>()?
         };

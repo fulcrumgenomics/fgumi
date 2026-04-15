@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
+use crate::bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
 use crate::grouper::{
     FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
 };
@@ -1195,7 +1195,10 @@ impl Command for MarkDuplicates {
         info!("{}", self.threading.log_message());
 
         // Open input BAM
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         if !is_template_coordinate_sorted(&header) {
             bail!(

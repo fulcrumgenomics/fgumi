@@ -6,7 +6,8 @@
 
 use crate::alignment_tags::regenerate_alignment_tags;
 use crate::bam_io::{
-    create_bam_reader, create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path,
+    create_bam_reader_for_pipeline_with_opts, create_bam_reader_with_opts, create_bam_writer,
+    is_stdin_path,
 };
 use crate::clipper::{ClippingMode, SamRecordClipper};
 use crate::grouper::TemplateGrouper;
@@ -237,7 +238,10 @@ impl Command for Clip {
         // ========================================================================
         let total_records = if let Some(threads) = self.threading.threads {
             // Read header for the 7-step pipeline (supports stdin)
-            let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+            let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+                &self.io.input,
+                self.io.pipeline_reader_opts(),
+            )?;
 
             // Load reference (always required for clip)
             let reference = Arc::new(ReferenceReader::new(&self.reference)?);
@@ -278,7 +282,11 @@ impl Clip {
 
         // Open input BAM with MT BGZF decompression
         let reader_threads = self.threading.num_threads();
-        let (mut reader, header) = create_bam_reader(&self.io.input, reader_threads)?;
+        let (mut reader, header) = create_bam_reader_with_opts(
+            &self.io.input,
+            reader_threads,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Update header sort order if specified
         let header = self.update_header_sort_order(header)?;
@@ -892,10 +900,7 @@ mod tests {
     #[test]
     fn test_default_clip_parameters() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -923,10 +928,7 @@ mod tests {
     #[test]
     fn test_clip_with_fixed_positions() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -955,10 +957,7 @@ mod tests {
     #[test]
     fn test_clip_with_overlapping_enabled() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -986,10 +985,7 @@ mod tests {
     #[test]
     fn test_clip_with_metrics_output() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: false,
@@ -1017,10 +1013,7 @@ mod tests {
     #[test]
     fn test_clip_with_tag_regeneration() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1047,10 +1040,7 @@ mod tests {
     #[test]
     fn test_clip_all_modes_enabled() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1082,10 +1072,7 @@ mod tests {
     fn test_clipping_mode_enum_values() {
         // Test that clipping_mode enum variants are set properly
         let soft = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
@@ -1111,10 +1098,7 @@ mod tests {
     #[test]
     fn test_clip_with_sort_order_specification() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1140,10 +1124,7 @@ mod tests {
     #[test]
     fn test_clip_asymmetric_fixed_positions() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
@@ -1173,10 +1154,7 @@ mod tests {
     #[test]
     fn test_clip_with_upgrade_all_clipping() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1204,10 +1182,7 @@ mod tests {
     #[test]
     fn test_clip_extending_past_mate_only() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1235,10 +1210,7 @@ mod tests {
     #[test]
     fn test_clip_overlapping_reads_only() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1266,10 +1238,7 @@ mod tests {
     #[test]
     fn test_clip_modes_with_auto_clip_attributes() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1297,10 +1266,7 @@ mod tests {
     #[test]
     fn test_clip_zero_bases_all_positions() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1330,10 +1296,7 @@ mod tests {
     #[test]
     fn test_clip_soft_with_mask_mode() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: true,
@@ -1361,10 +1324,7 @@ mod tests {
     #[test]
     fn test_clip_large_fixed_positions() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1394,10 +1354,7 @@ mod tests {
     #[test]
     fn test_clip_combination_overlapping_and_fixed() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1426,10 +1383,7 @@ mod tests {
     #[test]
     fn test_clip_all_three_modes_comparison() {
         let soft = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
@@ -1450,10 +1404,7 @@ mod tests {
         };
 
         let soft_mask = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: false,
@@ -1474,10 +1425,7 @@ mod tests {
         };
 
         let hard = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1506,10 +1454,7 @@ mod tests {
     #[test]
     fn test_clip_with_queryname_sort_order() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1535,10 +1480,7 @@ mod tests {
     #[test]
     fn test_clip_with_unsorted_sort_order() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1564,10 +1506,7 @@ mod tests {
     #[test]
     fn test_clip_single_read_end_clipping() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1597,10 +1536,7 @@ mod tests {
     #[test]
     fn test_clip_with_metrics_and_upgrade() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1628,10 +1564,7 @@ mod tests {
     #[test]
     fn test_clip_both_extending_and_overlapping() {
         let clip = Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
@@ -1701,7 +1634,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1748,7 +1681,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
@@ -1794,7 +1727,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: true,
@@ -1840,7 +1773,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1886,7 +1819,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1932,7 +1865,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1979,7 +1912,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2026,7 +1959,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2072,7 +2005,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -2119,7 +2052,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2166,7 +2099,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2213,7 +2146,7 @@ mod tests {
         builder.write(&input_path).expect("failed to write test BAM");
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path },
+            io: BamIoOptions::new(input_path, output_path),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -2266,7 +2199,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2327,10 +2260,7 @@ mod tests {
         read_two_three_prime: usize,
     ) -> Clip {
         Clip {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,

@@ -90,6 +90,9 @@ fgumi-consensus = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["fs"] }
+
 [features]
 default = ["simplex", "duplex", "codec"]
 simplex = ["fgumi-consensus/simplex"]

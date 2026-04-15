@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::bam_io::is_stdin_path;
+use crate::bam_io::{PipelineReaderOpts, is_stdin_path};
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use crate::validation::validate_file_exists;
@@ -141,9 +141,34 @@ pub struct BamIoOptions {
     /// Output BAM file
     #[arg(short = 'o', long = "output")]
     pub output: PathBuf,
+
+    /// Enable async userspace prefetch on the input BAM.
+    ///
+    /// Spawns a dedicated I/O thread that reads raw bytes into a bounded
+    /// queue ahead of the decompression step, so processing threads do
+    /// not block on disk. Prototype flag; defaults to off.
+    #[arg(long = "async-reader", default_value_t = false, hide = true)]
+    pub async_reader: bool,
+}
+
+impl Default for BamIoOptions {
+    fn default() -> Self {
+        Self { input: PathBuf::new(), output: PathBuf::new(), async_reader: false }
+    }
 }
 
 impl BamIoOptions {
+    /// Construct a `BamIoOptions` from input and output paths. Leaves
+    /// opt-in tuning flags (e.g. `async_reader`) at their default values.
+    pub fn new(input: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
+        Self { input: input.into(), output: output.into(), async_reader: false }
+    }
+
+    /// Build [`PipelineReaderOpts`] from the async-reader flag.
+    pub fn pipeline_reader_opts(&self) -> PipelineReaderOpts {
+        PipelineReaderOpts { async_reader: self.async_reader }
+    }
+
     /// Validates that the input file exists (skipped for stdin paths).
     ///
     /// # Errors

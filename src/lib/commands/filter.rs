@@ -9,7 +9,7 @@
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-use crate::bam_io::create_bam_reader_for_pipeline;
+use crate::bam_io::create_bam_reader_for_pipeline_with_opts;
 use crate::consensus_filter::{
     FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
     check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats_raw,
@@ -344,7 +344,10 @@ impl Command for Filter {
         }
 
         // Open input using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
+        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+            &self.io.input,
+            self.io.pipeline_reader_opts(),
+        )?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -1098,7 +1101,7 @@ mod tests {
     /// Helper function to create a Filter command with commonly used test defaults.
     fn create_filter_with_paths(input: PathBuf, output: PathBuf, reference: PathBuf) -> Filter {
         Filter {
-            io: BamIoOptions { input, output },
+            io: BamIoOptions::new(input, output),
             reference: Some(reference),
             min_reads: vec![1],
             max_read_error_rate: vec![0.025],
@@ -1162,10 +1165,7 @@ mod tests {
     #[test]
     fn test_default_filter_parameters() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1197,10 +1197,7 @@ mod tests {
     #[test]
     fn test_multithreaded_filter_configuration() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1230,10 +1227,7 @@ mod tests {
     #[test]
     fn test_filter_with_optional_outputs() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1265,10 +1259,7 @@ mod tests {
     #[test]
     fn test_validate_parameters_too_many_values() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![1, 2, 3, 4], // Too many values
             max_read_error_rate: vec![0.1],
@@ -1298,10 +1289,7 @@ mod tests {
     #[test]
     fn test_validate_parameters_invalid_stringency_order() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![1, 10], // Invalid: AB > CC
             max_read_error_rate: vec![0.1],
@@ -1733,10 +1721,7 @@ mod tests {
     fn test_validate_max_no_call_fraction_integer() {
         // When max_no_call_fraction >= 1.0, it should be an integer
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1772,10 +1757,7 @@ mod tests {
     fn test_validate_max_no_call_fraction_integer_valid() {
         // When max_no_call_fraction >= 1.0 and IS an integer, it should pass
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1809,10 +1791,7 @@ mod tests {
     #[test]
     fn test_filter_with_rejects_output() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1843,10 +1822,7 @@ mod tests {
     #[test]
     fn test_filter_with_stats_output() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1877,10 +1853,7 @@ mod tests {
     #[test]
     fn test_filter_multithreaded() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1910,10 +1883,7 @@ mod tests {
     #[test]
     fn test_filter_require_single_strand_agreement() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1943,10 +1913,7 @@ mod tests {
     #[test]
     fn test_filter_by_read_not_template() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1976,10 +1943,7 @@ mod tests {
     #[test]
     fn test_filter_reverse_per_base_tags_disabled() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2009,10 +1973,7 @@ mod tests {
     #[test]
     fn test_filter_high_min_base_quality() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2042,10 +2003,7 @@ mod tests {
     #[test]
     fn test_filter_with_min_mean_base_quality() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2075,10 +2033,7 @@ mod tests {
     #[test]
     fn test_filter_strict_error_rates() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.01],
@@ -2110,10 +2065,7 @@ mod tests {
     #[test]
     fn test_filter_lenient_error_rates() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.5],
@@ -2145,10 +2097,7 @@ mod tests {
     #[test]
     fn test_filter_high_min_reads_threshold() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![10],
             max_read_error_rate: vec![0.1],
@@ -2179,10 +2128,7 @@ mod tests {
     fn test_filter_duplex_different_thresholds() {
         // Test duplex with different thresholds for CC, AB, BA
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 3, 3], // CC=5, AB=3, BA=3
             max_read_error_rate: vec![0.05, 0.1, 0.1],
@@ -2215,10 +2161,7 @@ mod tests {
     #[test]
     fn test_filter_all_optional_outputs() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2250,10 +2193,7 @@ mod tests {
     #[test]
     fn test_filter_zero_no_call_fraction() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2283,10 +2223,7 @@ mod tests {
     #[test]
     fn test_filter_low_min_base_quality() {
         let filter = Filter {
-            io: BamIoOptions {
-                input: PathBuf::from("input.bam"),
-                output: PathBuf::from("output.bam"),
-            },
+            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2393,7 +2330,7 @@ mod tests {
         min_base_quality: Option<u8>,
     ) -> Result<()> {
         let cmd = Filter {
-            io: BamIoOptions { input: input.to_path_buf(), output: output.to_path_buf() },
+            io: BamIoOptions::new(input.to_path_buf(), output.to_path_buf()),
             reference: Some(reference.to_path_buf()),
             min_reads,
             max_read_error_rate,
@@ -2517,7 +2454,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![0.5],
@@ -2674,7 +2611,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -2750,7 +2687,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -2820,7 +2757,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -2947,7 +2884,7 @@ mod tests {
 
         // Use 3-value thresholds: duplex=5, AB=5, BA=5 (must be high-to-low)
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds (duplex >= AB >= BA)
             max_read_error_rate: vec![0.1],
@@ -3019,7 +2956,7 @@ mod tests {
 
         // With filter_by_template: false, reads are filtered independently
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3089,7 +3026,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3163,7 +3100,7 @@ mod tests {
 
         // Run single-threaded
         let cmd_single = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_single.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_single.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3190,7 +3127,7 @@ mod tests {
 
         // Run multi-threaded with 4 threads
         let cmd_multi = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_multi.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_multi.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3257,7 +3194,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -3315,7 +3252,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -3376,7 +3313,7 @@ mod tests {
 
         // Run multi-threaded with rejects output
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3446,7 +3383,7 @@ mod tests {
 
         // Run single-threaded
         let cmd_single = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_single.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_single.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA (must be high-to-low)
             max_read_error_rate: vec![0.1],
@@ -3473,7 +3410,7 @@ mod tests {
 
         // Run multi-threaded
         let cmd_multi = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_multi.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_multi.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1],
@@ -3558,7 +3495,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds
             max_read_error_rate: vec![0.1],
@@ -3671,7 +3608,7 @@ mod tests {
         drop(writer);
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3790,7 +3727,7 @@ mod tests {
         drop(writer);
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3830,7 +3767,7 @@ mod tests {
     fn test_validate_error_rate_ordering_ab_ba() {
         // Test validation of error rate ordering (AB <= BA)
         let cmd = Filter {
-            io: BamIoOptions { input: PathBuf::from("test.bam"), output: PathBuf::from("out.bam") },
+            io: BamIoOptions::new(PathBuf::from("test.bam"), PathBuf::from("out.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1, 0.2, 0.1], // AB (0.2) > BA (0.1) - invalid!
@@ -3865,7 +3802,7 @@ mod tests {
     fn test_validate_base_error_rate_ordering_ab_ba() {
         // Test validation of base error rate ordering (AB <= BA)
         let cmd = Filter {
-            io: BamIoOptions { input: PathBuf::from("test.bam"), output: PathBuf::from("out.bam") },
+            io: BamIoOptions::new(PathBuf::from("test.bam"), PathBuf::from("out.bam")),
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1],
@@ -3924,7 +3861,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3988,7 +3925,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path.clone(), output: output_path.clone() },
+            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds
             max_read_error_rate: vec![0.1],
@@ -4055,7 +3992,7 @@ mod tests {
         builder.write(&input_path)?;
 
         let cmd = Filter {
-            io: BamIoOptions { input: input_path, output: output_path.clone() },
+            io: BamIoOptions::new(input_path, output_path.clone()),
             reference: Some(ref_path),
             min_reads: vec![1],
             max_read_error_rate: vec![0.5],

@@ -31,7 +31,6 @@ use crate::validation::validate_file_exists;
 use anyhow::{Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
-use fgoxide::io::Io;
 use fgumi_raw_bam::UnmappedBamRecordBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
@@ -53,7 +52,7 @@ use noodles::sam::header::record::value::{
 };
 use read_structure::{ReadStructure, SegmentType};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -135,38 +134,64 @@ fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
 /// Open a FASTQ file with automatic detection of compression format.
 ///
 /// For BGZF-compressed files, uses noodles `MultithreadedReader` when threads > 1.
-/// For regular gzip files, uses fgoxide (flate2/zlib-ng) single-threaded decompression.
-/// For uncompressed files, opens directly.
+/// For regular gzip files, uses flate2 `MultiGzDecoder` single-threaded decompression.
+/// For uncompressed files, opens directly with buffering.
+///
+/// When `async_reader` is true the underlying file is wrapped in a
+/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the
+/// decompression layer, overlapping disk I/O with decompression.
 ///
 /// # Arguments
 /// * `path` - Path to the FASTQ file
 /// * `threads` - Number of decompression threads (only used for BGZF)
+/// * `async_reader` - If true, wrap the file in an async prefetch reader
 ///
 /// # Returns
 /// A boxed reader that implements `BufRead` + `Send`
-fn open_fastq_reader(path: &Path, threads: usize) -> Result<Box<dyn BufRead + Send>> {
+fn open_fastq_reader(
+    path: &Path,
+    threads: usize,
+    async_reader: bool,
+) -> Result<Box<dyn BufRead + Send>> {
+    use flate2::read::MultiGzDecoder;
+
     let format = detect_compression_format(path)?;
-    let fgio = Io::new(5, BUFFER_SIZE);
+
+    // Open file, optionally wrap in PrefetchReader for async I/O.
+    let open_reader = |path: &Path| -> Result<Box<dyn Read + Send>> {
+        let file = File::open(path)?;
+        if async_reader {
+            crate::os_hints::advise_sequential(&file);
+            log::info!(
+                "async FASTQ reader enabled: spawning fgumi-prefetch thread for {}",
+                path.display()
+            );
+            Ok(Box::new(crate::prefetch_reader::PrefetchReader::from_file(file)))
+        } else {
+            Ok(Box::new(file))
+        }
+    };
 
     match format {
         CompressionFormat::Bgzf if threads > 1 => {
             info!("Detected BGZF-compressed FASTQ, using {threads} decompression threads");
-            let file = File::open(path)?;
+            let reader = open_reader(path)?;
             let worker_count = std::num::NonZero::new(threads).expect("threads > 1 checked above");
-            let reader = MultithreadedReader::with_worker_count(worker_count, file);
-            Ok(Box::new(BufReader::new(reader)))
+            let reader = MultithreadedReader::with_worker_count(worker_count, reader);
+            Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, reader)))
         }
-        CompressionFormat::Bgzf => {
-            debug!("Detected BGZF-compressed FASTQ, using single-threaded decompression");
-            Ok(fgio.new_reader(path)?)
-        }
-        CompressionFormat::Gzip => {
-            debug!("Detected gzip-compressed FASTQ, using single-threaded decompression");
-            Ok(fgio.new_reader(path)?)
+        CompressionFormat::Bgzf | CompressionFormat::Gzip => {
+            debug!("Detected {format:?}-compressed FASTQ, using single-threaded decompression");
+            let reader = open_reader(path)?;
+            Ok(Box::new(BufReader::with_capacity(
+                BUFFER_SIZE,
+                MultiGzDecoder::new(BufReader::with_capacity(BUFFER_SIZE, reader)),
+            )))
         }
         CompressionFormat::Plain => {
             debug!("Detected uncompressed FASTQ");
-            Ok(fgio.new_reader(path)?)
+            let reader = open_reader(path)?;
+            Ok(Box::new(BufReader::with_capacity(BUFFER_SIZE, reader)))
         }
     }
 }
@@ -486,6 +511,12 @@ pub struct Extract {
     /// Queue memory options.
     #[command(flatten)]
     pub queue_memory: QueueMemoryOptions,
+
+    /// Wrap FASTQ inputs in a userspace async prefetch reader. Dedicates one
+    /// OS thread per input stream to issue reads ahead of decompression/parsing.
+    /// Hidden experimental flag.
+    #[arg(long = "async-reader", default_value_t = false, hide = true)]
+    pub async_reader: bool,
 }
 
 impl Extract {
@@ -951,7 +982,8 @@ impl Extract {
                 .with_stats(self.scheduler_opts.collect_stats())
                 .with_scheduler_strategy(self.scheduler_opts.strategy())
                 .with_deadlock_timeout(self.scheduler_opts.deadlock_timeout_secs())
-                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled());
+                .with_deadlock_recovery(self.scheduler_opts.deadlock_recover_enabled())
+                .with_async_reader(self.async_reader);
 
         // Calculate and apply queue memory limit
         let queue_memory_limit_bytes = self.queue_memory.calculate_memory_limit(num_threads)?;
@@ -967,7 +999,7 @@ impl Extract {
             Some(
                 self.inputs
                     .iter()
-                    .map(|p| open_fastq_reader(p, decomp_threads))
+                    .map(|p| open_fastq_reader(p, decomp_threads, self.async_reader))
                     .collect::<Result<Vec<_>>>()?,
             )
         };
@@ -1229,8 +1261,10 @@ impl Command for Extract {
         // Detect quality encoding from first 400 records
         // Use a separate reader for sampling to avoid consuming records from the main reader
         let mut sample_quals = Vec::new();
-        let mut temp_reader =
-            SimdFastqReader::with_capacity(open_fastq_reader(&self.inputs[0], 1)?, BUFFER_SIZE);
+        let mut temp_reader = SimdFastqReader::with_capacity(
+            open_fastq_reader(&self.inputs[0], 1, false)?,
+            BUFFER_SIZE,
+        );
         for _i in 0..QUALITY_DETECTION_SAMPLE_SIZE {
             match temp_reader.next() {
                 Some(Ok(rec)) => sample_quals.push(rec.quality),
@@ -1261,7 +1295,7 @@ impl Command for Extract {
             let fq_readers: Vec<Box<dyn BufRead + Send>> = self
                 .inputs
                 .iter()
-                .map(|p| open_fastq_reader(p, decomp_threads))
+                .map(|p| open_fastq_reader(p, decomp_threads, self.async_reader))
                 .collect::<Result<Vec<_>>>()?;
 
             let fq_sources: Vec<SimdFastqReader<Box<dyn BufRead + Send>>> = fq_readers
@@ -1430,6 +1464,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1484,6 +1519,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1542,6 +1578,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1590,6 +1627,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1647,6 +1685,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1697,6 +1736,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1754,6 +1794,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1808,6 +1849,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1869,6 +1911,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1915,6 +1958,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -1984,6 +2028,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2049,6 +2094,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         let err = extract
@@ -2101,6 +2147,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2146,6 +2193,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract2.execute("test").expect("execute should succeed");
@@ -2198,6 +2246,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2251,6 +2300,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2444,6 +2494,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2491,6 +2542,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2535,6 +2587,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2577,6 +2630,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2619,6 +2673,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2669,6 +2724,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2718,6 +2774,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2769,6 +2826,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2811,6 +2869,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -2867,6 +2926,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         let err =
@@ -2918,6 +2978,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3129,6 +3190,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         // Should succeed without panicking
@@ -3192,6 +3254,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3246,6 +3309,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3315,6 +3379,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3376,6 +3441,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test").expect("execute should succeed");
@@ -3431,6 +3497,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         // Should succeed with all quality tag parameters specified
@@ -3479,6 +3546,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test")?;
@@ -3608,6 +3676,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test")?;
@@ -3661,6 +3730,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             scheduler_opts: SchedulerOptions::default(),
             queue_memory: QueueMemoryOptions::default(),
+            async_reader: false,
         };
 
         extract.execute("test")?;
