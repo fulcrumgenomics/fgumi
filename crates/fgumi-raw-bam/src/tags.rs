@@ -1188,6 +1188,44 @@ impl RawRecordMut<'_> {
     }
 }
 
+/// Length-changing tag editor.
+///
+/// Borrows a full BAM record byte buffer plus the cached aux offset (so update/
+/// append/remove ops don't repeat the header scan). Splices the aux section
+/// in place via `Vec::splice` for length-changing operations.
+pub struct RawTagsEditor<'a> {
+    record: &'a mut Vec<u8>,
+    aux_offset: usize,
+}
+
+impl<'a> RawTagsEditor<'a> {
+    /// Borrow a full BAM record byte buffer.
+    ///
+    /// Computes and caches `aux_offset` once. If the record is too short for
+    /// a valid header, `aux_offset` falls back to `record.len()` so all tag
+    /// ops behave as if the aux section is empty.
+    #[inline]
+    pub fn from_vec(record: &'a mut Vec<u8>) -> Self {
+        let aux_offset = aux_data_offset_from_record(record).unwrap_or(record.len());
+        Self { record, aux_offset }
+    }
+
+    /// Returns the cached aux offset (start of tag section).
+    #[inline]
+    #[must_use]
+    pub fn aux_offset(&self) -> usize {
+        self.aux_offset
+    }
+
+    /// Borrow the aux section as a read-only view.
+    #[inline]
+    #[must_use]
+    pub fn view(&self) -> RawTagsView<'_> {
+        let off = self.aux_offset.min(self.record.len());
+        RawTagsView::new(&self.record[off..])
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::identity_op)]
 mod tests {
@@ -3008,5 +3046,19 @@ mod tests {
         assert!(ok);
         let got = RawRecordView::new(&rec).tags().find_float(b"AS").unwrap();
         assert!((got - 99.25).abs() < 1e-6);
+    }
+
+    // ========================================================================
+    // RawTagsEditor tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_tags_editor_from_vec_caches_aux_offset() {
+        let aux = b"RGZmygrp\0";
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let expected_off = aux_data_offset_from_record(&rec).unwrap();
+        let editor = RawTagsEditor::from_vec(&mut rec);
+        assert_eq!(editor.aux_offset(), expected_off);
+        assert_eq!(editor.view().find_string(b"RG"), Some(b"mygrp".as_slice()));
     }
 }
