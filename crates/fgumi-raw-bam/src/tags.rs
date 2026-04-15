@@ -960,12 +960,28 @@ impl<'a> IntoIterator for &RawTagsView<'a> {
     }
 }
 
+impl<'a> RawTagsView<'a> {
+    /// Single-pass extraction of (RG, cell, MC) string tags from this aux section.
+    #[inline]
+    #[must_use]
+    pub fn extract_string_batch(&self, cell_tag: &[u8; 2]) -> AuxStringTags<'a> {
+        extract_aux_string_tags(self.0, cell_tag)
+    }
+}
+
 impl<'a> RawRecordView<'a> {
     /// Returns a read-only view over this record's auxiliary tag section.
     #[inline]
     #[must_use]
     pub fn tags(&self) -> RawTagsView<'a> {
         RawTagsView::new(aux_data_slice(self.as_bytes()))
+    }
+
+    /// Single-pass extraction of (MI, RG, cell, MC) from this record's aux data.
+    #[inline]
+    #[must_use]
+    pub fn template_aux_tags(&self, cell_tag: Option<&[u8; 2]>) -> TemplateAuxTags<'a> {
+        extract_template_aux_tags(self.as_bytes(), cell_tag)
     }
 }
 
@@ -2671,5 +2687,16 @@ mod tests {
                 ("RG".into(), b'Z', b"rg1\0".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn test_raw_tags_extract_string_batch() {
+        use crate::fields::RawRecordView;
+        let aux = b"RGZmygrp\0BCZACGT\0MCZ50M\0";
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let s = RawRecordView::new(&rec).tags().extract_string_batch(b"BC");
+        assert_eq!(s.rg, Some(b"mygrp".as_slice()));
+        assert_eq!(s.cell, Some(b"ACGT".as_slice()));
+        assert_eq!(s.mc, Some("50M"));
     }
 }
