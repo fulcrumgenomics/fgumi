@@ -1,5 +1,6 @@
 use crate::fields::{
-    RawRecordView, TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size,
+    RawRecordMut, RawRecordView, TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice,
+    tag_value_size,
 };
 
 /// Find a tag's position and type byte in auxiliary data.
@@ -982,6 +983,112 @@ impl<'a> RawRecordView<'a> {
     #[must_use]
     pub fn template_aux_tags(&self, cell_tag: Option<&[u8; 2]>) -> TemplateAuxTags<'a> {
         extract_template_aux_tags(self.as_bytes(), cell_tag)
+    }
+}
+
+/// Borrowed fixed-length mutable view over a BAM record's aux section.
+///
+/// Cannot change the byte count of the aux section. Hosts in-place writers
+/// for B-array elements, Z-tag byte flips, and same-type tag overwrites.
+pub struct RawTagsMut<'a>(&'a mut [u8]);
+
+impl<'a> RawTagsMut<'a> {
+    /// Wraps a raw auxiliary-data slice mutably.
+    #[inline]
+    #[must_use]
+    pub fn new(aux: &'a mut [u8]) -> Self {
+        Self(aux)
+    }
+
+    /// Returns a read-only view over the aux section.
+    #[inline]
+    #[must_use]
+    pub fn view(&self) -> RawTagsView<'_> {
+        RawTagsView::new(self.0)
+    }
+
+    /// Overwrite a single u8 element of a B:C array tag in place.
+    ///
+    /// No-op on tag absence, type mismatch (must be `B` with sub-type `C`), or out-of-range index.
+    #[inline]
+    pub fn set_array_element_u8(&mut self, tag: &[u8; 2], index: usize, value: u8) {
+        Self::set_array_element_le(self.0, *tag, b'C', 1, index, &[value]);
+    }
+
+    /// Overwrite a single u16 element of a B:S array tag in place.
+    ///
+    /// No-op on tag absence, type mismatch (must be `B` with sub-type `S`), or out-of-range index.
+    #[inline]
+    pub fn set_array_element_u16(&mut self, tag: &[u8; 2], index: usize, value: u16) {
+        Self::set_array_element_le(self.0, *tag, b'S', 2, index, &value.to_le_bytes());
+    }
+
+    /// Overwrite a single i16 element of a B:s array tag in place.
+    ///
+    /// No-op on tag absence, type mismatch (must be `B` with sub-type `s`), or out-of-range index.
+    #[inline]
+    pub fn set_array_element_i16(&mut self, tag: &[u8; 2], index: usize, value: i16) {
+        Self::set_array_element_le(self.0, *tag, b's', 2, index, &value.to_le_bytes());
+    }
+
+    /// Overwrite a single i32 element of a B:i array tag in place.
+    ///
+    /// No-op on tag absence, type mismatch (must be `B` with sub-type `i`), or out-of-range index.
+    #[inline]
+    pub fn set_array_element_i32(&mut self, tag: &[u8; 2], index: usize, value: i32) {
+        Self::set_array_element_le(self.0, *tag, b'i', 4, index, &value.to_le_bytes());
+    }
+
+    /// Overwrite a single f32 element of a B:f array tag in place.
+    ///
+    /// No-op on tag absence, type mismatch (must be `B` with sub-type `f`), or out-of-range index.
+    #[inline]
+    pub fn set_array_element_f32(&mut self, tag: &[u8; 2], index: usize, value: f32) {
+        Self::set_array_element_le(self.0, *tag, b'f', 4, index, &value.to_le_bytes());
+    }
+
+    /// Internal helper: locate a B-type array of the expected sub-type and overwrite
+    /// element `index` with the provided little-endian bytes.
+    ///
+    /// The layout of a B-type tag entry in the aux section is:
+    /// `[tag0, tag1, 'B', sub_type, count(4 bytes LE), elem0..elemN]`
+    fn set_array_element_le(
+        aux: &mut [u8],
+        tag: [u8; 2],
+        expected_sub: u8,
+        elem_size: usize,
+        index: usize,
+        le_bytes: &[u8],
+    ) {
+        let Some((p, val_type)) = find_tag_position(aux, tag) else { return };
+        if val_type != b'B' || p + 8 > aux.len() {
+            return;
+        }
+        if aux[p + 3] != expected_sub {
+            return;
+        }
+        let count = u32::from_le_bytes([aux[p + 4], aux[p + 5], aux[p + 6], aux[p + 7]]) as usize;
+        if index >= count {
+            return;
+        }
+        let off = p + 8 + index * elem_size;
+        if off + elem_size > aux.len() {
+            return;
+        }
+        aux[off..off + elem_size].copy_from_slice(le_bytes);
+    }
+}
+
+impl RawRecordMut<'_> {
+    /// Borrow a fixed-length mutable view over this record's aux section.
+    #[inline]
+    #[must_use]
+    pub fn tags_mut(&mut self) -> RawTagsMut<'_> {
+        // Compute offset and length via immutable borrow; both immutable borrows end
+        // before the mutable borrow on the last line (NLL two-phase borrows).
+        let len = self.as_bytes().len();
+        let off = aux_data_offset_from_record(self.as_bytes()).unwrap_or(len);
+        RawTagsMut::new(&mut self.as_bytes_mut()[off..])
     }
 }
 
@@ -2698,5 +2805,28 @@ mod tests {
         assert_eq!(s.rg, Some(b"mygrp".as_slice()));
         assert_eq!(s.cell, Some(b"ACGT".as_slice()));
         assert_eq!(s.mc, Some("50M"));
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_array_element() {
+        use crate::fields::{RawRecordMut, RawRecordView};
+        // Build a record with B:S array tag "bq" of [10, 20, 30, 40]
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"bqBS");
+        aux.extend_from_slice(&4u32.to_le_bytes());
+        for v in [10u16, 20, 30, 40] {
+            aux.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux);
+
+        {
+            let mut m = RawRecordMut::new(&mut rec);
+            let mut tm = m.tags_mut();
+            tm.set_array_element_u16(b"bq", 2, 99);
+        }
+        let v = RawRecordView::new(&rec);
+        let arr = v.tags().find_array(b"bq").expect("array tag");
+        assert_eq!(arr.count, 4);
+        assert_eq!(array_tag_element_u16(&arr, 2), 99);
     }
 }
