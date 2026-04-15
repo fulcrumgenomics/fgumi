@@ -69,6 +69,173 @@ impl<'a> RawRecordView<'a> {
     }
 }
 
+impl<'a> RawRecordView<'a> {
+    // -- header (fixed-offset) --
+
+    /// Extract reference sequence ID from this record.
+    #[inline]
+    #[must_use]
+    pub fn ref_id(&self) -> i32 {
+        ref_id(self.0)
+    }
+
+    /// Extract 0-based leftmost position from this record.
+    #[inline]
+    #[must_use]
+    pub fn pos(&self) -> i32 {
+        pos(self.0)
+    }
+
+    /// Extract mapping quality from this record.
+    #[inline]
+    #[must_use]
+    pub fn mapq(&self) -> u8 {
+        mapq(self.0)
+    }
+
+    /// Extract bitwise flags from this record.
+    #[inline]
+    #[must_use]
+    pub fn flags(&self) -> u16 {
+        flags(self.0)
+    }
+
+    /// Extract `l_read_name` (read-name length including NUL) from this record.
+    #[inline]
+    #[must_use]
+    pub fn l_read_name(&self) -> u8 {
+        l_read_name(self.0)
+    }
+
+    /// Extract number of CIGAR operations from this record.
+    #[inline]
+    #[must_use]
+    pub fn n_cigar_op(&self) -> u16 {
+        n_cigar_op(self.0)
+    }
+
+    /// Extract sequence length from this record.
+    #[inline]
+    #[must_use]
+    pub fn l_seq(&self) -> u32 {
+        l_seq(self.0)
+    }
+
+    /// Extract mate reference sequence ID from this record.
+    #[inline]
+    #[must_use]
+    pub fn mate_ref_id(&self) -> i32 {
+        mate_ref_id(self.0)
+    }
+
+    /// Extract mate 0-based position from this record.
+    #[inline]
+    #[must_use]
+    pub fn mate_pos(&self) -> i32 {
+        mate_pos(self.0)
+    }
+
+    /// Extract template length (tlen) from this record.
+    #[inline]
+    #[must_use]
+    pub fn template_length(&self) -> i32 {
+        template_length(self.0)
+    }
+
+    /// Extract read name (without null terminator) from this record.
+    #[inline]
+    #[must_use]
+    pub fn read_name(&self) -> &'a [u8] {
+        read_name(self.0)
+    }
+
+    /// Extract the BAM bin field (computed by the upstream encoder from `pos` and CIGAR).
+    #[inline]
+    #[must_use]
+    pub fn bin(&self) -> u16 {
+        u16::from_le_bytes([self.0[10], self.0[11]])
+    }
+
+    // -- flag-bit convenience --
+
+    /// Returns `true` if the read is paired in sequencing.
+    #[inline]
+    #[must_use]
+    pub fn is_paired(&self) -> bool {
+        self.flags() & flags::PAIRED != 0
+    }
+
+    /// Returns `true` if the read is unmapped.
+    #[inline]
+    #[must_use]
+    pub fn is_unmapped(&self) -> bool {
+        self.flags() & flags::UNMAPPED != 0
+    }
+
+    /// Returns `true` if the mate is unmapped.
+    #[inline]
+    #[must_use]
+    pub fn is_mate_unmapped(&self) -> bool {
+        self.flags() & flags::MATE_UNMAPPED != 0
+    }
+
+    /// Returns `true` if the read is reverse complemented.
+    #[inline]
+    #[must_use]
+    pub fn is_reverse(&self) -> bool {
+        self.flags() & flags::REVERSE != 0
+    }
+
+    /// Returns `true` if the mate is reverse complemented.
+    #[inline]
+    #[must_use]
+    pub fn is_mate_reverse(&self) -> bool {
+        self.flags() & flags::MATE_REVERSE != 0
+    }
+
+    /// Returns `true` if the read is the first segment (R1).
+    #[inline]
+    #[must_use]
+    pub fn is_first_segment(&self) -> bool {
+        self.flags() & flags::FIRST_SEGMENT != 0
+    }
+
+    /// Returns `true` if the read is the last segment (R2).
+    #[inline]
+    #[must_use]
+    pub fn is_last_segment(&self) -> bool {
+        self.flags() & flags::LAST_SEGMENT != 0
+    }
+
+    /// Returns `true` if the read is a secondary alignment.
+    #[inline]
+    #[must_use]
+    pub fn is_secondary(&self) -> bool {
+        self.flags() & flags::SECONDARY != 0
+    }
+
+    /// Returns `true` if the read fails quality controls.
+    #[inline]
+    #[must_use]
+    pub fn is_qc_fail(&self) -> bool {
+        self.flags() & flags::QC_FAIL != 0
+    }
+
+    /// Returns `true` if the read is a PCR or optical duplicate.
+    #[inline]
+    #[must_use]
+    pub fn is_duplicate(&self) -> bool {
+        self.flags() & flags::DUPLICATE != 0
+    }
+
+    /// Returns `true` if the read is a supplementary alignment.
+    #[inline]
+    #[must_use]
+    pub fn is_supplementary(&self) -> bool {
+        self.flags() & flags::SUPPLEMENTARY != 0
+    }
+}
+
 /// BAM flag bits.
 pub mod flags {
     /// Read is paired in sequencing.
@@ -988,5 +1155,40 @@ mod tests {
     fn test_raw_record_view_try_new_min_length_succeeds() {
         let bytes = vec![0u8; MIN_BAM_RECORD_LEN];
         assert!(RawRecordView::try_new(&bytes).is_some());
+    }
+
+    #[test]
+    fn test_raw_record_view_header_accessors() {
+        use crate::testutil::*;
+        let mut rec = make_bam_bytes(
+            3,
+            200,
+            flags::PAIRED | flags::REVERSE,
+            b"read1",
+            &[encode_op(0, 10)],
+            6,
+            5,
+            400,
+            &[],
+        );
+        rec[9] = 42; // mapq
+        // bin
+        rec[10..12].copy_from_slice(&4680u16.to_le_bytes());
+
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.ref_id(), 3);
+        assert_eq!(v.pos(), 200);
+        assert_eq!(v.mapq(), 42);
+        assert_eq!(v.flags(), flags::PAIRED | flags::REVERSE);
+        assert_eq!(v.bin(), 4680);
+        assert_eq!(v.l_read_name(), 6);
+        assert_eq!(v.n_cigar_op(), 1);
+        assert_eq!(v.l_seq(), 6);
+        assert_eq!(v.mate_ref_id(), 5);
+        assert_eq!(v.mate_pos(), 400);
+        assert_eq!(v.read_name(), b"read1");
+        assert!(v.is_paired());
+        assert!(v.is_reverse());
+        assert!(!v.is_unmapped());
     }
 }
