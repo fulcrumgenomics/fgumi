@@ -140,9 +140,9 @@ fn create_temp_dir(base: Option<&Path>) -> Result<TempDir> {
 
 pub use inline_buffer::{TemplateKey, extract_coordinate_key_inline};
 pub use keys::{
-    CoordinateKey, PA_TAG, PrimaryAlignmentInfo, QuerynameComparator, QuerynameKey,
-    RawCoordinateKey, RawQuerynameKey, RawQuerynameLexKey, RawSortKey, SortContext, SortKey,
-    SortOrder, natural_compare, normalize_natural_key,
+    CoordinateKey, QuerynameComparator, QuerynameKey, RawCoordinateKey, RawQuerynameKey,
+    RawQuerynameLexKey, RawSortKey, SortContext, SortKey, SortOrder, natural_compare,
+    normalize_natural_key,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
 pub use raw::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline};

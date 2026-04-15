@@ -119,11 +119,13 @@ impl SamTag {
 
     // ── fgumi-internal tags ─────────────────────────────────────────────────
 
-    /// Primary alignment sort key for secondary/supplementary reads.
+    /// Template-coordinate sort key for secondary/supplementary reads.
     ///
-    /// Lowercase per the SAM specification convention for non-standard program tags.
-    /// Written by `fgumi zipper`; consumed by `fgumi sort --order template-coordinate`.
-    pub const PA: SamTag = SamTag::new(b'p', b'a');
+    /// Stores the primary alignments' template-coordinate sort key so
+    /// secondary/supplementary reads can sort adjacent to their primaries.
+    /// Lowercase per the SAM specification convention for non-standard
+    /// program tags. Written by `fgumi zipper`; validated by `fgumi dedup`.
+    pub const TC: SamTag = SamTag::new(b't', b'c');
 }
 
 impl Deref for SamTag {
@@ -202,7 +204,7 @@ mod tests {
         assert_eq!(*SamTag::CB, [b'C', b'B']);
         assert_eq!(*SamTag::QX, [b'Q', b'X']);
         assert_eq!(*SamTag::CY, [b'C', b'Y']);
-        assert_eq!(*SamTag::PA, [b'p', b'a']);
+        assert_eq!(*SamTag::TC, [b't', b'c']);
         assert_eq!(*SamTag::MS, [b'm', b's']);
         assert_eq!(*SamTag::NM, [b'N', b'M']);
     }
@@ -212,7 +214,7 @@ mod tests {
         assert_eq!(SamTag::RX.to_string(), "RX");
         assert_eq!(SamTag::MI.to_string(), "MI");
         assert_eq!(SamTag::CB.to_string(), "CB");
-        assert_eq!(SamTag::PA.to_string(), "pa");
+        assert_eq!(SamTag::TC.to_string(), "tc");
     }
 
     #[test]
@@ -254,8 +256,8 @@ mod tests {
 
     #[test]
     fn test_to_noodles_tag_const() {
-        const T: Tag = SamTag::PA.to_noodles_tag();
-        assert_eq!(T, Tag::from([b'p', b'a']));
+        const T: Tag = SamTag::TC.to_noodles_tag();
+        assert_eq!(T, Tag::from([b't', b'c']));
     }
 
     #[test]

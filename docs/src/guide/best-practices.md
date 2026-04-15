@@ -212,7 +212,7 @@ fgumi merge \
 For single-cell data, the `CB` cell barcode tag is automatically included in the merge key.
 
 All inputs must be sorted in the same order as `--order`. Do not use `samtools merge` for
-template-coordinate BAMs — it does not understand the `pa` tag that `fgumi sort` adds, and
+template-coordinate BAMs — it does not understand the `tc` tag that `fgumi zipper` adds, and
 will produce incorrect ordering.
 
 ### Step 1.4: UMI Grouping
@@ -442,7 +442,7 @@ fgumi extract \
   --library "library_name" \
   --output unmapped.bam
 
-# Step 2: Align reads (fgumi zipper adds required `pa` tag)
+# Step 2: Align reads (fgumi zipper adds required `tc` tag)
 fgumi fastq --input unmapped.bam \
   | bwa mem -t 16 -p -K 150000000 -Y ref.fa - \
   | fgumi zipper --unmapped unmapped.bam --reference ref.fa --output aligned.bam
@@ -455,9 +455,9 @@ fgumi dedup --input sorted.bam --output deduped.bam --metrics metrics.txt
 ```
 
 **Important:** You MUST use `fgumi zipper` and `fgumi sort` before `fgumi dedup`:
-- `fgumi zipper` adds the `pa` (primary alignment) tag to secondary/supplementary reads
-- `fgumi sort --order template-coordinate` uses this tag to keep all alignments for a template together
-- `samtools sort --template-coordinate` does NOT understand the `pa` tag and will produce incorrect results
+- `fgumi zipper` adds the `tc` (template-coordinate) tag to secondary/supplementary reads
+- `fgumi sort --order template-coordinate` keeps all alignments for a template together; downstream `fgumi dedup` uses the `tc` tag to validate input
+- `samtools sort --template-coordinate` does NOT understand the `tc` tag and will produce incorrect results for dedup
 
 ### Dedup Options
 

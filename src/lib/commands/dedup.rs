@@ -2,7 +2,7 @@
 //!
 //! This command marks or removes PCR duplicates using UMI information.
 //! It operates on template-coordinate sorted BAM files and requires
-//! the `pa` tag on secondary/supplementary reads (added by `fgumi zipper`).
+//! the `tc` tag on secondary/supplementary reads (added by `fgumi zipper`).
 //!
 //! # Algorithm
 //!
@@ -57,7 +57,7 @@ use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
     build_pipeline_config, parse_bool,
 };
-use crate::sort::PA_TAG;
+use crate::sam::TC_TAG;
 use crate::sort::bam_fields;
 
 /// Duplicate flag bit in SAM flags (0x400)
@@ -86,8 +86,8 @@ pub struct DedupMetrics {
     pub secondary_reads: u64,
     /// Supplementary reads processed
     pub supplementary_reads: u64,
-    /// Secondary/supplementary without pa tag
-    pub missing_pa_tag: u64,
+    /// Secondary/supplementary without tc tag
+    pub missing_tc_tag: u64,
     /// Filter metrics from position grouping
     pub filter_metrics: FilterMetrics,
 }
@@ -103,7 +103,7 @@ impl DedupMetrics {
         self.unique_reads += other.unique_reads;
         self.secondary_reads += other.secondary_reads;
         self.supplementary_reads += other.supplementary_reads;
-        self.missing_pa_tag += other.missing_pa_tag;
+        self.missing_tc_tag += other.missing_tc_tag;
         self.filter_metrics.merge(&other.filter_metrics);
     }
 
@@ -130,7 +130,7 @@ struct DedupMetricsOutput {
     duplicate_reads: u64,
     secondary_reads: u64,
     supplementary_reads: u64,
-    missing_pa_tag: u64,
+    missing_tc_tag: u64,
 }
 
 impl From<&DedupMetrics> for DedupMetricsOutput {
@@ -145,7 +145,7 @@ impl From<&DedupMetrics> for DedupMetricsOutput {
             duplicate_reads: m.duplicate_reads,
             secondary_reads: m.secondary_reads,
             supplementary_reads: m.supplementary_reads,
-            missing_pa_tag: m.missing_pa_tag,
+            missing_tc_tag: m.missing_tc_tag,
         }
     }
 }
@@ -952,8 +952,8 @@ fn process_position_group(
         }
     }
 
-    // Count reads and check for missing pa tags
-    let pa_tag_bytes: [u8; 2] = *PA_TAG.as_ref();
+    // Count reads and check for missing tc tags
+    let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;
         if let Some(raw_records) = template.all_raw_records() {
@@ -971,8 +971,8 @@ fn process_position_group(
                 }
                 if is_secondary || is_supplementary {
                     let aux = bam_fields::aux_data_slice(raw);
-                    if bam_fields::find_tag_type(aux, &pa_tag_bytes).is_none() {
-                        dedup_metrics.missing_pa_tag += 1;
+                    if bam_fields::find_tag_type(aux, &tc_tag_bytes).is_none() {
+                        dedup_metrics.missing_tc_tag += 1;
                     }
                 }
             }
@@ -989,9 +989,9 @@ fn process_position_group(
                 if is_supplementary {
                     dedup_metrics.supplementary_reads += 1;
                 }
-                // Single PA_TAG lookup for both secondary and supplementary
-                if (is_secondary || is_supplementary) && record.data().get(&PA_TAG).is_none() {
-                    dedup_metrics.missing_pa_tag += 1;
+                // Single TC_TAG lookup for both secondary and supplementary
+                if (is_secondary || is_supplementary) && record.data().get(&TC_TAG).is_none() {
+                    dedup_metrics.missing_tc_tag += 1;
                 }
             }
         }
@@ -1032,7 +1032,7 @@ fn set_mi_tag_on_record(
     about = "\x1b[38;5;151m[DEDUP]\x1b[0m         \x1b[36mMark or remove PCR duplicates using UMI information\x1b[0m",
     long_about = r#"
 Marks or removes PCR duplicates from a BAM file using UMI information.
-Requires template-coordinate sorted input with `pa` tags on secondary/supplementary
+Requires template-coordinate sorted input with `tc` tags on secondary/supplementary
 reads (added by `fgumi zipper`).
 
 Within each UMI family, the template with the highest sum of base qualities
@@ -1040,12 +1040,12 @@ is selected as the representative; all others are marked as duplicates.
 
 # Input Requirements
 
-- Must be processed with `fgumi zipper` (adds `pa` tag for secondary/supplementary reads)
+- Must be processed with `fgumi zipper` (adds `tc` tag for secondary/supplementary reads)
 - Must be sorted with `fgumi sort --order template-coordinate`
 - UMI tags on reads (RX tag), unless `--no-umi` is specified
 
 Note: Using `samtools sort` will NOT work correctly because it doesn't use the
-`pa` tag for template-coordinate ordering of secondary/supplementary reads.
+`tc` tag for template-coordinate ordering of secondary/supplementary reads.
 
 # Output Modes
 
@@ -1379,17 +1379,17 @@ impl Command for MarkDuplicates {
             final_metrics.duplicate_rate() * 100.0
         );
 
-        if final_metrics.missing_pa_tag > 0 {
+        if final_metrics.missing_tc_tag > 0 {
             bail!(
-                "{} secondary/supplementary reads are missing the `pa` tag.\n\n\
-                The `pa` tag is required for correct UMI-aware deduplication of \
+                "{} secondary/supplementary reads are missing the `tc` tag.\n\n\
+                The `tc` tag is required for correct UMI-aware deduplication of \
                 secondary and supplementary alignments. This tag is added by \
                 `fgumi zipper` during the merge of unmapped and mapped BAMs.\n\n\
                 To fix this, re-run your pipeline starting from `fgumi zipper`:\n  \
                 fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
                 fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_pa_tag
+                final_metrics.missing_tc_tag
             );
         }
 
@@ -2379,7 +2379,7 @@ mod tests {
             unique_reads: 16,
             secondary_reads: 3,
             supplementary_reads: 1,
-            missing_pa_tag: 1,
+            missing_tc_tag: 1,
             ..Default::default()
         };
 
@@ -2392,7 +2392,7 @@ mod tests {
             unique_reads: 8,
             secondary_reads: 2,
             supplementary_reads: 3,
-            missing_pa_tag: 2,
+            missing_tc_tag: 2,
             ..Default::default()
         };
 
@@ -2405,7 +2405,7 @@ mod tests {
         assert_eq!(m1.unique_reads, 24);
         assert_eq!(m1.secondary_reads, 5);
         assert_eq!(m1.supplementary_reads, 4);
-        assert_eq!(m1.missing_pa_tag, 3);
+        assert_eq!(m1.missing_tc_tag, 3);
     }
 
     #[test]
@@ -2426,7 +2426,7 @@ mod tests {
         assert_eq!(metrics.unique_reads, 0);
         assert_eq!(metrics.secondary_reads, 0);
         assert_eq!(metrics.supplementary_reads, 0);
-        assert_eq!(metrics.missing_pa_tag, 0);
+        assert_eq!(metrics.missing_tc_tag, 0);
     }
 
     #[test]
@@ -2440,7 +2440,7 @@ mod tests {
             unique_reads: 150,
             secondary_reads: 10,
             supplementary_reads: 5,
-            missing_pa_tag: 2,
+            missing_tc_tag: 2,
             ..Default::default()
         };
         let output = DedupMetricsOutput::from(&metrics);
@@ -2454,7 +2454,7 @@ mod tests {
         assert_eq!(output.unique_reads, 150);
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
-        assert_eq!(output.missing_pa_tag, 2);
+        assert_eq!(output.missing_tc_tag, 2);
     }
 
     // ========================================================================

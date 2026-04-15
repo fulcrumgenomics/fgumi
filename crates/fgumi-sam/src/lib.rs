@@ -37,6 +37,7 @@ pub mod builder;
 pub mod clipper;
 pub mod record_utils;
 pub mod tag;
+pub mod template_coordinate;
 
 /// Abstraction over reference genome access for alignment tag calculation.
 ///
@@ -93,6 +94,7 @@ pub use record_utils::{
     unclipped_five_prime_position, unclipped_start,
 };
 pub use tag::SamTag;
+pub use template_coordinate::{TC_TAG, TemplateCoordinateInfo};
 
 use bstr::ByteSlice;
 use log::warn;

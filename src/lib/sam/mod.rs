@@ -12,6 +12,9 @@ pub use fgumi_sam::{builder, record_utils};
 // Re-export SamTag newtype
 pub use fgumi_sam::SamTag;
 
+// Re-export TC (template-coordinate) sort-key tag and parser
+pub use fgumi_sam::{TC_TAG, TemplateCoordinateInfo};
+
 // Re-export top-level functions from fgumi-sam
 pub use fgumi_sam::{
     buf_value_to_smallest_signed_int, check_sort, is_sorted, is_template_coordinate_sorted,

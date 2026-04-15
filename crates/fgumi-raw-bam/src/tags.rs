@@ -1019,9 +1019,9 @@ mod tests {
 
     #[test]
     fn test_find_string_tag_cannot_find_b_int_array() {
-        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
         // BUG: find_string_tag returns None for B:i tags
-        assert_eq!(find_string_tag(&aux, b"pa"), None);
+        assert_eq!(find_string_tag(&aux, b"tc"), None);
     }
 
     // --- B:f array ---
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_find_string_tag_after_b_array() {
-        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        let mut aux = make_b_int_array_tag(*b"tc", &[1, 2, 3]);
         aux.extend_from_slice(b"RXZhello\x00");
         // Can find the Z-tag after the B-array
         assert_eq!(find_string_tag(&aux, b"RX"), Some(b"hello".as_ref()));
@@ -1232,9 +1232,9 @@ mod tests {
 
     #[test]
     fn test_find_int_tag_cannot_find_b_int_array() {
-        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
         // BUG: find_int_tag returns None for B:i tags
-        assert_eq!(find_int_tag(&aux, b"pa"), None);
+        assert_eq!(find_int_tag(&aux, b"tc"), None);
     }
 
     #[test]
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_find_int_tag_after_b_array() {
-        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        let mut aux = make_b_int_array_tag(*b"tc", &[1, 2, 3]);
         aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
         assert_eq!(find_int_tag(&aux, b"NM"), Some(5));
     }
@@ -1553,9 +1553,9 @@ mod tests {
 
     #[test]
     fn test_find_tag_type_finds_b_int_array() {
-        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
         // find_tag_type correctly finds B-array tags
-        assert_eq!(find_tag_type(&aux, b"pa"), Some(b'B'));
+        assert_eq!(find_tag_type(&aux, b"tc"), Some(b'B'));
     }
 
     #[test]
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn test_find_tag_type_after_b_array() {
-        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
+        let mut aux = make_b_int_array_tag(*b"tc", &[1, 2, 3]);
         aux.extend_from_slice(b"RXZhello\x00");
         assert_eq!(find_tag_type(&aux, b"RX"), Some(b'Z'));
     }
@@ -2278,24 +2278,24 @@ mod tests {
     }
 
     // ========================================================================
-    // Dedup pa-tag validation bug reproduction
+    // Dedup tc-tag validation bug reproduction
     // ========================================================================
 
     #[test]
-    fn test_dedup_pa_tag_check_fails_on_b_array() {
-        // Simulate the exact pa tag as produced by fgumi zipper: pa:B:i,0,27_056_961,0,207,60005,1
-        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
-        let pa_tag_bytes: [u8; 2] = *b"pa";
+    fn test_dedup_tc_tag_check_fails_on_b_array() {
+        // Simulate the exact tc tag as produced by fgumi zipper: tc:B:i,0,27_056_961,0,207,60005,1
+        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let tc_tag_bytes: [u8; 2] = *b"tc";
 
         // This is the exact check from dedup.rs:932-934
-        let found_by_dedup = find_string_tag(&aux, &pa_tag_bytes).is_some()
-            || find_int_tag(&aux, &pa_tag_bytes).is_some();
+        let found_by_dedup = find_string_tag(&aux, &tc_tag_bytes).is_some()
+            || find_int_tag(&aux, &tc_tag_bytes).is_some();
 
-        // BUG: dedup thinks the pa tag is missing even though it's present
-        assert!(!found_by_dedup, "dedup check should fail to find B:i pa tag");
+        // BUG: dedup thinks the tc tag is missing even though it's present
+        assert!(!found_by_dedup, "dedup check should fail to find B:i tc tag");
 
         // But find_tag_type correctly finds it
-        assert!(find_tag_type(&aux, &pa_tag_bytes).is_some());
+        assert!(find_tag_type(&aux, &tc_tag_bytes).is_some());
     }
 
     // ========================================================================
@@ -2306,14 +2306,14 @@ mod tests {
     fn test_append_i32_array_tag() {
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
         let values = [1i32, -200, 300_000];
-        append_i32_array_tag(&mut rec, b"pa", &values);
+        append_i32_array_tag(&mut rec, b"tc", &values);
 
         let aux = aux_data_slice(&rec);
-        let tag_type = find_tag_type(aux, b"pa");
+        let tag_type = find_tag_type(aux, b"tc");
         assert_eq!(tag_type, Some(b'B'));
 
         // Verify the array contents
-        let arr = find_array_tag(aux, b"pa").unwrap();
+        let arr = find_array_tag(aux, b"tc").unwrap();
         assert_eq!(arr.count, 3);
         assert_eq!(arr.elem_type, b'i');
     }
@@ -2321,10 +2321,10 @@ mod tests {
     #[test]
     fn test_append_i32_array_tag_empty() {
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
-        append_i32_array_tag(&mut rec, b"pa", &[]);
+        append_i32_array_tag(&mut rec, b"tc", &[]);
 
         let aux = aux_data_slice(&rec);
-        let arr = find_array_tag(aux, b"pa").unwrap();
+        let arr = find_array_tag(aux, b"tc").unwrap();
         assert_eq!(arr.count, 0);
     }
 
