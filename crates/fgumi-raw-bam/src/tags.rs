@@ -1,4 +1,6 @@
-use crate::fields::{TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size};
+use crate::fields::{
+    RawRecordView, TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice, tag_value_size,
+};
 
 /// Find a tag's position and type byte in auxiliary data.
 ///
@@ -796,6 +798,127 @@ pub fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[&[u8; 2]])
         }
 
         offset = entry_end;
+    }
+}
+
+/// Zero-allocation entry yielded by tag iterators.
+#[derive(Copy, Clone, Debug)]
+pub struct TagEntry<'a> {
+    pub tag: [u8; 2],
+    pub type_byte: u8,
+    pub value_bytes: &'a [u8],
+}
+
+/// Borrowed read-only view over a BAM record's auxiliary tag section.
+#[derive(Copy, Clone, Debug)]
+pub struct RawTagsView<'a>(&'a [u8]);
+
+impl<'a> RawTagsView<'a> {
+    /// Wraps a raw auxiliary-data slice.
+    #[inline]
+    #[must_use]
+    pub const fn new(aux: &'a [u8]) -> Self {
+        Self(aux)
+    }
+
+    /// Returns the underlying aux-data bytes.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+
+    /// Returns the number of bytes in the aux section.
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if the aux section is empty (no tags present).
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns `true` if the named tag is present in the aux section.
+    #[inline]
+    #[must_use]
+    pub fn contains(&self, tag: &[u8; 2]) -> bool {
+        find_tag_type(self.0, tag).is_some()
+    }
+
+    /// Returns the value of a `Z`-type (string) tag, without the null terminator.
+    ///
+    /// Returns `None` if the tag is absent or is not `Z`-typed.
+    #[inline]
+    #[must_use]
+    pub fn find_string(&self, tag: &[u8; 2]) -> Option<&'a [u8]> {
+        find_string_tag(self.0, tag)
+    }
+
+    /// Returns the value of any integer tag (`c/C/s/S/i/I`) widened to `i64`.
+    ///
+    /// Returns `None` if the tag is absent or is not an integer type.
+    #[inline]
+    #[must_use]
+    pub fn find_int(&self, tag: &[u8; 2]) -> Option<i64> {
+        find_int_tag(self.0, tag)
+    }
+
+    /// Returns the value of a `C`-type (unsigned byte) tag.
+    ///
+    /// Returns `None` if the tag is absent or is not `C`-typed.
+    #[inline]
+    #[must_use]
+    pub fn find_uint8(&self, tag: &[u8; 2]) -> Option<u8> {
+        find_uint8_tag(self.0, tag)
+    }
+
+    /// Returns the value of an `f`-type (32-bit float) tag.
+    ///
+    /// Returns `None` if the tag is absent or is not `f`-typed.
+    #[inline]
+    #[must_use]
+    pub fn find_float(&self, tag: &[u8; 2]) -> Option<f32> {
+        find_float_tag(self.0, tag)
+    }
+
+    /// Returns a zero-allocation reference to a `B`-type (array) tag.
+    ///
+    /// Returns `None` if the tag is absent or is not `B`-typed.
+    #[inline]
+    #[must_use]
+    pub fn find_array(&self, tag: &[u8; 2]) -> Option<ArrayTagRef<'a>> {
+        find_array_tag(self.0, tag)
+    }
+
+    /// Returns the MI (Molecular Identifier) tag as `(value, is_A_suffix)`.
+    ///
+    /// Returns `None` if the tag is absent or cannot be parsed.
+    #[inline]
+    #[must_use]
+    pub fn find_mi(&self) -> Option<(u64, bool)> {
+        find_mi_tag(self.0)
+    }
+
+    /// Returns the MC (mate CIGAR) tag as a `&str`.
+    ///
+    /// Returns `None` if the tag is absent or is not valid UTF-8.
+    #[inline]
+    #[must_use]
+    pub fn find_mc(&self) -> Option<&'a str> {
+        find_mc_tag(self.0)
+    }
+}
+
+impl<'a> RawRecordView<'a> {
+    /// Returns a read-only view over this record's auxiliary tag section.
+    #[inline]
+    #[must_use]
+    pub fn tags(&self) -> RawTagsView<'a> {
+        RawTagsView::new(aux_data_slice(self.as_bytes()))
     }
 }
 
@@ -2461,5 +2584,18 @@ mod tests {
         assert_eq!(arr.elem_type, b'C');
         assert_eq!(arr.count, values.len());
         assert_eq!(arr.data, values);
+    }
+
+    #[test]
+    fn test_raw_tags_view_construction_and_find_string() {
+        use crate::fields::RawRecordView;
+        let aux = b"RGZmysample\0";
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let v = RawRecordView::new(&rec);
+        let tags = v.tags();
+        assert_eq!(tags.find_string(b"RG"), Some(b"mysample".as_slice()));
+        assert!(!tags.is_empty());
+        assert!(tags.contains(b"RG"));
+        assert!(!tags.contains(b"NM"));
     }
 }
