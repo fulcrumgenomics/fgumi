@@ -1224,6 +1224,94 @@ impl<'a> RawTagsEditor<'a> {
         let off = self.aux_offset.min(self.record.len());
         RawTagsView::new(&self.record[off..])
     }
+
+    // -- append (always grow) --
+
+    /// Append a string (Z-type) tag to the record.
+    #[inline]
+    pub fn append_string(&mut self, tag: &[u8; 2], value: &[u8]) {
+        append_string_tag(self.record, tag, value);
+    }
+
+    /// Append an integer tag, choosing the smallest fitting unsigned/signed type.
+    #[inline]
+    pub fn append_int(&mut self, tag: &[u8; 2], value: i32) {
+        append_int_tag(self.record, tag, value);
+    }
+
+    /// Append a signed integer tag, choosing the smallest fitting signed type.
+    #[inline]
+    pub fn append_signed_int(&mut self, tag: &[u8; 2], value: i32) {
+        append_signed_int_tag(self.record, tag, value);
+    }
+
+    /// Append a float (`f`-type) tag to the record.
+    #[inline]
+    pub fn append_float(&mut self, tag: &[u8; 2], value: f32) {
+        append_float_tag(self.record, tag, value);
+    }
+
+    /// Append a Phred+33-encoded quality string tag.
+    ///
+    /// Converts raw Phred scores (0–93) to ASCII (Phred+33) and writes as a Z-type tag.
+    #[inline]
+    pub fn append_phred33_string(&mut self, tag: &[u8; 2], quals: &[u8]) {
+        append_phred33_string_tag(self.record, tag, quals);
+    }
+
+    /// Append a `B:C` (u8 array) tag to the record.
+    #[inline]
+    pub fn append_array_u8(&mut self, tag: &[u8; 2], values: &[u8]) {
+        append_u8_array_tag(self.record, tag, values);
+    }
+
+    /// Append a `B:s` (i16 array) tag to the record.
+    #[inline]
+    pub fn append_array_i16(&mut self, tag: &[u8; 2], values: &[i16]) {
+        append_i16_array_tag(self.record, tag, values);
+    }
+
+    /// Append a `B:i` (i32 array) tag to the record.
+    #[inline]
+    pub fn append_array_i32(&mut self, tag: &[u8; 2], values: &[i32]) {
+        append_i32_array_tag(self.record, tag, values);
+    }
+
+    // -- update / remove / normalize --
+
+    /// Update an existing integer tag in place, or append it if absent.
+    #[inline]
+    pub fn update_int(&mut self, tag: &[u8; 2], value: i32) {
+        update_int_tag(self.record, tag, value);
+    }
+
+    /// Update an existing string tag in place, or append it if absent.
+    #[inline]
+    pub fn update_string(&mut self, tag: &[u8; 2], value: &[u8]) {
+        update_string_tag(self.record, tag, value);
+    }
+
+    /// Remove a tag from the record. No-op if the tag is not found.
+    #[inline]
+    pub fn remove(&mut self, tag: &[u8; 2]) {
+        remove_tag(self.record, tag);
+    }
+
+    /// Re-encode an existing integer tag using the smallest fitting signed type.
+    ///
+    /// No-op if the tag is not found or is not an integer type.
+    #[inline]
+    pub fn normalize_int_to_smallest_signed(&mut self, tag: &[u8; 2]) {
+        normalize_int_tag_to_smallest_signed(self.record, tag);
+    }
+
+    /// Copy entries from a source aux view to this record, optionally skipping tags by key.
+    ///
+    /// All tags in `src` are appended to the record unless their two-byte key appears in `skip`.
+    #[inline]
+    pub fn copy_from(&mut self, src: RawTagsView<'_>, skip: &[&[u8; 2]]) {
+        copy_aux_tags(src.as_bytes(), self.record, skip);
+    }
 }
 
 #[cfg(test)]
@@ -3060,5 +3148,83 @@ mod tests {
         let editor = RawTagsEditor::from_vec(&mut rec);
         assert_eq!(editor.aux_offset(), expected_off);
         assert_eq!(editor.view().find_string(b"RG"), Some(b"mygrp".as_slice()));
+    }
+
+    #[test]
+    fn test_editor_append_remove_update_int_string_roundtrip() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.append_string(b"RG", b"mygrp");
+            ed.append_int(b"NM", 5);
+            ed.update_int(b"NM", 7);
+            ed.update_string(b"RG", b"newgrp");
+        }
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.tags().find_string(b"RG"), Some(b"newgrp".as_slice()));
+        assert_eq!(v.tags().find_int(b"NM"), Some(7));
+
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.remove(b"NM");
+        }
+        assert_eq!(RawRecordView::new(&rec).tags().find_int(b"NM"), None);
+    }
+
+    #[test]
+    fn test_editor_normalize_int_to_smallest_signed() {
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.append_int(b"NM", 100_000); // Will encode as 'i' (i32) — fits 100,000
+            ed.normalize_int_to_smallest_signed(b"NM");
+        }
+        let aux = aux_data_slice(&rec);
+        let (p, t) = find_tag_position(aux, *b"NM").unwrap();
+        assert_eq!(t, b'i');
+        assert_eq!(i32::from_le_bytes([aux[p + 3], aux[p + 4], aux[p + 5], aux[p + 6]]), 100_000);
+    }
+
+    #[test]
+    fn test_editor_append_phred33_string() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.append_phred33_string(b"OQ", &[30, 31, 32, 33]);
+        }
+        // Phred+33: 30 -> '?', 31 -> '@', 32 -> 'A', 33 -> 'B'
+        assert_eq!(RawRecordView::new(&rec).tags().find_string(b"OQ"), Some(b"?@AB".as_slice()));
+    }
+
+    #[test]
+    fn test_editor_append_array_i16() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.append_array_i16(b"sq", &[-100, 0, 100]);
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"sq").expect("present");
+        assert_eq!(arr.count, 3);
+        assert_eq!(arr.elem_type, b's');
+    }
+
+    #[test]
+    fn test_editor_copy_from_skip() {
+        use crate::fields::RawRecordView;
+        let src_aux = b"RGZmygrp\0NMc\x05ASc\x0a";
+        let src_rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, src_aux);
+        let mut dst_rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let src_view = RawRecordView::new(&src_rec);
+            let mut ed = RawTagsEditor::from_vec(&mut dst_rec);
+            ed.copy_from(src_view.tags(), &[b"NM"]);
+        }
+        let dst = RawRecordView::new(&dst_rec);
+        assert_eq!(dst.tags().find_string(b"RG"), Some(b"mygrp".as_slice()));
+        assert_eq!(dst.tags().find_int(b"NM"), None); // skipped
+        assert_eq!(dst.tags().find_int(b"AS"), Some(10));
     }
 }
