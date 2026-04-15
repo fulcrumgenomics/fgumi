@@ -210,7 +210,7 @@ use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{ReadType, SourceRead};
-use fgumi_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedBamRecordBuilder, flags};
 
 /// Duplex consensus read - matches fgbio's `DuplexConsensusRead`
 ///
@@ -630,8 +630,9 @@ impl DuplexConsensusCaller {
         for record in records {
             // Extract strand info before moving the record (drop borrow before push)
             let is_a_strand = {
-                let Some(mi_bytes) = bam_fields::find_string_tag_in_record(&record, b"MI") else {
-                    let read_name = String::from_utf8_lossy(bam_fields::read_name(&record));
+                let Some(mi_bytes) = RawRecordView::new(&record).tags().find_string(b"MI") else {
+                    let read_name =
+                        String::from_utf8_lossy(RawRecordView::new(&record).read_name());
                     bail!(
                         "Read '{read_name}' is missing MI tag. \
                         The duplex command requires all reads to have MI tags. \
@@ -764,14 +765,14 @@ impl DuplexConsensusCaller {
         let num_a = a_records
             .iter()
             .filter(|r| {
-                let flg = bam_fields::flags(r);
+                let flg = RawRecordView::new(r).flags();
                 (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
             })
             .count();
         let num_b = b_records
             .iter()
             .filter(|r| {
-                let flg = bam_fields::flags(r);
+                let flg = RawRecordView::new(r).flags();
                 (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
             })
             .count();
@@ -811,8 +812,8 @@ impl DuplexConsensusCaller {
         let Some(first) = reads.next() else {
             return true;
         };
-        let first_is_reverse = bam_fields::flags(first) & flags::REVERSE != 0;
-        reads.all(|r| (bam_fields::flags(r) & flags::REVERSE != 0) == first_is_reverse)
+        let first_is_reverse = RawRecordView::new(first).flags() & flags::REVERSE != 0;
+        reads.all(|r| (RawRecordView::new(r).flags() & flags::REVERSE != 0) == first_is_reverse)
     }
 
     // Helper function to cap quality scores to valid range [2, 93]
@@ -1221,9 +1222,9 @@ impl DuplexConsensusCaller {
         let mut all_umis = Vec::new();
 
         for raw in source_reads_a {
-            if let Some(rx_bytes) = bam_fields::find_string_tag_in_record(raw, b"RX") {
+            if let Some(rx_bytes) = RawRecordView::new(raw).tags().find_string(b"RX") {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
-                let is_first = bam_fields::flags(raw) & flags::FIRST_SEGMENT != 0;
+                let is_first = RawRecordView::new(raw).flags() & flags::FIRST_SEGMENT != 0;
                 if is_first == first_of_pair {
                     all_umis.push(rx);
                 } else {
@@ -1234,9 +1235,9 @@ impl DuplexConsensusCaller {
         }
 
         for raw in source_reads_b {
-            if let Some(rx_bytes) = bam_fields::find_string_tag_in_record(raw, b"RX") {
+            if let Some(rx_bytes) = RawRecordView::new(raw).tags().find_string(b"RX") {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
-                let is_first = bam_fields::flags(raw) & flags::FIRST_SEGMENT != 0;
+                let is_first = RawRecordView::new(raw).flags() & flags::FIRST_SEGMENT != 0;
                 if is_first == first_of_pair {
                     all_umis.push(rx);
                 } else {
@@ -1779,20 +1780,30 @@ impl DuplexConsensusCaller {
         let cell_barcode: Option<String> = cell_tag.and_then(|tag| {
             let tag_bytes: [u8; 2] = <[u8; 2]>::from(tag);
             a_records.first().or_else(|| b_records.first()).and_then(|r| {
-                bam_fields::find_string_tag_in_record(r, &tag_bytes)
+                RawRecordView::new(r)
+                    .tags()
+                    .find_string(&tag_bytes)
                     .map(|v| String::from_utf8_lossy(v).into_owned())
             })
         });
 
         // Split reads into R1/R2 groups for AB and BA strands (done once, reused below)
-        let ab_r1s: Vec<&Vec<u8>> =
-            a_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT != 0).collect();
-        let ab_r2s: Vec<&Vec<u8>> =
-            a_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT == 0).collect();
-        let ba_r1s: Vec<&Vec<u8>> =
-            b_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT != 0).collect();
-        let ba_r2s: Vec<&Vec<u8>> =
-            b_records.iter().filter(|r| bam_fields::flags(r) & flags::FIRST_SEGMENT == 0).collect();
+        let ab_r1s: Vec<&Vec<u8>> = a_records
+            .iter()
+            .filter(|r| RawRecordView::new(r).flags() & flags::FIRST_SEGMENT != 0)
+            .collect();
+        let ab_r2s: Vec<&Vec<u8>> = a_records
+            .iter()
+            .filter(|r| RawRecordView::new(r).flags() & flags::FIRST_SEGMENT == 0)
+            .collect();
+        let ba_r1s: Vec<&Vec<u8>> = b_records
+            .iter()
+            .filter(|r| RawRecordView::new(r).flags() & flags::FIRST_SEGMENT != 0)
+            .collect();
+        let ba_r2s: Vec<&Vec<u8>> = b_records
+            .iter()
+            .filter(|r| RawRecordView::new(r).flags() & flags::FIRST_SEGMENT == 0)
+            .collect();
 
         // Validate strand orientations before processing
         // The expected orientations are:

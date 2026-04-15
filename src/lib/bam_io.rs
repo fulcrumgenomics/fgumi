@@ -517,9 +517,10 @@ impl IndexingBamWriter {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn extract_alignment_context(bam: &[u8]) -> Option<(usize, Position, Position, bool)> {
         // Extract fields from BAM record
-        let tid = fgumi_raw_bam::ref_id(bam);
-        let pos = fgumi_raw_bam::pos(bam);
-        let flags = fgumi_raw_bam::flags(bam);
+        let v = fgumi_raw_bam::RawRecordView::new(bam);
+        let tid = v.ref_id();
+        let pos = v.pos();
+        let flags = v.flags();
 
         let is_unmapped = (flags & fgumi_raw_bam::flags::UNMAPPED) != 0;
 

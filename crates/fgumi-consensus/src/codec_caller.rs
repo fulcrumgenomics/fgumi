@@ -84,7 +84,7 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{self as bam_fields, UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedBamRecordBuilder, flags};
 use noodles::sam::alignment::record::data::field::Tag;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -416,9 +416,9 @@ impl CodecConsensusCaller {
         clip_from_start: bool,
         clipped_cigar: Option<&[u32]>,
     ) -> SourceRead {
-        let mut bases = bam_fields::extract_sequence(raw);
-        let mut quals = bam_fields::quality_scores_slice(raw).to_vec();
-        let flg = bam_fields::flags(raw);
+        let mut bases = RawRecordView::new(raw).sequence_vec();
+        let mut quals = RawRecordView::new(raw).quality_scores().to_vec();
+        let flg = RawRecordView::new(raw).flags();
 
         // Apply clipping: truncate bases and quals
         // Clamp clip_amount to avoid panic on malformed input (e.g., CIGAR/MC mismatch)
@@ -451,8 +451,8 @@ impl CodecConsensusCaller {
             quals.reverse();
         }
 
-        let rid = bam_fields::ref_id(raw);
-        let astart = i64::from(bam_fields::pos(raw));
+        let rid = RawRecordView::new(raw).ref_id();
+        let astart = i64::from(RawRecordView::new(raw).pos());
         let original_cigar = {
             let ops = bam_fields::get_cigar_ops(raw);
             bam_fields::simplify_cigar_from_raw(&ops)
@@ -533,14 +533,16 @@ impl CodecConsensusCaller {
         }
 
         // Extract MI tag from first record for naming
-        let umi: Option<String> = bam_fields::find_string_tag_in_record(&records[0], b"MI")
+        let umi: Option<String> = RawRecordView::new(&records[0])
+            .tags()
+            .find_string(b"MI")
             .map(|b| String::from_utf8_lossy(b).to_string());
 
         // Phase 1: Filter on raw bytes — keep paired, primary, mapped, FR-pair reads
         let mut paired_indices: Vec<usize> = Vec::new();
         let mut frag_count = 0usize;
         for (i, raw) in records.iter().enumerate() {
-            let flg = bam_fields::flags(raw);
+            let flg = RawRecordView::new(raw).flags();
             if flg & flags::PAIRED == 0 {
                 frag_count += 1;
                 continue;
@@ -567,7 +569,7 @@ impl CodecConsensusCaller {
         let mut by_name: HashMap<&[u8], Vec<usize>> = HashMap::new();
         let mut name_order: Vec<&[u8]> = Vec::new();
         for &idx in &paired_indices {
-            let name = bam_fields::read_name(&records[idx]);
+            let name = RawRecordView::new(&records[idx]).read_name();
             if !by_name.contains_key(name) {
                 name_order.push(name);
             }
@@ -584,7 +586,7 @@ impl CodecConsensusCaller {
             }
 
             let (i1, i2) = {
-                let flg0 = bam_fields::flags(&records[indices[0]]);
+                let flg0 = RawRecordView::new(&records[indices[0]]).flags();
                 if flg0 & flags::FIRST_SEGMENT != 0 {
                     (indices[0], indices[1])
                 } else {
@@ -810,7 +812,7 @@ impl CodecConsensusCaller {
 
     /// Build `ClippedRecordInfo` for a single raw record.
     fn build_clipped_info(raw: &[u8], raw_idx: usize, clip_amount: usize) -> ClippedRecordInfo {
-        let flg = bam_fields::flags(raw);
+        let flg = RawRecordView::new(raw).flags();
         let is_reverse = flg & flags::REVERSE != 0;
         let clip_from_start = is_reverse; // negative strand ⟹ clip from start
 
@@ -818,11 +820,11 @@ impl CodecConsensusCaller {
         let (clipped_cigar, ref_bases_consumed) =
             bam_fields::clip_cigar_ops_raw(&original_ops, clip_amount, clip_from_start);
 
-        let original_seq_len = bam_fields::l_seq(raw) as usize;
+        let original_seq_len = RawRecordView::new(raw).l_seq() as usize;
         let clipped_seq_len = original_seq_len.saturating_sub(clip_amount);
 
         // 1-based alignment start, adjusted for start-clipping
-        let pos_0based = bam_fields::pos(raw);
+        let pos_0based = RawRecordView::new(raw).pos();
         debug_assert!(
             pos_0based >= 0,
             "build_clipped_info called on unmapped record (pos={pos_0based})"
@@ -1324,7 +1326,7 @@ impl CodecConsensusCaller {
         if let Some(cell_tag) = &self.options.cell_tag {
             let cell_tag_bytes: [u8; 2] = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
             for raw in source_raws {
-                if let Some(cell_bc) = bam_fields::find_string_tag_in_record(raw, &cell_tag_bytes) {
+                if let Some(cell_bc) = RawRecordView::new(raw).tags().find_string(&cell_tag_bytes) {
                     if !cell_bc.is_empty() {
                         self.bam_builder.append_string_tag(&cell_tag_bytes, cell_bc);
                         break;
@@ -1340,7 +1342,9 @@ impl CodecConsensusCaller {
         let umis: Vec<String> = all_records
             .iter()
             .filter_map(|raw| {
-                bam_fields::find_string_tag_in_record(raw, b"RX")
+                RawRecordView::new(raw)
+                    .tags()
+                    .find_string(b"RX")
                     .and_then(|b| String::from_utf8(b.to_vec()).ok())
             })
             .collect();
@@ -1510,7 +1514,7 @@ impl CodecConsensusCaller {
     ) -> Option<usize> {
         let raw = Self::record_buf_to_raw(rec);
         let cigar_ops = bam_fields::get_cigar_ops(&raw);
-        let alignment_start = (bam_fields::pos(&raw) + 1) as usize; // 1-based
+        let alignment_start = (RawRecordView::new(&raw).pos() + 1) as usize; // 1-based
         bam_fields::read_pos_at_ref_pos_raw(
             &cigar_ops,
             alignment_start,

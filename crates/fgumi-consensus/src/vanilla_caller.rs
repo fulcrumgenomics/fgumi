@@ -13,7 +13,7 @@ use crate::phred::{
 use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{RawRecordView, UnmappedBamRecordBuilder, flags};
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 #[cfg(test)]
@@ -707,7 +707,7 @@ impl VanillaUmiConsensusCaller {
         let ref_positions = methylation::query_to_ref_positions(
             &anchor.simplified_cigar,
             anchor.alignment_start,
-            anchor.flags & fgumi_raw_bam::flags::REVERSE != 0,
+            anchor.flags & flags::REVERSE != 0,
             &anchor.original_cigar,
         );
 
@@ -741,10 +741,8 @@ impl VanillaUmiConsensusCaller {
 
     /// Filters reads to remove secondary/supplementary alignments.
     fn filter_reads(&mut self, reads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        use fgumi_raw_bam as bam_fields;
-
         let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|raw| {
-            let flg = bam_fields::flags(raw);
+            let flg = RawRecordView::new(raw).flags();
             flg & flags::SECONDARY == 0 && flg & flags::SUPPLEMENTARY == 0
         });
 
@@ -867,13 +865,13 @@ impl VanillaUmiConsensusCaller {
     ) -> Option<SourceRead> {
         use fgumi_raw_bam as bam_fields;
 
-        let flg = bam_fields::flags(raw);
+        let flg = RawRecordView::new(raw).flags();
         let is_negative_strand = flg & flags::REVERSE != 0;
         let min_bq = self.options.min_input_base_quality;
 
         // Get bases and quals from raw bytes
-        let mut bases = bam_fields::extract_sequence(raw);
-        let mut quals = bam_fields::quality_scores_slice(raw).to_vec();
+        let mut bases = RawRecordView::new(raw).sequence_vec();
+        let mut quals = RawRecordView::new(raw).quality_scores().to_vec();
         let read_len = bases.len();
 
         if quals.is_empty() || quals.len() != read_len {
@@ -930,8 +928,8 @@ impl VanillaUmiConsensusCaller {
 
         simplified_cigar = Self::truncate_simplified_cigar(&simplified_cigar, final_len);
 
-        let rid = bam_fields::ref_id(raw);
-        let astart = i64::from(bam_fields::pos(raw));
+        let rid = RawRecordView::new(raw).ref_id();
+        let astart = i64::from(RawRecordView::new(raw).pos());
 
         Some(SourceRead {
             original_idx,
@@ -1012,14 +1010,12 @@ impl VanillaUmiConsensusCaller {
         reason = "method signature kept for consistency with other caller trait methods"
     )]
     fn subgroup_reads(&self, reads: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        use fgumi_raw_bam as bam_fields;
-
         let mut fragment_reads = Vec::new();
         let mut r1_reads = Vec::new();
         let mut r2_reads = Vec::new();
 
         for raw in reads {
-            let flg = bam_fields::flags(&raw);
+            let flg = RawRecordView::new(&raw).flags();
             if flg & flags::PAIRED == 0 {
                 fragment_reads.push(raw);
             } else if flg & flags::FIRST_SEGMENT != 0 {
@@ -1366,8 +1362,6 @@ impl VanillaUmiConsensusCaller {
         errors: &[u16],
         methylation: Option<&crate::methylation::MethylationAnnotation>,
     ) {
-        use fgumi_raw_bam as bam_fields;
-
         let read_name = format!("{}:{}", self.read_name_prefix, umi);
 
         let mut flag = flags::UNMAPPED;
@@ -1415,7 +1409,7 @@ impl VanillaUmiConsensusCaller {
         if let Some(cell_tag) = self.options.cell_tag {
             if let Some(first_raw) = original_raws.first() {
                 let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
-                if let Some(value) = bam_fields::find_string_tag_in_record(first_raw, &tag_bytes) {
+                if let Some(value) = RawRecordView::new(first_raw).tags().find_string(&tag_bytes) {
                     self.bam_builder.append_string_tag(&tag_bytes, value);
                 }
             }
@@ -1425,7 +1419,9 @@ impl VanillaUmiConsensusCaller {
         let umis: Vec<String> = original_raws
             .iter()
             .filter_map(|raw| {
-                bam_fields::find_string_tag_in_record(raw, b"RX")
+                RawRecordView::new(raw)
+                    .tags()
+                    .find_string(b"RX")
                     .map(|v| String::from_utf8_lossy(v).into_owned())
             })
             .collect();
@@ -1438,9 +1434,9 @@ impl VanillaUmiConsensusCaller {
         // Methylation tags (EM-Seq/TAPs)
         if let Some(annot) = methylation {
             // Determine strand for MM tag format
-            let is_top = original_raws
-                .first()
-                .is_none_or(|raw| crate::methylation::is_top_strand(fgumi_raw_bam::flags(raw)));
+            let is_top = original_raws.first().is_none_or(|raw| {
+                crate::methylation::is_top_strand(RawRecordView::new(raw).flags())
+            });
 
             if let Some((mm, ml)) = crate::methylation::build_mm_ml_tags(
                 bases,
@@ -1467,8 +1463,6 @@ impl VanillaUmiConsensusCaller {
 
 impl ConsensusCaller for VanillaUmiConsensusCaller {
     fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
-        use fgumi_raw_bam as bam_fields;
-
         if records.is_empty() {
             return Ok(ConsensusOutput::default());
         }
@@ -1481,11 +1475,11 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         let tag_key = [tag_bytes[0], tag_bytes[1]];
 
         let first_raw = records.first().expect("records is non-empty (checked above)");
-        let read_name_bytes = bam_fields::read_name(first_raw);
+        let read_name_bytes = RawRecordView::new(first_raw).read_name();
         let read_name = String::from_utf8_lossy(read_name_bytes);
 
         let tag_value =
-            bam_fields::find_string_tag_in_record(first_raw, &tag_key).ok_or_else(|| {
+            RawRecordView::new(first_raw).tags().find_string(&tag_key).ok_or_else(|| {
                 anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name)
             })?;
 
@@ -1802,8 +1796,6 @@ mod tests {
 
     #[test]
     fn test_deterministic_downsampling() {
-        use fgumi_raw_bam as bam_fields;
-
         // Test that downsampling with a seed produces deterministic results
         let seed = 42u64;
         let options = VanillaUmiConsensusOptions {
@@ -1841,8 +1833,8 @@ mod tests {
         // Both should select the same reads in the same order
         for i in 0..3 {
             assert_eq!(
-                bam_fields::read_name(&downsampled1[i]),
-                bam_fields::read_name(&downsampled2[i])
+                RawRecordView::new(&downsampled1[i]).read_name(),
+                RawRecordView::new(&downsampled2[i]).read_name()
             );
         }
     }

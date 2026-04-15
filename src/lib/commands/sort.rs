@@ -346,7 +346,9 @@ fn verify_sort_order<K>(
             if is_violation(&key, prev) {
                 violations += 1;
                 if first_violation.is_none() {
-                    let name = String::from_utf8_lossy(fgumi_raw_bam::read_name(bam)).to_string();
+                    let name =
+                        String::from_utf8_lossy(fgumi_raw_bam::RawRecordView::new(bam).read_name())
+                            .to_string();
                     first_violation = Some((total_records, name));
                 }
             }
@@ -993,7 +995,7 @@ mod tests {
 
         let (total, violations, first_violation) = verify_sort_order(
             reader,
-            |bam| fgumi_raw_bam::read_name(bam).to_vec(),
+            |bam| fgumi_raw_bam::RawRecordView::new(bam).read_name().to_vec(),
             |key, prev| key < prev,
         )?;
 
@@ -1024,7 +1026,7 @@ mod tests {
 
         let (total, violations, first_violation) = verify_sort_order(
             reader,
-            |bam| fgumi_raw_bam::read_name(bam).to_vec(),
+            |bam| fgumi_raw_bam::RawRecordView::new(bam).read_name().to_vec(),
             |key, prev| key < prev,
         )?;
 
@@ -1055,7 +1057,7 @@ mod tests {
 
         let (total, violations, first_violation) = verify_sort_order(
             reader,
-            |bam| fgumi_raw_bam::read_name(bam).to_vec(),
+            |bam| fgumi_raw_bam::RawRecordView::new(bam).read_name().to_vec(),
             |key, prev| key < prev,
         )?;
 
