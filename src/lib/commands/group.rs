@@ -1117,9 +1117,11 @@ impl Command for GroupReadsByUmi {
         #[cfg(feature = "memory-debug")]
         let short_circuit_compress = short_circuit == "compress";
 
-        // Counter for contiguous MI assignment (incremented in the serial serialize step).
-        // AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering is fine because
-        // the serialize step is serial and ordered.
+        // Counter for contiguous MI assignment. The serialize step is parallel, so each
+        // thread reserves its own block via fetch_add of the per-group
+        // `distinct_mi_count`. AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering
+        // is fine because the counter is never read out-of-band (only the values produced
+        // by fetch_add are used, and each serialize thread uses only its own reservation).
         let next_mi_base = std::sync::atomic::AtomicU64::new(0);
 
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
@@ -1145,6 +1147,7 @@ impl Command for GroupReadsByUmi {
                         family_sizes: AHashMap::new(),
                         filter_metrics: FilterMetrics::new(),
                         input_record_count,
+                        distinct_mi_count: 0,
                     });
                 }
                 let mut filter_metrics = FilterMetrics::new();
@@ -1229,6 +1232,7 @@ impl Command for GroupReadsByUmi {
                         family_sizes: AHashMap::new(),
                         filter_metrics,
                         input_record_count,
+                        distinct_mi_count: 0,
                     });
                 }
 
@@ -1276,8 +1280,21 @@ impl Command for GroupReadsByUmi {
                         family_sizes: AHashMap::new(),
                         filter_metrics,
                         input_record_count,
+                        distinct_mi_count: 0,
                     });
                 }
+
+                // Compute the number of distinct numeric molecule IDs assigned in this group.
+                // Assigners hand out numeric IDs 0, 1, 2, ... contiguously, so `max(id) + 1`
+                // equals the count of distinct IDs used. This can be less than
+                // `templates.len()` when multiple templates share a UMI family (and hence a
+                // MoleculeId) or when paired A/B variants share the same numeric id.
+                let distinct_mi_count: u64 = templates
+                    .iter()
+                    .filter_map(|t| t.mi.id())
+                    .max()
+                    .map(|max_id| max_id + 1)
+                    .unwrap_or(0);
 
                 // Sort templates directly by (MI index, name) - avoids Vec<Vec<Template>> allocation
                 templates.sort_by(|a, b| {
@@ -1327,6 +1344,7 @@ impl Command for GroupReadsByUmi {
                     family_sizes,
                     filter_metrics,
                     input_record_count,
+                    distinct_mi_count,
                 })
             },
             // serialize_fn: Serialize records + collect metrics (serial, ordered)
@@ -1360,9 +1378,14 @@ impl Command for GroupReadsByUmi {
                 // Save input record count for progress tracking
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from serial counter (template count, not record count)
+                // Assign contiguous base_mi from the global counter. Advance by the
+                // number of distinct numeric MoleculeId IDs actually assigned in this
+                // group (not the template count), because multiple templates can share
+                // the same MoleculeId and because PairedA/PairedB share a numeric id.
+                // This ensures emitted MI integers are consecutive 0..N-1, matching
+                // fgbio's `GroupReadsByUmi` (see issue #269).
                 let base_mi = next_mi_base.fetch_add(
-                    processed.templates.len() as u64,
+                    processed.distinct_mi_count,
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1736,9 +1759,17 @@ impl GroupReadsByUmi {
             }
         }
 
-        // Write templates (already sorted by MI, then by name)
+        // Write templates (already sorted by MI, then by name).
+        //
+        // Advance the global MI counter by the number of distinct numeric MoleculeId
+        // IDs actually assigned in this group, not by the template count, so the
+        // emitted MI integers are consecutive 0..N-1 across all position groups
+        // (matching fgbio's `GroupReadsByUmi`; see issue #269). Assigners hand out
+        // numeric IDs 0, 1, 2, ... contiguously, so `max(id) + 1` equals the count.
+        let distinct_mi_count: u64 =
+            templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
         let base_mi = *next_mi_base;
-        *next_mi_base += templates.len() as u64;
+        *next_mi_base += distinct_mi_count;
         let assign_tag = Tag::from(assign_tag_bytes);
 
         for template in templates {
