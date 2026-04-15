@@ -38,6 +38,7 @@
 use crate::sam::{SamTag, record_utils, to_smallest_signed_int};
 use crate::unified_pipeline::MemoryEstimate;
 use anyhow::{Result, anyhow, bail};
+use fgumi_raw_bam::RawRecordView;
 use noodles::sam::alignment::record::Cigar;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -600,7 +601,7 @@ impl Template {
 
     /// Build a Template from raw BAM byte records, categorizing by flags.
     ///
-    /// The records are categorized using `bam_fields::flags()` to determine
+    /// The records are categorized using `RawRecordView::flags()` to determine
     /// R1/R2/supplementary/secondary status, with the same index-pair scheme
     /// as `Builder::build()`.
     ///
@@ -638,8 +639,8 @@ impl Template {
 
         // Fast path for common 2-record paired-end case (no supplementals/secondaries)
         if raw_records.len() == 2 {
-            let f0 = bam_fields::flags(&raw_records[0]);
-            let f1 = bam_fields::flags(&raw_records[1]);
+            let f0 = RawRecordView::new(&raw_records[0]).flags();
+            let f1 = RawRecordView::new(&raw_records[1]).flags();
             let neither_sec_supp =
                 (f0 | f1) & (bam_fields::flags::SECONDARY | bam_fields::flags::SUPPLEMENTARY) == 0;
             if neither_sec_supp {
@@ -687,7 +688,7 @@ impl Template {
         let mut r2_sec: Vec<usize> = Vec::new();
 
         for (i, rec) in raw_records.iter().enumerate() {
-            let flg = bam_fields::flags(rec);
+            let flg = RawRecordView::new(rec).flags();
             let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
             let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
             let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
@@ -1041,8 +1042,10 @@ impl Template {
 
         // Fix mate info for primary R1/R2 pair
         if let (Some((r1_i, _)), Some((r2_i, _))) = (self.r1, self.r2) {
-            let r1_is_unmapped = (bam_fields::flags(&rr[r1_i]) & bam_fields::flags::UNMAPPED) != 0;
-            let r2_is_unmapped = (bam_fields::flags(&rr[r2_i]) & bam_fields::flags::UNMAPPED) != 0;
+            let r1_is_unmapped =
+                (RawRecordView::new(&rr[r1_i]).flags() & bam_fields::flags::UNMAPPED) != 0;
+            let r2_is_unmapped =
+                (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::UNMAPPED) != 0;
 
             // Get alignment scores for mate score tags
             let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), b"AS");
@@ -1080,7 +1083,7 @@ impl Template {
             let rr = self.raw_records.as_ref().unwrap();
             let r2_ref_id = bam_fields::ref_id(&rr[r2_i]);
             let r2_pos = bam_fields::pos(&rr[r2_i]);
-            let r2_flags = bam_fields::flags(&rr[r2_i]);
+            let r2_flags = RawRecordView::new(&rr[r2_i]).flags();
             let r2_is_reverse = (r2_flags & bam_fields::flags::REVERSE) != 0;
             let r2_is_unmapped = (r2_flags & bam_fields::flags::UNMAPPED) != 0;
             let r2_tlen = bam_fields::template_length(&rr[r2_i]);
@@ -1120,7 +1123,7 @@ impl Template {
             let rr = self.raw_records.as_ref().unwrap();
             let r1_ref_id = bam_fields::ref_id(&rr[r1_i]);
             let r1_pos = bam_fields::pos(&rr[r1_i]);
-            let r1_flags = bam_fields::flags(&rr[r1_i]);
+            let r1_flags = RawRecordView::new(&rr[r1_i]).flags();
             let r1_is_reverse = (r1_flags & bam_fields::flags::REVERSE) != 0;
             let r1_is_unmapped = (r1_flags & bam_fields::flags::UNMAPPED) != 0;
             let r1_tlen = bam_fields::template_length(&rr[r1_i]);
@@ -1167,14 +1170,16 @@ impl Template {
         // Get R2's info for R1
         let r2_ref_id = bam_fields::ref_id(&rr[r2_i]);
         let r2_pos = bam_fields::pos(&rr[r2_i]);
-        let r2_is_reverse = (bam_fields::flags(&rr[r2_i]) & bam_fields::flags::REVERSE) != 0;
+        let r2_is_reverse =
+            (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::REVERSE) != 0;
         let r2_mapq = bam_fields::mapq(&rr[r2_i]);
         let r2_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r2_i]);
 
         // Get R1's info for R2
         let r1_ref_id = bam_fields::ref_id(&rr[r1_i]);
         let r1_pos = bam_fields::pos(&rr[r1_i]);
-        let r1_is_reverse = (bam_fields::flags(&rr[r1_i]) & bam_fields::flags::REVERSE) != 0;
+        let r1_is_reverse =
+            (RawRecordView::new(&rr[r1_i]).flags() & bam_fields::flags::REVERSE) != 0;
         let r1_mapq = bam_fields::mapq(&rr[r1_i]);
         let r1_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r1_i]);
 
@@ -1217,8 +1222,10 @@ impl Template {
         use crate::sort::bam_fields;
 
         let rr = self.raw_records.as_ref().unwrap();
-        let r1_is_reverse = (bam_fields::flags(&rr[r1_i]) & bam_fields::flags::REVERSE) != 0;
-        let r2_is_reverse = (bam_fields::flags(&rr[r2_i]) & bam_fields::flags::REVERSE) != 0;
+        let r1_is_reverse =
+            (RawRecordView::new(&rr[r1_i]).flags() & bam_fields::flags::REVERSE) != 0;
+        let r2_is_reverse =
+            (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::REVERSE) != 0;
 
         let rr = self.raw_records.as_mut().unwrap();
 
@@ -1252,13 +1259,13 @@ impl Template {
         let rr = self.raw_records.as_ref().unwrap();
         let mapped_ref_id = bam_fields::ref_id(&rr[mapped_i]);
         let mapped_pos = bam_fields::pos(&rr[mapped_i]);
-        let mapped_flags = bam_fields::flags(&rr[mapped_i]);
+        let mapped_flags = RawRecordView::new(&rr[mapped_i]).flags();
         let mapped_is_reverse = (mapped_flags & bam_fields::flags::REVERSE) != 0;
         let mapped_mapq = bam_fields::mapq(&rr[mapped_i]);
         let mapped_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[mapped_i]);
 
         let unmapped_is_reverse =
-            (bam_fields::flags(&rr[unmapped_i]) & bam_fields::flags::REVERSE) != 0;
+            (RawRecordView::new(&rr[unmapped_i]).flags() & bam_fields::flags::REVERSE) != 0;
 
         let rr = self.raw_records.as_mut().unwrap();
 
@@ -1489,7 +1496,7 @@ fn alignment_length(cigar: &noodles::sam::alignment::record_buf::Cigar) -> i32 {
 /// Sets mate flags (`MATE_REVERSE`, `MATE_UNMAPPED`) on a raw BAM record.
 fn set_mate_flags_raw(record: &mut [u8], mate_is_reverse: bool, mate_is_unmapped: bool) {
     use crate::sort::bam_fields;
-    let mut f = bam_fields::flags(record);
+    let mut f = RawRecordView::new(record).flags();
     f &= !bam_fields::flags::MATE_REVERSE;
     if mate_is_reverse {
         f |= bam_fields::flags::MATE_REVERSE;
@@ -1508,8 +1515,8 @@ fn set_mate_flags_raw(record: &mut [u8], mate_is_reverse: bool, mate_is_unmapped
 fn compute_insert_size_raw(rec1: &[u8], rec2: &[u8]) -> i32 {
     use crate::sort::bam_fields;
 
-    let f1 = bam_fields::flags(rec1);
-    let f2 = bam_fields::flags(rec2);
+    let f1 = RawRecordView::new(rec1).flags();
+    let f2 = RawRecordView::new(rec2).flags();
 
     // If either read is unmapped, return 0
     if (f1 & bam_fields::flags::UNMAPPED) != 0 || (f2 & bam_fields::flags::UNMAPPED) != 0 {
@@ -4104,7 +4111,7 @@ mod tests {
         assert!(template.raw_r2().is_some());
         // Verify R1 is at index 0 (has FIRST_SEGMENT flag)
         let raw_r1 = template.raw_r1().expect("raw_r1 should be present");
-        let r1_flags = crate::sort::bam_fields::flags(raw_r1);
+        let r1_flags = RawRecordView::new(raw_r1).flags();
         assert_ne!(r1_flags & FLAG_READ1, 0);
     }
 
@@ -4118,10 +4125,10 @@ mod tests {
         assert!(template.is_raw_byte_mode());
         // After swap, R1 should be at index 0
         let raw_r1 = template.raw_r1().expect("raw_r1 should be present");
-        let r1_flags = crate::sort::bam_fields::flags(raw_r1);
+        let r1_flags = RawRecordView::new(raw_r1).flags();
         assert_ne!(r1_flags & FLAG_READ1, 0);
         let raw_r2 = template.raw_r2().expect("raw_r2 should be present");
-        let r2_flags = crate::sort::bam_fields::flags(raw_r2);
+        let r2_flags = RawRecordView::new(raw_r2).flags();
         assert_ne!(r2_flags & FLAG_READ2, 0);
     }
 

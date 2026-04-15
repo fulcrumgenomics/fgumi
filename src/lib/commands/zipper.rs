@@ -65,6 +65,7 @@ use crate::vendored::encode_record_buf;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use clap::Parser;
+use fgumi_raw_bam::RawRecordView;
 use log::{debug, info, warn};
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -676,7 +677,7 @@ fn add_primary_alignment_tags_raw(mapped: &mut Template) {
 
     // Fast path: check if there are any secondary/supplementary reads
     let has_sec_supp = rr.iter().any(|r| {
-        let f = bam_fields::flags(r);
+        let f = RawRecordView::new(r).flags();
         (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0
     });
     if !has_sec_supp {
@@ -686,7 +687,7 @@ fn add_primary_alignment_tags_raw(mapped: &mut Template) {
     // Get R1 primary info
     let r1_info: Option<(i32, i32, bool)> = mapped.r1.and_then(|(i, _)| {
         let r = &rr[i];
-        let f = bam_fields::flags(r);
+        let f = RawRecordView::new(r).flags();
         if (f & bam_fields::flags::UNMAPPED) != 0 {
             return None;
         }
@@ -699,7 +700,7 @@ fn add_primary_alignment_tags_raw(mapped: &mut Template) {
     // Get R2 primary info
     let r2_info: Option<(i32, i32, bool)> = mapped.r2.and_then(|(i, _)| {
         let r = &rr[i];
-        let f = bam_fields::flags(r);
+        let f = RawRecordView::new(r).flags();
         if (f & bam_fields::flags::UNMAPPED) != 0 {
             return None;
         }
@@ -739,7 +740,7 @@ fn add_primary_alignment_tags_raw(mapped: &mut Template) {
 
     let rr = mapped.raw_records.as_mut().unwrap();
     for record in rr.iter_mut() {
-        let f = bam_fields::flags(record);
+        let f = RawRecordView::new(record.as_slice()).flags();
         if (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0 {
             bam_fields::remove_tag(record, pa_tag);
             bam_fields::append_i32_array_tag(record, pa_tag, &pa_values);
@@ -851,7 +852,7 @@ pub fn merge_raw(
             let mut pos = false;
             let mut neg = false;
             for &i in &mapped_indices {
-                if (bam_fields::flags(&rr[i]) & bam_fields::flags::REVERSE) == 0 {
+                if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) == 0 {
                     pos = true;
                 } else {
                     neg = true;
@@ -867,7 +868,7 @@ pub fn merge_raw(
         if has_pos {
             let rr = mapped.raw_records.as_mut().unwrap();
             for &i in &mapped_indices {
-                if (bam_fields::flags(&rr[i]) & bam_fields::flags::REVERSE) != 0 {
+                if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) != 0 {
                     continue;
                 }
                 let aux = bam_fields::aux_data_slice(&rr[i]);
@@ -893,7 +894,7 @@ pub fn merge_raw(
         if has_neg {
             let rr = mapped.raw_records.as_mut().unwrap();
             for &i in &mapped_indices {
-                if (bam_fields::flags(&rr[i]) & bam_fields::flags::REVERSE) == 0 {
+                if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) == 0 {
                     continue;
                 }
                 let aux = bam_fields::aux_data_slice(&rr[i]);
@@ -930,7 +931,7 @@ pub fn merge_raw(
         let is_qc_fail = u.flags().is_qc_fail();
         let rr = mapped.raw_records.as_mut().unwrap();
         for &i in &mapped_indices {
-            let mut f = bam_fields::flags(&rr[i]);
+            let mut f = RawRecordView::new(&rr[i]).flags();
             if is_qc_fail {
                 f |= bam_fields::flags::QC_FAIL;
             } else {

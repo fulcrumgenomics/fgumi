@@ -29,6 +29,7 @@ use std::cmp::Ordering;
 
 use crate::sam::SamTag;
 use crate::sort::bam_fields;
+use fgumi_raw_bam::RawRecordView;
 use std::io::{Read, Write};
 
 /// The PA (Primary Alignment) tag for secondary/supplementary reads.
@@ -517,7 +518,7 @@ impl RawSortKey for RawCoordinateKey {
     fn extract(bam: &[u8], ctx: &SortContext) -> Self {
         let tid = bam_fields::ref_id(bam);
         let pos = bam_fields::pos(bam);
-        let reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
+        let reverse = RawRecordView::new(bam).flags() & bam_fields::flags::REVERSE != 0;
 
         // Create key based on tid (samtools behavior):
         // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set
@@ -532,7 +533,7 @@ impl RawSortKey for RawCoordinateKey {
             return Self::unmapped();
         }
         let pos = bam_fields::pos(bam);
-        let reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
+        let reverse = RawRecordView::new(bam).flags() & bam_fields::flags::REVERSE != 0;
         // During merge we don't have nref, but for mapped records (tid >= 0)
         // nref is only used for unmapped handling, so any value > tid works.
         // Use tid+1 as a safe nref since tid is non-negative.

@@ -59,6 +59,7 @@ use crate::commands::common::{
 };
 use crate::sort::PA_TAG;
 use crate::sort::bam_fields;
+use fgumi_raw_bam::RawRecordView;
 
 /// Duplicate flag bit in SAM flags (0x400)
 const DUPLICATE_FLAG: u16 = 0x400;
@@ -301,8 +302,9 @@ fn filter_template_raw(
     }
 
     let both_unmapped = raw_r1
-        .is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0)
-        && raw_r2.is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0);
+        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0)
+        && raw_r2
+            .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0);
     if both_unmapped {
         metrics.discarded_poor_alignment += 1;
         return false;
@@ -310,7 +312,7 @@ fn filter_template_raw(
 
     // Phase 1: Flag-based checks
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
+        let flg = RawRecordView::new(raw).flags();
 
         if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
             metrics.discarded_non_pf += 1;
@@ -328,7 +330,7 @@ fn filter_template_raw(
 
     // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
+        let flg = RawRecordView::new(raw).flags();
         let aux = bam_fields::aux_data_slice(raw);
         let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
         let check_umi = !config.no_umi;
@@ -579,12 +581,14 @@ fn get_pair_orientation(template: &Template) -> (bool, bool) {
     (r1_positive, r2_positive)
 }
 
-/// Raw-byte pair orientation using `bam_fields::flags()`.
+/// Raw-byte pair orientation using `RawRecordView::flags()`.
 fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
-    let r1_positive =
-        template.raw_r1().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
-    let r2_positive =
-        template.raw_r2().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
+    let r1_positive = template
+        .raw_r1()
+        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
+    let r2_positive = template
+        .raw_r2()
+        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
 
@@ -828,7 +832,7 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
 fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
     if let Some(raw_records) = template.all_raw_records_mut() {
         for raw in raw_records.iter_mut() {
-            let flg = bam_fields::flags(raw);
+            let flg = RawRecordView::new(raw.as_slice()).flags();
             bam_fields::set_flags(raw, flg | DUPLICATE_FLAG);
             dedup_metrics.duplicate_reads += 1;
         }
@@ -892,7 +896,7 @@ fn process_position_group(
         .map(|mut t| {
             if let Some(raw_records) = t.all_raw_records_mut() {
                 for raw in raw_records.iter_mut() {
-                    let flg = bam_fields::flags(raw);
+                    let flg = RawRecordView::new(raw.as_slice()).flags();
                     bam_fields::set_flags(raw, flg & !DUPLICATE_FLAG);
                 }
             } else {
@@ -959,7 +963,7 @@ fn process_position_group(
         if let Some(raw_records) = template.all_raw_records() {
             for raw in raw_records {
                 dedup_metrics.total_reads += 1;
-                let flg = bam_fields::flags(raw);
+                let flg = RawRecordView::new(raw.as_slice()).flags();
                 let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
                 let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
 
@@ -1306,7 +1310,7 @@ impl Command for MarkDuplicates {
                             for raw in raw_records {
                                 // Skip duplicates if remove mode
                                 if remove_duplicates
-                                    && (bam_fields::flags(raw) & DUPLICATE_FLAG) != 0
+                                    && (RawRecordView::new(raw).flags() & DUPLICATE_FLAG) != 0
                                 {
                                     continue;
                                 }
@@ -2857,21 +2861,22 @@ mod tests {
     #[test]
     fn test_set_duplicate_flag_on_raw_record() {
         use crate::sort::bam_fields;
+        use fgumi_raw_bam::RawRecordView;
 
         let raw =
             make_raw_bam_for_dedup(b"rea", bam_fields::flags::PAIRED, 30, 4, &[20; 4], b"ACGT");
         let mut rec = raw;
-        let orig_flags = bam_fields::flags(&rec);
+        let orig_flags = RawRecordView::new(&rec).flags();
         assert_eq!(orig_flags & bam_fields::flags::DUPLICATE, 0);
 
         // Set duplicate flag
         bam_fields::set_flags(&mut rec, orig_flags | bam_fields::flags::DUPLICATE);
-        assert_ne!(bam_fields::flags(&rec) & bam_fields::flags::DUPLICATE, 0);
+        assert_ne!(RawRecordView::new(&rec).flags() & bam_fields::flags::DUPLICATE, 0);
 
         // Clear duplicate flag
-        let flags_with_dup = bam_fields::flags(&rec);
+        let flags_with_dup = RawRecordView::new(&rec).flags();
         bam_fields::set_flags(&mut rec, flags_with_dup & !bam_fields::flags::DUPLICATE);
-        assert_eq!(bam_fields::flags(&rec) & bam_fields::flags::DUPLICATE, 0);
+        assert_eq!(RawRecordView::new(&rec).flags() & bam_fields::flags::DUPLICATE, 0);
     }
 
     #[test]

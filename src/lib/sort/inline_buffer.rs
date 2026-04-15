@@ -13,6 +13,7 @@ use crate::sort::bam_fields;
 use crate::sort::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::sort::radix::bytes_needed_u64;
 use crate::sort::segmented_buf::SegmentedBuf;
+use fgumi_raw_bam::RawRecordView;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 
@@ -414,7 +415,7 @@ impl ProbeableBuffer for RecordBuffer {
 pub fn extract_coordinate_key_inline(bam: &[u8], nref: u32) -> u64 {
     let tid = bam_fields::ref_id(bam);
     let pos = bam_fields::pos(bam);
-    let reverse = (bam_fields::flags(bam) & bam_fields::flags::REVERSE) != 0;
+    let reverse = RawRecordView::new(bam).flags() & bam_fields::flags::REVERSE != 0;
 
     // Pack key based on tid (samtools behavior):
     // - tid >= 0: sort by (tid, pos, reverse) even if unmapped flag is set

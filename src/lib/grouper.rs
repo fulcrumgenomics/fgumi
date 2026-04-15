@@ -472,6 +472,7 @@ impl RecordPositionGrouper {
     fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
         use crate::sort::bam_fields;
         use crate::unified_pipeline::DecodedRecordData;
+        use fgumi_raw_bam::RawRecordView;
 
         if self.mc_validated {
             return Ok(());
@@ -479,7 +480,7 @@ impl RecordPositionGrouper {
 
         match &decoded.data {
             DecodedRecordData::Raw(raw) => {
-                let flg = bam_fields::flags(raw);
+                let flg = RawRecordView::new(raw).flags();
                 let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
                 let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
                 let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
