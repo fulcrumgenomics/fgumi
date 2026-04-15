@@ -8,6 +8,7 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::consensus_tags::per_base;
 use crate::sort::bam_fields;
+use fgumi_raw_bam::RawRecordView;
 
 /// Reverses per-base tags for a negative-strand read
 ///
@@ -78,7 +79,7 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
             bam_fields::MIN_BAM_RECORD_LEN
         );
     }
-    let flg = bam_fields::flags(record);
+    let flg = RawRecordView::new(record).flags();
     if (flg & bam_fields::flags::REVERSE) == 0 {
         return Ok(false);
     }

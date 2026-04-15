@@ -41,6 +41,7 @@ use super::deadlock::{
 use super::scheduler::{BackpressureState, SchedulerStrategy};
 use crate::read_info::{LibraryIndex, compute_group_key};
 use crate::sort::bam_fields;
+use fgumi_raw_bam::RawRecordView;
 
 /// Buffer size for buffered I/O (8 MB).
 /// This reduces syscalls by batching reads/writes into larger chunks.
@@ -439,7 +440,7 @@ fn compute_group_key_from_raw(
     };
 
     // Check secondary/supplementary
-    let flg = bam_fields::flags(raw);
+    let flg = RawRecordView::new(raw).flags();
     let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
     let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
     if is_secondary || is_supplementary {

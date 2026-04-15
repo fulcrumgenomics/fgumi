@@ -39,7 +39,7 @@ use crate::unified_pipeline::{
 };
 use crate::validation::validate_file_exists;
 use crossbeam_queue::SegQueue;
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -425,7 +425,7 @@ impl Command for Duplex {
                     Ok(0) => return None, // EOF
                     Ok(_) => {
                         let raw = record.into_inner();
-                        let flg = bam_fields::flags(&raw);
+                        let flg = RawRecordView::new(&raw).flags();
                         // Skip secondary and supplementary reads
                         if flg & bam_fields::flags::SECONDARY != 0
                             || flg & bam_fields::flags::SUPPLEMENTARY != 0
@@ -593,7 +593,7 @@ impl Duplex {
 
         // Record filter for duplex on raw bytes: skip secondary/supplementary, keep mapped or mate-mapped
         let record_filter = |raw: &[u8]| -> bool {
-            let flg = bam_fields::flags(raw);
+            let flg = RawRecordView::new(raw).flags();
             // Skip secondary and supplementary reads
             if flg & bam_fields::flags::SECONDARY != 0
                 || flg & bam_fields::flags::SUPPLEMENTARY != 0
