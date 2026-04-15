@@ -11,7 +11,7 @@ license.workspace = true
 ahash = "0.8"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"], optional = true }
-rayon = "1.10"
+rayon = "1.12"
 fgumi-dna = { workspace = true }
 
 [dev-dependencies]
