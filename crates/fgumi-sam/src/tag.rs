@@ -100,6 +100,8 @@ impl SamTag {
     pub const RG: SamTag = SamTag::new(b'R', b'G');
     /// Number of mismatches (edit distance) to the reference (SAM spec).
     pub const NM: SamTag = SamTag::new(b'N', b'M');
+    /// String encoding of the reference-relative alignment (SAM spec).
+    pub const MD: SamTag = SamTag::new(b'M', b'D');
     /// Mate's mapping quality (SAM spec).
     pub const MQ: SamTag = SamTag::new(b'M', b'Q');
     /// Mate's CIGAR string (SAM spec).
