@@ -127,7 +127,8 @@ fgumi group \
 ```
 
 `--async-reader` works with all input types: BAM files, BGZF/gzip/plain FASTQs,
-and piped stdin. It is most effective when I/O latency is high (network storage,
+and piped stdin. It is supported by all commands that read BAM/FASTQ input,
+including `sort`. It is most effective when I/O latency is high (network storage,
 cold page cache, small OS readahead). On systems where you can already set 4 MB+
 readahead, the additional benefit is modest.
 
@@ -353,6 +354,8 @@ Requested memory 16GB exceeds 90% of system memory (14.4GB)
 - `--max-memory` controls how much RAM is used for sort buffers; increase for large files to
   reduce the number of intermediate merge passes
 - For template-coordinate sort with single-cell data, the `CB` tag is included automatically
+- `--async-reader` is supported and can improve Phase 1 (input reading) throughput when disk
+  latency is high or the OS page cache readahead is small
 
 ### Merge
 - `fgumi merge` performs a k-way merge using a LoserTree for efficient multi-file merging

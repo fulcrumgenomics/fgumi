@@ -805,7 +805,14 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
 /// Create a raw BAM reader using the pool's Phase 1 integrated reading.
 ///
 /// Workers in the pool do `ReadInputBlocks` + `DecompressInput`. The main thread
-/// consumes decompressed bytes via `PooledInputStream`. No extra threads are spawned.
+/// consumes decompressed bytes via `PooledInputStream`.
+///
+/// When `async_reader` is false, no extra threads are spawned: the pool's block
+/// reader reads directly from the input file. When `async_reader` is true, the
+/// input file is wrapped in a `PrefetchReader`, which spawns one dedicated OS
+/// thread (`fgumi-prefetch`) that reads raw bytes ahead into a bounded queue so
+/// the pool's block reader never blocks on disk I/O. The prefetch thread lives
+/// for the duration of Phase 1 and is joined when the reader is dropped.
 ///
 /// # Flow
 ///
@@ -828,6 +835,7 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
 pub fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
     path: P,
     pool: &std::sync::Arc<crate::sort::worker_pool::SortWorkerPool>,
+    async_reader: bool,
 ) -> Result<(RawBamReader<crate::sort::read_ahead::PooledInputStream>, Header)> {
     use crate::sort::read_ahead::PooledInputStream;
     use crate::sort::worker_pool::phase;
@@ -869,7 +877,17 @@ pub fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
         file.seek(SeekFrom::Start(0))
             .with_context(|| format!("Failed to rewind input BAM: {}", path_ref.display()))?;
 
-        (header, Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file)))
+        let reader: Box<dyn io::Read + Send> = if async_reader {
+            crate::os_hints::advise_sequential(&file);
+            log::info!(
+                "async sort reader enabled: spawning fgumi-prefetch thread for {}",
+                path_ref.display()
+            );
+            Box::new(crate::prefetch_reader::PrefetchReader::from_file(file))
+        } else {
+            Box::new(io::BufReader::with_capacity(2 * 1024 * 1024, file))
+        };
+        (header, reader)
     };
 
     // Set the input file for pool workers and activate Phase 1

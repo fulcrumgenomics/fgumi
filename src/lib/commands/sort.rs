@@ -257,6 +257,14 @@ pub struct Sort {
     /// position tracking.
     #[arg(long = "write-index", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub write_index: bool,
+
+    /// Enable async userspace prefetch on the input BAM.
+    ///
+    /// Spawns a dedicated I/O thread that reads raw bytes into a bounded
+    /// queue ahead of the decompression step, so pool workers do not block
+    /// on disk. Prototype flag; defaults to off.
+    #[arg(long = "async-reader", default_value_t = false, hide = true)]
+    pub async_reader: bool,
 }
 
 /// Represents the memory limit configuration for sorting.
@@ -554,6 +562,7 @@ impl Sort {
             .output_compression(self.compression.compression_level)
             .temp_compression(self.temp_compression)
             .write_index(self.write_index)
+            .async_reader(self.async_reader)
             .pg_info(crate::version::VERSION.to_string(), command_line.to_string());
 
         // For auto mode, cap initial buffer pre-allocation at 768 MiB/thread
@@ -700,6 +709,7 @@ mod tests {
             compression: CompressionOptions::default(),
             temp_compression: 1,
             write_index: false,
+            async_reader: false,
         }
     }
 
