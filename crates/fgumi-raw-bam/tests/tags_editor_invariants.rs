@@ -221,3 +221,287 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Array update / element-write round-trip proptests (Issue #272 Easy gap ops)
+// =============================================================================
+
+/// Decode `count` little-endian `u8` elements from `data`.
+fn decode_u8_array(data: &[u8], count: usize) -> Vec<u8> {
+    (0..count).map(|i| data[i]).collect()
+}
+
+/// Decode `count` little-endian `u16` elements from `data`.
+fn decode_u16_array(data: &[u8], count: usize) -> Vec<u16> {
+    (0..count).map(|i| u16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect()
+}
+
+/// Decode `count` little-endian `i16` elements from `data`.
+fn decode_i16_array(data: &[u8], count: usize) -> Vec<i16> {
+    (0..count).map(|i| i16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect()
+}
+
+/// Decode `count` little-endian `i32` elements from `data`.
+fn decode_i32_array(data: &[u8], count: usize) -> Vec<i32> {
+    (0..count)
+        .map(|i| {
+            i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+        })
+        .collect()
+}
+
+/// Decode `count` little-endian `f32` elements from `data` as bit patterns.
+fn decode_f32_bits_array(data: &[u8], count: usize) -> Vec<u32> {
+    (0..count)
+        .map(|i| {
+            u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+        })
+        .collect()
+}
+
+proptest! {
+    // =========================================================================
+    // update_array_u8: whole-payload round-trip
+    // =========================================================================
+
+    #[test]
+    fn update_array_u8_roundtrip(values in proptest::collection::vec(any::<u8>(), 0..64)) {
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_u8(b"bq", &values);
+        }
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_u8");
+        prop_assert_eq!(arr.elem_type, b'C', "elem_type should be 'C' for u8");
+        prop_assert_eq!(arr.count, values.len());
+        let got = decode_u8_array(arr.data, arr.count);
+        prop_assert_eq!(got, values);
+    }
+
+    // =========================================================================
+    // update_array_u16: whole-payload round-trip
+    // =========================================================================
+
+    #[test]
+    fn update_array_u16_roundtrip(values in proptest::collection::vec(any::<u16>(), 0..64)) {
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_u16(b"bq", &values);
+        }
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_u16");
+        prop_assert_eq!(arr.elem_type, b'S', "elem_type should be 'S' for u16");
+        prop_assert_eq!(arr.count, values.len());
+        let got = decode_u16_array(arr.data, arr.count);
+        prop_assert_eq!(got, values);
+    }
+
+    // =========================================================================
+    // update_array_i16: whole-payload round-trip
+    // =========================================================================
+
+    #[test]
+    fn update_array_i16_roundtrip(values in proptest::collection::vec(any::<i16>(), 0..64)) {
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_i16(b"bq", &values);
+        }
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_i16");
+        prop_assert_eq!(arr.elem_type, b's', "elem_type should be 's' for i16");
+        prop_assert_eq!(arr.count, values.len());
+        let got = decode_i16_array(arr.data, arr.count);
+        prop_assert_eq!(got, values);
+    }
+
+    // =========================================================================
+    // update_array_i32: whole-payload round-trip
+    // =========================================================================
+
+    #[test]
+    fn update_array_i32_roundtrip(values in proptest::collection::vec(any::<i32>(), 0..64)) {
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_i32(b"bq", &values);
+        }
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_i32");
+        prop_assert_eq!(arr.elem_type, b'i', "elem_type should be 'i' for i32");
+        prop_assert_eq!(arr.count, values.len());
+        let got = decode_i32_array(arr.data, arr.count);
+        prop_assert_eq!(got, values);
+    }
+
+    // =========================================================================
+    // update_array_f32: whole-payload round-trip (bit equality — covers NaN)
+    // =========================================================================
+
+    #[test]
+    fn update_array_f32_roundtrip(values in proptest::collection::vec(any::<f32>(), 0..64)) {
+        let bits_in: Vec<u32> = values.iter().map(|f| f.to_bits()).collect();
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_f32(b"bq", &values);
+        }
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_f32");
+        prop_assert_eq!(arr.elem_type, b'f', "elem_type should be 'f' for f32");
+        prop_assert_eq!(arr.count, values.len());
+        let got = decode_f32_bits_array(arr.data, arr.count);
+        prop_assert_eq!(got, bits_in);
+    }
+
+    // =========================================================================
+    // set_array_element_u8: single-element overwrite, all others preserved
+    // =========================================================================
+
+    #[test]
+    fn set_array_element_u8_writes_one_element(
+        initial in proptest::collection::vec(any::<u8>(), 1..32),
+        index in 0usize..32,
+        new_val in any::<u8>(),
+    ) {
+        let index = index % initial.len();
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_u8(b"bq", &initial);
+        }
+        rec.tags_mut().set_array_element_u8(b"bq", index, new_val);
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_u8");
+        let got = decode_u8_array(arr.data, arr.count);
+        for (i, &v) in initial.iter().enumerate() {
+            if i == index {
+                prop_assert_eq!(got[i], new_val, "overwritten element mismatch at index {}", i);
+            } else {
+                prop_assert_eq!(got[i], v, "non-overwritten element changed at index {}", i);
+            }
+        }
+    }
+
+    // =========================================================================
+    // set_array_element_u16: single-element overwrite, all others preserved
+    // =========================================================================
+
+    #[test]
+    fn set_array_element_u16_writes_one_element(
+        initial in proptest::collection::vec(any::<u16>(), 1..32),
+        index in 0usize..32,
+        new_val in any::<u16>(),
+    ) {
+        let index = index % initial.len();
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_u16(b"bq", &initial);
+        }
+        rec.tags_mut().set_array_element_u16(b"bq", index, new_val);
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_u16");
+        let got = decode_u16_array(arr.data, arr.count);
+        for (i, &v) in initial.iter().enumerate() {
+            if i == index {
+                prop_assert_eq!(got[i], new_val, "overwritten element mismatch at index {}", i);
+            } else {
+                prop_assert_eq!(got[i], v, "non-overwritten element changed at index {}", i);
+            }
+        }
+    }
+
+    // =========================================================================
+    // set_array_element_i16: single-element overwrite, all others preserved
+    // =========================================================================
+
+    #[test]
+    fn set_array_element_i16_writes_one_element(
+        initial in proptest::collection::vec(any::<i16>(), 1..32),
+        index in 0usize..32,
+        new_val in any::<i16>(),
+    ) {
+        let index = index % initial.len();
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_i16(b"bq", &initial);
+        }
+        rec.tags_mut().set_array_element_i16(b"bq", index, new_val);
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_i16");
+        let got = decode_i16_array(arr.data, arr.count);
+        for (i, &v) in initial.iter().enumerate() {
+            if i == index {
+                prop_assert_eq!(got[i], new_val, "overwritten element mismatch at index {}", i);
+            } else {
+                prop_assert_eq!(got[i], v, "non-overwritten element changed at index {}", i);
+            }
+        }
+    }
+
+    // =========================================================================
+    // set_array_element_i32: single-element overwrite, all others preserved
+    // =========================================================================
+
+    #[test]
+    fn set_array_element_i32_writes_one_element(
+        initial in proptest::collection::vec(any::<i32>(), 1..32),
+        index in 0usize..32,
+        new_val in any::<i32>(),
+    ) {
+        let index = index % initial.len();
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_i32(b"bq", &initial);
+        }
+        rec.tags_mut().set_array_element_i32(b"bq", index, new_val);
+        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_i32");
+        let got = decode_i32_array(arr.data, arr.count);
+        for (i, &v) in initial.iter().enumerate() {
+            if i == index {
+                prop_assert_eq!(got[i], new_val, "overwritten element mismatch at index {}", i);
+            } else {
+                prop_assert_eq!(got[i], v, "non-overwritten element changed at index {}", i);
+            }
+        }
+    }
+
+    // =========================================================================
+    // set_array_element_f32: single-element overwrite (bit equality), others preserved
+    // =========================================================================
+
+    #[test]
+    fn set_array_element_f32_writes_one_element(
+        initial in proptest::collection::vec(any::<f32>(), 1..32),
+        index in 0usize..32,
+        new_val in any::<f32>(),
+    ) {
+        let index = index % initial.len();
+        let new_bits = new_val.to_bits();
+        let initial_bits: Vec<u32> = initial.iter().map(|f| f.to_bits()).collect();
+        let mut rec = base_record(&[]);
+        {
+            let mut ed = rec.tags_editor();
+            ed.update_array_f32(b"bq", &initial);
+        }
+        rec.tags_mut().set_array_element_f32(b"bq", index, new_val);
+        let arr =
+            rec.tags().find_array(b"bq").expect("array tag present after set_array_element_f32");
+        let got = decode_f32_bits_array(arr.data, arr.count);
+        for (i, &bits) in initial_bits.iter().enumerate() {
+            if i == index {
+                prop_assert_eq!(got[i], new_bits, "overwritten element mismatch at index {}", i);
+            } else {
+                prop_assert_eq!(got[i], bits, "non-overwritten element changed at index {}", i);
+            }
+        }
+    }
+
+    // =========================================================================
+    // set_bin / bin: round-trip across the full u16 domain
+    // =========================================================================
+
+    #[test]
+    fn set_bin_roundtrip(v in any::<u16>()) {
+        let mut rec = base_record(&[]);
+        rec.set_bin(v);
+        prop_assert_eq!(rec.bin(), v);
+    }
+}
