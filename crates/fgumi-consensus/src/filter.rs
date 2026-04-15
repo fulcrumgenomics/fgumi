@@ -850,7 +850,7 @@ pub fn template_passes_raw(raw_records: &[Vec<u8>], pass_map: &AHashMap<usize, b
     let mut all_primary_pass = true;
 
     for (idx, record) in raw_records.iter().enumerate() {
-        let flags = bam_fields::flags(record);
+        let flags = RawRecordView::new(record).flags();
         let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
             && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
 
@@ -892,7 +892,7 @@ pub fn is_duplex_consensus(record: &RecordBuf) -> bool {
 // Raw-byte equivalents (operate on &[u8] / &mut Vec<u8>)
 // ============================================================================
 
-use fgumi_raw_bam as bam_fields;
+use fgumi_raw_bam::{self as bam_fields, RawRecordView};
 use noodles::sam::alignment::record::cigar::op::Kind;
 
 /// Pre-parsed methylation aux tags from a raw BAM record.
@@ -1063,7 +1063,7 @@ pub fn compute_read_stats_raw(bam: &[u8]) -> (usize, f64) {
     assert!(bam.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(bam);
     let qual_off = bam_fields::qual_offset(bam);
-    let len = bam_fields::l_seq(bam) as usize;
+    let len = RawRecordView::new(bam).l_seq() as usize;
 
     let mut n_count = 0usize;
     let mut qual_sum = 0u64;
@@ -1126,7 +1126,7 @@ pub fn mask_bases_raw(
     anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
     let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
 
     // Pre-read per-base arrays into owned Vecs to release the immutable borrow on record
@@ -1181,7 +1181,7 @@ pub fn mask_duplex_bases_raw(
     anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
     let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
 
     // Pre-read per-base arrays and strings into owned data to release the immutable borrow
@@ -1322,7 +1322,7 @@ pub fn mask_methylation_depth_simplex_raw_with_tags(
     anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
 
     // If no methylation tags present, nothing to filter
     if tags.cu.is_none() && tags.ct.is_none() {
@@ -1374,7 +1374,7 @@ pub fn mask_methylation_depth_duplex_raw_with_tags(
     anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
 
     // If no methylation tags present, nothing to filter
     if tags.cu.is_none() && tags.ct.is_none() {
@@ -1420,24 +1420,24 @@ pub fn resolve_ref_bases_for_record(
     reference: &dyn crate::methylation::RefBaseProvider,
     ref_names: &[String],
 ) -> Option<Vec<Option<u8>>> {
-    let flags = bam_fields::flags(record);
+    let flags = RawRecordView::new(record).flags();
     if flags & bam_fields::flags::UNMAPPED != 0 {
         return None;
     }
 
-    let tid = bam_fields::ref_id(record);
+    let tid = RawRecordView::new(record).ref_id();
     if tid < 0 {
         return None;
     }
     let ref_name = ref_names.get(tid as usize)?;
-    let alignment_start = bam_fields::pos(record) as u64; // 0-based
+    let alignment_start = RawRecordView::new(record).pos() as u64; // 0-based
 
     // Try to get the full sequence slice for O(1) indexed access per base,
     // avoiding a HashMap lookup per position.
     let ref_seq = reference.sequence_for(ref_name);
 
     let cigar_ops = bam_fields::get_cigar_ops(record);
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
     let mut result = Vec::with_capacity(len);
     let mut ref_pos = alignment_start;
 
@@ -1525,7 +1525,7 @@ pub fn mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
 
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
 
     // If no per-strand methylation tags, nothing to check
     if tags.au.is_none() && tags.bu.is_none() {
@@ -1629,7 +1629,7 @@ pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
         return true; // unmapped reads pass
     };
 
-    let len = bam_fields::l_seq(record) as usize;
+    let len = RawRecordView::new(record).l_seq() as usize;
 
     // If no methylation tags, pass
     if methylation_tags.cu.is_none() && methylation_tags.ct.is_none() {
