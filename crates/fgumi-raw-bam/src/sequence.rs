@@ -158,6 +158,69 @@ pub fn quality_scores_slice_mut(bam: &mut [u8]) -> &mut [u8] {
     &mut bam[off..off + l]
 }
 
+use crate::fields::RawRecordView;
+
+impl<'a> RawRecordView<'a> {
+    /// Raw 4-bit packed sequence bytes (`(l_seq + 1) / 2` bytes).
+    #[inline]
+    #[must_use]
+    pub fn sequence_packed(&self) -> &'a [u8] {
+        let bam = self.as_bytes();
+        let l = l_seq(bam) as usize;
+        let off = seq_offset(bam);
+        let bytes = l.div_ceil(2);
+        &bam[off..off + bytes]
+    }
+
+    /// Zero-allocation iterator yielding decoded ASCII bases (A/C/G/T/N/…).
+    #[inline]
+    pub fn sequence_iter(&self) -> impl Iterator<Item = u8> + 'a {
+        let bam = self.as_bytes();
+        let l = l_seq(bam) as usize;
+        let off = seq_offset(bam);
+        (0..l).map(move |i| BAM_BASE_TO_ASCII[get_base(bam, off, i) as usize])
+    }
+
+    /// Convenience: collect the sequence into a `Vec<u8>` of ASCII bases.
+    #[inline]
+    #[must_use]
+    pub fn sequence_vec(&self) -> Vec<u8> {
+        extract_sequence(self.as_bytes())
+    }
+
+    /// Returns the 4-bit encoded base code at `position`
+    /// (1=A, 2=C, 4=G, 8=T, 15=N).
+    #[inline]
+    #[must_use]
+    pub fn get_base(&self, position: usize) -> u8 {
+        let bam = self.as_bytes();
+        get_base(bam, seq_offset(bam), position)
+    }
+
+    /// Returns `true` if the 4-bit encoded base at `position` is `N` (0xF).
+    #[inline]
+    #[must_use]
+    pub fn is_base_n(&self, position: usize) -> bool {
+        let bam = self.as_bytes();
+        is_base_n(bam, seq_offset(bam), position)
+    }
+
+    /// Zero-allocation slice over raw Phred quality scores (not Phred+33).
+    #[inline]
+    #[must_use]
+    pub fn quality_scores(&self) -> &'a [u8] {
+        quality_scores_slice(self.as_bytes())
+    }
+
+    /// Returns the raw Phred quality score at `position`.
+    #[inline]
+    #[must_use]
+    pub fn get_qual(&self, position: usize) -> u8 {
+        let bam = self.as_bytes();
+        get_qual(bam, qual_offset(bam), position)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +575,34 @@ mod tests {
         let mut dst = Vec::new();
         pack_sequence_into(&mut dst, b"NN");
         assert_eq!(dst, [0xFF]); // N=15, N=15
+    }
+
+    // ========================================================================
+    // RawRecordView sequence/quality method tests
+    // ========================================================================
+
+    #[test]
+    fn test_view_sequence_quality_methods() {
+        use crate::fields::RawRecordView;
+        // Build a record with seq "ACGT" and quals 30,30,30,30
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 4, -1, -1, &[]);
+        let so = seq_offset(&rec);
+        let qo = qual_offset(&rec);
+        rec[so] = 0x12; // A=1, C=2
+        rec[so + 1] = 0x48; // G=4, T=8
+        for i in 0..4 {
+            rec[qo + i] = 30;
+        }
+
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.l_seq(), 4);
+        assert_eq!(v.sequence_vec(), b"ACGT".to_vec());
+        assert_eq!(v.sequence_iter().collect::<Vec<u8>>(), b"ACGT".to_vec());
+        assert_eq!(v.sequence_packed(), &[0x12, 0x48]);
+        assert_eq!(v.quality_scores(), &[30, 30, 30, 30]);
+        assert_eq!(v.get_qual(0), 30);
+        assert_eq!(v.get_base(0), 1); // A
+        assert_eq!(v.get_base(3), 8); // T
+        assert!(!v.is_base_n(0));
     }
 }
