@@ -549,6 +549,34 @@ impl RawRecord {
     pub fn set_template_length(&mut self, v: i32) {
         RawRecordMut::new(&mut self.0).set_template_length(v);
     }
+
+    // -- Length-changing edits --
+
+    /// Replace the read name. Updates `l_read_name` and splices the name +
+    /// NUL terminator into the record.
+    ///
+    /// All other fields (CIGAR, sequence, quality, aux tags) are preserved
+    /// because they live after the name and shift accordingly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_name.len() + 1 > u8::MAX as usize` (the BAM spec encodes
+    /// `l_read_name` as a single byte).
+    pub fn set_read_name(&mut self, new_name: &[u8]) {
+        let new_l = new_name.len() + 1; // include NUL
+        let new_l_u8 = u8::try_from(new_l)
+            .unwrap_or_else(|_| panic!("read name too long: {} bytes", new_name.len()));
+        let old_l = self.0[8] as usize;
+        let start = 32;
+        let end = start + old_l;
+        // Splice: replace old name+NUL with new name+NUL
+        let mut replacement = Vec::with_capacity(new_l);
+        replacement.extend_from_slice(new_name);
+        replacement.push(0);
+        self.0.splice(start..end, replacement);
+        // Update l_read_name byte at offset 8
+        self.0[8] = new_l_u8;
+    }
 }
 
 /// A reader for raw BAM records.
@@ -699,6 +727,31 @@ mod tests {
 
         let result = read_raw_record(&mut reader, &mut record);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_read_name_resize() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"oldname", &[encode_op(0, 4)], 4, -1, -1, b"NMc\x05");
+        let mut rec = RawRecord::from(bytes);
+        let pre_cigar = rec.cigar_ops_vec();
+        let pre_seq = rec.sequence_vec();
+        let pre_qual = rec.quality_scores().to_vec();
+        let pre_nm = rec.tags().find_int(b"NM");
+
+        rec.set_read_name(b"new");
+        assert_eq!(rec.read_name(), b"new");
+        assert_eq!(rec.l_read_name(), 4); // 3 bytes + NUL
+        // All other fields preserved
+        assert_eq!(rec.cigar_ops_vec(), pre_cigar);
+        assert_eq!(rec.sequence_vec(), pre_seq);
+        assert_eq!(rec.quality_scores(), pre_qual.as_slice());
+        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+
+        // Empty name (still NUL-terminated)
+        rec.set_read_name(b"");
+        assert_eq!(rec.read_name(), b"");
+        assert_eq!(rec.l_read_name(), 1);
     }
 
     #[test]
