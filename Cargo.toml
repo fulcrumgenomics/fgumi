@@ -117,6 +117,18 @@ fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
 name = "core_functions"
 harness = false
 
+[[bench]]
+name = "raw_bam_accessors"
+harness = false
+
+[[bench]]
+name = "raw_bam_tags_editor"
+harness = false
+
+[[bench]]
+name = "raw_bam_length_changing"
+harness = false
+
 [build-dependencies]
 built = { version = "0", features = ["git2"] }
 
