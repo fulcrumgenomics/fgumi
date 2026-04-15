@@ -1077,6 +1077,117 @@ impl<'a> RawTagsMut<'a> {
         }
         aux[off..off + elem_size].copy_from_slice(le_bytes);
     }
+
+    /// Reverse element bytes of a B-type array tag in place.
+    #[inline]
+    pub fn reverse_array(&mut self, tag: &[u8; 2]) {
+        reverse_array_tag_in_place(self.0, 0, tag);
+    }
+
+    /// Reverse the bytes of a Z-type string tag value in place.
+    #[inline]
+    pub fn reverse_string(&mut self, tag: &[u8; 2]) {
+        reverse_string_tag_in_place(self.0, 0, tag);
+    }
+
+    /// Reverse-complement a Z-type string tag value (A<->T, C<->G).
+    #[inline]
+    pub fn reverse_complement_string(&mut self, tag: &[u8; 2]) {
+        reverse_complement_string_tag_in_place(self.0, 0, tag);
+    }
+
+    /// Overwrite an existing Z-type tag if the new value matches its current length.
+    ///
+    /// Returns `false` (no-op) if absent, wrong type, or different length.
+    pub fn set_string_in_place(&mut self, tag: &[u8; 2], value: &[u8]) -> bool {
+        let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
+            return false;
+        };
+        if val_type != b'Z' {
+            return false;
+        }
+        let start = p + 3;
+        let Some(nul_off) = self.0[start..].iter().position(|&b| b == 0) else {
+            return false;
+        };
+        if nul_off != value.len() {
+            return false;
+        }
+        self.0[start..start + value.len()].copy_from_slice(value);
+        true
+    }
+
+    /// Overwrite an existing integer tag if the new value fits its current type byte.
+    ///
+    /// Returns `false` if absent, value doesn't fit the existing type, or the
+    /// aux buffer is truncated and the value bytes lie out of bounds.
+    pub fn set_int_in_place(&mut self, tag: &[u8; 2], value: i64) -> bool {
+        let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
+            return false;
+        };
+        let len = self.0.len();
+        match val_type {
+            b'c' => i8::try_from(value)
+                .ok()
+                .filter(|_| p + 4 <= len)
+                .map(|v| {
+                    self.0[p + 3] = v.cast_unsigned();
+                })
+                .is_some(),
+            b'C' => u8::try_from(value)
+                .ok()
+                .filter(|_| p + 4 <= len)
+                .map(|v| {
+                    self.0[p + 3] = v;
+                })
+                .is_some(),
+            b's' => i16::try_from(value)
+                .ok()
+                .filter(|_| p + 5 <= len)
+                .map(|v| {
+                    self.0[p + 3..p + 5].copy_from_slice(&v.to_le_bytes());
+                })
+                .is_some(),
+            b'S' => u16::try_from(value)
+                .ok()
+                .filter(|_| p + 5 <= len)
+                .map(|v| {
+                    self.0[p + 3..p + 5].copy_from_slice(&v.to_le_bytes());
+                })
+                .is_some(),
+            b'i' => i32::try_from(value)
+                .ok()
+                .filter(|_| p + 7 <= len)
+                .map(|v| {
+                    self.0[p + 3..p + 7].copy_from_slice(&v.to_le_bytes());
+                })
+                .is_some(),
+            b'I' => u32::try_from(value)
+                .ok()
+                .filter(|_| p + 7 <= len)
+                .map(|v| {
+                    self.0[p + 3..p + 7].copy_from_slice(&v.to_le_bytes());
+                })
+                .is_some(),
+            _ => false,
+        }
+    }
+
+    /// Overwrite an existing `f`-type tag in place.
+    ///
+    /// Returns `false` if absent, wrong type, or the aux buffer is truncated
+    /// and the value bytes lie out of bounds.
+    #[inline]
+    pub fn set_float_in_place(&mut self, tag: &[u8; 2], value: f32) -> bool {
+        let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
+            return false;
+        };
+        if val_type != b'f' || p + 7 > self.0.len() {
+            return false;
+        }
+        self.0[p + 3..p + 7].copy_from_slice(&value.to_le_bytes());
+        true
+    }
 }
 
 impl RawRecordMut<'_> {
@@ -2831,5 +2942,124 @@ mod tests {
         let arr = v.tags().find_array(b"bq").expect("array tag");
         assert_eq!(arr.count, 4);
         assert_eq!(array_tag_element_u16(&arr, 2), 99);
+    }
+
+    // ========================================================================
+    // RawTagsMut reverse + in-place setter tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_tags_mut_reverse_string_in_place() {
+        use crate::fields::{RawRecordMut, RawRecordView};
+        let aux = b"BCZACGT\0";
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.tags_mut().reverse_string(b"BC");
+        }
+        assert_eq!(RawRecordView::new(&rec).tags().find_string(b"BC"), Some(b"TGCA".as_slice()));
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_string_in_place_same_length() {
+        use crate::fields::{RawRecordMut, RawRecordView};
+        let aux = b"BCZACGT\0";
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let ok = {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.tags_mut().set_string_in_place(b"BC", b"TTTT")
+        };
+        assert!(ok);
+        assert_eq!(RawRecordView::new(&rec).tags().find_string(b"BC"), Some(b"TTTT".as_slice()));
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_string_in_place_different_length_returns_false() {
+        use crate::fields::RawRecordMut;
+        let aux = b"BCZACGT\0";
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let ok = {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.tags_mut().set_string_in_place(b"BC", b"AC")
+        };
+        assert!(!ok);
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_int_in_place_fits() {
+        use crate::fields::{RawRecordMut, RawRecordView};
+        // NM:i:5 (4-byte signed int)
+        let mut aux = Vec::from(b"NMi".as_slice());
+        aux.extend_from_slice(&5i32.to_le_bytes());
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux);
+        let ok = {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.tags_mut().set_int_in_place(b"NM", 100_000)
+        };
+        assert!(ok);
+        assert_eq!(RawRecordView::new(&rec).tags().find_int(b"NM"), Some(100_000));
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_int_in_place_doesnt_fit_returns_false() {
+        use crate::fields::RawRecordMut;
+        // NM:c:5 (1-byte signed)
+        let aux = b"NMc\x05";
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
+        let ok = {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.tags_mut().set_int_in_place(b"NM", 100_000)
+        };
+        assert!(!ok);
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_int_in_place_truncated_aux_returns_false() {
+        // Slice the tag's value bytes off so set_int_in_place would otherwise
+        // panic on the out-of-bounds write. It must return false instead.
+        // Test every int sub-type since each branch has its own bounds check.
+        for sub in [b'c', b'C'] {
+            let aux = [b'N', b'M', sub]; // header only, no value byte
+            let mut tags = aux;
+            let mut tm = RawTagsMut::new(&mut tags);
+            assert!(!tm.set_int_in_place(b"NM", 1));
+        }
+        for sub in [b's', b'S'] {
+            let aux = [b'N', b'M', sub, 0]; // 1 of 2 value bytes
+            let mut tags = aux;
+            let mut tm = RawTagsMut::new(&mut tags);
+            assert!(!tm.set_int_in_place(b"NM", 1));
+        }
+        for sub in [b'i', b'I'] {
+            let aux = [b'N', b'M', sub, 0, 0, 0]; // 3 of 4 value bytes
+            let mut tags = aux;
+            let mut tm = RawTagsMut::new(&mut tags);
+            assert!(!tm.set_int_in_place(b"NM", 1));
+        }
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_float_in_place_truncated_aux_returns_false() {
+        // Slice off some of the f32 value bytes so set_float_in_place would
+        // otherwise panic on the out-of-bounds write.
+        let aux = [b'A', b'S', b'f', 0, 0, 0]; // 3 of 4 value bytes
+        let mut tags = aux;
+        let mut tm = RawTagsMut::new(&mut tags);
+        assert!(!tm.set_float_in_place(b"AS", 1.0));
+    }
+
+    #[test]
+    fn test_raw_tags_mut_set_float_in_place() {
+        use crate::fields::{RawRecordMut, RawRecordView};
+        let mut aux = Vec::from(b"ASf".as_slice());
+        aux.extend_from_slice(&12.5f32.to_le_bytes());
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux);
+        let ok = {
+            let mut m = RawRecordMut::new(&mut rec);
+            m.tags_mut().set_float_in_place(b"AS", 99.25)
+        };
+        assert!(ok);
+        let got = RawRecordView::new(&rec).tags().find_float(b"AS").unwrap();
+        assert!((got - 99.25).abs() < 1e-6);
     }
 }
