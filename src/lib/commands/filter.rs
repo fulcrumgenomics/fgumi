@@ -35,6 +35,7 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
 use crossbeam_queue::SegQueue;
+use fgumi_raw_bam::RawRecordView;
 use log::info;
 use noodles::sam::Header;
 use std::io;
@@ -669,7 +670,7 @@ impl Filter {
                 let template_pass = template_passes_raw(&template_records, &pass_map);
 
                 for (idx, record) in template_records.into_iter().enumerate() {
-                    let flags = bam_fields::flags(&record);
+                    let flags = RawRecordView::new(&record).flags();
                     let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
                         && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
 
@@ -754,7 +755,7 @@ impl Filter {
         // Fail fast if we encounter a mapped read without a reference, since masking
         // can invalidate NM/UQ/MD tags and we have no way to regenerate them.
         if reference.is_none() {
-            let flags = bam_fields::flags(record);
+            let flags = RawRecordView::new(record).flags();
             if (flags & bam_fields::flags::UNMAPPED) == 0 {
                 bail!(
                     "--ref is required when filtering mapped reads \

@@ -1993,7 +1993,7 @@ mod tests {
             10,
             |bam: &[u8]| {
                 // Check flag field
-                let flag = fgumi_raw_bam::flags(bam);
+                let flag = fgumi_raw_bam::RawRecordView::new(bam).flags();
                 flag & fgumi_raw_bam::flags::SECONDARY == 0 // keep if NOT secondary
             },
             |raw: &[u8]| {

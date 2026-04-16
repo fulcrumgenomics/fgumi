@@ -214,6 +214,7 @@ fn filter_template_raw(
     metrics: &mut FilterMetrics,
 ) -> bool {
     use crate::sort::bam_fields;
+    use fgumi_raw_bam::RawRecordView;
 
     let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
     let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
@@ -228,8 +229,9 @@ fn filter_template_raw(
 
     // Check if both reads are unmapped
     let both_unmapped = raw_r1
-        .is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0)
-        && raw_r2.is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::UNMAPPED) != 0);
+        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0)
+        && raw_r2
+            .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::UNMAPPED) != 0);
     if both_unmapped && !config.allow_unmapped {
         metrics.discarded_poor_alignment += num_primary_reads;
         return false;
@@ -237,7 +239,7 @@ fn filter_template_raw(
 
     // Phase 1: Cheap flag-based checks
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
+        let flg = RawRecordView::new(raw).flags();
 
         if !config.include_non_pf && (flg & bam_fields::flags::QC_FAIL) != 0 {
             metrics.discarded_non_pf += num_primary_reads;
@@ -252,7 +254,7 @@ fn filter_template_raw(
 
     // Phase 2: Single-pass tag lookups (MQ + UMI in one aux scan)
     for raw in [raw_r1, raw_r2].into_iter().flatten() {
-        let flg = bam_fields::flags(raw);
+        let flg = RawRecordView::new(raw).flags();
         let aux = bam_fields::aux_data_slice(raw);
         let check_mq = (flg & bam_fields::flags::MATE_UNMAPPED) == 0;
         let check_umi = !config.no_umi;
@@ -377,11 +379,14 @@ fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
 /// Get pair orientation from raw-byte template.
 fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
     use crate::sort::bam_fields;
+    use fgumi_raw_bam::RawRecordView;
 
-    let r1_positive =
-        template.raw_r1().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
-    let r2_positive =
-        template.raw_r2().is_none_or(|r| (bam_fields::flags(r) & bam_fields::flags::REVERSE) == 0);
+    let r1_positive = template
+        .raw_r1()
+        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
+    let r2_positive = template
+        .raw_r2()
+        .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
 

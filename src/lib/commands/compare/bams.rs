@@ -380,7 +380,7 @@ fn record_name_to_string(record: &RecordBuf) -> String {
 
 /// Check if the first-in-template (R1) flag is set in raw BAM record bytes.
 fn is_first_segment_raw(raw: &RawRecord) -> bool {
-    let flags = raw_fields::flags(raw.as_ref());
+    let flags = fgumi_raw_bam::RawRecordView::new(raw.as_ref()).flags();
     flags & raw_fields::flags::FIRST_SEGMENT != 0
 }
 
@@ -461,7 +461,8 @@ fn build_mi_map_parallel(
                 let results: Vec<MiExtractResult> = batch
                     .par_iter()
                     .map(|raw| {
-                        let name_bytes = raw_fields::read_name(raw.as_ref());
+                        let name_bytes =
+                            fgumi_raw_bam::RawRecordView::new(raw.as_ref()).read_name();
                         let is_read1 = is_first_segment_raw(raw);
                         let key_hash = hash_read_key_raw(name_bytes, is_read1);
 
@@ -1164,8 +1165,8 @@ impl CompareBams {
             for (r1, r2) in cmp_batch1.iter().zip(cmp_batch2.iter()) {
                 grouping_stats.total_records += 1;
 
-                let name1_bytes = raw_fields::read_name(r1.as_ref());
-                let name2_bytes = raw_fields::read_name(r2.as_ref());
+                let name1_bytes = fgumi_raw_bam::RawRecordView::new(r1.as_ref()).read_name();
+                let name2_bytes = fgumi_raw_bam::RawRecordView::new(r2.as_ref()).read_name();
                 let is_read1 = is_first_segment_raw(r1);
 
                 if name1_bytes != name2_bytes {

@@ -1,3 +1,4 @@
+use crate::raw_bam_record::RawRecord;
 use crate::sequence::pack_sequence_into;
 use crate::tags::{
     append_float_tag, append_i16_array_tag, append_int_tag, append_phred33_string_tag,
@@ -27,9 +28,13 @@ use crate::tags::{
 /// builder.append_int_tag(b"cD", max_depth);
 /// builder.append_float_tag(b"cE", error_rate);
 /// builder.append_i16_array_tag(b"cd", &depth_array);
-/// builder.write_with_block_size(&mut output);
 ///
-/// builder.clear();
+/// // Option A: return the record as a RawRecord (moves the buffer out).
+/// let record: RawRecord = builder.build();
+///
+/// // Option B (alternative): write directly without taking ownership.
+/// // builder.write_with_block_size(&mut output);
+/// // builder.clear();
 /// // ... build next record ...
 /// ```
 pub struct UnmappedBamRecordBuilder {
@@ -173,6 +178,21 @@ impl UnmappedBamRecordBuilder {
     pub fn append_phred33_string_tag(&mut self, tag: &[u8; 2], quals: &[u8]) {
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_phred33_string_tag(&mut self.buf, tag, quals);
+    }
+
+    /// Consume the completed record bytes and return them as a [`RawRecord`].
+    ///
+    /// This moves the internal buffer out of the builder. After calling
+    /// `build()`, the builder's buffer is empty; call [`Self::build_record`]
+    /// again before appending tags or writing.
+    ///
+    /// Callers that need the raw bytes can use [`RawRecord::into_inner`].
+    #[inline]
+    #[must_use]
+    pub fn build(&mut self) -> RawRecord {
+        debug_assert!(self.sealed, "must call build_record first");
+        self.sealed = false;
+        RawRecord::from(std::mem::take(&mut self.buf))
     }
 
     /// Get the completed record bytes (**without** the 4-byte `block_size` prefix).
@@ -449,6 +469,41 @@ mod tests {
     // ========================================================================
     // UnmappedBamRecordBuilder additional tests
     // ========================================================================
+
+    #[test]
+    fn test_builder_build_returns_raw_record() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+        builder.append_string_tag(b"MI", b"7");
+
+        let record = builder.build();
+
+        // Should be a valid RawRecord with the expected fields.
+        assert_eq!(l_seq(record.as_ref()), 4);
+        assert_eq!(read_name(record.as_ref()), b"r1");
+        assert_eq!(find_string_tag(aux_data_slice(record.as_ref()), b"MI"), Some(b"7" as &[u8]));
+
+        // After build(), the builder's internal buffer should be empty (moved out).
+        assert!(builder.buf.is_empty());
+        assert!(!builder.sealed);
+
+        // The builder can be reused.
+        builder.build_record(b"r2", flags::UNMAPPED, b"AC", &[20, 25]);
+        assert_eq!(l_seq(builder.as_bytes()), 2);
+        assert_eq!(read_name(builder.as_bytes()), b"r2");
+    }
+
+    #[test]
+    fn test_builder_build_into_inner() {
+        let mut builder = UnmappedBamRecordBuilder::new();
+        builder.build_record(b"r3", flags::UNMAPPED, b"ACGT", &[10, 20, 30, 40]);
+
+        let bytes_before = builder.as_bytes().to_vec();
+        let record = builder.build();
+
+        // into_inner() should yield the same bytes.
+        assert_eq!(record.into_inner(), bytes_before);
+    }
 
     #[test]
     fn test_builder_default() {

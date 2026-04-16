@@ -296,7 +296,9 @@ impl LibraryLookup {
     #[cfg(test)]
     #[must_use]
     pub fn get_ordinal(&self, bam: &[u8]) -> u32 {
-        fgumi_raw_bam::tags::find_string_tag_in_record(bam, &SamTag::RG)
+        fgumi_raw_bam::RawRecordView::new(bam)
+            .tags()
+            .find_string(&SamTag::RG)
             .and_then(|rg| self.rg_to_ordinal.get(rg))
             .copied()
             .unwrap_or(0)
@@ -2870,12 +2872,13 @@ pub fn extract_template_key_inline(
     let cb_hash = aux.cell.map_or(0u64, |cb_bytes| cb_hasher.hash_one(cb_bytes));
 
     // Extract fields from raw bytes
-    let tid = bam_fields::ref_id(bam_bytes);
-    let pos = bam_fields::pos(bam_bytes);
-    let l_read_name = bam_fields::l_read_name(bam_bytes) as usize;
-    let flag = bam_fields::flags(bam_bytes);
-    let mate_tid = bam_fields::mate_ref_id(bam_bytes);
-    let mate_pos = bam_fields::mate_pos(bam_bytes);
+    let v = bam_fields::RawRecordView::new(bam_bytes);
+    let tid = v.ref_id();
+    let pos = v.pos();
+    let l_read_name = v.l_read_name() as usize;
+    let flag = v.flags();
+    let mate_tid = v.mate_ref_id();
+    let mate_pos = v.mate_pos();
 
     // Extract flags
     let is_unmapped = (flag & flags::UNMAPPED) != 0;
@@ -3167,7 +3170,10 @@ mod tests {
     #[case::absent(b"".as_slice(), None)]
     fn test_find_rg_tag(#[case] aux_data: &[u8], #[case] expected: Option<&[u8]>) {
         let bam = build_bam_with_aux(aux_data);
-        assert_eq!(fgumi_raw_bam::tags::find_string_tag_in_record(&bam, &SamTag::RG), expected);
+        assert_eq!(
+            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(&SamTag::RG),
+            expected
+        );
     }
 
     #[test]
@@ -3179,7 +3185,7 @@ mod tests {
         aux.extend_from_slice(b"RGZmygroup\0");
         let bam = build_bam_with_aux(&aux);
         assert_eq!(
-            fgumi_raw_bam::tags::find_string_tag_in_record(&bam, &SamTag::RG),
+            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(&SamTag::RG),
             Some(b"mygroup".as_slice())
         );
     }
@@ -3589,7 +3595,7 @@ mod tests {
         let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader)
             .map(|rec| {
-                let name_bytes = fgumi_raw_bam::fields::read_name(rec.as_ref());
+                let name_bytes = fgumi_raw_bam::RawRecordView::new(rec.as_ref()).read_name();
                 String::from_utf8(name_bytes.to_vec()).expect("read name should be valid UTF-8")
             })
             .collect()
@@ -3602,7 +3608,10 @@ mod tests {
         RawReadAheadReader::new(reader)
             .map(|rec| {
                 let bytes = rec.as_ref();
-                (fgumi_raw_bam::fields::ref_id(bytes), fgumi_raw_bam::fields::pos(bytes))
+                {
+                    let v = fgumi_raw_bam::RawRecordView::new(bytes);
+                    (v.ref_id(), v.pos())
+                }
             })
             .collect()
     }
