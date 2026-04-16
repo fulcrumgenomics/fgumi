@@ -30,6 +30,212 @@ pub const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
 /// `ref_id`, `pos`, etc.) require at least this many bytes.
 pub const MIN_BAM_RECORD_LEN: usize = 32;
 
+/// Borrowed read-only view over a complete BAM record's bytes.
+///
+/// Wraps `&'a [u8]`. All BAM-spec accessors (`flags`, `pos`, `cigar`, `sequence`,
+/// `tags`, …) are inherent methods on this type.
+///
+/// All accessors assume `bytes.len() >= MIN_BAM_RECORD_LEN`. Use [`RawRecordView::new`]
+/// when the caller can vouch for that (hot path); use [`RawRecordView::try_new`] for
+/// untrusted input.
+#[derive(Copy, Clone, Debug)]
+pub struct RawRecordView<'a>(&'a [u8]);
+
+impl<'a> RawRecordView<'a> {
+    /// Wrap raw BAM bytes without validation.
+    ///
+    /// In debug builds, asserts `bytes.len() >= MIN_BAM_RECORD_LEN`. In release
+    /// builds, accessor methods on a too-short slice will panic on out-of-bounds
+    /// indexing.
+    #[inline]
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        debug_assert!(bytes.len() >= MIN_BAM_RECORD_LEN);
+        Self(bytes)
+    }
+
+    /// Wrap raw BAM bytes, returning `None` if too short for the fixed header.
+    #[inline]
+    #[must_use]
+    pub const fn try_new(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() >= MIN_BAM_RECORD_LEN { Some(Self(bytes)) } else { None }
+    }
+
+    /// Returns the underlying byte slice.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
+impl<'a> RawRecordView<'a> {
+    // -- header (fixed-offset) --
+
+    /// Extract reference sequence ID from this record.
+    #[inline]
+    #[must_use]
+    pub fn ref_id(&self) -> i32 {
+        ref_id(self.0)
+    }
+
+    /// Extract 0-based leftmost position from this record.
+    #[inline]
+    #[must_use]
+    pub fn pos(&self) -> i32 {
+        pos(self.0)
+    }
+
+    /// Extract mapping quality from this record.
+    #[inline]
+    #[must_use]
+    pub fn mapq(&self) -> u8 {
+        mapq(self.0)
+    }
+
+    /// Extract bitwise flags from this record.
+    #[inline]
+    #[must_use]
+    pub fn flags(&self) -> u16 {
+        flags(self.0)
+    }
+
+    /// Extract `l_read_name` (read-name length including NUL) from this record.
+    #[inline]
+    #[must_use]
+    pub fn l_read_name(&self) -> u8 {
+        l_read_name(self.0)
+    }
+
+    /// Extract number of CIGAR operations from this record.
+    #[inline]
+    #[must_use]
+    pub fn n_cigar_op(&self) -> u16 {
+        n_cigar_op(self.0)
+    }
+
+    /// Extract sequence length from this record.
+    #[inline]
+    #[must_use]
+    pub fn l_seq(&self) -> u32 {
+        l_seq(self.0)
+    }
+
+    /// Extract mate reference sequence ID from this record.
+    #[inline]
+    #[must_use]
+    pub fn mate_ref_id(&self) -> i32 {
+        mate_ref_id(self.0)
+    }
+
+    /// Extract mate 0-based position from this record.
+    #[inline]
+    #[must_use]
+    pub fn mate_pos(&self) -> i32 {
+        mate_pos(self.0)
+    }
+
+    /// Extract template length (tlen) from this record.
+    #[inline]
+    #[must_use]
+    pub fn template_length(&self) -> i32 {
+        template_length(self.0)
+    }
+
+    /// Extract read name (without null terminator) from this record.
+    #[inline]
+    #[must_use]
+    pub fn read_name(&self) -> &'a [u8] {
+        read_name(self.0)
+    }
+
+    /// Extract the BAM bin field (computed by the upstream encoder from `pos` and CIGAR).
+    #[inline]
+    #[must_use]
+    pub fn bin(&self) -> u16 {
+        u16::from_le_bytes([self.0[10], self.0[11]])
+    }
+
+    // -- flag-bit convenience --
+
+    /// Returns `true` if the read is paired in sequencing.
+    #[inline]
+    #[must_use]
+    pub fn is_paired(&self) -> bool {
+        self.flags() & flags::PAIRED != 0
+    }
+
+    /// Returns `true` if the read is unmapped.
+    #[inline]
+    #[must_use]
+    pub fn is_unmapped(&self) -> bool {
+        self.flags() & flags::UNMAPPED != 0
+    }
+
+    /// Returns `true` if the mate is unmapped.
+    #[inline]
+    #[must_use]
+    pub fn is_mate_unmapped(&self) -> bool {
+        self.flags() & flags::MATE_UNMAPPED != 0
+    }
+
+    /// Returns `true` if the read is reverse complemented.
+    #[inline]
+    #[must_use]
+    pub fn is_reverse(&self) -> bool {
+        self.flags() & flags::REVERSE != 0
+    }
+
+    /// Returns `true` if the mate is reverse complemented.
+    #[inline]
+    #[must_use]
+    pub fn is_mate_reverse(&self) -> bool {
+        self.flags() & flags::MATE_REVERSE != 0
+    }
+
+    /// Returns `true` if the read is the first segment (R1).
+    #[inline]
+    #[must_use]
+    pub fn is_first_segment(&self) -> bool {
+        self.flags() & flags::FIRST_SEGMENT != 0
+    }
+
+    /// Returns `true` if the read is the last segment (R2).
+    #[inline]
+    #[must_use]
+    pub fn is_last_segment(&self) -> bool {
+        self.flags() & flags::LAST_SEGMENT != 0
+    }
+
+    /// Returns `true` if the read is a secondary alignment.
+    #[inline]
+    #[must_use]
+    pub fn is_secondary(&self) -> bool {
+        self.flags() & flags::SECONDARY != 0
+    }
+
+    /// Returns `true` if the read fails quality controls.
+    #[inline]
+    #[must_use]
+    pub fn is_qc_fail(&self) -> bool {
+        self.flags() & flags::QC_FAIL != 0
+    }
+
+    /// Returns `true` if the read is a PCR or optical duplicate.
+    #[inline]
+    #[must_use]
+    pub fn is_duplicate(&self) -> bool {
+        self.flags() & flags::DUPLICATE != 0
+    }
+
+    /// Returns `true` if the read is a supplementary alignment.
+    #[inline]
+    #[must_use]
+    pub fn is_supplementary(&self) -> bool {
+        self.flags() & flags::SUPPLEMENTARY != 0
+    }
+}
+
 /// BAM flag bits.
 pub mod flags {
     /// Read is paired in sequencing.
@@ -423,6 +629,124 @@ pub fn extract_template_coordinate_fields(bam_bytes: &[u8]) -> TemplateCoordFiel
         l_read_name: l_rn,
         n_cigar_op: n_co,
         l_seq: l_s,
+    }
+}
+
+impl<'a> RawRecordView<'a> {
+    /// Extract `(tid, pos, reverse, name)` for coordinate-key sorting.
+    /// Unmapped reads return `(i32::MAX, i32::MAX, false, name)`.
+    #[inline]
+    #[must_use]
+    pub fn coordinate_fields(&self) -> (i32, i32, bool, &'a [u8]) {
+        extract_coordinate_fields(self.0)
+    }
+
+    /// Extract template-coordinate sort fields in a single pass.
+    #[inline]
+    #[must_use]
+    pub fn template_coordinate_fields(&self) -> TemplateCoordFields<'a> {
+        extract_template_coordinate_fields(self.0)
+    }
+}
+
+/// Borrowed fixed-length mutable view over a complete BAM record's bytes.
+///
+/// Wraps `&'a mut [u8]`. Provides every fixed-offset setter plus per-base /
+/// per-quality writes, but cannot change the record's byte length.
+///
+/// Read methods are accessed via [`RawRecordMut::view`].
+#[derive(Debug)]
+pub struct RawRecordMut<'a>(&'a mut [u8]);
+
+impl<'a> RawRecordMut<'a> {
+    /// Wrap raw BAM bytes mutably without validation.
+    ///
+    /// In debug builds, asserts `bytes.len() >= MIN_BAM_RECORD_LEN`. In release
+    /// builds, setter methods on a too-short slice will panic on out-of-bounds
+    /// indexing.
+    #[inline]
+    #[must_use]
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        debug_assert!(bytes.len() >= MIN_BAM_RECORD_LEN);
+        Self(bytes)
+    }
+
+    /// Wrap raw BAM bytes mutably, returning `None` if too short for the fixed header.
+    #[inline]
+    #[must_use]
+    pub fn try_new(bytes: &'a mut [u8]) -> Option<Self> {
+        if bytes.len() >= MIN_BAM_RECORD_LEN { Some(Self(bytes)) } else { None }
+    }
+
+    /// Borrow as a read-only view (lifetime tied to `&self`).
+    #[inline]
+    #[must_use]
+    pub fn view(&self) -> RawRecordView<'_> {
+        RawRecordView(self.0)
+    }
+
+    /// Returns the underlying byte slice as a shared reference.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0
+    }
+
+    /// Returns the underlying byte slice as a mutable reference.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.0
+    }
+
+    // -- header (fixed-offset) setters --
+
+    /// Set the reference sequence ID.
+    #[inline]
+    pub fn set_ref_id(&mut self, v: i32) {
+        set_ref_id(self.0, v);
+    }
+
+    /// Set the 0-based leftmost position.
+    #[inline]
+    pub fn set_pos(&mut self, v: i32) {
+        set_pos(self.0, v);
+    }
+
+    /// Set the mapping quality.
+    #[inline]
+    pub fn set_mapq(&mut self, v: u8) {
+        set_mapq(self.0, v);
+    }
+
+    /// Set the bitwise flags.
+    #[inline]
+    pub fn set_flags(&mut self, v: u16) {
+        set_flags(self.0, v);
+    }
+
+    /// Set the mate reference sequence ID.
+    #[inline]
+    pub fn set_mate_ref_id(&mut self, v: i32) {
+        set_mate_ref_id(self.0, v);
+    }
+
+    /// Set the mate 0-based position.
+    #[inline]
+    pub fn set_mate_pos(&mut self, v: i32) {
+        set_mate_pos(self.0, v);
+    }
+
+    /// Set the template length (TLEN).
+    #[inline]
+    pub fn set_template_length(&mut self, v: i32) {
+        set_template_length(self.0, v);
+    }
+
+    /// Set the BAM bin field (bytes 10–11, little-endian u16).
+    #[inline]
+    pub fn set_bin(&mut self, v: u16) {
+        self.0[10..12].copy_from_slice(&v.to_le_bytes());
     }
 }
 
@@ -930,5 +1254,108 @@ mod tests {
         assert_eq!(pos(&rec), 0);
         set_pos(&mut rec, 9999);
         assert_eq!(pos(&rec), 9999);
+    }
+
+    #[test]
+    fn test_raw_record_view_new_and_as_bytes() {
+        let bytes = vec![0u8; 32];
+        let view = RawRecordView::new(&bytes);
+        assert_eq!(view.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_raw_record_view_try_new_too_short_returns_none() {
+        let bytes = vec![0u8; 31];
+        assert!(RawRecordView::try_new(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_raw_record_view_try_new_min_length_succeeds() {
+        let bytes = vec![0u8; MIN_BAM_RECORD_LEN];
+        assert!(RawRecordView::try_new(&bytes).is_some());
+    }
+
+    #[test]
+    fn test_raw_record_view_header_accessors() {
+        use crate::testutil::*;
+        let mut rec = make_bam_bytes(
+            3,
+            200,
+            flags::PAIRED | flags::REVERSE,
+            b"read1",
+            &[encode_op(0, 10)],
+            6,
+            5,
+            400,
+            &[],
+        );
+        rec[9] = 42; // mapq
+        // bin
+        rec[10..12].copy_from_slice(&4680u16.to_le_bytes());
+
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.ref_id(), 3);
+        assert_eq!(v.pos(), 200);
+        assert_eq!(v.mapq(), 42);
+        assert_eq!(v.flags(), flags::PAIRED | flags::REVERSE);
+        assert_eq!(v.bin(), 4680);
+        assert_eq!(v.l_read_name(), 6);
+        assert_eq!(v.n_cigar_op(), 1);
+        assert_eq!(v.l_seq(), 6);
+        assert_eq!(v.mate_ref_id(), 5);
+        assert_eq!(v.mate_pos(), 400);
+        assert_eq!(v.read_name(), b"read1");
+        assert!(v.is_paired());
+        assert!(v.is_reverse());
+        assert!(!v.is_unmapped());
+    }
+
+    #[test]
+    fn test_view_batched_coord_helpers() {
+        use crate::testutil::*;
+        let rec = make_bam_bytes(3, 200, flags::REVERSE, b"r", &[], 0, -1, -1, &[]);
+        let v = RawRecordView::new(&rec);
+        let (tid, pos, reverse, name) = v.coordinate_fields();
+        assert_eq!((tid, pos, reverse), (3, 200, true));
+        assert_eq!(name, b"r");
+
+        let f = v.template_coordinate_fields();
+        assert_eq!(f.tid, 3);
+        assert!(f.flags.reverse());
+    }
+
+    // ========================================================================
+    // RawRecordMut tests
+    // ========================================================================
+
+    #[test]
+    fn test_raw_record_mut_constructors_and_view() {
+        let mut bytes = vec![0u8; 32];
+        let m = RawRecordMut::new(&mut bytes);
+        assert_eq!(m.view().as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_raw_record_mut_setters() {
+        use crate::testutil::*;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        let mut m = RawRecordMut::new(&mut rec);
+        m.set_ref_id(7);
+        m.set_pos(123);
+        m.set_mapq(40);
+        m.set_flags(flags::PAIRED | flags::REVERSE);
+        m.set_bin(4680);
+        m.set_mate_ref_id(8);
+        m.set_mate_pos(456);
+        m.set_template_length(300);
+        let v = m.view();
+        assert_eq!(v.ref_id(), 7);
+        assert_eq!(v.pos(), 123);
+        assert_eq!(v.mapq(), 40);
+        assert_eq!(v.flags(), flags::PAIRED | flags::REVERSE);
+        assert_eq!(v.bin(), 4680);
+        assert_eq!(v.mate_ref_id(), 8);
+        assert_eq!(v.mate_pos(), 456);
+        assert_eq!(v.template_length(), 300);
     }
 }

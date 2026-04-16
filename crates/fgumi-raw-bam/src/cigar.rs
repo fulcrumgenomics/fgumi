@@ -926,6 +926,87 @@ fn clip_cigar_end_raw(
     (result, 0) // ref_bases_consumed is 0 for end clipping (no position adjustment)
 }
 
+use crate::fields::RawRecordView;
+
+impl<'a> RawRecordView<'a> {
+    /// Raw CIGAR bytes (4 bytes per op), zero-allocation.
+    #[inline]
+    #[must_use]
+    pub fn cigar_raw_bytes(&self) -> &'a [u8] {
+        let bam = self.as_bytes();
+        let lrn = l_read_name(bam) as usize;
+        let n = n_cigar_op(bam) as usize;
+        let start = 32 + lrn;
+        let end = start + n * 4;
+        if end <= bam.len() { &bam[start..end] } else { &[] }
+    }
+
+    /// Zero-allocation iterator yielding decoded CIGAR ops as raw `u32`.
+    #[inline]
+    pub fn cigar_ops_iter(&self) -> impl Iterator<Item = u32> + 'a {
+        self.cigar_raw_bytes().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    }
+
+    /// Convenience: collect CIGAR ops into a `Vec<u32>`.
+    #[inline]
+    #[must_use]
+    pub fn cigar_ops_vec(&self) -> Vec<u32> {
+        get_cigar_ops(self.as_bytes())
+    }
+
+    /// Format CIGAR as a SAM-style string.
+    #[inline]
+    #[must_use]
+    pub fn cigar_to_string(&self) -> String {
+        cigar_to_string_from_raw(self.as_bytes())
+    }
+
+    /// Sum of M/D/N/=/X op lengths (reference-consuming).
+    #[inline]
+    #[must_use]
+    pub fn reference_length(&self) -> i32 {
+        reference_length_from_raw_bam(self.as_bytes())
+    }
+
+    /// Sum of M/I/S/=/X op lengths (query-consuming).
+    #[inline]
+    #[must_use]
+    pub fn query_length(&self) -> usize {
+        self.cigar_ops_iter()
+            .filter(|&op| consumes_query(op & 0xF))
+            .map(|op| (op >> 4) as usize)
+            .sum()
+    }
+
+    /// Compute 1-based alignment end position.
+    #[inline]
+    #[must_use]
+    pub fn alignment_end_1based(&self) -> Option<usize> {
+        alignment_end_from_raw(self.as_bytes())
+    }
+
+    /// Compute 1-based alignment start position.
+    #[inline]
+    #[must_use]
+    pub fn alignment_start_1based(&self) -> Option<usize> {
+        alignment_start_from_raw(self.as_bytes())
+    }
+
+    /// Computes the unclipped 5' coordinate (1-based) for grouping keys.
+    #[inline]
+    #[must_use]
+    pub fn unclipped_5prime_1based(&self) -> i32 {
+        unclipped_5prime_from_raw_bam(self.as_bytes())
+    }
+
+    /// Virtual clipping — see [`clip_cigar_ops_raw`].
+    #[inline]
+    #[must_use]
+    pub fn clip_cigar_ops(&self, clip_amount: usize, from_start: bool) -> (Vec<u32>, usize) {
+        clip_cigar_ops_raw(&self.cigar_ops_vec(), clip_amount, from_start)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2039,5 +2120,29 @@ mod tests {
         assert_eq!(cigar_op_kind(10 << 4 | 1), Kind::Insertion);
         // 5D = (5 << 4) | 2
         assert_eq!(cigar_op_kind(5 << 4 | 2), Kind::Deletion);
+    }
+
+    #[test]
+    fn test_view_cigar_methods() {
+        use crate::fields::RawRecordView;
+        use crate::testutil::*;
+        let rec = make_bam_bytes(
+            0,
+            100,
+            0,
+            b"r",
+            &[encode_op(0, 50), encode_op(2, 5), encode_op(0, 50)],
+            100,
+            -1,
+            -1,
+            &[],
+        );
+        let v = RawRecordView::new(&rec);
+        assert_eq!(v.cigar_ops_vec(), vec![encode_op(0, 50), encode_op(2, 5), encode_op(0, 50)]);
+        assert_eq!(v.cigar_to_string(), "50M5D50M");
+        assert_eq!(v.reference_length(), 105);
+        assert_eq!(v.query_length(), 100);
+        assert_eq!(v.cigar_raw_bytes().len(), 12);
+        assert_eq!(v.cigar_ops_iter().count(), 3);
     }
 }
