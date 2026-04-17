@@ -5,10 +5,9 @@
 //! 2. Rejected reads output
 //! 3. Statistics output
 
-use fgumi_lib::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
+use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -16,15 +15,26 @@ use tempfile::TempDir;
 
 use crate::helpers::bam_generator::{create_minimal_header, create_test_reference};
 
+/// Convert a raw BAM record to a `RecordBuf` using the default (empty) header.
+///
+/// Used to bridge the raw-byte builder API with the noodles BAM writer for test
+/// file creation.
+fn to_record_buf(raw: &RawRecord) -> noodles::sam::alignment::RecordBuf {
+    fgumi_raw_bam::raw_record_to_record_buf(raw, &noodles::sam::Header::default())
+        .expect("raw_record_to_record_buf should succeed in test")
+}
+
 /// Create a consensus BAM with records that have consensus tags.
-fn create_consensus_bam(path: &Path, records: Vec<RecordBuf>) {
+fn create_consensus_bam(path: &Path, records: Vec<RawRecord>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
     for record in records {
-        writer.write_alignment_record(&header, &record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(&record))
+            .expect("Failed to write record");
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
@@ -38,31 +48,31 @@ fn test_filter_command_basic() {
     let ref_path = create_test_reference(temp_dir.path());
 
     // Create consensus reads with good quality and per-base tags (cd/ce).
-    let r1 = RecordBuilder::new()
-        .name("cons1")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let r1 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons1")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name("cons2")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(200)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[5; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let r2 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons2")
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[5; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     create_consensus_bam(&input_bam, vec![r1, r2]);
 
@@ -109,32 +119,32 @@ fn test_filter_command_rejects_low_depth() {
     let ref_path = create_test_reference(temp_dir.path());
 
     // Good read: per-base depth 10 (all above min-reads=3), no bases masked
-    let good = RecordBuilder::new()
-        .name("good")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let good = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"good")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     // Low-depth read: per-base depth 1 (all below min-reads=3), all bases masked
-    let low_depth = RecordBuilder::new()
-        .name("low_depth")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(200)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[1; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let low_depth = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"low_depth")
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[1; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     create_consensus_bam(&input_bam, vec![good, low_depth]);
 
@@ -182,16 +192,18 @@ fn test_filter_command_with_stats() {
     let stats_path = temp_dir.path().join("stats.txt");
     let ref_path = create_test_reference(temp_dir.path());
 
-    let record = RecordBuilder::new()
-        .name("cons1")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(ConsensusTagsBuilder::new().depth_max(10).depth_min(8).error_rate(0.005))
-        .build();
+    let record = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons1")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_int_tag(b"cD", 10).add_int_tag(b"cM", 8).add_float_tag(b"cE", 0.005_f32);
+        b.build()
+    };
 
     create_consensus_bam(&input_bam, vec![record]);
 
@@ -232,25 +244,19 @@ fn test_filter_command_no_ref_unmapped_reads() {
     let output_bam = temp_dir.path().join("output.bam");
 
     // Create unmapped consensus reads with good per-base tags
-    let r1 = RecordBuilder::new()
-        .name("cons1")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .unmapped(true)
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let r1 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons1").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name("cons2")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .unmapped(true)
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[5; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let r2 = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"cons2").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[5; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     create_consensus_bam(&input_bam, vec![r1, r2]);
 
@@ -293,26 +299,20 @@ fn test_filter_command_no_ref_with_rejects() {
     let rejects_bam = temp_dir.path().join("rejects.bam");
 
     // Good unmapped read: per-base depth 10 (above min-reads=3)
-    let good = RecordBuilder::new()
-        .name("good")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .unmapped(true)
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let good = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"good").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     // Low-depth unmapped read: per-base depth 1 (below min-reads=3), all bases masked
-    let low_depth = RecordBuilder::new()
-        .name("low_depth")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .unmapped(true)
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[1; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let low_depth = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"low_depth").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[1; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     create_consensus_bam(&input_bam, vec![good, low_depth]);
 
@@ -362,18 +362,18 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
     let output_bam = temp_dir.path().join("output.bam");
 
     // Create a mapped consensus read (has ref_id, alignment_start, cigar)
-    let mapped = RecordBuilder::new()
-        .name("mapped_read")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let mapped = {
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"mapped_read")
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8]);
+        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     create_consensus_bam(&input_bam, vec![mapped]);
 

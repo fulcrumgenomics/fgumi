@@ -5,18 +5,15 @@
 //! 2. Statistics output
 //! 3. Rejected reads output
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
-use noodles::sam::alignment::record_buf::data::field::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::create_minimal_header;
+use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 
 /// Create a paired-end read pair for duplex consensus testing.
 ///
@@ -28,11 +25,12 @@ fn create_duplex_read_pair(
     mi_tag: &str,
     sequence: &str,
     quality: u8,
-    ref_start: usize,
+    ref_start: i32,
     is_b_strand: bool,
-) -> (RecordBuf, RecordBuf) {
-    let read_len = sequence.len();
-    let cigar = format!("{read_len}M");
+) -> (RawRecord, RawRecord) {
+    let seq = sequence.as_bytes();
+    let read_len = seq.len();
+    let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4;
 
     let (r1_start, r2_start, r1_rev, r2_rev) = if is_b_strand {
         // B strand: RF orientation — R1 reverse at far position, R2 forward at near
@@ -49,50 +47,55 @@ fn create_duplex_read_pair(
     )]
     let tlen: i32 = if is_b_strand { -((read_len + 100) as i32) } else { (read_len + 100) as i32 };
 
-    let mut r1 = RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![quality; read_len])
-        .paired(true)
-        .first_segment(true)
-        .reverse_complement(r1_rev)
-        .mate_reverse_complement(r2_rev)
-        .reference_sequence_id(0)
-        .alignment_start(r1_start)
-        .mapping_quality(60)
-        .cigar(&cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(r2_start)
-        .template_length(tlen)
-        .build();
+    let r1_flags = flags::PAIRED
+        | flags::FIRST_SEGMENT
+        | if r1_rev { flags::REVERSE } else { 0 }
+        | if r2_rev { flags::MATE_REVERSE } else { 0 };
 
-    let mut r2 = RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![quality; read_len])
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(r2_rev)
-        .mate_reverse_complement(r1_rev)
-        .reference_sequence_id(0)
-        .alignment_start(r2_start)
-        .mapping_quality(60)
-        .cigar(&cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(r1_start)
-        .template_length(-tlen)
-        .build();
+    let r2_flags = flags::PAIRED
+        | flags::LAST_SEGMENT
+        | if r2_rev { flags::REVERSE } else { 0 }
+        | if r1_rev { flags::MATE_REVERSE } else { 0 };
 
-    // Add MI tag
-    let mi = Tag::from(fgumi_lib::sam::SamTag::MI);
-    r1.data_mut().insert(mi, Value::from(mi_tag));
-    r2.data_mut().insert(mi, Value::from(mi_tag));
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(seq)
+            .qualities(&vec![quality; read_len])
+            .flags(r1_flags)
+            .ref_id(0)
+            .pos(r1_start - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(r2_start - 1)
+            .template_length(tlen)
+            .add_string_tag(b"MI", mi_tag.as_bytes());
+        b.build()
+    };
+
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(seq)
+            .qualities(&vec![quality; read_len])
+            .flags(r2_flags)
+            .ref_id(0)
+            .pos(r2_start - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(r1_start - 1)
+            .template_length(-tlen)
+            .add_string_tag(b"MI", mi_tag.as_bytes());
+        b.build()
+    };
 
     (r1, r2)
 }
 
 /// Create a BAM with duplex-grouped reads (MI tags with /A and /B strand suffixes).
-fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RecordBuf, RecordBuf)>>) {
+fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RawRecord, RawRecord)>>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
@@ -100,8 +103,12 @@ fn create_duplex_bam(path: &Path, molecules: Vec<Vec<(RecordBuf, RecordBuf)>>) {
 
     for pairs in molecules {
         for (r1, r2) in pairs {
-            writer.write_alignment_record(&header, &r1).expect("Failed to write R1");
-            writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
+            writer
+                .write_alignment_record(&header, &to_record_buf(&r1))
+                .expect("Failed to write R1");
+            writer
+                .write_alignment_record(&header, &to_record_buf(&r2))
+                .expect("Failed to write R2");
         }
     }
     writer.try_finish().expect("Failed to finish BAM");
@@ -112,9 +119,9 @@ fn create_duplex_molecule(
     mi_id: &str,
     sequence: &str,
     quality: u8,
-    ref_start: usize,
+    ref_start: i32,
     depth: usize,
-) -> Vec<(RecordBuf, RecordBuf)> {
+) -> Vec<(RawRecord, RawRecord)> {
     let mut molecule = Vec::new();
     for i in 0..depth {
         let (r1, r2) = create_duplex_read_pair(

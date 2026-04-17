@@ -1199,10 +1199,11 @@ impl Command for Zipper {
 mod tests {
     use super::*;
     use crate::sam::SamTag;
+    use crate::sam::TC_TAG;
     use crate::sam::builder::{
         MAPPED_PG_ID, REFERENCE_LENGTH, SamBuilder as FgSamBuilder, create_ref_dict,
     };
-    use crate::sam::{TC_TAG, TemplateCoordinateInfo};
+
     use anyhow::Result;
     use bstr::ByteSlice;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
@@ -2712,11 +2713,11 @@ mod tests {
             .expect("Should have supplementary in output");
 
         // Check pa tag was added
-        let pa_value =
+        let tc_value =
             supp_record.data().get(&TC_TAG).expect("Supplementary should have pa tag after merge");
 
         // Parse and verify the pa tag
-        let tc_info = TemplateCoordinateInfo::from_tag_value(pa_value)
+        let tc_info = TemplateCoordinateInfo::from_tag_value(tc_value)
             .expect("Should be able to parse pa tag");
 
         // pa tag should contain both primaries' unclipped 5' positions
