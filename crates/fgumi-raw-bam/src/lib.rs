@@ -13,6 +13,9 @@ pub mod tags;
 pub mod testutil;
 
 #[cfg(feature = "noodles")]
+pub mod indexed_reader;
+
+#[cfg(feature = "noodles")]
 pub mod noodles_compat;
 
 // Re-exports — callers use fgumi_raw_bam::FooBar etc.
@@ -55,22 +58,39 @@ pub use fields::{
 };
 
 // -- builder --
-pub use builder::UnmappedBamRecordBuilder;
+pub use builder::{SamBuilder, UnmappedSamBuilder};
 
 // -- cigar --
 pub use cigar::{
-    alignment_end_from_raw, alignment_start_from_raw, cigar_op_kind, cigar_to_string_from_raw,
-    clip_cigar_ops_raw, consumes_query, consumes_read, consumes_ref, get_cigar_ops,
-    mate_unclipped_5prime, mate_unclipped_5prime_1based, query_length_from_cigar,
-    read_pos_at_ref_pos_raw, reference_length_from_cigar, reference_length_from_raw_bam,
-    unclipped_5prime_from_raw_bam, unclipped_5prime_raw,
+    // -- typed CIGAR iteration --
+    CigarKind,
+    CigarOp,
+    alignment_end_from_raw,
+    alignment_start_from_raw,
+    cigar_op_kind,
+    cigar_to_string_from_raw,
+    clip_cigar_ops_raw,
+    consumes_query,
+    consumes_read,
+    consumes_ref,
+    get_cigar_ops,
+    mate_unclipped_5prime,
+    mate_unclipped_5prime_1based,
+    query_length_from_cigar,
+    read_pos_at_ref_pos_raw,
+    reference_length_from_cigar,
+    reference_length_from_raw_bam,
+    unclipped_5prime_from_raw_bam,
+    unclipped_5prime_raw,
 };
 
 // -- overlap --
 pub use overlap::{is_fr_pair_raw, num_bases_extending_past_mate_raw};
 
 // -- raw_bam_record --
-pub use raw_bam_record::{RawBamReader, RawRecord, read_raw_record};
+pub use raw_bam_record::{
+    RawBamReader, RawBamWriter, RawRecord, read_raw_record, write_raw_record, write_raw_records,
+};
 
 // -- sequence --
 pub use sequence::{
@@ -84,7 +104,7 @@ pub use sort::{compare_coordinate_raw, compare_names_raw, compare_queryname_raw,
 // -- tags --
 pub use tags::{
     ArrayTagRef, AuxStringTags, AuxTagsIter, RawTagsEditor, RawTagsMut, RawTagsView, TagEntry,
-    TemplateAuxTags, append_i32_array_tag, append_signed_int_tag, array_tag_element_u16,
+    TagValue, TemplateAuxTags, append_i32_array_tag, append_signed_int_tag, array_tag_element_u16,
     array_tag_to_vec_u16, extract_aux_string_tags, extract_template_aux_tags, find_array_tag,
     find_float_tag, find_int_tag, find_mc_tag_in_record, find_string_tag,
     find_string_tag_in_record, find_tag_type, find_uint8_tag, normalize_int_tag_to_smallest_signed,
@@ -97,3 +117,6 @@ pub use testutil::*;
 
 #[cfg(feature = "noodles")]
 pub use noodles_compat::*;
+
+#[cfg(feature = "noodles")]
+pub use indexed_reader::{IndexedRawBamReader, RawQueryIter, UnmappedIter};

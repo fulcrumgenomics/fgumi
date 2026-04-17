@@ -84,7 +84,7 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedSamBuilder, flags};
 use noodles::sam::alignment::record::data::field::Tag;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -284,7 +284,7 @@ pub struct CodecConsensusCaller {
     ss_caller: VanillaUmiConsensusCaller,
 
     /// Reusable builder for raw-byte BAM record output
-    bam_builder: UnmappedBamRecordBuilder,
+    bam_builder: UnmappedSamBuilder,
 
     /// Whether to store rejected reads (raw bytes) for output
     track_rejects: bool,
@@ -350,7 +350,7 @@ impl CodecConsensusCaller {
             rng,
             consensus_counter: 0,
             ss_caller,
-            bam_builder: UnmappedBamRecordBuilder::new(),
+            bam_builder: UnmappedSamBuilder::new(),
             track_rejects: false,
             rejected_reads: Vec::new(),
         }

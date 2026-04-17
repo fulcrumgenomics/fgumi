@@ -31,7 +31,7 @@ use crate::validation::validate_file_exists;
 use anyhow::{Result, bail, ensure};
 use bstr::{BString, ByteSlice};
 use clap::Parser;
-use fgumi_raw_bam::UnmappedBamRecordBuilder;
+use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
 use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
@@ -769,7 +769,7 @@ impl Extract {
 
     /// Write raw BAM records from a read set directly to a writer.
     ///
-    /// Uses `UnmappedBamRecordBuilder` to construct records as raw bytes,
+    /// Uses `UnmappedSamBuilder` to construct records as raw bytes,
     /// bypassing `RecordBuf` allocation and encoding overhead.
     ///
     /// Returns the number of records written.
@@ -778,7 +778,7 @@ impl Extract {
         &self,
         read_set: &FastqSet,
         encoding: QualityEncoding,
-        builder: &mut UnmappedBamRecordBuilder,
+        builder: &mut UnmappedSamBuilder,
         writer: &mut RawBamWriter,
     ) -> Result<u64> {
         let templates: Vec<&FastqSegment> = read_set.template_segments().collect();
@@ -924,7 +924,7 @@ impl Extract {
     ) -> Result<u64> {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
         let mut read_pair_count: u64 = 0;
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
 
         loop {
             let mut next_read_sets = Vec::with_capacity(fq_iterators.len());
@@ -1170,7 +1170,7 @@ fn make_raw_records_static(
     };
 
     let num_templates = templates.len();
-    let mut builder = UnmappedBamRecordBuilder::new();
+    let mut builder = UnmappedSamBuilder::new();
     let mut data = Vec::new();
 
     for (index, template) in templates.iter().enumerate() {

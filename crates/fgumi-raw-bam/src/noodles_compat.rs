@@ -54,6 +54,155 @@ pub fn simplify_cigar_from_raw(
     simplified
 }
 
+/// Length of the 4-byte little-endian `block_size` prefix in the BAM framing protocol.
+///
+/// When `noodles::bam::io::Writer<Vec<u8>>` writes a record it prepends a `u32` `block_size`
+/// field before the record payload.  This constant names that prefix so it can be stripped.
+const BLOCK_SIZE_PREFIX_LEN: usize = 4;
+
+/// Encode a single `RecordBuf` to raw BAM bytes and wrap in a [`RawRecord`].
+///
+/// Uses noodles' BAM writer machinery writing to an in-memory buffer to produce
+/// the record's binary representation. The 4-byte `block_size` prefix written
+/// by the BAM framing protocol is stripped so the returned `RawRecord` contains
+/// only the record payload bytes (matching the layout of records produced by
+/// [`raw_records_to_record_bufs`] and consumed by [`RawRecord`] field accessors).
+///
+/// # Errors
+///
+/// Returns an error if encoding fails (e.g., the record contains an invalid
+/// reference-sequence ID or alignment position for the given `header`).
+pub fn encode_record_buf_to_raw(
+    buf: &noodles::sam::alignment::RecordBuf,
+    header: &noodles::sam::Header,
+) -> anyhow::Result<crate::RawRecord> {
+    use noodles::sam::alignment::io::Write as _;
+
+    // Writer<Vec<u8>> is uncompressed — writes 4-byte block_size + record bytes.
+    let mut writer = noodles::bam::io::Writer::from(Vec::new());
+    writer
+        .write_alignment_record(header, buf)
+        .map_err(|e| anyhow::anyhow!("encode_record_buf_to_raw: {e}"))?;
+    let raw = writer.into_inner();
+
+    // Skip the 4-byte little-endian block_size prefix to get the record bytes.
+    anyhow::ensure!(
+        raw.len() >= BLOCK_SIZE_PREFIX_LEN,
+        "encode_record_buf_to_raw: encoded output too short ({} bytes)",
+        raw.len()
+    );
+    Ok(crate::RawRecord::from(raw[BLOCK_SIZE_PREFIX_LEN..].to_vec()))
+}
+
+/// Decode a single raw BAM record to a noodles `RecordBuf`.
+///
+/// Convenience wrapper around [`raw_records_to_record_bufs`] for the single-record
+/// case.
+///
+/// # Errors
+///
+/// Returns an error if the record bytes cannot be decoded (e.g., malformed
+/// binary data).
+pub fn raw_record_to_record_buf(
+    rec: &crate::RawRecord,
+    _header: &noodles::sam::Header,
+) -> anyhow::Result<noodles::sam::alignment::RecordBuf> {
+    let mut bufs = raw_records_to_record_bufs(&[rec.as_ref().to_vec()])?;
+    bufs.pop().ok_or_else(|| anyhow::anyhow!("raw_record_to_record_buf: no record decoded"))
+}
+
+/// Amortized `RecordBuf` → `RawRecord` encoder.
+///
+/// Holds a reference to the SAM header and an internal scratch `Vec<u8>` so
+/// that per-call allocations for the encoded output are avoided.  The scratch
+/// buffer is reused on every call to [`encode`] and [`encode_into`].
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let mut enc = RecordBufEncoder::new(&header);
+/// for record in records {
+///     let raw = enc.encode(&record)?;
+///     // use raw …
+/// }
+/// ```
+pub struct RecordBufEncoder<'h> {
+    header: &'h noodles::sam::Header,
+    /// Scratch buffer reused across encode calls to amortize allocations.
+    scratch: Vec<u8>,
+}
+
+impl<'h> RecordBufEncoder<'h> {
+    /// Creates a new encoder that encodes against `header`.
+    #[must_use]
+    pub fn new(header: &'h noodles::sam::Header) -> Self {
+        Self { header, scratch: Vec::with_capacity(512) }
+    }
+
+    /// Encode `buf` into a freshly-allocated [`RawRecord`].
+    ///
+    /// The internal scratch buffer is reused for the encoding step, so no
+    /// allocation is needed there.  The returned [`RawRecord`] owns its bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails.
+    pub fn encode(
+        &mut self,
+        buf: &noodles::sam::alignment::RecordBuf,
+    ) -> anyhow::Result<crate::RawRecord> {
+        use noodles::sam::alignment::io::Write as _;
+
+        self.scratch.clear();
+        let mut writer = noodles::bam::io::Writer::from(&mut self.scratch);
+        writer
+            .write_alignment_record(self.header, buf)
+            .map_err(|e| anyhow::anyhow!("RecordBufEncoder::encode: {e}"))?;
+
+        // Skip the 4-byte block_size prefix.
+        anyhow::ensure!(
+            self.scratch.len() >= BLOCK_SIZE_PREFIX_LEN,
+            "RecordBufEncoder::encode: encoded output too short ({} bytes)",
+            self.scratch.len()
+        );
+        Ok(crate::RawRecord::from(self.scratch[BLOCK_SIZE_PREFIX_LEN..].to_vec()))
+    }
+
+    /// Encode `buf` into the caller-supplied `out` [`RawRecord`], replacing its
+    /// contents.
+    ///
+    /// Reuses both the internal scratch buffer and the storage inside `out` to
+    /// minimise allocations per call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails.
+    pub fn encode_into(
+        &mut self,
+        buf: &noodles::sam::alignment::RecordBuf,
+        out: &mut crate::RawRecord,
+    ) -> anyhow::Result<()> {
+        use noodles::sam::alignment::io::Write as _;
+
+        self.scratch.clear();
+        let mut writer = noodles::bam::io::Writer::from(&mut self.scratch);
+        writer
+            .write_alignment_record(self.header, buf)
+            .map_err(|e| anyhow::anyhow!("RecordBufEncoder::encode_into: {e}"))?;
+
+        // Skip the 4-byte block_size prefix.
+        anyhow::ensure!(
+            self.scratch.len() >= BLOCK_SIZE_PREFIX_LEN,
+            "RecordBufEncoder::encode_into: encoded output too short ({} bytes)",
+            self.scratch.len()
+        );
+        let out_vec = out.as_mut_vec();
+        out_vec.clear();
+        out_vec.extend_from_slice(&self.scratch[BLOCK_SIZE_PREFIX_LEN..]);
+        Ok(())
+    }
+}
+
 /// Decode raw BAM byte records to noodles `RecordBuf`.
 ///
 /// This is a temporary bridge for consensus callers (duplex, codec) that still
@@ -216,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_raw_records_to_record_bufs_single() {
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"read1", 0, b"ACGT", &[30, 25, 20, 15]);
         builder.append_string_tag(b"MI", b"1");
         let raw = builder.as_bytes().to_vec();
@@ -231,7 +380,7 @@ mod tests {
     fn test_raw_records_to_record_bufs_multiple() {
         let mut records = Vec::new();
         for i in 0..3 {
-            let mut builder = UnmappedBamRecordBuilder::new();
+            let mut builder = UnmappedSamBuilder::new();
             let name = format!("read{i}");
             builder.build_record(name.as_bytes(), 0, b"AC", &[30, 25]);
             records.push(builder.as_bytes().to_vec());
@@ -251,5 +400,104 @@ mod tests {
         let bufs =
             raw_records_to_record_bufs(&[]).expect("converting empty record list should succeed");
         assert!(bufs.is_empty());
+    }
+
+    // ========================================================================
+    // encode_record_buf_to_raw / raw_record_to_record_buf round-trip tests
+    // ========================================================================
+
+    #[test]
+    fn test_encode_record_buf_to_raw_single() {
+        let mut builder = UnmappedSamBuilder::new();
+        builder.build_record(b"read1", 0, b"ACGT", &[30, 25, 20, 15]);
+        builder.append_string_tag(b"MI", b"1");
+        let original_raw = crate::RawRecord::from(builder.as_bytes().to_vec());
+
+        // Decode to RecordBuf then re-encode and compare field-by-field.
+        let header = noodles::sam::Header::default();
+        let buf = raw_records_to_record_bufs(&[original_raw.as_ref().to_vec()])
+            .expect("decode should succeed")
+            .pop()
+            .expect("should have one record");
+
+        let reencoded = encode_record_buf_to_raw(&buf, &header)
+            .expect("encode_record_buf_to_raw should succeed");
+        assert_eq!(reencoded.as_ref(), original_raw.as_ref());
+    }
+
+    #[test]
+    fn test_raw_record_to_record_buf_single() {
+        let mut builder = UnmappedSamBuilder::new();
+        builder.build_record(b"myread", 0, b"GCTA", &[40, 30, 20, 10]);
+        let raw = crate::RawRecord::from(builder.as_bytes().to_vec());
+
+        let header = noodles::sam::Header::default();
+        let buf = raw_record_to_record_buf(&raw, &header)
+            .expect("raw_record_to_record_buf should succeed");
+        assert_eq!(buf.name().map(std::convert::AsRef::as_ref), Some(b"myread".as_ref()));
+    }
+
+    // ========================================================================
+    // RecordBufEncoder tests
+    // ========================================================================
+
+    #[test]
+    fn test_record_buf_encoder_encode() {
+        let mut builder = UnmappedSamBuilder::new();
+        builder.build_record(b"enc1", 0, b"TTTT", &[20, 20, 20, 20]);
+        let original_raw = crate::RawRecord::from(builder.as_bytes().to_vec());
+
+        let header = noodles::sam::Header::default();
+        let buf = raw_records_to_record_bufs(&[original_raw.as_ref().to_vec()])
+            .expect("decode should succeed")
+            .pop()
+            .expect("one record");
+
+        let mut enc = RecordBufEncoder::new(&header);
+        let result = enc.encode(&buf).expect("encode should succeed");
+        assert_eq!(result.as_ref(), original_raw.as_ref());
+    }
+
+    #[test]
+    fn test_record_buf_encoder_encode_into() {
+        let mut builder = UnmappedSamBuilder::new();
+        builder.build_record(b"enc2", 0, b"CCCC", &[10, 10, 10, 10]);
+        let original_raw = crate::RawRecord::from(builder.as_bytes().to_vec());
+
+        let header = noodles::sam::Header::default();
+        let buf = raw_records_to_record_bufs(&[original_raw.as_ref().to_vec()])
+            .expect("decode should succeed")
+            .pop()
+            .expect("one record");
+
+        let mut encoder = RecordBufEncoder::new(&header);
+        let mut out = crate::RawRecord::new();
+        encoder.encode_into(&buf, &mut out).expect("encode_into should succeed");
+        assert_eq!(out.as_ref(), original_raw.as_ref());
+    }
+
+    #[test]
+    fn test_record_buf_encoder_encode_into_reuses_buffer() {
+        // Encodes two records into the same `out` RawRecord to verify reuse.
+        let header = noodles::sam::Header::default();
+        let mut encoder = RecordBufEncoder::new(&header);
+        let mut out = crate::RawRecord::new();
+
+        for name in &[b"aa" as &[u8], b"bb"] {
+            let mut builder = UnmappedSamBuilder::new();
+            builder.build_record(name, 0, b"AC", &[30, 25]);
+            let raw = crate::RawRecord::from(builder.as_bytes().to_vec());
+            let buf = raw_records_to_record_bufs(&[raw.as_ref().to_vec()])
+                .expect("decode should succeed")
+                .pop()
+                .expect("one record");
+            encoder.encode_into(&buf, &mut out).expect("encode_into should succeed");
+            // Verify round-trip: re-decode the encoded bytes and check name.
+            let decoded = raw_records_to_record_bufs(&[out.as_ref().to_vec()])
+                .expect("re-decode should succeed")
+                .pop()
+                .expect("one record");
+            assert_eq!(decoded.name().map(AsRef::as_ref), Some(*name));
+        }
     }
 }

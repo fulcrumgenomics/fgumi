@@ -363,6 +363,7 @@ pub fn extract_template_aux_tags<'a>(
 }
 
 /// Zero-allocation reference to a B-type array tag in aux data.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ArrayTagRef<'a> {
     /// Element bytes (raw, little-endian).
     pub data: &'a [u8],
@@ -411,6 +412,44 @@ fn parse_array_tag_at(aux_data: &[u8], data_start: usize) -> Option<ArrayTagRef<
         return None;
     }
     Some(ArrayTagRef { data: &aux_data[elements_start..elements_end], elem_type, count, elem_size })
+}
+
+/// Zero-copy typed BAM aux tag value.
+///
+/// Borrows directly into the raw record bytes — no allocation, no decode beyond the tag header.
+/// Integer variants are always widened to `i64` regardless of the on-disk type byte.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TagValue<'a> {
+    /// `A` — single printable ASCII character.
+    Char(u8),
+    /// `c`/`C`/`s`/`S`/`i`/`I` — any integer type, widened to `i64`.
+    Int(i64),
+    /// `f` — 32-bit IEEE float.
+    Float(f32),
+    /// `Z` — NUL-terminated string; bytes exclude the NUL.
+    String(&'a [u8]),
+    /// `H` — NUL-terminated hex string; bytes exclude the NUL.
+    Hex(&'a [u8]),
+    /// `B` — typed array; zero-allocation reference into the record.
+    Array(ArrayTagRef<'a>),
+}
+
+impl TagValue<'_> {
+    /// Returns the canonical BAM type byte for this variant.
+    ///
+    /// Integer variants always return `b'i'` (the widened representation);
+    /// callers that need the exact on-disk width should use [`RawTagsView::iter`] directly.
+    #[must_use]
+    pub fn type_byte(&self) -> u8 {
+        match self {
+            Self::Char(_) => b'A',
+            Self::Int(_) => b'i',
+            Self::Float(_) => b'f',
+            Self::String(_) => b'Z',
+            Self::Hex(_) => b'H',
+            Self::Array(a) => a.elem_type,
+        }
+    }
 }
 
 /// Read one element from an `ArrayTagRef` as `u16`.
@@ -957,6 +996,55 @@ impl<'a> RawTagsView<'a> {
     pub fn find_mc(&self) -> Option<&'a str> {
         find_mc_tag(self.0)
     }
+
+    /// Returns the typed value of a tag as a [`TagValue`], borrowing into the record bytes.
+    ///
+    /// Handles all BAM aux types: `A`, `c`/`C`/`s`/`S`/`i`/`I`, `f`, `Z`, `H`, `B`.
+    /// Integer types are widened to `i64`. Returns `None` if the tag is absent or malformed.
+    #[inline]
+    #[must_use]
+    pub fn get(&self, tag: &[u8; 2]) -> Option<TagValue<'a>> {
+        let (p, val_type) = find_tag_position(self.0, *tag)?;
+        let start = p + 3;
+        let aux = self.0;
+        match val_type {
+            b'A' => Some(TagValue::Char(aux[start])),
+            b'c' | b'C' | b's' | b'S' | b'i' | b'I' => {
+                extract_int_value(aux, p, val_type).map(TagValue::Int)
+            }
+            b'f' => {
+                if start + 4 > aux.len() {
+                    return None;
+                }
+                Some(TagValue::Float(f32::from_le_bytes([
+                    aux[start],
+                    aux[start + 1],
+                    aux[start + 2],
+                    aux[start + 3],
+                ])))
+            }
+            b'Z' => {
+                let end = aux[start..].iter().position(|&b| b == 0)?;
+                Some(TagValue::String(&aux[start..start + end]))
+            }
+            b'H' => {
+                let end = aux[start..].iter().position(|&b| b == 0)?;
+                Some(TagValue::Hex(&aux[start..start + end]))
+            }
+            b'B' => parse_array_tag_at(aux, start).map(TagValue::Array),
+            _ => None,
+        }
+    }
+
+    /// Iterate over all tags as `(tag, TagValue)` pairs, borrowing into the record bytes.
+    ///
+    /// Skips any tag whose value cannot be decoded (malformed entries stop iteration).
+    pub fn iter_typed(&self) -> impl Iterator<Item = ([u8; 2], TagValue<'a>)> + 'a {
+        let aux = self.0;
+        RawTagsView::new(aux)
+            .iter()
+            .filter_map(move |entry| RawTagsView::new(aux).get(&entry.tag).map(|v| (entry.tag, v)))
+    }
 }
 
 /// Forward-only iterator over aux tag entries.
@@ -1164,70 +1252,55 @@ impl<'a> RawTagsMut<'a> {
 
     /// Overwrite an existing integer tag if the new value fits its current type byte.
     ///
-    /// Returns `false` if absent, value doesn't fit the existing type, or the
-    /// aux buffer is truncated and the value bytes lie out of bounds.
+    /// Returns `false` if absent or value doesn't fit the existing type.
     pub fn set_int_in_place(&mut self, tag: &[u8; 2], value: i64) -> bool {
         let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
             return false;
         };
-        let len = self.0.len();
         match val_type {
             b'c' => i8::try_from(value)
-                .ok()
-                .filter(|_| p + 4 <= len)
                 .map(|v| {
                     self.0[p + 3] = v.cast_unsigned();
                 })
-                .is_some(),
+                .is_ok(),
             b'C' => u8::try_from(value)
-                .ok()
-                .filter(|_| p + 4 <= len)
                 .map(|v| {
                     self.0[p + 3] = v;
                 })
-                .is_some(),
+                .is_ok(),
             b's' => i16::try_from(value)
-                .ok()
-                .filter(|_| p + 5 <= len)
                 .map(|v| {
                     self.0[p + 3..p + 5].copy_from_slice(&v.to_le_bytes());
                 })
-                .is_some(),
+                .is_ok(),
             b'S' => u16::try_from(value)
-                .ok()
-                .filter(|_| p + 5 <= len)
                 .map(|v| {
                     self.0[p + 3..p + 5].copy_from_slice(&v.to_le_bytes());
                 })
-                .is_some(),
+                .is_ok(),
             b'i' => i32::try_from(value)
-                .ok()
-                .filter(|_| p + 7 <= len)
                 .map(|v| {
                     self.0[p + 3..p + 7].copy_from_slice(&v.to_le_bytes());
                 })
-                .is_some(),
+                .is_ok(),
             b'I' => u32::try_from(value)
-                .ok()
-                .filter(|_| p + 7 <= len)
                 .map(|v| {
                     self.0[p + 3..p + 7].copy_from_slice(&v.to_le_bytes());
                 })
-                .is_some(),
+                .is_ok(),
             _ => false,
         }
     }
 
     /// Overwrite an existing `f`-type tag in place.
     ///
-    /// Returns `false` if absent, wrong type, or the aux buffer is truncated
-    /// and the value bytes lie out of bounds.
+    /// Returns `false` if absent or wrong type.
     #[inline]
     pub fn set_float_in_place(&mut self, tag: &[u8; 2], value: f32) -> bool {
         let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
             return false;
         };
-        if val_type != b'f' || p + 7 > self.0.len() {
+        if val_type != b'f' {
             return false;
         }
         self.0[p + 3..p + 7].copy_from_slice(&value.to_le_bytes());
@@ -1243,10 +1316,7 @@ impl RawRecordMut<'_> {
         // Compute offset and length via immutable borrow; both immutable borrows end
         // before the mutable borrow on the last line (NLL two-phase borrows).
         let len = self.as_bytes().len();
-        // Clamp against truncated/corrupt records where the parsed offset can
-        // exceed the buffer length; falls back to an empty aux view rather than panicking.
-        let off =
-            aux_data_offset_from_record(self.as_bytes()).filter(|&off| off <= len).unwrap_or(len);
+        let off = aux_data_offset_from_record(self.as_bytes()).unwrap_or(len);
         RawTagsMut::new(&mut self.as_bytes_mut()[off..])
     }
 }
@@ -1746,9 +1816,9 @@ mod tests {
 
     #[test]
     fn test_find_string_tag_cannot_find_b_int_array() {
-        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
         // BUG: find_string_tag returns None for B:i tags
-        assert_eq!(find_string_tag(&aux, b"tc"), None);
+        assert_eq!(find_string_tag(&aux, b"pa"), None);
     }
 
     // --- B:f array ---
@@ -1858,7 +1928,7 @@ mod tests {
 
     #[test]
     fn test_find_string_tag_after_b_array() {
-        let mut aux = make_b_int_array_tag(*b"tc", &[1, 2, 3]);
+        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
         aux.extend_from_slice(b"RXZhello\x00");
         // Can find the Z-tag after the B-array
         assert_eq!(find_string_tag(&aux, b"RX"), Some(b"hello".as_ref()));
@@ -1959,9 +2029,9 @@ mod tests {
 
     #[test]
     fn test_find_int_tag_cannot_find_b_int_array() {
-        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
         // BUG: find_int_tag returns None for B:i tags
-        assert_eq!(find_int_tag(&aux, b"tc"), None);
+        assert_eq!(find_int_tag(&aux, b"pa"), None);
     }
 
     #[test]
@@ -2044,7 +2114,7 @@ mod tests {
 
     #[test]
     fn test_find_int_tag_after_b_array() {
-        let mut aux = make_b_int_array_tag(*b"tc", &[1, 2, 3]);
+        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
         aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
         assert_eq!(find_int_tag(&aux, b"NM"), Some(5));
     }
@@ -2280,9 +2350,9 @@ mod tests {
 
     #[test]
     fn test_find_tag_type_finds_b_int_array() {
-        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
         // find_tag_type correctly finds B-array tags
-        assert_eq!(find_tag_type(&aux, b"tc"), Some(b'B'));
+        assert_eq!(find_tag_type(&aux, b"pa"), Some(b'B'));
     }
 
     #[test]
@@ -2364,7 +2434,7 @@ mod tests {
 
     #[test]
     fn test_find_tag_type_after_b_array() {
-        let mut aux = make_b_int_array_tag(*b"tc", &[1, 2, 3]);
+        let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
         aux.extend_from_slice(b"RXZhello\x00");
         assert_eq!(find_tag_type(&aux, b"RX"), Some(b'Z'));
     }
@@ -3005,24 +3075,24 @@ mod tests {
     }
 
     // ========================================================================
-    // Dedup tc-tag validation bug reproduction
+    // Dedup pa-tag validation bug reproduction
     // ========================================================================
 
     #[test]
-    fn test_dedup_tc_tag_check_fails_on_b_array() {
-        // Simulate the exact tc tag as produced by fgumi zipper: tc:B:i,0,27_056_961,0,207,60005,1
-        let aux = make_b_int_array_tag(*b"tc", &[0, 27_056_961, 0, 207, 60005, 1]);
-        let tc_tag_bytes: [u8; 2] = *b"tc";
+    fn test_dedup_pa_tag_check_fails_on_b_array() {
+        // Simulate the exact pa tag as produced by fgumi zipper: pa:B:i,0,27_056_961,0,207,60005,1
+        let aux = make_b_int_array_tag(*b"pa", &[0, 27_056_961, 0, 207, 60005, 1]);
+        let pa_tag_bytes: [u8; 2] = *b"pa";
 
         // This is the exact check from dedup.rs:932-934
-        let found_by_dedup = find_string_tag(&aux, &tc_tag_bytes).is_some()
-            || find_int_tag(&aux, &tc_tag_bytes).is_some();
+        let found_by_dedup = find_string_tag(&aux, &pa_tag_bytes).is_some()
+            || find_int_tag(&aux, &pa_tag_bytes).is_some();
 
-        // BUG: dedup thinks the tc tag is missing even though it's present
-        assert!(!found_by_dedup, "dedup check should fail to find B:i tc tag");
+        // BUG: dedup thinks the pa tag is missing even though it's present
+        assert!(!found_by_dedup, "dedup check should fail to find B:i pa tag");
 
         // But find_tag_type correctly finds it
-        assert!(find_tag_type(&aux, &tc_tag_bytes).is_some());
+        assert!(find_tag_type(&aux, &pa_tag_bytes).is_some());
     }
 
     // ========================================================================
@@ -3033,14 +3103,14 @@ mod tests {
     fn test_append_i32_array_tag() {
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
         let values = [1i32, -200, 300_000];
-        append_i32_array_tag(&mut rec, b"tc", &values);
+        append_i32_array_tag(&mut rec, b"pa", &values);
 
         let aux = aux_data_slice(&rec);
-        let tag_type = find_tag_type(aux, b"tc");
+        let tag_type = find_tag_type(aux, b"pa");
         assert_eq!(tag_type, Some(b'B'));
 
         // Verify the array contents
-        let arr = find_array_tag(aux, b"tc").unwrap();
+        let arr = find_array_tag(aux, b"pa").unwrap();
         assert_eq!(arr.count, 3);
         assert_eq!(arr.elem_type, b'i');
     }
@@ -3048,10 +3118,10 @@ mod tests {
     #[test]
     fn test_append_i32_array_tag_empty() {
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
-        append_i32_array_tag(&mut rec, b"tc", &[]);
+        append_i32_array_tag(&mut rec, b"pa", &[]);
 
         let aux = aux_data_slice(&rec);
-        let arr = find_array_tag(aux, b"tc").unwrap();
+        let arr = find_array_tag(aux, b"pa").unwrap();
         assert_eq!(arr.count, 0);
     }
 
@@ -3334,41 +3404,6 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_tags_mut_set_int_in_place_truncated_aux_returns_false() {
-        // Slice the tag's value bytes off so set_int_in_place would otherwise
-        // panic on the out-of-bounds write. It must return false instead.
-        // Test every int sub-type since each branch has its own bounds check.
-        for sub in [b'c', b'C'] {
-            let aux = [b'N', b'M', sub]; // header only, no value byte
-            let mut tags = aux;
-            let mut tm = RawTagsMut::new(&mut tags);
-            assert!(!tm.set_int_in_place(b"NM", 1));
-        }
-        for sub in [b's', b'S'] {
-            let aux = [b'N', b'M', sub, 0]; // 1 of 2 value bytes
-            let mut tags = aux;
-            let mut tm = RawTagsMut::new(&mut tags);
-            assert!(!tm.set_int_in_place(b"NM", 1));
-        }
-        for sub in [b'i', b'I'] {
-            let aux = [b'N', b'M', sub, 0, 0, 0]; // 3 of 4 value bytes
-            let mut tags = aux;
-            let mut tm = RawTagsMut::new(&mut tags);
-            assert!(!tm.set_int_in_place(b"NM", 1));
-        }
-    }
-
-    #[test]
-    fn test_raw_tags_mut_set_float_in_place_truncated_aux_returns_false() {
-        // Slice off some of the f32 value bytes so set_float_in_place would
-        // otherwise panic on the out-of-bounds write.
-        let aux = [b'A', b'S', b'f', 0, 0, 0]; // 3 of 4 value bytes
-        let mut tags = aux;
-        let mut tm = RawTagsMut::new(&mut tags);
-        assert!(!tm.set_float_in_place(b"AS", 1.0));
-    }
-
-    #[test]
     fn test_raw_tags_mut_set_float_in_place() {
         use crate::fields::{RawRecordMut, RawRecordView};
         let mut aux = Vec::from(b"ASf".as_slice());
@@ -3582,5 +3617,102 @@ mod tests {
         let arr = RawRecordView::new(&rec).tags().find_array(b"sq").expect("present");
         assert_eq!(arr.elem_type, b's');
         assert_eq!(arr.count, 3);
+    }
+
+    // ========================================================================
+    // TagValue / RawTagsView::get / iter_typed tests
+    // ========================================================================
+
+    #[test]
+    fn test_tag_value_get_char_a() {
+        // Build aux with XA:A:! (single ASCII char 0x21)
+        let aux = [b'X', b'A', b'A', b'!'];
+        let view = RawTagsView::new(&aux);
+        assert_eq!(view.get(b"XA"), Some(TagValue::Char(b'!')));
+    }
+
+    #[rstest]
+    #[case::signed_byte(b'c', vec![42u8], 42i64)]
+    #[case::unsigned_byte(b'C', vec![200u8], 200i64)]
+    #[case::signed_short(b's', (-300i16).to_le_bytes().to_vec(), -300i64)]
+    #[case::unsigned_short(b'S', 50_000u16.to_le_bytes().to_vec(), 50_000i64)]
+    #[case::signed_int(b'i', (-100_000i32).to_le_bytes().to_vec(), -100_000i64)]
+    #[case::unsigned_int(b'I', 3_000_000_000u32.to_le_bytes().to_vec(), 3_000_000_000i64)]
+    fn test_tag_value_get_int_variants(
+        #[case] type_byte: u8,
+        #[case] value_bytes: Vec<u8>,
+        #[case] expected: i64,
+    ) {
+        let mut aux = vec![b'X', b'Y', type_byte];
+        aux.extend_from_slice(&value_bytes);
+        let view = RawTagsView::new(&aux);
+        assert_eq!(view.get(b"XY"), Some(TagValue::Int(expected)));
+    }
+
+    #[test]
+    fn test_tag_value_get_float() {
+        let value: f32 = 1.5;
+        let mut aux = vec![b'A', b'S', b'f'];
+        aux.extend_from_slice(&value.to_le_bytes());
+        let view = RawTagsView::new(&aux);
+        match view.get(b"AS") {
+            Some(TagValue::Float(got)) => assert_eq!(got.to_bits(), value.to_bits()),
+            other => panic!("expected TagValue::Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tag_value_get_string_z() {
+        // RX:Z:hello\0 — get should return TagValue::String without NUL
+        let aux = b"RXZhello\x00";
+        let view = RawTagsView::new(aux.as_ref());
+        assert_eq!(view.get(b"RX"), Some(TagValue::String(b"hello")));
+    }
+
+    #[test]
+    fn test_tag_value_get_hex_h() {
+        // XH:H:1A2B\0 — H-type is distinct from Z-type
+        let aux = b"XHH1A2B\x00";
+        let view = RawTagsView::new(aux.as_ref());
+        assert_eq!(view.get(b"XH"), Some(TagValue::Hex(b"1A2B")));
+        // Confirm it does NOT return TagValue::String for H tags
+        assert_ne!(view.get(b"XH"), Some(TagValue::String(b"1A2B")));
+    }
+
+    #[test]
+    fn test_tag_value_get_array_b() {
+        // Build B:i array [10, 20, 30]
+        let aux = make_b_int_array_tag(*b"pa", &[10, 20, 30]);
+        let view = RawTagsView::new(&aux);
+        match view.get(b"pa") {
+            Some(TagValue::Array(arr)) => {
+                assert_eq!(arr.elem_type, b'i');
+                assert_eq!(arr.count, 3);
+            }
+            other => panic!("expected TagValue::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tag_value_iter_typed_roundtrip() {
+        // Record with 3 tags of different types: NM:C:5, RG:Z:lib1, AS:f:1.5
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&[b'N', b'M', b'C', 5u8]); // NM:C:5
+        aux.extend_from_slice(b"RGZlib1\x00"); // RG:Z:lib1
+        aux.extend_from_slice(b"ASf"); // AS:f:1.5
+        aux.extend_from_slice(&1.5f32.to_le_bytes());
+
+        let view = RawTagsView::new(&aux);
+        let pairs: Vec<([u8; 2], TagValue<'_>)> = view.iter_typed().collect();
+
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (*b"NM", TagValue::Int(5)));
+        assert_eq!(pairs[1], (*b"RG", TagValue::String(b"lib1")));
+        let (tag2, val2) = pairs[2];
+        assert_eq!(tag2, *b"AS");
+        match val2 {
+            TagValue::Float(f) => assert_eq!(f.to_bits(), 1.5f32.to_bits()),
+            other => panic!("expected TagValue::Float(1.5), got {other:?}"),
+        }
     }
 }

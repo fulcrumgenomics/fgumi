@@ -13,7 +13,7 @@ use crate::phred::{
 use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{RawRecordView, UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 #[cfg(test)]
@@ -376,7 +376,7 @@ pub struct VanillaUmiConsensusCaller {
     single_input_consensus_quals: Vec<u8>,
 
     /// Reusable builder for raw-byte BAM record construction.
-    bam_builder: UnmappedBamRecordBuilder,
+    bam_builder: UnmappedSamBuilder,
 
     /// Optional reference genome for EM-Seq methylation annotation.
     reference: Option<std::sync::Arc<dyn crate::methylation::RefBaseProvider + Send + Sync>>,
@@ -444,7 +444,7 @@ impl VanillaUmiConsensusCaller {
             rejected_reads: Vec::new(),
             track_rejects,
             single_input_consensus_quals,
-            bam_builder: UnmappedBamRecordBuilder::new(),
+            bam_builder: UnmappedSamBuilder::new(),
             reference: None,
             ref_names: None,
         }
