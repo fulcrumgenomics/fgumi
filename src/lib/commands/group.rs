@@ -13,6 +13,7 @@ use crate::grouper::{
 };
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
 use crate::read_info::{LibraryIndex, compute_group_key};
 use crate::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
@@ -29,7 +30,6 @@ use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use parking_lot::Mutex;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
@@ -86,26 +86,6 @@ impl GroupMetricsAccumulator {
         }
         self.filter_metrics.merge(filter_metrics);
     }
-}
-
-// Thread-slot assignment for [`GroupMetricsAccumulator`] lookup. Each worker
-// thread lazily claims a slot index from a process-wide counter and caches it
-// in TLS; callers wrap via `% num_slots`, so reused threads and counter growth
-// across test runs stay correct (collisions just share a slot).
-static GROUP_SLOT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-std::thread_local! {
-    static GROUP_SLOT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-#[inline]
-fn group_thread_slot(num_slots: usize) -> usize {
-    GROUP_SLOT.with(|c| {
-        c.get().unwrap_or_else(|| {
-            let s = GROUP_SLOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            c.set(Some(s));
-            s
-        })
-    }) % num_slots.max(1)
 }
 
 /// Configuration for template filtering during group processing.
@@ -1071,11 +1051,7 @@ impl Command for GroupReadsByUmi {
         // so retained memory is O(threads × distinct sizes) rather than growing
         // one hashmap per position group (see issue #285).
         let num_threads = self.threading.num_threads();
-        let accumulators: Arc<Vec<Mutex<GroupMetricsAccumulator>>> = Arc::new(
-            (0..num_threads.max(1))
-                .map(|_| Mutex::new(GroupMetricsAccumulator::default()))
-                .collect(),
-        );
+        let accumulators = PerThreadAccumulator::<GroupMetricsAccumulator>::new(num_threads);
 
         // Clone values needed by closures
         let strategy = effective_strategy;
@@ -1414,10 +1390,9 @@ impl Command for GroupReadsByUmi {
                 // Merge per-group metrics into this worker's accumulator slot.
                 // Memory stays O(threads × distinct sizes) instead of growing
                 // one hashmap per position group.
-                let slot = group_thread_slot(accumulators_clone.len());
-                accumulators_clone[slot]
-                    .lock()
-                    .record_group(processed.family_sizes, &processed.filter_metrics);
+                accumulators_clone.with_slot(|acc| {
+                    acc.record_group(processed.family_sizes, &processed.filter_metrics);
+                });
 
                 // Save input record count for progress tracking
                 let input_record_count = processed.input_record_count;
@@ -1555,7 +1530,7 @@ impl Command for GroupReadsByUmi {
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut total_filter_metrics = FilterMetrics::new();
 
-        for slot in accumulators.iter() {
+        for slot in accumulators.slots() {
             let acc = slot.lock();
             for (&size, &count) in &acc.family_sizes {
                 *family_size_counter.entry(size).or_insert(0) += count;
