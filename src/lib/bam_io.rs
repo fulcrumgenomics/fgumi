@@ -432,28 +432,6 @@ impl IndexingBamWriter {
         Ok(())
     }
 
-    /// Write a record buffer to the BAM file and update the index.
-    ///
-    /// This method encodes the record buffer to raw bytes using noodles' encoder,
-    /// then writes it. Useful for the non-fast sorting path that uses decoded records.
-    ///
-    /// # Errors
-    /// Returns an error if encoding or writing the record fails.
-    pub fn write_record_buf(
-        &mut self,
-        header: &Header,
-        record: &noodles::sam::alignment::record_buf::RecordBuf,
-    ) -> io::Result<()> {
-        use crate::vendored::bam_codec::encode_record_buf;
-
-        // Encode record to raw bytes
-        let mut buf = Vec::new();
-        encode_record_buf(&mut buf, header, record)?;
-
-        // Write using raw record method
-        self.write_raw_record(&buf)
-    }
-
     /// Process block completion notifications and resolve cached index entries.
     #[allow(clippy::cast_possible_truncation)]
     fn flush_completed_blocks(&mut self) -> io::Result<()> {

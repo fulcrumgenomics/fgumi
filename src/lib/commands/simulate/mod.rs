@@ -58,3 +58,44 @@ impl SimulateCommand {
         }
     }
 }
+
+/// Compute the BAM bin for an alignment range using SAM spec §5.3 reg2bin.
+///
+/// `start_1based` and `end_1based` are 1-based inclusive coordinates. Returns the
+/// SAM "unmapped bin" (4680) when either bound is `None`. Used by the simulate
+/// commands when constructing mapped BAM records via `fgumi_raw_bam::SamBuilder`,
+/// which does not compute the bin field automatically.
+///
+/// The bin layer constants `((1 << k) - 1) / 7` are written verbatim from the SAM
+/// specification reference C code; clippy's `eq_op` lint flags the smallest layer
+/// (`((1 << 3) - 1) / 7 == 7 / 7 == 1`) as a tautology, but we keep the form to
+/// stay textually identical to the spec.
+#[allow(clippy::eq_op, clippy::cast_possible_truncation)]
+#[must_use]
+pub fn region_to_bin(start_1based: Option<u32>, end_1based: Option<u32>) -> u16 {
+    /// SAM spec §4.2.1: `reg2bin(-1, 0)` = 4680.
+    const UNMAPPED_BIN: u16 = 4680;
+
+    let (Some(start_1), Some(end_1)) = (start_1based, end_1based) else {
+        return UNMAPPED_BIN;
+    };
+    let start = (start_1.saturating_sub(1)) as usize;
+    let end = (end_1.saturating_sub(1)) as usize;
+
+    let bin = if start >> 14 == end >> 14 {
+        ((1 << 15) - 1) / 7 + (start >> 14)
+    } else if start >> 17 == end >> 17 {
+        ((1 << 12) - 1) / 7 + (start >> 17)
+    } else if start >> 20 == end >> 20 {
+        ((1 << 9) - 1) / 7 + (start >> 20)
+    } else if start >> 23 == end >> 23 {
+        ((1 << 6) - 1) / 7 + (start >> 23)
+    } else if start >> 26 == end >> 26 {
+        ((1 << 3) - 1) / 7 + (start >> 26)
+    } else {
+        0
+    };
+
+    // Truncate overflowing bin IDs (matches noodles behaviour).
+    bin as u16
+}

@@ -34,8 +34,6 @@ pub mod codec_caller;
 #[cfg(feature = "simplex")]
 pub mod methylation;
 
-mod vendored;
-
 /// Methylation chemistry mode for consensus calling.
 ///
 /// Controls how C→T conversions at reference cytosine positions are interpreted

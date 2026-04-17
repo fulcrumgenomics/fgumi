@@ -1,18 +1,16 @@
 //! Generate BAM and includelist for correct.
 
-use crate::bam_io::create_bam_writer;
+use crate::bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::generate_random_sequence;
 use crate::progress::ProgressTracker;
-use crate::sam::builder::RecordBuilder;
 use crate::simulate::create_rng;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
@@ -99,8 +97,8 @@ pub struct CorrectReads {
 /// A generated read pair ready for output.
 struct CorrectReadPair {
     read_name: String,
-    r1_record: RecordBuf,
-    r2_record: RecordBuf,
+    r1_record: RawRecord,
+    r2_record: RawRecord,
     /// Truth data: (`true_umi`, `observed_umi`, `expected_correction`, `edit_distance`, `error_type`)
     truth: (String, String, String, usize, &'static str),
 }
@@ -215,8 +213,12 @@ impl Command for CorrectReads {
 
         // Spawn writer thread with multi-threaded BGZF compression
         let writer_handle = thread::spawn(move || -> Result<(u64, u64, u64, u64, u64)> {
-            let mut writer =
-                create_bam_writer(&output_path, &header_clone, writer_threads, compression_level)?;
+            let mut writer = create_raw_bam_writer(
+                &output_path,
+                &header_clone,
+                writer_threads,
+                compression_level,
+            )?;
 
             // Create truth file
             let truth_file = File::create(&truth_path)
@@ -240,8 +242,8 @@ impl Command for CorrectReads {
                 read_count += 1;
                 progress.log_if_needed(1);
 
-                writer.write_alignment_record(&header_clone, &pair.r1_record)?;
-                writer.write_alignment_record(&header_clone, &pair.r2_record)?;
+                writer.write_raw_record(pair.r1_record.as_ref())?;
+                writer.write_raw_record(pair.r2_record.as_ref())?;
 
                 // Count error types
                 let (true_umi, observed_umi, expected_correction, edit_distance, error_type) =
@@ -264,6 +266,7 @@ impl Command for CorrectReads {
 
             progress.log_final();
             truth_writer.flush()?;
+            writer.finish()?;
 
             Ok((read_count, exact_count, edit1_count, edit2_count, multi_count))
         });
@@ -367,28 +370,34 @@ fn generate_correct_read_pair(
     let template_r2 = generate_random_sequence(params.read_length, &mut rng);
 
     // Build R1 (flag 77: UNMAPPED | SEGMENTED | FIRST_SEGMENT | MATE_UNMAPPED)
-    let r1_record = RecordBuilder::new()
-        .name(&read_name)
-        .sequence(&String::from_utf8_lossy(&template_r1))
+    let mut r1_builder = SamBuilder::new();
+    r1_builder
+        .read_name(read_name.as_bytes())
+        .flags(
+            raw_flags::PAIRED
+                | raw_flags::FIRST_SEGMENT
+                | raw_flags::UNMAPPED
+                | raw_flags::MATE_UNMAPPED,
+        )
+        .sequence(&template_r1)
         .qualities(&vec![params.quality; template_r1.len()])
-        .paired(true)
-        .first_segment(true)
-        .unmapped(true)
-        .mate_unmapped(true)
-        .tag("RX", observed_umi.clone())
-        .build();
+        .add_string_tag(b"RX", observed_umi.as_bytes());
+    let r1_record = r1_builder.build();
 
     // Build R2 (flag 141: UNMAPPED | SEGMENTED | LAST_SEGMENT | MATE_UNMAPPED)
-    let r2_record = RecordBuilder::new()
-        .name(&read_name)
-        .sequence(&String::from_utf8_lossy(&template_r2))
+    let mut r2_builder = SamBuilder::new();
+    r2_builder
+        .read_name(read_name.as_bytes())
+        .flags(
+            raw_flags::PAIRED
+                | raw_flags::LAST_SEGMENT
+                | raw_flags::UNMAPPED
+                | raw_flags::MATE_UNMAPPED,
+        )
+        .sequence(&template_r2)
         .qualities(&vec![params.quality; template_r2.len()])
-        .paired(true)
-        .first_segment(false)
-        .unmapped(true)
-        .mate_unmapped(true)
-        .tag("RX", observed_umi.clone())
-        .build();
+        .add_string_tag(b"RX", observed_umi.as_bytes());
+    let r2_record = r2_builder.build();
 
     CorrectReadPair {
         read_name,

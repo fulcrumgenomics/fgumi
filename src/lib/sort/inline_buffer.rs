@@ -246,11 +246,11 @@ impl RecordBuffer {
     /// (256 MiB) or if the record length exceeds `u32::MAX`.
     #[inline]
     pub fn push_coordinate(&mut self, record: &[u8]) -> anyhow::Result<()> {
-        // Require full BAM core record length to match RawRecordView preconditions.
-        const MIN_BAM_RECORD_LEN: usize = 32;
+        // BAM fixed-length block is 32 bytes; coordinate fields end at offset 15.
+        const MIN_BAM_RECORD_LEN: usize = 16;
         anyhow::ensure!(
             record.len() >= MIN_BAM_RECORD_LEN,
-            "BAM record is truncated: need at least {} bytes for BAM core fields, got {}",
+            "BAM record is truncated: need at least {} bytes to extract coordinate fields, got {}",
             MIN_BAM_RECORD_LEN,
             record.len(),
         );

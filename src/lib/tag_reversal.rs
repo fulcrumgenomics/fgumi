@@ -105,7 +105,6 @@ mod tests {
     fn test_reverse_per_base_tags_raw_string_tag_aq() {
         // Verify aq Z-type tag is reversed via the raw path too
         use crate::sort::bam_fields;
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
 
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
@@ -113,8 +112,9 @@ mod tests {
         let record_buf = to_record_buf(&b.build());
 
         let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
+        let raw_rec = fgumi_raw_bam::encode_record_buf_to_raw(&record_buf, &header)
+            .expect("encoding record should succeed");
+        let mut raw: Vec<u8> = raw_rec.as_ref().to_vec();
 
         let result =
             reverse_per_base_tags_raw(&mut raw).expect("reverse_per_base_tags_raw should succeed");
@@ -137,14 +137,13 @@ mod tests {
     #[test]
     fn test_reverse_per_base_tags_raw_positive_strand() {
         // Build a valid raw record on positive strand — should return Ok(false)
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(0);
         let record_buf = to_record_buf(&b.build());
         let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
+        let raw_rec = fgumi_raw_bam::encode_record_buf_to_raw(&record_buf, &header)
+            .expect("encoding record should succeed");
+        let mut raw: Vec<u8> = raw_rec.as_ref().to_vec();
 
         let result = reverse_per_base_tags_raw(&mut raw);
         assert!(result.is_ok());
@@ -155,7 +154,6 @@ mod tests {
     fn test_reverse_per_base_tags_raw_negative_strand() {
         // Build a valid raw record on negative strand with a cd tag — should reverse it
         use crate::sort::bam_fields;
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
 
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
@@ -164,8 +162,9 @@ mod tests {
         record_buf.data_mut().insert(tag, Value::from(vec![1u16, 2, 3, 4]));
 
         let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
+        let raw_rec = fgumi_raw_bam::encode_record_buf_to_raw(&record_buf, &header)
+            .expect("encoding record should succeed");
+        let mut raw: Vec<u8> = raw_rec.as_ref().to_vec();
 
         let result = reverse_per_base_tags_raw(&mut raw);
         assert!(result.is_ok());

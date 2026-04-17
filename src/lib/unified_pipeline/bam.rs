@@ -3455,108 +3455,10 @@ where
 // BAM Pipeline Helpers
 // ============================================================================
 
-// Thread-local buffer for serializing BAM records.
-// Reusing this buffer across calls avoids repeated allocations.
-thread_local! {
-    static SERIALIZE_RECORD_BUFFER: std::cell::RefCell<Vec<u8>> =
-        std::cell::RefCell::new(Vec::with_capacity(512));
-}
-
-/// Serialize BAM records into a provided buffer.
-///
-/// Appends serialized BAM bytes to the provided buffer and returns the record count.
-/// This variant is more efficient when the caller wants to reuse a buffer.
-///
-/// Accepts `RecordBuf` because callers (e.g., `clip`, `dedup`) produce records via
-/// noodles typed operations (CIGAR editing, tag mutation) and pass them directly here.
-///
-/// # Errors
-///
-/// Returns an I/O error if record encoding fails.
-#[allow(clippy::cast_possible_truncation)]
-pub fn serialize_bam_records_into(
-    records: &[RecordBuf],
-    header: &Header,
-    output: &mut Vec<u8>,
-) -> io::Result<u64> {
-    use crate::vendored::bam_codec::encode_record_buf;
-
-    log::trace!("serialize_bam_records_into: {} records", records.len());
-
-    // Pre-allocate output buffer based on batch size estimate
-    // Typical record: ~300-500 bytes, plus 4-byte block_size prefix
-    // Use 400 bytes as a reasonable average
-    let estimated_batch_size = records.len() * 400;
-    output.reserve(estimated_batch_size);
-
-    SERIALIZE_RECORD_BUFFER.with(|buf| {
-        let mut record_data = buf.borrow_mut();
-
-        for (i, record) in records.iter().enumerate() {
-            // Clear and reuse the buffer for each record
-            record_data.clear();
-            if let Err(e) = encode_record_buf(&mut record_data, header, record) {
-                log::error!(
-                    "serialize_bam_records_into: failed to encode record {}: {:?}, name={:?}, seq_len={}, qual_len={}",
-                    i,
-                    e,
-                    record.name(),
-                    record.sequence().len(),
-                    record.quality_scores().len(),
-                );
-                return Err(e);
-            }
-
-            // Add `block_size` prefix + record data
-            let block_size = record_data.len() as u32;
-            output.extend_from_slice(&block_size.to_le_bytes());
-            output.extend_from_slice(&record_data);
-        }
-
-        Ok(records.len() as u64)
-    })
-}
-
-/// Serialize BAM records to a new `SerializedBatch`.
-///
-/// This is a convenience wrapper around `serialize_bam_records_into` that allocates
-/// a new buffer. Use `serialize_bam_records_into` for better performance when
-/// buffer reuse is possible.
-///
-/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
-///
-/// # Errors
-///
-/// Returns an I/O error if record encoding fails.
-pub fn serialize_bam_records(
-    records: &[RecordBuf],
-    header: &Header,
-) -> io::Result<SerializedBatch> {
-    let mut data = Vec::with_capacity(records.len() * 256);
-    let record_count = serialize_bam_records_into(records, header, &mut data)?;
-    Ok(SerializedBatch { data, record_count, secondary_data: None })
-}
-
-/// Serialize a single BAM record to bytes.
-///
-/// This produces raw BAM record bytes (`block_size` prefix + record data),
-/// suitable for BGZF compression in the pipeline. Uses thread-local buffer.
-///
-/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
-///
-/// # Errors
-///
-/// Returns an I/O error if record encoding fails.
-pub fn serialize_bam_record(record: &RecordBuf, header: &Header) -> io::Result<SerializedBatch> {
-    let mut data = Vec::with_capacity(256);
-    let record_count = serialize_bam_record_into(record, header, &mut data)?;
-    Ok(SerializedBatch { data, record_count, secondary_data: None })
-}
-
 /// Serialize a single BAM record to bytes, appending to the provided buffer.
 ///
 /// This produces raw BAM record bytes (`block_size` prefix + record data),
-/// suitable for BGZF compression in the pipeline. Uses thread-local buffer for encoding.
+/// suitable for BGZF compression in the pipeline.
 ///
 /// Returns the number of records serialized (always 1 for a single record).
 ///
@@ -3571,75 +3473,15 @@ pub fn serialize_bam_record_into(
     header: &Header,
     output: &mut Vec<u8>,
 ) -> io::Result<u64> {
-    use crate::vendored::bam_codec::encode_record_buf;
+    let raw = fgumi_raw_bam::encode_record_buf_to_raw(record, header).map_err(io::Error::other)?;
+    let bytes = raw.as_ref();
 
-    SERIALIZE_RECORD_BUFFER.with(|buf| {
-        let mut record_data = buf.borrow_mut();
-        record_data.clear();
-        encode_record_buf(&mut record_data, header, record)?;
+    // Append `block_size` prefix + record data to output
+    let block_size = bytes.len() as u32;
+    output.extend_from_slice(&block_size.to_le_bytes());
+    output.extend_from_slice(bytes);
 
-        // Append `block_size` prefix + record data to output
-        let block_size = record_data.len() as u32;
-        output.extend_from_slice(&block_size.to_le_bytes());
-        output.extend_from_slice(&record_data);
-
-        Ok(1)
-    })
-}
-
-/// Serialize BAM records directly to a BGZF compressor (zero-copy).
-///
-/// This writes records directly to the compressor's internal buffer, avoiding
-/// the intermediate serialization buffer copy. Records are compressed into
-/// BGZF blocks as the buffer fills.
-///
-/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
-///
-/// Returns the number of records serialized.
-///
-/// # Errors
-///
-/// Returns an I/O error if record encoding or compression fails.
-#[allow(clippy::cast_possible_truncation)]
-pub fn serialize_bam_records_to_compressor(
-    records: &[RecordBuf],
-    header: &Header,
-    compressor: &mut crate::bgzf_writer::InlineBgzfCompressor,
-) -> io::Result<u64> {
-    use crate::vendored::bam_codec::encode_record_buf;
-
-    log::trace!("serialize_bam_records_to_compressor: {} records", records.len());
-
-    SERIALIZE_RECORD_BUFFER.with(|buf| {
-        let mut record_data = buf.borrow_mut();
-
-        for (i, record) in records.iter().enumerate() {
-            // Clear and reuse the buffer for each record
-            record_data.clear();
-            if let Err(e) = encode_record_buf(&mut record_data, header, record) {
-                log::error!(
-                    "serialize_bam_records_to_compressor: failed to encode record {}: {:?}, name={:?}, seq_len={}, qual_len={}",
-                    i,
-                    e,
-                    record.name(),
-                    record.sequence().len(),
-                    record.quality_scores().len(),
-                );
-                return Err(e);
-            }
-
-            // Write block_size prefix + record data directly to compressor buffer
-            let block_size = record_data.len() as u32;
-            let buffer = compressor.buffer_mut();
-            buffer.extend_from_slice(&block_size.to_le_bytes());
-            buffer.extend_from_slice(&record_data);
-
-            // Compress if buffer is full
-            compressor.maybe_compress()?;
-        }
-
-        Ok(records.len() as u64)
-    })
+    Ok(1)
 }
 
 /// Configuration for running a BAM file through the pipeline.

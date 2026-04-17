@@ -53,7 +53,7 @@ use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
     build_pipeline_config, parse_bool,
 };
-use crate::sam::TC_TAG;
+use crate::sort::PA_TAG;
 use crate::sort::bam_fields;
 use fgumi_raw_bam::RawRecordView;
 
@@ -746,7 +746,7 @@ fn process_position_group(
     }
 
     // Count reads and check for missing pa tags
-    let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
+    let pa_tag_bytes: [u8; 2] = *PA_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;
         for raw in template.records() {
@@ -763,7 +763,7 @@ fn process_position_group(
             }
             if is_secondary || is_supplementary {
                 let aux = bam_fields::aux_data_slice(raw);
-                if bam_fields::find_tag_type(aux, &tc_tag_bytes).is_none() {
+                if bam_fields::find_tag_type(aux, &pa_tag_bytes).is_none() {
                     dedup_metrics.missing_pa_tag += 1;
                 }
             }

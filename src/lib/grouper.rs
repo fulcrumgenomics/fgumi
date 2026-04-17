@@ -331,16 +331,6 @@ pub struct ProcessedPositionGroup {
     pub filter_metrics: FilterMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
-    /// Number of distinct numeric molecule IDs assigned in this group (i.e., the
-    /// size of the block the serialize step must reserve from the global MI
-    /// counter). Equals `max(MoleculeId::id()) + 1` across assigned templates,
-    /// or `0` when no templates have an assigned MI. This can be strictly less
-    /// than `templates.len()` because templates in the same UMI family share
-    /// a `MoleculeId`, and because `PairedA(id)` / `PairedB(id)` share the same
-    /// numeric `id`. Using this value for the block size (rather than the
-    /// template count) ensures the emitted MI tag integers are consecutive
-    /// `0..N-1`, matching fgbio's `GroupReadsByUmi`.
-    pub distinct_mi_count: u64,
 }
 
 // ============================================================================

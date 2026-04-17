@@ -632,8 +632,8 @@ pub fn apply_overlapping_consensus(
     let mut read_pairs: AHashMap<Vec<u8>, (Option<usize>, Option<usize>)> = AHashMap::new();
 
     for (idx, record) in records.iter().enumerate() {
-        let name = RawRecordView::new(record.as_ref()).read_name().to_vec();
-        let flg = RawRecordView::new(record.as_ref()).flags();
+        let name = RawRecordView::new(record).read_name().to_vec();
+        let flg = RawRecordView::new(record).flags();
 
         if flg & fgumi_raw_bam::flags::FIRST_SEGMENT != 0 {
             read_pairs.entry(name).or_insert((None, None)).0 = Some(idx);
@@ -653,9 +653,7 @@ pub fn apply_overlapping_consensus(
                 (&mut right[0], &mut left[*idx2])
             };
 
-            caller
-                .call(r1.as_mut_vec().as_mut_slice(), r2.as_mut_vec().as_mut_slice())
-                .context("Failed to call overlapping consensus on raw bytes")?;
+            caller.call(r1, r2).context("Failed to call overlapping consensus on raw bytes")?;
         }
     }
 
