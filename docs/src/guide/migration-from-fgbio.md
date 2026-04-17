@@ -102,6 +102,19 @@ For single-cell data, `fgumi sort --order template-coordinate` automatically inc
 cell barcode tag in the sort key so that templates from different cells at the same locus are not
 interleaved. fgbio's template-coordinate sort does not support this.
 
+### Rejects BAM Sort Order
+
+When `--rejects` is enabled on `simplex`, `duplex`, `codec`, or `correct`, fgumi writes
+rejected records from worker threads in mutex-acquisition order, which is not guaranteed
+to match input order under `--threads > 1`. Because of this, fgumi stamps the rejects BAM
+header with `SO:unsorted` (and drops any `GO`/`SS` tags inherited from the input) so
+downstream tools don't assume the input's sort order carried over.
+
+fgbio's equivalent tools copy the input header onto the rejects BAM unchanged, which can
+leave a stale `SO` tag when more than one consensus-calling thread is used. If you were
+relying on fgbio's rejects header carrying the input's sort order, sort the rejects BAM
+explicitly after the fact.
+
 ### Boolean Flag Values
 
 fgumi boolean flags (e.g. `--output-per-base-tags`, `--trim`, `--require-single-strand-agreement`)

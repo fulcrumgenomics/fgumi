@@ -5,8 +5,8 @@
 //! errors introduced during sample preparation.
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
+    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
 use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
@@ -28,8 +28,9 @@ use fgoxide::io::DelimFile;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::sam::SamTag;
+use crate::sam::{SamTag, header_as_unsorted};
 use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
+use parking_lot::Mutex;
 
 use log::info;
 use noodles::sam::Header;
@@ -61,8 +62,6 @@ use super::common::{MethylationRef, load_methylation_reference};
 struct SimplexProcessedBatch {
     /// Pre-serialized consensus reads to write to output BAM
     consensus_output: ConsensusOutput,
-    /// Rejected reads as raw BAM bytes (written to rejects file if enabled)
-    rejects: Vec<Vec<u8>>,
     /// Number of MI groups in this batch
     groups_count: u64,
     /// Consensus calling statistics for this batch
@@ -74,15 +73,15 @@ struct SimplexProcessedBatch {
 impl MemoryEstimate for SimplexProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
         self.consensus_output.data.capacity()
-            + self.rejects.iter().map(Vec::capacity).sum::<usize>()
-            + self.rejects.capacity() * std::mem::size_of::<Vec<u8>>()
     }
 }
 
-/// Per-thread accumulator for simplex consensus metrics and rejects.
+/// Per-thread accumulator for simplex consensus metrics.
 ///
 /// Merged into final aggregates after the pipeline completes; one instance
-/// per worker slot (see [`PerThreadAccumulator`]).
+/// per worker slot (see [`PerThreadAccumulator`]). Rejected records are
+/// streamed directly to the rejects BAM during serialize and are not
+/// buffered in the accumulator.
 #[derive(Default)]
 struct CollectedSimplexMetrics {
     /// Consensus calling statistics
@@ -91,10 +90,6 @@ struct CollectedSimplexMetrics {
     overlapping_stats: Option<CorrectionStats>,
     /// Number of MI groups processed
     groups_processed: u64,
-    /// Rejected reads as raw BAM bytes for deferred writing.
-    /// NB: rejects buffering is left unchanged here; streaming rejects to
-    /// disk during the pipeline is a follow-up (tracked separately).
-    rejects: Vec<Vec<u8>>,
 }
 
 /// Calls simplex consensus sequences from reads with the same unique molecular tag.
@@ -498,7 +493,7 @@ impl Simplex {
         )?;
 
         // Per-thread metrics accumulator: bounded metric memory, no unbounded
-        // queue. Rejects buffering semantics are preserved (see follow-up).
+        // queue. Rejects are streamed to disk during serialize, not stored here.
         let collected_metrics = PerThreadAccumulator::<CollectedSimplexMetrics>::new(num_threads);
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
@@ -533,15 +528,37 @@ impl Simplex {
             methylation_mode,
         };
 
-        // Clone input_header before pipeline (needed for rejects writing)
-        let rejects_header = input_header.clone();
+        // Open rejects writer up front. Rejected records are streamed straight
+        // to disk from process_fn, per-MI-group, so no batch-level buffering.
+        // Because workers flush under a mutex rather than through the ordered
+        // serialize stage, reject records are emitted in mutex-acquisition
+        // order, not input order; mark the rejects header as SO:unsorted so
+        // downstream tools don't assume the input's sort order carried over.
+        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
+            if let Some(path) = self.rejects_opts.rejects.as_ref() {
+                let writer_threads = self.threading.num_threads();
+                let rejects_header = header_as_unsorted(&input_header);
+                let w = create_raw_bam_writer(
+                    path,
+                    &rejects_header,
+                    writer_threads,
+                    self.compression.compression_level,
+                )?;
+                Some(Arc::new(Mutex::new(Some(w))))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
 
         // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let groups_processed = run_bam_pipeline_from_reader(
+        let pipeline_result = run_bam_pipeline_from_reader(
             pipeline_config,
             reader,
             input_header,
@@ -578,10 +595,27 @@ impl Simplex {
                 };
 
                 let mut all_output = ConsensusOutput::default();
-                let mut all_rejects = Vec::new();
                 let mut batch_stats = ConsensusCallingStats::new();
                 let mut batch_overlapping = CorrectionStats::new();
                 let groups_count = batch.groups.len() as u64;
+
+                // Stream per-MI-group rejects straight to disk so they don't
+                // accumulate in a batch-level Vec. The mutex only serializes the
+                // raw-byte append; BGZF compression runs on the writer's own
+                // thread pool.
+                let flush_rejects = |recs: &[Vec<u8>]| -> io::Result<()> {
+                    if let Some(ref rw_arc) = rejects_writer_for_process {
+                        if !recs.is_empty() {
+                            let mut guard = rw_arc.lock();
+                            if let Some(w) = guard.as_mut() {
+                                for raw in recs {
+                                    w.write_raw_record(raw)?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                };
 
                 for RawMiGroup { mi, records: mut raw_records } in batch.groups {
                     caller.clear();
@@ -594,7 +628,7 @@ impl Simplex {
                             raw_records.len(),
                         );
                         if track_rejects {
-                            all_rejects.extend(raw_records); // Already raw bytes!
+                            flush_rejects(&raw_records)?;
                         }
                         continue;
                     }
@@ -607,7 +641,7 @@ impl Simplex {
                             batch_stats.record_input(raw_records.len());
                             batch_stats.record_rejection(RejectionReason::Other, raw_records.len());
                             if track_rejects {
-                                all_rejects.extend(raw_records);
+                                flush_rejects(&raw_records)?;
                             }
                             continue;
                         }
@@ -620,7 +654,7 @@ impl Simplex {
                             all_output.merge(batch_output);
                             batch_stats.merge(&caller.statistics());
                             if track_rejects {
-                                all_rejects.extend(caller.take_rejected_reads());
+                                flush_rejects(&caller.take_rejected_reads())?;
                             }
                         }
                         Err(e) => {
@@ -631,7 +665,6 @@ impl Simplex {
 
                 Ok(SimplexProcessedBatch {
                     consensus_output: all_output,
-                    rejects: all_rejects,
                     groups_count,
                     stats: batch_stats,
                     overlapping_stats: if overlapping_enabled {
@@ -646,18 +679,17 @@ impl Simplex {
                   _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
-                // Merge per-batch metrics + rejects into this worker's slot
+                // Rejects were already streamed to disk in process_fn.
+                // Merge per-batch metrics into this worker's accumulator slot
                 let batch_stats = processed.stats;
                 let batch_overlapping = processed.overlapping_stats;
                 let groups_count = processed.groups_count;
-                let mut batch_rejects = processed.rejects;
                 collected_metrics_for_serialize.with_slot(|m| {
                     m.stats.merge(&batch_stats);
                     if let Some(o) = batch_overlapping {
                         m.overlapping_stats.get_or_insert_with(CorrectionStats::new).merge(&o);
                     }
                     m.groups_processed += groups_count;
-                    m.rejects.append(&mut batch_rejects);
                 });
 
                 // Serialize consensus reads
@@ -665,50 +697,44 @@ impl Simplex {
                 output.extend_from_slice(&processed.consensus_output.data);
                 Ok(count)
             },
-        )
-        .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?;
+        );
 
-        // ========== Post-pipeline: Aggregate metrics and write rejects ==========
+        // Always finalize the rejects writer, even if the pipeline failed, so any
+        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
+        // finish() failures alongside any pipeline error so neither is silently
+        // dropped.
+        let rejects_finish_result = rejects_writer
+            .and_then(|rw_arc| rw_arc.lock().take())
+            .map(|writer| writer.finish().context("Failed to finish rejects file"));
+
+        let groups_processed = match (pipeline_result, rejects_finish_result) {
+            (Ok(groups_processed), Some(Ok(()))) => {
+                info!("Rejected reads streamed to rejects file during processing");
+                groups_processed
+            }
+            (Ok(groups_processed), None) => groups_processed,
+            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
+            (Err(pipeline_err), Some(Err(finish_err))) => {
+                return Err(anyhow::anyhow!(
+                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
+                ));
+            }
+            (Err(pipeline_err), _) => {
+                return Err(anyhow::anyhow!("Pipeline error: {pipeline_err}"));
+            }
+        };
+
+        // ========== Post-pipeline: Aggregate metrics ==========
         let mut total_groups = 0u64;
         let mut merged_stats = ConsensusCallingStats::new();
         let mut merged_overlapping_stats = CorrectionStats::new();
-        let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
         for slot in collected_metrics.slots() {
-            let mut m = slot.lock();
+            let m = slot.lock();
             total_groups += m.groups_processed;
             merged_stats.merge(&m.stats);
             if let Some(ref ocs) = m.overlapping_stats {
                 merged_overlapping_stats.merge(ocs);
-            }
-            if track_rejects {
-                all_rejects.append(&mut m.rejects);
-            }
-        }
-
-        // Write deferred rejects as raw BAM bytes
-        if track_rejects && !all_rejects.is_empty() {
-            if let Some(rejects_path) = &self.rejects_opts.rejects {
-                let writer_threads = self.threading.num_threads();
-                let rejects_writer = create_optional_bam_writer(
-                    Some(rejects_path),
-                    &rejects_header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?;
-                if let Some(mut rw) = rejects_writer {
-                    for raw_record in &all_rejects {
-                        let block_size = raw_record.len() as u32;
-                        rw.get_mut()
-                            .write_all(&block_size.to_le_bytes())
-                            .context("Failed to write rejected read block size")?;
-                        rw.get_mut()
-                            .write_all(raw_record)
-                            .context("Failed to write rejected read")?;
-                    }
-                    rw.into_inner().finish().context("Failed to finish rejects file")?;
-                    info!("Wrote {} rejected reads", all_rejects.len());
-                }
             }
         }
 
@@ -1617,22 +1643,17 @@ mod tests {
     fn test_simplex_processed_batch_memory_estimate() {
         let mut data = Vec::with_capacity(1024);
         data.extend_from_slice(&[0u8; 100]);
-        let mut reject = Vec::with_capacity(512);
-        reject.extend_from_slice(&[0u8; 50]);
 
         let batch = SimplexProcessedBatch {
             consensus_output: ConsensusOutput { data, count: 1 },
-            rejects: vec![reject],
             groups_count: 1,
             stats: ConsensusCallingStats::default(),
             overlapping_stats: None,
         };
 
         let estimate = batch.estimate_heap_size();
-        // Should use capacity (1024 + 512) not len (100 + 50)
-        assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
-        // Should also include Vec<Vec<u8>> overhead
-        assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
+        // Should use capacity (1024) not len (100).
+        assert!(estimate >= 1024, "estimate {estimate} should be >= 1024 (capacity)");
     }
 
     #[rstest]
