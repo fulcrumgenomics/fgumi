@@ -5,7 +5,7 @@
 //! records in memory before sorting.
 
 use super::sort::TemplateCoordKey;
-use crate::bam_io::create_bam_writer;
+use crate::bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
@@ -13,17 +13,16 @@ use crate::commands::simulate::common::{
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
     apply_methylation_conversion, generate_random_sequence, pad_sequence,
 };
+use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
-use crate::sam::builder::RecordBuilder;
 use crate::simulate::{
     FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias, create_rng,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
+use fgumi_raw_bam::{RawRecord, RawRecordView, SamBuilder, flags as raw_flags};
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
 use rand::RngExt;
@@ -248,7 +247,7 @@ impl Command for MappedReads {
         molecules.sort_unstable();
 
         // Set up writer with multi-threaded BGZF compression
-        let mut writer = create_bam_writer(
+        let mut writer = create_raw_bam_writer(
             &self.output,
             &header,
             self.threads,
@@ -290,15 +289,15 @@ impl Command for MappedReads {
                 // is lower first so pairs are emitted in coordinate order. R1F2
                 // pairs have R1 (reverse read) at the higher coordinate, so emit R2
                 // first when R1's alignment_start is strictly greater.
-                let r1_pos = r1.alignment_start().map(|p| p.get()).unwrap_or(0);
-                let r2_pos = r2.alignment_start().map(|p| p.get()).unwrap_or(0);
+                let r1_pos = RawRecordView::new(r1.as_ref()).pos();
+                let r2_pos = RawRecordView::new(r2.as_ref()).pos();
                 let r2_first = r1_pos > r2_pos;
                 if r2_first {
-                    writer.write_alignment_record(&header, &r2)?;
-                    writer.write_alignment_record(&header, &r1)?;
+                    writer.write_raw_record(r2.as_ref())?;
+                    writer.write_raw_record(r1.as_ref())?;
                 } else {
-                    writer.write_alignment_record(&header, &r1)?;
-                    writer.write_alignment_record(&header, &r2)?;
+                    writer.write_raw_record(r1.as_ref())?;
+                    writer.write_raw_record(r2.as_ref())?;
                 }
                 let strand_char = if is_top_strand { '+' } else { '-' };
                 writeln!(
@@ -317,6 +316,7 @@ impl Command for MappedReads {
 
         progress.log_final();
         truth_writer.flush()?;
+        writer.finish()?;
 
         info!("Generated {total_pairs} read pairs");
         info!("Done");
@@ -327,7 +327,7 @@ impl Command for MappedReads {
 
 /// A single R1/R2 pair plus identifiers used for truth/metadata:
 /// `(r1, r2, read_name, umi_str, is_top_strand)`.
-type MoleculeReadPair = (RecordBuf, RecordBuf, String, String, bool);
+type MoleculeReadPair = (RawRecord, RawRecord, String, String, bool);
 
 /// Result of generating all read pairs for a molecule: the pairs plus the
 /// effective `(chrom_idx, local_pos)` at which the template actually lives.
@@ -499,33 +499,57 @@ fn build_record(
     umi: &str,
     mate_cigar: &str,
     mate_mapq: u8,
-) -> RecordBuf {
-    let seq_str = String::from_utf8_lossy(seq);
+) -> RawRecord {
+    // Build flags: PAIRED + (FIRST_SEGMENT or LAST_SEGMENT) + reverse-strand bits.
+    let segment_flag = if is_first { raw_flags::FIRST_SEGMENT } else { raw_flags::LAST_SEGMENT };
+    let reverse_flag = if is_reverse { raw_flags::REVERSE } else { 0 };
+    let mate_reverse_flag = if is_reverse { 0 } else { raw_flags::MATE_REVERSE };
+    let flags = raw_flags::PAIRED | segment_flag | reverse_flag | mate_reverse_flag;
 
-    RecordBuilder::new()
-        .name(name)
-        .sequence(&seq_str)
-        .qualities(quals)
-        .reference_sequence_id(ref_id)
-        .alignment_start(pos + 1) // Convert 0-based to 1-based
-        .mapping_quality(mapq)
-        .paired(true)
-        .first_segment(is_first)
-        .reverse_complement(is_reverse)
-        .mate_reverse_complement(!is_reverse)
-        .mate_reference_sequence_id(ref_id)
-        .mate_alignment_start(mate_pos + 1) // Convert 0-based to 1-based
+    // Single CIGAR op: {seq.len()}M (match). All simulated alignments are gap-free.
+    let n = u32::try_from(seq.len()).expect("sequence length fits u32");
+    // BAM CIGAR encoding: (length << 4) | op_code. op_code 0 = M (alignment match).
+    let cigar_op = n << 4;
+
+    // Pre-compute bin for the alignment range.
+    let alignment_start_1based = u32::try_from(pos + 1).expect("alignment start fits u32");
+    let alignment_end_1based = alignment_start_1based + n.saturating_sub(1);
+    let bin = region_to_bin(Some(alignment_start_1based), Some(alignment_end_1based));
+
+    let ref_id_i32 = i32::try_from(ref_id).expect("ref_id fits i32");
+    let pos_i32 = i32::try_from(pos).expect("pos fits i32");
+    let mate_pos_i32 = i32::try_from(mate_pos).expect("mate_pos fits i32");
+
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .flags(flags)
+        .ref_id(ref_id_i32)
+        .pos(pos_i32)
+        .mapq(mapq)
+        .bin(bin)
+        .mate_ref_id(ref_id_i32)
+        .mate_pos(mate_pos_i32)
         .template_length(tlen)
-        .tag("RX", umi)
-        .tag("MC", mate_cigar)
-        .tag("MQ", i32::from(mate_mapq))
-        .build()
+        .cigar_ops(&[cigar_op])
+        .sequence(seq)
+        .qualities(quals)
+        .add_string_tag(b"RX", umi.as_bytes())
+        .add_string_tag(b"MC", mate_cigar.as_bytes())
+        .add_int_tag(b"MQ", i32::from(mate_mapq));
+    b.build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::simulate::create_rng;
+
+    /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
+    /// assertions.
+    fn to_record_buf(raw: &RawRecord) -> noodles::sam::alignment::RecordBuf {
+        fgumi_raw_bam::raw_record_to_record_buf(raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
 
     // Tests for generate_random_sequence
     #[test]
@@ -652,7 +676,7 @@ mod tests {
     fn test_build_record_r1_basic() {
         let seq = b"ACGT";
         let quals = vec![30, 30, 30, 30];
-        let record = build_record(
+        let raw = build_record(
             "test_read",
             seq,
             &quals,
@@ -667,6 +691,7 @@ mod tests {
             "4M",
             60,
         );
+        let record = to_record_buf(&raw);
 
         // Check name
         assert!(record.name().is_some());
@@ -684,7 +709,7 @@ mod tests {
     fn test_build_record_r2_basic() {
         let seq = b"ACGT";
         let quals = vec![30, 30, 30, 30];
-        let record = build_record(
+        let raw = build_record(
             "test_read",
             seq,
             &quals,
@@ -699,6 +724,7 @@ mod tests {
             "4M",
             60,
         );
+        let record = to_record_buf(&raw);
 
         // Check flags for R2
         let flags = record.flags();
@@ -713,8 +739,9 @@ mod tests {
     fn test_build_record_positions() {
         let seq = b"ACGTACGT";
         let quals = vec![30; 8];
-        let record =
+        let raw =
             build_record("read", seq, &quals, 0, 1000, 60, true, false, 1100, 200, "AAA", "8M", 60);
+        let record = to_record_buf(&raw);
 
         // Position should be 1-based in BAM
         assert_eq!(
@@ -735,9 +762,10 @@ mod tests {
 
         // Note: mapq 255 is treated as "unavailable" by noodles, so skip it
         for mapq in [0, 30, 60] {
-            let record = build_record(
+            let raw = build_record(
                 "read", seq, &quals, 0, 100, mapq, true, false, 200, 100, "AAA", "4M", mapq,
             );
+            let record = to_record_buf(&raw);
             assert_eq!(
                 record.mapping_quality().expect("record should have mapping quality").get(),
                 mapq
@@ -749,8 +777,9 @@ mod tests {
     fn test_build_record_quality_scores() {
         let seq = b"ACGTACGT";
         let quals = vec![10, 20, 30, 40, 30, 20, 10, 5];
-        let record =
+        let raw =
             build_record("read", seq, &quals, 0, 100, 60, true, false, 200, 100, "AAA", "8M", 60);
+        let record = to_record_buf(&raw);
 
         let record_quals: Vec<u8> = record.quality_scores().iter().collect();
         assert_eq!(record_quals, quals);
@@ -762,9 +791,10 @@ mod tests {
         let quals = vec![30; 4];
 
         for ref_id in [0, 1, 5] {
-            let record = build_record(
+            let raw = build_record(
                 "read", seq, &quals, ref_id, 100, 60, true, false, 200, 100, "AAA", "4M", 60,
             );
+            let record = to_record_buf(&raw);
             assert_eq!(record.reference_sequence_id(), Some(ref_id));
             assert_eq!(record.mate_reference_sequence_id(), Some(ref_id));
         }
@@ -774,8 +804,9 @@ mod tests {
     fn test_build_record_negative_tlen() {
         let seq = b"ACGT";
         let quals = vec![30; 4];
-        let record =
+        let raw =
             build_record("read", seq, &quals, 0, 200, 60, false, true, 100, -150, "AAA", "4M", 60);
+        let record = to_record_buf(&raw);
 
         assert_eq!(record.template_length(), -150);
     }
@@ -894,18 +925,19 @@ mod tests {
         assert!(!pairs.is_empty());
 
         for (r1, r2, _, _, _) in &pairs {
+            let r1_view = RawRecordView::new(r1.as_ref());
+            let r2_view = RawRecordView::new(r2.as_ref());
             // Both reads should reference the effective chromosome (primary or fallback)
-            assert_eq!(r1.reference_sequence_id(), Some(eff_chrom));
-            assert_eq!(r2.reference_sequence_id(), Some(eff_chrom));
+            assert_eq!(r1_view.ref_id() as usize, eff_chrom);
+            assert_eq!(r2_view.ref_id() as usize, eff_chrom);
 
-            // R1 or R2 should be at eff_pos (depending on strand)
-            let r1_pos = r1.alignment_start().map(|p| p.get()).unwrap_or(0);
-            let r2_pos = r2.alignment_start().map(|p| p.get()).unwrap_or(0);
-            // One of the reads should be at eff_pos + 1 (1-based)
+            // R1 or R2 should be at eff_pos (raw is 0-based, eff_pos is 0-based)
+            let r1_pos = r1_view.pos();
+            let r2_pos = r2_view.pos();
             assert!(
-                r1_pos == eff_pos + 1 || r2_pos == eff_pos + 1,
-                "Expected one read at position {} (1-based), got r1={}, r2={}",
-                eff_pos + 1,
+                r1_pos == eff_pos as i32 || r2_pos == eff_pos as i32,
+                "Expected one read at position {} (0-based), got r1={}, r2={}",
+                eff_pos,
                 r1_pos,
                 r2_pos
             );
@@ -950,12 +982,14 @@ mod tests {
             let (pairs, _chrom, _pos) =
                 generate_molecule_reads(seed as usize, seed, 0, 500, &params, &ref_genome);
             for (r1, _, _, _, is_top) in &pairs {
+                let r1_flags = RawRecordView::new(r1.as_ref()).flags();
+                let is_reverse = (r1_flags & raw_flags::REVERSE) != 0;
                 if *is_top {
                     saw_f1r2 = true;
-                    assert!(!r1.flags().is_reverse_complemented(), "F1R2: R1 should be forward");
+                    assert!(!is_reverse, "F1R2: R1 should be forward");
                 } else {
                     saw_r1f2 = true;
-                    assert!(r1.flags().is_reverse_complemented(), "R1F2: R1 should be reverse");
+                    assert!(is_reverse, "R1F2: R1 should be reverse");
                 }
             }
         }

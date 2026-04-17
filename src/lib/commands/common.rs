@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::bam_io::{PipelineReaderOpts, is_stdin_path};
+use crate::bam_io::is_stdin_path;
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use crate::validation::validate_file_exists;
@@ -165,8 +165,8 @@ impl BamIoOptions {
     }
 
     /// Build [`PipelineReaderOpts`] from the async-reader flag.
-    pub fn pipeline_reader_opts(&self) -> PipelineReaderOpts {
-        PipelineReaderOpts { async_reader: self.async_reader }
+    pub fn pipeline_reader_opts(&self) -> crate::bam_io::PipelineReaderOpts {
+        crate::bam_io::PipelineReaderOpts { async_reader: self.async_reader }
     }
 
     /// Validates that the input file exists (skipped for stdin paths).

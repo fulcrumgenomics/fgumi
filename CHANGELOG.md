@@ -2,12 +2,6 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
-
-### Breaking Changes
-
-- Rename the template-coordinate sort-key tag written by `fgumi zipper` from `pa` to `tc` to avoid collision with bwa-mem's `pa:f` (primary-alignment score fraction) ([#268](https://github.com/fulcrumgenomics/fgumi/issues/268)). The `--skip-pa-tags` flag on `fgumi zipper` is renamed to `--skip-tc-tags`, and the `missing_pa_tag` dedup metric field is renamed to `missing_tc_tag`. Existing fgumi-zippered BAMs must be re-zippered (or the tag must be manually renamed) before `fgumi dedup` will accept them.
-
 ## [0.1.3] - 2026-04-11
 
 ### Bug Fixes

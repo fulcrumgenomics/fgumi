@@ -55,8 +55,8 @@ use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::reference::{ReferenceReader, find_dict_path};
-use crate::sam::{TemplateCoordinateInfo, check_sort};
-use crate::sort::bam_fields;
+use crate::sam::check_sort;
+use crate::sort::{PrimaryAlignmentInfo, bam_fields};
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::validate_file_exists;
@@ -169,7 +169,7 @@ pub struct Zipper {
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
     #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub skip_tc_tags: bool,
+    pub skip_pa_tags: bool,
 
     /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
     ///
@@ -256,7 +256,7 @@ pub fn build_output_header(unmapped: &Header, mapped: &Header, dict_path: &Path)
 }
 
 /// Adds `pa` tags to secondary/supplementary reads.
-fn add_template_coordinate_tags_raw(mapped: &mut Template) {
+fn add_primary_alignment_tags(mapped: &mut Template) {
     let rr = &mapped.records;
 
     // Fast path: check if there are any secondary/supplementary reads
@@ -294,39 +294,39 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
         Some((ref_id, pos, is_reverse))
     });
 
-    let tc_info: Option<TemplateCoordinateInfo> = match (r1_info, r2_info) {
+    let pa_info: Option<PrimaryAlignmentInfo> = match (r1_info, r2_info) {
         (Some((t1, p1, n1)), Some((t2, p2, n2))) => {
             if (t1, p1) <= (t2, p2) {
-                Some(TemplateCoordinateInfo::new(t1, p1, n1, t2, p2, n2))
+                Some(PrimaryAlignmentInfo::new(t1, p1, n1, t2, p2, n2))
             } else {
-                Some(TemplateCoordinateInfo::new(t2, p2, n2, t1, p1, n1))
+                Some(PrimaryAlignmentInfo::new(t2, p2, n2, t1, p1, n1))
             }
         }
         (Some((t, p, n)), None) | (None, Some((t, p, n))) => {
-            Some(TemplateCoordinateInfo::new(t, p, n, t, p, n))
+            Some(PrimaryAlignmentInfo::new(t, p, n, t, p, n))
         }
         (None, None) => None,
     };
 
-    let Some(tc_info) = tc_info else {
+    let Some(pa_info) = pa_info else {
         return;
     };
 
-    let tc_tag = b"tc";
-    let tc_values = [
-        tc_info.tid1,
-        tc_info.pos1,
-        i32::from(tc_info.neg1),
-        tc_info.tid2,
-        tc_info.pos2,
-        i32::from(tc_info.neg2),
+    let pa_tag = b"pa";
+    let pa_values = [
+        pa_info.tid1,
+        pa_info.pos1,
+        i32::from(pa_info.neg1),
+        pa_info.tid2,
+        pa_info.pos2,
+        i32::from(pa_info.neg2),
     ];
 
     for record in mapped.records.iter_mut() {
         let f = RawRecordView::new(record.as_ref()).flags();
         if (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0 {
-            bam_fields::remove_tag(record.as_mut_vec(), tc_tag);
-            bam_fields::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
+            bam_fields::remove_tag(record.as_mut_vec(), pa_tag);
+            bam_fields::append_i32_array_tag(record.as_mut_vec(), pa_tag, &pa_values);
         }
     }
 }
@@ -374,7 +374,7 @@ pub fn merge_raw(
     unmapped: &Template,
     mapped: &mut Template,
     tag_info: &TagInfo,
-    skip_tc_tags: bool,
+    skip_pa_tags: bool,
 ) -> Result<()> {
     // Step 1: Fix mate info
     mapped.fix_mate_info()?;
@@ -515,8 +515,8 @@ pub fn merge_raw(
     }
 
     // Step 6: Add PA tags
-    if !skip_tc_tags {
-        add_template_coordinate_tags_raw(mapped);
+    if !skip_pa_tags {
+        add_primary_alignment_tags(mapped);
     }
 
     Ok(())
@@ -857,7 +857,7 @@ impl Zipper {
 
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
-                    merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_tc_tags)?;
+                    merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_pa_tags)?;
                     if let Some(ref_reader) = reference {
                         // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
                         restore_unconverted_bases_in_raw_template(
@@ -1199,11 +1199,11 @@ impl Command for Zipper {
 mod tests {
     use super::*;
     use crate::sam::SamTag;
-    use crate::sam::TC_TAG;
     use crate::sam::builder::{
         MAPPED_PG_ID, REFERENCE_LENGTH, SamBuilder as FgSamBuilder, create_ref_dict,
     };
-
+    use crate::sort::PA_TAG;
+    use crate::sort::keys::PrimaryAlignmentInfo;
     use anyhow::Result;
     use bstr::ByteSlice;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
@@ -1223,11 +1223,11 @@ mod tests {
             .expect("raw_record_to_record_buf failed")
     }
 
-    /// Extract `TemplateCoordinateInfo` from a raw BAM record's `pa` tag.
+    /// Extract `PrimaryAlignmentInfo` from a raw BAM record's `pa` tag.
     ///
     /// Returns `None` if the `pa` tag is absent or malformed.
-    fn tc_info_from_raw(rec: &RawRecord) -> Option<TemplateCoordinateInfo> {
-        let arr = rec.tags().find_array(b"tc")?;
+    fn pa_info_from_raw(rec: &RawRecord) -> Option<PrimaryAlignmentInfo> {
+        let arr = rec.tags().find_array(b"pa")?;
         // pa tag is B:i with 6 int32 elements
         if arr.elem_type != b'i' || arr.count != 6 {
             return None;
@@ -1241,7 +1241,7 @@ mod tests {
                 arr.data[off + 3],
             ])
         };
-        Some(TemplateCoordinateInfo {
+        Some(PrimaryAlignmentInfo {
             tid1: read_i32(0),
             pos1: read_i32(1),
             neg1: read_i32(2) != 0,
@@ -1378,7 +1378,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
-            skip_tc_tags: false,
+            skip_pa_tags: false,
             restore_unconverted_bases: false,
         };
 
@@ -2125,7 +2125,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
-            skip_tc_tags: false,
+            skip_pa_tags: false,
             restore_unconverted_bases: false,
         };
 
@@ -2333,7 +2333,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads,
-            skip_tc_tags: false,
+            skip_pa_tags: false,
             restore_unconverted_bases: false,
         };
 
@@ -2420,7 +2420,7 @@ mod tests {
             compression: CompressionOptions { compression_level: 1 },
             bwa_chunk_size: 150_000_000,
             exclude_missing_reads: false,
-            skip_tc_tags: false,
+            skip_pa_tags: false,
             restore_unconverted_bases: false,
         };
 
@@ -2481,8 +2481,8 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
 
-        // Call add_template_coordinate_tags_raw
-        add_template_coordinate_tags_raw(&mut template);
+        // Call add_primary_alignment_tags
+        add_primary_alignment_tags(&mut template);
 
         // Check that supplementary has pa tag
         let supp = template
@@ -2492,19 +2492,19 @@ mod tests {
             .expect("Should have supplementary");
 
         // Parse and verify the pa tag
-        let tc_info = tc_info_from_raw(supp).expect("Supplementary should have pa tag");
+        let pa_info = pa_info_from_raw(supp).expect("Supplementary should have pa tag");
 
         // Only R1 mapped, so both positions should be the same
-        assert_eq!(tc_info.tid1, 0, "tid1 should be R1's reference");
-        assert_eq!(tc_info.pos1, 100, "pos1 should be R1's position");
-        assert!(!tc_info.neg1, "neg1 should be false (forward strand)");
-        assert_eq!(tc_info.tid2, 0, "tid2 should equal tid1 (single read)");
-        assert_eq!(tc_info.pos2, 100, "pos2 should equal pos1 (single read)");
-        assert!(!tc_info.neg2, "neg2 should equal neg1 (single read)");
+        assert_eq!(pa_info.tid1, 0, "tid1 should be R1's reference");
+        assert_eq!(pa_info.pos1, 100, "pos1 should be R1's position");
+        assert!(!pa_info.neg1, "neg1 should be false (forward strand)");
+        assert_eq!(pa_info.tid2, 0, "tid2 should equal tid1 (single read)");
+        assert_eq!(pa_info.pos2, 100, "pos2 should equal pos1 (single read)");
+        assert!(!pa_info.neg2, "neg2 should equal neg1 (single read)");
 
         // Check that primary does NOT have pa tag
         let primary = template.r1().expect("Should have primary R1");
-        assert!(tc_info_from_raw(primary).is_none(), "Primary should not have pa tag");
+        assert!(pa_info_from_raw(primary).is_none(), "Primary should not have pa tag");
 
         Ok(())
     }
@@ -2543,20 +2543,20 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        add_primary_alignment_tags(&mut template);
 
         let secondary =
             template.records().iter().find(|r| r.is_secondary()).expect("Should have secondary");
 
         // Parse and verify the pa tag
-        let tc_info = tc_info_from_raw(secondary).expect("Secondary should have pa tag");
+        let pa_info = pa_info_from_raw(secondary).expect("Secondary should have pa tag");
 
         // Primary is on reverse strand with 8M cigar
         // Unclipped 5' position for reverse strand = alignment_start + alignment_span - 1
         // = 200 + 8 - 1 = 207
-        assert_eq!(tc_info.tid1, 0, "tid1 should be R1's reference");
-        assert_eq!(tc_info.pos1, 207, "pos1 should be R1's unclipped 5' position");
-        assert!(tc_info.neg1, "neg1 should be true (reverse strand)");
+        assert_eq!(pa_info.tid1, 0, "tid1 should be R1's reference");
+        assert_eq!(pa_info.pos1, 207, "pos1 should be R1's unclipped 5' position");
+        assert!(pa_info.neg1, "neg1 should be true (reverse strand)");
 
         Ok(())
     }
@@ -2612,7 +2612,7 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, primary_r2, supplementary_r2])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        add_primary_alignment_tags(&mut template);
 
         let supp = template
             .records()
@@ -2621,17 +2621,17 @@ mod tests {
             .expect("Should have supplementary");
 
         // Parse and verify the pa tag
-        let tc_info = tc_info_from_raw(supp).expect("Supplementary R2 should have pa tag");
+        let pa_info = pa_info_from_raw(supp).expect("Supplementary R2 should have pa tag");
 
         // pa tag should contain BOTH primaries' unclipped 5' positions (sorted by position)
         // R1 forward strand at 100 with 8M -> unclipped 5' = 100
         // R2 reverse strand at 300 with 8M -> unclipped 5' = 300 + 8 - 1 = 307
-        assert_eq!(tc_info.tid1, 0, "tid1 should be R1's reference (earlier)");
-        assert_eq!(tc_info.pos1, 100, "pos1 should be R1's unclipped 5' position (earlier)");
-        assert!(!tc_info.neg1, "neg1 should be false (R1 forward strand)");
-        assert_eq!(tc_info.tid2, 0, "tid2 should be R2's reference (later)");
-        assert_eq!(tc_info.pos2, 307, "pos2 should be R2's unclipped 5' position (later)");
-        assert!(tc_info.neg2, "neg2 should be true (R2 reverse strand)");
+        assert_eq!(pa_info.tid1, 0, "tid1 should be R1's reference (earlier)");
+        assert_eq!(pa_info.pos1, 100, "pos1 should be R1's unclipped 5' position (earlier)");
+        assert!(!pa_info.neg1, "neg1 should be false (R1 forward strand)");
+        assert_eq!(pa_info.tid2, 0, "tid2 should be R2's reference (later)");
+        assert_eq!(pa_info.pos2, 307, "pos2 should be R2's unclipped 5' position (later)");
+        assert!(pa_info.neg2, "neg2 should be true (R2 reverse strand)");
 
         Ok(())
     }
@@ -2657,7 +2657,7 @@ mod tests {
 
         let mut template = Template::from_records(vec![supplementary])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        add_primary_alignment_tags(&mut template);
 
         let supp = template
             .records()
@@ -2667,7 +2667,7 @@ mod tests {
 
         // Should NOT have pa tag since there's no primary
         assert!(
-            tc_info_from_raw(supp).is_none(),
+            pa_info_from_raw(supp).is_none(),
             "Supplementary without primary should not have pa tag"
         );
 
@@ -2713,20 +2713,20 @@ mod tests {
             .expect("Should have supplementary in output");
 
         // Check pa tag was added
-        let tc_value =
-            supp_record.data().get(&TC_TAG).expect("Supplementary should have pa tag after merge");
+        let pa_value =
+            supp_record.data().get(&PA_TAG).expect("Supplementary should have pa tag after merge");
 
         // Parse and verify the pa tag
-        let tc_info = TemplateCoordinateInfo::from_tag_value(tc_value)
-            .expect("Should be able to parse pa tag");
+        let pa_info =
+            PrimaryAlignmentInfo::from_tag_value(pa_value).expect("Should be able to parse pa tag");
 
         // pa tag should contain both primaries' unclipped 5' positions
         // R1: forward strand at 100 with 100M -> unclipped 5' = 100
         // R2: reverse strand at 200 with 100M -> unclipped 5' = 200 + 100 - 1 = 299
-        assert_eq!(tc_info.tid1, 0, "tid1 should be 0");
-        assert_eq!(tc_info.pos1, 100, "pos1 should be R1's unclipped 5' position");
-        assert_eq!(tc_info.tid2, 0, "tid2 should be 0");
-        assert_eq!(tc_info.pos2, 299, "pos2 should be R2's unclipped 5' position (reverse strand)");
+        assert_eq!(pa_info.tid1, 0, "tid1 should be 0");
+        assert_eq!(pa_info.pos1, 100, "pos1 should be R1's unclipped 5' position");
+        assert_eq!(pa_info.tid2, 0, "tid2 should be 0");
+        assert_eq!(pa_info.pos2, 299, "pos2 should be R2's unclipped 5' position (reverse strand)");
 
         // Verify RX tag was also copied
         let rx_tag = Tag::from(SamTag::RX);
@@ -2738,7 +2738,7 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that `add_template_coordinate_tags_raw` returns early when there are no
+    /// Tests that `add_primary_alignment_tags` returns early when there are no
     /// secondary/supplementary reads (the early exit optimization).
     #[test]
     fn test_add_pa_tag_early_exit_no_secondary_supplementary() -> Result<()> {
@@ -2773,18 +2773,18 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, primary_r2])?;
 
-        // Call add_template_coordinate_tags_raw - should return early
-        add_template_coordinate_tags_raw(&mut template);
+        // Call add_primary_alignment_tags - should return early
+        add_primary_alignment_tags(&mut template);
 
         // Verify no pa tags were added (primaries don't get pa tags)
         for record in template.records() {
-            assert!(tc_info_from_raw(record).is_none(), "Primary reads should not have pa tag");
+            assert!(pa_info_from_raw(record).is_none(), "Primary reads should not have pa tag");
         }
 
         Ok(())
     }
 
-    /// Tests that `add_template_coordinate_tags_raw` only adds pa tag to secondary/supplementary,
+    /// Tests that `add_primary_alignment_tags` only adds pa tag to secondary/supplementary,
     /// not to primary reads, even when secondary/supplementary are present.
     #[test]
     fn test_add_pa_tag_only_to_secondary_supplementary() -> Result<()> {
@@ -2819,14 +2819,14 @@ mod tests {
 
         let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
 
-        add_template_coordinate_tags_raw(&mut template);
+        add_primary_alignment_tags(&mut template);
 
         // Check each record
         for record in template.records() {
             if record.is_secondary() {
-                assert!(tc_info_from_raw(record).is_some(), "Secondary should have pa tag");
+                assert!(pa_info_from_raw(record).is_some(), "Secondary should have pa tag");
             } else {
-                assert!(tc_info_from_raw(record).is_none(), "Primary should not have pa tag");
+                assert!(pa_info_from_raw(record).is_none(), "Primary should not have pa tag");
             }
         }
 
@@ -2834,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_tc_tags_parameter() -> Result<()> {
+    fn test_skip_pa_tags_parameter() -> Result<()> {
         use crate::template::Template;
 
         const FLAG_UNMAPPED: u16 = 0x4;
@@ -2880,14 +2880,14 @@ mod tests {
 
         let tag_info = TagInfo::new(vec![], vec![], vec![]);
 
-        // Test with skip_tc_tags = true
+        // Test with skip_pa_tags = true
         merge_raw(&unmapped, &mut template, &tag_info, true)?;
 
-        // Supplementary should NOT have pa tag when skip_tc_tags is true
+        // Supplementary should NOT have pa tag when skip_pa_tags is true
         for record in template.records() {
             assert!(
-                tc_info_from_raw(record).is_none(),
-                "No records should have pa tag when skip_tc_tags=true"
+                pa_info_from_raw(record).is_none(),
+                "No records should have pa tag when skip_pa_tags=true"
             );
         }
 
@@ -2895,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_tc_tags_false_adds_tags() -> Result<()> {
+    fn test_skip_pa_tags_false_adds_tags() -> Result<()> {
         use crate::template::Template;
 
         const FLAG_UNMAPPED: u16 = 0x4;
@@ -2941,16 +2941,16 @@ mod tests {
 
         let tag_info = TagInfo::new(vec![], vec![], vec![]);
 
-        // Test with skip_tc_tags = false
+        // Test with skip_pa_tags = false
         merge_raw(&unmapped, &mut template, &tag_info, false)?;
 
-        // Supplementary SHOULD have pa tag when skip_tc_tags is false
+        // Supplementary SHOULD have pa tag when skip_pa_tags is false
         let has_pa_tag = template
             .records()
             .iter()
-            .any(|r| r.is_supplementary() && tc_info_from_raw(r).is_some());
+            .any(|r| r.is_supplementary() && pa_info_from_raw(r).is_some());
 
-        assert!(has_pa_tag, "Supplementary should have pa tag when skip_tc_tags=false");
+        assert!(has_pa_tag, "Supplementary should have pa tag when skip_pa_tags=false");
 
         Ok(())
     }
@@ -3667,9 +3667,9 @@ mod tests {
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "false"], false)]
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=true"], true)]
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=false"], false)]
-    fn test_skip_tc_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
+    fn test_skip_pa_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
-        assert_eq!(cmd.skip_tc_tags, expected);
+        assert_eq!(cmd.skip_pa_tags, expected);
     }
 
     #[rstest]

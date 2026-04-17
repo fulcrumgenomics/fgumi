@@ -34,9 +34,7 @@ use crate::unified_pipeline::MemoryEstimate;
 /// This enables ordered output from parallel processing where
 /// items may complete out of order.
 ///
-/// Uses a sparse `VecDeque`: pop is O(1); insert is O(1) when the sequence
-/// number arrives in order, and O(gap) when it arrives ahead of the current
-/// buffer end (the gap is filled with `None` sentinels).
+/// Uses a sparse `VecDeque` for O(1) insert and pop operations.
 ///
 /// # Memory Tracking
 ///
