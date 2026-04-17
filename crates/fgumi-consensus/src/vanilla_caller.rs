@@ -13,7 +13,7 @@ use crate::phred::{
 use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 #[cfg(test)]
@@ -364,7 +364,11 @@ pub struct VanillaUmiConsensusCaller {
     /// Random number generator for downsampling (seeded or thread-local)
     rng: StdRng,
 
-    /// Rejected reads as raw bytes (if tracking is enabled)
+    /// Rejected reads as raw bytes (if tracking is enabled).
+    ///
+    /// Retained as `Vec<Vec<u8>>` (not `Vec<RawRecord>`) because callers aggregate into
+    /// `all_rejects: Vec<Vec<u8>>` for deferred BAM writing; that rejects path is a
+    /// separate migration from the input path changed here.
     rejected_reads: Vec<Vec<u8>>,
 
     /// Whether to track rejected reads
@@ -740,21 +744,21 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Filters reads to remove secondary/supplementary alignments.
-    fn filter_reads(&mut self, reads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    fn filter_reads(&mut self, reads: Vec<RawRecord>) -> Vec<RawRecord> {
         let (accepted, rejected): (Vec<_>, Vec<_>) = reads.into_iter().partition(|raw| {
-            let flg = RawRecordView::new(raw).flags();
+            let flg = RawRecordView::new(raw.as_ref()).flags();
             flg & flags::SECONDARY == 0 && flg & flags::SUPPLEMENTARY == 0
         });
 
         if self.track_rejects {
-            self.rejected_reads.extend(rejected);
+            self.rejected_reads.extend(rejected.into_iter().map(RawRecord::into_inner));
         }
 
         accepted
     }
 
     /// Downsamples reads if there are more than `max_reads`
-    fn downsample_reads(&mut self, mut reads: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    fn downsample_reads(&mut self, mut reads: Vec<RawRecord>) -> Vec<RawRecord> {
         if let Some(max_reads) = self.options.max_reads {
             if reads.len() > max_reads {
                 reads.shuffle(&mut self.rng);
@@ -865,14 +869,13 @@ impl VanillaUmiConsensusCaller {
     ) -> Option<SourceRead> {
         use fgumi_raw_bam as bam_fields;
 
-        let view = RawRecordView::new(raw);
-        let flg = view.flags();
+        let flg = RawRecordView::new(raw).flags();
         let is_negative_strand = flg & flags::REVERSE != 0;
         let min_bq = self.options.min_input_base_quality;
 
         // Get bases and quals from raw bytes
-        let mut bases = view.sequence_vec();
-        let mut quals = view.quality_scores().to_vec();
+        let mut bases = RawRecordView::new(raw).sequence_vec();
+        let mut quals = RawRecordView::new(raw).quality_scores().to_vec();
         let read_len = bases.len();
 
         if quals.is_empty() || quals.len() != read_len {
@@ -929,8 +932,8 @@ impl VanillaUmiConsensusCaller {
 
         simplified_cigar = Self::truncate_simplified_cigar(&simplified_cigar, final_len);
 
-        let rid = view.ref_id();
-        let astart = i64::from(view.pos());
+        let rid = RawRecordView::new(raw).ref_id();
+        let astart = i64::from(RawRecordView::new(raw).pos());
 
         Some(SourceRead {
             original_idx,
@@ -1003,20 +1006,19 @@ impl VanillaUmiConsensusCaller {
 
     /// Sub-groups reads by read type (fragment, R1, R2)
     #[expect(
-        clippy::type_complexity,
-        reason = "tuple return type is clearer than a one-off struct for internal grouping"
-    )]
-    #[expect(
         clippy::unused_self,
         reason = "method signature kept for consistency with other caller trait methods"
     )]
-    fn subgroup_reads(&self, reads: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    fn subgroup_reads(
+        &self,
+        reads: Vec<RawRecord>,
+    ) -> (Vec<RawRecord>, Vec<RawRecord>, Vec<RawRecord>) {
         let mut fragment_reads = Vec::new();
         let mut r1_reads = Vec::new();
         let mut r2_reads = Vec::new();
 
         for raw in reads {
-            let flg = RawRecordView::new(&raw).flags();
+            let flg = RawRecordView::new(raw.as_ref()).flags();
             if flg & flags::PAIRED == 0 {
                 fragment_reads.push(raw);
             } else if flg & flags::FIRST_SEGMENT != 0 {
@@ -1030,7 +1032,7 @@ impl VanillaUmiConsensusCaller {
     }
 
     /// Processes a single UMI group to produce consensus reads
-    fn process_group(&mut self, umi: &str, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+    fn process_group(&mut self, umi: &str, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
         let input_count = records.len();
         self.stats.record_input(input_count);
 
@@ -1050,7 +1052,7 @@ impl VanillaUmiConsensusCaller {
         if reads.len() < self.options.min_reads {
             self.stats.record_rejection(RejectionReason::InsufficientReads, reads.len());
             if self.track_rejects {
-                self.rejected_reads.extend(reads);
+                self.rejected_reads.extend(reads.into_iter().map(RawRecord::into_inner));
             }
             return Ok(ConsensusOutput::default());
         }
@@ -1107,13 +1109,17 @@ impl VanillaUmiConsensusCaller {
     /// Returns a tuple of:
     /// - `bool` — whether a consensus was produced
     /// - `usize` — count of reads that survived all internal filtering (not rejected)
-    /// - `Vec<Vec<u8>>` — the surviving raw reads (only populated when `self.track_rejects`)
+    /// - `Vec<Vec<u8>>` — the surviving raw reads as bytes (only populated when `self.track_rejects`)
+    ///
+    /// The return type's third element is `Vec<Vec<u8>>` (not `Vec<RawRecord>`) because
+    /// orphan-consensus rejections are forwarded to `rejected_reads: Vec<Vec<u8>>`; that
+    /// rejects path is a separate migration from the input migration done here.
     fn process_subgroup(
         &mut self,
         output: &mut ConsensusOutput,
         umi: &str,
         read_type: ReadType,
-        group_reads: Vec<Vec<u8>>,
+        group_reads: Vec<RawRecord>,
     ) -> Result<(bool, usize, Vec<Vec<u8>>)> {
         use fgumi_raw_bam as bam_fields;
 
@@ -1124,7 +1130,7 @@ impl VanillaUmiConsensusCaller {
         if group_reads.len() < self.options.min_reads {
             self.stats.record_rejection(RejectionReason::InsufficientReads, group_reads.len());
             if self.track_rejects {
-                self.rejected_reads.extend(group_reads);
+                self.rejected_reads.extend(group_reads.into_iter().map(RawRecord::into_inner));
             }
             return Ok((false, 0, Vec::new()));
         }
@@ -1132,7 +1138,7 @@ impl VanillaUmiConsensusCaller {
         // Calculate mate overlap clips from raw bytes
         let mate_overlap_clips: Vec<usize> = group_reads
             .iter()
-            .map(|raw| bam_fields::num_bases_extending_past_mate_raw(raw))
+            .map(|raw| bam_fields::num_bases_extending_past_mate_raw(raw.as_ref()))
             .collect();
 
         // Create SourceReads from raw bytes
@@ -1142,7 +1148,7 @@ impl VanillaUmiConsensusCaller {
         for (idx, (raw, &mate_clip)) in
             group_reads.iter().zip(mate_overlap_clips.iter()).enumerate()
         {
-            if let Some(sr) = self.create_source_read(raw, idx, mate_clip) {
+            if let Some(sr) = self.create_source_read(raw.as_ref(), idx, mate_clip) {
                 source_reads.push(sr);
             } else {
                 zero_length_indices.push(idx);
@@ -1156,7 +1162,7 @@ impl VanillaUmiConsensusCaller {
             );
             if self.track_rejects {
                 for &idx in &zero_length_indices {
-                    self.rejected_reads.push(group_reads[idx].clone());
+                    self.rejected_reads.push(group_reads[idx].to_vec());
                 }
             }
         }
@@ -1166,7 +1172,7 @@ impl VanillaUmiConsensusCaller {
                 self.stats.record_rejection(RejectionReason::InsufficientReads, source_reads.len());
                 if self.track_rejects {
                     for sr in &source_reads {
-                        self.rejected_reads.push(group_reads[sr.original_idx].clone());
+                        self.rejected_reads.push(group_reads[sr.original_idx].to_vec());
                     }
                 }
             }
@@ -1179,7 +1185,7 @@ impl VanillaUmiConsensusCaller {
 
         if self.track_rejects {
             for idx in rejected_indices {
-                self.rejected_reads.push(group_reads[idx].clone());
+                self.rejected_reads.push(group_reads[idx].to_vec());
             }
         }
 
@@ -1191,7 +1197,7 @@ impl VanillaUmiConsensusCaller {
                 );
                 if self.track_rejects {
                     for sr in &filtered_source_reads {
-                        self.rejected_reads.push(group_reads[sr.original_idx].clone());
+                        self.rejected_reads.push(group_reads[sr.original_idx].to_vec());
                     }
                 }
             }
@@ -1201,7 +1207,7 @@ impl VanillaUmiConsensusCaller {
         // Capture surviving count and reads before building consensus
         let surviving_count = filtered_source_reads.len();
         let surviving_reads = if self.track_rejects {
-            filtered_source_reads.iter().map(|sr| group_reads[sr.original_idx].clone()).collect()
+            filtered_source_reads.iter().map(|sr| group_reads[sr.original_idx].to_vec()).collect()
         } else {
             Vec::new()
         };
@@ -1222,10 +1228,8 @@ impl VanillaUmiConsensusCaller {
         let methylation = methylation.map(|m| m.truncate(bases.len()));
 
         // Get raw records for tag extraction
-        let original_raws: Vec<&[u8]> = filtered_source_reads
-            .iter()
-            .map(|sr| group_reads[sr.original_idx].as_slice())
-            .collect();
+        let original_raws: Vec<&[u8]> =
+            filtered_source_reads.iter().map(|sr| group_reads[sr.original_idx].as_ref()).collect();
 
         self.build_consensus_record_into(
             output,
@@ -1463,7 +1467,7 @@ impl VanillaUmiConsensusCaller {
 }
 
 impl ConsensusCaller for VanillaUmiConsensusCaller {
-    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
         if records.is_empty() {
             return Ok(ConsensusOutput::default());
         }
@@ -1476,13 +1480,13 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         let tag_key = [tag_bytes[0], tag_bytes[1]];
 
         let first_raw = records.first().expect("records is non-empty (checked above)");
-        let read_name_bytes = RawRecordView::new(first_raw).read_name();
+        let read_name_bytes = RawRecordView::new(first_raw.as_ref()).read_name();
         let read_name = String::from_utf8_lossy(read_name_bytes);
 
         let tag_value =
-            RawRecordView::new(first_raw).tags().find_string(&tag_key).ok_or_else(|| {
-                anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name)
-            })?;
+            RawRecordView::new(first_raw.as_ref()).tags().find_string(&tag_key).ok_or_else(
+                || anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name),
+            )?;
 
         let umi = String::from_utf8_lossy(tag_value).into_owned();
 
@@ -1575,7 +1579,8 @@ mod tests {
         caller: &mut VanillaUmiConsensusCaller,
         records: Vec<RecordBuf>,
     ) -> anyhow::Result<ConsensusOutput> {
-        let raw: Vec<Vec<u8>> = records.iter().map(encode_to_raw).collect();
+        let raw: Vec<RawRecord> =
+            records.iter().map(|r| RawRecord::from(encode_to_raw(r))).collect();
         caller.consensus_reads(raw)
     }
 
@@ -1729,7 +1734,8 @@ mod tests {
         // Mark read2 as secondary
         *read2.flags_mut() = NoodlesFlags::SECONDARY;
 
-        let filtered = caller.filter_reads(vec![encode_to_raw(&read1), encode_to_raw(&read2)]);
+        let filtered =
+            caller.filter_reads(vec![encode_to_raw(&read1).into(), encode_to_raw(&read2).into()]);
         assert_eq!(filtered.len(), 1);
     }
 
@@ -1744,9 +1750,9 @@ mod tests {
         let r2 = create_test_read("r2", b"ACGT", b"####", true, false);
 
         let (frag_reads, r1_reads, r2_reads) = caller.subgroup_reads(vec![
-            encode_to_raw(&fragment),
-            encode_to_raw(&r1),
-            encode_to_raw(&r2),
+            encode_to_raw(&fragment).into(),
+            encode_to_raw(&r1).into(),
+            encode_to_raw(&r2).into(),
         ]);
 
         // Should have one read in each subgroup
@@ -1807,11 +1813,11 @@ mod tests {
         };
 
         // Create 10 reads with different names
-        let mut reads = Vec::new();
+        let mut reads: Vec<RawRecord> = Vec::new();
         for i in 0..10 {
             let name = format!("read{i}");
             let read = create_test_read(&name, b"ACGT", b"####", false, false);
-            reads.push(encode_to_raw(&read));
+            reads.push(encode_to_raw(&read).into());
         }
 
         // Create two callers with the same seed
@@ -1851,11 +1857,11 @@ mod tests {
         };
 
         // Create 10 reads
-        let mut reads = Vec::new();
+        let mut reads: Vec<RawRecord> = Vec::new();
         for i in 0..10 {
             let name = format!("read{i}");
             let read = create_test_read(&name, b"ACGT", b"####", false, false);
-            reads.push(encode_to_raw(&read));
+            reads.push(encode_to_raw(&read).into());
         }
 
         let mut caller =

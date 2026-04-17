@@ -84,7 +84,7 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use noodles::sam::alignment::record::data::field::Tag;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -416,10 +416,9 @@ impl CodecConsensusCaller {
         clip_from_start: bool,
         clipped_cigar: Option<&[u32]>,
     ) -> SourceRead {
-        let view = RawRecordView::new(raw);
-        let mut bases = view.sequence_vec();
-        let mut quals = view.quality_scores().to_vec();
-        let flg = view.flags();
+        let mut bases = RawRecordView::new(raw).sequence_vec();
+        let mut quals = RawRecordView::new(raw).quality_scores().to_vec();
+        let flg = RawRecordView::new(raw).flags();
 
         // Apply clipping: truncate bases and quals
         // Clamp clip_amount to avoid panic on malformed input (e.g., CIGAR/MC mismatch)
@@ -452,8 +451,8 @@ impl CodecConsensusCaller {
             quals.reverse();
         }
 
-        let rid = view.ref_id();
-        let astart = i64::from(view.pos());
+        let rid = RawRecordView::new(raw).ref_id();
+        let astart = i64::from(RawRecordView::new(raw).pos());
         let original_cigar = {
             let ops = bam_fields::get_cigar_ops(raw);
             bam_fields::simplify_cigar_from_raw(&ops)
@@ -526,7 +525,7 @@ impl CodecConsensusCaller {
         clippy::too_many_lines,
         reason = "consensus pipeline has many sequential steps that are clearest in one function"
     )]
-    fn consensus_reads_raw(&mut self, records: &[Vec<u8>]) -> Result<ConsensusOutput> {
+    fn consensus_reads_raw(&mut self, records: &[RawRecord]) -> Result<ConsensusOutput> {
         self.stats.total_input_reads += records.len() as u64;
 
         if records.is_empty() {
@@ -793,7 +792,7 @@ impl CodecConsensusCaller {
         let all_paired_raws: Vec<&[u8]> = r1_infos
             .iter()
             .chain(r2_infos.iter())
-            .map(|info| records[info.raw_idx].as_slice())
+            .map(|info| records[info.raw_idx].as_ref())
             .collect();
 
         let mut output = ConsensusOutput::default();
@@ -813,8 +812,7 @@ impl CodecConsensusCaller {
 
     /// Build `ClippedRecordInfo` for a single raw record.
     fn build_clipped_info(raw: &[u8], raw_idx: usize, clip_amount: usize) -> ClippedRecordInfo {
-        let view = RawRecordView::new(raw);
-        let flg = view.flags();
+        let flg = RawRecordView::new(raw).flags();
         let is_reverse = flg & flags::REVERSE != 0;
         let clip_from_start = is_reverse; // negative strand ⟹ clip from start
 
@@ -822,11 +820,11 @@ impl CodecConsensusCaller {
         let (clipped_cigar, ref_bases_consumed) =
             bam_fields::clip_cigar_ops_raw(&original_ops, clip_amount, clip_from_start);
 
-        let original_seq_len = view.l_seq() as usize;
+        let original_seq_len = RawRecordView::new(raw).l_seq() as usize;
         let clipped_seq_len = original_seq_len.saturating_sub(clip_amount);
 
         // 1-based alignment start, adjusted for start-clipping
-        let pos_0based = view.pos();
+        let pos_0based = RawRecordView::new(raw).pos();
         debug_assert!(
             pos_0based >= 0,
             "build_clipped_info called on unmapped record (pos={pos_0based})"
@@ -1229,7 +1227,7 @@ impl CodecConsensusCaller {
         ss_b: &SingleStrandConsensus,
         umi: Option<&str>,
         source_raws: &[&[u8]],
-        all_records: &[Vec<u8>],
+        all_records: &[RawRecord],
     ) -> Result<()> {
         // Generate read name - use ':' delimiter to match fgbio format
         self.consensus_counter += 1;
@@ -1377,11 +1375,11 @@ impl CodecConsensusCaller {
 /// This allows `CodecConsensusCaller` to be used polymorphically with other
 /// consensus callers (e.g., `VanillaUmiConsensusCaller`, `DuplexConsensusCaller`).
 impl ConsensusCaller for CodecConsensusCaller {
-    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
         let result = self.consensus_reads_raw(&records)?;
         // When a group fails to produce consensus, all its records are rejected
         if self.track_rejects && result.count == 0 && !records.is_empty() {
-            self.rejected_reads.extend(records);
+            self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
         }
         Ok(result)
     }
@@ -1477,7 +1475,8 @@ impl CodecConsensusCaller {
         &mut self,
         recs: Vec<noodles::sam::alignment::RecordBuf>,
     ) -> Result<ConsensusOutput> {
-        let raw_records: Vec<Vec<u8>> = recs.iter().map(Self::record_buf_to_raw).collect();
+        let raw_records: Vec<RawRecord> =
+            recs.iter().map(|r| RawRecord::from(Self::record_buf_to_raw(r))).collect();
         self.consensus_reads(raw_records)
     }
 }
@@ -1501,7 +1500,8 @@ impl CodecConsensusCaller {
         &mut self,
         recs: Vec<noodles::sam::alignment::RecordBuf>,
     ) -> Vec<noodles::sam::alignment::RecordBuf> {
-        let raws: Vec<Vec<u8>> = recs.iter().map(Self::record_buf_to_raw).collect();
+        let raws: Vec<RawRecord> =
+            recs.iter().map(|r| RawRecord::from(Self::record_buf_to_raw(r))).collect();
         let infos: Vec<ClippedRecordInfo> =
             raws.iter().enumerate().map(|(i, raw)| Self::build_clipped_info(raw, i, 0)).collect();
         let filtered = self.filter_to_most_common_alignment_raw(infos);

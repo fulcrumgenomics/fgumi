@@ -15,7 +15,7 @@ use crate::logging::{OperationTimer, log_consensus_summary};
 use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
 use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
-    apply_overlapping_consensus_raw,
+    apply_overlapping_consensus,
 };
 use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
@@ -397,12 +397,15 @@ impl Command for Simplex {
 
             // Apply overlapping consensus if enabled (modifies raw bytes in-place)
             if let Some(ref mut oc) = overlapping_caller {
-                apply_overlapping_consensus_raw(&mut records, oc)?;
+                apply_overlapping_consensus(&mut records, oc)?;
             }
 
-            // Call consensus directly — records are already raw bytes!
+            // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
+            // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
+            let raw: Vec<fgumi_raw_bam::RawRecord> =
+                records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
             let output = caller
-                .consensus_reads(records)
+                .consensus_reads(raw)
                 .with_context(|| format!("Failed to call consensus for UMI: {umi}"))?;
 
             let batch_size = output.count;
@@ -599,7 +602,7 @@ impl Simplex {
                     // Apply overlapping consensus if enabled (modifies raw bytes in-place)
                     if let Some(ref mut oc) = overlapping_caller {
                         oc.reset_stats();
-                        if apply_overlapping_consensus_raw(&mut raw_records, oc).is_err() {
+                        if apply_overlapping_consensus(&mut raw_records, oc).is_err() {
                             batch_overlapping.merge(oc.stats());
                             batch_stats.record_input(raw_records.len());
                             batch_stats.record_rejection(RejectionReason::Other, raw_records.len());
@@ -611,8 +614,11 @@ impl Simplex {
                         batch_overlapping.merge(oc.stats());
                     }
 
-                    // Call consensus directly — records are already raw bytes!
-                    match caller.consensus_reads(raw_records) {
+                    // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
+                    // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
+                    let raw: Vec<fgumi_raw_bam::RawRecord> =
+                        raw_records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
+                    match caller.consensus_reads(raw) {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
                             batch_stats.merge(&caller.statistics());

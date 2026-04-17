@@ -380,8 +380,11 @@ impl Command for Codec {
         for result in mi_group_iter {
             let (umi, records) = result.context("Failed to read MI group")?;
 
-            // Call consensus directly — records are already raw bytes!
-            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+            // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
+            // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
+            let raw: Vec<fgumi_raw_bam::RawRecord> =
+                records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
+            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(raw);
             match result {
                 Ok(output) => {
                     let batch_size = output.count;
@@ -571,8 +574,11 @@ impl Codec {
                 for RawMiGroup { mi, records } in batch.groups {
                     caller.clear();
 
-                    // Call CODEC consensus directly — records are already raw bytes!
-                    let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+                    // Call CODEC consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
+                    // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
+                    let raw: Vec<fgumi_raw_bam::RawRecord> =
+                        records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
+                    let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(raw);
                     match result {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);

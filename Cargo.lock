@@ -751,10 +751,12 @@ name = "fgumi-raw-bam"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "bstr 1.12.1",
  "bytemuck",
  "noodles",
  "proptest",
  "rstest",
+ "tempfile",
  "wide 1.3.0",
 ]
 
@@ -1485,6 +1487,7 @@ dependencies = [
  "noodles-bam",
  "noodles-bgzf",
  "noodles-core",
+ "noodles-csi",
  "noodles-fasta",
  "noodles-sam",
  "noodles-vcf",
