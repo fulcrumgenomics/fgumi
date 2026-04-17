@@ -836,7 +836,7 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
 fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
     if let Some(raw_records) = template.all_raw_records_mut() {
         for raw in raw_records.iter_mut() {
-            let flg = RawRecordView::new(raw.as_slice()).flags();
+            let flg = RawRecordView::new(raw.as_ref()).flags();
             bam_fields::set_flags(raw, flg | DUPLICATE_FLAG);
             dedup_metrics.duplicate_reads += 1;
         }
@@ -901,7 +901,7 @@ fn process_position_group(
         .map(|mut t| {
             if let Some(raw_records) = t.all_raw_records_mut() {
                 for raw in raw_records.iter_mut() {
-                    let flg = RawRecordView::new(raw.as_slice()).flags();
+                    let flg = RawRecordView::new(raw.as_ref()).flags();
                     bam_fields::set_flags(raw, flg & !DUPLICATE_FLAG);
                 }
             } else {
@@ -968,7 +968,7 @@ fn process_position_group(
         if let Some(raw_records) = template.all_raw_records() {
             for raw in raw_records {
                 dedup_metrics.total_reads += 1;
-                let flg = RawRecordView::new(raw.as_slice()).flags();
+                let flg = RawRecordView::new(raw.as_ref()).flags();
                 let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
                 let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
 
@@ -2509,7 +2509,7 @@ mod tests {
         // (rejected as poor alignment due to missing UMI tag).
 
         let raw = make_raw_bam_record_truncated_aux();
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
@@ -2553,7 +2553,7 @@ mod tests {
         rec.extend_from_slice(b"MQc"); // tag=MQ, type=c (signed byte)
         rec.push(10); // MAPQ = 10 (< min_mapq of 20)
 
-        let template = Template::from_raw_records(vec![rec])
+        let template = Template::from_raw_records(vec![rec].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
@@ -2648,7 +2648,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         assert_eq!(score_template_raw(&template), 60);
     }
@@ -2664,7 +2664,7 @@ mod tests {
             &[10, 10, 10, 10],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         assert_eq!(score_template_raw(&template), 40);
     }
@@ -2688,8 +2688,9 @@ mod tests {
             &[10, 10, 10, 10],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![r1, r2])
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_raw_records(vec![r1, r2].into_iter().map(Into::into).collect())
+                .expect("test template construction should not fail");
         assert_eq!(score_template_raw(&template), 100);
     }
 
@@ -2708,7 +2709,7 @@ mod tests {
                 qualities,
                 b"ACGT",
             );
-            Template::from_raw_records(vec![raw])
+            Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
                 .expect("test template construction should not fail")
         };
         assert_eq!(score_template(&template_rb), score_template(&template_raw));
@@ -2730,7 +2731,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -2756,7 +2757,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -2783,7 +2784,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -2809,7 +2810,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -2835,7 +2836,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -2860,7 +2861,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -3036,7 +3037,7 @@ mod tests {
             4,
             &[20, 20, 20, 20],
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -3064,7 +3065,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -3092,7 +3093,7 @@ mod tests {
             &[20, 20, 20, 20],
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,

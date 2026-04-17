@@ -5,6 +5,7 @@
 //! (e.g., output from `group`).
 
 use anyhow::{Result, bail};
+use fgumi_raw_bam::RawRecord;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::io;
@@ -706,13 +707,13 @@ pub struct RawMiGroup {
     /// The MI tag value (e.g., "0", "1/A", "1/B")
     pub mi: String,
     /// Raw BAM records sharing this MI value
-    pub records: Vec<Vec<u8>>,
+    pub records: Vec<RawRecord>,
 }
 
 impl RawMiGroup {
     /// Creates a new raw MI group.
     #[must_use]
-    pub fn new(mi: String, records: Vec<Vec<u8>>) -> Self {
+    pub fn new(mi: String, records: Vec<RawRecord>) -> Self {
         Self { mi, records }
     }
 }
@@ -726,8 +727,9 @@ impl BatchWeight for RawMiGroup {
 impl MemoryEstimate for RawMiGroup {
     fn estimate_heap_size(&self) -> usize {
         let mi_size = self.mi.capacity();
-        let records_size: usize = self.records.iter().map(std::vec::Vec::capacity).sum();
-        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<Vec<u8>>();
+        // RawRecord wraps Vec<u8>; use .len() for byte content (capacity not exposed)
+        let records_size: usize = self.records.iter().map(RawRecord::len).sum();
+        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<RawRecord>();
         mi_size + records_size + records_vec_overhead
     }
 }
@@ -780,7 +782,7 @@ pub struct RawMiGrouper {
     /// Current MI value being accumulated
     current_mi: Option<String>,
     /// Records in current MI group (raw bytes)
-    current_records: Vec<Vec<u8>>,
+    current_records: Vec<RawRecord>,
     /// Completed groups waiting to be batched
     pending_groups: VecDeque<RawMiGroup>,
     /// Whether `finish()` has been called
@@ -971,14 +973,14 @@ impl Grouper for RawMiGrouper {
 #[allow(clippy::type_complexity)]
 pub struct RawMiGroupIterator<I>
 where
-    I: Iterator<Item = Result<Vec<u8>>>,
+    I: Iterator<Item = Result<RawRecord>>,
 {
     record_iter: I,
     tag: [u8; 2],
     /// Optional cell barcode tag for composite grouping (MI + cell barcode)
     cell_tag: Option<[u8; 2]>,
     current_mi: Option<String>,
-    current_group: Vec<Vec<u8>>,
+    current_group: Vec<RawRecord>,
     done: bool,
     /// Pending error to return after flushing a group
     pending_error: Option<anyhow::Error>,
@@ -988,7 +990,7 @@ where
 
 impl<I> RawMiGroupIterator<I>
 where
-    I: Iterator<Item = Result<Vec<u8>>>,
+    I: Iterator<Item = Result<RawRecord>>,
 {
     /// Creates a new `RawMiGroupIterator`.
     ///
@@ -1067,9 +1069,9 @@ where
 
 impl<I> Iterator for RawMiGroupIterator<I>
 where
-    I: Iterator<Item = Result<Vec<u8>>>,
+    I: Iterator<Item = Result<RawRecord>>,
 {
-    type Item = Result<(String, Vec<Vec<u8>>)>;
+    type Item = Result<(String, Vec<RawRecord>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -1387,7 +1389,7 @@ mod tests {
     //   then: qual     (l_seq bytes)
     //   then: aux data
     #[allow(clippy::cast_possible_truncation)]
-    fn make_raw_bam_with_tag(tag_name: &str, tag_value: &str) -> Vec<u8> {
+    fn make_raw_bam_with_tag(tag_name: &str, tag_value: &str) -> RawRecord {
         let name = b"read";
         let l_read_name: u8 = (name.len() + 1) as u8; // +1 for NUL
         let seq_len: u32 = 4; // 4 bases (ACGT)
@@ -1427,12 +1429,12 @@ mod tests {
         let aux_start = 32 + l_read_name as usize + seq_bytes + seq_len as usize;
         buf[aux_start..aux_start + aux.len()].copy_from_slice(&aux);
 
-        buf
+        RawRecord::from(buf)
     }
 
     /// Build a minimal raw BAM record with no aux tags.
     #[allow(clippy::cast_possible_truncation)]
-    fn make_raw_bam_without_tag() -> Vec<u8> {
+    fn make_raw_bam_without_tag() -> RawRecord {
         let name = b"read";
         let l_read_name: u8 = (name.len() + 1) as u8;
         let seq_len: u32 = 4;
@@ -1453,7 +1455,7 @@ mod tests {
         buf[name_start..name_start + name.len()].copy_from_slice(name);
         buf[name_start + name.len()] = 0;
 
-        buf
+        RawRecord::from(buf)
     }
 
     // ========================================================================
@@ -1462,14 +1464,14 @@ mod tests {
 
     #[test]
     fn test_raw_empty_iterator() {
-        let records: Vec<Result<Vec<u8>>> = vec![];
+        let records: Vec<Result<RawRecord>> = vec![];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
         assert!(iter.next().is_none());
     }
 
     #[test]
     fn test_raw_single_group() {
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "0")),
@@ -1485,7 +1487,7 @@ mod tests {
 
     #[test]
     fn test_raw_multiple_groups() {
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "1")),
@@ -1512,7 +1514,7 @@ mod tests {
 
     #[test]
     fn test_raw_skips_records_without_mi_tag() {
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_without_tag()),
             Ok(make_raw_bam_with_tag("MI", "0")),
@@ -1534,7 +1536,7 @@ mod tests {
 
     #[test]
     fn test_raw_error_propagation() {
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Err(anyhow::anyhow!("test error")),
             Ok(make_raw_bam_with_tag("MI", "1")),
@@ -1555,7 +1557,7 @@ mod tests {
 
     #[test]
     fn test_raw_error_with_no_pending_group() {
-        let records: Vec<Result<Vec<u8>>> =
+        let records: Vec<Result<RawRecord>> =
             vec![Err(anyhow::anyhow!("immediate error")), Ok(make_raw_bam_with_tag("MI", "0"))];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
 
@@ -1569,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_raw_custom_tag() {
-        let records: Vec<Result<Vec<u8>>> =
+        let records: Vec<Result<RawRecord>> =
             vec![Ok(make_raw_bam_with_tag("RX", "ACGT")), Ok(make_raw_bam_with_tag("RX", "ACGT"))];
         let mut iter = RawMiGroupIterator::new(records.into_iter(), "RX");
 
@@ -1583,14 +1585,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Tag name must be exactly 2 characters")]
     fn test_raw_invalid_tag_length() {
-        let records: Vec<Result<Vec<u8>>> = vec![];
+        let records: Vec<Result<RawRecord>> = vec![];
         let _ = RawMiGroupIterator::new(records.into_iter(), "M");
     }
 
     #[test]
     fn test_raw_with_transform() {
         // Simulate duplex reads: 1/A, 1/B should group under "1"
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "1/A")),
             Ok(make_raw_bam_with_tag("MI", "1/A")),
             Ok(make_raw_bam_with_tag("MI", "1/B")),
@@ -1618,7 +1620,7 @@ mod tests {
 
     #[test]
     fn test_raw_with_transform_empty() {
-        let records: Vec<Result<Vec<u8>>> = vec![];
+        let records: Vec<Result<RawRecord>> = vec![];
         let mut iter = RawMiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
             String::from_utf8_lossy(raw).to_uppercase()
         });
@@ -1628,7 +1630,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Tag name must be exactly 2 characters")]
     fn test_raw_with_transform_invalid_tag_length() {
-        let records: Vec<Result<Vec<u8>>> = vec![];
+        let records: Vec<Result<RawRecord>> = vec![];
         let _ = RawMiGroupIterator::with_transform(records.into_iter(), "ABC", |raw| {
             String::from_utf8_lossy(raw).into_owned()
         });
@@ -1636,7 +1638,7 @@ mod tests {
 
     #[test]
     fn test_raw_get_mi_without_transform() {
-        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<Vec<u8>>>(), "MI");
+        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
         let bam = make_raw_bam_with_tag("MI", "42");
         assert_eq!(iter.get_mi(&bam), Some("42".to_string()));
     }
@@ -1644,7 +1646,7 @@ mod tests {
     #[test]
     fn test_raw_get_mi_with_transform() {
         let iter = RawMiGroupIterator::with_transform(
-            std::iter::empty::<Result<Vec<u8>>>(),
+            std::iter::empty::<Result<RawRecord>>(),
             "MI",
             |raw| {
                 let s = String::from_utf8_lossy(raw);
@@ -1657,21 +1659,21 @@ mod tests {
 
     #[test]
     fn test_raw_get_mi_missing_tag() {
-        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<Vec<u8>>>(), "MI");
+        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
         let bam = make_raw_bam_without_tag();
         assert_eq!(iter.get_mi(&bam), None);
     }
 
     #[test]
     fn test_raw_get_mi_wrong_tag() {
-        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<Vec<u8>>>(), "MI");
+        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
         let bam = make_raw_bam_with_tag("RX", "ACGT");
         assert_eq!(iter.get_mi(&bam), None);
     }
 
     /// Build a minimal raw BAM record with two string tags.
     #[allow(clippy::cast_possible_truncation)]
-    fn make_raw_bam_with_two_tags(tag1: &str, val1: &str, tag2: &str, val2: &str) -> Vec<u8> {
+    fn make_raw_bam_with_two_tags(tag1: &str, val1: &str, tag2: &str, val2: &str) -> RawRecord {
         let name = b"read";
         let l_read_name: u8 = (name.len() + 1) as u8;
         let seq_len: u32 = 4;
@@ -1707,13 +1709,13 @@ mod tests {
         let aux_start = 32 + l_read_name as usize + seq_bytes + seq_len as usize;
         buf[aux_start..aux_start + aux.len()].copy_from_slice(&aux);
 
-        buf
+        RawRecord::from(buf)
     }
 
     #[test]
     fn test_raw_cell_tag_composite_grouping() {
         // Same MI but different cell barcodes should form separate groups
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "TGCA")),
@@ -1738,7 +1740,7 @@ mod tests {
     #[test]
     fn test_raw_cell_tag_none_groups_by_mi_only() {
         // Without cell_tag, same MI records group together regardless of other tags
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "TGCA")),
         ];
@@ -1754,7 +1756,7 @@ mod tests {
     #[test]
     fn test_raw_cell_tag_missing_cell_value() {
         // Records with MI but no cell tag get grouped under "MI\t" (empty cell)
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "1")),
             Ok(make_raw_bam_with_tag("MI", "1")),
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
@@ -1778,7 +1780,7 @@ mod tests {
     #[test]
     fn test_raw_cell_tag_with_transform() {
         // Cell tag should work with MI transform (duplex-style /A /B stripping)
-        let records: Vec<Result<Vec<u8>>> = vec![
+        let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_two_tags("MI", "1/A", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1/B", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1/A", "CB", "TGCA")),

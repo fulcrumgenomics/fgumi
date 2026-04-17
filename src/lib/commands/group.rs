@@ -14,7 +14,7 @@ use crate::grouper::{
 use crate::logging::{OperationTimer, log_umi_grouping_summary};
 use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
 use crate::progress::ProgressTracker;
-use crate::read_info::{LibraryIndex, compute_group_key};
+use crate::read_info::LibraryIndex;
 use crate::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
 use crate::template::{MoleculeId, Template};
 use crate::umi::parallel_assigner::{
@@ -23,6 +23,7 @@ use crate::umi::parallel_assigner::{
 };
 use crate::umi::{UmiValidation, validate_umi};
 use crate::unified_pipeline::DecodedRecord;
+use crate::unified_pipeline::compute_group_key_from_raw;
 use crate::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
@@ -36,6 +37,7 @@ use crate::sam::SamTag;
 use crate::unified_pipeline::MemoryEstimate;
 use crate::validation::validate_file_exists;
 use crate::vendored::bam_codec::encode_record_buf;
+use fgumi_raw_bam::{RawBamReader, RawRecord};
 use log::{info, warn};
 use noodles::sam;
 use noodles::sam::Header;
@@ -91,9 +93,13 @@ struct GroupFilterConfig {
     allow_unmapped: bool,
 }
 
-/// Filter a template based on filtering criteria.
+/// Filter a template based on filtering criteria using the noodles typed API.
+///
 /// Returns true if the template should be kept, false if it should be discarded.
 /// Updates `filter_metrics` with the reason for filtering.
+///
+/// **Retention:** kept as a noodles fallback for any caller that supplies parsed (non-raw)
+/// templates. The primary execution paths use `filter_template_raw` instead.
 fn filter_template(
     template: &Template,
     config: &GroupFilterConfig,
@@ -461,7 +467,10 @@ fn truncate_umis_impl(umis: Vec<String>, min_umi_length: Option<usize>) -> Resul
     }
 }
 
-/// Check if R1 is genomically earlier than R2 (static implementation).
+/// Check if R1 is genomically earlier than R2 using the noodles typed API.
+///
+/// **Retention:** noodles fallback used by `assign_umi_groups_for_indices_impl` when
+/// templates carry parsed `RecordBuf` data (raw-byte mode uses `is_r1_genomically_earlier_raw`).
 fn is_r1_genomically_earlier_impl(
     r1: &sam::alignment::RecordBuf,
     r2: &sam::alignment::RecordBuf,
@@ -476,7 +485,10 @@ fn is_r1_genomically_earlier_impl(
     Ok(r1_pos <= r2_pos)
 }
 
-/// Get pair orientation for a template (static implementation).
+/// Get pair orientation for a template using the noodles typed API.
+///
+/// **Retention:** noodles fallback used by `assign_umi_groups_impl` when templates carry
+/// parsed `RecordBuf` data (raw-byte mode uses `get_pair_orientation_raw`).
 fn get_pair_orientation_impl(template: &Template) -> (bool, bool) {
     let r1_positive = template.r1().is_none_or(|r| !r.flags().is_reverse_complemented());
     let r2_positive = template.r2().is_none_or(|r| !r.flags().is_reverse_complemented());
@@ -646,6 +658,10 @@ fn assign_umi_groups_for_indices_impl(
 /// Converts the `MoleculeId` enum to a string representation with the base offset applied,
 /// and sets the MI tag on the record. This is called just before writing to minimize
 /// memory usage (strings are not stored until write time).
+///
+/// **Retention:** noodles fallback used by the serializer's non-raw branch
+/// (`!raw_mode`) in both the pipeline and `process_and_write_position_group`. The raw-byte
+/// path injects the MI tag directly via `bam_fields::update_string_tag`.
 #[inline]
 fn set_mi_tag_on_record(
     record: &mut noodles::sam::alignment::record_buf::RecordBuf,
@@ -1561,14 +1577,16 @@ impl GroupReadsByUmi {
     ) -> Result<()> {
         info!("Using single-threaded mode");
 
-        // Wrap the reader in a BufReader and create noodles BAM reader
-        // This reuses the already-opened reader (required for stdin support)
+        // Wrap the reader in a BufReader and use noodles to skip past the BAM header bytes.
+        // The reader is positioned at file start; we must discard the header to reach records.
+        // This reuses the already-opened reader (required for stdin support).
         let buf_reader = std::io::BufReader::new(reader);
-        let mut bam_reader = noodles::bam::io::Reader::new(buf_reader);
+        let mut noodles_reader = noodles::bam::io::Reader::new(buf_reader);
+        let _ = noodles_reader.read_header().context("Failed to skip BAM header")?;
 
-        // Skip past header bytes - the reader is positioned at file start, but we already
-        // have the header. We must read (and discard) it to position at the first record.
-        let _ = bam_reader.read_header().context("Failed to skip BAM header")?;
+        // After the header skip, extract the inner BufReader and wrap in RawBamReader.
+        // Raw-byte mode avoids the noodles decode/encode round-trip (~15% CPU savings).
+        let mut raw_reader = RawBamReader::new(noodles_reader.into_inner());
 
         // Create output writer (single-threaded for strict thread control)
         let mut writer =
@@ -1589,13 +1607,17 @@ impl GroupReadsByUmi {
         // Progress tracking
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Iterate over all records
-        for record_result in bam_reader.record_bufs(header) {
-            let record = record_result?;
+        // Iterate over all records in raw-byte mode
+        let mut raw_rec = RawRecord::new();
+        loop {
+            let bytes_read = raw_reader.read_record(&mut raw_rec)?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
 
-            // Compute GroupKey for this record
-            let key = compute_group_key(&record, &library_index, Some(cell_tag));
-            let decoded = DecodedRecord::new(record, key);
+            // Compute GroupKey directly from raw bytes — no noodles decode needed
+            let key = compute_group_key_from_raw(&raw_rec, &library_index, Some(cell_tag));
+            let decoded = DecodedRecord::from_raw_bytes(raw_rec.clone(), key);
 
             // Feed to RecordPositionGrouper - may emit completed groups
             let completed_groups = grouper.add_records(vec![decoded])?;
@@ -1664,6 +1686,11 @@ impl GroupReadsByUmi {
 
     /// Process a single position group: build templates, filter, assign UMIs, and write output.
     /// Used by `execute_single_threaded` for streaming processing.
+    ///
+    /// Dispatches on raw-byte vs noodles mode based on the template storage format.
+    /// In raw-byte mode (single-threaded path after migration), uses zero-allocation filter
+    /// and direct raw-byte MI-tag injection. The noodles path is kept as a fallback for
+    /// any future code path that supplies parsed templates (e.g. tests or external callers).
     #[allow(clippy::too_many_arguments)]
     fn process_and_write_position_group(
         group: RawPositionGroup,
@@ -1686,10 +1713,19 @@ impl GroupReadsByUmi {
 
         let mut filter_metrics = FilterMetrics::new();
 
-        // Filter templates
+        // Dispatch filter on template storage mode
+        let raw_mode = all_templates.first().is_some_and(Template::is_raw_byte_mode);
         let filtered_templates: Vec<Template> = all_templates
             .into_iter()
-            .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
+            .filter(|t| {
+                if raw_mode {
+                    filter_template_raw(t, filter_config, &mut filter_metrics)
+                } else {
+                    // Noodles fallback: retained for any caller that supplies parsed templates
+                    // (e.g. external tests or future commands that don't opt into raw-byte mode).
+                    filter_template(t, filter_config, &mut filter_metrics)
+                }
+            })
             .collect();
 
         // Merge filter metrics
@@ -1778,19 +1814,55 @@ impl GroupReadsByUmi {
             templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
         let base_mi = *next_mi_base;
         *next_mi_base += distinct_mi_count;
-        let assign_tag = Tag::from(assign_tag_bytes);
 
-        for template in templates {
-            let mi = template.mi;
-            // Write primary reads with MI tags set just before writing
-            let (r1, r2) = template.into_primary_reads();
-            if let Some(mut r1) = r1 {
-                set_mi_tag_on_record(&mut r1, mi, assign_tag, base_mi);
-                writer.write_alignment_record(header, &r1)?;
+        if raw_mode {
+            // Raw-byte output: inject MI tag directly into raw bytes, write without noodles
+            use crate::sort::bam_fields;
+            use std::io::Write as _;
+            let mut scratch = Vec::with_capacity(512);
+            let mut mi_buf = String::with_capacity(16);
+            for template in templates {
+                let mi = template.mi;
+                let has_mi = mi.is_assigned();
+                if has_mi {
+                    mi_buf.clear();
+                    mi.write_with_offset(base_mi, &mut mi_buf);
+                }
+                for raw in [template.raw_r1(), template.raw_r2()].into_iter().flatten() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    if has_mi {
+                        scratch.clear();
+                        scratch.extend_from_slice(raw);
+                        bam_fields::update_string_tag(
+                            &mut scratch,
+                            &assign_tag_bytes,
+                            mi_buf.as_bytes(),
+                        );
+                        let block_size = scratch.len() as u32;
+                        writer.get_mut().write_all(&block_size.to_le_bytes())?;
+                        writer.get_mut().write_all(&scratch)?;
+                    } else {
+                        let block_size = raw.len() as u32;
+                        writer.get_mut().write_all(&block_size.to_le_bytes())?;
+                        writer.get_mut().write_all(raw)?;
+                    }
+                }
             }
-            if let Some(mut r2) = r2 {
-                set_mi_tag_on_record(&mut r2, mi, assign_tag, base_mi);
-                writer.write_alignment_record(header, &r2)?;
+        } else {
+            // Noodles fallback: retained for callers that supply parsed (non-raw) templates.
+            // set_mi_tag_on_record and write_alignment_record use the typed RecordBuf API.
+            let assign_tag = Tag::from(assign_tag_bytes);
+            for template in templates {
+                let mi = template.mi;
+                let (r1, r2) = template.into_primary_reads();
+                if let Some(mut r1) = r1 {
+                    set_mi_tag_on_record(&mut r1, mi, assign_tag, base_mi);
+                    writer.write_alignment_record(header, &r1)?;
+                }
+                if let Some(mut r2) = r2 {
+                    set_mi_tag_on_record(&mut r2, mi, assign_tag, base_mi);
+                    writer.write_alignment_record(header, &r2)?;
+                }
             }
         }
 
@@ -4853,7 +4925,7 @@ mod tests {
             30,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -4878,7 +4950,7 @@ mod tests {
             10,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -4904,7 +4976,7 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -4929,7 +5001,7 @@ mod tests {
             30,
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -4954,7 +5026,7 @@ mod tests {
             30,
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -4978,7 +5050,7 @@ mod tests {
             0,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw])
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
@@ -5027,7 +5099,7 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![supp])
+        let template = Template::from_raw_records(vec![supp].into_iter().map(Into::into).collect())
             .expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],

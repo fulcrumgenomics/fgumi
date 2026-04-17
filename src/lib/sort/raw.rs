@@ -731,8 +731,8 @@ impl<K: RawSortKey + 'static> GenericKeyedChunkReader<K> {
 enum ChunkSource<K: RawSortKey + Default + 'static> {
     /// Disk-based chunk with prefetching reader (legacy path with per-source threads).
     Disk(GenericKeyedChunkReader<K>),
-    /// In-memory sorted records.
-    Memory { records: Vec<(K, Vec<u8>)>, idx: usize },
+    /// In-memory sorted records from the inline buffer.
+    Memory { records: Vec<(K, fgumi_raw_bam::RawRecord)>, idx: usize },
     /// Pool-integrated disk source — workers read and decompress, main thread parses.
     /// The `source_id` maps to the `MainThreadChunkConsumer`'s per-source buffer.
     PoolDisk { source_id: usize },
@@ -753,7 +753,10 @@ impl<K: RawSortKey + Default + 'static> ChunkSource<K> {
             ChunkSource::Memory { records, idx } => {
                 if *idx < records.len() {
                     let (ref mut key, ref mut data) = records[*idx];
-                    std::mem::swap(buf, data);
+                    // Bridge: RawRecord wraps Vec<u8>; swap via the inner vec to avoid
+                    // re-allocating. The caller's buf is a plain Vec<u8> (merge scratch).
+                    // TODO: change merge scratch to RawRecord to eliminate this bridge.
+                    std::mem::swap(buf, data.as_mut_vec());
                     let key = std::mem::take(key);
                     *idx += 1;
                     Ok(Some(key))
@@ -1816,7 +1819,9 @@ impl RawExternalSorter {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer); each
             // chunk becomes its own in-memory merge source.
-            let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
+            let memory_chunks: Vec<Vec<(RawCoordinateKey, fgumi_raw_bam::RawRecord)>> = if buffer
+                .is_empty()
+            {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -1829,7 +1834,7 @@ impl RawExternalSorter {
                     .iter()
                     .map(|r| {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
-                        (key, buffer.get_record(r).to_vec())
+                        (key, fgumi_raw_bam::RawRecord::from(buffer.get_record(r).to_vec()))
                     })
                     .collect();
                 vec![chunk]
@@ -2000,7 +2005,9 @@ impl RawExternalSorter {
             })?;
         } else {
             // Sort remaining records into separate sub-array chunks
-            let memory_chunks: Vec<Vec<(RawCoordinateKey, Vec<u8>)>> = if buffer.is_empty() {
+            let memory_chunks: Vec<Vec<(RawCoordinateKey, fgumi_raw_bam::RawRecord)>> = if buffer
+                .is_empty()
+            {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -2013,7 +2020,7 @@ impl RawExternalSorter {
                     .iter()
                     .map(|r| {
                         let key = RawCoordinateKey { sort_key: r.sort_key };
-                        (key, buffer.get_record(r).to_vec())
+                        (key, fgumi_raw_bam::RawRecord::from(buffer.get_record(r).to_vec()))
                     })
                     .collect();
                 vec![chunk]
@@ -2108,7 +2115,7 @@ impl RawExternalSorter {
         let estimated_records = init_cap / 300;
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
-        let mut entries: Vec<(K, Vec<u8>)> = Vec::with_capacity(estimated_records);
+        let mut entries: Vec<(K, fgumi_raw_bam::RawRecord)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
         let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
@@ -2130,7 +2137,7 @@ impl RawExternalSorter {
             let record_size = bam_bytes.len() + 50; // approximate key size
             memory_used += record_size;
 
-            entries.push((key, bam_bytes.to_vec()));
+            entries.push((key, fgumi_raw_bam::RawRecord::from(bam_bytes.to_vec())));
 
             if probe.should_sample_read(stats.total_records) {
                 let bstats = BufferProbeStats::simple(memory_used as u64, entries.len() as u64);
@@ -2220,7 +2227,7 @@ impl RawExternalSorter {
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<Vec<(K, Vec<u8>)>> = if entries.is_empty() {
+            let memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> = if entries.is_empty() {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| {
@@ -2237,7 +2244,8 @@ impl RawExternalSorter {
                     // and reverse. Each split_off is O(chunk_size) → O(n) total.
                     let mut remaining = std::mem::take(&mut entries);
                     let num_chunks = remaining.len().div_ceil(chunk_size);
-                    let mut chunks: Vec<Vec<(K, Vec<u8>)>> = Vec::with_capacity(num_chunks);
+                    let mut chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>> =
+                        Vec::with_capacity(num_chunks);
                     let tail_len = remaining.len() % chunk_size;
                     if tail_len != 0 {
                         let split_at = remaining.len() - tail_len;
@@ -2431,7 +2439,9 @@ impl RawExternalSorter {
         } else {
             // Sort remaining records into separate sub-array chunks (avoids
             // intermediate merge back into a single sorted buffer)
-            let memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>> = if buffer.is_empty() {
+            let memory_chunks: Vec<Vec<(TemplateKey, fgumi_raw_bam::RawRecord)>> = if buffer
+                .is_empty()
+            {
                 Vec::new()
             } else if self.threads > 1 {
                 timer.time_sort(|| rayon_pool.install(|| buffer.par_sort_into_chunks(self.threads)))
@@ -2439,7 +2449,10 @@ impl RawExternalSorter {
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
                 });
-                let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
+                let chunk = buffer
+                    .iter_sorted_keyed()
+                    .map(|(k, r)| (k, fgumi_raw_bam::RawRecord::from(r.to_vec())))
+                    .collect();
                 vec![chunk]
             };
 
@@ -2480,7 +2493,7 @@ impl RawExternalSorter {
     /// does not yet support pool-integrated decompression.
     fn build_chunk_sources<K: RawSortKey + Default + 'static>(
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
+        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
         reader_concurrency: usize,
         pool_decompress: bool,
         pool: &Arc<SortWorkerPool>,
@@ -2525,7 +2538,7 @@ impl RawExternalSorter {
     fn merge_chunks_keyed(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>>,
+        memory_chunks: Vec<Vec<(TemplateKey, fgumi_raw_bam::RawRecord)>>,
         header: &Header,
         output: &Path,
         total_records: u64,
@@ -2550,7 +2563,7 @@ impl RawExternalSorter {
     fn merge_chunks_generic<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
+        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
         header: &Header,
         output: &Path,
         total_records: u64,
@@ -2730,7 +2743,7 @@ impl RawExternalSorter {
     pub fn merge_chunks_for_test<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
+        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
         header: &Header,
         output: &Path,
         pool: &Arc<SortWorkerPool>,
@@ -2745,7 +2758,7 @@ impl RawExternalSorter {
     fn merge_chunks_with_index<K: RawSortKey + Default + 'static>(
         &self,
         chunk_files: &[PathBuf],
-        memory_chunks: Vec<Vec<(K, Vec<u8>)>>,
+        memory_chunks: Vec<Vec<(K, fgumi_raw_bam::RawRecord)>>,
         header: &Header,
         output: &Path,
         total_records: u64,

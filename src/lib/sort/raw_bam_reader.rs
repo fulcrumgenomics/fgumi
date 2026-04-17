@@ -32,7 +32,7 @@ use std::io::{self, BufReader, Read};
 /// Number of BGZF blocks to read per batch.
 const BLOCKS_PER_BATCH: usize = 64;
 
-use fgumi_raw_bam::BAM_MAGIC;
+use fgumi_raw_bam::{BAM_MAGIC, RawRecord};
 
 /// A raw BAM record reader that reads directly from BGZF blocks.
 ///
@@ -199,7 +199,7 @@ impl<R: Read> RawBamRecordReader<R> {
     /// # Errors
     ///
     /// Returns an error if the header has not been skipped or the record is truncated.
-    pub fn next_record(&mut self) -> io::Result<Option<Vec<u8>>> {
+    pub fn next_record(&mut self) -> io::Result<Option<RawRecord>> {
         if !self.header_skipped {
             return Err(io::Error::other("Must call skip_header() first"));
         }
@@ -232,7 +232,9 @@ impl<R: Read> RawBamRecordReader<R> {
         }
 
         // Copy record bytes (without the 4-byte block_size prefix, matching noodles format)
-        let record = self.decompressed[self.position + 4..self.position + total_size].to_vec();
+        let record = RawRecord::from(
+            self.decompressed[self.position + 4..self.position + total_size].to_vec(),
+        );
         self.position += total_size;
 
         Ok(Some(record))
@@ -307,7 +309,7 @@ impl<R: Read> RawBamRecordReader<R> {
 
 /// Iterator adapter for `RawBamRecordReader`.
 impl<R: Read> Iterator for RawBamRecordReader<R> {
-    type Item = io::Result<Vec<u8>>;
+    type Item = io::Result<RawRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.next_record() {
@@ -353,7 +355,7 @@ impl<R: Read> BatchedRawBamReader<R> {
     /// # Errors
     ///
     /// Returns an error if a record is truncated or invalid.
-    pub fn next_batch(&mut self) -> io::Result<Option<Vec<Vec<u8>>>> {
+    pub fn next_batch(&mut self) -> io::Result<Option<Vec<RawRecord>>> {
         let mut batch = Vec::with_capacity(self.batch_size);
 
         for _ in 0..self.batch_size {
@@ -550,7 +552,7 @@ mod tests {
         let record = reader.next_record().expect("failed to read first record");
         assert!(record.is_some(), "Expected one record");
         let record = record.expect("record should be Some");
-        assert_eq!(record, rec, "Record bytes should match");
+        assert_eq!(record.as_ref(), rec.as_slice(), "Record bytes should match");
 
         // No more records
         let eof = reader.next_record().expect("failed to read at EOF");
@@ -572,9 +574,9 @@ mod tests {
         let r2 = reader.next_record().expect("failed to read record 2").expect("record 2");
         let r3 = reader.next_record().expect("failed to read record 3").expect("record 3");
 
-        assert_eq!(r1, rec_a);
-        assert_eq!(r2, rec_b);
-        assert_eq!(r3, rec_c);
+        assert_eq!(r1.as_ref(), rec_a.as_slice());
+        assert_eq!(r2.as_ref(), rec_b.as_slice());
+        assert_eq!(r3.as_ref(), rec_c.as_slice());
 
         assert!(reader.next_record().expect("failed to read at EOF").is_none(), "Expected EOF");
     }
@@ -588,11 +590,11 @@ mod tests {
             .expect("failed to create reader for iterator test");
         reader.skip_header().expect("failed to skip header");
 
-        let records: Vec<Vec<u8>> =
+        let records: Vec<RawRecord> =
             reader.map(|r| r.expect("failed to read record via iterator")).collect();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0], rec_a);
-        assert_eq!(records[1], rec_b);
+        assert_eq!(records[0].as_ref(), rec_a.as_slice());
+        assert_eq!(records[1].as_ref(), rec_b.as_slice());
     }
 
     #[test]
@@ -609,13 +611,13 @@ mod tests {
         // First batch: 2 records
         let batch1 = reader.next_batch().expect("failed to read batch 1").expect("batch 1");
         assert_eq!(batch1.len(), 2);
-        assert_eq!(batch1[0], rec_a);
-        assert_eq!(batch1[1], rec_b);
+        assert_eq!(batch1[0].as_ref(), rec_a.as_slice());
+        assert_eq!(batch1[1].as_ref(), rec_b.as_slice());
 
         // Second batch: 1 record (remainder)
         let batch2 = reader.next_batch().expect("failed to read batch 2").expect("batch 2");
         assert_eq!(batch2.len(), 1);
-        assert_eq!(batch2[0], rec_c);
+        assert_eq!(batch2[0].as_ref(), rec_c.as_slice());
 
         // No more batches
         assert!(

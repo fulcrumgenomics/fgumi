@@ -346,7 +346,7 @@ fn verify_sort_order<K>(
     for result in raw_reader {
         let record_bytes = result?;
         total_records += 1;
-        let bam = record_bytes.as_slice();
+        let bam: &[u8] = &record_bytes;
 
         let key = extract_key(bam);
 

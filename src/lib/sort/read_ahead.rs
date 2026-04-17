@@ -15,8 +15,8 @@
 //!
 //! # Readers
 //!
-//! - [`ReadAheadReader`]: Yields `noodles::bam::Record` (uses noodles parsing)
-//! - [`RawReadAheadReader`]: Yields `RawRecord` (raw bytes, no noodles Record)
+//! - [`ReadAheadReader`]: Yields [`RawRecord`] (raw bytes, no noodles Record)
+//! - [`RawReadAheadReader`]: Yields [`RawRecord`] (raw bytes, no noodles Record)
 //!
 //! # Batched Reading
 //!
@@ -24,10 +24,9 @@
 //! channel synchronization overhead by ~256x compared to per-record sends.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use noodles::bam::Record;
 use std::thread::{self, JoinHandle};
 
-use crate::bam_io::{BamReaderAuto, RawBamReaderAuto};
+use crate::bam_io::RawBamReaderAuto;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
 use std::io::Read as IoRead;
 
@@ -49,11 +48,11 @@ const CHANNEL_BUFFER_SIZE: usize = 16;
 /// synchronization overhead by ~256x compared to per-record sends.
 pub struct ReadAheadReader {
     /// Receiver for prefetched record batches (Option to allow closing before join).
-    receiver: Option<Receiver<Vec<Record>>>,
+    receiver: Option<Receiver<Vec<RawRecord>>>,
     /// Handle to the reader thread.
     handle: Option<JoinHandle<()>>,
     /// Current batch being consumed.
-    current_batch: Vec<Record>,
+    current_batch: Vec<RawRecord>,
     /// Index into current batch.
     batch_index: usize,
 }
@@ -61,14 +60,14 @@ pub struct ReadAheadReader {
 impl ReadAheadReader {
     /// Create a new read-ahead reader with default buffer size.
     #[must_use]
-    pub fn new(reader: BamReaderAuto) -> Self {
+    pub fn new(reader: RawBamReaderAuto) -> Self {
         Self::with_batch_size(reader, BATCH_SIZE, CHANNEL_BUFFER_SIZE)
     }
 
     /// Create a new read-ahead reader with specified batch and buffer sizes.
     #[must_use]
     pub fn with_batch_size(
-        mut reader: BamReaderAuto,
+        mut reader: RawBamReaderAuto,
         batch_size: usize,
         channel_buffer: usize,
     ) -> Self {
@@ -83,7 +82,7 @@ impl ReadAheadReader {
 
     /// Create with legacy per-record behavior (for compatibility).
     #[must_use]
-    pub fn with_buffer_size(reader: BamReaderAuto, buffer_size: usize) -> Self {
+    pub fn with_buffer_size(reader: RawBamReaderAuto, buffer_size: usize) -> Self {
         // Approximate the old behavior: buffer_size records total
         let buffer_size = buffer_size.max(1);
         let batch_size = BATCH_SIZE.min(buffer_size);
@@ -91,22 +90,19 @@ impl ReadAheadReader {
         Self::with_batch_size(reader, batch_size, channel_buffer)
     }
 
-    /// Reader thread function - reads records in batches.
+    /// Reader thread function - reads raw records in batches.
     ///
     /// # Error handling
     ///
-    /// Unlike [`RawReadAheadReader`], this reader does **not** propagate I/O errors
-    /// to the foreground thread. When a read fails the error is logged and the thread
-    /// sends an EOF sentinel, making the error indistinguishable from clean EOF.
+    /// This reader does **not** propagate I/O errors to the foreground thread.
+    /// When a read fails the error is logged and the thread sends an EOF sentinel,
+    /// making the error indistinguishable from clean EOF.
     ///
-    /// This is intentional: `ReadAheadReader` is used in paths (e.g. group/correct)
-    /// where errors are surfaced by the noodles layer before they reach here, and
-    /// adding an `error_slot` would complicate the public API for no practical gain.
     /// If you need error propagation, use [`RawReadAheadReader`] which provides
     /// `take_error()`.
     #[allow(clippy::needless_pass_by_value)]
-    fn reader_thread(reader: &mut BamReaderAuto, tx: Sender<Vec<Record>>, batch_size: usize) {
-        let mut record = Record::default();
+    fn reader_thread(reader: &mut RawBamReaderAuto, tx: Sender<Vec<RawRecord>>, batch_size: usize) {
+        let mut record = RawRecord::new();
         let mut batch = Vec::with_capacity(batch_size);
 
         loop {
@@ -151,7 +147,7 @@ impl ReadAheadReader {
     /// Returns `Some(record)` if a record is available, `None` on EOF or error.
     #[inline]
     #[must_use]
-    pub fn next_record(&mut self) -> Option<Record> {
+    pub fn next_record(&mut self) -> Option<RawRecord> {
         // Check if we have records in the current batch
         if self.batch_index < self.current_batch.len() {
             let record = std::mem::take(&mut self.current_batch[self.batch_index]);
@@ -187,7 +183,7 @@ impl Drop for ReadAheadReader {
 
 /// Iterator adapter for `ReadAheadReader`.
 impl Iterator for ReadAheadReader {
-    type Item = Record;
+    type Item = RawRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_record()
@@ -654,7 +650,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use tempfile::NamedTempFile;
 
-    use crate::bam_io::{create_bam_reader, create_raw_bam_reader};
+    use crate::bam_io::create_raw_bam_reader;
 
     /// Create a temporary BAM file with the given number of unmapped records.
     /// Returns the temp file handle (keeps the file alive) and the header used.
@@ -688,7 +684,7 @@ mod tests {
     fn test_read_ahead_reader_empty_bam() {
         let (tmp, _header) = create_test_bam_file(0);
         let (reader, _header) =
-            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         assert!(ra.next_record().is_none(), "Empty BAM should yield no records");
@@ -698,7 +694,7 @@ mod tests {
     fn test_read_ahead_reader_single_record() {
         let (tmp, _header) = create_test_bam_file(1);
         let (reader, _header) =
-            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         assert!(ra.next_record().is_some(), "Should yield exactly one record");
@@ -710,7 +706,7 @@ mod tests {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
         let (reader, _header) =
-            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         let mut count = 0;
@@ -725,10 +721,10 @@ mod tests {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
         let (reader, _header) =
-            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let ra = ReadAheadReader::new(reader);
-        let records: Vec<Record> = ra.collect();
+        let records: Vec<RawRecord> = ra.collect();
         assert_eq!(records.len(), num, "Iterator should collect exactly {num} records");
     }
 
@@ -737,11 +733,11 @@ mod tests {
         let num = 10;
         let (tmp, _header) = create_test_bam_file(num);
         let (reader, _header) =
-            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         // Use a small buffer size (4) to exercise partial-batch logic
         let ra = ReadAheadReader::with_buffer_size(reader, 4);
-        let records: Vec<Record> = ra.collect();
+        let records: Vec<RawRecord> = ra.collect();
         assert_eq!(records.len(), num, "with_buffer_size(4) should still read all {num} records");
     }
 
@@ -752,7 +748,7 @@ mod tests {
         let num = 5000;
         let (tmp, _header) = create_test_bam_file(num);
         let (reader, _header) =
-            create_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
+            create_raw_bam_reader(tmp.path(), 1).expect("creating BAM reader should succeed");
 
         let mut ra = ReadAheadReader::new(reader);
         // Read only a few records

@@ -10,7 +10,7 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use crate::phred::{MIN_PHRED, NO_CALL_BASE};
 use fgumi_metrics::rejection::RejectionReason;
 use fgumi_raw_bam as bam_fields;
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 
 /// Expands a 1-3 element slice to a 3-element array, filling missing values from the last.
 ///
@@ -367,7 +367,7 @@ impl FilterResult {
 ///
 /// A template passes if it has at least one primary read and all primary reads pass.
 #[must_use]
-pub fn template_passes(raw_records: &[Vec<u8>], pass_map: &AHashMap<usize, bool>) -> bool {
+pub fn template_passes(raw_records: &[RawRecord], pass_map: &AHashMap<usize, bool>) -> bool {
     let mut has_primary = false;
     let mut all_primary_pass = true;
 

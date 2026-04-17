@@ -375,7 +375,7 @@ impl Command for Simplex {
             let mut record = RawRecord::new();
             match raw_reader.read_record(&mut record) {
                 Ok(0) => None, // EOF
-                Ok(_) => Some(Ok(record.into_inner())),
+                Ok(_) => Some(Ok(record)),
                 Err(e) => Some(Err(e.into())),
             }
         });
@@ -400,12 +400,10 @@ impl Command for Simplex {
                 apply_overlapping_consensus(&mut records, oc)?;
             }
 
-            // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
-            // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
-            let raw: Vec<fgumi_raw_bam::RawRecord> =
-                records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
+            // Call consensus — mi_group now yields Vec<RawRecord> directly, which is
+            // what ConsensusCaller::consensus_reads expects.
             let output = caller
-                .consensus_reads(raw)
+                .consensus_reads(records)
                 .with_context(|| format!("Failed to call consensus for UMI: {umi}"))?;
 
             let batch_size = output.count;
@@ -594,7 +592,8 @@ impl Simplex {
                             raw_records.len(),
                         );
                         if track_rejects {
-                            all_rejects.extend(raw_records); // Already raw bytes!
+                            // TODO(#272): bridge – remove when rejects Vec accepts RawRecord
+                            all_rejects.extend(raw_records.into_iter().map(RawRecord::into_inner));
                         }
                         continue;
                     }
@@ -607,18 +606,17 @@ impl Simplex {
                             batch_stats.record_input(raw_records.len());
                             batch_stats.record_rejection(RejectionReason::Other, raw_records.len());
                             if track_rejects {
-                                all_rejects.extend(raw_records);
+                                // TODO(#272): bridge – remove when rejects Vec accepts RawRecord
+                                all_rejects
+                                    .extend(raw_records.into_iter().map(RawRecord::into_inner));
                             }
                             continue;
                         }
                         batch_overlapping.merge(oc.stats());
                     }
 
-                    // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
-                    // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
-                    let raw: Vec<fgumi_raw_bam::RawRecord> =
-                        raw_records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
-                    match caller.consensus_reads(raw) {
+                    // Call consensus — mi_group now yields Vec<RawRecord> directly.
+                    match caller.consensus_reads(raw_records) {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
                             batch_stats.merge(&caller.statistics());

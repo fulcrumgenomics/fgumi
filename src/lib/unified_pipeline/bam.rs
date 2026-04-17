@@ -332,9 +332,6 @@ pub fn decode_records(
 ) -> io::Result<Vec<DecodedRecord>> {
     let num_records = batch.offsets.len().saturating_sub(1);
     let mut records = Vec::with_capacity(num_records);
-    // read_record_buf requires a Header for reference name resolution and alignment parsing,
-    // but this non-production path only uses integer reference IDs, so an empty header suffices.
-    let header = noodles::sam::Header::default();
 
     for i in 0..num_records {
         let start = batch.offsets[i];
@@ -375,6 +372,10 @@ pub fn decode_records(
         let record_data = &batch.buffer[start + 4..end];
 
         if group_key_config.raw_byte_mode {
+            // Raw-byte path: zero-copy GroupKey computation without the noodles RecordBuf
+            // round-trip. Activated only when raw_byte_mode = true (via GroupKeyConfig::new_raw).
+            // Used by `dedup`, `group`, and other commands that opt in via GroupKeyConfig::new_raw;
+            // other commands use the noodles path below via the default config.
             let raw = record_data.to_vec();
             if raw.len() < 32 {
                 return Err(io::Error::new(
@@ -402,12 +403,12 @@ pub fn decode_records(
             );
             records.push(DecodedRecord::from_raw_bytes(raw, key));
         } else {
-            // Use noodles' public Reader API for decoding, as recommended by the
-            // noodles maintainer (see noodles#364). Reader::from accepts any R: Read
-            // and read_record_buf reads the block_size prefix then decodes the record.
+            // Noodles decode path: retained for commands (e.g. clip) that need typed
+            // RecordBuf access in downstream Template processing (CIGAR edits, flag API).
+            // Uses noodles Reader::from per maintainer recommendation (noodles#364).
             let mut reader = noodles::bam::io::Reader::from(&batch.buffer[start..end]);
             let mut record = RecordBuf::default();
-            reader.read_record_buf(&header, &mut record)?;
+            reader.read_record_buf(&noodles::sam::Header::default(), &mut record)?;
 
             let key = compute_group_key(
                 &record,
@@ -424,7 +425,8 @@ pub fn decode_records(
 /// Compute a `GroupKey` directly from raw BAM bytes, matching `compute_group_key()` exactly.
 ///
 /// Uses 1-based coordinate helpers to produce identical keys to the noodles path.
-fn compute_group_key_from_raw(
+#[must_use]
+pub fn compute_group_key_from_raw(
     raw: &[u8],
     library_index: &LibraryIndex,
     cell_tag: Option<noodles::sam::alignment::record::data::field::Tag>,
@@ -3482,14 +3484,13 @@ thread_local! {
         std::cell::RefCell::new(Vec::with_capacity(512));
 }
 
-/// Serialize a batch of BAM records to bytes.
-///
-/// This function encodes multiple BAM records into a single byte buffer,
-/// ready for BGZF compression. Uses thread-local buffer to avoid allocations.
 /// Serialize BAM records into a provided buffer.
 ///
 /// Appends serialized BAM bytes to the provided buffer and returns the record count.
 /// This variant is more efficient when the caller wants to reuse a buffer.
+///
+/// Accepts `RecordBuf` because callers (e.g., `clip`, `dedup`) produce records via
+/// noodles typed operations (CIGAR editing, tag mutation) and pass them directly here.
 ///
 /// # Errors
 ///
@@ -3544,6 +3545,8 @@ pub fn serialize_bam_records_into(
 /// a new buffer. Use `serialize_bam_records_into` for better performance when
 /// buffer reuse is possible.
 ///
+/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
+///
 /// # Errors
 ///
 /// Returns an I/O error if record encoding fails.
@@ -3561,6 +3564,8 @@ pub fn serialize_bam_records(
 /// This produces raw BAM record bytes (`block_size` prefix + record data),
 /// suitable for BGZF compression in the pipeline. Uses thread-local buffer.
 ///
+/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
+///
 /// # Errors
 ///
 /// Returns an I/O error if record encoding fails.
@@ -3576,6 +3581,8 @@ pub fn serialize_bam_record(record: &RecordBuf, header: &Header) -> io::Result<S
 /// suitable for BGZF compression in the pipeline. Uses thread-local buffer for encoding.
 ///
 /// Returns the number of records serialized (always 1 for a single record).
+///
+/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
 ///
 /// # Errors
 ///
@@ -3607,6 +3614,8 @@ pub fn serialize_bam_record_into(
 /// This writes records directly to the compressor's internal buffer, avoiding
 /// the intermediate serialization buffer copy. Records are compressed into
 /// BGZF blocks as the buffer fills.
+///
+/// Accepts `RecordBuf` because callers produce records via noodles typed operations.
 ///
 /// Returns the number of records serialized.
 ///

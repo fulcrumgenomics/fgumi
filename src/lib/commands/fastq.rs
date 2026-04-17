@@ -3,15 +3,16 @@
 //! This tool reads a BAM file and outputs interleaved FASTQ to stdout for piping to aligners.
 //! Input should be queryname-sorted or template-coordinate sorted.
 
-use crate::bam_io::create_bam_reader;
+use crate::bam_io::create_raw_bam_reader;
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
 use crate::validation::validate_file_exists;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
+use fgumi_raw_bam::{
+    RawRecord, extract_sequence, quality_scores_slice, read_name as raw_read_name,
+};
 use log::info;
-use noodles::bam;
-use noodles::sam::alignment::record::Flags;
 use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 
@@ -117,7 +118,7 @@ impl Command for Fastq {
         info!("Read name suffix: {}", if self.no_suffix { "disabled" } else { "enabled" });
         info!("BWA chunk size: {} bases", self.bwa_chunk_size);
 
-        let (mut reader, _header) = create_bam_reader(&self.input, self.threads)?;
+        let (mut reader, _header) = create_raw_bam_reader(&self.input, self.threads)?;
 
         // Use 64MB buffer for efficient pipe throughput
         let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, stdout().lock());
@@ -132,23 +133,27 @@ impl Command for Fastq {
         // Reusable buffers to avoid per-record allocations
         let mut seq_buf: Vec<u8> = Vec::with_capacity(512);
         let mut qual_buf: Vec<u8> = Vec::with_capacity(512);
+        let mut record = RawRecord::new();
 
-        for result in reader.records() {
-            let record = result.context("Failed to read BAM record")?;
+        loop {
+            let n = reader.read_record(&mut record)?;
+            if n == 0 {
+                break; // EOF
+            }
             total_records += 1;
 
             let flags = record.flags();
 
             // Filter by flags
-            if (flags.bits() & self.exclude_flags) != 0 {
+            if (flags & self.exclude_flags) != 0 {
                 continue;
             }
-            if (flags.bits() & self.require_flags) != self.require_flags {
+            if (flags & self.require_flags) != self.require_flags {
                 continue;
             }
 
             // Get sequence length for batch tracking
-            let seq_len = record.sequence().len();
+            let seq_len = record.l_seq() as usize;
 
             // Write FASTQ record
             write_fastq_record(
@@ -186,39 +191,38 @@ impl Command for Fastq {
 #[inline]
 fn write_fastq_record<W: Write>(
     writer: &mut W,
-    record: &bam::Record,
-    flags: Flags,
+    record: &RawRecord,
+    flags: u16,
     no_suffix: bool,
     seq_buf: &mut Vec<u8>,
     qual_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    // Get read name - use concrete method for direct access
-    let name = record.name().context("Record missing name")?;
+    use fgumi_raw_bam::flags as flag_bits;
+
+    // Get read name (without null terminator)
+    let name = raw_read_name(record);
 
     // Determine read suffix (/1 or /2)
+    let is_first = (flags & flag_bits::FIRST_SEGMENT) != 0;
+    let is_last = (flags & flag_bits::LAST_SEGMENT) != 0;
     let suffix: &[u8] = if no_suffix {
         b""
-    } else if flags.is_first_segment() && !flags.is_last_segment() {
+    } else if is_first && !is_last {
         b"/1"
-    } else if flags.is_last_segment() && !flags.is_first_segment() {
+    } else if is_last && !is_first {
         b"/2"
     } else {
         b"" // Single-end or both flags set
     };
 
-    // Get sequence and quality - use concrete methods for direct slice access
-    let seq = record.sequence();
-    let qual = record.quality_scores();
+    // Decode sequence from 4-bit BAM encoding to ASCII bases
+    *seq_buf = extract_sequence(record);
 
-    // Collect sequence bytes into reusable buffer
-    seq_buf.clear();
-    seq_buf.extend(seq.iter());
-
-    // Collect and transform quality bytes using direct slice access (no Result unwrapping)
+    // Copy quality bytes and transform to Phred+33 ASCII
     qual_buf.clear();
-    qual_buf.extend(qual.as_ref().iter().map(|&s| QUAL_TO_ASCII[s as usize]));
+    qual_buf.extend(quality_scores_slice(record).iter().map(|&s| QUAL_TO_ASCII[s as usize]));
 
-    if flags.is_reverse_complemented() {
+    if (flags & flag_bits::REVERSE) != 0 {
         // Reverse complement sequence in place using lookup table
         seq_buf.reverse();
         for base in seq_buf.iter_mut() {
@@ -230,7 +234,7 @@ fn write_fastq_record<W: Write>(
 
     // Write all parts
     writer.write_all(b"@")?;
-    writer.write_all(name.as_ref())?;
+    writer.write_all(name)?;
     writer.write_all(suffix)?;
     writer.write_all(b"\n")?;
     writer.write_all(seq_buf)?;

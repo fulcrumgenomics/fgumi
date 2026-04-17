@@ -38,7 +38,7 @@
 use crate::sam::{SamTag, record_utils, to_smallest_signed_int};
 use crate::unified_pipeline::MemoryEstimate;
 use anyhow::{Result, anyhow, bail};
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 use noodles::sam::alignment::record::Cigar;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -66,8 +66,8 @@ pub struct Template {
     pub name: Vec<u8>,
     /// The records (empty in raw-byte mode)
     pub records: Vec<RecordBuf>,
-    /// Raw BAM record bytes (without `block_size` prefix). Present only in raw-byte mode.
-    pub raw_records: Option<Vec<Vec<u8>>>,
+    /// Raw BAM records (without `block_size` prefix). Present only in raw-byte mode.
+    pub raw_records: Option<Vec<RawRecord>>,
     /// Primary R1 read (first segment, non-secondary, non-supplementary)
     pub r1: Option<(usize, usize)>,
     /// Primary R2 read (second segment, non-secondary, non-supplementary)
@@ -568,34 +568,34 @@ impl Template {
         self.raw_records.is_some()
     }
 
-    /// Returns the raw R1 bytes if in raw-byte mode.
+    /// Returns the raw R1 record if in raw-byte mode.
     #[must_use]
-    pub fn raw_r1(&self) -> Option<&[u8]> {
+    pub fn raw_r1(&self) -> Option<&RawRecord> {
         let rr = self.raw_records.as_ref()?;
-        self.r1.map(|_| rr[0].as_slice())
+        self.r1.map(|_| &rr[0])
     }
 
-    /// Returns the raw R2 bytes if in raw-byte mode.
+    /// Returns the raw R2 record if in raw-byte mode.
     #[must_use]
-    pub fn raw_r2(&self) -> Option<&[u8]> {
+    pub fn raw_r2(&self) -> Option<&RawRecord> {
         let rr = self.raw_records.as_ref()?;
-        self.r2.map(|(i, _)| rr[i].as_slice())
+        self.r2.map(|(i, _)| &rr[i])
     }
 
     /// Returns all raw records if in raw-byte mode.
     #[must_use]
-    pub fn all_raw_records(&self) -> Option<&[Vec<u8>]> {
+    pub fn all_raw_records(&self) -> Option<&[RawRecord]> {
         self.raw_records.as_deref()
     }
 
     /// Consumes self and returns the raw records if in raw-byte mode.
     #[must_use]
-    pub fn into_raw_records(self) -> Option<Vec<Vec<u8>>> {
+    pub fn into_raw_records(self) -> Option<Vec<RawRecord>> {
         self.raw_records
     }
 
     /// Returns mutable access to all raw records if in raw-byte mode.
-    pub fn all_raw_records_mut(&mut self) -> Option<&mut [Vec<u8>]> {
+    pub fn all_raw_records_mut(&mut self) -> Option<&mut [RawRecord]> {
         self.raw_records.as_deref_mut()
     }
 
@@ -609,7 +609,7 @@ impl Template {
     ///
     /// Returns an error if multiple primary R1s or R2s are found.
     #[allow(clippy::too_many_lines)]
-    pub fn from_raw_records(mut raw_records: Vec<Vec<u8>>) -> Result<Self> {
+    pub fn from_raw_records(mut raw_records: Vec<RawRecord>) -> Result<Self> {
         use crate::sort::bam_fields;
 
         if raw_records.is_empty() {
@@ -720,8 +720,8 @@ impl Template {
 
         // Build ordered Vec: r1, r2, r1_supplementals, r2_supplementals, r1_secondaries, r2_secondaries
         // (matching Builder::build() ordering, with supplementals/secondaries reversed)
-        let mut ordered: Vec<Vec<u8>> = Vec::with_capacity(raw_records.len());
-        let mut take = |idx: usize| -> Vec<u8> { std::mem::take(&mut raw_records[idx]) };
+        let mut ordered: Vec<RawRecord> = Vec::with_capacity(raw_records.len());
+        let mut take = |idx: usize| -> RawRecord { std::mem::take(&mut raw_records[idx]) };
 
         // Track indices
         let r1_pair = if let Some(idx) = r1_idx {
@@ -1066,14 +1066,14 @@ impl Template {
             let rr = self.raw_records.as_mut().unwrap();
             if let Some(as_value) = r2_as {
                 if let Ok(v) = i32::try_from(as_value) {
-                    bam_fields::remove_tag(&mut rr[r1_i], b"ms");
-                    bam_fields::append_signed_int_tag(&mut rr[r1_i], b"ms", v);
+                    bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"ms");
+                    bam_fields::append_signed_int_tag(rr[r1_i].as_mut_vec(), b"ms", v);
                 }
             }
             if let Some(as_value) = r1_as {
                 if let Ok(v) = i32::try_from(as_value) {
-                    bam_fields::remove_tag(&mut rr[r2_i], b"ms");
-                    bam_fields::append_signed_int_tag(&mut rr[r2_i], b"ms", v);
+                    bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"ms");
+                    bam_fields::append_signed_int_tag(rr[r2_i].as_mut_vec(), b"ms", v);
                 }
             }
         }
@@ -1100,18 +1100,22 @@ impl Template {
                     bam_fields::set_template_length(rec, -r2_tlen);
 
                     let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-                    bam_fields::update_int_tag(rec, b"MQ", mq_val);
+                    bam_fields::update_int_tag(rec.as_mut_vec(), b"MQ", mq_val);
 
                     if !r2_cigar_str.is_empty() && r2_cigar_str != "*" && !r2_is_unmapped {
-                        bam_fields::update_string_tag(rec, b"MC", r2_cigar_str.as_bytes());
+                        bam_fields::update_string_tag(
+                            rec.as_mut_vec(),
+                            b"MC",
+                            r2_cigar_str.as_bytes(),
+                        );
                     } else {
-                        bam_fields::remove_tag(rec, b"MC");
+                        bam_fields::remove_tag(rec.as_mut_vec(), b"MC");
                     }
 
                     if let Some(as_value) = r2_as {
                         if let Ok(v) = i32::try_from(as_value) {
-                            bam_fields::remove_tag(rec, b"ms");
-                            bam_fields::append_signed_int_tag(rec, b"ms", v);
+                            bam_fields::remove_tag(rec.as_mut_vec(), b"ms");
+                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), b"ms", v);
                         }
                     }
                 }
@@ -1140,18 +1144,22 @@ impl Template {
                     bam_fields::set_template_length(rec, -r1_tlen);
 
                     let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-                    bam_fields::update_int_tag(rec, b"MQ", mq_val);
+                    bam_fields::update_int_tag(rec.as_mut_vec(), b"MQ", mq_val);
 
                     if !r1_cigar_str.is_empty() && r1_cigar_str != "*" && !r1_is_unmapped {
-                        bam_fields::update_string_tag(rec, b"MC", r1_cigar_str.as_bytes());
+                        bam_fields::update_string_tag(
+                            rec.as_mut_vec(),
+                            b"MC",
+                            r1_cigar_str.as_bytes(),
+                        );
                     } else {
-                        bam_fields::remove_tag(rec, b"MC");
+                        bam_fields::remove_tag(rec.as_mut_vec(), b"MC");
                     }
 
                     if let Some(as_value) = r1_as {
                         if let Ok(v) = i32::try_from(as_value) {
-                            bam_fields::remove_tag(rec, b"ms");
-                            bam_fields::append_signed_int_tag(rec, b"ms", v);
+                            bam_fields::remove_tag(rec.as_mut_vec(), b"ms");
+                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), b"ms", v);
                         }
                     }
                 }
@@ -1193,11 +1201,11 @@ impl Template {
         bam_fields::set_mate_pos(&mut rr[r1_i], r2_pos);
         set_mate_flags_raw(&mut rr[r1_i], r2_is_reverse, false);
         let r2_mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-        bam_fields::update_int_tag(&mut rr[r1_i], b"MQ", r2_mq_val);
+        bam_fields::update_int_tag(rr[r1_i].as_mut_vec(), b"MQ", r2_mq_val);
         if !r2_cigar_str.is_empty() && r2_cigar_str != "*" {
-            bam_fields::update_string_tag(&mut rr[r1_i], b"MC", r2_cigar_str.as_bytes());
+            bam_fields::update_string_tag(rr[r1_i].as_mut_vec(), b"MC", r2_cigar_str.as_bytes());
         } else {
-            bam_fields::remove_tag(&mut rr[r1_i], b"MC");
+            bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"MC");
         }
 
         // Set mate info on R2 from R1
@@ -1205,11 +1213,11 @@ impl Template {
         bam_fields::set_mate_pos(&mut rr[r2_i], r1_pos);
         set_mate_flags_raw(&mut rr[r2_i], r1_is_reverse, false);
         let r1_mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-        bam_fields::update_int_tag(&mut rr[r2_i], b"MQ", r1_mq_val);
+        bam_fields::update_int_tag(rr[r2_i].as_mut_vec(), b"MQ", r1_mq_val);
         if !r1_cigar_str.is_empty() && r1_cigar_str != "*" {
-            bam_fields::update_string_tag(&mut rr[r2_i], b"MC", r1_cigar_str.as_bytes());
+            bam_fields::update_string_tag(rr[r2_i].as_mut_vec(), b"MC", r1_cigar_str.as_bytes());
         } else {
-            bam_fields::remove_tag(&mut rr[r2_i], b"MC");
+            bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"MC");
         }
 
         // Set insert size
@@ -1235,8 +1243,8 @@ impl Template {
         bam_fields::set_mate_ref_id(&mut rr[r1_i], -1);
         bam_fields::set_mate_pos(&mut rr[r1_i], -1);
         set_mate_flags_raw(&mut rr[r1_i], r2_is_reverse, true);
-        bam_fields::remove_tag(&mut rr[r1_i], b"MQ");
-        bam_fields::remove_tag(&mut rr[r1_i], b"MC");
+        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"MQ");
+        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"MC");
         bam_fields::set_template_length(&mut rr[r1_i], 0);
 
         // R2: set to unmapped coordinates
@@ -1245,8 +1253,8 @@ impl Template {
         bam_fields::set_mate_ref_id(&mut rr[r2_i], -1);
         bam_fields::set_mate_pos(&mut rr[r2_i], -1);
         set_mate_flags_raw(&mut rr[r2_i], r1_is_reverse, true);
-        bam_fields::remove_tag(&mut rr[r2_i], b"MQ");
-        bam_fields::remove_tag(&mut rr[r2_i], b"MC");
+        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"MQ");
+        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"MC");
         bam_fields::set_template_length(&mut rr[r2_i], 0);
     }
 
@@ -1277,8 +1285,8 @@ impl Template {
         bam_fields::set_mate_ref_id(&mut rr[mapped_i], mapped_ref_id);
         bam_fields::set_mate_pos(&mut rr[mapped_i], mapped_pos);
         set_mate_flags_raw(&mut rr[mapped_i], unmapped_is_reverse, true);
-        bam_fields::remove_tag(&mut rr[mapped_i], b"MQ");
-        bam_fields::remove_tag(&mut rr[mapped_i], b"MC");
+        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), b"MQ");
+        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), b"MC");
         bam_fields::set_template_length(&mut rr[mapped_i], 0);
 
         // Set mate info on unmapped read (mate is mapped)
@@ -1286,11 +1294,15 @@ impl Template {
         bam_fields::set_mate_pos(&mut rr[unmapped_i], mapped_pos);
         set_mate_flags_raw(&mut rr[unmapped_i], mapped_is_reverse, false);
         let mq_val = if mapped_mapq == 255 { 255 } else { i32::from(mapped_mapq) };
-        bam_fields::update_int_tag(&mut rr[unmapped_i], b"MQ", mq_val);
+        bam_fields::update_int_tag(rr[unmapped_i].as_mut_vec(), b"MQ", mq_val);
         if !mapped_cigar_str.is_empty() && mapped_cigar_str != "*" {
-            bam_fields::update_string_tag(&mut rr[unmapped_i], b"MC", mapped_cigar_str.as_bytes());
+            bam_fields::update_string_tag(
+                rr[unmapped_i].as_mut_vec(),
+                b"MC",
+                mapped_cigar_str.as_bytes(),
+            );
         } else {
-            bam_fields::remove_tag(&mut rr[unmapped_i], b"MC");
+            bam_fields::remove_tag(rr[unmapped_i].as_mut_vec(), b"MC");
         }
         bam_fields::set_template_length(&mut rr[unmapped_i], 0);
     }
@@ -1837,9 +1849,11 @@ impl MemoryEstimate for Template {
         let records_size: usize = self.records.iter().map(estimate_record_buf_heap_size).sum();
         let records_vec_overhead = self.records.capacity() * std::mem::size_of::<RecordBuf>();
 
+        // RawRecord wraps Vec<u8>; use .len() for byte content (capacity not exposed
+        // on shared ref, but len is a conservative lower bound for the estimate).
         let raw_records_size = self.raw_records.as_ref().map_or(0, |rr| {
-            rr.iter().map(Vec::capacity).sum::<usize>()
-                + rr.capacity() * std::mem::size_of::<Vec<u8>>()
+            rr.iter().map(RawRecord::len).sum::<usize>()
+                + rr.capacity() * std::mem::size_of::<RawRecord>()
         });
 
         name_size + records_size + records_vec_overhead + raw_records_size
@@ -4054,8 +4068,8 @@ mod tests {
     #[test]
     fn test_from_raw_records_creates_raw_mode_template() {
         let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let template =
-            Template::from_raw_records(vec![raw]).expect("from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
+            .expect("from_raw_records should succeed");
 
         // Verify it's in raw-byte mode
         assert!(template.is_raw_byte_mode());
@@ -4069,8 +4083,8 @@ mod tests {
     fn test_r1_accessor_returns_none_in_raw_mode() {
         // After fix: calling r1() on a raw-mode Template returns None instead of panicking
         let raw = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let template =
-            Template::from_raw_records(vec![raw]).expect("from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
+            .expect("from_raw_records should succeed");
 
         // r1() should return None in raw mode (use raw_r1() instead)
         assert!(template.r1().is_none());
@@ -4084,7 +4098,8 @@ mod tests {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
         let template =
-            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
+            Template::from_raw_records(vec![r1, r2].into_iter().map(Into::into).collect())
+                .expect("from_raw_records should succeed");
 
         assert!(template.is_raw_byte_mode());
 
@@ -4104,7 +4119,8 @@ mod tests {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
         let template =
-            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
+            Template::from_raw_records(vec![r1, r2].into_iter().map(Into::into).collect())
+                .expect("from_raw_records should succeed");
 
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
@@ -4120,7 +4136,9 @@ mod tests {
         // R2 first, R1 second — fast path should swap them
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
-        let template = Template::from_raw_records(vec![r2, r1]).expect("from_raw_records");
+        let template =
+            Template::from_raw_records(vec![r2, r1].into_iter().map(Into::into).collect())
+                .expect("from_raw_records");
 
         assert!(template.is_raw_byte_mode());
         // After swap, R1 should be at index 0
@@ -4137,7 +4155,8 @@ mod tests {
         // Both records are R1 — fast path should fall through to general path (error)
         let r1a = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r1b = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
-        let result = Template::from_raw_records(vec![r1a, r1b]);
+        let result =
+            Template::from_raw_records(vec![r1a, r1b].into_iter().map(Into::into).collect());
         assert!(result.is_err());
     }
 
@@ -4150,7 +4169,8 @@ mod tests {
             FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SECONDARY,
         );
         let template =
-            Template::from_raw_records(vec![r1, sec]).expect("from_raw_records should succeed");
+            Template::from_raw_records(vec![r1, sec].into_iter().map(Into::into).collect())
+                .expect("from_raw_records should succeed");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
     }
@@ -4165,7 +4185,8 @@ mod tests {
         );
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
         let template =
-            Template::from_raw_records(vec![r1, r1_supp, r2]).expect("value should be present");
+            Template::from_raw_records(vec![r1, r1_supp, r2].into_iter().map(Into::into).collect())
+                .expect("value should be present");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
         assert!(template.raw_r2().is_some());
@@ -4175,8 +4196,8 @@ mod tests {
     fn test_from_raw_records_single_unpaired() {
         // Single unpaired record — should be treated as R1
         let r = make_minimal_raw_bam(b"read1", 0); // no PAIRED flag
-        let template =
-            Template::from_raw_records(vec![r]).expect("from_raw_records should succeed");
+        let template = Template::from_raw_records(vec![r].into_iter().map(Into::into).collect())
+            .expect("from_raw_records should succeed");
         assert!(template.is_raw_byte_mode());
         assert!(template.raw_r1().is_some());
         assert!(template.raw_r2().is_none());
@@ -4197,7 +4218,9 @@ mod tests {
             FLAG_PAIRED | FLAG_READ1 | crate::sort::bam_fields::flags::SUPPLEMENTARY,
         );
         let r2_wrong = make_minimal_raw_bam(b"read2", FLAG_PAIRED | FLAG_READ2);
-        let result = Template::from_raw_records(vec![r1, r1_supp, r2_wrong]);
+        let result = Template::from_raw_records(
+            vec![r1, r1_supp, r2_wrong].into_iter().map(Into::into).collect(),
+        );
         assert!(result.is_err());
     }
 
@@ -4206,7 +4229,8 @@ mod tests {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
         let mut template =
-            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
+            Template::from_raw_records(vec![r1, r2].into_iter().map(Into::into).collect())
+                .expect("from_raw_records should succeed");
         // Should be able to get mutable access
         let recs = template.all_raw_records_mut().expect("all_raw_records_mut should succeed");
         assert_eq!(recs.len(), 2);
@@ -4217,7 +4241,8 @@ mod tests {
         let r1 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ1);
         let r2 = make_minimal_raw_bam(b"read1", FLAG_PAIRED | FLAG_READ2);
         let template =
-            Template::from_raw_records(vec![r1, r2]).expect("from_raw_records should succeed");
+            Template::from_raw_records(vec![r1, r2].into_iter().map(Into::into).collect())
+                .expect("from_raw_records should succeed");
         let recs = template.into_raw_records().expect("into_raw_records should succeed");
         assert_eq!(recs.len(), 2);
     }
@@ -4226,7 +4251,8 @@ mod tests {
     fn test_from_raw_records_truncated_header() {
         // Record too short (< 32 bytes)
         let short = vec![0u8; 20];
-        let err = Template::from_raw_records(vec![short]).unwrap_err();
+        let err = Template::from_raw_records(vec![short].into_iter().map(Into::into).collect())
+            .unwrap_err();
         assert!(err.to_string().contains("too short"), "Error: {err}");
     }
 
@@ -4235,7 +4261,8 @@ mod tests {
         // Record has 32 bytes but l_read_name claims more bytes than available
         let mut buf = vec![0u8; 34]; // 32 header + 2 bytes
         buf[8] = 10; // l_read_name=10, but only 2 bytes after header
-        let err = Template::from_raw_records(vec![buf]).unwrap_err();
+        let err = Template::from_raw_records(vec![buf].into_iter().map(Into::into).collect())
+            .unwrap_err();
         assert!(err.to_string().contains("truncated"), "Error: {err}");
     }
 
@@ -4243,7 +4270,9 @@ mod tests {
     fn test_from_raw_records_valid_l_read_name() {
         // Record with l_read_name that exactly fits
         let rec = make_minimal_raw_bam(b"test", FLAG_PAIRED | FLAG_READ1);
-        assert!(Template::from_raw_records(vec![rec]).is_ok());
+        assert!(
+            Template::from_raw_records(vec![rec].into_iter().map(Into::into).collect()).is_ok()
+        );
     }
 
     // ========================================================================
