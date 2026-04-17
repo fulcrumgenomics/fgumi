@@ -27,7 +27,7 @@ use crate::consensus::codec_caller::{
 };
 use crate::consensus_caller::{ConsensusCaller, ConsensusOutput};
 use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
 use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::unified_pipeline::{
@@ -262,23 +262,6 @@ impl Command for Codec {
         // Note: Unlike simplex/duplex, CODEC does not support overlapping consensus calling
         // (matching fgbio's CallCodecConsensusReads which has no such option).
 
-        // Open input BAM using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
-
-        // Create output header for unmapped consensus reads
-        let output_header = create_unmapped_consensus_header(
-            &header,
-            &self.read_group.read_group_id,
-            "Read group",
-            command_line,
-        )?;
-
-        // Use library name from header if no prefix is specified (like fgbio)
-        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
-
         // Parse cell tag
         let cell_tag = Tag::from(SamTag::CB);
 
@@ -292,23 +275,43 @@ impl Command for Codec {
         // --threads N mode: Use 7-step unified pipeline
         // None: Use single-threaded fast path
         // ============================================================
-        // IMPORTANT: Check this BEFORE creating any output file handles to avoid
-        // file handle conflicts that can corrupt the output.
+        // IMPORTANT: Check threading BEFORE opening any reader so we only open
+        // the input once — opening twice wastes I/O and breaks stdin streaming.
         if let Some(threads) = self.threading.threads {
+            let (reader, header) = create_bam_reader_for_pipeline_with_opts(
+                &self.io.input,
+                self.io.pipeline_reader_opts(),
+            )?;
+            let output_header = create_unmapped_consensus_header(
+                &header,
+                &self.read_group.read_group_id,
+                "Read group",
+                command_line,
+            )?;
+            let read_name_prefix = self.read_group.prefix_or_from_header(&header);
+
             let result = self.execute_threads_mode(
                 threads,
                 reader,
-                header.clone(),
+                header,
                 output_header,
-                read_name_prefix.clone(),
+                read_name_prefix,
                 track_rejects,
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
             return result;
         }
 
-        // Drop the reader for single-threaded mode - we use MiGroupIterator which needs its own reader
-        drop(reader);
+        // Single-threaded fast path: open the raw reader once and derive the header from it.
+        let (mut raw_reader, header) =
+            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        let output_header = create_unmapped_consensus_header(
+            &header,
+            &self.read_group.read_group_id,
+            "Read group",
+            command_line,
+        )?;
+        let read_name_prefix = self.read_group.prefix_or_from_header(&header);
 
         // ============================================================
         // For non-pipeline modes, create output writers here
@@ -356,9 +359,7 @@ impl Command for Codec {
         let mut record_count: usize = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Create the MI group iterator for single-threaded streaming (raw bytes)
-        let (mut raw_reader, _) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        // Use the raw_reader opened above (single input open).
         let raw_record_iter = std::iter::from_fn(move || {
             let mut record = RawRecord::new();
             match raw_reader.read_record(&mut record) {
@@ -367,8 +368,7 @@ impl Command for Codec {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter =
-            RawMiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
+        let mi_group_iter = MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
 
         let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
             read_name_prefix,
@@ -380,7 +380,7 @@ impl Command for Codec {
         for result in mi_group_iter {
             let (umi, records) = result.context("Failed to read MI group")?;
 
-            // Call consensus — mi_group yields Vec<RawRecord>.
+            // Call consensus directly — records are already RawRecord values.
             let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
             match result {
                 Ok(output) => {
@@ -538,9 +538,8 @@ impl Codec {
         // Clone input_header before pipeline (needed for rejects writing)
         let rejects_header = input_header.clone();
 
-        // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -549,13 +548,13 @@ impl Codec {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create RawMiGrouper ==========
+            // ========== grouper_fn: Create MiGrouper ==========
             move |_header: &Header| {
-                Box::new(RawMiGrouper::new("MI", batch_size))
-                    as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
+                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
+                    as Box<dyn Grouper<Group = MiGroupBatch> + Send>
             },
             // ========== process_fn: CODEC consensus calling ==========
-            move |batch: RawMiGroupBatch| -> io::Result<CodecProcessedBatch> {
+            move |batch: MiGroupBatch| -> io::Result<CodecProcessedBatch> {
                 // Create per-thread CODEC consensus caller
                 let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
                     read_name_prefix.clone(),
@@ -569,10 +568,10 @@ impl Codec {
                 let mut batch_stats = CodecConsensusStats::default();
                 let groups_count = batch.groups.len() as u64;
 
-                for RawMiGroup { mi, records } in batch.groups {
+                for MiGroup { mi, records } in batch.groups {
                     caller.clear();
 
-                    // Call CODEC consensus — mi_group yields Vec<RawRecord>.
+                    // Call CODEC consensus directly — records are already RawRecord values.
                     let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
                     match result {
                         Ok(batch_output) => {
@@ -583,11 +582,17 @@ impl Codec {
                             }
                         }
                         Err(e) => {
-                            // Handle duplex disagreement errors by merging stats
+                            // Handle duplex disagreement errors by merging stats and
+                            // preserving rejects so --rejects output matches single-threaded mode.
                             if e.to_string().contains("duplex disagreement") {
                                 batch_stats.merge(caller.statistics());
+                                if track_rejects {
+                                    all_rejects.extend(caller.take_rejected_reads());
+                                }
                             } else {
-                                log::warn!("CODEC consensus error for MI {mi}: {e}");
+                                return Err(io::Error::other(format!(
+                                    "CODEC consensus error for MI {mi}: {e}"
+                                )));
                             }
                         }
                     }
@@ -698,7 +703,7 @@ mod tests {
     /// Helper to create a Codec with specified input/output paths
     fn create_codec_with_paths(input: PathBuf, output: PathBuf) -> Codec {
         Codec {
-            io: BamIoOptions::new(input, output),
+            io: BamIoOptions { input, output, async_reader: false },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions::default(),
@@ -776,14 +781,21 @@ mod tests {
     }
 
     // Integration tests
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{
+        SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
+    };
     use noodles::sam::Header;
-    use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use tempfile::TempDir;
 
+    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> RecordBuf {
+        raw_record_to_record_buf(&raw, &Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
+
     /// Helper to create a CODEC-style FR read pair with proper overlap
     /// R1 forward at start1, R2 reverse at start2, with `read_len` bases each
+    #[allow(clippy::cast_possible_truncation)]
     fn create_codec_fr_pair_overlapping(
         mi_value: &str,
         start1: usize,
@@ -792,65 +804,61 @@ mod tests {
         quals: &[u8],
     ) -> (RecordBuf, RecordBuf) {
         // Use a simple reference-matching sequence
-        let seq_forward = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let seq_forward = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let seq = &seq_forward[..read_len];
 
         // For R2 reverse, we need the reverse complement
-        let seq_rc: String = seq
-            .chars()
+        let seq_rc: Vec<u8> = seq
+            .iter()
             .rev()
-            .map(|c| match c {
-                'A' => 'T',
-                'T' => 'A',
-                'C' => 'G',
-                'G' => 'C',
-                _ => c,
+            .map(|&c| match c {
+                b'A' => b'T',
+                b'T' => b'A',
+                b'C' => b'G',
+                b'G' => b'C',
+                other => other,
             })
             .collect();
 
         let insert_size: i32 = (start2 + read_len) as i32 - start1 as i32;
+        let cigar = encode_op(0, read_len);
+        // R1: PAIRED | PROPERLY_SEGMENTED | FIRST_SEGMENT | MATE_REVERSE = 0x1|0x2|0x40|0x20 = 99
+        const PROPERLY_PAIRED: u16 = 0x2;
+        let r1_flags = flags::PAIRED | PROPERLY_PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE;
+        // R2: PAIRED | PROPERLY_SEGMENTED | LAST_SEGMENT | REVERSE = 0x1|0x2|0x80|0x10 = 147
+        let r2_flags = flags::PAIRED | PROPERLY_PAIRED | flags::LAST_SEGMENT | flags::REVERSE;
 
-        // R1: Forward strand, first segment
-        let r1 = RecordBuilder::new()
-            .name(&format!("read_{mi_value}"))
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(format!("read_{mi_value}").as_bytes())
+            .flags(r1_flags)
+            .ref_id(0)
+            .pos(start1 as i32 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
             .sequence(seq)
             .qualities(quals)
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::PROPERLY_SEGMENTED
-                    | Flags::FIRST_SEGMENT
-                    | Flags::MATE_REVERSE_COMPLEMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(start1)
-            .cigar(&format!("{read_len}M"))
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(start2)
-            .template_length(insert_size)
-            .tag("MI", mi_value)
-            .tag("RG", "A")
-            .build();
+            .mate_ref_id(0)
+            .mate_pos(start2 as i32 - 1)
+            .template_length(insert_size);
+        b1.add_string_tag(b"MI", mi_value.as_bytes());
+        b1.add_string_tag(b"RG", b"A");
+        let r1 = to_record_buf(b1.build());
 
-        // R2: Reverse strand, last segment (stored as revcomp in BAM)
-        let r2 = RecordBuilder::new()
-            .name(&format!("read_{mi_value}"))
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(format!("read_{mi_value}").as_bytes())
+            .flags(r2_flags)
+            .ref_id(0)
+            .pos(start2 as i32 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
             .sequence(&seq_rc)
             .qualities(quals)
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::PROPERLY_SEGMENTED
-                    | Flags::LAST_SEGMENT
-                    | Flags::REVERSE_COMPLEMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(start2)
-            .cigar(&format!("{read_len}M"))
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(start1)
-            .template_length(-insert_size)
-            .tag("MI", mi_value)
-            .tag("RG", "A")
-            .build();
+            .mate_ref_id(0)
+            .mate_pos(start1 as i32 - 1)
+            .template_length(-insert_size);
+        b2.add_string_tag(b"MI", mi_value.as_bytes());
+        b2.add_string_tag(b"RG", b"A");
+        let r2 = to_record_buf(b2.build());
 
         (r1, r2)
     }

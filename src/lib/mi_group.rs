@@ -4,378 +4,32 @@
 //! This is useful for streaming consensus calling where input is already sorted by MI groups
 //! (e.g., output from `group`).
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::io;
 
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, MemoryEstimate};
 
-/// An iterator that groups consecutive BAM records by their MI (Molecular Identifier) tag.
-///
-/// This iterator assumes records with the same MI value are consecutive in the input stream,
-/// which is the output format from `group`. Each call to `next()` returns all records
-/// sharing the same MI value as a single group.
-///
-/// # Example
-///
-/// ```ignore
-/// use fgumi_lib::mi_group::MiGroupIterator;
-///
-/// let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-/// let mi_groups = MiGroupIterator::new(record_iter, "MI");
-///
-/// for result in mi_groups {
-///     let (mi_value, records) = result?;
-///     // Process all records with this MI value
-/// }
-/// ```
-pub struct MiGroupIterator<I>
-where
-    I: Iterator<Item = Result<RecordBuf>>,
-{
-    record_iter: I,
-    tag: Tag,
-    current_mi: Option<String>,
-    current_group: Vec<RecordBuf>,
-    pending_error: Option<anyhow::Error>,
-    done: bool,
-}
-
-impl<I> MiGroupIterator<I>
-where
-    I: Iterator<Item = Result<RecordBuf>>,
-{
-    /// Creates a new `MiGroupIterator`.
-    ///
-    /// # Arguments
-    ///
-    /// * `record_iter` - Iterator over records to group by MI tag
-    /// * `tag_name` - The two-character tag name (e.g., "MI")
-    ///
-    /// # Panics
-    ///
-    /// Panics if `tag_name` is not exactly 2 characters.
-    pub fn new(record_iter: I, tag_name: &str) -> Self {
-        assert!(tag_name.len() == 2, "Tag name must be exactly 2 characters");
-        let tag_bytes = tag_name.as_bytes();
-        let tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
-
-        MiGroupIterator {
-            record_iter,
-            tag,
-            current_mi: None,
-            current_group: Vec::new(),
-            pending_error: None,
-            done: false,
-        }
-    }
-
-    /// Extracts the MI tag value from a record.
-    fn get_mi(&self, record: &RecordBuf) -> Result<Option<String>> {
-        if let Some(tag_value) = record.data().get(&self.tag) {
-            match tag_value {
-                noodles::sam::alignment::record_buf::data::field::Value::String(s) => {
-                    Ok(Some(s.to_string()))
-                }
-                _ => {
-                    bail!("MI tag must be a string value");
-                }
-            }
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl<I> Iterator for MiGroupIterator<I>
-where
-    I: Iterator<Item = Result<RecordBuf>>,
-{
-    /// Each item is a Result containing (`MI_value`, `Vec<RecordBuf>`) or an error.
-    type Item = Result<(String, Vec<RecordBuf>)>;
-
-    /// Returns the next MI group from the record iterator.
-    ///
-    /// Reads records until the MI tag changes, then returns the completed group.
-    /// On EOF, returns any remaining group, then None.
-    ///
-    /// Records without an MI tag are skipped.
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        // Check for pending error (return after we've flushed any pending group)
-        if let Some(e) = self.pending_error.take() {
-            self.done = true;
-            return Some(Err(e));
-        }
-
-        loop {
-            match self.record_iter.next() {
-                None => {
-                    // EOF - return any remaining group
-                    self.done = true;
-                    if self.current_group.is_empty() {
-                        return None;
-                    }
-                    let mi = self.current_mi.take().unwrap_or_default();
-                    let group = std::mem::take(&mut self.current_group);
-                    return Some(Ok((mi, group)));
-                }
-                Some(Err(e)) => {
-                    // If we have a pending group, return it first and save the error
-                    if !self.current_group.is_empty() {
-                        self.pending_error = Some(e);
-                        let mi = self.current_mi.take().unwrap_or_default();
-                        let group = std::mem::take(&mut self.current_group);
-                        return Some(Ok((mi, group)));
-                    }
-                    self.done = true;
-                    return Some(Err(e));
-                }
-                Some(Ok(record)) => {
-                    // Extract MI tag
-                    let mi = match self.get_mi(&record) {
-                        Ok(Some(mi)) => mi,
-                        Ok(None) => {
-                            // Skip records without MI tag
-                            continue;
-                        }
-                        Err(e) => {
-                            // If we have a pending group, return it first and save the error
-                            if !self.current_group.is_empty() {
-                                self.pending_error = Some(e);
-                                let mi = self.current_mi.take().unwrap_or_default();
-                                let group = std::mem::take(&mut self.current_group);
-                                return Some(Ok((mi, group)));
-                            }
-                            self.done = true;
-                            return Some(Err(e));
-                        }
-                    };
-
-                    if self.current_group.is_empty() {
-                        // First record or first record after returning a group
-                        self.current_mi = Some(mi);
-                        self.current_group.push(record);
-                    } else if self.current_mi.as_ref() == Some(&mi) {
-                        // Same MI, add to current group
-                        self.current_group.push(record);
-                    } else {
-                        // Different MI - return current group and start new one
-                        let old_mi = self.current_mi.take().unwrap_or_default();
-                        let group = std::mem::take(&mut self.current_group);
-                        self.current_mi = Some(mi);
-                        self.current_group.push(record);
-                        return Some(Ok((old_mi, group)));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// An iterator that groups consecutive BAM records by a transformed key.
-///
-/// Similar to `MiGroupIterator` but applies a key transformation function to the MI tag
-/// before grouping. This is useful for duplex consensus calling where reads with
-/// "1/A" and "1/B" should be grouped together under key "1".
-///
-/// # Example
-///
-/// ```ignore
-/// use fgumi_lib::mi_group::MiGroupIteratorWithTransform;
-/// use fgumi_lib::umi::extract_mi_base;
-///
-/// let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-/// let mi_groups = MiGroupIteratorWithTransform::new(
-///     record_iter,
-///     "MI",
-///     |mi| extract_mi_base(mi).to_string(),
-/// );
-///
-/// for result in mi_groups {
-///     let (base_mi, records) = result?;
-///     // records contains all reads with MI tags like "base_mi/A" and "base_mi/B"
-/// }
-/// ```
-pub struct MiGroupIteratorWithTransform<I, F>
-where
-    I: Iterator<Item = Result<RecordBuf>>,
-    F: Fn(&str) -> String,
-{
-    record_iter: I,
-    tag: Tag,
-    key_transform: F,
-    current_key: Option<String>,
-    current_group: Vec<RecordBuf>,
-    pending_error: Option<anyhow::Error>,
-    done: bool,
-}
-
-impl<I, F> MiGroupIteratorWithTransform<I, F>
-where
-    I: Iterator<Item = Result<RecordBuf>>,
-    F: Fn(&str) -> String,
-{
-    /// Creates a new `MiGroupIteratorWithTransform`.
-    ///
-    /// # Arguments
-    ///
-    /// * `record_iter` - Iterator over records to group
-    /// * `tag_name` - The two-character tag name (e.g., "MI")
-    /// * `key_transform` - Function to transform the tag value into a grouping key
-    ///
-    /// # Panics
-    ///
-    /// Panics if `tag_name` is not exactly 2 characters.
-    pub fn new(record_iter: I, tag_name: &str, key_transform: F) -> Self {
-        assert!(tag_name.len() == 2, "Tag name must be exactly 2 characters");
-        let tag_bytes = tag_name.as_bytes();
-        let tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
-
-        MiGroupIteratorWithTransform {
-            record_iter,
-            tag,
-            key_transform,
-            current_key: None,
-            current_group: Vec::new(),
-            pending_error: None,
-            done: false,
-        }
-    }
-
-    /// Extracts the tag value from a record and transforms it using the key function.
-    fn get_key(&self, record: &RecordBuf) -> Result<Option<String>> {
-        if let Some(tag_value) = record.data().get(&self.tag) {
-            match tag_value {
-                noodles::sam::alignment::record_buf::data::field::Value::String(s) => {
-                    let raw = s.to_string();
-                    Ok(Some((self.key_transform)(&raw)))
-                }
-                _ => {
-                    bail!("Tag must be a string value");
-                }
-            }
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl<I, F> Iterator for MiGroupIteratorWithTransform<I, F>
-where
-    I: Iterator<Item = Result<RecordBuf>>,
-    F: Fn(&str) -> String,
-{
-    /// Each item is a Result containing (key, `Vec<RecordBuf>`) or an error.
-    type Item = Result<(String, Vec<RecordBuf>)>;
-
-    /// Returns the next group from the record iterator.
-    ///
-    /// Reads records until the transformed key changes, then returns the completed group.
-    /// On EOF, returns any remaining group, then None.
-    ///
-    /// Records without the tag are skipped.
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        // Check for pending error (return after we've flushed any pending group)
-        if let Some(e) = self.pending_error.take() {
-            self.done = true;
-            return Some(Err(e));
-        }
-
-        loop {
-            match self.record_iter.next() {
-                None => {
-                    // EOF - return any remaining group
-                    self.done = true;
-                    if self.current_group.is_empty() {
-                        return None;
-                    }
-                    let key = self.current_key.take().unwrap_or_default();
-                    let group = std::mem::take(&mut self.current_group);
-                    return Some(Ok((key, group)));
-                }
-                Some(Err(e)) => {
-                    // If we have a pending group, return it first and save the error
-                    if !self.current_group.is_empty() {
-                        self.pending_error = Some(e);
-                        let key = self.current_key.take().unwrap_or_default();
-                        let group = std::mem::take(&mut self.current_group);
-                        return Some(Ok((key, group)));
-                    }
-                    self.done = true;
-                    return Some(Err(e));
-                }
-                Some(Ok(record)) => {
-                    // Extract and transform tag
-                    let key = match self.get_key(&record) {
-                        Ok(Some(key)) => key,
-                        Ok(None) => {
-                            // Skip records without tag
-                            continue;
-                        }
-                        Err(e) => {
-                            // If we have a pending group, return it first and save the error
-                            if !self.current_group.is_empty() {
-                                self.pending_error = Some(e);
-                                let key = self.current_key.take().unwrap_or_default();
-                                let group = std::mem::take(&mut self.current_group);
-                                return Some(Ok((key, group)));
-                            }
-                            self.done = true;
-                            return Some(Err(e));
-                        }
-                    };
-
-                    if self.current_group.is_empty() {
-                        // First record or first record after returning a group
-                        self.current_key = Some(key);
-                        self.current_group.push(record);
-                    } else if self.current_key.as_ref() == Some(&key) {
-                        // Same key, add to current group
-                        self.current_group.push(record);
-                    } else {
-                        // Different key - return current group and start new one
-                        let old_key = self.current_key.take().unwrap_or_default();
-                        let group = std::mem::take(&mut self.current_group);
-                        self.current_key = Some(key);
-                        self.current_group.push(record);
-                        return Some(Ok((old_key, group)));
-                    }
-                }
-            }
-        }
-    }
-}
+use crate::unified_pipeline::Grouper;
+use std::collections::VecDeque;
 
 // ============================================================================
-// Parallel processing support for MI groups
+// Raw-byte MI grouping for consensus callers
 // ============================================================================
 
-/// A single MI group: the MI tag value and all records with that MI.
-///
-/// This represents records that share the same Molecular Identifier (MI) tag value,
-/// used by consensus calling commands to group reads from the same source molecule.
+/// A single MI group holding raw-byte BAM records.
 #[derive(Debug, Clone)]
 pub struct MiGroup {
     /// The MI tag value (e.g., "0", "1/A", "1/B")
     pub mi: String,
-    /// All records sharing this MI value
-    pub records: Vec<RecordBuf>,
+    /// Raw BAM records sharing this MI value
+    pub records: Vec<RawRecord>,
 }
 
 impl MiGroup {
-    /// Creates a new MI group.
+    /// Creates a new raw MI group.
     #[must_use]
-    pub fn new(mi: String, records: Vec<RecordBuf>) -> Self {
+    pub fn new(mi: String, records: Vec<RawRecord>) -> Self {
         Self { mi, records }
     }
 }
@@ -388,47 +42,28 @@ impl BatchWeight for MiGroup {
 
 impl MemoryEstimate for MiGroup {
     fn estimate_heap_size(&self) -> usize {
-        // mi: String (heap allocated)
         let mi_size = self.mi.capacity();
-
-        // records: Vec<RecordBuf>
-        let records_size: usize = self.records.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<RecordBuf>();
-
+        let records_size: usize = self.records.iter().map(RawRecord::capacity).sum();
+        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<RawRecord>();
         mi_size + records_size + records_vec_overhead
     }
 }
 
-impl MemoryEstimate for MiGroupBatch {
-    fn estimate_heap_size(&self) -> usize {
-        let groups_size: usize = self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        let groups_vec_overhead = self.groups.capacity() * std::mem::size_of::<MiGroup>();
-        groups_size + groups_vec_overhead
-    }
-}
-
-/// A batch of MI groups for parallel processing.
-///
-/// This structure holds a collection of MI groups that will be processed together
-/// in parallel.
-///
-/// # Performance
-///
-/// The batch is designed to be reused across iterations to minimize allocations.
+/// A batch of raw MI groups for parallel processing.
 #[derive(Default)]
 pub struct MiGroupBatch {
-    /// The MI groups in this batch
+    /// The raw MI groups in this batch
     pub groups: Vec<MiGroup>,
 }
 
 impl MiGroupBatch {
-    /// Creates a new empty MI group batch.
+    /// Creates a new empty raw MI group batch.
     #[must_use]
     pub fn new() -> Self {
         Self { groups: Vec::new() }
     }
 
-    /// Creates a new MI group batch with pre-allocated capacity.
+    /// Creates a new raw MI group batch with pre-allocated capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self { groups: Vec::with_capacity(capacity) }
@@ -440,7 +75,7 @@ impl MiGroupBatch {
         self.groups.len()
     }
 
-    /// Returns true if the batch is empty.
+    /// Returns true if the batch contains no groups.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
@@ -458,322 +93,26 @@ impl BatchWeight for MiGroupBatch {
     }
 }
 
-// ============================================================================
-// MiGrouper for 7-step unified pipeline
-// ============================================================================
-
-use crate::unified_pipeline::Grouper;
-use std::collections::VecDeque;
-
-/// Type alias for record filter function used in [`MiGrouper`].
-type RecordFilterFn = Box<dyn Fn(&RecordBuf) -> bool + Send + Sync>;
-
-/// Type alias for MI tag transformation function used in [`MiGrouper`].
-type MiTransformFn = Box<dyn Fn(&str) -> String + Send + Sync>;
-
-/// A Grouper that reads pre-grouped BAM records by MI tag for the 7-step pipeline.
-///
-/// Input BAM is expected to be sorted/grouped by MI tag (output from group command).
-/// This grouper reads consecutive records with the same MI tag and yields them as groups.
-///
-/// Unlike `OwnedMiGroupReader` which implements the `Reader` trait for the parallel
-/// framework, this implements the `Grouper` trait for the 7-step unified pipeline.
-/// The key difference is that `Grouper::add_bytes` receives raw decompressed bytes
-/// and must deserialize BAM records inline.
-///
-/// # Example
-///
-/// ```ignore
-/// use fgumi_lib::mi_group::MiGrouper;
-/// use fgumi_lib::unified_pipeline::Grouper;
-///
-/// let grouper = MiGrouper::new("MI", 100);
-/// // Use with run_bam_pipeline_with_grouper...
-/// ```
-///
-/// For duplex consensus calling with record filtering and MI transformation:
-///
-/// ```ignore
-/// let grouper = MiGrouper::with_filter_and_transform(
-///     "MI",
-///     100,
-///     |r| !r.flags().is_secondary(), // filter function
-///     |mi| extract_mi_base(mi).to_string(),   // transform function
-/// );
-/// ```
-pub struct MiGrouper {
-    /// The MI tag to group by (e.g., "MI")
-    tag: Tag,
-    /// Number of MI groups per batch
-    batch_size: usize,
-    /// Current MI value being accumulated
-    current_mi: Option<String>,
-    /// Records in current MI group
-    current_records: Vec<RecordBuf>,
-    /// Completed groups waiting to be batched
-    pending_groups: VecDeque<MiGroup>,
-    /// Whether `finish()` has been called
-    finished: bool,
-    /// Optional record filter (returns true to keep record)
-    record_filter: Option<RecordFilterFn>,
-    /// Optional MI tag transformation function
-    mi_transform: Option<MiTransformFn>,
-}
-
-impl MiGrouper {
-    /// Create a new `MiGrouper`.
-    ///
-    /// # Arguments
-    /// * `tag_name` - The MI tag name (e.g., "MI")
-    /// * `batch_size` - Number of MI groups per batch (100 is typical)
-    ///
-    /// # Panics
-    ///
-    /// Panics if `tag_name` is not exactly 2 characters.
-    #[must_use]
-    pub fn new(tag_name: &str, batch_size: usize) -> Self {
-        assert!(tag_name.len() == 2, "Tag name must be exactly 2 characters");
-        let tag_bytes = tag_name.as_bytes();
-        let tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
-
-        Self {
-            tag,
-            batch_size: batch_size.max(1),
-            current_mi: None,
-            current_records: Vec::new(),
-            pending_groups: VecDeque::new(),
-            finished: false,
-            record_filter: None,
-            mi_transform: None,
-        }
-    }
-
-    /// Create a `MiGrouper` with record filtering and MI tag transformation.
-    ///
-    /// This is useful for duplex consensus calling where we need to:
-    /// - Filter out secondary/supplementary reads
-    /// - Transform MI tags by stripping /A and /B suffixes
-    ///
-    /// # Arguments
-    /// * `tag_name` - The MI tag name (e.g., "MI")
-    /// * `batch_size` - Number of MI groups per batch (100 is typical)
-    /// * `record_filter` - Function that returns true to keep a record
-    /// * `mi_transform` - Function to transform MI tag value (e.g., strip /A /B suffix)
-    ///
-    /// # Panics
-    ///
-    /// Panics if `tag_name` is not exactly 2 characters.
-    pub fn with_filter_and_transform<F, T>(
-        tag_name: &str,
-        batch_size: usize,
-        record_filter: F,
-        mi_transform: T,
-    ) -> Self
-    where
-        F: Fn(&RecordBuf) -> bool + Send + Sync + 'static,
-        T: Fn(&str) -> String + Send + Sync + 'static,
-    {
-        assert!(tag_name.len() == 2, "Tag name must be exactly 2 characters");
-        let tag_bytes = tag_name.as_bytes();
-        let tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
-
-        Self {
-            tag,
-            batch_size: batch_size.max(1),
-            current_mi: None,
-            current_records: Vec::new(),
-            pending_groups: VecDeque::new(),
-            finished: false,
-            record_filter: Some(Box::new(record_filter)),
-            mi_transform: Some(Box::new(mi_transform)),
-        }
-    }
-
-    /// Get the MI tag value from a record, optionally applying transformation.
-    fn get_mi_tag(&self, record: &RecordBuf) -> Option<String> {
-        record.data().get(&self.tag).and_then(|v| match v {
-            noodles::sam::alignment::record_buf::data::field::Value::String(s) => {
-                let raw = s.to_string();
-                // Apply transform if configured
-                if let Some(ref transform) = self.mi_transform {
-                    Some(transform(&raw))
-                } else {
-                    Some(raw)
-                }
-            }
-            _ => None,
-        })
-    }
-
-    /// Check if a record passes the filter (or return true if no filter).
-    fn should_keep(&self, record: &RecordBuf) -> bool {
-        match &self.record_filter {
-            Some(filter) => filter(record),
-            None => true,
-        }
-    }
-
-    /// Flush current MI group to pending.
-    fn flush_current_group(&mut self) {
-        if let Some(mi) = self.current_mi.take() {
-            if !self.current_records.is_empty() {
-                let records = std::mem::take(&mut self.current_records);
-                self.pending_groups.push_back(MiGroup::new(mi, records));
-            }
-        }
-    }
-
-    /// Try to form complete batches from pending groups.
-    fn drain_batches(&mut self) -> Vec<MiGroupBatch> {
-        let mut batches = Vec::new();
-        while self.pending_groups.len() >= self.batch_size {
-            let groups: Vec<MiGroup> = self.pending_groups.drain(..self.batch_size).collect();
-            batches.push(MiGroupBatch { groups });
-        }
-        batches
-    }
-}
-
-impl Grouper for MiGrouper {
-    type Group = MiGroupBatch;
-
-    fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
-        for decoded in records {
-            let record = decoded.into_record().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "MiGrouper requires parsed records")
-            })?;
-            // Apply record filter if configured - skip records that don't pass
-            if !self.should_keep(&record) {
-                continue;
-            }
-
-            // Get MI tag from record (with optional transformation)
-            let mi = self.get_mi_tag(&record).unwrap_or_default();
-
-            // Check if this starts a new MI group
-            match &self.current_mi {
-                Some(current) if current == &mi => {
-                    // Same MI, add to current group
-                    self.current_records.push(record);
-                }
-                Some(_) => {
-                    // Different MI, flush current and start new
-                    self.flush_current_group();
-                    self.current_mi = Some(mi);
-                    self.current_records.push(record);
-                }
-                None => {
-                    // First record
-                    self.current_mi = Some(mi);
-                    self.current_records.push(record);
-                }
-            }
-        }
-
-        // Return complete batches
-        Ok(self.drain_batches())
-    }
-
-    fn finish(&mut self) -> io::Result<Option<Self::Group>> {
-        if self.finished {
-            return Ok(None);
-        }
-        self.finished = true;
-
-        // Flush any remaining current group
-        self.flush_current_group();
-
-        // Return any remaining groups as final batch
-        if self.pending_groups.is_empty() {
-            Ok(None)
-        } else {
-            let groups: Vec<MiGroup> = self.pending_groups.drain(..).collect();
-            Ok(Some(MiGroupBatch { groups }))
-        }
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending_groups.is_empty() || self.current_mi.is_some()
-    }
-}
-
-// ============================================================================
-// Raw-byte MI grouping for consensus callers
-// ============================================================================
-
-/// A single MI group holding raw-byte BAM records.
-#[derive(Debug, Clone)]
-pub struct RawMiGroup {
-    /// The MI tag value (e.g., "0", "1/A", "1/B")
-    pub mi: String,
-    /// Raw BAM records sharing this MI value
-    pub records: Vec<RawRecord>,
-}
-
-impl RawMiGroup {
-    /// Creates a new raw MI group.
-    #[must_use]
-    pub fn new(mi: String, records: Vec<RawRecord>) -> Self {
-        Self { mi, records }
-    }
-}
-
-impl BatchWeight for RawMiGroup {
-    fn batch_weight(&self) -> usize {
-        self.records.len()
-    }
-}
-
-impl MemoryEstimate for RawMiGroup {
-    fn estimate_heap_size(&self) -> usize {
-        let mi_size = self.mi.capacity();
-        let records_size: usize = self.records.iter().map(RawRecord::capacity).sum();
-        let records_vec_overhead = self.records.capacity() * std::mem::size_of::<RawRecord>();
-        mi_size + records_size + records_vec_overhead
-    }
-}
-
-/// A batch of raw MI groups for parallel processing.
-#[derive(Default)]
-pub struct RawMiGroupBatch {
-    /// The raw MI groups in this batch
-    pub groups: Vec<RawMiGroup>,
-}
-
-impl RawMiGroupBatch {
-    /// Creates a new empty raw MI group batch.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { groups: Vec::new() }
-    }
-}
-
-impl BatchWeight for RawMiGroupBatch {
-    fn batch_weight(&self) -> usize {
-        self.groups.iter().map(|g| g.records.len()).sum()
-    }
-}
-
-impl MemoryEstimate for RawMiGroupBatch {
+impl MemoryEstimate for MiGroupBatch {
     fn estimate_heap_size(&self) -> usize {
         let groups_size: usize = self.groups.iter().map(MemoryEstimate::estimate_heap_size).sum();
-        let groups_vec_overhead = self.groups.capacity() * std::mem::size_of::<RawMiGroup>();
+        let groups_vec_overhead = self.groups.capacity() * std::mem::size_of::<MiGroup>();
         groups_size + groups_vec_overhead
     }
 }
 
 /// Type alias for raw-byte MI tag transformation function.
-type RawMiTransformFn = Box<dyn Fn(&[u8]) -> String + Send + Sync>;
+type MiTransformFn = Box<dyn Fn(&[u8]) -> String + Send + Sync>;
 
 /// Type alias for raw-byte record filter function.
-type RawRecordFilterFn = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
+type RecordFilterFn = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 /// A Grouper that groups raw-byte BAM records by MI tag.
 ///
-/// This is the raw-byte equivalent of `MiGrouper`. Instead of parsing records
-/// into `RecordBuf`, it extracts MI tags directly from raw BAM bytes using
-/// `bam_fields::find_string_tag_in_record()`.
-pub struct RawMiGrouper {
+/// Records arrive as raw BAM bytes (see [`DecodedRecord::from_raw_bytes`]). MI tags are
+/// extracted directly from the raw bytes using `bam_fields::find_string_tag_in_record()`
+/// without parsing into `RecordBuf`.
+pub struct MiGrouper {
     /// The MI tag bytes to search for
     tag: [u8; 2],
     /// Number of MI groups per batch
@@ -783,19 +122,19 @@ pub struct RawMiGrouper {
     /// Records in current MI group (raw bytes)
     current_records: Vec<RawRecord>,
     /// Completed groups waiting to be batched
-    pending_groups: VecDeque<RawMiGroup>,
+    pending_groups: VecDeque<MiGroup>,
     /// Whether `finish()` has been called
     finished: bool,
     /// Optional MI tag transformation function
-    mi_transform: Option<RawMiTransformFn>,
+    mi_transform: Option<MiTransformFn>,
     /// Optional record filter
-    record_filter: Option<RawRecordFilterFn>,
+    record_filter: Option<RecordFilterFn>,
     /// Optional cell barcode tag for composite grouping (MI + cell barcode)
     cell_tag: Option<[u8; 2]>,
 }
 
-impl RawMiGrouper {
-    /// Create a new `RawMiGrouper`.
+impl MiGrouper {
+    /// Create a new `MiGrouper`.
     ///
     /// # Panics
     ///
@@ -818,7 +157,7 @@ impl RawMiGrouper {
         }
     }
 
-    /// Create a `RawMiGrouper` with record filtering and MI tag transformation.
+    /// Create a `MiGrouper` with record filtering and MI tag transformation.
     ///
     /// # Panics
     ///
@@ -892,38 +231,40 @@ impl RawMiGrouper {
         if let Some(mi) = self.current_mi.take() {
             if !self.current_records.is_empty() {
                 let records = std::mem::take(&mut self.current_records);
-                self.pending_groups.push_back(RawMiGroup::new(mi, records));
+                self.pending_groups.push_back(MiGroup::new(mi, records));
             }
         }
     }
 
     /// Try to form complete batches from pending groups.
-    fn drain_batches(&mut self) -> Vec<RawMiGroupBatch> {
+    fn drain_batches(&mut self) -> Vec<MiGroupBatch> {
         let mut batches = Vec::new();
         while self.pending_groups.len() >= self.batch_size {
-            let groups: Vec<RawMiGroup> = self.pending_groups.drain(..self.batch_size).collect();
-            batches.push(RawMiGroupBatch { groups });
+            let groups: Vec<MiGroup> = self.pending_groups.drain(..self.batch_size).collect();
+            batches.push(MiGroupBatch { groups });
         }
         batches
     }
 }
 
-impl Grouper for RawMiGrouper {
-    type Group = RawMiGroupBatch;
+impl Grouper for MiGrouper {
+    type Group = MiGroupBatch;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
         for decoded in records {
-            let raw = decoded.into_raw_bytes().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "RawMiGrouper requires raw byte records")
-            })?;
+            let raw = decoded.into_raw_bytes();
 
             // Apply record filter if configured
             if !self.should_keep(&raw) {
                 continue;
             }
 
-            // Get MI tag from raw bytes (use empty string if absent, matching MiGrouper behavior)
-            let mi = self.get_mi_tag(&raw).unwrap_or_default();
+            // Skip records without an MI tag: the consensus caller requires the
+            // MI tag and would fail when processing them. `MiGroupIterator`
+            // applies the same skip policy for parity across paths.
+            let Some(mi) = self.get_mi_tag(&raw) else {
+                continue;
+            };
 
             // Check if this starts a new MI group
             match &self.current_mi {
@@ -956,8 +297,8 @@ impl Grouper for RawMiGrouper {
         if self.pending_groups.is_empty() {
             Ok(None)
         } else {
-            let groups: Vec<RawMiGroup> = self.pending_groups.drain(..).collect();
-            Ok(Some(RawMiGroupBatch { groups }))
+            let groups: Vec<MiGroup> = self.pending_groups.drain(..).collect();
+            Ok(Some(MiGroupBatch { groups }))
         }
     }
 
@@ -966,11 +307,10 @@ impl Grouper for RawMiGrouper {
     }
 }
 
-/// An iterator that groups consecutive raw BAM records by their MI tag.
-///
-/// This is the raw-byte equivalent of `MiGroupIterator` for the single-threaded path.
+/// An iterator that groups consecutive raw BAM records by their MI tag, yielding
+/// one group per distinct MI value from the input stream.
 #[allow(clippy::type_complexity)]
-pub struct RawMiGroupIterator<I>
+pub struct MiGroupIterator<I>
 where
     I: Iterator<Item = Result<RawRecord>>,
 {
@@ -987,11 +327,11 @@ where
     mi_transform: Option<Box<dyn Fn(&[u8]) -> String>>,
 }
 
-impl<I> RawMiGroupIterator<I>
+impl<I> MiGroupIterator<I>
 where
     I: Iterator<Item = Result<RawRecord>>,
 {
-    /// Creates a new `RawMiGroupIterator`.
+    /// Creates a new `MiGroupIterator`.
     ///
     /// # Panics
     ///
@@ -1011,7 +351,7 @@ where
         }
     }
 
-    /// Creates a new `RawMiGroupIterator` with MI tag transformation.
+    /// Creates a new `MiGroupIterator` with MI tag transformation.
     ///
     /// # Panics
     ///
@@ -1066,7 +406,7 @@ where
     }
 }
 
-impl<I> Iterator for RawMiGroupIterator<I>
+impl<I> Iterator for MiGroupIterator<I>
 where
     I: Iterator<Item = Result<RawRecord>>,
 {
@@ -1105,6 +445,9 @@ where
                     return Some(Err(e));
                 }
                 Some(Ok(raw)) => {
+                    // Skip records without an MI tag; the consensus caller requires
+                    // an MI tag and would fail when processing them. `MiGrouper`
+                    // applies the same skip policy for parity across paths.
                     let Some(mi) = self.get_mi(&raw) else {
                         continue;
                     };
@@ -1132,237 +475,7 @@ where
 mod tests {
     use super::*;
     use crate::sam::SamTag;
-    use crate::sam::builder::RecordBuilder;
     use crate::umi::extract_mi_base;
-
-    fn create_record_with_mi(mi: &str) -> RecordBuf {
-        RecordBuilder::new()
-            .sequence("ACGT") // Minimal sequence
-            .tag("MI", mi)
-            .build()
-    }
-
-    fn create_record_without_mi() -> RecordBuf {
-        RecordBuilder::new()
-            .sequence("ACGT") // Minimal sequence
-            .build()
-    }
-
-    #[test]
-    fn test_empty_iterator() {
-        let records: Vec<Result<RecordBuf>> = vec![];
-        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_single_group() {
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("0")),
-            Ok(create_record_with_mi("0")),
-            Ok(create_record_with_mi("0")),
-        ];
-        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "0");
-        assert_eq!(result.1.len(), 3);
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_multiple_groups() {
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("0")),
-            Ok(create_record_with_mi("0")),
-            Ok(create_record_with_mi("1")),
-            Ok(create_record_with_mi("1")),
-            Ok(create_record_with_mi("1")),
-            Ok(create_record_with_mi("2")),
-        ];
-        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "0");
-        assert_eq!(result.1.len(), 2);
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "1");
-        assert_eq!(result.1.len(), 3);
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "2");
-        assert_eq!(result.1.len(), 1);
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_skips_records_without_mi_tag() {
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("0")),
-            Ok(create_record_without_mi()),
-            Ok(create_record_with_mi("0")),
-            Ok(create_record_without_mi()),
-            Ok(create_record_with_mi("1")),
-        ];
-        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "0");
-        assert_eq!(result.1.len(), 2); // Skipped record without MI
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "1");
-        assert_eq!(result.1.len(), 1);
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_error_propagation() {
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("0")),
-            Err(anyhow::anyhow!("test error")),
-            Ok(create_record_with_mi("1")),
-        ];
-        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
-
-        // First group before error
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "0");
-        assert_eq!(result.1.len(), 1);
-
-        // Error
-        let result = iter.next().expect("iterator should yield item");
-        assert!(result.is_err());
-
-        // Iterator should be done after error
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_custom_tag() {
-        let record1 = RecordBuilder::new().sequence("ACGT").tag("RX", "ACGT").build();
-
-        let record2 = RecordBuilder::new().sequence("ACGT").tag("RX", "ACGT").build();
-
-        let records: Vec<Result<RecordBuf>> = vec![Ok(record1), Ok(record2)];
-        let mut iter = MiGroupIterator::new(records.into_iter(), "RX");
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "ACGT");
-        assert_eq!(result.1.len(), 2);
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "Tag name must be exactly 2 characters")]
-    fn test_invalid_tag_length() {
-        let records: Vec<Result<RecordBuf>> = vec![];
-        let _ = MiGroupIterator::new(records.into_iter(), "M");
-    }
-
-    // Tests for MiGroupIteratorWithTransform
-    #[test]
-    fn test_transform_groups_by_base_mi() {
-        // Simulate duplex reads: 1/A, 1/A, 1/B, 1/B, 2/A, 2/B
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("1/A")),
-            Ok(create_record_with_mi("1/A")),
-            Ok(create_record_with_mi("1/B")),
-            Ok(create_record_with_mi("1/B")),
-            Ok(create_record_with_mi("2/A")),
-            Ok(create_record_with_mi("2/B")),
-        ];
-        let mut iter = MiGroupIteratorWithTransform::new(records.into_iter(), "MI", |mi| {
-            extract_mi_base(mi).to_string()
-        });
-
-        // First group: base MI "1" with 4 reads (2 /A + 2 /B)
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "1");
-        assert_eq!(result.1.len(), 4);
-
-        // Second group: base MI "2" with 2 reads (1 /A + 1 /B)
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "2");
-        assert_eq!(result.1.len(), 2);
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_transform_empty_iterator() {
-        let records: Vec<Result<RecordBuf>> = vec![];
-        let mut iter = MiGroupIteratorWithTransform::new(records.into_iter(), "MI", |mi| {
-            extract_mi_base(mi).to_string()
-        });
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_transform_single_group() {
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("0/A")),
-            Ok(create_record_with_mi("0/B")),
-            Ok(create_record_with_mi("0/A")),
-        ];
-        let mut iter = MiGroupIteratorWithTransform::new(records.into_iter(), "MI", |mi| {
-            extract_mi_base(mi).to_string()
-        });
-
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "0");
-        assert_eq!(result.1.len(), 3);
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_transform_error_propagation() {
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("0/A")),
-            Err(anyhow::anyhow!("test error")),
-            Ok(create_record_with_mi("1/B")),
-        ];
-        let mut iter = MiGroupIteratorWithTransform::new(records.into_iter(), "MI", |mi| {
-            extract_mi_base(mi).to_string()
-        });
-
-        // First group before error
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "0");
-        assert_eq!(result.1.len(), 1);
-
-        // Error
-        let result = iter.next().expect("iterator should yield item");
-        assert!(result.is_err());
-
-        // Iterator should be done after error
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_transform_custom_function() {
-        // Test with a custom transformation function (uppercase)
-        let records: Vec<Result<RecordBuf>> = vec![
-            Ok(create_record_with_mi("abc")),
-            Ok(create_record_with_mi("ABC")),
-            Ok(create_record_with_mi("Abc")),
-        ];
-        let mut iter =
-            MiGroupIteratorWithTransform::new(records.into_iter(), "MI", str::to_uppercase);
-
-        // All should be grouped together since they uppercase to "ABC"
-        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
-        assert_eq!(result.0, "ABC");
-        assert_eq!(result.1.len(), 3);
-
-        assert!(iter.next().is_none());
-    }
 
     // ========================================================================
     // Helpers for raw BAM byte construction
@@ -1458,24 +571,24 @@ mod tests {
     }
 
     // ========================================================================
-    // RawMiGroupIterator tests
+    // MiGroupIterator tests
     // ========================================================================
 
     #[test]
-    fn test_raw_empty_iterator() {
+    fn test_empty_iterator() {
         let records: Vec<Result<RawRecord>> = vec![];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
         assert!(iter.next().is_none());
     }
 
     #[test]
-    fn test_raw_single_group() {
+    fn test_single_group() {
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "0")),
         ];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
@@ -1485,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_multiple_groups() {
+    fn test_multiple_groups() {
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_with_tag("MI", "0")),
@@ -1494,7 +607,7 @@ mod tests {
             Ok(make_raw_bam_with_tag("MI", "1")),
             Ok(make_raw_bam_with_tag("MI", "2")),
         ];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
@@ -1512,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_skips_records_without_mi_tag() {
+    fn test_skips_records_without_mi_tag() {
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Ok(make_raw_bam_without_tag()),
@@ -1520,7 +633,7 @@ mod tests {
             Ok(make_raw_bam_without_tag()),
             Ok(make_raw_bam_with_tag("MI", "1")),
         ];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "0");
@@ -1534,13 +647,13 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_error_propagation() {
+    fn test_error_propagation() {
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "0")),
             Err(anyhow::anyhow!("test error")),
             Ok(make_raw_bam_with_tag("MI", "1")),
         ];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
         // First group before error
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
@@ -1555,10 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_error_with_no_pending_group() {
+    fn test_error_with_no_pending_group() {
         let records: Vec<Result<RawRecord>> =
             vec![Err(anyhow::anyhow!("immediate error")), Ok(make_raw_bam_with_tag("MI", "0"))];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI");
 
         // Error should be returned directly
         let result = iter.next().expect("iterator should yield item");
@@ -1569,10 +682,10 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_custom_tag() {
+    fn test_custom_tag() {
         let records: Vec<Result<RawRecord>> =
             vec![Ok(make_raw_bam_with_tag("RX", "ACGT")), Ok(make_raw_bam_with_tag("RX", "ACGT"))];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "RX");
+        let mut iter = MiGroupIterator::new(records.into_iter(), "RX");
 
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "ACGT");
@@ -1583,13 +696,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Tag name must be exactly 2 characters")]
-    fn test_raw_invalid_tag_length() {
+    fn test_invalid_tag_length() {
         let records: Vec<Result<RawRecord>> = vec![];
-        let _ = RawMiGroupIterator::new(records.into_iter(), "M");
+        let _ = MiGroupIterator::new(records.into_iter(), "M");
     }
 
     #[test]
-    fn test_raw_with_transform() {
+    fn test_with_transform() {
         // Simulate duplex reads: 1/A, 1/B should group under "1"
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "1/A")),
@@ -1599,7 +712,7 @@ mod tests {
             Ok(make_raw_bam_with_tag("MI", "2/A")),
             Ok(make_raw_bam_with_tag("MI", "2/B")),
         ];
-        let mut iter = RawMiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
+        let mut iter = MiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
             let s = String::from_utf8_lossy(raw);
             extract_mi_base(&s).to_string()
         });
@@ -1618,9 +731,9 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_with_transform_empty() {
+    fn test_with_transform_empty() {
         let records: Vec<Result<RawRecord>> = vec![];
-        let mut iter = RawMiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
+        let mut iter = MiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
             String::from_utf8_lossy(raw).to_uppercase()
         });
         assert!(iter.next().is_none());
@@ -1628,44 +741,41 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Tag name must be exactly 2 characters")]
-    fn test_raw_with_transform_invalid_tag_length() {
+    fn test_with_transform_invalid_tag_length() {
         let records: Vec<Result<RawRecord>> = vec![];
-        let _ = RawMiGroupIterator::with_transform(records.into_iter(), "ABC", |raw| {
+        let _ = MiGroupIterator::with_transform(records.into_iter(), "ABC", |raw| {
             String::from_utf8_lossy(raw).into_owned()
         });
     }
 
     #[test]
-    fn test_raw_get_mi_without_transform() {
-        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
+    fn test_get_mi_without_transform() {
+        let iter = MiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
         let bam = make_raw_bam_with_tag("MI", "42");
         assert_eq!(iter.get_mi(&bam), Some("42".to_string()));
     }
 
     #[test]
-    fn test_raw_get_mi_with_transform() {
-        let iter = RawMiGroupIterator::with_transform(
-            std::iter::empty::<Result<RawRecord>>(),
-            "MI",
-            |raw| {
+    fn test_get_mi_with_transform() {
+        let iter =
+            MiGroupIterator::with_transform(std::iter::empty::<Result<RawRecord>>(), "MI", |raw| {
                 let s = String::from_utf8_lossy(raw);
                 s.to_uppercase()
-            },
-        );
+            });
         let bam = make_raw_bam_with_tag("MI", "abc");
         assert_eq!(iter.get_mi(&bam), Some("ABC".to_string()));
     }
 
     #[test]
-    fn test_raw_get_mi_missing_tag() {
-        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
+    fn test_get_mi_missing_tag() {
+        let iter = MiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
         let bam = make_raw_bam_without_tag();
         assert_eq!(iter.get_mi(&bam), None);
     }
 
     #[test]
-    fn test_raw_get_mi_wrong_tag() {
-        let iter = RawMiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
+    fn test_get_mi_wrong_tag() {
+        let iter = MiGroupIterator::new(std::iter::empty::<Result<RawRecord>>(), "MI");
         let bam = make_raw_bam_with_tag("RX", "ACGT");
         assert_eq!(iter.get_mi(&bam), None);
     }
@@ -1712,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_cell_tag_composite_grouping() {
+    fn test_cell_tag_composite_grouping() {
         // Same MI but different cell barcodes should form separate groups
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
@@ -1721,7 +831,7 @@ mod tests {
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "TGCA")),
         ];
         let mut iter =
-            RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some(*SamTag::CB));
+            MiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some(*SamTag::CB));
 
         // First group: MI=1, CB=ACGT
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
@@ -1737,13 +847,13 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_cell_tag_none_groups_by_mi_only() {
+    fn test_cell_tag_none_groups_by_mi_only() {
         // Without cell_tag, same MI records group together regardless of other tags
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "TGCA")),
         ];
-        let mut iter = RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(None);
+        let mut iter = MiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(None);
 
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
         assert_eq!(result.0, "1");
@@ -1753,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_cell_tag_missing_cell_value() {
+    fn test_cell_tag_missing_cell_value() {
         // Records with MI but no cell tag get grouped under "MI\t" (empty cell)
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_tag("MI", "1")),
@@ -1761,7 +871,7 @@ mod tests {
             Ok(make_raw_bam_with_two_tags("MI", "1", "CB", "ACGT")),
         ];
         let mut iter =
-            RawMiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some(*SamTag::CB));
+            MiGroupIterator::new(records.into_iter(), "MI").with_cell_tag(Some(*SamTag::CB));
 
         // First group: MI=1, no CB (key = "1\t")
         let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
@@ -1777,14 +887,14 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_cell_tag_with_transform() {
+    fn test_cell_tag_with_transform() {
         // Cell tag should work with MI transform (duplex-style /A /B stripping)
         let records: Vec<Result<RawRecord>> = vec![
             Ok(make_raw_bam_with_two_tags("MI", "1/A", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1/B", "CB", "ACGT")),
             Ok(make_raw_bam_with_two_tags("MI", "1/A", "CB", "TGCA")),
         ];
-        let mut iter = RawMiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
+        let mut iter = MiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
             let s = String::from_utf8_lossy(raw);
             extract_mi_base(&s).to_string()
         })
@@ -1805,7 +915,7 @@ mod tests {
     }
 
     // ========================================================================
-    // RawMiGrouper tests (Grouper trait impl)
+    // MiGrouper tests (Grouper trait impl)
     // ========================================================================
 
     /// Helper: create a `DecodedRecord` from raw bytes with a dummy group key.
@@ -1822,16 +932,9 @@ mod tests {
         DecodedRecord::from_raw_bytes(raw, key)
     }
 
-    /// Helper: create a parsed `DecodedRecord` (for testing error paths).
-    fn make_parsed_decoded_record(mi: &str) -> DecodedRecord {
-        let record = create_record_with_mi(mi);
-        let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
-        DecodedRecord::new(record, key)
-    }
-
     #[test]
-    fn test_raw_grouper_single_mi_group() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
+    fn test_grouper_single_mi_group() {
+        let mut grouper = MiGrouper::new("MI", 10);
 
         let records = vec![
             make_raw_decoded_record("MI", "0"),
@@ -1852,8 +955,8 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_multiple_mi_groups() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
+    fn test_grouper_multiple_mi_groups() {
+        let mut grouper = MiGrouper::new("MI", 10);
 
         let records = vec![
             make_raw_decoded_record("MI", "0"),
@@ -1879,8 +982,8 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_batch_size_triggers() {
-        let mut grouper = RawMiGrouper::new("MI", 2);
+    fn test_grouper_batch_size_triggers() {
+        let mut grouper = MiGrouper::new("MI", 2);
 
         let records = vec![
             make_raw_decoded_record("MI", "0"),
@@ -1911,8 +1014,10 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_groups_records_without_mi_under_empty_key() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
+    fn test_grouper_skips_records_without_mi_tag() {
+        // Matches `MiGroupIterator`: records without an MI tag are skipped so
+        // the consensus caller never sees them (it requires the MI tag).
+        let mut grouper = MiGrouper::new("MI", 10);
 
         let records = vec![
             make_raw_decoded_record("MI", "0"),
@@ -1923,30 +1028,17 @@ mod tests {
         let batches = grouper.add_records(records).expect("add_records should succeed");
         assert!(batches.is_empty());
 
-        // Records without MI are now grouped under "" (matching MiGrouper behavior)
         let final_batch =
             grouper.finish().expect("finish should succeed").expect("should return final batch");
-        assert_eq!(final_batch.groups.len(), 3);
+        // The no-MI record is dropped; the two MI=0 records coalesce into one group.
+        assert_eq!(final_batch.groups.len(), 1);
         assert_eq!(final_batch.groups[0].mi, "0");
-        assert_eq!(final_batch.groups[0].records.len(), 1);
-        assert_eq!(final_batch.groups[1].mi, "");
-        assert_eq!(final_batch.groups[1].records.len(), 1);
-        assert_eq!(final_batch.groups[2].mi, "0");
-        assert_eq!(final_batch.groups[2].records.len(), 1);
+        assert_eq!(final_batch.groups[0].records.len(), 2);
     }
 
     #[test]
-    fn test_raw_grouper_rejects_parsed_records() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
-
-        let records = vec![make_parsed_decoded_record("0")];
-        let result = grouper.add_records(records);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_raw_grouper_finish_empty() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
+    fn test_grouper_finish_empty() {
+        let mut grouper = MiGrouper::new("MI", 10);
         assert!(!grouper.has_pending());
 
         let final_batch = grouper.finish().expect("finish should succeed");
@@ -1954,8 +1046,8 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_finish_idempotent() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
+    fn test_grouper_finish_idempotent() {
+        let mut grouper = MiGrouper::new("MI", 10);
 
         let records = vec![make_raw_decoded_record("MI", "0")];
         grouper.add_records(records).expect("add_records should succeed");
@@ -1968,8 +1060,8 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_has_pending_states() {
-        let mut grouper = RawMiGrouper::new("MI", 10);
+    fn test_grouper_has_pending_states() {
+        let mut grouper = MiGrouper::new("MI", 10);
 
         // Initially nothing pending
         assert!(!grouper.has_pending());
@@ -1986,10 +1078,10 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_with_filter_and_transform() {
+    fn test_grouper_with_filter_and_transform() {
         // Build records with flag field set: use byte 14..16 for flag.
         // We create a filter that checks the flag field for secondary alignment (0x100).
-        let mut grouper = RawMiGrouper::with_filter_and_transform(
+        let mut grouper = MiGrouper::with_filter_and_transform(
             "MI",
             10,
             |bam: &[u8]| {
@@ -2032,17 +1124,17 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_grouper_cell_tag_composite_grouping() {
+    fn test_grouper_cell_tag_composite_grouping() {
         // Records with the same MI but different cell barcodes must form separate groups.
         // The composite key (MI\tCB) is used internally for grouping only; it is stored in
-        // `RawMiGroup::mi` for logging but never written back to the output records.
+        // `MiGroup::mi` for logging but never written back to the output records.
         fn make_two_tag_decoded(mi: &str, cb: &str) -> DecodedRecord {
             let raw = make_raw_bam_with_two_tags("MI", mi, "CB", cb);
             let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
             DecodedRecord::from_raw_bytes(raw, key)
         }
 
-        let mut grouper = RawMiGrouper::new("MI", 10).with_cell_tag(Some(*SamTag::CB));
+        let mut grouper = MiGrouper::new("MI", 10).with_cell_tag(Some(*SamTag::CB));
 
         // Two records per (MI, CB) combination; MI=1,CB=ACGT and MI=1,CB=TGCA must be split.
         let records = vec![
@@ -2076,195 +1168,69 @@ mod tests {
     }
 
     // ========================================================================
-    // MiGrouper tests (Grouper trait impl)
-    // ========================================================================
-
-    // Helper: create a parsed `DecodedRecord` for `MiGrouper` tests.
-    fn make_decoded_record_for_mi_grouper(mi: &str) -> DecodedRecord {
-        let record = create_record_with_mi(mi);
-        let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
-        DecodedRecord::new(record, key)
-    }
-
-    #[test]
-    fn test_mi_grouper_single_group() {
-        let mut grouper = MiGrouper::new("MI", 10);
-
-        let records = vec![
-            make_decoded_record_for_mi_grouper("0"),
-            make_decoded_record_for_mi_grouper("0"),
-            make_decoded_record_for_mi_grouper("0"),
-        ];
-
-        let batches = grouper.add_records(records).expect("add_records should succeed");
-        assert!(batches.is_empty());
-        assert!(grouper.has_pending());
-
-        let final_batch =
-            grouper.finish().expect("finish should succeed").expect("should return final batch");
-        assert_eq!(final_batch.groups.len(), 1);
-        assert_eq!(final_batch.groups[0].mi, "0");
-        assert_eq!(final_batch.groups[0].records.len(), 3);
-    }
-
-    #[test]
-    fn test_mi_grouper_multiple_groups() {
-        let mut grouper = MiGrouper::new("MI", 10);
-
-        let records = vec![
-            make_decoded_record_for_mi_grouper("0"),
-            make_decoded_record_for_mi_grouper("0"),
-            make_decoded_record_for_mi_grouper("1"),
-            make_decoded_record_for_mi_grouper("1"),
-            make_decoded_record_for_mi_grouper("1"),
-            make_decoded_record_for_mi_grouper("2"),
-        ];
-
-        let batches = grouper.add_records(records).expect("add_records should succeed");
-        assert!(batches.is_empty());
-
-        let final_batch =
-            grouper.finish().expect("finish should succeed").expect("should return final batch");
-        assert_eq!(final_batch.groups.len(), 3);
-        assert_eq!(final_batch.groups[0].mi, "0");
-        assert_eq!(final_batch.groups[0].records.len(), 2);
-        assert_eq!(final_batch.groups[1].mi, "1");
-        assert_eq!(final_batch.groups[1].records.len(), 3);
-        assert_eq!(final_batch.groups[2].mi, "2");
-        assert_eq!(final_batch.groups[2].records.len(), 1);
-    }
-
-    #[test]
-    fn test_mi_grouper_batch_size_triggers() {
-        let mut grouper = MiGrouper::new("MI", 2);
-
-        let records = vec![
-            make_decoded_record_for_mi_grouper("0"),
-            make_decoded_record_for_mi_grouper("1"),
-            make_decoded_record_for_mi_grouper("2"),
-            make_decoded_record_for_mi_grouper("3"),
-            make_decoded_record_for_mi_grouper("4"),
-        ];
-
-        let batches = grouper.add_records(records).expect("add_records should succeed");
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].groups.len(), 2);
-        assert_eq!(batches[0].groups[0].mi, "0");
-        assert_eq!(batches[0].groups[1].mi, "1");
-        assert_eq!(batches[1].groups.len(), 2);
-        assert_eq!(batches[1].groups[0].mi, "2");
-        assert_eq!(batches[1].groups[1].mi, "3");
-
-        assert!(grouper.has_pending());
-
-        let final_batch =
-            grouper.finish().expect("finish should succeed").expect("should return final batch");
-        assert_eq!(final_batch.groups.len(), 1);
-        assert_eq!(final_batch.groups[0].mi, "4");
-    }
-
-    #[test]
-    fn test_mi_grouper_rejects_raw_records() {
-        let mut grouper = MiGrouper::new("MI", 10);
-
-        let records = vec![make_raw_decoded_record("MI", "0")];
-        let result = grouper.add_records(records);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mi_grouper_finish_empty() {
-        let mut grouper = MiGrouper::new("MI", 10);
-        assert!(!grouper.has_pending());
-
-        let final_batch = grouper.finish().expect("finish should succeed");
-        assert!(final_batch.is_none());
-    }
-
-    #[test]
-    fn test_mi_grouper_finish_idempotent() {
-        let mut grouper = MiGrouper::new("MI", 10);
-
-        let records = vec![make_decoded_record_for_mi_grouper("0")];
-        grouper.add_records(records).expect("add_records should succeed");
-
-        let batch1 = grouper.finish().expect("finish should succeed");
-        assert!(batch1.is_some());
-
-        let batch2 = grouper.finish().expect("finish should succeed");
-        assert!(batch2.is_none());
-    }
-
-    #[test]
-    fn test_mi_grouper_with_filter_and_transform() {
-        let mut grouper = MiGrouper::with_filter_and_transform(
-            "MI",
-            10,
-            |_r| true, // keep all records
-            |mi| extract_mi_base(mi).to_string(),
-        );
-
-        let records = vec![
-            make_decoded_record_for_mi_grouper("1/A"),
-            make_decoded_record_for_mi_grouper("1/B"),
-            make_decoded_record_for_mi_grouper("2/A"),
-        ];
-
-        let batches = grouper.add_records(records).expect("add_records should succeed");
-        assert!(batches.is_empty());
-
-        let final_batch =
-            grouper.finish().expect("finish should succeed").expect("should return final batch");
-        assert_eq!(final_batch.groups.len(), 2);
-        assert_eq!(final_batch.groups[0].mi, "1");
-        assert_eq!(final_batch.groups[0].records.len(), 2);
-        assert_eq!(final_batch.groups[1].mi, "2");
-        assert_eq!(final_batch.groups[1].records.len(), 1);
-    }
-
-    #[test]
-    fn test_mi_grouper_has_pending_states() {
-        let mut grouper = MiGrouper::new("MI", 10);
-
-        assert!(!grouper.has_pending());
-
-        let records = vec![make_decoded_record_for_mi_grouper("0")];
-        grouper.add_records(records).expect("add_records should succeed");
-        assert!(grouper.has_pending());
-
-        let records = vec![make_decoded_record_for_mi_grouper("1")];
-        grouper.add_records(records).expect("add_records should succeed");
-        assert!(grouper.has_pending());
-    }
-
-    #[test]
-    fn test_mi_grouper_record_without_mi_gets_empty_string() {
-        let mut grouper = MiGrouper::new("MI", 10);
-
-        let record = create_record_without_mi();
-        let key = crate::unified_pipeline::GroupKey::single(0, 0, 0, 0, 0, 0);
-        let records = vec![DecodedRecord::new(record, key)];
-
-        let batches = grouper.add_records(records).expect("add_records should succeed");
-        assert!(batches.is_empty());
-
-        // Record without MI tag gets default empty string as MI value
-        let final_batch =
-            grouper.finish().expect("finish should succeed").expect("should return final batch");
-        assert_eq!(final_batch.groups.len(), 1);
-        assert_eq!(final_batch.groups[0].mi, "");
-        assert_eq!(final_batch.groups[0].records.len(), 1);
-    }
-
-    // ========================================================================
     // Batch type tests
     // ========================================================================
 
     #[test]
+    fn test_mi_group_new() {
+        let raw = make_raw_bam_with_tag("MI", "42");
+        let group = MiGroup::new("42".to_string(), vec![raw]);
+        assert_eq!(group.mi, "42");
+        assert_eq!(group.records.len(), 1);
+    }
+
+    #[test]
+    fn test_mi_group_batch_weight() {
+        let group = MiGroup::new(
+            "0".to_string(),
+            vec![make_raw_bam_with_tag("MI", "0"), make_raw_bam_with_tag("MI", "0")],
+        );
+        assert_eq!(group.batch_weight(), 2);
+    }
+
+    #[test]
+    fn test_mi_group_memory_estimate() {
+        let group = MiGroup::new("0".to_string(), vec![make_raw_bam_with_tag("MI", "0")]);
+        let size = group.estimate_heap_size();
+        assert!(size > 0);
+    }
+
+    #[test]
     fn test_mi_group_batch_new() {
         let batch = MiGroupBatch::new();
-        assert!(batch.is_empty());
-        assert_eq!(batch.len(), 0);
+        assert!(batch.groups.is_empty());
+    }
+
+    #[test]
+    fn test_mi_group_batch_default() {
+        let batch = MiGroupBatch::default();
+        assert!(batch.groups.is_empty());
+    }
+
+    #[test]
+    fn test_mi_group_batch_weight_method() {
+        let mut batch = MiGroupBatch::new();
+        assert_eq!(batch.batch_weight(), 0);
+
+        batch.groups.push(MiGroup::new(
+            "0".to_string(),
+            vec![make_raw_bam_with_tag("MI", "0"), make_raw_bam_with_tag("MI", "0")],
+        ));
+        assert_eq!(batch.batch_weight(), 2);
+
+        batch.groups.push(MiGroup::new("1".to_string(), vec![make_raw_bam_with_tag("MI", "1")]));
+        assert_eq!(batch.batch_weight(), 3);
+    }
+
+    #[test]
+    fn test_mi_group_batch_memory_estimate() {
+        let batch = MiGroupBatch::new();
+        let _ = batch.estimate_heap_size(); // Should not panic
+
+        let mut batch = MiGroupBatch::new();
+        batch.groups.push(MiGroup::new("0".to_string(), vec![make_raw_bam_with_tag("MI", "0")]));
+        let size = batch.estimate_heap_size();
+        assert!(size > 0);
     }
 
     #[test]
@@ -2279,13 +1245,13 @@ mod tests {
         let mut batch = MiGroupBatch::new();
         assert!(batch.is_empty());
 
-        batch.groups.push(MiGroup::new("0".to_string(), vec![create_record_with_mi("0")]));
+        batch.groups.push(MiGroup::new("0".to_string(), vec![make_raw_bam_with_tag("MI", "0")]));
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 1);
 
         batch.groups.push(MiGroup::new(
             "1".to_string(),
-            vec![create_record_with_mi("1"), create_record_with_mi("1")],
+            vec![make_raw_bam_with_tag("MI", "1"), make_raw_bam_with_tag("MI", "1")],
         ));
         assert_eq!(batch.len(), 2);
     }
@@ -2293,7 +1259,7 @@ mod tests {
     #[test]
     fn test_mi_group_batch_clear() {
         let mut batch = MiGroupBatch::new();
-        batch.groups.push(MiGroup::new("0".to_string(), vec![create_record_with_mi("0")]));
+        batch.groups.push(MiGroup::new("0".to_string(), vec![make_raw_bam_with_tag("MI", "0")]));
         assert!(!batch.is_empty());
 
         batch.clear();
@@ -2302,128 +1268,83 @@ mod tests {
     }
 
     #[test]
-    fn test_mi_group_batch_weight() {
-        let mut batch = MiGroupBatch::new();
-        assert_eq!(batch.batch_weight(), 0);
-
-        batch.groups.push(MiGroup::new(
-            "0".to_string(),
-            vec![create_record_with_mi("0"), create_record_with_mi("0")],
-        ));
-        assert_eq!(batch.batch_weight(), 2);
-
-        batch.groups.push(MiGroup::new("1".to_string(), vec![create_record_with_mi("1")]));
-        assert_eq!(batch.batch_weight(), 3);
-    }
-
-    #[test]
-    fn test_mi_group_batch_default() {
-        let batch = MiGroupBatch::default();
-        assert!(batch.is_empty());
-    }
-
-    #[test]
-    fn test_mi_group_batch_memory_estimate() {
-        let batch = MiGroupBatch::new();
-        // Empty batch should have minimal heap size (just vec overhead)
-        let _ = batch.estimate_heap_size(); // Should not panic
-
-        let mut batch = MiGroupBatch::new();
-        batch.groups.push(MiGroup::new("0".to_string(), vec![create_record_with_mi("0")]));
-        let size = batch.estimate_heap_size();
-        assert!(size > 0);
-    }
-
-    #[test]
-    fn test_mi_group_new() {
-        let group = MiGroup::new("42".to_string(), vec![create_record_with_mi("42")]);
-        assert_eq!(group.mi, "42");
-        assert_eq!(group.records.len(), 1);
-    }
-
-    #[test]
     fn test_mi_group_batch_weight_single() {
         let group = MiGroup::new(
             "0".to_string(),
             vec![
-                create_record_with_mi("0"),
-                create_record_with_mi("0"),
-                create_record_with_mi("0"),
+                make_raw_bam_with_tag("MI", "0"),
+                make_raw_bam_with_tag("MI", "0"),
+                make_raw_bam_with_tag("MI", "0"),
             ],
         );
         assert_eq!(group.batch_weight(), 3);
     }
 
-    #[test]
-    fn test_mi_group_memory_estimate() {
-        let group = MiGroup::new("0".to_string(), vec![create_record_with_mi("0")]);
-        let size = group.estimate_heap_size();
-        assert!(size > 0);
-    }
-
     // ========================================================================
-    // Raw batch type tests
+    // MiGroupIterator::with_transform edge case tests
     // ========================================================================
 
     #[test]
-    fn test_raw_mi_group_new() {
-        let raw = make_raw_bam_with_tag("MI", "42");
-        let group = RawMiGroup::new("42".to_string(), vec![raw]);
-        assert_eq!(group.mi, "42");
-        assert_eq!(group.records.len(), 1);
+    fn test_with_transform_single_group() {
+        // 0/A, 0/B, 0/A all transform to "0" → one group of 3
+        let records: Vec<Result<RawRecord>> = vec![
+            Ok(make_raw_bam_with_tag("MI", "0/A")),
+            Ok(make_raw_bam_with_tag("MI", "0/B")),
+            Ok(make_raw_bam_with_tag("MI", "0/A")),
+        ];
+        let mut iter = MiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
+            let s = String::from_utf8_lossy(raw);
+            extract_mi_base(&s).to_string()
+        });
+
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
+        assert_eq!(result.0, "0");
+        assert_eq!(result.1.len(), 3);
+
+        assert!(iter.next().is_none());
     }
 
     #[test]
-    fn test_raw_mi_group_batch_weight() {
-        let group = RawMiGroup::new(
-            "0".to_string(),
-            vec![make_raw_bam_with_tag("MI", "0"), make_raw_bam_with_tag("MI", "0")],
-        );
-        assert_eq!(group.batch_weight(), 2);
+    fn test_with_transform_error_propagation() {
+        let records: Vec<Result<RawRecord>> = vec![
+            Ok(make_raw_bam_with_tag("MI", "0/A")),
+            Err(anyhow::anyhow!("test error")),
+            Ok(make_raw_bam_with_tag("MI", "1/B")),
+        ];
+        let mut iter = MiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
+            let s = String::from_utf8_lossy(raw);
+            extract_mi_base(&s).to_string()
+        });
+
+        // First group before the error
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
+        assert_eq!(result.0, "0");
+        assert_eq!(result.1.len(), 1);
+
+        // Error is returned next
+        let result = iter.next().expect("iterator should yield item");
+        assert!(result.is_err());
+
+        // Iterator is done after the error
+        assert!(iter.next().is_none());
     }
 
     #[test]
-    fn test_raw_mi_group_memory_estimate() {
-        let group = RawMiGroup::new("0".to_string(), vec![make_raw_bam_with_tag("MI", "0")]);
-        let size = group.estimate_heap_size();
-        assert!(size > 0);
-    }
+    fn test_with_transform_custom_function() {
+        // Custom transform: uppercase. "abc", "ABC", "Abc" all → "ABC" → single group.
+        let records: Vec<Result<RawRecord>> = vec![
+            Ok(make_raw_bam_with_tag("MI", "abc")),
+            Ok(make_raw_bam_with_tag("MI", "ABC")),
+            Ok(make_raw_bam_with_tag("MI", "Abc")),
+        ];
+        let mut iter = MiGroupIterator::with_transform(records.into_iter(), "MI", |raw| {
+            String::from_utf8_lossy(raw).to_uppercase()
+        });
 
-    #[test]
-    fn test_raw_mi_group_batch_new() {
-        let batch = RawMiGroupBatch::new();
-        assert!(batch.groups.is_empty());
-    }
+        let result = iter.next().expect("iterator should yield item").expect("item should be Ok");
+        assert_eq!(result.0, "ABC");
+        assert_eq!(result.1.len(), 3);
 
-    #[test]
-    fn test_raw_mi_group_batch_default() {
-        let batch = RawMiGroupBatch::default();
-        assert!(batch.groups.is_empty());
-    }
-
-    #[test]
-    fn test_raw_mi_group_batch_weight_method() {
-        let mut batch = RawMiGroupBatch::new();
-        assert_eq!(batch.batch_weight(), 0);
-
-        batch.groups.push(RawMiGroup::new(
-            "0".to_string(),
-            vec![make_raw_bam_with_tag("MI", "0"), make_raw_bam_with_tag("MI", "0")],
-        ));
-        assert_eq!(batch.batch_weight(), 2);
-
-        batch.groups.push(RawMiGroup::new("1".to_string(), vec![make_raw_bam_with_tag("MI", "1")]));
-        assert_eq!(batch.batch_weight(), 3);
-    }
-
-    #[test]
-    fn test_raw_mi_group_batch_memory_estimate() {
-        let batch = RawMiGroupBatch::new();
-        let _ = batch.estimate_heap_size(); // Should not panic
-
-        let mut batch = RawMiGroupBatch::new();
-        batch.groups.push(RawMiGroup::new("0".to_string(), vec![make_raw_bam_with_tag("MI", "0")]));
-        let size = batch.estimate_heap_size();
-        assert!(size > 0);
+        assert!(iter.next().is_none());
     }
 }

@@ -37,7 +37,7 @@ fn test_bam_pipeline_passthrough() {
         &input_bam,
         &output_bam,
         // Grouper factory
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         // Process function (pass-through)
         |record: RecordBuf| Ok(record),
         // Serialize function
@@ -94,7 +94,7 @@ fn test_bam_pipeline_thread_counts() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             serialize_bam_record_into(&record, header, output)
@@ -125,7 +125,7 @@ fn test_bam_pipeline_with_transform() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         // Transform: return record (already uppercase, just verify it works)
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
@@ -153,7 +153,7 @@ fn test_bam_pipeline_empty_input() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             serialize_bam_record_into(&record, header, output)
@@ -227,7 +227,7 @@ fn test_error_input_file_not_found() {
         config,
         &nonexistent,
         &output_bam,
-        |_| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |r: RecordBuf| Ok(r),
         |r: RecordBuf, h: &Header, output: &mut Vec<u8>| serialize_bam_record_into(&r, h, output),
     );
@@ -256,7 +256,7 @@ fn test_error_output_dir_not_found() {
         config,
         &input_bam,
         output_bam,
-        |_| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |r: RecordBuf| Ok(r),
         |r: RecordBuf, h: &Header, output: &mut Vec<u8>| serialize_bam_record_into(&r, h, output),
     );
@@ -284,7 +284,7 @@ fn test_error_process_fn_fails() {
         config,
         &input_bam,
         &output_bam,
-        |_| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |_record: RecordBuf| Err(io::Error::new(io::ErrorKind::InvalidData, "Process failed")),
         |r: RecordBuf, h: &Header, output: &mut Vec<u8>| serialize_bam_record_into(&r, h, output),
     );
@@ -312,7 +312,7 @@ fn test_error_serialize_fn_fails() {
         config,
         &input_bam,
         &output_bam,
-        |_| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |r: RecordBuf| Ok(r),
         |_r: RecordBuf, _h: &Header, _output: &mut Vec<u8>| {
             Err(io::Error::new(io::ErrorKind::InvalidData, "Serialize failed"))
@@ -389,7 +389,7 @@ fn test_error_corrupted_bgzf() {
         config,
         &corrupted_bam,
         &output_bam,
-        |_| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |r: RecordBuf| Ok(r),
         |r: RecordBuf, h: &Header, output: &mut Vec<u8>| serialize_bam_record_into(&r, h, output),
     );

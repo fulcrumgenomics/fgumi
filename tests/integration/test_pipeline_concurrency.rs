@@ -122,7 +122,7 @@ fn run_passthrough_pipeline(
         config,
         input_path,
         output_path,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             serialize_bam_record_into(&record, header, output)
@@ -143,7 +143,7 @@ fn run_passthrough_pipeline_with_config(
         config,
         input_path,
         output_path,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             serialize_bam_record_into(&record, header, output)
@@ -393,7 +393,7 @@ fn test_bam_pipeline_no_dropped_records_under_backpressure() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         move |record: RecordBuf| {
             process_count_clone.fetch_add(1, Ordering::Relaxed);
             // Brief yield to simulate work without excessive delay
@@ -476,7 +476,7 @@ fn test_error_propagation_process_fn_multithreaded() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         move |record: RecordBuf| {
             let n = count_clone.fetch_add(1, Ordering::Relaxed);
             if n == 50 {
@@ -517,7 +517,7 @@ fn test_error_propagation_serialize_fn_multithreaded() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(SingleRecordGrouper::new()),
+        |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
         |record: RecordBuf| Ok(record),
         move |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             let n = count_clone.fetch_add(1, Ordering::Relaxed);
@@ -538,11 +538,12 @@ fn test_error_propagation_serialize_fn_multithreaded() {
 struct FailAfterNGrouper {
     count: usize,
     fail_after: usize,
+    header: Header,
 }
 
 impl FailAfterNGrouper {
-    fn new(fail_after: usize) -> Self {
-        Self { count: 0, fail_after }
+    fn new(fail_after: usize, header: Header) -> Self {
+        Self { count: 0, fail_after, header }
     }
 }
 
@@ -560,9 +561,8 @@ impl Grouper for FailAfterNGrouper {
         records
             .into_iter()
             .map(|d| {
-                d.into_record().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Expected parsed record")
-                })
+                fgumi_raw_bam::raw_record_to_record_buf(&d.into_raw_bytes(), &self.header)
+                    .map_err(io::Error::other)
             })
             .collect()
     }
@@ -590,7 +590,7 @@ fn test_error_propagation_grouper_multithreaded() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(FailAfterNGrouper::new(50)),
+        |header: &Header| Box::new(FailAfterNGrouper::new(50, header.clone())),
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             serialize_bam_record_into(&record, header, output)
@@ -621,7 +621,7 @@ fn test_error_does_not_cause_hang() {
             config,
             &input_clone,
             &output_bam,
-            |_header: &Header| Box::new(SingleRecordGrouper::new()),
+            |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
             move |record: RecordBuf| {
                 let n = count_clone.fetch_add(1, Ordering::Relaxed);
                 if n == 30 {
@@ -647,7 +647,7 @@ fn test_error_does_not_cause_hang() {
             config,
             &input_clone2,
             &output_bam2,
-            |_header: &Header| Box::new(FailAfterNGrouper::new(30)),
+            |header: &Header| Box::new(FailAfterNGrouper::new(30, header.clone())),
             |record: RecordBuf| Ok(record),
             |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
                 serialize_bam_record_into(&record, header, output)
@@ -974,7 +974,7 @@ mod stress_tests {
                     config,
                     &input_clone,
                     &output_clone,
-                    |_| Box::new(SingleRecordGrouper::new()),
+                    |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
                     move |record: RecordBuf| {
                         let n = count_clone.fetch_add(1, Ordering::Relaxed);
                         if n == fail_at {
@@ -1017,7 +1017,7 @@ mod stress_tests {
                     config,
                     &input_clone,
                     &output_clone,
-                    |_| Box::new(SingleRecordGrouper::new()),
+                    |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
                     |record: RecordBuf| {
                         // ~10% failure rate using a cheap hash of the record name
                         let hash = record
@@ -1208,7 +1208,7 @@ mod stress_tests {
                 config,
                 &input_clone,
                 &output_clone,
-                |_| Box::new(SingleRecordGrouper::new()),
+                |header: &Header| Box::new(SingleRecordGrouper::with_header(header.clone())),
                 move |record: RecordBuf| {
                     process_count_clone.fetch_add(1, Ordering::Relaxed);
                     // Brief sleep to simulate slow processing, but not enough to trigger deadlock
