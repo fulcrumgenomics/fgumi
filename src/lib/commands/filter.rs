@@ -21,6 +21,7 @@ use crate::consensus_filter::{
 };
 use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use crate::logging::OperationTimer;
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::read_info::LibraryIndex;
 use crate::reference::ReferenceReader;
 use crate::sort::bam_fields;
@@ -34,7 +35,6 @@ use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use fgumi_raw_bam::RawRecordView;
 use log::info;
 use noodles::sam::Header;
@@ -260,7 +260,7 @@ fn serialize_raw_records(records: &[Vec<u8>], output: &mut Vec<u8>) -> io::Resul
     Ok(records.len() as u64)
 }
 
-/// Metrics collected from filter processing, aggregated post-pipeline.
+/// Per-thread accumulator merged into final counts after pipeline completion.
 #[derive(Default)]
 struct CollectedFilterMetrics {
     /// Total records processed.
@@ -278,7 +278,7 @@ struct FilterPipelineSetup {
     pipeline_config: BamPipelineConfig,
     config: Arc<FilterConfig>,
     reference: Option<Arc<ReferenceReader>>,
-    collected_metrics: Arc<SegQueue<CollectedFilterMetrics>>,
+    collected_metrics: Arc<PerThreadAccumulator<CollectedFilterMetrics>>,
     progress_counter: Arc<AtomicU64>,
 }
 
@@ -406,7 +406,7 @@ impl Filter {
             None => None,
         };
 
-        let collected_metrics: Arc<SegQueue<CollectedFilterMetrics>> = Arc::new(SegQueue::new());
+        let collected_metrics = PerThreadAccumulator::<CollectedFilterMetrics>::new(num_threads);
         let progress_counter = Arc::new(AtomicU64::new(0));
 
         Ok(FilterPipelineSetup {
@@ -475,11 +475,11 @@ impl Filter {
                                  _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
-            collected_for_serialize.push(CollectedFilterMetrics {
-                total_records: processed.records_count,
-                passed_records: processed.passed_count,
-                failed_records: processed.records_count - processed.passed_count,
-                total_bases_masked: processed.bases_masked,
+            collected_for_serialize.with_slot(|m| {
+                m.total_records += processed.records_count;
+                m.passed_records += processed.passed_count;
+                m.failed_records += processed.records_count - processed.passed_count;
+                m.total_bases_masked += processed.bases_masked;
             });
 
             serialize_raw_records(&processed.kept_records, output)
@@ -523,11 +523,12 @@ impl Filter {
         let mut failed_reads = 0u64;
         let mut total_bases_masked = 0u64;
 
-        while let Some(metrics) = setup.collected_metrics.pop() {
-            total_reads += metrics.total_records;
-            passed_reads += metrics.passed_records;
-            failed_reads += metrics.failed_records;
-            total_bases_masked += metrics.total_bases_masked;
+        for slot in setup.collected_metrics.slots() {
+            let m = slot.lock();
+            total_reads += m.total_records;
+            passed_reads += m.passed_records;
+            failed_reads += m.failed_records;
+            total_bases_masked += m.total_bases_masked;
         }
 
         if let Some(stats_path) = &self.stats {
