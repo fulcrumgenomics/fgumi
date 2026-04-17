@@ -27,9 +27,9 @@ use clap::Parser;
 use fgoxide::io::DelimFile;
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::sam::SamTag;
 use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
-use crossbeam_queue::SegQueue;
 
 use log::info;
 use noodles::sam::Header;
@@ -79,10 +79,10 @@ impl MemoryEstimate for SimplexProcessedBatch {
     }
 }
 
-/// Metrics collected from each batch during parallel processing.
+/// Per-thread accumulator for simplex consensus metrics and rejects.
 ///
-/// Used with a lock-free queue (`SegQueue`) to collect metrics from
-/// parallel workers for post-pipeline aggregation.
+/// Merged into final aggregates after the pipeline completes; one instance
+/// per worker slot (see [`PerThreadAccumulator`]).
 #[derive(Default)]
 struct CollectedSimplexMetrics {
     /// Consensus calling statistics
@@ -91,7 +91,9 @@ struct CollectedSimplexMetrics {
     overlapping_stats: Option<CorrectionStats>,
     /// Number of MI groups processed
     groups_processed: u64,
-    /// Rejected reads as raw BAM bytes for deferred writing
+    /// Rejected reads as raw BAM bytes for deferred writing.
+    /// NB: rejects buffering is left unchanged here; streaming rejects to
+    /// disk during the pipeline is a follow-up (tracked separately).
     rejects: Vec<Vec<u8>>,
 }
 
@@ -495,8 +497,9 @@ impl Simplex {
             num_threads,
         )?;
 
-        // Lock-free metrics collection
-        let collected_metrics: Arc<SegQueue<CollectedSimplexMetrics>> = Arc::new(SegQueue::new());
+        // Per-thread metrics accumulator: bounded metric memory, no unbounded
+        // queue. Rejects buffering semantics are preserved (see follow-up).
+        let collected_metrics = PerThreadAccumulator::<CollectedSimplexMetrics>::new(num_threads);
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Capture configuration for closures
@@ -643,12 +646,18 @@ impl Simplex {
                   _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
-                // Collect metrics (lock-free)
-                collected_metrics_for_serialize.push(CollectedSimplexMetrics {
-                    stats: processed.stats,
-                    overlapping_stats: processed.overlapping_stats,
-                    groups_processed: processed.groups_count,
-                    rejects: processed.rejects,
+                // Merge per-batch metrics + rejects into this worker's slot
+                let batch_stats = processed.stats;
+                let batch_overlapping = processed.overlapping_stats;
+                let groups_count = processed.groups_count;
+                let mut batch_rejects = processed.rejects;
+                collected_metrics_for_serialize.with_slot(|m| {
+                    m.stats.merge(&batch_stats);
+                    if let Some(o) = batch_overlapping {
+                        m.overlapping_stats.get_or_insert_with(CorrectionStats::new).merge(&o);
+                    }
+                    m.groups_processed += groups_count;
+                    m.rejects.append(&mut batch_rejects);
                 });
 
                 // Serialize consensus reads
@@ -665,14 +674,15 @@ impl Simplex {
         let mut merged_overlapping_stats = CorrectionStats::new();
         let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
-        while let Some(metrics) = collected_metrics.pop() {
-            total_groups += metrics.groups_processed;
-            merged_stats.merge(&metrics.stats);
-            if let Some(ref ocs) = metrics.overlapping_stats {
+        for slot in collected_metrics.slots() {
+            let mut m = slot.lock();
+            total_groups += m.groups_processed;
+            merged_stats.merge(&m.stats);
+            if let Some(ref ocs) = m.overlapping_stats {
                 merged_overlapping_stats.merge(ocs);
             }
             if track_rejects {
-                all_rejects.extend(metrics.rejects);
+                all_rejects.append(&mut m.rejects);
             }
         }
 
