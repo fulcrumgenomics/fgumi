@@ -88,6 +88,7 @@
 //!
 //! ```rust,ignore
 //! use fgumi_lib::consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
+//! use fgumi_raw_bam::RawRecord;
 //! use anyhow::Result;
 //!
 //! pub struct MyConsensusCaller {
@@ -96,8 +97,8 @@
 //! }
 //!
 //! impl ConsensusCaller for MyConsensusCaller {
-//!     fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
-//!         // Each Vec<u8> is a raw BAM record (without block_size prefix)
+//!     fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
+//!         // Each RawRecord is a raw BAM record (without block_size prefix)
 //!         self.stats.record_input(records.len());
 //!
 //!         // ... filter reads, call consensus, write into output ...
@@ -121,6 +122,7 @@
 //! ```rust,ignore
 //! use fgumi_lib::consensus::vanilla_consensus_caller::VanillaUmiConsensusCaller;
 //! use fgumi_lib::consensus::caller::ConsensusCaller;
+//! use fgumi_raw_bam::RawRecord;
 //!
 //! // Create consensus caller
 //! let mut caller = VanillaUmiConsensusCaller::new(
@@ -129,8 +131,8 @@
 //!     options,                   // configuration options
 //! );
 //!
-//! // Process a group of raw-byte BAM records with the same UMI
-//! let records: Vec<Vec<u8>> = vec![raw_record1, raw_record2, raw_record3];
+//! // Process a group of raw BAM records with the same UMI
+//! let records: Vec<RawRecord> = vec![raw_record1, raw_record2, raw_record3];
 //! let consensus = caller.consensus_reads(records)?;
 //!
 //! // Check statistics
@@ -159,6 +161,7 @@
 //! - `base_builder`: Core likelihood-based consensus base calling logic
 
 use anyhow::Result;
+use fgumi_raw_bam::RawRecord;
 use noodles::sam::Header;
 use std::collections::HashMap;
 
@@ -196,14 +199,14 @@ impl ConsensusOutput {
 
 /// The main trait for consensus callers that generate consensus reads from groups of raw reads.
 ///
-/// All consensus callers operate on raw BAM byte records (`Vec<u8>`) to avoid the overhead
-/// of noodles `RecordBuf` parsing. Each `Vec<u8>` is a complete BAM record without the
-/// 4-byte `block_size` prefix.
+/// All consensus callers operate on [`RawRecord`] values to avoid the overhead of noodles
+/// `RecordBuf` parsing. Each record is a complete BAM record without the 4-byte `block_size`
+/// prefix.
 pub trait ConsensusCaller: Send + Sync {
     /// Takes a group of raw-byte BAM records with the same UMI and generates consensus reads.
     ///
     /// # Arguments
-    /// * `records` - Raw BAM byte records from the same source molecule (same MI tag)
+    /// * `records` - Raw BAM records from the same source molecule (same MI tag)
     ///
     /// # Returns
     /// Pre-serialized consensus output (may be empty if the group doesn't meet minimum requirements)
@@ -212,7 +215,7 @@ pub trait ConsensusCaller: Send + Sync {
     ///
     /// Returns an error if BAM record parsing fails or consensus calling encounters an
     /// unrecoverable issue (e.g., malformed tags, invalid CIGAR).
-    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput>;
+    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput>;
 
     /// Returns the total number of input reads examined by the consensus caller
     fn total_reads(&self) -> usize;

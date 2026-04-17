@@ -210,7 +210,7 @@ use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{ReadType, SourceRead};
-use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 
 /// Duplex consensus read - matches fgbio's `DuplexConsensusRead`
 ///
@@ -494,13 +494,13 @@ impl DuplexConsensusCaller {
                 ),
             )
             .build();
-        let raw: Vec<Vec<u8>> = records
+        let raw: Vec<RawRecord> = records
             .iter()
             .map(|rec| {
                 let mut buf = Vec::new();
                 crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
                     .map_err(|e| anyhow::anyhow!("Failed to encode RecordBuf: {e}"))?;
-                Ok(buf)
+                Ok(RawRecord::from(buf))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         self.consensus_reads(raw)
@@ -609,13 +609,9 @@ impl DuplexConsensusCaller {
     ///
     /// IMPORTANT: This function requires that all reads have MI tags with /A or /B suffixes.
     /// The duplex command MUST be used with reads grouped using the "paired" strategy.
-    #[expect(
-        clippy::type_complexity,
-        reason = "tuple return type is clearer than a one-off struct for strand partitioning"
-    )]
     fn partition_records_by_strand(
-        records: Vec<Vec<u8>>,
-    ) -> Result<(Option<String>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+        records: Vec<RawRecord>,
+    ) -> Result<(Option<String>, Vec<RawRecord>, Vec<RawRecord>)> {
         if records.is_empty() {
             return Ok((None, Vec::new(), Vec::new()));
         }
@@ -748,34 +744,39 @@ impl DuplexConsensusCaller {
         }
     }
 
+    /// Returns true if the record is a paired first-of-pair read.
+    ///
+    /// An unpaired/fragment read is never treated as R1.
+    fn is_paired_r1(record: &RawRecord) -> bool {
+        let flg = RawRecordView::new(record).flags();
+        (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
+    }
+
+    /// Returns true if the record is a paired second-of-pair read.
+    ///
+    /// An unpaired/fragment read is never treated as R2. `FIRST_SEGMENT == 0`
+    /// alone is insufficient since unpaired reads have both segment bits clear.
+    fn is_paired_r2(record: &RawRecord) -> bool {
+        let flg = RawRecordView::new(record).flags();
+        (flg & flags::PAIRED != 0) && (flg & flags::LAST_SEGMENT != 0)
+    }
+
     /// Checks if there are enough input reads according to the `min_reads` thresholds.
     /// This matches fgbio's `hasMinimumNumberOfReads` logic.
     ///
     /// Counts only R1 reads (first of pair) for each strand, sorts them so XY >= YX,
     /// then checks: `total >= min_total AND xy >= min_xy AND yx >= min_yx`
     fn has_minimum_number_of_reads(
-        a_records: &[Vec<u8>],
-        b_records: &[Vec<u8>],
+        a_records: &[RawRecord],
+        b_records: &[RawRecord],
         min_total_reads: usize,
         min_xy_reads: usize,
         min_yx_reads: usize,
     ) -> bool {
         // Count R1s only (first of pair) for each strand
         // Match fgbio: x.count(r => r.paired && r.firstOfPair)
-        let num_a = a_records
-            .iter()
-            .filter(|r| {
-                let flg = RawRecordView::new(r).flags();
-                (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
-            })
-            .count();
-        let num_b = b_records
-            .iter()
-            .filter(|r| {
-                let flg = RawRecordView::new(r).flags();
-                (flg & flags::PAIRED != 0) && (flg & flags::FIRST_SEGMENT != 0)
-            })
-            .count();
+        let num_a = a_records.iter().filter(|r| Self::is_paired_r1(r)).count();
+        let num_b = b_records.iter().filter(|r| Self::is_paired_r1(r)).count();
 
         // Sort so xy is the larger count, yx is the smaller
         let (num_xy, num_yx) = if num_a >= num_b { (num_a, num_b) } else { (num_b, num_a) };
@@ -808,7 +809,7 @@ impl DuplexConsensusCaller {
     /// Check if all reads in an iterator are on the same strand.
     /// Returns true if all reads have the same orientation (all forward or all reverse).
     /// Also returns true for empty iterators.
-    fn are_all_same_strand<'a>(mut reads: impl Iterator<Item = &'a Vec<u8>>) -> bool {
+    fn are_all_same_strand<'a>(mut reads: impl Iterator<Item = &'a RawRecord>) -> bool {
         let Some(first) = reads.next() else {
             return true;
         };
@@ -1088,8 +1089,8 @@ impl DuplexConsensusCaller {
         consensus: &DuplexConsensusRead,
         read_type: ReadType,
         umi: &str,
-        source_reads_a: &[&[u8]],
-        source_reads_b: &[&[u8]],
+        source_reads_a: &[&RawRecord],
+        source_reads_b: &[&RawRecord],
         produce_per_base_tags: bool,
         read_name_prefix: &str,
         read_group_id: &str,
@@ -1221,11 +1222,23 @@ impl DuplexConsensusCaller {
         // 9. Build RX consensus from source reads
         let mut all_umis = Vec::new();
 
-        for raw in source_reads_a.iter().chain(source_reads_b.iter()) {
-            let view = RawRecordView::new(raw);
-            if let Some(rx_bytes) = view.tags().find_string(b"RX") {
+        for raw in source_reads_a {
+            if let Some(rx_bytes) = raw.tags().find_string(b"RX") {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
-                let is_first = view.flags() & flags::FIRST_SEGMENT != 0;
+                let is_first = raw.flags() & flags::FIRST_SEGMENT != 0;
+                if is_first == first_of_pair {
+                    all_umis.push(rx);
+                } else {
+                    let reversed: Vec<&str> = rx.split('-').rev().collect();
+                    all_umis.push(reversed.join("-"));
+                }
+            }
+        }
+
+        for raw in source_reads_b {
+            if let Some(rx_bytes) = raw.tags().find_string(b"RX") {
+                let rx = String::from_utf8_lossy(rx_bytes).to_string();
+                let is_first = raw.flags() & flags::FIRST_SEGMENT != 0;
                 if is_first == first_of_pair {
                     all_umis.push(rx);
                 } else {
@@ -1728,8 +1741,8 @@ impl DuplexConsensusCaller {
     )]
     fn process_group(
         base_mi: String,
-        a_records: Vec<Vec<u8>>,
-        b_records: Vec<Vec<u8>>,
+        a_records: Vec<RawRecord>,
+        b_records: Vec<RawRecord>,
         ss_caller: &mut VanillaUmiConsensusCaller,
         produce_per_base_tags: bool,
         min_total_reads: usize,
@@ -1776,34 +1789,12 @@ impl DuplexConsensusCaller {
         });
 
         // Split reads into R1/R2 groups for AB and BA strands (done once, reused below).
-        // Only properly paired records are classified; unpaired/malformed records are skipped
-        // so they cannot leak into orientation checks, SS consensus, or RX aggregation.
-        let mut ab_r1s = Vec::new();
-        let mut ab_r2s = Vec::new();
-        for r in &a_records {
-            let flg = RawRecordView::new(r).flags();
-            if flg & flags::PAIRED == 0 {
-                continue;
-            }
-            if flg & flags::FIRST_SEGMENT != 0 {
-                ab_r1s.push(r);
-            } else if flg & flags::LAST_SEGMENT != 0 {
-                ab_r2s.push(r);
-            }
-        }
-        let mut ba_r1s = Vec::new();
-        let mut ba_r2s = Vec::new();
-        for r in &b_records {
-            let flg = RawRecordView::new(r).flags();
-            if flg & flags::PAIRED == 0 {
-                continue;
-            }
-            if flg & flags::FIRST_SEGMENT != 0 {
-                ba_r1s.push(r);
-            } else if flg & flags::LAST_SEGMENT != 0 {
-                ba_r2s.push(r);
-            }
-        }
+        // Require PAIRED for both: otherwise unpaired/fragment reads (which have both
+        // segment bits clear) would be misclassified as R2.
+        let ab_r1s: Vec<&RawRecord> = a_records.iter().filter(|r| Self::is_paired_r1(r)).collect();
+        let ab_r2s: Vec<&RawRecord> = a_records.iter().filter(|r| Self::is_paired_r2(r)).collect();
+        let ba_r1s: Vec<&RawRecord> = b_records.iter().filter(|r| Self::is_paired_r1(r)).collect();
+        let ba_r2s: Vec<&RawRecord> = b_records.iter().filter(|r| Self::is_paired_r2(r)).collect();
 
         // Validate strand orientations before processing
         // The expected orientations are:
@@ -1851,8 +1842,8 @@ impl DuplexConsensusCaller {
             ab_r2s.len() + ba_r1s.len()
         );
 
-        // Keep references to original raw bytes for later tag extraction
-        let x_raws: Vec<&[u8]> = ab_r1s.iter().chain(ba_r2s.iter()).map(|r| r.as_slice()).collect();
+        // Keep references to original raw records for later tag extraction
+        let x_raws: Vec<&RawRecord> = ab_r1s.iter().chain(ba_r2s.iter()).copied().collect();
         let x_sources: Vec<SourceRead> = x_raws
             .iter()
             .enumerate()
@@ -1862,7 +1853,7 @@ impl DuplexConsensusCaller {
             })
             .collect();
 
-        let y_raws: Vec<&[u8]> = ab_r2s.iter().chain(ba_r1s.iter()).map(|r| r.as_slice()).collect();
+        let y_raws: Vec<&RawRecord> = ab_r2s.iter().chain(ba_r1s.iter()).copied().collect();
         let y_sources: Vec<SourceRead> = y_raws
             .iter()
             .enumerate()
@@ -1912,28 +1903,28 @@ impl DuplexConsensusCaller {
         );
 
         // Extract raw records for tag extraction using original_idx to map back
-        let filtered_ab_r1_raws: Vec<&[u8]> = filtered_ab_r1s
+        let filtered_ab_r1_raws: Vec<&RawRecord> = filtered_ab_r1s
             .iter()
             .map(|sr| {
                 debug_assert!(sr.original_idx < x_raws.len());
                 x_raws[sr.original_idx]
             })
             .collect();
-        let filtered_ba_r2_raws: Vec<&[u8]> = filtered_ba_r2s
+        let filtered_ba_r2_raws: Vec<&RawRecord> = filtered_ba_r2s
             .iter()
             .map(|sr| {
                 debug_assert!(sr.original_idx < x_raws.len());
                 x_raws[sr.original_idx]
             })
             .collect();
-        let filtered_ab_r2_raws: Vec<&[u8]> = filtered_ab_r2s
+        let filtered_ab_r2_raws: Vec<&RawRecord> = filtered_ab_r2s
             .iter()
             .map(|sr| {
                 debug_assert!(sr.original_idx < y_raws.len());
                 y_raws[sr.original_idx]
             })
             .collect();
-        let filtered_ba_r1_raws: Vec<&[u8]> = filtered_ba_r1s
+        let filtered_ba_r1_raws: Vec<&RawRecord> = filtered_ba_r1s
             .iter()
             .map(|sr| {
                 debug_assert!(sr.original_idx < y_raws.len());
@@ -2103,7 +2094,7 @@ impl DuplexConsensusCaller {
                     let duplex_r2 = Self::duplex_consensus(Some(r2_a), None, None);
 
                     if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
-                        let empty: &[&[u8]] = &[];
+                        let empty: &[&RawRecord] = &[];
                         Self::duplex_read_into(
                             &mut builder,
                             &mut output,
@@ -2150,7 +2141,7 @@ impl DuplexConsensusCaller {
                     let duplex_r2 = Self::duplex_consensus(Some(r2_b), None, None);
 
                     if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
-                        let empty: &[&[u8]] = &[];
+                        let empty: &[&RawRecord] = &[];
                         Self::duplex_read_into(
                             &mut builder,
                             &mut output,
@@ -2204,7 +2195,7 @@ impl DuplexConsensusCaller {
 }
 
 impl ConsensusCaller for DuplexConsensusCaller {
-    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
         self.stats.record_input(records.len());
 
         // Partition records by strand using raw byte-level operations.
@@ -2285,12 +2276,12 @@ mod tests {
     use fgumi_sam::builder::RecordBuilder;
     use noodles::sam::alignment::record_buf::data::field::Value;
 
-    fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
+    fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> RawRecord {
         let header = noodles::sam::Header::default();
         let mut buf = Vec::new();
         crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
             .expect("encode_record_buf should succeed");
-        buf
+        RawRecord::from(buf)
     }
 
     #[test]
@@ -4724,7 +4715,7 @@ mod tests {
         // has_minimum_number_of_reads only counts R1s (first segment of paired reads)
 
         // Create 3 AB R1 reads
-        let a_reads: Vec<Vec<u8>> = (0..3)
+        let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
                 encode_to_raw(
                     &RecordBuilder::new()
@@ -4737,7 +4728,7 @@ mod tests {
             .collect();
 
         // Create 2 BA R1 reads
-        let b_reads: Vec<Vec<u8>> = (0..2)
+        let b_reads: Vec<RawRecord> = (0..2)
             .map(|_| {
                 encode_to_raw(
                     &RecordBuilder::new()
@@ -4767,7 +4758,7 @@ mod tests {
         // Test asymmetric min_reads [D, M_AB, M_BA] configuration
 
         // Create 3 AB R1 reads
-        let a_reads: Vec<Vec<u8>> = (0..3)
+        let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
                 encode_to_raw(
                     &RecordBuilder::new()
@@ -4824,7 +4815,7 @@ mod tests {
             encode_to_raw(&RecordBuilder::new().sequence("ACGT").reverse_complement(true).build());
 
         // Empty collection
-        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&Vec<u8>>()));
+        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&RawRecord>()));
 
         // All forward
         assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &fwd_raw].into_iter()));
@@ -5166,7 +5157,7 @@ mod tests {
         assert!(!DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &rev_raw].into_iter()));
 
         // Empty - should return true
-        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&Vec<u8>>()));
+        assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&RawRecord>()));
 
         // Single record
         assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_raw].into_iter()));
@@ -5476,13 +5467,13 @@ mod tests {
     #[test]
     fn test_has_minimum_number_of_reads_basic() {
         // Create mock reads with paired + first segment flags for R1 counting
-        let a_reads: Vec<Vec<u8>> = (0..3)
+        let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
                 encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
             })
             .collect();
 
-        let b_reads: Vec<Vec<u8>> = (0..3)
+        let b_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
                 encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
             })
@@ -5507,14 +5498,14 @@ mod tests {
     #[test]
     fn test_has_minimum_number_of_reads_empty_strand() {
         // Create 3 A reads
-        let a_reads: Vec<Vec<u8>> = (0..3)
+        let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
                 encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
             })
             .collect();
 
         // Empty B reads
-        let b_reads: Vec<Vec<u8>> = vec![];
+        let b_reads: Vec<RawRecord> = vec![];
 
         // XY = 3, YX = 0, total = 3
 
@@ -5530,6 +5521,60 @@ mod tests {
             &a_reads, &b_reads, 1, // min_total
             1, // min_xy
             1, // min_yx - requires at least 1
+        ));
+    }
+
+    #[test]
+    fn test_is_paired_r1_and_r2_predicates() {
+        // Paired R1: PAIRED | FIRST_SEGMENT.
+        let paired_r1 =
+            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build());
+        assert!(DuplexConsensusCaller::is_paired_r1(&paired_r1));
+        assert!(!DuplexConsensusCaller::is_paired_r2(&paired_r1));
+
+        // Paired R2: PAIRED | LAST_SEGMENT.
+        let paired_r2 =
+            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(false).build());
+        assert!(!DuplexConsensusCaller::is_paired_r1(&paired_r2));
+        assert!(DuplexConsensusCaller::is_paired_r2(&paired_r2));
+
+        // Unpaired fragment: neither PAIRED nor any segment bit. Must not be
+        // classified as R1 or R2 — this is the regression guarded by fix.
+        let fragment = encode_to_raw(&RecordBuilder::new().sequence("ACGT").build());
+        assert!(!DuplexConsensusCaller::is_paired_r1(&fragment));
+        assert!(!DuplexConsensusCaller::is_paired_r2(&fragment));
+    }
+
+    #[test]
+    fn test_has_minimum_number_of_reads_ignores_unpaired_fragments() {
+        // Three R1s plus two unpaired fragments on the A strand: fragments
+        // must not contribute to the R1 count.
+        let a_r1s: Vec<RawRecord> = (0..3)
+            .map(|_| {
+                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+            })
+            .collect();
+        let a_fragments: Vec<RawRecord> =
+            (0..2).map(|_| encode_to_raw(&RecordBuilder::new().sequence("ACGT").build())).collect();
+        let a_reads: Vec<RawRecord> = a_r1s.into_iter().chain(a_fragments).collect();
+
+        let b_reads: Vec<RawRecord> = (0..3)
+            .map(|_| {
+                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+            })
+            .collect();
+
+        // With fragments excluded: total R1s = 3 + 3 = 6 -> passes min_total=6.
+        assert!(DuplexConsensusCaller::has_minimum_number_of_reads(
+            &a_reads, &b_reads, 6, // min_total
+            3, // min_xy
+            3, // min_yx
+        ));
+        // min_total=7 would only pass if fragments were counted -> must fail.
+        assert!(!DuplexConsensusCaller::has_minimum_number_of_reads(
+            &a_reads, &b_reads, 7, // min_total
+            3, // min_xy
+            3, // min_yx
         ));
     }
 

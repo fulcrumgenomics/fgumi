@@ -27,7 +27,7 @@ use crate::logging::{OperationTimer, log_consensus_summary};
 use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
 use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
-    apply_overlapping_consensus_raw,
+    apply_overlapping_consensus,
 };
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
@@ -471,12 +471,15 @@ impl Command for Duplex {
             // Skip if group doesn't have both strands - no duplex possible anyway
             if let Some(ref mut oc) = overlapping_caller {
                 if has_both_strands_raw(&records) {
-                    apply_overlapping_consensus_raw(&mut records, oc)?;
+                    apply_overlapping_consensus(&mut records, oc)?;
                 }
             }
 
-            // Call consensus directly -- records are already raw bytes!
-            let output = consensus_caller.consensus_reads(records)?;
+            // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
+            // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
+            let raw: Vec<fgumi_raw_bam::RawRecord> =
+                records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
+            let output = consensus_caller.consensus_reads(raw)?;
 
             // Write pre-serialized consensus reads
             let batch_size = output.count;
@@ -693,15 +696,18 @@ impl Duplex {
                     if let Some(ref mut oc) = overlapping_caller {
                         if has_both_strands_raw(&group_reads) {
                             oc.reset_stats();
-                            if apply_overlapping_consensus_raw(&mut group_reads, oc).is_err() {
+                            if apply_overlapping_consensus(&mut group_reads, oc).is_err() {
                                 continue;
                             }
                             batch_overlapping.merge(oc.stats());
                         }
                     }
 
-                    // Call duplex consensus directly -- records are already raw bytes!
-                    match caller.consensus_reads(group_reads) {
+                    // Call duplex consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
+                    // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
+                    let group_raw: Vec<fgumi_raw_bam::RawRecord> =
+                        group_reads.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
+                    match caller.consensus_reads(group_raw) {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
                             batch_stats.merge(&caller.statistics());
