@@ -9,16 +9,13 @@ use fgumi_raw_bam::fields::{aux_data_offset_from_record, tag_value_size};
 
 /// Result of a structured raw BAM record comparison.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct RawCompareResult {
     /// Whether the core fields (everything before aux data) are identical.
     pub core_match: bool,
-    /// Whether the aux tags are byte-identical (same order and content, including skipped tags).
+    /// Whether the aux tags are byte-identical (same order and content).
     pub tags_match: bool,
-    /// Whether the aux tags are semantically identical regardless of order (skipped tags excluded).
+    /// Whether the aux tags are semantically identical regardless of order.
     pub tag_order_match: bool,
-    /// Whether the non-skipped aux tags are byte-identical in the same order.
-    pub filtered_tags_match: bool,
 }
 
 /// Returns `true` if two raw BAM records are byte-identical.
@@ -85,6 +82,12 @@ fn collect_tag_entries(aux_data: &[u8]) -> Option<Vec<([u8; 2], usize, usize)>> 
         let data_start = i + 3;
         let size = tag_value_size(val_type, aux_data.get(data_start..)?)?;
         let val_end = data_start + size;
+        // `tag_value_size` returns the declared size without confirming the buffer
+        // is long enough; reject entries that would slice past the end of the aux
+        // data so downstream comparisons cannot panic on truncated records.
+        if val_end > aux_data.len() {
+            return None;
+        }
         entries.push((tag_name, val_start, val_end));
         i = val_end;
     }
@@ -115,8 +118,7 @@ fn decode_int_tag(type_byte: u8, data: &[u8]) -> Option<i64> {
 }
 
 /// Returns `true` if the aux data regions contain the same tags with the same values,
-/// regardless of the order in which tags appear. Tags whose two-byte names appear in
-/// `skip` are excluded from the comparison on both sides.
+/// regardless of the order in which tags appear.
 ///
 /// Integer tag values are compared semantically: if both tags have integer types
 /// (`c`/`C`/`s`/`S`/`i`/`I`) but different encodings (e.g., `C` for u8 vs `s` for i16),
@@ -127,7 +129,7 @@ fn decode_int_tag(type_byte: u8, data: &[u8]) -> Option<i64> {
 ///
 /// Returns `false` if either record has malformed aux data.
 #[must_use]
-pub fn raw_tags_equal_order_independent_except(r1: &[u8], r2: &[u8], skip: &[[u8; 2]]) -> bool {
+pub fn raw_tags_equal_order_independent(r1: &[u8], r2: &[u8]) -> bool {
     let aux1 = fgumi_raw_bam::fields::aux_data_slice(r1);
     let aux2 = fgumi_raw_bam::fields::aux_data_slice(r2);
 
@@ -136,21 +138,24 @@ pub fn raw_tags_equal_order_independent_except(r1: &[u8], r2: &[u8], skip: &[[u8
         return false;
     };
 
-    let count1 = entries1.iter().filter(|(t, _, _)| !skip.contains(t)).count();
-    let count2 = entries2.iter().filter(|(t, _, _)| !skip.contains(t)).count();
-    if count1 != count2 {
+    if entries1.len() != entries2.len() {
         return false;
     }
 
+    // For each tag in r1, find an unused matching tag in r2 and compare values.
+    // We track which entries2 indices have already been matched so that malformed
+    // records with duplicate tags do not inadvertently share a single r2 entry
+    // across multiple r1 entries.
+    let mut matched = vec![false; entries2.len()];
     for &(tag1, start1, end1) in &entries1 {
-        if skip.contains(&tag1) {
-            continue;
-        }
-        let Some(&(_, start2, end2)) = entries2.iter().find(|(t, _, _)| *t == tag1) else {
+        let Some((idx2, &(_, start2, end2))) =
+            entries2.iter().enumerate().find(|(i, (t, _, _))| *t == tag1 && !matched[*i])
+        else {
             return false;
         };
         // Fast path: byte-identical values (includes type byte)
         if aux1[start1..end1] == aux2[start2..end2] {
+            matched[idx2] = true;
             continue;
         }
         // If both are integer types, compare semantically by decoding to i64
@@ -160,7 +165,10 @@ pub fn raw_tags_equal_order_independent_except(r1: &[u8], r2: &[u8], skip: &[[u8
             let data1 = &aux1[start1 + 1..end1];
             let data2 = &aux2[start2 + 1..end2];
             match (decode_int_tag(type1, data1), decode_int_tag(type2, data2)) {
-                (Some(v1), Some(v2)) if v1 == v2 => continue,
+                (Some(v1), Some(v2)) if v1 == v2 => {
+                    matched[idx2] = true;
+                    continue;
+                }
                 _ => return false,
             }
         } else {
@@ -171,55 +179,17 @@ pub fn raw_tags_equal_order_independent_except(r1: &[u8], r2: &[u8], skip: &[[u8
     true
 }
 
-/// Returns `true` if the non-skipped aux tags are byte-identical and in the same order.
-///
-/// Returns `false` if either record has malformed aux data or the non-skipped tags
-/// differ in count, name, order, or byte content.
-#[must_use]
-fn raw_tags_byte_equal_except(r1: &[u8], r2: &[u8], skip: &[[u8; 2]]) -> bool {
-    let aux1 = fgumi_raw_bam::fields::aux_data_slice(r1);
-    let aux2 = fgumi_raw_bam::fields::aux_data_slice(r2);
-
-    let (Some(entries1), Some(entries2)) = (collect_tag_entries(aux1), collect_tag_entries(aux2))
-    else {
-        return false;
-    };
-
-    let filtered1: Vec<_> =
-        entries1.iter().copied().filter(|(t, _, _)| !skip.contains(t)).collect();
-    let filtered2: Vec<_> =
-        entries2.iter().copied().filter(|(t, _, _)| !skip.contains(t)).collect();
-
-    if filtered1.len() != filtered2.len() {
-        return false;
-    }
-
-    filtered1
-        .iter()
-        .zip(filtered2.iter())
-        .all(|(&(t1, s1, e1), &(t2, s2, e2))| t1 == t2 && aux1[s1..e1] == aux2[s2..e2])
-}
-
 /// Performs a structured comparison of two raw BAM records, reporting which parts match.
-/// Tags whose two-byte names appear in `skip` are excluded from the semantic tag comparison.
 ///
-/// Returns a [`RawCompareResult`] with:
-/// - `tags_match`: full byte-identity of all aux data (including skipped tags)
-/// - `tag_order_match`: semantic equality of non-skipped tags regardless of order
-/// - `filtered_tags_match`: byte-identity of non-skipped tags in the same order
-///
+/// Returns a [`RawCompareResult`] with `core_match`, `tags_match`, and `tag_order_match`.
 /// If core fields cannot be parsed (record too short), `core_match` is `false`.
-/// If aux data is malformed, `tag_order_match` and `filtered_tags_match` are `false`.
+/// If aux data is malformed, `tag_order_match` is `false`.
 #[must_use]
-pub fn raw_compare_structured_except(r1: &[u8], r2: &[u8], skip: &[[u8; 2]]) -> RawCompareResult {
+pub fn raw_compare_structured(r1: &[u8], r2: &[u8]) -> RawCompareResult {
     let core_match = raw_core_fields_equal(r1, r2);
     let tags_match = raw_tags_byte_equal(r1, r2);
-    // When bytes match fully, any subset also matches; otherwise fall back to filtered comparison.
-    let tag_order_match =
-        if tags_match { true } else { raw_tags_equal_order_independent_except(r1, r2, skip) };
-    let filtered_tags_match =
-        tags_match || (!skip.is_empty() && raw_tags_byte_equal_except(r1, r2, skip));
-    RawCompareResult { core_match, tags_match, tag_order_match, filtered_tags_match }
+    let tag_order_match = if tags_match { true } else { raw_tags_equal_order_independent(r1, r2) };
+    RawCompareResult { core_match, tags_match, tag_order_match }
 }
 
 #[cfg(test)]
@@ -403,7 +373,7 @@ mod tests {
         aux.extend_from_slice(&make_i_tag(*b"NM", 5));
         let r1 = base_record(&aux);
         let r2 = base_record(&aux);
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -414,14 +384,14 @@ mod tests {
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_different_values() {
         let r1 = base_record(&make_i_tag(*b"NM", 5));
         let r2 = base_record(&make_i_tag(*b"NM", 10));
-        assert!(!raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -431,7 +401,7 @@ mod tests {
         let aux2 = make_z_tag(*SamTag::RG, b"s1");
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
-        assert!(!raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -441,14 +411,14 @@ mod tests {
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
-        assert!(!raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_no_tags() {
         let r1 = base_record(&[]);
         let r2 = base_record(&[]);
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -466,7 +436,7 @@ mod tests {
 
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -475,7 +445,7 @@ mod tests {
         let rec = base_record(&make_i_tag(*b"NM", 5));
         // Both have empty aux slices due to short record, but the short record
         // returns empty aux, so it won't match a record with tags.
-        assert!(!raw_tags_equal_order_independent_except(&short, &rec, &[]));
+        assert!(!raw_tags_equal_order_independent(&short, &rec));
     }
 
     // ========================================================================
@@ -486,15 +456,10 @@ mod tests {
     fn test_structured_identical() {
         let aux = make_i_tag(*b"NM", 5);
         let rec = base_record(&aux);
-        let result = raw_compare_structured_except(&rec, &rec, &[]);
+        let result = raw_compare_structured(&rec, &rec);
         assert_eq!(
             result,
-            RawCompareResult {
-                core_match: true,
-                tags_match: true,
-                tag_order_match: true,
-                filtered_tags_match: true,
-            }
+            RawCompareResult { core_match: true, tags_match: true, tag_order_match: true }
         );
     }
 
@@ -502,7 +467,7 @@ mod tests {
     fn test_structured_different_core() {
         let r1 = make_bam_bytes(1, 100, 0, b"rea", &[], 4, 1, 200, &[]);
         let r2 = make_bam_bytes(1, 999, 0, b"rea", &[], 4, 1, 200, &[]);
-        let result = raw_compare_structured_except(&r1, &r2, &[]);
+        let result = raw_compare_structured(&r1, &r2);
         assert!(!result.core_match);
         assert!(result.tags_match); // both have no tags
     }
@@ -515,7 +480,7 @@ mod tests {
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
-        let result = raw_compare_structured_except(&r1, &r2, &[]);
+        let result = raw_compare_structured(&r1, &r2);
         assert!(result.core_match);
         assert!(!result.tags_match);
         assert!(result.tag_order_match);
@@ -525,7 +490,7 @@ mod tests {
     fn test_structured_different_tags() {
         let r1 = base_record(&make_i_tag(*b"NM", 5));
         let r2 = base_record(&make_i_tag(*b"NM", 10));
-        let result = raw_compare_structured_except(&r1, &r2, &[]);
+        let result = raw_compare_structured(&r1, &r2);
         assert!(result.core_match);
         assert!(!result.tags_match);
         assert!(!result.tag_order_match);
@@ -535,7 +500,7 @@ mod tests {
     fn test_structured_short_records() {
         let short = vec![0u8; 10];
         let rec = base_record(&[]);
-        let result = raw_compare_structured_except(&short, &rec, &[]);
+        let result = raw_compare_structured(&short, &rec);
         assert!(!result.core_match);
     }
 
@@ -553,7 +518,7 @@ mod tests {
         // Set different bin values
         r1[10..12].copy_from_slice(&100u16.to_le_bytes());
         r2[10..12].copy_from_slice(&200u16.to_le_bytes());
-        let result = raw_compare_structured_except(&r1, &r2, &[]);
+        let result = raw_compare_structured(&r1, &r2);
         assert!(result.core_match);
         assert!(!result.tags_match);
         assert!(result.tag_order_match);
@@ -608,6 +573,41 @@ mod tests {
         assert_eq!(entries[0].2, aux.len());
     }
 
+    #[test]
+    fn test_collect_entries_truncated_fixed_size_returns_none() {
+        // `i` type (i32) declares 4 bytes of value but only 2 are present in the slice.
+        // Without bounds enforcement on val_end, this produces an entry with
+        // val_end > aux_data.len() and slicing by a downstream caller panics.
+        let aux = [b'N', b'M', b'i', 0x00, 0x01];
+        assert!(collect_tag_entries(&aux).is_none());
+    }
+
+    #[test]
+    fn test_collect_entries_truncated_b_array_returns_none() {
+        // B-array declares 5 i32 elements but the buffer only has room for 2 after the header.
+        // `tag_value_size` returns 5 + 5*4 = 25 which overshoots the slice.
+        let mut aux = vec![b'X', b'A', b'B', b'i']; // B array of i32
+        aux.extend_from_slice(&5u32.to_le_bytes()); // claim 5 elements
+        aux.extend_from_slice(&1i32.to_le_bytes()); // only 2 actually follow
+        aux.extend_from_slice(&2i32.to_le_bytes());
+        assert!(collect_tag_entries(&aux).is_none());
+    }
+
+    #[test]
+    fn test_order_independent_truncated_fixed_size_returns_false() {
+        // Regression: `raw_tags_equal_order_independent` used to panic when aux data was
+        // truncated for a fixed-size type because `collect_tag_entries` produced entries
+        // whose `val_end` exceeded `aux_data.len()`. It must return `false` instead.
+        let aux_good = make_i_tag(*b"NM", 42);
+        let aux_bad = [b'N', b'M', b'i', 0x00, 0x01]; // truncated i32 (only 2 bytes)
+        let r1 = base_record(&aux_good);
+        let r2 = base_record(&aux_bad);
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
+        // Also when both sides are truncated: malformed aux => false.
+        let r3 = base_record(&aux_bad);
+        assert!(!raw_tags_equal_order_independent(&r2, &r3));
+    }
+
     // ========================================================================
     // Semantic integer comparison tests
     // ========================================================================
@@ -618,7 +618,7 @@ mod tests {
         // These are semantically equal but have different byte encodings.
         let r1 = base_record(&make_c_tag(*b"cD", 158));
         let r2 = base_record(&make_s_tag(*b"cD", 158));
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -626,7 +626,7 @@ mod tests {
         // NM tag: u8 (C) value 42 vs i32 (i) value 42
         let r1 = base_record(&make_c_tag(*b"NM", 42));
         let r2 = base_record(&make_i_tag(*b"NM", 42));
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -634,7 +634,7 @@ mod tests {
         // MQ tag: i16 (s) value 300 vs i32 (i) value 300
         let r1 = base_record(&make_s_tag(*b"MQ", 300));
         let r2 = base_record(&make_i_tag(*b"MQ", 300));
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -642,7 +642,7 @@ mod tests {
         // NM tag: u32 (I) value 1000 vs i32 (i) value 1000
         let r1 = base_record(&make_upper_i_tag(*b"NM", 1000));
         let r2 = base_record(&make_i_tag(*b"NM", 1000));
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -650,7 +650,7 @@ mod tests {
         // NM tag: u32 (I) value 42 vs u8 (C) value 42
         let r1 = base_record(&make_upper_i_tag(*b"NM", 42));
         let r2 = base_record(&make_c_tag(*b"NM", 42));
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -658,7 +658,7 @@ mod tests {
         // Same tag name, different int types, different values => should NOT match
         let r1 = base_record(&make_c_tag(*b"NM", 5));
         let r2 = base_record(&make_i_tag(*b"NM", 10));
-        assert!(!raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -666,7 +666,7 @@ mod tests {
         // Same tag name, one is int (C), other is string (Z) => should NOT match
         let r1 = base_record(&make_c_tag(*b"XY", 65)); // 65 = 'A'
         let r2 = base_record(&make_z_tag(*b"XY", b"A"));
-        assert!(!raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -675,7 +675,7 @@ mod tests {
         // report tags_match=false (bytes differ) but tag_order_match=true (semantically equal)
         let r1 = base_record(&make_c_tag(*b"cD", 158));
         let r2 = base_record(&make_s_tag(*b"cD", 158));
-        let result = raw_compare_structured_except(&r1, &r2, &[]);
+        let result = raw_compare_structured(&r1, &r2);
         assert!(result.core_match);
         assert!(!result.tags_match); // raw bytes differ
         assert!(result.tag_order_match); // semantically equal
@@ -694,7 +694,7 @@ mod tests {
 
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -702,7 +702,7 @@ mod tests {
         // -100 as i8 (c) vs -100 as i16 (s) => should match
         let r1 = base_record(&[b'X', b'N', b'c', (-100i8) as u8]);
         let r2 = base_record(&make_s_tag(*b"XN", -100));
-        assert!(raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
@@ -710,6 +710,6 @@ mod tests {
         // i8(-1) = 0xFF vs u8(255) = 0xFF => semantically different, should NOT match
         let r1 = base_record(&[b'X', b'V', b'c', 0xFF]); // -1 as i8
         let r2 = base_record(&make_c_tag(*b"XV", 255)); // 255 as u8
-        assert!(!raw_tags_equal_order_independent_except(&r1, &r2, &[]));
+        assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 }

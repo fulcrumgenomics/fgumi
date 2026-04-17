@@ -125,11 +125,27 @@ name = "core_functions"
 harness = false
 
 [[bench]]
-name = "reorder_buffer"
+name = "raw_bam_accessors"
+harness = false
+
+[[bench]]
+name = "raw_bam_tags_editor"
+harness = false
+
+[[bench]]
+name = "raw_bam_length_changing"
+harness = false
+
+[[bench]]
+name = "raw_bam_vs_recordbuf"
 harness = false
 
 [[bench]]
 name = "raw_bam"
+harness = false
+
+[[bench]]
+name = "reorder_buffer"
 harness = false
 
 [build-dependencies]

@@ -374,6 +374,15 @@ mod tests {
         to_record_buf(b.build())
     }
 
+    /// Canonical `BamIoOptions` used by `Downsample` test constructors.
+    fn test_bam_io_options() -> BamIoOptions {
+        BamIoOptions {
+            input: PathBuf::from("input.bam"),
+            output: PathBuf::from("output.bam"),
+            async_reader: false,
+        }
+    }
+
     #[test]
     fn test_get_mi_tag_string() {
         let record = create_test_record("read1", "12345");
@@ -459,7 +468,7 @@ mod tests {
     #[test]
     fn test_validate_fraction_too_low() {
         let cmd = Downsample {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: test_bam_io_options(),
             fraction: 0.0,
             rejects: None,
             seed: None,
@@ -476,7 +485,7 @@ mod tests {
     #[test]
     fn test_validate_fraction_too_high() {
         let cmd = Downsample {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: test_bam_io_options(),
             fraction: 1.5,
             rejects: None,
             seed: None,
@@ -492,7 +501,7 @@ mod tests {
     #[test]
     fn test_validate_fraction_valid() {
         let cmd = Downsample {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: test_bam_io_options(),
             fraction: 0.5,
             rejects: None,
             seed: None,
@@ -530,7 +539,7 @@ mod tests {
     #[allow(clippy::float_cmp)] // Testing exact value assignment, not computation
     fn test_downsample_parameters() {
         let cmd = Downsample {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: test_bam_io_options(),
             fraction: 0.1,
             rejects: Some(PathBuf::from("rejects.bam")),
             seed: Some(42),

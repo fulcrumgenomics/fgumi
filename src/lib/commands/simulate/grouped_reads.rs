@@ -5,7 +5,7 @@
 //! records in memory before sorting.
 
 use super::sort::TemplateCoordKey;
-use crate::bam_io::create_bam_writer;
+use crate::bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{
@@ -13,18 +13,17 @@ use crate::commands::simulate::common::{
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
     StrandBiasArgs, apply_methylation_conversion, generate_random_sequence, pad_sequence,
 };
+use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
-use crate::sam::builder::RecordBuilder;
 use crate::simulate::{
     FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias,
     StrandBiasModel, create_rng,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
 use rand::{Rng, RngExt};
@@ -254,7 +253,7 @@ impl Command for GroupedReads {
         molecules.sort_unstable();
 
         // Set up writer with multi-threaded BGZF compression
-        let mut writer = create_bam_writer(
+        let mut writer = create_raw_bam_writer(
             &self.output,
             &header,
             self.threads,
@@ -302,11 +301,11 @@ impl Command for GroupedReads {
                 //   R2 first if insert < 2*read_len, else R1 first
                 let r2_first = !is_top_strand && insert_size < 2 * params.read_length;
                 if r2_first {
-                    writer.write_alignment_record(&header, &r2)?;
-                    writer.write_alignment_record(&header, &r1)?;
+                    writer.write_raw_record(r2.as_ref())?;
+                    writer.write_raw_record(r1.as_ref())?;
                 } else {
-                    writer.write_alignment_record(&header, &r1)?;
-                    writer.write_alignment_record(&header, &r2)?;
+                    writer.write_raw_record(r1.as_ref())?;
+                    writer.write_raw_record(r2.as_ref())?;
                 }
                 let strand_char = if is_top_strand { '+' } else { '-' };
                 writeln!(
@@ -326,6 +325,7 @@ impl Command for GroupedReads {
 
         progress.log_final();
         truth_writer.flush()?;
+        writer.finish()?;
 
         info!("Generated {total_pairs} read pairs");
         info!("Done");
@@ -337,8 +337,8 @@ impl Command for GroupedReads {
 /// Generate all read pairs for a single molecule.
 ///
 /// A single R1/R2 pair plus identifiers used for truth/metadata:
-/// `(r1, r2, read_name, umi_str, mi, is_top_strand, family_size)`.
-type MoleculeReadPair = (RecordBuf, RecordBuf, String, String, String, bool, usize);
+/// `(r1, r2, read_name, umi_str, mi, is_top_strand, insert_size)`.
+type MoleculeReadPair = (RawRecord, RawRecord, String, String, String, bool, usize);
 
 /// Result of generating all read pairs for a molecule: the pairs plus the
 /// effective `(chrom_idx, local_pos)` at which the template actually lives.
@@ -515,7 +515,7 @@ fn generate_read_pair_records(
     methylation: &MethylationConfig,
     shared_template: Option<&[u8]>,
     rng: &mut impl Rng,
-) -> (RecordBuf, RecordBuf) {
+) -> (RawRecord, RawRecord) {
     // Use shared reference template or generate random per-read.
     // Avoid copying the shared template — only borrow it.
     let random_template;
@@ -627,40 +627,71 @@ fn build_record(
     mi_tag: &str,
     mate_cigar: &str,
     mate_mapq: u8,
-) -> RecordBuf {
-    let seq_str = String::from_utf8_lossy(seq);
+) -> RawRecord {
+    // Build flags: PAIRED + PROPER_PAIR + (FIRST_SEGMENT or LAST_SEGMENT) + reverse-strand bits.
+    // Simulated pairs are generated as proper paired alignments; downstream tools commonly
+    // filter on the 0x2 bit, so set it explicitly.
+    let segment_flag = if is_first { raw_flags::FIRST_SEGMENT } else { raw_flags::LAST_SEGMENT };
+    let reverse_flag = if is_reverse { raw_flags::REVERSE } else { 0 };
+    let mate_reverse_flag = if is_reverse { 0 } else { raw_flags::MATE_REVERSE };
+    let flags = raw_flags::PAIRED
+        | raw_flags::PROPER_PAIR
+        | segment_flag
+        | reverse_flag
+        | mate_reverse_flag;
 
-    RecordBuilder::new()
-        .name(name)
-        .sequence(&seq_str)
-        .qualities(quals)
-        .reference_sequence_id(ref_id)
-        .alignment_start(pos + 1) // Convert 0-based to 1-based
-        .mapping_quality(mapq)
-        .paired(true)
-        .first_segment(is_first)
-        .reverse_complement(is_reverse)
-        .mate_reverse_complement(!is_reverse)
-        .mate_reference_sequence_id(ref_id)
-        .mate_alignment_start(mate_pos + 1) // Convert 0-based to 1-based
+    // Single CIGAR op: {seq.len()}M (match). All simulated alignments are gap-free.
+    let n = u32::try_from(seq.len()).expect("sequence length fits u32");
+    // BAM CIGAR encoding: (length << 4) | op_code. op_code 0 = M (alignment match).
+    let cigar_op = n << 4;
+
+    // Pre-compute bin for the alignment range.
+    let alignment_start_1based = u32::try_from(pos + 1).expect("alignment start fits u32");
+    let alignment_end_1based = alignment_start_1based + n.saturating_sub(1);
+    let bin = region_to_bin(Some(alignment_start_1based), Some(alignment_end_1based));
+
+    let ref_id_i32 = i32::try_from(ref_id).expect("ref_id fits i32");
+    let pos_i32 = i32::try_from(pos).expect("pos fits i32");
+    let mate_pos_i32 = i32::try_from(mate_pos).expect("mate_pos fits i32");
+
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .flags(flags)
+        .ref_id(ref_id_i32)
+        .pos(pos_i32)
+        .mapq(mapq)
+        .bin(bin)
+        .mate_ref_id(ref_id_i32)
+        .mate_pos(mate_pos_i32)
         .template_length(tlen)
-        .tag("RX", umi)
-        .tag("MI", mi_tag)
-        .tag("MC", mate_cigar)
-        .tag("MQ", i32::from(mate_mapq))
-        .build()
+        .cigar_ops(&[cigar_op])
+        .sequence(seq)
+        .qualities(quals)
+        .add_string_tag(b"RX", umi.as_bytes())
+        .add_string_tag(b"MI", mi_tag.as_bytes())
+        .add_string_tag(b"MC", mate_cigar.as_bytes())
+        .add_int_tag(b"MQ", i32::from(mate_mapq));
+    b.build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::simulate::create_rng;
+    use fgumi_raw_bam::RawRecordView;
 
     const DISABLED_METHYLATION: MethylationConfig = MethylationConfig {
         mode: fgumi_consensus::MethylationMode::Disabled,
         cpg_methylation_rate: 0.75,
         conversion_rate: 0.98,
     };
+
+    /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
+    /// assertions.
+    fn to_record_buf(raw: &RawRecord) -> noodles::sam::alignment::RecordBuf {
+        fgumi_raw_bam::raw_record_to_record_buf(raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
 
     #[test]
     fn test_generate_random_sequence_length() {
@@ -720,7 +751,7 @@ mod tests {
     fn test_build_record_with_mi_tag() {
         let seq = b"ACGT";
         let quals = vec![30, 30, 30, 30];
-        let record = build_record(
+        let raw = build_record(
             "test_read",
             seq,
             &quals,
@@ -736,6 +767,7 @@ mod tests {
             "4M",
             60,
         );
+        let record = to_record_buf(&raw);
 
         // Check name exists
         assert!(record.name().is_some());
@@ -750,7 +782,7 @@ mod tests {
     fn test_build_record_simplex_mi_tag() {
         let seq = b"ACGT";
         let quals = vec![30, 30, 30, 30];
-        let record = build_record(
+        let raw = build_record(
             "test_read",
             seq,
             &quals,
@@ -766,6 +798,7 @@ mod tests {
             "4M",
             60,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
     }
@@ -776,7 +809,7 @@ mod tests {
         let quality_model = PositionQualityModel::default();
         let quality_bias = ReadPairQualityBias::default();
 
-        let (r1, r2) = generate_read_pair_records(
+        let (r1_raw, r2_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "0/A",
@@ -792,6 +825,8 @@ mod tests {
             None,
             &mut rng,
         );
+        let r1 = to_record_buf(&r1_raw);
+        let r2 = to_record_buf(&r2_raw);
 
         // Check R1 flags
         assert!(r1.flags().is_first_segment());
@@ -808,7 +843,7 @@ mod tests {
         let quality_model = PositionQualityModel::default();
         let quality_bias = ReadPairQualityBias::default();
 
-        let (r1, r2) = generate_read_pair_records(
+        let (r1_raw, r2_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "5/B",
@@ -824,6 +859,8 @@ mod tests {
             None,
             &mut rng,
         );
+        let r1 = to_record_buf(&r1_raw);
+        let r2 = to_record_buf(&r2_raw);
 
         // Bottom strand has opposite orientation: R1 reverse, R2 forward
         assert!(r1.flags().is_first_segment());
@@ -838,7 +875,7 @@ mod tests {
         let quality_model = PositionQualityModel::default();
         let quality_bias = ReadPairQualityBias::default();
 
-        let (r1, r2) = generate_read_pair_records(
+        let (r1_raw, r2_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "10",
@@ -854,6 +891,8 @@ mod tests {
             None,
             &mut rng,
         );
+        let r1 = to_record_buf(&r1_raw);
+        let r2 = to_record_buf(&r2_raw);
 
         // Simplex top strand has same orientation as F1R2
         assert!(r1.flags().is_first_segment());
@@ -869,7 +908,7 @@ mod tests {
         let quality_bias = ReadPairQualityBias::default();
 
         // Insert size smaller than read length
-        let (r1, r2) = generate_read_pair_records(
+        let (r1_raw, r2_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "0/A",
@@ -885,6 +924,8 @@ mod tests {
             None,
             &mut rng,
         );
+        let r1 = to_record_buf(&r1_raw);
+        let r2 = to_record_buf(&r2_raw);
 
         // Both records should still be valid
         assert!(r1.flags().is_first_segment());
@@ -899,7 +940,7 @@ mod tests {
         let mut rng1 = create_rng(Some(42));
         let mut rng2 = create_rng(Some(42));
 
-        let (r1_a, r2_a) = generate_read_pair_records(
+        let (r1_a_raw, r2_a_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "0/A",
@@ -916,7 +957,7 @@ mod tests {
             &mut rng1,
         );
 
-        let (r1_b, r2_b) = generate_read_pair_records(
+        let (r1_b_raw, r2_b_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "0/A",
@@ -934,15 +975,21 @@ mod tests {
         );
 
         // Both should produce same flags
-        assert_eq!(r1_a.flags(), r1_b.flags());
-        assert_eq!(r2_a.flags(), r2_b.flags());
+        assert_eq!(
+            RawRecordView::new(r1_a_raw.as_ref()).flags(),
+            RawRecordView::new(r1_b_raw.as_ref()).flags()
+        );
+        assert_eq!(
+            RawRecordView::new(r2_a_raw.as_ref()).flags(),
+            RawRecordView::new(r2_b_raw.as_ref()).flags()
+        );
     }
 
     #[test]
     fn test_build_record_r2_flags() {
         let seq = b"ACGT";
         let quals = vec![30, 30, 30, 30];
-        let record = build_record(
+        let raw = build_record(
             "test_read",
             seq,
             &quals,
@@ -958,6 +1005,7 @@ mod tests {
             "4M",
             60,
         );
+        let record = to_record_buf(&raw);
 
         let flags = record.flags();
         assert!(flags.is_last_segment());
@@ -970,9 +1018,10 @@ mod tests {
     fn test_build_record_positions() {
         let seq = b"ACGTACGT";
         let quals = vec![30; 8];
-        let record = build_record(
+        let raw = build_record(
             "read", seq, &quals, 0, 1000, 60, true, false, 1100, 200, "AAA", "0/A", "8M", 60,
         );
+        let record = to_record_buf(&raw);
 
         // Position should be 1-based in BAM
         assert_eq!(
@@ -992,9 +1041,10 @@ mod tests {
         let quals = vec![30; 4];
 
         for mapq in [0, 30, 60] {
-            let record = build_record(
+            let raw = build_record(
                 "read", seq, &quals, 0, 100, mapq, true, false, 200, 100, "AAA", "0", "4M", mapq,
             );
+            let record = to_record_buf(&raw);
             assert_eq!(
                 record.mapping_quality().expect("record should have mapping quality").get(),
                 mapq
@@ -1006,9 +1056,10 @@ mod tests {
     fn test_build_record_quality_scores() {
         let seq = b"ACGTACGT";
         let quals = vec![10, 20, 30, 40, 30, 20, 10, 5];
-        let record = build_record(
+        let raw = build_record(
             "read", seq, &quals, 0, 100, 60, true, false, 200, 100, "AAA", "0", "8M", 60,
         );
+        let record = to_record_buf(&raw);
 
         let record_quals: Vec<u8> = record.quality_scores().iter().collect();
         assert_eq!(record_quals, quals);
@@ -1091,7 +1142,7 @@ mod tests {
         let quality_model = PositionQualityModel::default();
         let quality_bias = ReadPairQualityBias::default();
 
-        let (r1, r2) = generate_read_pair_records(
+        let (r1_raw, r2_raw) = generate_read_pair_records(
             "read_001",
             "ACGTACGT",
             "1/A",
@@ -1107,6 +1158,8 @@ mod tests {
             None,
             &mut rng,
         );
+        let r1 = to_record_buf(&r1_raw);
+        let r2 = to_record_buf(&r2_raw);
 
         // Top strand: R1 forward, R2 reverse
         assert!(r1.flags().is_first_segment());
@@ -1134,7 +1187,7 @@ mod tests {
         let quality_bias = ReadPairQualityBias::default();
         let mut rng = create_rng(Some(42));
 
-        let (r1, _r2) = generate_read_pair_records(
+        let (r1_raw, _r2_raw) = generate_read_pair_records(
             "test_meth",
             "AAAAAAAA",
             "1/A",
@@ -1150,6 +1203,7 @@ mod tests {
             Some(template),
             &mut rng,
         );
+        let r1 = to_record_buf(&r1_raw);
 
         // R1 (top strand, forward) should have C->T conversions at non-CpG C positions
         let r1_seq: Vec<u8> = r1.sequence().as_ref().to_vec();
@@ -1181,7 +1235,7 @@ mod tests {
 
         // Generate top strand pair (F1R2)
         let mut rng_a = create_rng(Some(42));
-        let (r1_a, _) = generate_read_pair_records(
+        let (r1_a_raw, _) = generate_read_pair_records(
             "test",
             "AAAAAAAA",
             "1/A",
@@ -1200,7 +1254,7 @@ mod tests {
 
         // Generate bottom strand pair with disabled methylation to check it differs
         let mut rng_b = create_rng(Some(42));
-        let (r1_b_no_meth, _) = generate_read_pair_records(
+        let (r1_b_no_meth_raw, _) = generate_read_pair_records(
             "test",
             "AAAAAAAA",
             "1/B",
@@ -1219,7 +1273,7 @@ mod tests {
 
         // Generate bottom strand pair with EM-Seq
         let mut rng_b2 = create_rng(Some(42));
-        let (r1_b_meth, _) = generate_read_pair_records(
+        let (r1_b_meth_raw, _) = generate_read_pair_records(
             "test",
             "AAAAAAAA",
             "1/B",
@@ -1237,14 +1291,15 @@ mod tests {
         );
 
         // Top strand R1 (forward, top) should differ from bottom strand R1 (reverse, revcomped)
-        let r1_a_seq: Vec<u8> = r1_a.sequence().as_ref().to_vec();
-        let r1_b_seq: Vec<u8> = r1_b_meth.sequence().as_ref().to_vec();
+        let r1_a_seq: Vec<u8> = to_record_buf(&r1_a_raw).sequence().as_ref().to_vec();
+        let r1_b_seq: Vec<u8> = to_record_buf(&r1_b_meth_raw).sequence().as_ref().to_vec();
         // Bottom strand R1 is reverse-complemented from end of template with bottom-strand
         // methylation, so conversion pattern should differ from top strand R1
         assert_ne!(r1_a_seq, r1_b_seq, "Top and bottom strand R1 should differ");
 
         // Bottom strand with methylation should differ from bottom strand without
-        let r1_b_no_meth_seq: Vec<u8> = r1_b_no_meth.sequence().as_ref().to_vec();
+        let r1_b_no_meth_seq: Vec<u8> =
+            to_record_buf(&r1_b_no_meth_raw).sequence().as_ref().to_vec();
         assert_ne!(
             r1_b_seq, r1_b_no_meth_seq,
             "Bottom strand with/without methylation should differ"
@@ -1293,8 +1348,8 @@ mod tests {
         assert!(!pairs.is_empty());
 
         for (r1, r2, _, _, _, _, _) in &pairs {
-            assert_eq!(r1.reference_sequence_id(), Some(eff_chrom));
-            assert_eq!(r2.reference_sequence_id(), Some(eff_chrom));
+            assert_eq!(RawRecordView::new(r1.as_ref()).ref_id() as usize, eff_chrom);
+            assert_eq!(RawRecordView::new(r2.as_ref()).ref_id() as usize, eff_chrom);
         }
     }
 

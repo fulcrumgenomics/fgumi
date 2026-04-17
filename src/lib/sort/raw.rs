@@ -1335,7 +1335,10 @@ impl RawExternalSorter {
         self
     }
 
-    /// Enable async prefetch reader for input I/O.
+    /// Enable/disable the async prefetch reader on input.
+    ///
+    /// When enabled, the input BAM is wrapped in a `PrefetchReader` before the
+    /// BGZF layer, which overlaps block I/O with decompression.
     #[must_use]
     pub fn async_reader(mut self, enabled: bool) -> Self {
         self.async_reader = enabled;

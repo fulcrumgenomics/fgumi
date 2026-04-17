@@ -240,6 +240,8 @@ impl<'a> RawRecordView<'a> {
 pub mod flags {
     /// Read is paired in sequencing.
     pub const PAIRED: u16 = 0x1;
+    /// Each segment properly aligned according to the aligner.
+    pub const PROPER_PAIR: u16 = 0x2;
     /// Read is unmapped.
     pub const UNMAPPED: u16 = 0x4;
     /// Mate is unmapped.

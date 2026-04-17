@@ -52,7 +52,7 @@ use noodles::sam::header::record::value::{
 };
 use read_structure::{ReadStructure, SegmentType};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -134,12 +134,8 @@ fn detect_compression_format(path: &Path) -> Result<CompressionFormat> {
 /// Open a FASTQ file with automatic detection of compression format.
 ///
 /// For BGZF-compressed files, uses noodles `MultithreadedReader` when threads > 1.
-/// For regular gzip files, uses flate2 `MultiGzDecoder` single-threaded decompression.
-/// For uncompressed files, opens directly with buffering.
-///
-/// When `async_reader` is true the underlying file is wrapped in a
-/// [`PrefetchReader`](crate::prefetch_reader::PrefetchReader) before the
-/// decompression layer, overlapping disk I/O with decompression.
+/// For regular gzip files, uses `flate2::read::MultiGzDecoder` single-threaded.
+/// For uncompressed files, opens directly.
 ///
 /// # Arguments
 /// * `path` - Path to the FASTQ file
@@ -158,7 +154,7 @@ fn open_fastq_reader(
     let format = detect_compression_format(path)?;
 
     // Open file, optionally wrap in PrefetchReader for async I/O.
-    let open_reader = |path: &Path| -> Result<Box<dyn Read + Send>> {
+    let open_reader = |path: &Path| -> Result<Box<dyn std::io::Read + Send>> {
         let file = File::open(path)?;
         if async_reader {
             crate::os_hints::advise_sequential(&file);
@@ -1262,7 +1258,7 @@ impl Command for Extract {
         // Use a separate reader for sampling to avoid consuming records from the main reader
         let mut sample_quals = Vec::new();
         let mut temp_reader = SimdFastqReader::with_capacity(
-            open_fastq_reader(&self.inputs[0], 1, false)?,
+            open_fastq_reader(&self.inputs[0], 1, self.async_reader)?,
             BUFFER_SIZE,
         );
         for _i in 0..QUALITY_DETECTION_SAMPLE_SIZE {

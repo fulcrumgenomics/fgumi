@@ -660,9 +660,7 @@ pub fn apply_overlapping_consensus(
                 (&mut right[0], &mut left[*idx2])
             };
 
-            caller
-                .call(r1.as_mut_vec().as_mut_slice(), r2.as_mut_vec().as_mut_slice())
-                .context("Failed to call overlapping consensus on raw bytes")?;
+            caller.call(r1, r2).context("Failed to call overlapping consensus on raw bytes")?;
         }
     }
 
