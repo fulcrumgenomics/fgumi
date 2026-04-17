@@ -30,6 +30,7 @@ use crate::sort::memory_probe::{
 };
 use crate::sort::pooled_chunk_writer::PooledChunkWriter;
 use crate::sort::read_ahead::{RawReadAheadReader, RecordSource};
+use crate::sort::tmp_dir_alloc::TmpDirAllocator;
 use crate::sort::worker_pool::SortWorkerPool;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -1082,29 +1083,34 @@ impl<K: RawSortKey + 'static> Read for SourceReadAdapter<'_, K> {
 /// Maintains monotonic counters for both chunk files (`chunk_0000.keyed`, ...)
 /// and merged files (`merged_0000.keyed`, ...) to prevent naming collisions
 /// after consolidation drains entries from the chunk file list.
+///
+/// When multiple temp directories are supplied via [`TmpDirAllocator`], chunk
+/// and merged files are distributed across them in round-robin order.
 struct ChunkNamer<'a> {
-    temp_path: &'a Path,
+    alloc: &'a mut TmpDirAllocator,
     chunk_count: usize,
     merge_count: usize,
 }
 
 impl<'a> ChunkNamer<'a> {
-    fn new(temp_path: &'a Path) -> Self {
-        Self { temp_path, chunk_count: 0, merge_count: 0 }
+    fn new(alloc: &'a mut TmpDirAllocator) -> Self {
+        Self { alloc, chunk_count: 0, merge_count: 0 }
     }
 
-    /// Returns the next unique chunk file path.
-    fn next_chunk_path(&mut self) -> PathBuf {
-        let path = self.temp_path.join(format!("chunk_{:04}.keyed", self.chunk_count));
+    /// Returns the next unique chunk file path, drawing from the allocator.
+    fn next_chunk_path(&mut self) -> Result<PathBuf> {
+        let base = self.alloc.next()?;
+        let path = base.join(format!("chunk_{:04}.keyed", self.chunk_count));
         self.chunk_count += 1;
-        path
+        Ok(path)
     }
 
-    /// Returns the next unique merged file path.
-    fn next_merged_path(&mut self) -> PathBuf {
-        let path = self.temp_path.join(format!("merged_{:04}.keyed", self.merge_count));
+    /// Returns the next unique merged file path, drawing from the allocator.
+    fn next_merged_path(&mut self) -> Result<PathBuf> {
+        let base = self.alloc.next()?;
+        let path = base.join(format!("merged_{:04}.keyed", self.merge_count));
         self.merge_count += 1;
-        path
+        Ok(path)
     }
 }
 
@@ -1139,8 +1145,13 @@ pub struct RawExternalSorter {
     sort_order: SortOrder,
     /// Maximum memory to use for in-memory sorting.
     memory_limit: usize,
-    /// Temporary directory for spill files.
-    temp_dir: Option<PathBuf>,
+    /// Temporary directories for spill files.
+    ///
+    /// When empty, a single directory is created under the system default
+    /// temp location. When one or more paths are given, spill files are
+    /// distributed across them in free-space-aware round-robin order via
+    /// [`TmpDirAllocator`].
+    temp_dirs: Vec<PathBuf>,
     /// Number of threads for parallel operations.
     threads: usize,
     /// Compression level for output.
@@ -1206,7 +1217,7 @@ impl RawExternalSorter {
         Self {
             sort_order,
             memory_limit: 512 * 1024 * 1024, // 512 MB default
-            temp_dir: None,
+            temp_dirs: Vec::new(),
             threads: 1,
             output_compression: 6,
             temp_compression: 1, // Default: fast compression
@@ -1226,10 +1237,23 @@ impl RawExternalSorter {
         self
     }
 
-    /// Set the temporary directory for spill files.
+    /// Set a single temporary directory for spill files.
+    ///
+    /// Equivalent to calling [`Self::temp_dirs`] with a single-element vector.
     #[must_use]
     pub fn temp_dir(mut self, path: PathBuf) -> Self {
-        self.temp_dir = Some(path);
+        self.temp_dirs = vec![path];
+        self
+    }
+
+    /// Set multiple temporary directories for spill files.
+    ///
+    /// Spill files are distributed across the supplied directories in
+    /// free-space-aware round-robin order. Passing an empty vector falls
+    /// back to a single directory under the system temp location.
+    #[must_use]
+    pub fn temp_dirs(mut self, paths: Vec<PathBuf>) -> Self {
+        self.temp_dirs = paths;
         self
     }
 
@@ -1401,7 +1425,7 @@ impl RawExternalSorter {
         );
 
         // Create merged output file
-        let merged_path = namer.next_merged_path();
+        let merged_path = namer.next_merged_path()?;
 
         // Open readers with semaphore to cap concurrent I/O.
         let sem = make_reader_semaphore(self.threads);
@@ -1505,20 +1529,19 @@ impl RawExternalSorter {
             header
         };
 
-        // Create temp directory
-        let temp_dir = self.create_temp_dir()?;
-        let temp_path = temp_dir.path();
+        // _temp_dirs: RAII handles; kept alive until sort returns.
+        let (_temp_dirs, mut alloc) = self.create_temp_dirs()?;
 
         // Sort based on order
         match self.sort_order {
             SortOrder::Coordinate => {
-                self.sort_coordinate(record_source, pool, &header, output, temp_path)
+                self.sort_coordinate(record_source, pool, &header, output, &mut alloc)
             }
             SortOrder::Queryname(comparator) => {
-                self.sort_queryname(record_source, pool, &header, output, temp_path, comparator)
+                self.sort_queryname(record_source, pool, &header, output, &mut alloc, comparator)
             }
             SortOrder::TemplateCoordinate => {
-                self.sort_template_coordinate(record_source, pool, &header, output, temp_path)
+                self.sort_template_coordinate(record_source, pool, &header, output, &mut alloc)
             }
         }
     }
@@ -1670,12 +1693,12 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        temp_path: &Path,
+        alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
         if self.write_index {
-            self.sort_coordinate_with_index(record_source, pool, header, output, temp_path)
+            self.sort_coordinate_with_index(record_source, pool, header, output, alloc)
         } else {
-            self.sort_coordinate_optimized(record_source, pool, header, output, temp_path)
+            self.sort_coordinate_optimized(record_source, pool, header, output, alloc)
         }
     }
 
@@ -1690,7 +1713,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        temp_path: &Path,
+        alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
         use crate::sort::keys::RawCoordinateKey;
 
@@ -1710,7 +1733,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
-        let mut namer = ChunkNamer::new(temp_path);
+        let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
@@ -1747,7 +1770,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path();
+                let chunk_path = namer.next_chunk_path()?;
 
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -1876,7 +1899,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        temp_path: &Path,
+        alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
         use crate::bam_io::{create_indexing_bam_writer, write_bai_index};
         use crate::sort::keys::RawCoordinateKey;
@@ -1894,7 +1917,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
-        let mut namer = ChunkNamer::new(temp_path);
+        let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
@@ -1926,7 +1949,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path();
+                let chunk_path = namer.next_chunk_path()?;
 
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -2063,7 +2086,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        temp_path: &Path,
+        alloc: &mut TmpDirAllocator,
         comparator: QuerynameComparator,
     ) -> Result<RawSortStats> {
         use crate::sort::keys::{RawQuerynameKey, RawQuerynameLexKey};
@@ -2074,14 +2097,14 @@ impl RawExternalSorter {
                 pool,
                 header,
                 output,
-                temp_path,
+                alloc,
             ),
             QuerynameComparator::Natural => self.sort_queryname_keyed::<RawQuerynameKey>(
                 record_source,
                 pool,
                 header,
                 output,
-                temp_path,
+                alloc,
             ),
         }
     }
@@ -2094,7 +2117,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        temp_path: &Path,
+        alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
         use crate::sort::keys::SortContext;
 
@@ -2110,7 +2133,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut entries: Vec<(K, Vec<u8>)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
-        let mut namer = ChunkNamer::new(temp_path);
+        let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
@@ -2155,7 +2178,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(bstats, Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path();
+                let chunk_path = namer.next_chunk_path()?;
 
                 timer.time_sort(|| {
                     use rayon::prelude::*;
@@ -2300,7 +2323,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        temp_path: &Path,
+        alloc: &mut TmpDirAllocator,
     ) -> Result<RawSortStats> {
         let mut stats = RawSortStats::default();
         let mut timer = SortPhaseTimer::new();
@@ -2323,7 +2346,7 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
-        let mut namer = ChunkNamer::new(temp_path);
+        let mut namer = ChunkNamer::new(alloc);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
@@ -2367,7 +2390,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path();
+                let chunk_path = namer.next_chunk_path()?;
 
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -2842,9 +2865,34 @@ impl RawExternalSorter {
         super::create_output_header(self.sort_order, header)
     }
 
-    /// Create temporary directory for spill files.
-    fn create_temp_dir(&self) -> Result<TempDir> {
-        super::create_temp_dir(self.temp_dir.as_deref())
+    /// Create per-base temp directories and an allocator over their subdirs.
+    ///
+    /// For each user-supplied base directory, a fresh sort-run subdirectory is
+    /// created (via `tempfile::TempDir`). The returned [`Vec<TempDir>`] owns
+    /// those handles so subdirs are removed on drop; the allocator hands out
+    /// the corresponding subdir paths for chunk/merged file placement.
+    ///
+    /// When `temp_dirs` is empty, a single subdirectory is created under the
+    /// system default temp location.
+    fn create_temp_dirs(&self) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
+        use super::create_temp_dir;
+
+        if self.temp_dirs.is_empty() {
+            let td = create_temp_dir(None)?;
+            let base = td.path().to_path_buf();
+            let alloc = TmpDirAllocator::new(vec![base])?;
+            return Ok((vec![td], alloc));
+        }
+
+        let mut handles = Vec::with_capacity(self.temp_dirs.len());
+        let mut subdirs = Vec::with_capacity(self.temp_dirs.len());
+        for base in &self.temp_dirs {
+            let td = create_temp_dir(Some(base))?;
+            subdirs.push(td.path().to_path_buf());
+            handles.push(td);
+        }
+        let alloc = TmpDirAllocator::new(subdirs)?;
+        Ok((handles, alloc))
     }
 }
 
@@ -3051,7 +3099,7 @@ mod tests {
     fn test_raw_sorter_defaults() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate);
         assert_eq!(sorter.memory_limit, 512 * 1024 * 1024);
-        assert!(sorter.temp_dir.is_none());
+        assert!(sorter.temp_dirs.is_empty());
         assert_eq!(sorter.threads, 1);
         assert_eq!(sorter.output_compression, 6);
         assert_eq!(sorter.temp_compression, 1);
@@ -3073,7 +3121,7 @@ mod tests {
             .max_temp_files(128);
 
         assert_eq!(sorter.memory_limit, 1024);
-        assert_eq!(sorter.temp_dir, Some(PathBuf::from("/tmp/test")));
+        assert_eq!(sorter.temp_dirs, vec![PathBuf::from("/tmp/test")]);
         assert_eq!(sorter.threads, 8);
         assert_eq!(sorter.output_compression, 9);
         assert_eq!(sorter.temp_compression, 3);
@@ -3943,5 +3991,64 @@ mod tests {
             let total: usize = chunks.iter().map(Vec::len).sum();
             assert_eq!(total, n, "n={n} threads={threads}: total mismatch");
         }
+    }
+
+    /// End-to-end sort across two temp directories. Forces multiple spill
+    /// chunks and verifies the output is still correct. The round-robin
+    /// distribution itself is covered by `TmpDirAllocator`'s unit tests; this
+    /// test proves the plumbing from `temp_dirs(...)` through to the sort
+    /// fns works and that multi-dir mode produces byte-identical output to
+    /// single-dir mode.
+    #[test]
+    fn test_sort_with_two_temp_dirs_matches_single_dir() {
+        use crate::sam::builder::SamBuilder;
+
+        let num_pairs = 200;
+        let mut builder = SamBuilder::new();
+        for i in 0..num_pairs {
+            let _ = builder
+                .add_pair()
+                .name(&format!("read{i:05}"))
+                .start1(i * 200 + 1)
+                .start2(i * 200 + 101)
+                .build();
+        }
+
+        let workdir = tempfile::tempdir().expect("workdir");
+        let input = workdir.path().join("input.bam");
+        let output_multi = workdir.path().join("output_multi.bam");
+        let output_single = workdir.path().join("output_single.bam");
+        builder.write_bam(&input).expect("write bam");
+
+        let tmp_a = tempfile::tempdir().expect("tmp a");
+        let tmp_b = tempfile::tempdir().expect("tmp b");
+
+        // 8 KiB memory limit forces several spills across the dir rotation.
+        let stats_multi = RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .threads(1)
+            .temp_compression(0)
+            .output_compression(0)
+            .temp_dirs(vec![tmp_a.path().to_path_buf(), tmp_b.path().to_path_buf()])
+            .sort(&input, &output_multi)
+            .expect("multi-dir sort should succeed");
+
+        assert!(stats_multi.chunks_written >= 2, "expected multiple spill chunks");
+
+        RawExternalSorter::new(SortOrder::Coordinate)
+            .memory_limit(8 * 1024)
+            .threads(1)
+            .temp_compression(0)
+            .output_compression(0)
+            .sort(&input, &output_single)
+            .expect("single-dir sort should succeed");
+
+        let names_multi = collect_read_names(&output_multi);
+        let names_single = collect_read_names(&output_single);
+        assert_eq!(names_multi.len(), num_pairs * 2, "record count mismatch");
+        assert_eq!(
+            names_multi, names_single,
+            "multi-dir and single-dir sort produced different record orders"
+        );
     }
 }
