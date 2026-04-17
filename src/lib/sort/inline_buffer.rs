@@ -13,7 +13,7 @@ use crate::sort::bam_fields;
 use crate::sort::keys::{RawCoordinateKey, RawSortKey, SortContext};
 use crate::sort::radix::bytes_needed_u64;
 use crate::sort::segmented_buf::SegmentedBuf;
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 
@@ -190,8 +190,11 @@ macro_rules! par_sort_into_chunks_impl {
 
         if $threads <= 1 || n < RADIX_THRESHOLD * 2 || n <= 10_000 {
             $sort_fn(&mut $self.refs);
-            let chunk =
-                $self.refs.iter().map(|r| ($key_fn(r), $self.get_record(r).to_vec())).collect();
+            let chunk = $self
+                .refs
+                .iter()
+                .map(|r| ($key_fn(r), RawRecord::from($self.get_record(r).to_vec())))
+                .collect();
             return vec![chunk];
         }
 
@@ -204,7 +207,12 @@ macro_rules! par_sort_into_chunks_impl {
         $self
             .refs
             .chunks(chunk_size)
-            .map(|chunk| chunk.iter().map(|r| ($key_fn(r), $self.get_record(r).to_vec())).collect())
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|r| ($key_fn(r), RawRecord::from($self.get_record(r).to_vec())))
+                    .collect()
+            })
             .collect()
     }};
 }
@@ -302,14 +310,14 @@ impl RecordBuffer {
     ///
     /// Instead of merging the parallel sort sub-arrays back into one sorted
     /// buffer (as `par_sort` does), this returns each sub-array as its own
-    /// `Vec<(RawCoordinateKey, Vec<u8>)>` so they can be passed as separate
+    /// `Vec<(RawCoordinateKey, RawRecord)>` so they can be passed as separate
     /// merge sources to the k-way merge, avoiding the intermediate merge step.
     ///
     /// When `threads <= 1`, returns a single chunk.
     pub fn par_sort_into_chunks(
         &mut self,
         threads: usize,
-    ) -> Vec<Vec<(RawCoordinateKey, Vec<u8>)>> {
+    ) -> Vec<Vec<(RawCoordinateKey, RawRecord)>> {
         par_sort_into_chunks_impl!(self, threads, radix_sort_record_refs, |r: &RecordRef| {
             RawCoordinateKey { sort_key: r.sort_key }
         })
@@ -910,11 +918,11 @@ impl TemplateRecordBuffer {
     ///
     /// Instead of merging the parallel sort sub-arrays back into one sorted
     /// buffer (as `par_sort` does), this returns each sub-array as its own
-    /// `Vec<(TemplateKey, Vec<u8>)>` so they can be passed as separate merge
+    /// `Vec<(TemplateKey, RawRecord)>` so they can be passed as separate merge
     /// sources to the k-way merge, avoiding the intermediate merge step.
     ///
     /// When `threads <= 1`, returns a single chunk.
-    pub fn par_sort_into_chunks(&mut self, threads: usize) -> Vec<Vec<(TemplateKey, Vec<u8>)>> {
+    pub fn par_sort_into_chunks(&mut self, threads: usize) -> Vec<Vec<(TemplateKey, RawRecord)>> {
         par_sort_into_chunks_impl!(
             self,
             threads,

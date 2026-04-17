@@ -41,6 +41,8 @@
 use bytesize::ByteSize;
 use log::{Level, info, log_enabled};
 
+#[cfg(feature = "memory-debug")]
+pub use platform_ffi::print_mi_stats;
 pub use platform_ffi::{force_mi_collect, process_rss_bytes};
 
 /// Log target for the memory probe. Enable with
@@ -62,6 +64,18 @@ mod platform_ffi {
         // SAFETY: mi_collect(true) is a thread-safe arena maintenance call.
         unsafe {
             libmimalloc_sys::mi_collect(true);
+        }
+    }
+
+    /// Print mimalloc allocator statistics to stderr via the default output handler.
+    ///
+    /// `mi_stats_print_out(None, null_mut())` uses mimalloc's internal synchronization,
+    /// making it safe to call concurrently with allocation/deallocation on other threads.
+    #[cfg(feature = "memory-debug")]
+    pub fn print_mi_stats() {
+        // SAFETY: mimalloc synchronizes stats collection internally.
+        unsafe {
+            libmimalloc_sys::mi_stats_print_out(None, std::ptr::null_mut());
         }
     }
 

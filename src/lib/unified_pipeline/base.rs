@@ -92,6 +92,7 @@ use crate::bgzf_reader::{RawBgzfBlock, decompress_block_into, read_raw_blocks};
 use crate::read_info::LibraryIndex;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::sam::SamTag;
+use fgumi_raw_bam::RawRecord;
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::data::field::Tag;
 
@@ -385,13 +386,7 @@ pub fn start_memory_monitor(
                     && peak_rss > 4_000_000_000
                 {
                     log::info!("=== MIMALLOC STATS AT PEAK (no mi_collect) ===");
-                    // SAFETY: `mi_stats_print_out(None, null_mut())` prints mimalloc allocator
-                    // statistics to stderr using the default output handler. mimalloc internally
-                    // synchronizes stats collection, making this safe to call concurrently with
-                    // allocation/deallocation on other threads.
-                    unsafe {
-                        libmimalloc_sys::mi_stats_print_out(None, std::ptr::null_mut());
-                    }
+                    crate::sort::memory_probe::print_mi_stats();
                     stats_printed = true;
                 }
                 if current_rss > peak_rss {
@@ -1493,10 +1488,15 @@ pub struct DecodedRecord {
 }
 
 /// Record data: either a parsed noodles `RecordBuf` or raw BAM bytes.
+///
+/// The `Parsed` variant is retained for commands (e.g. `clip`) that require typed
+/// `RecordBuf` access for CIGAR edits and the noodles flag API.
+/// The `Raw` variant uses [`RawRecord`] for zero-overhead byte access and
+/// direct output writes without re-encoding.
 #[derive(Debug)]
 pub enum DecodedRecordData {
     Parsed(RecordBuf),
-    Raw(Vec<u8>),
+    Raw(RawRecord),
 }
 
 impl DecodedRecord {
@@ -1507,23 +1507,26 @@ impl DecodedRecord {
     }
 
     /// Create a decoded record from raw bytes, skipping noodles decode.
+    ///
+    /// Accepts anything that converts `Into<RawRecord>` (e.g. a bare `Vec<u8>` or
+    /// an already-constructed `RawRecord`).
     #[must_use]
-    pub fn from_raw_bytes(raw: Vec<u8>, key: GroupKey) -> Self {
-        Self { key, data: DecodedRecordData::Raw(raw) }
+    pub fn from_raw_bytes(raw: impl Into<RawRecord>, key: GroupKey) -> Self {
+        Self { key, data: DecodedRecordData::Raw(raw.into()) }
     }
 
-    /// Returns the raw bytes if this is a raw-mode record.
+    /// Returns a reference to the raw bytes if this is a raw-mode record.
     #[must_use]
     pub fn raw_bytes(&self) -> Option<&[u8]> {
         match &self.data {
-            DecodedRecordData::Raw(v) => Some(v),
+            DecodedRecordData::Raw(v) => Some(v.as_ref()),
             DecodedRecordData::Parsed(_) => None,
         }
     }
 
-    /// Takes the raw bytes out if this is a raw-mode record.
+    /// Takes the [`RawRecord`] out if this is a raw-mode record.
     #[must_use]
-    pub fn into_raw_bytes(self) -> Option<Vec<u8>> {
+    pub fn into_raw_bytes(self) -> Option<RawRecord> {
         match self.data {
             DecodedRecordData::Raw(v) => Some(v),
             DecodedRecordData::Parsed(_) => None,
@@ -1555,6 +1558,8 @@ impl MemoryEstimate for DecodedRecord {
             DecodedRecordData::Parsed(record) => {
                 crate::template::estimate_record_buf_heap_size(record)
             }
+            // RawRecord::capacity() returns the inner Vec<u8> capacity — same semantics
+            // as the previous Vec<u8>::capacity() call.
             DecodedRecordData::Raw(raw) => raw.capacity(),
         }
     }

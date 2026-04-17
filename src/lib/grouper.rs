@@ -14,6 +14,7 @@ use crate::sam::SamTag;
 use crate::sort::bam_fields;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
+use fgumi_raw_bam::RawRecord;
 
 // ============================================================================
 // BatchWeight Implementations
@@ -30,6 +31,20 @@ impl BatchWeight for RecordBuf {
 impl BatchWeight for Vec<u8> {
     fn batch_weight(&self) -> usize {
         1
+    }
+}
+
+/// [`RawRecord`] has weight 1 (same semantics as the `Vec<u8>` impl above).
+impl BatchWeight for RawRecord {
+    fn batch_weight(&self) -> usize {
+        1
+    }
+}
+
+/// Heap size of a [`RawRecord`] is its buffer capacity.
+impl MemoryEstimate for RawRecord {
+    fn estimate_heap_size(&self) -> usize {
+        self.capacity()
     }
 }
 
@@ -110,7 +125,7 @@ impl SingleRawRecordGrouper {
 }
 
 impl Grouper for SingleRawRecordGrouper {
-    type Group = Vec<u8>;
+    type Group = RawRecord;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
         records
@@ -165,8 +180,8 @@ pub struct TemplateGrouper {
     current_name_hash: Option<u64>,
     /// Records for current template (non-raw mode).
     current_records: Vec<RecordBuf>,
-    /// Raw byte records for current template (raw-byte mode).
-    current_raw_records: Vec<Vec<u8>>,
+    /// Raw records for current template (raw-byte mode).
+    current_raw_records: Vec<RawRecord>,
     /// Completed templates waiting to be batched.
     pending_templates: VecDeque<Template>,
 }
@@ -1002,8 +1017,8 @@ mod tests {
         use crate::unified_pipeline::{DecodedRecord, GroupKey};
 
         let mut grouper = SingleRawRecordGrouper::new();
-        let raw1 = vec![1u8; 36];
-        let raw2 = vec![2u8; 36];
+        let raw1 = RawRecord::from(vec![1u8; 36]);
+        let raw2 = RawRecord::from(vec![2u8; 36]);
         let records = vec![
             DecodedRecord::from_raw_bytes(raw1.clone(), GroupKey::default()),
             DecodedRecord::from_raw_bytes(raw2.clone(), GroupKey::default()),

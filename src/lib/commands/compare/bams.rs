@@ -27,8 +27,6 @@ use fgumi_raw_bam::{RawRecord, find_int_tag, find_string_tag};
 use itertools::Itertools;
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::record::Cigar as CigarTrait;
-use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
@@ -249,84 +247,81 @@ impl std::fmt::Display for DiffType {
 const FIELD_NAMES: [&str; 11] =
     ["QNAME", "FLAG", "RNAME", "POS", "MAPQ", "CIGAR", "RNEXT", "PNEXT", "TLEN", "SEQ", "QUAL"];
 
-/// Convert CIGAR op kind to its SAM character representation.
-fn cigar_kind_to_char(kind: Kind) -> char {
-    match kind {
-        Kind::Match => 'M',
-        Kind::Insertion => 'I',
-        Kind::Deletion => 'D',
-        Kind::Skip => 'N',
-        Kind::SoftClip => 'S',
-        Kind::HardClip => 'H',
-        Kind::Pad => 'P',
-        Kind::SequenceMatch => '=',
-        Kind::SequenceMismatch => 'X',
+/// Format CIGAR from raw BAM record bytes as a SAM-style string.
+fn format_cigar_raw(bam: &[u8]) -> String {
+    let s = fgumi_raw_bam::cigar_to_string_from_raw(bam);
+    if s.is_empty() { "*".to_string() } else { s }
+}
+
+/// Format sequence from raw BAM record bytes as an ASCII string.
+fn format_sequence_raw(bam: &[u8]) -> String {
+    let view = fgumi_raw_bam::RawRecordView::new(bam);
+    if view.l_seq() == 0 {
+        "*".to_string()
+    } else {
+        // extract_sequence returns uppercase ASCII bases (A/C/G/T/N/=…)
+        String::from_utf8_lossy(&fgumi_raw_bam::extract_sequence(bam)).into_owned()
     }
 }
 
-/// Format CIGAR as a string.
-fn format_cigar(record: &RecordBuf) -> String {
-    let cigar = record.cigar();
-    let ops: Vec<String> = cigar
-        .iter()
-        .flatten()
-        .map(|op| format!("{}{}", op.len(), cigar_kind_to_char(op.kind())))
-        .collect();
-    if ops.is_empty() { "*".to_string() } else { ops.join("") }
-}
+/// Extract core SAM fields as comparable strings directly from raw BAM bytes.
+///
+/// RNAME and RNEXT are resolved through `header` (requires typed API).
+/// All other fields are read from raw bytes via `RawRecordView`.
+fn get_core_fields_raw(raw: &RawRecord, header: &noodles::sam::Header) -> [String; 11] {
+    let view = fgumi_raw_bam::RawRecordView::new(raw.as_ref());
 
-/// Format sequence as a string.
-fn format_sequence(record: &RecordBuf) -> String {
-    let seq = record.sequence();
-    if seq.is_empty() {
+    let qname = String::from_utf8_lossy(view.read_name()).into_owned();
+    let flag = view.flags().to_string();
+
+    // ref_id is 0-based index into header reference sequences; -1 = unmapped
+    let ref_id = view.ref_id();
+    let rname = if ref_id < 0 {
         "*".to_string()
     } else {
-        seq.as_ref()
-            .iter()
-            .map(|&b| match b {
-                b'A' | b'a' => 'A',
-                b'C' | b'c' => 'C',
-                b'G' | b'g' => 'G',
-                b'T' | b't' => 'T',
-                _ => 'N',
-            })
-            .collect()
-    }
-}
+        header
+            .reference_sequences()
+            .get_index(ref_id as usize)
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| "*".to_string())
+    };
 
-/// Extract core SAM fields as comparable strings.
-fn get_core_fields(record: &RecordBuf, header: &noodles::sam::Header) -> [String; 11] {
-    let qname = record_name_to_string(record);
-    let flag = record.flags().bits().to_string();
+    // pos is 0-based; SAM/display convention is 1-based (0 when unmapped)
+    let pos_raw = view.pos();
+    let pos = if pos_raw < 0 { "0".to_string() } else { (pos_raw + 1).to_string() };
 
-    let rname = record
-        .reference_sequence_id()
-        .and_then(|id| header.reference_sequences().get_index(id).map(|(name, _)| name.to_string()))
-        .unwrap_or_else(|| "*".to_string());
+    let mapq_raw = view.mapq();
+    let mapq = if mapq_raw == 255 { "255".to_string() } else { mapq_raw.to_string() };
 
-    // Position is 0-based internally, report as 1-based
-    let pos = record.alignment_start().map_or_else(|| "0".to_string(), |p| p.get().to_string());
+    let cigar = format_cigar_raw(raw.as_ref());
 
-    let mapq = record.mapping_quality().map_or_else(|| "255".to_string(), |q| q.get().to_string());
-
-    let cigar = format_cigar(record);
-
-    let rnext = record
-        .mate_reference_sequence_id()
-        .and_then(|id| header.reference_sequences().get_index(id).map(|(name, _)| name.to_string()))
-        .unwrap_or_else(|| "*".to_string());
-
-    let pnext =
-        record.mate_alignment_start().map_or_else(|| "0".to_string(), |p| p.get().to_string());
-
-    let tlen = record.template_length().to_string();
-
-    let seq = format_sequence(record);
-
-    let qual = if record.quality_scores().is_empty() {
+    let mate_ref_id = view.mate_ref_id();
+    let rnext = if mate_ref_id < 0 {
         "*".to_string()
     } else {
-        record.quality_scores().as_ref().iter().map(|q| (q + 33) as char).collect()
+        header
+            .reference_sequences()
+            .get_index(mate_ref_id as usize)
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| "*".to_string())
+    };
+
+    let mate_pos_raw = view.mate_pos();
+    let pnext = if mate_pos_raw < 0 { "0".to_string() } else { (mate_pos_raw + 1).to_string() };
+
+    let tlen = view.template_length().to_string();
+
+    let seq = format_sequence_raw(raw.as_ref());
+
+    // Quality scores in raw BAM are 0-based Phred. Per SAM/BAM spec, absent QUAL is
+    // signaled by ALL bytes being 0xFF — match that exactly to avoid mis-classifying
+    // malformed records with a stray 0xFF. Saturate the Phred→ASCII conversion at '~'
+    // (Phred 93) to avoid u8 wraparound for any remaining out-of-range bytes.
+    let qual_bytes = fgumi_raw_bam::quality_scores_slice(raw.as_ref());
+    let qual = if qual_bytes.is_empty() || qual_bytes.iter().all(|&q| q == 0xFF) {
+        "*".to_string()
+    } else {
+        qual_bytes.iter().map(|&q| (q.saturating_add(33).min(b'~')) as char).collect()
     };
 
     [qname, flag, rname, pos, mapq, cigar, rnext, pnext, tlen, seq, qual]
@@ -379,9 +374,9 @@ fn record_name_to_string(record: &RecordBuf) -> String {
 }
 
 /// Check if the first-in-template (R1) flag is set in raw BAM record bytes.
+#[inline]
 fn is_first_segment_raw(raw: &RawRecord) -> bool {
-    let flags = fgumi_raw_bam::RawRecordView::new(raw.as_ref()).flags();
-    flags & raw_fields::flags::FIRST_SEGMENT != 0
+    fgumi_raw_bam::RawRecordView::new(raw.as_ref()).is_first_segment()
 }
 
 // ============================================================================
@@ -598,8 +593,9 @@ fn deserialize_raw_record(raw: &RawRecord) -> Result<RecordBuf> {
 /// **Tier 2:** Structured raw comparison — compare core fields and tags at the byte
 ///   level without full deserialization. If core and tags match (possibly with different
 ///   tag order), return without deserializing.
-/// **Tier 3:** Full deserialization — only when records actually differ, deserialize
-///   to `RecordBuf` for human-readable diff reporting.
+/// **Tier 3:** Targeted deserialization for diff reporting — deserialize to `RecordBuf`
+///   only for tag-diff cases that need typed tag display; render core-field diffs
+///   directly from raw bytes.
 ///
 /// Returns `(results, core_matches, core_diffs, tag_matches, tag_diffs, tag_order_diffs)`.
 fn compare_raw_batch_parallel(
@@ -638,44 +634,45 @@ fn compare_raw_batch_parallel(
                 };
             }
 
-            // Tier 3: Full deserialization for diff reporting
-            let rec1 = match deserialize_raw_record(r1) {
-                Ok(r) => r,
-                Err(e) => {
-                    return RecordCompareResult {
-                        core_match: false,
-                        tags_match: false,
-                        tag_order_match: false,
-                        diff_detail: Some(DiffDetail {
-                            record_num,
-                            qname: format!("<deserialization error: {e}>"),
-                            flags: String::new(),
-                            diff_type: DiffType::CoreDiff,
-                            diffs: vec![format!("Failed to deserialize record from BAM1: {e}")],
-                        }),
-                    };
-                }
-            };
-            let rec2 = match deserialize_raw_record(r2) {
-                Ok(r) => r,
-                Err(e) => {
-                    return RecordCompareResult {
-                        core_match: false,
-                        tags_match: false,
-                        tag_order_match: false,
-                        diff_detail: Some(DiffDetail {
-                            record_num,
-                            qname: record_name_to_string(&rec1),
-                            flags: rec1.flags().bits().to_string(),
-                            diff_type: DiffType::CoreDiff,
-                            diffs: vec![format!("Failed to deserialize record from BAM2: {e}")],
-                        }),
-                    };
-                }
-            };
-
+            // Tier 3: diff reporting — two sub-cases:
+            //   (a) core matches but tags differ: deserialize for typed tag value display
+            //   (b) core fields differ: use raw bytes directly (no deserialization needed)
             let diff_detail = if raw_result.core_match {
-                // Core matches but tags differ
+                // (a) Core matches but tags differ — deserialize for typed tag value display
+                let rec1 = match deserialize_raw_record(r1) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return RecordCompareResult {
+                            core_match: false,
+                            tags_match: false,
+                            tag_order_match: false,
+                            diff_detail: Some(DiffDetail {
+                                record_num,
+                                qname: format!("<deserialization error: {e}>"),
+                                flags: String::new(),
+                                diff_type: DiffType::TagDiff,
+                                diffs: vec![format!("Failed to deserialize record from BAM1: {e}")],
+                            }),
+                        };
+                    }
+                };
+                let rec2 = match deserialize_raw_record(r2) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return RecordCompareResult {
+                            core_match: false,
+                            tags_match: false,
+                            tag_order_match: false,
+                            diff_detail: Some(DiffDetail {
+                                record_num,
+                                qname: record_name_to_string(&rec1),
+                                flags: rec1.flags().bits().to_string(),
+                                diff_type: DiffType::TagDiff,
+                                diffs: vec![format!("Failed to deserialize record from BAM2: {e}")],
+                            }),
+                        };
+                    }
+                };
                 let tags1 = get_tags_map(&rec1);
                 let tags2 = get_tags_map(&rec2);
                 let mut all_tags: Vec<&String> = tags1.keys().chain(tags2.keys()).collect();
@@ -713,9 +710,9 @@ fn compare_raw_batch_parallel(
                     diffs,
                 })
             } else {
-                // Core fields differ
-                let core1 = get_core_fields(&rec1, header1);
-                let core2 = get_core_fields(&rec2, header2);
+                // (b) Core fields differ — extract from raw bytes via RawRecordView
+                let core1 = get_core_fields_raw(r1, header1);
+                let core2 = get_core_fields_raw(r2, header2);
                 let diffs: Vec<String> = core1
                     .iter()
                     .zip(core2.iter())

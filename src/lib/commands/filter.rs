@@ -34,7 +34,7 @@ use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
 use std::io;
@@ -222,9 +222,9 @@ pub struct Filter {
 /// Result from processing a batch of records through raw-byte filtering.
 struct FilterProcessedBatchRaw {
     /// Records that passed filtering (raw bytes).
-    kept_records: Vec<Vec<u8>>,
+    kept_records: Vec<RawRecord>,
     /// Records that failed filtering (raw bytes, if tracking rejects).
-    rejected_records: Vec<Vec<u8>>,
+    rejected_records: Vec<RawRecord>,
     /// Number of records processed.
     records_count: u64,
     /// Number of records that passed.
@@ -235,17 +235,17 @@ struct FilterProcessedBatchRaw {
 
 impl MemoryEstimate for FilterProcessedBatchRaw {
     fn estimate_heap_size(&self) -> usize {
-        let vec_overhead = std::mem::size_of::<Vec<u8>>();
+        let vec_overhead = std::mem::size_of::<RawRecord>();
         let kept_outer = self.kept_records.capacity() * vec_overhead;
-        let kept_inner: usize = self.kept_records.iter().map(|v| v.capacity()).sum();
+        let kept_inner: usize = self.kept_records.iter().map(RawRecord::capacity).sum();
         let rejected_outer = self.rejected_records.capacity() * vec_overhead;
-        let rejected_inner: usize = self.rejected_records.iter().map(|v| v.capacity()).sum();
+        let rejected_inner: usize = self.rejected_records.iter().map(RawRecord::capacity).sum();
         kept_outer + kept_inner + rejected_outer + rejected_inner
     }
 }
 
 /// Serialize raw BAM records directly (bypasses `bam_codec` encoder).
-fn serialize_raw_records(records: &[Vec<u8>], output: &mut Vec<u8>) -> io::Result<u64> {
+fn serialize_raw_records(records: &[RawRecord], output: &mut Vec<u8>) -> io::Result<u64> {
     for record in records {
         let len = u32::try_from(record.len()).map_err(|_| {
             io::Error::new(
@@ -557,12 +557,12 @@ impl Filter {
         let ctx = self.process_captures(&setup, &header);
 
         let grouper_fn = move |_header: &Header| {
-            Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = Vec<u8>> + Send>
+            Box::new(SingleRawRecordGrouper::new()) as Box<dyn Grouper<Group = RawRecord> + Send>
         };
 
-        let process_fn = move |mut record: Vec<u8>| -> io::Result<FilterProcessedBatchRaw> {
-            let mut kept_records = Vec::new();
-            let mut rejected_records = Vec::new();
+        let process_fn = move |mut record: RawRecord| -> io::Result<FilterProcessedBatchRaw> {
+            let mut kept_records: Vec<RawRecord> = Vec::new();
+            let mut rejected_records: Vec<RawRecord> = Vec::new();
             let mut passed_count = 0u64;
 
             let (bases_masked, pass) = Self::process_record_raw(
@@ -631,14 +631,14 @@ impl Filter {
         };
 
         let process_fn = move |batch: TemplateBatch| -> io::Result<FilterProcessedBatchRaw> {
-            let mut kept_records: Vec<Vec<u8>> = Vec::new();
-            let mut rejected_records: Vec<Vec<u8>> = Vec::new();
+            let mut kept_records: Vec<RawRecord> = Vec::new();
+            let mut rejected_records: Vec<RawRecord> = Vec::new();
             let mut total_records = 0u64;
             let mut passed_count = 0u64;
             let mut bases_masked = 0u64;
 
             for template in batch {
-                let mut template_records = template
+                let mut template_records: Vec<RawRecord> = template
                     .into_raw_records()
                     .ok_or_else(|| io::Error::other("template has no raw records"))?;
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
@@ -737,7 +737,7 @@ impl Filter {
     /// Returns `(bases_masked, pass)`.
     #[allow(clippy::too_many_arguments)]
     fn process_record_raw(
-        record: &mut Vec<u8>,
+        record: &mut RawRecord,
         config: &FilterConfig,
         reference: Option<&ReferenceReader>,
         header: &Header,
@@ -831,7 +831,7 @@ impl Filter {
         }
 
         if let Some(reference) = reference {
-            regenerate_alignment_tags_raw(record, header, reference)?;
+            regenerate_alignment_tags_raw(record.as_mut_vec(), header, reference)?;
         }
 
         let mut pass = {
@@ -1683,7 +1683,7 @@ mod tests {
         let r1 = create_r1_record(b"ACGT", &[30, 30, 30, 30]);
         let r2 = create_r2_record(b"GGGG", &[30, 30, 30, 30]);
 
-        let records: Vec<Vec<u8>> = vec![r1.into_inner(), r2.into_inner()];
+        let records = vec![r1, r2];
         let mut pass_map = AHashMap::new();
         pass_map.insert(0, true);
         pass_map.insert(1, true);
@@ -1699,7 +1699,7 @@ mod tests {
         let r1 = create_r1_record(b"ACGT", &[30, 30, 30, 30]);
         let r2 = create_r2_record(b"GGGG", &[30, 30, 30, 30]);
 
-        let records: Vec<Vec<u8>> = vec![r1.into_inner(), r2.into_inner()];
+        let records = vec![r1, r2];
         let mut pass_map = AHashMap::new();
         pass_map.insert(0, true);
         pass_map.insert(1, false); // One fails
@@ -4263,8 +4263,9 @@ mod tests {
             .build();
 
         let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record)?;
+        let mut raw_bytes = Vec::new();
+        encode_record_buf(&mut raw_bytes, &header, &record)?;
+        let mut raw = RawRecord::from(raw_bytes);
 
         let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
 
@@ -4313,8 +4314,9 @@ mod tests {
             )
             .build();
 
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &sam_builder.header, &record)?;
+        let mut raw_bytes = Vec::new();
+        encode_record_buf(&mut raw_bytes, &sam_builder.header, &record)?;
+        let mut raw = RawRecord::from(raw_bytes);
 
         let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
 

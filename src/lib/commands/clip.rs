@@ -27,6 +27,8 @@ use clap::Parser;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
+// RecordBuf retained: SamRecordClipper (T2.9) requires typed CIGAR/sequence editing on RecordBuf;
+// all record flow in clip.rs is driven by that clipper and Template.records (T2.1).
 use noodles::sam::alignment::record::Cigar as CigarTrait;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -168,6 +170,7 @@ pub struct Clip {
 /// Result from processing a batch of templates through clipping.
 struct ClipProcessedBatch {
     /// Clipped records to write to output BAM.
+    // RecordBuf retained: SamRecordClipper (T2.9) mutates typed CIGAR/sequence on RecordBuf.
     clipped_records: Vec<RecordBuf>,
     /// Number of templates processed.
     templates_count: u64,
@@ -405,6 +408,8 @@ impl Clip {
     /// # Errors
     ///
     /// Returns an error if clipping operations fail.
+    // RecordBuf retained throughout clip_fragment / clip_pair / update_mate_info:
+    // SamRecordClipper (T2.9) requires typed CIGAR editing on RecordBuf.
     fn clip_fragment(
         &self,
         clipper: &SamRecordClipper,
@@ -853,6 +858,8 @@ impl Clip {
 ///
 /// * `record` - The record to update (mutable)
 /// * `mate` - The mate record to read information from
+// RecordBuf retained: records here are the same SamRecordClipper-mutated RecordBuf objects;
+// converting to raw bytes for tag ops and back would add overhead with no benefit until T2.9.
 #[allow(clippy::similar_names)] // mc_tag and mq_tag are standard SAM tags
 #[allow(clippy::cast_lossless)] // u8 to i32 cast is intentional for SAM tag format
 fn update_mate_info(

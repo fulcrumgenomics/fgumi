@@ -24,9 +24,9 @@
 //! - **Buffered prefetch**: Records are prefetched ahead of merge consumption
 //! - **Multi-threaded output**: Writing uses parallel BGZF compression
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use noodles::bam::{self, Record};
+use fgumi_raw_bam::{RawRecord, read_raw_record};
 use noodles::bgzf;
 use noodles::sam::Header;
 use std::cmp::Ordering;
@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
 use super::MERGE_BUFFER_SIZE;
-use crate::bam_io::create_bam_writer;
+use crate::bam_io::create_raw_bam_writer;
 
 /// Number of records to prefetch per chunk reader.
 const PREFETCH_BUFFER_SIZE: usize = 128;
@@ -45,7 +45,7 @@ const PREFETCH_BUFFER_SIZE: usize = 128;
 /// A record with its sort key and source chunk index.
 pub struct MergeEntry<K> {
     pub key: K,
-    pub record: Record,
+    pub record: RawRecord,
     pub chunk_idx: usize,
 }
 
@@ -85,13 +85,18 @@ impl Default for ParallelMergeConfig {
     }
 }
 
+/// One message from a [`PrefetchingChunkReader`] — `Ok(Some(_))` carries a record,
+/// `Ok(None)` signals clean EOF, and `Err(_)` carries a reader/I/O failure that
+/// must abort the merge instead of being silently treated as EOF.
+type ChunkReaderMsg = std::result::Result<Option<RawRecord>, String>;
+
 /// Prefetching chunk reader that runs in a background thread.
 ///
 /// This reader maintains a buffer of prefetched records, allowing the merge
 /// thread to consume records without blocking on I/O.
 struct PrefetchingChunkReader {
     /// Receiver for prefetched records.
-    record_rx: Receiver<Option<Record>>,
+    record_rx: Receiver<ChunkReaderMsg>,
     /// Handle to the reader thread.
     _handle: JoinHandle<()>,
     /// Chunk index for heap management.
@@ -105,11 +110,10 @@ impl PrefetchingChunkReader {
         // Channel for prefetched records
         let (record_tx, record_rx) = bounded(PREFETCH_BUFFER_SIZE);
 
-        // Spawn reader thread
+        // Spawn reader thread. Reader-side failures are surfaced over the
+        // channel so the merge loop can abort instead of truncating.
         let handle = thread::spawn(move || {
-            if let Err(e) = Self::reader_thread(path, record_tx) {
-                log::error!("Chunk reader thread failed: {e}");
-            }
+            Self::reader_thread(path, record_tx);
         });
 
         Ok(Self { record_rx, _handle: handle, idx })
@@ -117,48 +121,62 @@ impl PrefetchingChunkReader {
 
     /// Reader thread function.
     #[allow(clippy::needless_pass_by_value)]
-    fn reader_thread(path: PathBuf, tx: Sender<Option<Record>>) -> Result<()> {
-        let file = File::open(&path).context("Failed to open chunk file")?;
+    fn reader_thread(path: PathBuf, tx: Sender<ChunkReaderMsg>) {
+        let file = match File::open(&path).context("Failed to open chunk file") {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
         let buf_reader = BufReader::with_capacity(MERGE_BUFFER_SIZE, file);
         let bgzf_reader = bgzf::io::Reader::new(buf_reader);
-        let mut reader = bam::io::Reader::from(bgzf_reader);
+        let mut noodles_reader = noodles::bam::io::Reader::from(bgzf_reader);
 
         // Read and discard header
-        reader.read_header()?;
+        if let Err(e) = noodles_reader.read_header() {
+            let _ = tx.send(Err(format!("Failed to read chunk header: {e}")));
+            return;
+        }
 
-        // Read records and send to channel
-        let mut record = Record::default();
+        // Extract the inner BGZF reader (header already consumed)
+        let mut bgzf_reader = noodles_reader.into_inner();
+
+        // Read raw records and send to channel
+        let mut record = RawRecord::new();
         loop {
-            match reader.read_record(&mut record) {
+            match read_raw_record(&mut bgzf_reader, &mut record) {
                 Ok(0) => {
-                    // EOF - send None to signal end
-                    let _ = tx.send(None);
+                    // Clean EOF
+                    let _ = tx.send(Ok(None));
                     break;
                 }
                 Ok(_) => {
-                    // Clone and send record (take ownership of current, reset for next)
+                    // Take ownership of current record and replace with empty one
                     let owned_record = std::mem::take(&mut record);
-                    if tx.send(Some(owned_record)).is_err() {
+                    if tx.send(Ok(Some(owned_record))).is_err() {
                         // Receiver dropped, exit
                         break;
                     }
                 }
                 Err(e) => {
-                    log::error!("Error reading chunk: {e}");
-                    let _ = tx.send(None);
+                    let _ = tx.send(Err(format!("Error reading chunk: {e}")));
                     break;
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Get the next record from the prefetch buffer.
-    fn next(&self) -> Option<Record> {
+    ///
+    /// Returns `Ok(Some(_))` for a record, `Ok(None)` for clean EOF, and
+    /// `Err(_)` if the reader thread reported a failure or the channel was
+    /// dropped unexpectedly.
+    fn next(&self) -> Result<Option<RawRecord>> {
         match self.record_rx.recv() {
-            Ok(Some(record)) => Some(record),
-            Ok(None) | Err(_) => None,
+            Ok(Ok(record)) => Ok(record),
+            Ok(Err(e)) => Err(anyhow!("{e}")),
+            Err(e) => Err(anyhow!("chunk reader channel closed: {e}")),
         }
     }
 }
@@ -179,7 +197,7 @@ pub fn parallel_merge<K, F>(
 ) -> Result<u64>
 where
     K: Clone + Send + Sync + Ord,
-    F: Fn(&Record) -> K + Send + Sync,
+    F: Fn(&RawRecord) -> K + Send + Sync,
 {
     log::info!(
         "Starting parallel merge of {} chunks with {} reader threads",
@@ -199,27 +217,31 @@ where
         BinaryHeap::with_capacity(chunk_files.len());
 
     for reader in &chunk_readers {
-        if let Some(record) = reader.next() {
+        if let Some(record) = reader.next()? {
             let key = extract_key(&record);
             heap.push(std::cmp::Reverse(MergeEntry { key, record, chunk_idx: reader.idx }));
         }
     }
 
     // Create output writer with multi-threaded compression
-    let mut writer =
-        create_bam_writer(output, output_header, config.writer_threads, config.compression_level)?;
+    let mut writer = create_raw_bam_writer(
+        output,
+        output_header,
+        config.writer_threads,
+        config.compression_level,
+    )?;
 
     let mut records_merged = 0u64;
 
     // Merge loop
     while let Some(std::cmp::Reverse(entry)) = heap.pop() {
         // Write record to output
-        writer.write_record(output_header, &entry.record)?;
+        writer.write_raw_record(&entry.record)?;
         records_merged += 1;
 
         // Get next record from the same chunk (non-blocking due to prefetch buffer)
         let reader = &chunk_readers[entry.chunk_idx];
-        if let Some(record) = reader.next() {
+        if let Some(record) = reader.next()? {
             let key = extract_key(&record);
             heap.push(std::cmp::Reverse(MergeEntry { key, record, chunk_idx: entry.chunk_idx }));
         }
@@ -249,7 +271,7 @@ pub fn parallel_merge_buffered<K, F>(
 ) -> Result<u64>
 where
     K: Clone + Send + Sync + Ord,
-    F: Fn(&Record) -> K + Send + Sync,
+    F: Fn(&RawRecord) -> K + Send + Sync,
 {
     const OUTPUT_BUFFER_SIZE: usize = 1024;
 
@@ -271,18 +293,22 @@ where
         BinaryHeap::with_capacity(chunk_files.len());
 
     for reader in &chunk_readers {
-        if let Some(record) = reader.next() {
+        if let Some(record) = reader.next()? {
             let key = extract_key(&record);
             heap.push(std::cmp::Reverse(MergeEntry { key, record, chunk_idx: reader.idx }));
         }
     }
 
     // Create output writer with multi-threaded compression
-    let mut writer =
-        create_bam_writer(output, output_header, config.writer_threads, config.compression_level)?;
+    let mut writer = create_raw_bam_writer(
+        output,
+        output_header,
+        config.writer_threads,
+        config.compression_level,
+    )?;
 
     let mut records_merged = 0u64;
-    let mut output_buffer: Vec<Record> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
+    let mut output_buffer: Vec<RawRecord> = Vec::with_capacity(OUTPUT_BUFFER_SIZE);
 
     // Merge loop with output buffering
     while let Some(std::cmp::Reverse(entry)) = heap.pop() {
@@ -292,13 +318,13 @@ where
         // Flush buffer if full
         if output_buffer.len() >= OUTPUT_BUFFER_SIZE {
             for record in output_buffer.drain(..) {
-                writer.write_record(output_header, &record)?;
+                writer.write_raw_record(&record)?;
             }
         }
 
         // Get next record from the same chunk
         let reader = &chunk_readers[entry.chunk_idx];
-        if let Some(record) = reader.next() {
+        if let Some(record) = reader.next()? {
             let key = extract_key(&record);
             heap.push(std::cmp::Reverse(MergeEntry { key, record, chunk_idx: entry.chunk_idx }));
         }
@@ -306,7 +332,7 @@ where
 
     // Flush remaining buffered records
     for record in output_buffer {
-        writer.write_record(output_header, &record)?;
+        writer.write_raw_record(&record)?;
     }
 
     log::info!("Buffered parallel merge complete: {records_merged} records merged");
@@ -320,8 +346,8 @@ mod tests {
 
     #[test]
     fn test_merge_entry_ordering() {
-        let entry1 = MergeEntry { key: 1, record: Record::default(), chunk_idx: 0 };
-        let entry2 = MergeEntry { key: 2, record: Record::default(), chunk_idx: 1 };
+        let entry1 = MergeEntry { key: 1, record: RawRecord::new(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 2, record: RawRecord::new(), chunk_idx: 1 };
 
         assert!(entry1 < entry2);
     }
@@ -336,40 +362,40 @@ mod tests {
 
     #[test]
     fn test_merge_entry_equal_keys() {
-        let entry1 = MergeEntry { key: 5, record: Record::default(), chunk_idx: 0 };
-        let entry2 = MergeEntry { key: 5, record: Record::default(), chunk_idx: 1 };
+        let entry1 = MergeEntry { key: 5, record: RawRecord::new(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 5, record: RawRecord::new(), chunk_idx: 1 };
 
         assert_eq!(entry1.cmp(&entry2), Ordering::Equal);
     }
 
     #[test]
     fn test_merge_entry_greater_than() {
-        let entry1 = MergeEntry { key: 2, record: Record::default(), chunk_idx: 0 };
-        let entry2 = MergeEntry { key: 1, record: Record::default(), chunk_idx: 1 };
+        let entry1 = MergeEntry { key: 2, record: RawRecord::new(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 1, record: RawRecord::new(), chunk_idx: 1 };
 
         assert!(entry1 > entry2);
     }
 
     #[test]
     fn test_merge_entry_ordering_ignores_chunk_idx() {
-        let entry1 = MergeEntry { key: 42, record: Record::default(), chunk_idx: 0 };
-        let entry2 = MergeEntry { key: 42, record: Record::default(), chunk_idx: 99 };
+        let entry1 = MergeEntry { key: 42, record: RawRecord::new(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 42, record: RawRecord::new(), chunk_idx: 99 };
 
         assert_eq!(entry1.cmp(&entry2), Ordering::Equal);
     }
 
     #[test]
     fn test_merge_entry_partial_eq() {
-        let entry1 = MergeEntry { key: 10, record: Record::default(), chunk_idx: 0 };
-        let entry2 = MergeEntry { key: 10, record: Record::default(), chunk_idx: 3 };
+        let entry1 = MergeEntry { key: 10, record: RawRecord::new(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 10, record: RawRecord::new(), chunk_idx: 3 };
 
         assert!(entry1 == entry2);
     }
 
     #[test]
     fn test_merge_entry_partial_eq_different() {
-        let entry1 = MergeEntry { key: 10, record: Record::default(), chunk_idx: 0 };
-        let entry2 = MergeEntry { key: 20, record: Record::default(), chunk_idx: 0 };
+        let entry1 = MergeEntry { key: 10, record: RawRecord::new(), chunk_idx: 0 };
+        let entry2 = MergeEntry { key: 20, record: RawRecord::new(), chunk_idx: 0 };
 
         assert!(entry1 != entry2);
     }
@@ -377,11 +403,11 @@ mod tests {
     #[test]
     fn test_merge_entry_string_keys() {
         let entry_a =
-            MergeEntry { key: "apple".to_string(), record: Record::default(), chunk_idx: 0 };
+            MergeEntry { key: "apple".to_string(), record: RawRecord::new(), chunk_idx: 0 };
         let entry_b =
-            MergeEntry { key: "banana".to_string(), record: Record::default(), chunk_idx: 1 };
+            MergeEntry { key: "banana".to_string(), record: RawRecord::new(), chunk_idx: 1 };
         let entry_c =
-            MergeEntry { key: "cherry".to_string(), record: Record::default(), chunk_idx: 2 };
+            MergeEntry { key: "cherry".to_string(), record: RawRecord::new(), chunk_idx: 2 };
 
         assert!(entry_a < entry_b);
         assert!(entry_b < entry_c);
@@ -393,9 +419,9 @@ mod tests {
         use std::cmp::Reverse;
 
         let mut heap = BinaryHeap::new();
-        heap.push(Reverse(MergeEntry { key: 3, record: Record::default(), chunk_idx: 0 }));
-        heap.push(Reverse(MergeEntry { key: 1, record: Record::default(), chunk_idx: 1 }));
-        heap.push(Reverse(MergeEntry { key: 2, record: Record::default(), chunk_idx: 2 }));
+        heap.push(Reverse(MergeEntry { key: 3, record: RawRecord::new(), chunk_idx: 0 }));
+        heap.push(Reverse(MergeEntry { key: 1, record: RawRecord::new(), chunk_idx: 1 }));
+        heap.push(Reverse(MergeEntry { key: 2, record: RawRecord::new(), chunk_idx: 2 }));
 
         // Should come out in ascending order: 1, 2, 3
         assert_eq!(heap.pop().expect("heap should have elements").0.key, 1);
