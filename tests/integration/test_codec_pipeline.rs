@@ -13,13 +13,29 @@
 //! 4. Handling of strand orientation
 //! 5. Overlap region computation
 
+use fgumi_lib::consensus::caller::ConsensusCaller;
 use fgumi_lib::consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
-use fgumi_lib::sam::builder::RecordBuilder;
-use noodles::sam::alignment::record::cigar::Op;
+use fgumi_raw_bam::RawRecord;
 use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record_buf::{Cigar, RecordBuf};
 
-/// Helper function to create a test paired read with proper CIGAR
+/// Map a noodles CIGAR `Kind` to its BAM op code (bits 3:0 of each cigar word).
+const fn kind_to_op_code(k: Kind) -> u32 {
+    match k {
+        Kind::Match => 0,
+        Kind::Insertion => 1,
+        Kind::Deletion => 2,
+        Kind::Skip => 3,
+        Kind::SoftClip => 4,
+        Kind::HardClip => 5,
+        Kind::Pad => 6,
+        Kind::SequenceMatch => 7,
+        Kind::SequenceMismatch => 8,
+    }
+}
+
+/// Helper function to create a test paired read with proper CIGAR.
+///
+/// Returns a `RawRecord` built directly via `fgumi_raw_bam::SamBuilder`.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn create_codec_read(
     name: &str,
@@ -32,54 +48,68 @@ fn create_codec_read(
     mate_start: usize,
     cigar_ops: &[(Kind, usize)],
     umi: &str,
-) -> RecordBuf {
-    // Build CIGAR and calculate reference length
-    let mut cigar = Cigar::default();
-    let mut ref_len = 0usize;
-    for &(kind, len) in cigar_ops {
-        cigar.as_mut().push(Op::new(kind, len));
-        match kind {
-            Kind::Match
-            | Kind::SequenceMatch
-            | Kind::SequenceMismatch
-            | Kind::Deletion
-            | Kind::Skip => {
-                ref_len += len;
-            }
-            _ => {}
-        }
-    }
+) -> RawRecord {
+    use fgumi_raw_bam::flags as raw_flags;
 
-    // Calculate template length for FR pair detection
+    // Encode CIGAR as BAM u32 words and compute reference length
+    let mut ref_len = 0usize;
+    let encoded_cigar: Vec<u32> = cigar_ops
+        .iter()
+        .map(|&(kind, len)| {
+            match kind {
+                Kind::Match
+                | Kind::SequenceMatch
+                | Kind::SequenceMismatch
+                | Kind::Deletion
+                | Kind::Skip => {
+                    ref_len += len;
+                }
+                _ => {}
+            }
+            (u32::try_from(len).expect("cigar len fits u32") << 4) | kind_to_op_code(kind)
+        })
+        .collect();
+
+    // Compute template length for FR pair detection
     let insert_size: i32 = if ref_start <= mate_start {
         (mate_start + ref_len - ref_start) as i32
     } else {
         -((ref_start + ref_len - mate_start) as i32)
     };
 
-    let mut record = RecordBuilder::new()
-        .name(name)
-        .sequence(&String::from_utf8_lossy(seq))
+    // Build flags
+    let mut flags = raw_flags::PAIRED;
+    if is_first {
+        flags |= raw_flags::FIRST_SEGMENT;
+    } else {
+        flags |= raw_flags::LAST_SEGMENT;
+    }
+    if is_reverse {
+        flags |= raw_flags::REVERSE;
+    }
+    if mate_is_reverse {
+        flags |= raw_flags::MATE_REVERSE;
+    }
+
+    let mut b = fgumi_raw_bam::SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(seq)
         .qualities(qual)
-        .reference_sequence_id(0)
-        .alignment_start(ref_start)
-        .paired(true)
-        .first_segment(is_first)
-        .reverse_complement(is_reverse)
-        .mate_reverse_complement(mate_is_reverse)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(mate_start)
-        .tag("MI", umi)
-        .build();
-
-    // Set CIGAR (built from ops) and template length
-    *record.cigar_mut() = cigar;
-    *record.template_length_mut() = insert_size;
-
-    record
+        .flags(flags)
+        .ref_id(0)
+        .pos(i32::try_from(ref_start).expect("ref_start fits i32") - 1) // 0-based
+        .mapq(60)
+        .cigar_ops(&encoded_cigar)
+        .mate_ref_id(0)
+        .mate_pos(i32::try_from(mate_start).expect("mate_start fits i32") - 1) // 0-based
+        .template_length(insert_size)
+        .add_string_tag(b"MI", umi.as_bytes());
+    b.build()
 }
 
-/// Creates a CODEC read pair (R1 forward, R2 reverse - FR orientation)
+/// Creates a CODEC read pair (R1 forward, R2 reverse - FR orientation).
+///
+/// Returns raw BAM records directly without an intermediate `RecordBuf`.
 #[allow(clippy::too_many_arguments)]
 fn create_codec_read_pair(
     name: &str,
@@ -90,7 +120,7 @@ fn create_codec_read_pair(
     r1_start: usize,
     r2_start: usize,
     umi: &str,
-) -> (RecordBuf, RecordBuf) {
+) -> (RawRecord, RawRecord) {
     let r1 = create_codec_read(
         name,
         r1_seq,
@@ -145,7 +175,7 @@ fn test_codec_single_pair_consensus() {
     );
 
     let reads = vec![r1, r2];
-    let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+    let output = caller.consensus_reads(reads).unwrap();
 
     // Should produce exactly 1 consensus read
     assert_eq!(output.count, 1, "Single read pair should produce 1 consensus");
@@ -184,7 +214,7 @@ fn test_codec_multiple_pairs_consensus() {
         reads.push(r2);
     }
 
-    let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+    let output = caller.consensus_reads(reads).unwrap();
 
     assert_eq!(output.count, 1, "Multiple pairs should produce 1 consensus");
 
@@ -220,7 +250,7 @@ fn test_codec_insufficient_reads_rejection() {
         reads.push(r2);
     }
 
-    let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+    let output = caller.consensus_reads(reads).unwrap();
 
     assert_eq!(output.count, 0, "Should reject when fewer than min_reads_per_strand pairs");
 
@@ -240,17 +270,21 @@ fn test_codec_fragment_reads_rejection() {
     let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
     // Create a fragment read (not paired - no SEGMENTED flag)
-    let record = RecordBuilder::new()
-        .name("fragment1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .cigar("8M")
-        .tag("MI", "UMI004")
-        .build();
+    let record = {
+        let mut b = fgumi_raw_bam::SamBuilder::new();
+        b.read_name(b"fragment1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(0) // not paired
+            .ref_id(0)
+            .pos(99) // 0-based (alignment_start 100)
+            .mapq(60)
+            .cigar_ops(&[8u32 << 4]) // 8M
+            .add_string_tag(b"MI", b"UMI004");
+        b.build()
+    };
 
-    let output = caller.consensus_reads_from_sam_records(vec![record]).unwrap();
+    let output = caller.consensus_reads(vec![record]).unwrap();
 
     assert_eq!(output.count, 0, "Fragment reads should be rejected");
 
@@ -282,7 +316,7 @@ fn test_codec_consensus_has_required_tags() {
         "UMI005",
     );
 
-    let output = caller.consensus_reads_from_sam_records(vec![r1, r2]).unwrap();
+    let output = caller.consensus_reads(vec![r1, r2]).unwrap();
     assert_eq!(output.count, 1);
 
     // Verify raw bytes are present (detailed tag validation is covered by unit tests)
@@ -294,7 +328,7 @@ fn test_codec_empty_input() {
     let options = CodecConsensusOptions::default();
     let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-    let output = caller.consensus_reads_from_sam_records(Vec::new()).unwrap();
+    let output = caller.consensus_reads(Vec::new()).unwrap();
 
     assert_eq!(output.count, 0, "Empty input should produce empty output");
     assert_eq!(caller.statistics().total_input_reads, 0);
@@ -333,7 +367,7 @@ fn test_codec_rejected_reads_tracking() {
         reads.push(r2);
     }
 
-    let output = caller.consensus_reads_from_sam_records(reads).unwrap();
+    let output = caller.consensus_reads(reads).unwrap();
     assert_eq!(output.count, 0);
 
     // With reject tracking enabled, rejected reads should be stored
@@ -365,7 +399,7 @@ fn test_codec_min_duplex_length_filter() {
         "UMI007",
     );
 
-    let output = caller.consensus_reads_from_sam_records(vec![r1, r2]).unwrap();
+    let output = caller.consensus_reads(vec![r1, r2]).unwrap();
 
     assert_eq!(output.count, 0, "Should reject reads with insufficient duplex length");
 }
@@ -392,7 +426,7 @@ fn test_codec_statistics_tracking() {
             100,
             &format!("UMI{mol_idx:03}"),
         );
-        let _ = caller.consensus_reads_from_sam_records(vec![r1, r2]).unwrap();
+        let _ = caller.consensus_reads(vec![r1, r2]).unwrap();
     }
 
     let stats = caller.statistics();

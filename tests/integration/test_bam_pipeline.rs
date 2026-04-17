@@ -182,8 +182,9 @@ fn create_test_bam(path: &std::path::Path, header: &Header) -> Vec<RecordBuf> {
     let family3 = create_umi_family("GGGGGGGG", 15, "family3", "ATCGATCG", 30);
 
     for record in family1.iter().chain(family2.iter()).chain(family3.iter()) {
-        writer.write_alignment_record(header, record).expect("Failed to write record");
-        records.push(record.clone());
+        let record_buf = crate::helpers::bam_generator::to_record_buf(record);
+        writer.write_alignment_record(header, &record_buf).expect("Failed to write record");
+        records.push(record_buf);
     }
 
     writer.finish(header).expect("Failed to finish BAM");

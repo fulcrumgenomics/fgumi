@@ -344,21 +344,34 @@ fn get_mi_tag(record: &RecordBuf) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, raw_record_to_record_buf};
+
+    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> RecordBuf {
+        raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
 
     /// Create a test record with an MI tag
     fn create_test_record(name: &str, mi: &str) -> RecordBuf {
-        RecordBuilder::new().name(name).tag("MI", mi).build()
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes());
+        b.add_string_tag(b"MI", mi.as_bytes());
+        to_record_buf(b.build())
     }
 
     /// Create a test record with an integer MI tag
     fn create_test_record_int_mi(name: &str, mi: i32) -> RecordBuf {
-        RecordBuilder::new().name(name).tag("MI", mi).build()
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes());
+        b.add_int_tag(b"MI", mi);
+        to_record_buf(b.build())
     }
 
     /// Create a test record without an MI tag
     fn create_test_record_no_mi(name: &str) -> RecordBuf {
-        RecordBuilder::new().name(name).build()
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes());
+        to_record_buf(b.build())
     }
 
     #[test]

@@ -1,8 +1,17 @@
 //! Utilities for generating test BAM data programmatically.
 
-use fgumi_lib::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::sam::Header;
 use noodles::sam::alignment::record_buf::RecordBuf;
+
+/// Convert a `RawRecord` to a noodles `RecordBuf` using the default (empty) header.
+///
+/// Used to bridge the raw-byte builder API with the noodles BAM writer for test
+/// file creation.
+pub fn to_record_buf(raw: &RawRecord) -> RecordBuf {
+    fgumi_raw_bam::raw_record_to_record_buf(raw, &noodles::sam::Header::default())
+        .expect("raw_record_to_record_buf should succeed in test")
+}
 
 /// Creates a UMI family with specified parameters.
 ///
@@ -20,25 +29,30 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 ///
 /// # Returns
 ///
-/// Vector of `RecordBuf` representing the UMI family
+/// Vector of `RawRecord` representing the UMI family
 pub fn create_umi_family(
     umi: &str,
     depth: usize,
     base_name: &str,
     sequence: &str,
     quality: u8,
-) -> Vec<RecordBuf> {
+) -> Vec<RawRecord> {
+    let seq = sequence.as_bytes();
+    let cigar_op = u32::try_from(seq.len()).expect("seq.len() fits u32") << 4; // NM
     (0..depth)
         .map(|i| {
-            RecordBuilder::new()
-                .name(&format!("{base_name}_{i}"))
-                .sequence(sequence)
-                .qualities(&vec![quality; sequence.len()])
-                .reference_sequence_id(0)
-                .alignment_start(100)
-                .mapping_quality(60)
-                .tag("RX", umi)
-                .build()
+            let name = format!("{base_name}_{i}");
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(0)
+                .cigar_ops(&[cigar_op])
+                .sequence(seq)
+                .qualities(&vec![quality; seq.len()])
+                .add_string_tag(b"RX", umi.as_bytes());
+            b.build()
         })
         .collect()
 }
@@ -59,7 +73,7 @@ pub fn create_umi_family(
 ///
 /// # Returns
 ///
-/// Vector of `RecordBuf` with R1 and R2 reads properly flagged
+/// Vector of `RawRecord` with R1 and R2 reads properly flagged
 pub fn create_paired_umi_family(
     umi: &str,
     depth: usize,
@@ -67,39 +81,42 @@ pub fn create_paired_umi_family(
     r1_sequence: &str,
     r2_sequence: &str,
     quality: u8,
-) -> Vec<RecordBuf> {
+) -> Vec<RawRecord> {
+    let r1_seq = r1_sequence.as_bytes();
+    let r2_seq = r2_sequence.as_bytes();
+    let r1_cigar = u32::try_from(r1_seq.len()).expect("r1_seq.len() fits u32") << 4;
+    let r2_cigar = u32::try_from(r2_seq.len()).expect("r2_seq.len() fits u32") << 4;
+
     let mut records = Vec::new();
 
     for i in 0..depth {
         let read_name = format!("{base_name}_{i}");
 
-        // R1
-        let r1 = RecordBuilder::new()
-            .name(&read_name)
-            .sequence(r1_sequence)
-            .qualities(&vec![quality; r1_sequence.len()])
-            .paired(true)
-            .first_segment(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .tag("RX", umi)
-            .build();
-        records.push(r1);
+        // R1: paired + first segment
+        let mut b1 = SamBuilder::new();
+        b1.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .cigar_ops(&[r1_cigar])
+            .sequence(r1_seq)
+            .qualities(&vec![quality; r1_seq.len()])
+            .add_string_tag(b"RX", umi.as_bytes());
+        records.push(b1.build());
 
-        // R2
-        let r2 = RecordBuilder::new()
-            .name(&read_name)
-            .sequence(r2_sequence)
-            .qualities(&vec![quality; r2_sequence.len()])
-            .paired(true)
-            .first_segment(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .tag("RX", umi)
-            .build();
-        records.push(r2);
+        // R2: paired + last segment
+        let mut b2 = SamBuilder::new();
+        b2.read_name(read_name.as_bytes())
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .cigar_ops(&[r2_cigar])
+            .sequence(r2_seq)
+            .qualities(&vec![quality; r2_seq.len()])
+            .add_string_tag(b"RX", umi.as_bytes());
+        records.push(b2.build());
     }
 
     records
@@ -118,7 +135,7 @@ pub fn create_paired_umi_family(
 ///
 /// # Returns
 ///
-/// `RecordBuf` representing a consensus read
+/// `RawRecord` representing a consensus read
 pub fn create_consensus_read(
     name: &str,
     sequence: &str,
@@ -126,18 +143,16 @@ pub fn create_consensus_read(
     depth_min: i32,
     error_rate: f32,
     mean_quality: u8,
-) -> RecordBuf {
-    RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![mean_quality; sequence.len()])
-        .consensus_tags(
-            ConsensusTagsBuilder::new()
-                .depth_max(depth_max)
-                .depth_min(depth_min)
-                .error_rate(error_rate),
-        )
-        .build()
+) -> RawRecord {
+    let seq = sequence.as_bytes();
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .sequence(seq)
+        .qualities(&vec![mean_quality; seq.len()])
+        .add_int_tag(b"cD", depth_max)
+        .add_int_tag(b"cM", depth_min)
+        .add_float_tag(b"cE", error_rate);
+    b.build()
 }
 
 /// Builds a SAM header with the given header tags and one reference sequence.
@@ -225,7 +240,7 @@ pub fn create_umi_family_with_errors(
     base_depth: usize,
     error_depth: usize,
     sequence: &str,
-) -> Vec<RecordBuf> {
+) -> Vec<RawRecord> {
     let mut records = Vec::new();
 
     // Add base UMI reads
@@ -288,11 +303,12 @@ mod tests {
         assert_eq!(family.len(), 5);
 
         for (i, record) in family.iter().enumerate() {
+            let buf = to_record_buf(record);
             assert_eq!(
-                record.name().map(std::convert::AsRef::as_ref),
+                buf.name().map(std::convert::AsRef::as_ref),
                 Some(format!("test_{i}").as_bytes())
             );
-            assert_eq!(record.sequence().as_ref(), b"AAAA");
+            assert_eq!(buf.sequence().as_ref(), b"AAAA");
         }
     }
 
@@ -304,18 +320,21 @@ mod tests {
         assert_eq!(family.len(), 6);
 
         // Check R1/R2 flags
-        assert!(family[0].flags().is_first_segment());
-        assert!(!family[1].flags().is_first_segment());
-        assert!(family[1].flags().is_last_segment());
+        let r1_flags = family[0].flags();
+        let r2_flags = family[1].flags();
+        assert_ne!(r1_flags & flags::FIRST_SEGMENT, 0, "R1 should have FIRST_SEGMENT flag");
+        assert_eq!(r2_flags & flags::FIRST_SEGMENT, 0, "R2 should not have FIRST_SEGMENT flag");
+        assert_ne!(r2_flags & flags::LAST_SEGMENT, 0, "R2 should have LAST_SEGMENT flag");
     }
 
     #[test]
     fn test_create_consensus_read() {
         let consensus = create_consensus_read("cons1", "ACGT", 10, 5, 0.01, 35);
+        let buf = to_record_buf(&consensus);
 
-        assert_eq!(consensus.name().map(std::convert::AsRef::as_ref), Some(b"cons1".as_ref()));
-        assert_eq!(consensus.sequence().as_ref(), b"ACGT");
-        assert_eq!(consensus.quality_scores().as_ref(), &[35, 35, 35, 35]);
+        assert_eq!(buf.name().map(std::convert::AsRef::as_ref), Some(b"cons1".as_ref()));
+        assert_eq!(buf.sequence().as_ref(), b"ACGT");
+        assert_eq!(buf.quality_scores().as_ref(), &[35, 35, 35, 35]);
     }
 
     #[test]

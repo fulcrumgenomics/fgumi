@@ -5,27 +5,26 @@
 //! 2. Fixed clipping (5' and 3' ends)
 //! 3. Metrics output
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_test_reference};
+use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, to_record_buf};
 
 /// Create a BAM with paired reads.
-fn create_paired_bam(path: &Path, pairs: Vec<(RecordBuf, RecordBuf)>) {
+fn create_paired_bam(path: &Path, pairs: Vec<(RawRecord, RawRecord)>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
     for (r1, r2) in pairs {
-        writer.write_alignment_record(&header, &r1).expect("Failed to write R1");
-        writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
+        writer.write_alignment_record(&header, &to_record_buf(&r1)).expect("Failed to write R1");
+        writer.write_alignment_record(&header, &to_record_buf(&r2)).expect("Failed to write R2");
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
@@ -39,36 +38,37 @@ fn test_clip_command_basic() {
     let ref_path = create_test_reference(temp_dir.path());
 
     // Create a paired-end read
-    let r1 = RecordBuilder::new()
-        .name("read1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(true)
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(104)
-        .template_length(12)
-        .build();
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(103)
+            .template_length(12);
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name("read1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(104)
-        .mapping_quality(60)
-        .cigar("8M")
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(100)
-        .template_length(-12)
-        .build();
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(103)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-12);
+        b.build()
+    };
 
     create_paired_bam(&input_bam, vec![(r1, r2)]);
 
@@ -110,36 +110,37 @@ fn test_clip_command_with_metrics() {
     let metrics_path = temp_dir.path().join("metrics.txt");
     let ref_path = create_test_reference(temp_dir.path());
 
-    let r1 = RecordBuilder::new()
-        .name("read1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(true)
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(200)
-        .template_length(108)
-        .build();
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .template_length(108);
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name("read1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(200)
-        .mapping_quality(60)
-        .cigar("8M")
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(100)
-        .template_length(-108)
-        .build();
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-108);
+        b.build()
+    };
 
     create_paired_bam(&input_bam, vec![(r1, r2)]);
 

@@ -22,7 +22,7 @@ use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles_bgzf::io::Writer as BgzfWriter;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family};
+use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
 
 // ============================================================================
 // Helpers
@@ -197,7 +197,9 @@ fn create_test_bam(path: &Path) {
     let family3 = create_umi_family("GGGGGGGG", 4, "family3", "TTTTAAAA", 30);
 
     for record in family1.iter().chain(family2.iter()).chain(family3.iter()) {
-        writer.write_alignment_record(&header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
@@ -216,7 +218,7 @@ fn create_grouped_bam(path: &Path) {
     {
         let records = create_umi_family(umi, depth, base, "ACGTACGT", 30);
         for record in records {
-            let mut rec = record.clone();
+            let mut rec = to_record_buf(&record);
             rec.data_mut().insert(mi_tag, Value::from(mi));
             writer.write_alignment_record(&header, &rec).expect("Failed to write record");
         }

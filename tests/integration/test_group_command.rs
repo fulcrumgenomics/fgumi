@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family};
+use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
 
 /// Test that the group command properly writes metrics in the new format.
 #[test]
@@ -127,7 +127,9 @@ fn create_test_input_bam(path: &PathBuf) {
     let family3 = create_umi_family("GGGGGGGG", 15, "family3", "ATCGATCG", 30);
 
     for record in family1.iter().chain(family2.iter()).chain(family3.iter()) {
-        writer.write_alignment_record(&header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
 
     writer.try_finish().expect("Failed to finish BAM");
@@ -147,7 +149,9 @@ fn create_test_bam_with_n_umis(path: &PathBuf) {
     let bad_family = create_umi_family("NNNNNNNN", 3, "bad", "TGCATGCA", 30);
 
     for record in good_family.iter().chain(bad_family.iter()) {
-        writer.write_alignment_record(&header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
 
     writer.try_finish().expect("Failed to finish BAM");

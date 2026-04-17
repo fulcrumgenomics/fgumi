@@ -163,31 +163,58 @@ pub fn assert_different_molecule_ids(family1: &[RecordBuf], family2: &[RecordBuf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_lib::sam::builder::RecordBuilder;
+    use crate::helpers::bam_generator::to_record_buf;
+    use fgumi_raw_bam::{SamBuilder, flags};
 
     #[test]
     fn test_assert_mi_tag() {
-        let record =
-            RecordBuilder::new().name("test").sequence("ACGT").tag("MI", "molecule_123").build();
-
+        let raw = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"test")
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .add_string_tag(b"MI", b"molecule_123");
+            b.build()
+        };
+        let record = to_record_buf(&raw);
         assert_mi_tag(&record, "molecule_123");
     }
 
     #[test]
     #[should_panic(expected = "MI tag mismatch")]
     fn test_assert_mi_tag_mismatch() {
-        let record =
-            RecordBuilder::new().name("test").sequence("ACGT").tag("MI", "molecule_123").build();
-
+        let raw = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"test")
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .add_string_tag(b"MI", b"molecule_123");
+            b.build()
+        };
+        let record = to_record_buf(&raw);
         assert_mi_tag(&record, "wrong_id");
     }
 
     #[test]
     fn test_assert_proper_pairing() {
-        let r1 = RecordBuilder::new().name("pair1").sequence("ACGT").first_segment(true).build();
-
-        let r2 = RecordBuilder::new().name("pair1").sequence("TGCA").first_segment(false).build();
-
+        let raw_r1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"pair1")
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
+        let raw_r2 = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"pair1")
+                .sequence(b"TGCA")
+                .qualities(&[30; 4])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.build()
+        };
+        let r1 = to_record_buf(&raw_r1);
+        let r2 = to_record_buf(&raw_r2);
         assert_proper_pairing(&r1, &r2);
     }
 }

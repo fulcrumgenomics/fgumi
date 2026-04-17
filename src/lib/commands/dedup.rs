@@ -84,7 +84,7 @@ pub struct DedupMetrics {
     /// Supplementary reads processed
     pub supplementary_reads: u64,
     /// Secondary/supplementary without pa tag
-    pub missing_tc_tag: u64,
+    pub missing_pa_tag: u64,
     /// Filter metrics from position grouping
     pub filter_metrics: FilterMetrics,
 }
@@ -100,7 +100,7 @@ impl DedupMetrics {
         self.unique_reads += other.unique_reads;
         self.secondary_reads += other.secondary_reads;
         self.supplementary_reads += other.supplementary_reads;
-        self.missing_tc_tag += other.missing_tc_tag;
+        self.missing_pa_tag += other.missing_pa_tag;
         self.filter_metrics.merge(&other.filter_metrics);
     }
 
@@ -127,7 +127,7 @@ struct DedupMetricsOutput {
     duplicate_reads: u64,
     secondary_reads: u64,
     supplementary_reads: u64,
-    missing_tc_tag: u64,
+    missing_pa_tag: u64,
 }
 
 impl From<&DedupMetrics> for DedupMetricsOutput {
@@ -142,7 +142,7 @@ impl From<&DedupMetrics> for DedupMetricsOutput {
             duplicate_reads: m.duplicate_reads,
             secondary_reads: m.secondary_reads,
             supplementary_reads: m.supplementary_reads,
-            missing_tc_tag: m.missing_tc_tag,
+            missing_pa_tag: m.missing_pa_tag,
         }
     }
 }
@@ -174,10 +174,6 @@ pub struct ProcessedDedupGroup {
     pub dedup_metrics: DedupMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
-    /// Number of distinct numeric molecule IDs assigned in this group. See
-    /// [`fgumi_lib::grouper::ProcessedPositionGroup::distinct_mi_count`] for
-    /// rationale; ensures emitted MI tag integers are consecutive 0..N-1.
-    pub distinct_mi_count: u64,
 }
 
 impl BatchWeight for ProcessedDedupGroup {
@@ -688,7 +684,6 @@ fn process_position_group(
             family_sizes: AHashMap::new(),
             dedup_metrics,
             input_record_count,
-            distinct_mi_count: 0,
         });
     }
 
@@ -750,7 +745,7 @@ fn process_position_group(
         }
     }
 
-    // Count reads and check for missing tc tags
+    // Count reads and check for missing pa tags
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;
@@ -769,7 +764,7 @@ fn process_position_group(
             if is_secondary || is_supplementary {
                 let aux = bam_fields::aux_data_slice(raw);
                 if bam_fields::find_tag_type(aux, &tc_tag_bytes).is_none() {
-                    dedup_metrics.missing_tc_tag += 1;
+                    dedup_metrics.missing_pa_tag += 1;
                 }
             }
         }
@@ -777,18 +772,7 @@ fn process_position_group(
 
     dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
 
-    // Compute distinct numeric MoleculeId count for the global MI counter block
-    // size; see issue #269 / ProcessedPositionGroup::distinct_mi_count rationale.
-    let distinct_mi_count: u64 =
-        templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
-
-    Ok(ProcessedDedupGroup {
-        templates,
-        family_sizes,
-        dedup_metrics,
-        input_record_count,
-        distinct_mi_count,
-    })
+    Ok(ProcessedDedupGroup { templates, family_sizes, dedup_metrics, input_record_count })
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1046,12 +1030,11 @@ impl Command for MarkDuplicates {
 
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from the global counter. Advance by the
-                // number of distinct numeric MoleculeId IDs actually assigned in this
-                // group, not the template count, so the emitted MI integers are
-                // consecutive 0..N-1 (see issue #269).
-                let base_mi = next_mi_base
-                    .fetch_add(processed.distinct_mi_count, std::sync::atomic::Ordering::Relaxed);
+                // Assign contiguous base_mi from serial counter
+                let base_mi = next_mi_base.fetch_add(
+                    processed.templates.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
                 output.reserve(processed.templates.len() * 2 * 400);
                 // Serialize templates
@@ -1119,7 +1102,7 @@ impl Command for MarkDuplicates {
             final_metrics.duplicate_rate() * 100.0
         );
 
-        if final_metrics.missing_tc_tag > 0 {
+        if final_metrics.missing_pa_tag > 0 {
             bail!(
                 "{} secondary/supplementary reads are missing the `pa` tag.\n\n\
                 The `pa` tag is required for correct UMI-aware deduplication of \
@@ -1129,7 +1112,7 @@ impl Command for MarkDuplicates {
                 fgumi zipper -i aligned.bam --unmapped unmapped.bam -r reference.fa -o merged.bam\n  \
                 fgumi sort -i merged.bam -o sorted.bam --order template-coordinate\n  \
                 fgumi dedup -i sorted.bam -o deduped.bam",
-                final_metrics.missing_tc_tag
+                final_metrics.missing_pa_tag
             );
         }
 
@@ -2112,7 +2095,7 @@ mod tests {
             unique_reads: 16,
             secondary_reads: 3,
             supplementary_reads: 1,
-            missing_tc_tag: 1,
+            missing_pa_tag: 1,
             ..Default::default()
         };
 
@@ -2125,7 +2108,7 @@ mod tests {
             unique_reads: 8,
             secondary_reads: 2,
             supplementary_reads: 3,
-            missing_tc_tag: 2,
+            missing_pa_tag: 2,
             ..Default::default()
         };
 
@@ -2138,7 +2121,7 @@ mod tests {
         assert_eq!(m1.unique_reads, 24);
         assert_eq!(m1.secondary_reads, 5);
         assert_eq!(m1.supplementary_reads, 4);
-        assert_eq!(m1.missing_tc_tag, 3);
+        assert_eq!(m1.missing_pa_tag, 3);
     }
 
     #[test]
@@ -2159,7 +2142,7 @@ mod tests {
         assert_eq!(metrics.unique_reads, 0);
         assert_eq!(metrics.secondary_reads, 0);
         assert_eq!(metrics.supplementary_reads, 0);
-        assert_eq!(metrics.missing_tc_tag, 0);
+        assert_eq!(metrics.missing_pa_tag, 0);
     }
 
     #[test]
@@ -2173,7 +2156,7 @@ mod tests {
             unique_reads: 150,
             secondary_reads: 10,
             supplementary_reads: 5,
-            missing_tc_tag: 2,
+            missing_pa_tag: 2,
             ..Default::default()
         };
         let output = DedupMetricsOutput::from(&metrics);
@@ -2187,7 +2170,7 @@ mod tests {
         assert_eq!(output.unique_reads, 150);
         assert_eq!(output.secondary_reads, 10);
         assert_eq!(output.supplementary_reads, 5);
-        assert_eq!(output.missing_tc_tag, 2);
+        assert_eq!(output.missing_pa_tag, 2);
     }
 
     // ========================================================================
@@ -2618,7 +2601,6 @@ mod tests {
             family_sizes: AHashMap::new(),
             dedup_metrics: DedupMetrics::default(),
             input_record_count: 1,
-            distinct_mi_count: 0,
         };
 
         let estimate = batch.estimate_heap_size();

@@ -1,6 +1,6 @@
 //! Integration tests for the downsample command.
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::SamBuilder;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -28,14 +28,21 @@ fn create_grouped_bam(path: &PathBuf, families: Vec<(&str, usize)>) {
     let mut read_idx = 0;
     for (mi, count) in families {
         for _ in 0..count {
-            let record = RecordBuilder::new()
-                .name(&format!("read_{read_idx}"))
-                .sequence("ACGT") // Minimal sequence
-                .reference_sequence_id(0)
-                .alignment_start(100)
-                .mapping_quality(60)
-                .tag("MI", mi)
-                .build();
+            let raw = {
+                let mut b = SamBuilder::new();
+                b.read_name(format!("read_{read_idx}").as_bytes())
+                    .sequence(b"ACGT")
+                    .qualities(&[30; 4])
+                    .ref_id(0)
+                    .pos(99) // 0-based (alignment_start 100)
+                    .mapq(60)
+                    .cigar_ops(&[4u32 << 4]) // 4M
+                    .add_string_tag(b"MI", mi.as_bytes());
+                b.build()
+            };
+            let record =
+                fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
+                    .expect("raw_record_to_record_buf failed in test");
 
             writer.write_alignment_record(&header, &record).expect("Failed to write record");
             read_idx += 1;

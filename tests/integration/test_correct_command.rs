@@ -12,21 +12,21 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family};
+use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
+use fgumi_raw_bam::RawRecord;
 
 /// Write a BAM with UMI-tagged reads.
-fn create_umi_bam(
-    path: &PathBuf,
-    families: Vec<Vec<noodles::sam::alignment::record_buf::RecordBuf>>,
-) {
+fn create_umi_bam(path: &PathBuf, families: Vec<Vec<RawRecord>>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
     for family in families {
-        for record in family {
-            writer.write_alignment_record(&header, &record).expect("Failed to write record");
+        for record in &family {
+            writer
+                .write_alignment_record(&header, &to_record_buf(record))
+                .expect("Failed to write record");
         }
     }
     writer.try_finish().expect("Failed to finish BAM");

@@ -3,56 +3,59 @@
 use fgoxide::io::DelimFile;
 use fgumi_lib::metrics::shared::UmiMetric;
 use fgumi_lib::metrics::simplex::{SimplexFamilySizeMetric, SimplexYieldMetric};
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::create_minimal_header;
+use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 
 /// Creates a paired-end read pair for simplex-metrics testing.
 fn create_simplex_pair(
     name: &str,
-    ref_id: usize,
-    pos1: usize,
-    pos2: usize,
+    ref_id: i32,
+    pos1: i32,
+    pos2: i32,
     rx_umi: &str,
     mi_tag: &str,
-) -> (RecordBuf, RecordBuf) {
-    let sequence = "ACGTACGTACGTACGT";
+) -> (RawRecord, RawRecord) {
+    let sequence = b"ACGTACGTACGTACGT";
     let quality = 30u8;
+    let cigar_op = u32::try_from(sequence.len()).expect("sequence.len() fits u32") << 4;
 
-    let r1 = RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![quality; sequence.len()])
-        .paired(true)
-        .first_segment(true)
-        .reference_sequence_id(ref_id)
-        .alignment_start(pos1)
-        .mapping_quality(60)
-        .tag("RX", rx_umi)
-        .tag("MI", mi_tag)
-        .build();
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(sequence)
+            .qualities(&vec![quality; sequence.len()])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(ref_id)
+            .pos(pos1 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .add_string_tag(b"RX", rx_umi.as_bytes())
+            .add_string_tag(b"MI", mi_tag.as_bytes());
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![quality; sequence.len()])
-        .paired(true)
-        .first_segment(false)
-        .reference_sequence_id(ref_id)
-        .alignment_start(pos2)
-        .mapping_quality(60)
-        .reverse_complement(true)
-        .tag("RX", rx_umi)
-        .tag("MI", mi_tag)
-        .build();
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(sequence)
+            .qualities(&vec![quality; sequence.len()])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(ref_id)
+            .pos(pos2 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .add_string_tag(b"RX", rx_umi.as_bytes())
+            .add_string_tag(b"MI", mi_tag.as_bytes());
+        b.build()
+    };
 
     (r1, r2)
 }
@@ -90,7 +93,9 @@ fn create_simplex_test_bam(path: &PathBuf, header: &Header) {
     }
 
     for record in &records {
-        writer.write_alignment_record(header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
     writer.finish(header).expect("Failed to finish BAM");
 }

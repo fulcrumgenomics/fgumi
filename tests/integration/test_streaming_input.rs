@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family};
+use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
 
 /// Test that the group command works correctly with piped input.
 #[test]
@@ -238,7 +238,9 @@ fn create_test_input_bam(path: &PathBuf) {
     let family2 = create_umi_family("CCCCCCCC", 3, "family2", "TGCATGCA", 30);
 
     for record in family1.iter().chain(family2.iter()) {
-        writer.write_alignment_record(&header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
 
     writer.try_finish().expect("Failed to finish BAM");
@@ -259,23 +261,20 @@ fn create_grouped_test_bam(path: &PathBuf) {
     let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
     let records = create_umi_family("AAAAAAAA", 5, "mol1", "ACGTACGT", 30);
 
-    // Add MI tag to each record
+    // Add MI tag to each record (convert to RecordBuf first to enable tag mutation)
     let mi_value = 1;
-    for record in records {
-        let mut rec = record.clone();
-        // Get existing data and add MI tag
-        let data = rec.data_mut();
-        data.insert(mi_tag, Value::from(mi_value));
+    for raw in &records {
+        let mut rec = to_record_buf(raw);
+        rec.data_mut().insert(mi_tag, Value::from(mi_value));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
     // Second family with different MI
     let mi_value2 = 2;
     let records2 = create_umi_family("CCCCCCCC", 3, "mol2", "TGCATGCA", 30);
-    for record in records2 {
-        let mut rec = record.clone();
-        let data = rec.data_mut();
-        data.insert(mi_tag, Value::from(mi_value2));
+    for raw in &records2 {
+        let mut rec = to_record_buf(raw);
+        rec.data_mut().insert(mi_tag, Value::from(mi_value2));
         writer.write_alignment_record(&header, &rec).expect("Failed to write record");
     }
 
