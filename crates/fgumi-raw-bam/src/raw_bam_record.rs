@@ -457,6 +457,20 @@ impl RawRecord {
         RawRecordView::new(&self.0).cigar_ops_vec()
     }
 
+    /// Zero-allocation iterator yielding raw CIGAR ops as `u32`.
+    #[inline]
+    pub fn cigar_ops_iter(&self) -> impl Iterator<Item = u32> + '_ {
+        // Mirror `cigar_ops_typed` so the borrow is tied to &self.0 directly.
+        use crate::fields::{l_read_name, n_cigar_op};
+        let bam: &[u8] = &self.0;
+        let lrn = l_read_name(bam) as usize;
+        let n = n_cigar_op(bam) as usize;
+        let start = 32 + lrn;
+        let end = start + n * 4;
+        let bytes = if end <= bam.len() { &bam[start..end] } else { &bam[..0] };
+        bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    }
+
     /// Typed iteration over CIGAR ops. Each [`crate::cigar::CigarOp`] is a `Copy` newtype over
     /// the raw u32 — zero-cost ergonomic equivalent of noodles `cigar().iter()`.
     #[inline]
@@ -712,8 +726,11 @@ impl RawRecord {
     /// # Panics
     ///
     /// Panics if `new_name.len() + 1 > u8::MAX as usize` (the BAM spec encodes
-    /// `l_read_name` as a single byte).
+    /// `l_read_name` as a single byte), or if `new_name` contains an embedded
+    /// NUL byte (the BAM spec terminates the read name with a single NUL, so
+    /// embedded NULs would produce a truncated QNAME for downstream readers).
     pub fn set_read_name(&mut self, new_name: &[u8]) {
+        assert!(!new_name.contains(&0), "read name must not contain embedded NUL bytes");
         let new_l = new_name.len() + 1; // include NUL
         let new_l_u8 = u8::try_from(new_l)
             .unwrap_or_else(|_| panic!("read name too long: {} bytes", new_name.len()));
@@ -1148,6 +1165,17 @@ mod tests {
         rec.set_read_name(b"");
         assert_eq!(rec.l_read_name(), 1); // just the NUL
         assert_eq!(rec.read_name(), b"");
+    }
+
+    /// Embedded NULs would give downstream C-string-style readers a truncated
+    /// QNAME while `l_read_name` still spans the full field; reject them.
+    #[test]
+    #[should_panic(expected = "embedded NUL")]
+    fn test_set_read_name_rejects_embedded_nul() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        rec.set_read_name(b"a\0b");
     }
 
     /// `set_cigar_ops(&[])` clears the CIGAR entirely: `n_cigar_op` must be 0

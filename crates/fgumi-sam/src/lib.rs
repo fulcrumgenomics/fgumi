@@ -85,7 +85,7 @@ pub use builder::{
     SamBuilder, Strand, create_default_test_fasta, create_ref_dict, create_test_fasta,
     degrading_qualities, parse_cigar, repeat_n, uniform_qualities,
 };
-pub use clipper::{ClippingMode, SamRecordClipper};
+pub use clipper::{ClippingMode, RawRecordClipper, SamRecordClipper};
 pub use record_utils::{
     PairOrientation, alignment_end, cigar_reference_length, get_pair_orientation, is_fr_pair,
     is_fr_pair_from_tags, leading_clipping, leading_soft_clipping, mate_unclipped_end,

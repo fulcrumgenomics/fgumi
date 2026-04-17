@@ -1002,4 +1002,47 @@ mod tests {
 
         Ok(())
     }
+
+    /// Zero-ref-span CIGAR (pure insertion) should return `Ok(true)` since NM/MD/UQ are written.
+    #[test]
+    fn test_regenerate_alignment_tags_zero_ref_span_returns_true() -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+
+        // Pure-insertion CIGAR: 4I. Mapped record but ref_span = 0.
+        let mut record = create_mapped_record("ACGT", &[30, 30, 30, 30], "4I", 1);
+        let regenerated = regenerate_alignment_tags(&mut record, &header, &reference)?;
+
+        assert!(regenerated, "tags were written for zero-ref-span record; return must be true");
+        assert_eq!(record.data().get(&nm_tag()), Some(&Value::from(0u32)));
+        assert_eq!(record.data().get(&uq_tag()), Some(&Value::from(0u32)));
+        assert_eq!(record.data().get(&md_tag()), Some(&Value::from("0".to_string())));
+
+        Ok(())
+    }
+
+    /// Raw-path zero-ref-span CIGAR (pure insertion) should return `Ok(true)` since NM/MD/UQ
+    /// are written.
+    #[test]
+    fn test_regenerate_alignment_tags_raw_zero_ref_span_returns_true() -> Result<()> {
+        let (_fasta, reference) = create_test_reference()?;
+        let header = create_test_header();
+
+        let record_buf = create_mapped_record("ACGT", &[30, 30, 30, 30], "4I", 1);
+        let mut raw = encode_record_buf_to_raw(&header, &record_buf)?;
+        let regenerated = regenerate_alignment_tags_raw(&mut raw, &header, &reference)?;
+
+        assert!(regenerated, "tags were written for zero-ref-span raw record; return must be true");
+        let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
+        let aux = &raw[aux_off..];
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, b"NM"), Some(0i64));
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, b"UQ"), Some(0i64));
+        assert_eq!(
+            fgumi_raw_bam::find_string_tag(aux, b"MD")
+                .map(|s| std::str::from_utf8(s).expect("MD tag should be valid UTF-8")),
+            Some("0")
+        );
+
+        Ok(())
+    }
 }
