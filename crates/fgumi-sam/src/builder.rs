@@ -106,6 +106,7 @@ impl Strand {
 pub struct SamBuilder {
     /// SAM header
     pub header: Header,
+    // RecordBuf kept: noodles write_alignment_record requires a RecordBuf-implementing type; raw-bam has no noodles-writer integration.
     /// Accumulated records
     records: Vec<RecordBuf>,
     /// Default read length
@@ -267,6 +268,7 @@ impl SamBuilder {
     }
 
     /// Returns a reference to the accumulated records.
+    // RecordBuf kept: callers pass these directly to noodles write_alignment_record.
     #[must_use]
     pub fn records(&self) -> &[RecordBuf] {
         &self.records
@@ -290,6 +292,7 @@ impl SamBuilder {
     }
 
     /// Returns an iterator over the accumulated records.
+    // RecordBuf kept: same as records() — feeds noodles write_alignment_record.
     pub fn iter(&self) -> impl Iterator<Item = &RecordBuf> {
         self.records.iter()
     }
@@ -297,6 +300,7 @@ impl SamBuilder {
     /// Pushes a raw record to the collection.
     ///
     /// This is useful when you need to add pre-built records to the collection.
+    // RecordBuf kept: collection stores RecordBuf for noodles writer consumption.
     pub fn push_record(&mut self, record: RecordBuf) {
         self.records.push(record);
     }
@@ -540,6 +544,7 @@ impl<'a> PairBuilder<'a> {
     /// # Panics
     ///
     /// Panics if the alignment start positions are invalid.
+    // RecordBuf kept: produces RecordBuf required by noodles write_alignment_record in SamBuilder.
     #[must_use]
     #[expect(clippy::too_many_lines, reason = "test builder with many configuration steps")]
     pub fn build(self) -> (RecordBuf, RecordBuf) {
@@ -796,6 +801,7 @@ impl<'a> FragBuilder<'a> {
     /// # Panics
     ///
     /// Panics if the alignment start position is invalid.
+    // RecordBuf kept: produces RecordBuf required by noodles write_alignment_record in SamBuilder.
     #[must_use]
     pub fn build(self) -> RecordBuf {
         let name = self.name.unwrap_or_else(|| self.parent.next_name());
@@ -1321,6 +1327,7 @@ impl RecordBuilder {
     /// # Panics
     ///
     /// Panics if CIGAR string parsing fails (should only happen with invalid CIGAR).
+    // RecordBuf kept: used by tests and record_utils tests which pass RecordBuf directly to noodles-typed functions.
     #[must_use]
     pub fn build(self) -> RecordBuf {
         let mut record = RecordBuf::default();
@@ -1607,6 +1614,7 @@ impl RecordPairBuilder {
     ///
     /// Panics if start positions or sequence lengths do not fit in `i32`, which is
     /// only possible with unreasonably large test values.
+    // RecordBuf kept: delegates to RecordBuilder::build() which produces RecordBuf for noodles-typed callers.
     #[must_use]
     pub fn build(self) -> (RecordBuf, RecordBuf) {
         let name = self.name.unwrap_or_else(|| "pair".to_string());
@@ -1877,6 +1885,7 @@ impl ConsensusTagsBuilder {
     }
 
     /// Builds the tags as a vector of (Tag, Value) pairs.
+    // RecordBuf kept: produces BufValue pairs for insertion into RecordBuf::data_mut() (noodles typed tag data).
     #[must_use]
     pub fn build(self) -> Vec<(Tag, BufValue)> {
         // Guard against conflicting tag sources

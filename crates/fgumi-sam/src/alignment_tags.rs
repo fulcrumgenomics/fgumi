@@ -101,7 +101,7 @@ pub fn regenerate_alignment_tags(
         record.data_mut().insert(nm_tag(), Value::from(0u32));
         record.data_mut().insert(md_tag(), Value::String("0".to_owned().into()));
         record.data_mut().insert(uq_tag(), Value::from(0u32));
-        return Ok(true);
+        return Ok(false);
     }
 
     // Fetch entire reference span in one call
@@ -302,7 +302,7 @@ pub fn regenerate_alignment_tags_raw(
         editor.update_int(b"NM", 0);
         editor.update_int(b"UQ", 0);
         editor.update_string(b"MD", b"0");
-        return Ok(true);
+        return Ok(false);
     }
 
     // Fetch entire reference span in one call
