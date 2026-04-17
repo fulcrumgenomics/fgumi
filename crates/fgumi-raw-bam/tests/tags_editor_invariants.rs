@@ -5,18 +5,6 @@ use fgumi_raw_bam::RawRecord;
 use fgumi_raw_bam::testutil::{encode_op, make_bam_bytes};
 use proptest::prelude::*;
 
-/// Strategy yielding `(Vec<T>, usize)` where the index is uniformly drawn
-/// from `0..vec.len()`. Avoids the low-index bias of `index % vec.len()`
-/// when the index range exceeds the vec length.
-macro_rules! vec_and_valid_index {
-    ($ty:ty) => {
-        proptest::collection::vec(any::<$ty>(), 1..32).prop_flat_map(|v| {
-            let len = v.len();
-            (Just(v), 0..len)
-        })
-    };
-}
-
 /// Build a minimal valid [`RawRecord`] with the given aux bytes.
 ///
 /// Uses a 4-base Match CIGAR op and a short name whose length + NUL is
@@ -196,7 +184,7 @@ proptest! {
         ),
     ) {
         let mut rec = base_record(&[]);
-        let initial_record_len = rec.as_ref().len();
+        let aux_len = rec.as_ref().len();
 
         for (kind, tag, int_val, str_val) in &ops {
             {
@@ -226,10 +214,10 @@ proptest! {
 
             // The record must not be shorter than it was at the start (header + fixed fields).
             prop_assert!(
-                rec.as_ref().len() >= initial_record_len,
+                rec.as_ref().len() >= aux_len,
                 "record shrank below initial size: {} < {}",
                 rec.as_ref().len(),
-                initial_record_len
+                aux_len
             );
         }
     }
@@ -241,38 +229,34 @@ proptest! {
 
 /// Decode `count` little-endian `u8` elements from `data`.
 fn decode_u8_array(data: &[u8], count: usize) -> Vec<u8> {
-    data[..count].to_vec()
+    (0..count).map(|i| data[i]).collect()
 }
 
 /// Decode `count` little-endian `u16` elements from `data`.
 fn decode_u16_array(data: &[u8], count: usize) -> Vec<u16> {
-    data.chunks_exact(2)
-        .take(count)
-        .map(|c| u16::from_le_bytes(c.try_into().expect("chunks_exact(2) yields 2-byte chunks")))
-        .collect()
+    (0..count).map(|i| u16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect()
 }
 
 /// Decode `count` little-endian `i16` elements from `data`.
 fn decode_i16_array(data: &[u8], count: usize) -> Vec<i16> {
-    data.chunks_exact(2)
-        .take(count)
-        .map(|c| i16::from_le_bytes(c.try_into().expect("chunks_exact(2) yields 2-byte chunks")))
-        .collect()
+    (0..count).map(|i| i16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect()
 }
 
 /// Decode `count` little-endian `i32` elements from `data`.
 fn decode_i32_array(data: &[u8], count: usize) -> Vec<i32> {
-    data.chunks_exact(4)
-        .take(count)
-        .map(|c| i32::from_le_bytes(c.try_into().expect("chunks_exact(4) yields 4-byte chunks")))
+    (0..count)
+        .map(|i| {
+            i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+        })
         .collect()
 }
 
 /// Decode `count` little-endian `f32` elements from `data` as bit patterns.
 fn decode_f32_bits_array(data: &[u8], count: usize) -> Vec<u32> {
-    data.chunks_exact(4)
-        .take(count)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4) yields 4-byte chunks")))
+    (0..count)
+        .map(|i| {
+            u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+        })
         .collect()
 }
 
@@ -374,9 +358,11 @@ proptest! {
 
     #[test]
     fn set_array_element_u8_writes_one_element(
-        (initial, index) in vec_and_valid_index!(u8),
+        initial in proptest::collection::vec(any::<u8>(), 1..32),
+        index in 0usize..32,
         new_val in any::<u8>(),
     ) {
+        let index = index % initial.len();
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
@@ -400,9 +386,11 @@ proptest! {
 
     #[test]
     fn set_array_element_u16_writes_one_element(
-        (initial, index) in vec_and_valid_index!(u16),
+        initial in proptest::collection::vec(any::<u16>(), 1..32),
+        index in 0usize..32,
         new_val in any::<u16>(),
     ) {
+        let index = index % initial.len();
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
@@ -426,9 +414,11 @@ proptest! {
 
     #[test]
     fn set_array_element_i16_writes_one_element(
-        (initial, index) in vec_and_valid_index!(i16),
+        initial in proptest::collection::vec(any::<i16>(), 1..32),
+        index in 0usize..32,
         new_val in any::<i16>(),
     ) {
+        let index = index % initial.len();
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
@@ -452,9 +442,11 @@ proptest! {
 
     #[test]
     fn set_array_element_i32_writes_one_element(
-        (initial, index) in vec_and_valid_index!(i32),
+        initial in proptest::collection::vec(any::<i32>(), 1..32),
+        index in 0usize..32,
         new_val in any::<i32>(),
     ) {
+        let index = index % initial.len();
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
@@ -478,9 +470,11 @@ proptest! {
 
     #[test]
     fn set_array_element_f32_writes_one_element(
-        (initial, index) in vec_and_valid_index!(f32),
+        initial in proptest::collection::vec(any::<f32>(), 1..32),
+        index in 0usize..32,
         new_val in any::<f32>(),
     ) {
+        let index = index % initial.len();
         let new_bits = new_val.to_bits();
         let initial_bits: Vec<u32> = initial.iter().map(|f| f.to_bits()).collect();
         let mut rec = base_record(&[]);

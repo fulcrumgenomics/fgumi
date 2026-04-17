@@ -1,8 +1,10 @@
 #![cfg(feature = "noodles")]
+#![deny(unsafe_code)]
 
 use fgumi_raw_bam::testutil::{encode_op, make_bam_bytes};
 use fgumi_raw_bam::{RawRecord, raw_records_to_record_bufs};
 use noodles::sam::alignment::record::Cigar;
+use noodles::sam::alignment::record::cigar::op::Kind;
 
 /// Decode a single [`RawRecord`] through noodles and return the parsed record.
 ///
@@ -41,8 +43,9 @@ proptest::proptest! {
         proptest::prop_assert_eq!(decoded, Some(name.as_bytes()));
     }
 
-    /// Verify that [`RawRecord::set_cigar_ops`] produces bytes that noodles decodes
-    /// to the same CIGAR operations (kind + length), across many random op sequences.
+    /// Verify that [`RawRecord::set_cigar_ops`] produces bytes that noodles
+    /// decodes to the exact same CIGAR: every op's kind (Match, here) and
+    /// length must match the original, not just the op count.
     #[test]
     fn set_cigar_ops_roundtrips(
         ops in proptest::collection::vec(1u32..=100u32, 1..=10),
@@ -58,24 +61,22 @@ proptest::proptest! {
         // Internal view must reflect the new CIGAR.
         proptest::prop_assert_eq!(rec.cigar_ops_vec(), cigar_ops.clone());
 
-        // Noodles must decode each op with the same kind and length.
+        // Noodles must decode the same ops with matching kinds and lengths.
         let buf = decode_with_noodles(&rec);
-        let decoded: Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> = buf
+        let decoded: Vec<(Kind, usize)> = buf
             .cigar()
             .iter()
-            .map(|r| r.expect("noodles cigar op decode failed"))
-            .map(|op| (op.kind(), op.len()))
-            .collect();
-        let expected: Vec<(noodles::sam::alignment::record::cigar::op::Kind, usize)> = ops
-            .iter()
-            .map(|&len| (noodles::sam::alignment::record::cigar::op::Kind::Match, len as usize))
-            .collect();
+            .map(|r| r.map(|o| (o.kind(), o.len())))
+            .collect::<Result<_, _>>()
+            .expect("cigar iter");
+        let expected: Vec<(Kind, usize)> =
+            ops.iter().map(|&len| (Kind::Match, len as usize)).collect();
         proptest::prop_assert_eq!(decoded, expected);
     }
 
-    /// Verify that [`RawRecord::set_sequence_and_qualities`] produces bytes that
-    /// noodles decodes to the same bases and quality scores, across many random
-    /// sequence lengths.
+    /// Verify that [`RawRecord::set_sequence_and_qualities`] produces bytes
+    /// that noodles decodes to the exact same sequence and quality scores,
+    /// byte for byte — not just parseable output.
     #[test]
     fn set_sequence_and_qualities_roundtrips(
         n in 1usize..=200,
@@ -97,7 +98,7 @@ proptest::proptest! {
         proptest::prop_assert_eq!(rec.sequence_vec(), bases.clone());
         proptest::prop_assert_eq!(rec.quality_scores().to_vec(), quals.clone());
 
-        // Noodles must decode the same bases and quality scores element-wise.
+        // Noodles must decode the same sequence + quality scores.
         let buf = decode_with_noodles(&rec);
         proptest::prop_assert_eq!(buf.sequence().as_ref(), bases.as_slice());
         proptest::prop_assert_eq!(buf.quality_scores().as_ref(), quals.as_slice());

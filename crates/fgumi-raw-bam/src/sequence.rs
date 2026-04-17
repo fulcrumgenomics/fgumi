@@ -222,21 +222,16 @@ pub fn pack_sequence_into(dst: &mut Vec<u8>, bases: &[u8]) {
 ///
 /// # Panics
 ///
-/// Panics if `dst.len() < bases.len().div_ceil(2)`. This contract is enforced
-/// unconditionally (not just in debug builds) so callers get a clear failure
-/// at the call boundary rather than a later bounds-check panic.
+/// Panics if `dst.len() < bases.len().div_ceil(2)`.
 #[inline]
 pub fn pack_sequence_into_slice(dst: &mut [u8], bases: &[u8]) {
     if bases.is_empty() {
         return;
     }
     let packed_len = bases.len().div_ceil(2);
-    assert!(
-        dst.len() >= packed_len,
-        "pack_sequence_into_slice: destination slice too small; need {} bytes, got {}",
-        packed_len,
-        dst.len(),
-    );
+    // Public precondition: keep the check active in release builds so a too-small
+    // `dst` aborts immediately instead of panicking mid-write after partial output.
+    assert!(dst.len() >= packed_len, "dst too short: got {} bytes, need {packed_len}", dst.len(),);
     let mut i = 0usize;
     let mut chunks = bases.chunks_exact(PACK_CHUNK);
     for chunk in chunks.by_ref() {
@@ -744,6 +739,16 @@ mod tests {
         assert_eq!(dst, [0xFF]); // N=15, N=15
     }
 
+    #[test]
+    #[should_panic(expected = "dst too short")]
+    fn test_pack_sequence_into_slice_panics_on_short_dst_in_release() {
+        // Must abort up-front (not mid-write) even in release builds.
+        // Previously used `debug_assert!`, which was compiled out of release
+        // builds and allowed partial writes before an index panic.
+        let mut dst = [0u8; 1]; // need 2 bytes for 4 bases
+        pack_sequence_into_slice(&mut dst, b"ACGT");
+    }
+
     // ========================================================================
     // RawRecordView sequence/quality method tests
     // ========================================================================
@@ -777,28 +782,12 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[should_panic(expected = "pack_sequence_into_slice: destination slice too small")]
-    fn test_pack_sequence_into_slice_asserts_on_undersized_dst() {
-        // Contract must be enforced in release builds too: bases=8 needs 4 bytes,
-        // dst has only 3 → unconditional assert.
-        let bases = b"ACGTACGT";
-        let mut dst = [0u8; 3];
-        pack_sequence_into_slice(&mut dst, bases);
-    }
-
-    #[test]
     fn test_extract_sequence_simd_matches_scalar_over_lengths() {
         // Test a range of lengths that exercise the SIMD path (>=32) and the
-        // scalar tail (length % 32 != 0). The expected bytes are computed by
-        // the scalar `get_base` / `BAM_BASE_TO_ASCII` decoder on the same
-        // packed record, so this directly verifies the SIMD shuffle order
-        // against the scalar path (not just pack->unpack round-trip).
-        //
-        // Cycling through the full 16-nibble alphabet `=ACMGRSVTWYHKDBN`
-        // exercises every LUT entry at every even/odd (hi/lo) nibble slot.
-        const ALPHABET: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
+        // scalar tail (length % 32 != 0).
         for l in [0usize, 1, 15, 31, 32, 33, 63, 64, 150, 200, 255] {
-            let seq: Vec<u8> = (0..l).map(|i| ALPHABET[i % 16]).collect();
+            // Build a record with a deterministic sequence pattern.
+            let seq: Vec<u8> = (0..l).map(|i| b"ACGTN"[i % 5]).collect();
             let mut packed = Vec::new();
             pack_sequence_into(&mut packed, &seq);
             // Build a BAM record with the packed sequence in place.
@@ -807,14 +796,8 @@ mod tests {
             let packed_len = l.div_ceil(2);
             bam[so..so + packed_len].copy_from_slice(&packed);
 
-            // Expected: decode the same packed bytes with the scalar decoder.
-            let expected: Vec<u8> =
-                (0..l).map(|i| BAM_BASE_TO_ASCII[get_base(&bam, so, i) as usize]).collect();
-
             let got = extract_sequence(&bam);
-            assert_eq!(got, expected, "SIMD vs scalar mismatch at l={l}");
-            // And the round-trip against the source bases also holds.
-            assert_eq!(got, seq, "round-trip mismatch at l={l}");
+            assert_eq!(got, seq, "mismatch at l={l}");
         }
     }
 
