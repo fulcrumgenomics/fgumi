@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Cap `fgumi group` metric memory by merging per-position-group counts into per-thread accumulators instead of a `SegQueue` that grew one `AHashMap` per position group ([#285](https://github.com/fulcrumgenomics/fgumi/issues/285)).
+
 ### Breaking Changes
 
 - Rename the template-coordinate sort-key tag written by `fgumi zipper` from `pa` to `tc` to avoid collision with bwa-mem's `pa:f` (primary-alignment score fraction) ([#268](https://github.com/fulcrumgenomics/fgumi/issues/268)). The `--skip-pa-tags` flag on `fgumi zipper` is renamed to `--skip-tc-tags`, and the `missing_pa_tag` dedup metric field is renamed to `missing_tc_tag`. Existing fgumi-zippered BAMs must be re-zippered (or the tag must be manually renamed) before `fgumi dedup` will accept them.

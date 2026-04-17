@@ -28,8 +28,8 @@ use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use bstr::BString;
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
+use parking_lot::Mutex;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
 use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
@@ -65,13 +65,47 @@ fn estimate_templates_heap_size(templates: &[Template]) -> usize {
 
 // UmiGroupingMetrics and FamilySizeMetrics are imported from crate::metrics
 
-/// Collected metrics from `serialize_fn`, aggregated after pipeline completion.
+/// Per-thread accumulator for group metrics. Each pipeline worker merges
+/// per-position-group results into its own slot, so memory is O(threads ×
+/// distinct family/position-group sizes) rather than O(position groups).
 #[derive(Default, Debug)]
-struct CollectedMetrics {
+struct GroupMetricsAccumulator {
     family_sizes: AHashMap<usize, u64>,
-    /// Number of UMI families in this position group.
-    position_group_size: usize,
+    position_group_sizes: AHashMap<usize, u64>,
     filter_metrics: FilterMetrics,
+}
+
+impl GroupMetricsAccumulator {
+    fn record_group(&mut self, family_sizes: AHashMap<usize, u64>, filter_metrics: &FilterMetrics) {
+        let position_group_size: u64 = family_sizes.values().sum();
+        for (size, count) in family_sizes {
+            *self.family_sizes.entry(size).or_insert(0) += count;
+        }
+        if position_group_size > 0 {
+            *self.position_group_sizes.entry(position_group_size as usize).or_insert(0) += 1;
+        }
+        self.filter_metrics.merge(filter_metrics);
+    }
+}
+
+// Thread-slot assignment for [`GroupMetricsAccumulator`] lookup. Each worker
+// thread lazily claims a slot index from a process-wide counter and caches it
+// in TLS; callers wrap via `% num_slots`, so reused threads and counter growth
+// across test runs stay correct (collisions just share a slot).
+static GROUP_SLOT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static GROUP_SLOT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn group_thread_slot(num_slots: usize) -> usize {
+    GROUP_SLOT.with(|c| {
+        c.get().unwrap_or_else(|| {
+            let s = GROUP_SLOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.set(Some(s));
+            s
+        })
+    }) % num_slots.max(1)
 }
 
 /// Configuration for template filtering during group processing.
@@ -1033,16 +1067,22 @@ impl Command for GroupReadsByUmi {
         // ============================================================
         // Use 7-step unified pipeline (--threads N was specified)
         // ============================================================
-        // Shared state for collecting metrics from parallel serialize_fn
-        // Use lock-free SegQueue to avoid contention when multiple threads push metrics
-        let collected_metrics: Arc<SegQueue<CollectedMetrics>> = Arc::new(SegQueue::new());
+        // Per-thread metric accumulators: each worker merges into its own slot,
+        // so retained memory is O(threads × distinct sizes) rather than growing
+        // one hashmap per position group (see issue #285).
+        let num_threads = self.threading.num_threads();
+        let accumulators: Arc<Vec<Mutex<GroupMetricsAccumulator>>> = Arc::new(
+            (0..num_threads.max(1))
+                .map(|_| Mutex::new(GroupMetricsAccumulator::default()))
+                .collect(),
+        );
 
         // Clone values needed by closures
         let strategy = effective_strategy;
         let index_threshold = self.index_threshold;
         let no_umi = self.no_umi;
         let allow_unmapped = self.allow_unmapped;
-        let collected_metrics_clone = Arc::clone(&collected_metrics);
+        let accumulators_clone = Arc::clone(&accumulators);
 
         // Setup comprehensive memory monitoring first if debug mode is enabled
         #[cfg(feature = "memory-debug")]
@@ -1077,7 +1117,6 @@ impl Command for GroupReadsByUmi {
         let stats_for_serialize = shared_stats.clone();
 
         // Configure 7-step pipeline
-        let num_threads = self.threading.num_threads();
         let mut pipeline_config = build_pipeline_config(
             &self.scheduler_opts,
             &self.compression,
@@ -1372,16 +1411,13 @@ impl Command for GroupReadsByUmi {
                     drop(processed);
                     return Ok(count);
                 }
-                // Collect metrics for later aggregation
-                let position_group_size: u64 = processed.family_sizes.values().sum();
-                let metrics = CollectedMetrics {
-                    family_sizes: processed.family_sizes,
-                    position_group_size: position_group_size as usize,
-                    filter_metrics: processed.filter_metrics,
-                };
-
-                // Lock-free push to SegQueue - no contention
-                collected_metrics_clone.push(metrics);
+                // Merge per-group metrics into this worker's accumulator slot.
+                // Memory stays O(threads × distinct sizes) instead of growing
+                // one hashmap per position group.
+                let slot = group_thread_slot(accumulators_clone.len());
+                accumulators_clone[slot]
+                    .lock()
+                    .record_group(processed.family_sizes, &processed.filter_metrics);
 
                 // Save input record count for progress tracking
                 let input_record_count = processed.input_record_count;
@@ -1510,20 +1546,24 @@ impl Command for GroupReadsByUmi {
 
         info!("Wrote output to {}", self.io.output.display());
 
-        // Aggregate collected metrics from lock-free SegQueue
-        // Drain all metrics and merge them
+        // Reduce per-thread accumulators into final counters. The pipeline has
+        // returned, so `accumulators_clone` inside serialize_fn has been dropped
+        // along with the closure; remaining Arc holders are this call site and
+        // any debug monitor, so we iterate slots by reference rather than
+        // requiring unique ownership.
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut total_filter_metrics = FilterMetrics::new();
 
-        while let Some(m) = collected_metrics.pop() {
-            for (size, count) in m.family_sizes {
+        for slot in accumulators.iter() {
+            let acc = slot.lock();
+            for (&size, &count) in &acc.family_sizes {
                 *family_size_counter.entry(size).or_insert(0) += count;
             }
-            if m.position_group_size > 0 {
-                *position_group_size_counter.entry(m.position_group_size).or_insert(0) += 1;
+            for (&size, &count) in &acc.position_group_sizes {
+                *position_group_size_counter.entry(size).or_insert(0) += count;
             }
-            total_filter_metrics.merge(&m.filter_metrics);
+            total_filter_metrics.merge(&acc.filter_metrics);
         }
 
         let metrics = build_grouping_metrics(&total_filter_metrics, &family_size_counter);
@@ -2598,6 +2638,142 @@ mod tests {
                 fraction_gt_or_eq_position_group_size: 1.0 / 3.0,
             }
         );
+        Ok(())
+    }
+
+    /// Regression test for #285: verify that the per-thread accumulator path
+    /// used in the multi-threaded pipeline produces metrics identical to the
+    /// single-threaded fast path. Runs the same dataset as
+    /// `test_metrics_prefix_writes_all_files` across three threading modes and
+    /// asserts family sizes, grouping metrics, and position-group sizes all
+    /// match.
+    #[rstest]
+    #[case::fast_path(ThreadingOptions::none())]
+    #[case::pipeline_1(ThreadingOptions::new(1))]
+    #[case::pipeline_4(ThreadingOptions::new(4))]
+    fn test_metrics_parity_across_threading_modes(
+        #[case] threading: ThreadingOptions,
+    ) -> Result<()> {
+        // Same dataset as test_metrics_prefix_writes_all_files, plus one
+        // extra N-containing UMI pair (discarded) so the parity check also
+        // covers the `filter_metrics` merge in the per-thread accumulators:
+        //   Position group 1 (pos 100,300): UMI AAA x3 + CCC x1 = 2 families
+        //   Position group 2 (pos 200,400): UMI AAA x2          = 1 family
+        //   Position group 3 (pos 300,500): UMI AAA/CCC/GGG x1  = 3 families
+        //   Discarded (N in UMI):           1 pair (pos 100,300)
+        //
+        // Expected family sizes: {1: 4, 2: 1, 3: 1}
+        // Expected position group sizes: {1: 1, 2: 1, 3: 1}
+        // Expected grouping: 20 records total, 18 accepted, 2 discarded for
+        // Ns in UMI, 6 families.
+        let mut records = Vec::new();
+        for i in 1..=3 {
+            let (r1, r2) = build_test_pair(&format!("a{i:02}"), 0, 100, 300, 60, 60, "AAAAAAAA");
+            records.push(r1);
+            records.push(r2);
+        }
+        let (r1, r2) = build_test_pair("a04", 0, 100, 300, 60, 60, "CCCCCCCC");
+        records.push(r1);
+        records.push(r2);
+        for i in 1..=2 {
+            let (r1, r2) = build_test_pair(&format!("b{i:02}"), 0, 200, 400, 60, 60, "AAAAAAAA");
+            records.push(r1);
+            records.push(r2);
+        }
+        let (r1, r2) = build_test_pair("c01", 0, 300, 500, 60, 60, "AAAAAAAA");
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair("c02", 0, 300, 500, 60, 60, "CCCCCCCC");
+        records.push(r1);
+        records.push(r2);
+        let (r1, r2) = build_test_pair("c03", 0, 300, 500, 60, 60, "GGGGGGGG");
+        records.push(r1);
+        records.push(r2);
+        // Extra discarded pair: UMI contains N.
+        let (r1, r2) = build_test_pair("d01", 0, 100, 300, 60, 60, "AANAAAAA");
+        records.push(r1);
+        records.push(r2);
+
+        let input = create_test_bam(records)?;
+        let paths = TestPaths::new()?;
+
+        let cmd = GroupReadsByUmi {
+            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            metrics: Some(paths.metrics_prefix.clone()),
+            threading,
+            ..test_group_cmd(Strategy::Identity, 0)
+        };
+
+        cmd.execute("test")?;
+
+        let (family_path, grouping_path, position_path) =
+            metrics_prefix_paths(&paths.metrics_prefix);
+
+        // Family sizes must match the known single-threaded reference exactly.
+        let family_metrics: Vec<FamilySizeMetrics> = DelimFile::default().read_tsv(&family_path)?;
+        assert_eq!(
+            family_metrics,
+            vec![
+                FamilySizeMetrics {
+                    family_size: 1,
+                    count: 4,
+                    fraction: 4.0 / 6.0,
+                    fraction_gt_or_eq_family_size: 1.0,
+                },
+                FamilySizeMetrics {
+                    family_size: 2,
+                    count: 1,
+                    fraction: 1.0 / 6.0,
+                    fraction_gt_or_eq_family_size: 2.0 / 6.0,
+                },
+                FamilySizeMetrics {
+                    family_size: 3,
+                    count: 1,
+                    fraction: 1.0 / 6.0,
+                    fraction_gt_or_eq_family_size: 1.0 / 6.0,
+                },
+            ],
+        );
+
+        // Grouping counters: UmiGroupingMetrics has no PartialEq, so compare
+        // the integer fields that the per-thread accumulators feed.
+        let grouping: Vec<UmiGroupingMetrics> = DelimFile::default().read_tsv(&grouping_path)?;
+        assert_eq!(grouping.len(), 1);
+        assert_eq!(grouping[0].total_records, 20);
+        assert_eq!(grouping[0].accepted_records, 18);
+        assert_eq!(grouping[0].total_families, 6);
+        assert_eq!(grouping[0].discarded_non_pf, 0);
+        assert_eq!(grouping[0].discarded_poor_alignment, 0);
+        assert_eq!(grouping[0].discarded_ns_in_umi, 2);
+        assert_eq!(grouping[0].discarded_umi_too_short, 0);
+
+        // Position group sizes must match the known single-threaded reference.
+        let position_metrics: Vec<PositionGroupSizeMetrics> =
+            DelimFile::default().read_tsv(&position_path)?;
+        assert_eq!(
+            position_metrics,
+            vec![
+                PositionGroupSizeMetrics {
+                    position_group_size: 1,
+                    count: 1,
+                    fraction: 1.0 / 3.0,
+                    fraction_gt_or_eq_position_group_size: 1.0,
+                },
+                PositionGroupSizeMetrics {
+                    position_group_size: 2,
+                    count: 1,
+                    fraction: 1.0 / 3.0,
+                    fraction_gt_or_eq_position_group_size: 2.0 / 3.0,
+                },
+                PositionGroupSizeMetrics {
+                    position_group_size: 3,
+                    count: 1,
+                    fraction: 1.0 / 3.0,
+                    fraction_gt_or_eq_position_group_size: 1.0 / 3.0,
+                },
+            ],
+        );
+
         Ok(())
     }
 
