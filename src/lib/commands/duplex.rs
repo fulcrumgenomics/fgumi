@@ -6,8 +6,8 @@
 //! 2. Duplex consensus from paired single-strand consensuses
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
+    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader,
 };
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -24,7 +24,7 @@ use crate::commands::consensus_runner::{
 use crate::consensus_caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
 use crate::duplex_consensus_caller::DuplexConsensusCaller;
 use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
 use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
@@ -246,10 +246,10 @@ impl Command for Duplex {
     /// # };
     /// # use std::path::PathBuf;
     /// let duplex = Duplex {
-    ///     io: BamIoOptions::new(
-    ///         PathBuf::from("grouped.bam"),
-    ///         PathBuf::from("duplex.bam"),
-    ///     ),
+    ///     io: BamIoOptions {
+    ///         input: PathBuf::from("grouped.bam"),
+    ///         output: PathBuf::from("duplex.bam"),
+    ///     },
     ///     rejects_opts: RejectsOptions::default(),
     ///     stats_opts: StatsOptions::default(),
     ///     read_group: ReadGroupOptions {
@@ -302,10 +302,7 @@ impl Command for Duplex {
         );
 
         // Open input BAM using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -358,7 +355,7 @@ impl Command for Duplex {
             return result;
         }
 
-        // Drop the reader for single-threaded mode - we use RawMiGroupIterator which needs its own reader
+        // Drop the reader for single-threaded mode - we use MiGroupIterator which needs its own reader
         drop(reader);
 
         // ============================================================
@@ -414,8 +411,7 @@ impl Command for Duplex {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         // Create the MI group iterator for single-threaded streaming (raw bytes)
-        let (mut raw_reader, _) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
         // Create raw byte iterator, filtering out secondary/supplementary and keeping
         // only mapped or mate-mapped reads
         let raw_record_iter = std::iter::from_fn(move || {
@@ -447,7 +443,7 @@ impl Command for Duplex {
 
         // Group by base MI (strip /A, /B suffix) for streaming using raw bytes
         let mi_group_iter =
-            RawMiGroupIterator::with_transform(raw_record_iter, "MI", |mi_bytes: &[u8]| {
+            MiGroupIterator::with_transform(raw_record_iter, "MI", |mi_bytes: &[u8]| {
                 let mi_str = String::from_utf8_lossy(mi_bytes);
                 extract_mi_base(&mi_str).to_string()
             })
@@ -474,7 +470,7 @@ impl Command for Duplex {
                 }
             }
 
-            // Call consensus — mi_group now yields Vec<RawRecord> directly.
+            // Call consensus directly — records are already RawRecord values.
             let output = consensus_caller.consensus_reads(records)?;
 
             // Write pre-serialized consensus reads
@@ -615,9 +611,8 @@ impl Duplex {
         // Clone input_header before pipeline (needed for rejects writing)
         let rejects_header = input_header.clone();
 
-        // Set raw-byte mode GroupKeyConfig so decode step skips noodles parsing
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -626,20 +621,20 @@ impl Duplex {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create RawMiGrouper with filter, transform, and cell tag ==========
+            // ========== grouper_fn: Create MiGrouper with filter, transform, and cell tag ==========
             move |_header: &Header| {
                 Box::new(
-                    RawMiGrouper::with_filter_and_transform(
+                    MiGrouper::with_filter_and_transform(
                         "MI",
                         batch_size,
                         record_filter,
                         mi_transform,
                     )
                     .with_cell_tag(Some(*SamTag::CB)),
-                ) as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
+                ) as Box<dyn Grouper<Group = MiGroupBatch> + Send>
             },
             // ========== process_fn: Duplex consensus calling ==========
-            move |batch: RawMiGroupBatch| -> io::Result<DuplexProcessedBatch> {
+            move |batch: MiGroupBatch| -> io::Result<DuplexProcessedBatch> {
                 // Create per-thread duplex consensus caller
                 let mut caller = DuplexConsensusCaller::new(
                     read_name_prefix.clone(),
@@ -683,7 +678,7 @@ impl Duplex {
                 let mut batch_overlapping = CorrectionStats::new();
                 let groups_count = batch.groups.len() as u64;
 
-                for RawMiGroup { mi, records: mut group_reads } in batch.groups {
+                for MiGroup { mi, records: mut group_reads } in batch.groups {
                     caller.clear();
 
                     // Apply overlapping consensus if enabled (modifies raw bytes in-place)
@@ -698,7 +693,7 @@ impl Duplex {
                         }
                     }
 
-                    // Call duplex consensus — mi_group yields Vec<RawRecord>.
+                    // Call duplex consensus directly — records are already RawRecord values.
                     match caller.consensus_reads(group_reads) {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
@@ -865,8 +860,10 @@ fn has_both_strands_raw(records: &[RawRecord]) -> bool {
 mod tests {
     use super::*;
     use crate::bam_io::{create_bam_reader, create_bam_writer};
-    use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
     use anyhow::Result;
+    use fgumi_raw_bam::{
+        SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
+    };
     use noodles::sam;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use noodles::sam::alignment::record::data::field::Tag;
@@ -901,7 +898,7 @@ mod tests {
     /// Uses sensible test defaults: disabled per-base tags, disabled overlapping consensus.
     fn create_duplex_with_paths(input: PathBuf, output: PathBuf) -> Duplex {
         Duplex {
-            io: BamIoOptions::new(input, output),
+            io: BamIoOptions { input, output, async_reader: false },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions {
@@ -946,6 +943,11 @@ mod tests {
         builder.build()
     }
 
+    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> sam::alignment::RecordBuf {
+        raw_record_to_record_buf(&raw, &sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
+
     /// Build a test read with common parameters
     #[allow(clippy::cast_sign_loss)]
     fn build_test_read(
@@ -953,45 +955,22 @@ mod tests {
         ref_id: usize,
         pos: i32,
         mapq: u8,
-        flags: u16,
-        bases: &str,
+        raw_flags: u16,
+        bases: &[u8],
     ) -> sam::alignment::RecordBuf {
-        let cigar = format!("{}M", bases.len());
+        let cigar = encode_op(0, bases.len());
         let qual = vec![40u8; bases.len()];
 
-        let mut builder = RecordBuilder::new()
-            .name(name)
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(raw_flags)
+            .ref_id(ref_id as i32)
+            .pos(pos - 1)
+            .mapq(mapq)
+            .cigar_ops(&[cigar])
             .sequence(bases)
-            .qualities(&qual)
-            .reference_sequence_id(ref_id)
-            .alignment_start(pos as usize)
-            .mapping_quality(mapq)
-            .cigar(&cigar);
-
-        // Set flags based on raw u16
-        let sam_flags = sam::alignment::record::Flags::from(flags);
-        if sam_flags.is_segmented() {
-            builder = builder.paired(true);
-        }
-        if sam_flags.is_properly_segmented() {
-            builder = builder.properly_paired(true);
-        }
-        if sam_flags.is_first_segment() {
-            builder = builder.first_segment(true);
-        } else if sam_flags.is_last_segment() {
-            builder = builder.first_segment(false);
-        }
-        if sam_flags.is_reverse_complemented() {
-            builder = builder.reverse_complement(true);
-        }
-        if sam_flags.is_unmapped() {
-            builder = builder.unmapped(true);
-        }
-        if sam_flags.is_mate_unmapped() {
-            builder = builder.mate_unmapped(true);
-        }
-
-        builder.build()
+            .qualities(&qual);
+        to_record_buf(b.build())
     }
 
     /// Create a pair of reads with MI tag
@@ -1002,27 +981,54 @@ mod tests {
         pos1: i32,
         pos2: i32,
         mi_tag: &str,
-        bases: &str,
+        bases: &[u8],
         rx_tag: Option<&str>,
         cell_tag: Option<&str>,
     ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
-        let mut builder = RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(bases)
-            .r2_sequence(bases)
-            .reference_sequence_id(ref_id)
-            .r1_start(pos1 as usize)
-            .r2_start(pos2 as usize)
-            .tag("MI", mi_tag);
+        let cigar = encode_op(0, bases.len());
+        let qual = vec![40u8; bases.len()];
 
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(ref_id as i32)
+            .pos(pos1 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(bases)
+            .qualities(&qual)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos2 - 1);
+        b1.add_string_tag(b"MI", mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            builder = builder.tag("RX", rx);
+            b1.add_string_tag(b"RX", rx.as_bytes());
         }
         if let Some(cell) = cell_tag {
-            builder = builder.tag("CB", cell);
+            b1.add_string_tag(b"CB", cell.as_bytes());
         }
+        let r1 = to_record_buf(b1.build());
 
-        builder.build()
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(ref_id as i32)
+            .pos(pos2 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(bases)
+            .qualities(&qual)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos1 - 1);
+        b2.add_string_tag(b"MI", mi_tag.as_bytes());
+        if let Some(rx) = rx_tag {
+            b2.add_string_tag(b"RX", rx.as_bytes());
+        }
+        if let Some(cell) = cell_tag {
+            b2.add_string_tag(b"CB", cell.as_bytes());
+        }
+        let r2 = to_record_buf(b2.build());
+
+        (r1, r2)
     }
 
     /// Write records to a temporary BAM file
@@ -1170,15 +1176,15 @@ mod tests {
 
         // A reads: R1 at 100 (forward), R2 at 200 (reverse) - query name "q1"
         let (r1_a, r2_a) =
-            build_duplex_pair("q1", 0, 100, 200, "1/A", "AAAAAAAAAA", Some("AAT-CCG"), None);
+            build_duplex_pair("q1", 0, 100, 200, "1/A", b"AAAAAAAAAA", Some("AAT-CCG"), None);
         records.push(r1_a);
         records.push(r2_a);
 
         // B reads: R1 at 200 (reverse), R2 at 100 (forward) - query name "q2", positions swapped
         let flags1 = 0x53; // paired, proper pair, first in pair, reverse
         let flags2 = 0x83; // paired, proper pair, second in pair, forward
-        let mut r1_b = build_test_read("q2", 0, 200, 60, flags1, "TTTTTTTTTT"); // Reverse complement of A
-        let mut r2_b = build_test_read("q2", 0, 100, 60, flags2, "AAAAAAAAAA");
+        let mut r1_b = build_test_read("q2", 0, 200, 60, flags1, b"TTTTTTTTTT"); // Reverse complement of A
+        let mut r2_b = build_test_read("q2", 0, 100, 60, flags2, b"AAAAAAAAAA");
 
         // Set mate info
         *r1_b.mate_reference_sequence_id_mut() = Some(0);
@@ -1233,7 +1239,7 @@ mod tests {
         let mut records = Vec::new();
 
         // AB reads: R1 forward (+), R2 forward (+) - WRONG!
-        let (r1, mut r2) = build_duplex_pair("ab1", 0, 100, 200, "1/A", "AAAAAAAAAA", None, None);
+        let (r1, mut r2) = build_duplex_pair("ab1", 0, 100, 200, "1/A", b"AAAAAAAAAA", None, None);
         // Make R2 forward instead of reverse
         let mut flags2 = r2.flags();
         flags2.set(noodles::sam::alignment::record::Flags::REVERSE_COMPLEMENTED, false);
@@ -1244,8 +1250,8 @@ mod tests {
         // BA reads: R1 forward (+), R2 reverse (-) - correct orientation
         let flags1 = 0x53; // paired, first in pair, reverse
         let flags2 = 0x83; // paired, second in pair
-        let mut r1 = build_test_read("ba1", 0, 200, 60, flags1, "AAAAAAAAAA");
-        let mut r2 = build_test_read("ba1", 0, 100, 60, flags2, "AAAAAAAAAA");
+        let mut r1 = build_test_read("ba1", 0, 200, 60, flags1, b"AAAAAAAAAA");
+        let mut r2 = build_test_read("ba1", 0, 100, 60, flags2, b"AAAAAAAAAA");
 
         *r1.mate_reference_sequence_id_mut() = Some(0);
         *r1.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();
@@ -1287,7 +1293,7 @@ mod tests {
                 100,
                 100,
                 "1/A",
-                "AAAAAAAAAA",
+                b"AAAAAAAAAA",
                 Some("AAT-CCG"),
                 None,
             );
@@ -1299,8 +1305,8 @@ mod tests {
         for i in 1..=2 {
             let flags1 = 0x53;
             let flags2 = 0x83;
-            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, "AAAAAAAAAA");
-            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, "AAAAAAAAAA");
+            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, b"AAAAAAAAAA");
+            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, b"AAAAAAAAAA");
 
             *r1.mate_reference_sequence_id_mut() = Some(0);
             *r1.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();
@@ -1352,7 +1358,7 @@ mod tests {
                 100,
                 100,
                 "1/A",
-                "AAAAAAAAAA",
+                b"AAAAAAAAAA",
                 Some("AAT-CCG"),
                 None,
             );
@@ -1364,8 +1370,8 @@ mod tests {
         for i in 1..=3 {
             let flags1 = 0x53;
             let flags2 = 0x83;
-            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, "AAAAAAAAAA");
-            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, "AAAAAAAAAA");
+            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, b"AAAAAAAAAA");
+            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, b"AAAAAAAAAA");
 
             *r1.mate_reference_sequence_id_mut() = Some(0);
             *r1.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();
@@ -1419,7 +1425,7 @@ mod tests {
                 100,
                 100,
                 "1/A",
-                "AAAAAAAAAA",
+                b"AAAAAAAAAA",
                 Some("AAT-CCG"),
                 Some("CELLBC"),
             );
@@ -1431,8 +1437,8 @@ mod tests {
         for i in 1..=3 {
             let flags1 = 0x53;
             let flags2 = 0x83;
-            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, "AAAAAAAAAA");
-            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, "AAAAAAAAAA");
+            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, b"AAAAAAAAAA");
+            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, b"AAAAAAAAAA");
 
             *r1.mate_reference_sequence_id_mut() = Some(0);
             *r1.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();
@@ -1489,7 +1495,7 @@ mod tests {
                     100 * group,
                     100 * group,
                     &format!("{group}/A"),
-                    "AAAAAAAAAA",
+                    b"AAAAAAAAAA",
                     Some("AAT-CCG"),
                     None,
                 );
@@ -1507,7 +1513,7 @@ mod tests {
                     100 * group,
                     60,
                     flags1,
-                    "AAAAAAAAAA",
+                    b"AAAAAAAAAA",
                 );
                 let mut r2 = build_test_read(
                     &format!("g{group}_ba{i}"),
@@ -1515,7 +1521,7 @@ mod tests {
                     100 * group,
                     60,
                     flags2,
-                    "AAAAAAAAAA",
+                    b"AAAAAAAAAA",
                 );
 
                 *r1.mate_reference_sequence_id_mut() = Some(0);
@@ -1587,7 +1593,7 @@ mod tests {
                 100,
                 100,
                 "1/A",
-                "AAAAAAAAAA",
+                b"AAAAAAAAAA",
                 Some("AAT-CCG"),
                 None,
             );
@@ -1636,7 +1642,7 @@ mod tests {
                 100,
                 200,
                 "1/A",
-                "AAAAAAAAAA",
+                b"AAAAAAAAAA",
                 Some("AAT-CCG"),
                 None,
             );
@@ -1650,7 +1656,7 @@ mod tests {
                 100,
                 200,
                 "1/B",
-                "AAAAAAAAAA",
+                b"AAAAAAAAAA",
                 Some("AAT-CCG"),
                 None,
             );
@@ -1713,7 +1719,7 @@ mod tests {
         // AB reads: R1 forward at 100, R2 reverse at 100
         for i in 0..3 {
             let (r1, r2) =
-                build_duplex_pair(&format!("ab{i}"), 0, 100, 100, "1/A", "CCCCCCCCCC", None, None);
+                build_duplex_pair(&format!("ab{i}"), 0, 100, 100, "1/A", b"CCCCCCCCCC", None, None);
             records.push(r1);
             records.push(r2);
         }
@@ -1722,8 +1728,8 @@ mod tests {
         for i in 0..3 {
             let flags1 = 0x53_u16; // paired, proper pair, first in pair, reverse
             let flags2 = 0x83_u16; // paired, proper pair, second in pair, forward
-            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, "CCCCCCCCCC");
-            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, "CCCCCCCCCC");
+            let mut r1 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags1, b"CCCCCCCCCC");
+            let mut r2 = build_test_read(&format!("ba{i}"), 0, 100, 60, flags2, b"CCCCCCCCCC");
 
             *r1.mate_reference_sequence_id_mut() = Some(0);
             *r1.mate_alignment_start_mut() = noodles::core::Position::try_from(100_usize).ok();

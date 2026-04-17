@@ -1482,93 +1482,60 @@ impl Default for GroupKey {
 /// This is the output of the Decode step and input to the Group step.
 /// The key is computed during the parallel Decode step so that the
 /// serial Group step only needs to do fast integer comparisons.
-///
-/// Uses an enum for the record data to avoid carrying both `RecordBuf` and
-/// `Vec<u8>` — saving ~24 bytes per record in parsed mode and ~200 bytes
-/// in raw mode.
 #[derive(Debug)]
 pub struct DecodedRecord {
     /// Pre-computed grouping key.
     pub key: GroupKey,
-    /// The record data — either a parsed `RecordBuf` or raw bytes.
-    pub(crate) data: DecodedRecordData,
-}
-
-/// Record data: either a parsed noodles `RecordBuf` or raw BAM bytes.
-///
-/// The `Parsed` variant is retained for commands (e.g. `clip`) that require typed
-/// `RecordBuf` access for CIGAR edits and the noodles flag API.
-/// The `Raw` variant uses [`RawRecord`] for zero-overhead byte access and
-/// direct output writes without re-encoding.
-#[derive(Debug)]
-pub enum DecodedRecordData {
-    Parsed(RecordBuf),
-    Raw(RawRecord),
+    /// Raw BAM record bytes.
+    pub(crate) data: RawRecord,
 }
 
 impl DecodedRecord {
-    /// Create a new decoded record with its grouping key.
-    #[must_use]
-    pub fn new(record: RecordBuf, key: GroupKey) -> Self {
-        Self { key, data: DecodedRecordData::Parsed(record) }
-    }
-
     /// Create a decoded record from raw bytes, skipping noodles decode.
     ///
     /// Accepts anything that converts `Into<RawRecord>` (e.g. a bare `Vec<u8>` or
     /// an already-constructed `RawRecord`).
     #[must_use]
     pub fn from_raw_bytes(raw: impl Into<RawRecord>, key: GroupKey) -> Self {
-        Self { key, data: DecodedRecordData::Raw(raw.into()) }
+        Self { key, data: raw.into() }
     }
 
-    /// Returns a reference to the raw bytes if this is a raw-mode record.
+    /// Returns a reference to the raw bytes.
     #[must_use]
-    pub fn raw_bytes(&self) -> Option<&[u8]> {
-        match &self.data {
-            DecodedRecordData::Raw(v) => Some(v.as_ref()),
-            DecodedRecordData::Parsed(_) => None,
-        }
+    pub fn raw_bytes(&self) -> &[u8] {
+        self.data.as_ref()
     }
 
-    /// Takes the [`RawRecord`] out if this is a raw-mode record.
+    /// Takes the [`RawRecord`] out.
     #[must_use]
-    pub fn into_raw_bytes(self) -> Option<RawRecord> {
-        match self.data {
-            DecodedRecordData::Raw(v) => Some(v),
-            DecodedRecordData::Parsed(_) => None,
-        }
+    pub fn into_raw_bytes(self) -> RawRecord {
+        self.data
     }
+}
 
-    /// Returns a reference to the `RecordBuf` if this is a parsed-mode record.
-    #[must_use]
-    pub fn record(&self) -> Option<&RecordBuf> {
-        match &self.data {
-            DecodedRecordData::Parsed(r) => Some(r),
-            DecodedRecordData::Raw(_) => None,
-        }
-    }
-
-    /// Takes the `RecordBuf` out if this is a parsed-mode record.
-    #[must_use]
-    pub fn into_record(self) -> Option<RecordBuf> {
-        match self.data {
-            DecodedRecordData::Parsed(r) => Some(r),
-            DecodedRecordData::Raw(_) => None,
-        }
-    }
+/// Estimates the heap allocation of a `RecordBuf`.
+///
+/// The inline struct overhead (flags, position, etc.) is accounted for by the caller
+/// via `capacity * size_of::<RecordBuf>()`, so we only count heap allocations here.
+pub(crate) fn estimate_record_buf_heap_size(record: &RecordBuf) -> usize {
+    let name_size = record.name().map_or(0, |n| n.len());
+    let seq_len = record.sequence().len();
+    let qual_len = record.quality_scores().len();
+    let cigar_ops = record.cigar().as_ref().len();
+    let cigar_size = cigar_ops * 4;
+    let data_fields = record.data().iter().count();
+    let entry_capacity = (data_fields * 115) / 100 + 1;
+    let entries_size = data_fields * 48;
+    let hash_table_size = entry_capacity * 16;
+    let value_heap_size = data_fields * 16;
+    let data_size = entries_size + hash_table_size + value_heap_size;
+    name_size + seq_len + qual_len + cigar_size + data_size
 }
 
 impl MemoryEstimate for DecodedRecord {
     fn estimate_heap_size(&self) -> usize {
-        match &self.data {
-            DecodedRecordData::Parsed(record) => {
-                crate::template::estimate_record_buf_heap_size(record)
-            }
-            // RawRecord::capacity() returns the inner Vec<u8> capacity — same semantics
-            // as the previous Vec<u8>::capacity() call.
-            DecodedRecordData::Raw(raw) => raw.capacity(),
-        }
+        // RawRecord::capacity() returns the inner Vec<u8> capacity.
+        self.data.capacity()
     }
 }
 
@@ -1581,8 +1548,7 @@ impl MemoryEstimate for Vec<DecodedRecord> {
 
 impl MemoryEstimate for RecordBuf {
     fn estimate_heap_size(&self) -> usize {
-        // Delegate to the detailed estimation in template.rs (single source of truth)
-        crate::template::estimate_record_buf_heap_size(self)
+        estimate_record_buf_heap_size(self)
     }
 }
 
@@ -1615,35 +1581,19 @@ pub struct GroupKeyConfig {
     pub library_index: Arc<LibraryIndex>,
     /// Tag used for cell barcode extraction. None skips cell extraction.
     pub cell_tag: Option<Tag>,
-    /// When true, skip noodles decode and work with raw BAM bytes.
-    pub raw_byte_mode: bool,
 }
 
 impl GroupKeyConfig {
     /// Create a new `GroupKeyConfig`.
     #[must_use]
     pub fn new(library_index: LibraryIndex, cell_tag: Tag) -> Self {
-        Self {
-            library_index: Arc::new(library_index),
-            cell_tag: Some(cell_tag),
-            raw_byte_mode: false,
-        }
+        Self { library_index: Arc::new(library_index), cell_tag: Some(cell_tag) }
     }
 
-    /// Create a `GroupKeyConfig` for raw-byte mode.
-    #[must_use]
-    pub fn new_raw(library_index: LibraryIndex, cell_tag: Tag) -> Self {
-        Self {
-            library_index: Arc::new(library_index),
-            cell_tag: Some(cell_tag),
-            raw_byte_mode: true,
-        }
-    }
-
-    /// Create a `GroupKeyConfig` for raw-byte mode without cell barcode extraction.
+    /// Create a `GroupKeyConfig` without cell barcode extraction.
     #[must_use]
     pub fn new_raw_no_cell(library_index: LibraryIndex) -> Self {
-        Self { library_index: Arc::new(library_index), cell_tag: None, raw_byte_mode: true }
+        Self { library_index: Arc::new(library_index), cell_tag: None }
     }
 }
 
@@ -1652,7 +1602,6 @@ impl Default for GroupKeyConfig {
         Self {
             library_index: Arc::new(LibraryIndex::default()),
             cell_tag: Some(Tag::from(SamTag::CB)), // Default cell barcode tag
-            raw_byte_mode: false,
         }
     }
 }
@@ -6006,15 +5955,9 @@ mod tests {
     }
 
     #[test]
-    fn test_decoded_record_record_accessor() {
-        let rec = RecordBuf::default();
-        let parsed = DecodedRecord::new(rec, GroupKey::default());
-        assert!(parsed.record().is_some());
-        assert!(parsed.raw_bytes().is_none());
-
+    fn test_decoded_record_raw_accessor() {
         let raw = DecodedRecord::from_raw_bytes(vec![0u8; 32], GroupKey::default());
-        assert!(raw.record().is_none());
-        assert!(raw.raw_bytes().is_some());
+        assert!(!raw.raw_bytes().is_empty());
     }
 
     #[test]
@@ -6033,10 +5976,14 @@ mod tests {
 
     #[test]
     fn test_memory_estimate_vec_record_buf() {
-        use crate::sam::builder::RecordBuilder;
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, raw_record_to_record_buf};
+        use noodles::sam::Header;
         use noodles::sam::alignment::record_buf::RecordBuf;
 
-        let record = RecordBuilder::new().sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGT").qualities(&[30, 30, 30, 30]).flags(0);
+        let record = raw_record_to_record_buf(&b.build(), &Header::default())
+            .expect("raw_record_to_record_buf failed in test");
         let mut records: Vec<RecordBuf> = Vec::with_capacity(10);
         records.push(record);
 

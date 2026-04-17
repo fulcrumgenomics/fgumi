@@ -2,7 +2,7 @@
 //!
 //! This command marks or removes PCR duplicates using UMI information.
 //! It operates on template-coordinate sorted BAM files and requires
-//! the `tc` tag on secondary/supplementary reads (added by `fgumi zipper`).
+//! the `pa` tag on secondary/supplementary reads (added by `fgumi zipper`).
 //!
 //! # Algorithm
 //!
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
+use crate::bam_io::{create_bam_reader_for_pipeline, is_stdin_path};
 use crate::grouper::{
     FilterMetrics, RawPositionGroup, RecordPositionGrouper, build_templates_from_records,
 };
@@ -30,25 +30,21 @@ use crate::logging::OperationTimer;
 use crate::metrics::group::FamilySizeMetrics;
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
-use crate::sam::{is_template_coordinate_sorted, unclipped_five_prime_position};
-use crate::template::{MoleculeId, Template};
+use crate::sam::is_template_coordinate_sorted;
+use crate::template::Template;
 use crate::umi::{UmiValidation, validate_umi};
 use crate::unified_pipeline::{
     BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
-    serialize_bam_records_into,
 };
 use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
-use bstr::BString;
 use clap::Parser;
 use fgoxide::io::DelimFile;
 
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -87,7 +83,7 @@ pub struct DedupMetrics {
     pub secondary_reads: u64,
     /// Supplementary reads processed
     pub supplementary_reads: u64,
-    /// Secondary/supplementary without tc tag
+    /// Secondary/supplementary without pa tag
     pub missing_tc_tag: u64,
     /// Filter metrics from position grouping
     pub filter_metrics: FilterMetrics,
@@ -225,38 +221,13 @@ struct DedupFilterConfig {
 /// Scores a template for duplicate selection.
 /// Higher score = more likely to be chosen as representative.
 ///
-/// Scoring is based on sum of base qualities from primary reads,
-/// matching HTSJDK/Picard's `SUM_OF_BASE_QUALITIES` strategy.
+/// Sums base qualities from primary reads (R1 and R2), capping each quality at 15
+/// per base to match Picard/HTSJDK's `SUM_OF_BASE_QUALITIES` strategy.
 #[inline]
 fn score_template(template: &Template) -> i64 {
-    if template.is_raw_byte_mode() {
-        return score_template_raw(template);
-    }
-
     let mut score: u32 = 0;
 
-    // Score R1 primary
-    if let Some(r1) = template.r1() {
-        score += sum_base_qualities(r1);
-    }
-
-    // Score R2 primary
-    if let Some(r2) = template.r2() {
-        score += sum_base_qualities(r2);
-    }
-
-    i64::from(score)
-}
-
-/// Raw-byte version of `score_template`. Sums base qualities from raw BAM bytes,
-/// capping each quality at 15 per base (matching Picard/HTSJDK behavior).
-#[inline]
-fn score_template_raw(template: &Template) -> i64 {
-    use crate::sort::bam_fields;
-
-    let mut score: u32 = 0;
-
-    for raw in [template.raw_r1(), template.raw_r2()].into_iter().flatten() {
+    for raw in [template.r1(), template.r2()].into_iter().flatten() {
         if raw.len() < 32 {
             continue;
         }
@@ -274,29 +245,19 @@ fn score_template_raw(template: &Template) -> i64 {
     i64::from(score)
 }
 
-/// Sums base qualities for a record, capping at 15 per base (like Picard).
-///
-/// Uses u32 accumulator for faster arithmetic. u32 is sufficient for reads
-/// up to ~286 million bases (2^32 / 15), far exceeding any real read length.
-#[inline]
-fn sum_base_qualities(record: &noodles::sam::alignment::RecordBuf) -> u32 {
-    record.quality_scores().as_ref().iter().map(|&q| u32::from(std::cmp::min(q, 15))).sum()
-}
-
 //////////////////////////////////////////////////////////////////////////////
 // Template filtering (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
 
-/// Raw-byte version of `filter_template`.
-fn filter_template_raw(
+/// Filter a template based on filtering criteria.
+/// Returns true if the template should be kept.
+fn filter_template(
     template: &Template,
     config: &DedupFilterConfig,
     metrics: &mut FilterMetrics,
 ) -> bool {
-    use crate::sort::bam_fields;
-
-    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r1 = template.r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
 
     metrics.total_templates += 1;
 
@@ -436,101 +397,6 @@ fn filter_template_raw(
     true
 }
 
-/// Filter a template based on filtering criteria.
-/// Returns true if the template should be kept.
-fn filter_template(
-    template: &Template,
-    config: &DedupFilterConfig,
-    metrics: &mut FilterMetrics,
-) -> bool {
-    let r1 = template.r1();
-    let r2 = template.r2();
-
-    metrics.total_templates += 1;
-
-    // Need at least one primary read
-    if r1.is_none() && r2.is_none() {
-        metrics.discarded_poor_alignment += 1;
-        return false;
-    }
-
-    // Check if both reads are unmapped
-    let both_unmapped =
-        r1.is_none_or(|r| r.flags().is_unmapped()) && r2.is_none_or(|r| r.flags().is_unmapped());
-
-    if both_unmapped {
-        metrics.discarded_poor_alignment += 1;
-        return false;
-    }
-
-    // Phase 1: Flag-based checks
-    for record in [r1, r2].into_iter().flatten() {
-        let flags = record.flags();
-
-        // Filter non-PF if requested
-        if !config.include_non_pf && flags.is_qc_fail() {
-            metrics.discarded_non_pf += 1;
-            return false;
-        }
-
-        // Check MAPQ for mapped reads
-        if !flags.is_unmapped() {
-            let mapq = record.mapping_quality().map_or(0, u8::from);
-            if mapq < config.min_mapq {
-                metrics.discarded_poor_alignment += 1;
-                return false;
-            }
-        }
-    }
-
-    // Phase 2: Tag-based checks
-    for record in [r1, r2].into_iter().flatten() {
-        let flags = record.flags();
-
-        // Check mate MAPQ via MQ tag
-        if !flags.is_mate_unmapped() {
-            if let Some(data) = record.data().get(b"MQ") {
-                if let Some(mq) = data.as_int() {
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    if (mq as u8) < config.min_mapq {
-                        metrics.discarded_poor_alignment += 1;
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        // Check UMI for Ns and minimum length using common validation
-        if let Some(DataValue::String(umi)) = record.data().get(&config.umi_tag) {
-            match validate_umi(umi) {
-                UmiValidation::ContainsN => {
-                    metrics.discarded_ns_in_umi += 1;
-                    return false;
-                }
-                UmiValidation::Valid(base_count) => {
-                    if let Some(min_len) = config.min_umi_length {
-                        if base_count < min_len {
-                            metrics.discarded_umi_too_short += 1;
-                            return false;
-                        }
-                    }
-                }
-            }
-        } else {
-            metrics.discarded_poor_alignment += 1;
-            return false;
-        }
-    }
-
-    metrics.accepted_templates += 1;
-    true
-}
-
 //////////////////////////////////////////////////////////////////////////////
 // UMI assignment (adapted from group command)
 //////////////////////////////////////////////////////////////////////////////
@@ -577,41 +443,16 @@ fn umi_for_read(umi: &str, is_r1_earlier: bool, assigner: &dyn UmiAssigner) -> R
 
 /// Get pair orientation for a template.
 fn get_pair_orientation(template: &Template) -> (bool, bool) {
-    if template.is_raw_byte_mode() {
-        return get_pair_orientation_raw(template);
-    }
-    let r1_positive = template.r1().is_none_or(|r| !r.flags().is_reverse_complemented());
-    let r2_positive = template.r2().is_none_or(|r| !r.flags().is_reverse_complemented());
-    (r1_positive, r2_positive)
-}
-
-/// Raw-byte pair orientation using `RawRecordView::flags()`.
-fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
     let r1_positive = template
-        .raw_r1()
+        .r1()
         .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
     let r2_positive = template
-        .raw_r2()
+        .r2()
         .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
 
 /// Check if R1 is genomically earlier than R2.
-fn is_r1_genomically_earlier(
-    r1: &noodles::sam::alignment::RecordBuf,
-    r2: &noodles::sam::alignment::RecordBuf,
-) -> Result<bool> {
-    let ref1 = r1.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
-    let ref2 = r2.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
-    if ref1 != ref2 {
-        return Ok(ref1 < ref2);
-    }
-    let r1_pos = unclipped_five_prime_position(r1).unwrap_or(0);
-    let r2_pos = unclipped_five_prime_position(r2).unwrap_or(0);
-    Ok(r1_pos <= r2_pos)
-}
-
-/// Raw-byte version: check if R1 is genomically earlier than R2.
 fn is_r1_genomically_earlier_raw(r1: &[u8], r2: &[u8]) -> bool {
     let ref1 = bam_fields::ref_id(r1);
     let ref2 = bam_fields::ref_id(r2);
@@ -651,7 +492,6 @@ fn assign_umi_groups_for_indices(
     }
 
     let mut umis = Vec::with_capacity(indices.len());
-    let raw_mode = templates[indices[0]].is_raw_byte_mode();
 
     for &idx in indices {
         let template = &templates[idx];
@@ -660,52 +500,25 @@ fn assign_umi_groups_for_indices(
         let processed_umi = if no_umi {
             String::new()
         } else {
-            let (umi_str_ref, is_r1_earlier) = if raw_mode {
-                let umi_bytes = if let Some(r1_raw) = template.raw_r1() {
-                    let aux = bam_fields::aux_data_slice(r1_raw);
-                    bam_fields::find_string_tag(aux, &raw_tag)
-                } else if let Some(r2_raw) = template.raw_r2() {
-                    let aux = bam_fields::aux_data_slice(r2_raw);
-                    bam_fields::find_string_tag(aux, &raw_tag)
-                } else {
-                    None
-                };
-                let umi_bytes = umi_bytes.ok_or_else(|| anyhow::anyhow!("No UMI tag found"))?;
-                let umi_str = std::str::from_utf8(umi_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
-                let earlier = if let (Some(r1), Some(r2)) = (template.raw_r1(), template.raw_r2()) {
-                    is_r1_genomically_earlier_raw(r1, r2)
-                } else {
-                    true
-                };
-                (umi_str, earlier)
+            let umi_bytes = if let Some(r1_raw) = template.r1() {
+                let aux = bam_fields::aux_data_slice(r1_raw);
+                bam_fields::find_string_tag(aux, &raw_tag)
+            } else if let Some(r2_raw) = template.r2() {
+                let aux = bam_fields::aux_data_slice(r2_raw);
+                bam_fields::find_string_tag(aux, &raw_tag)
             } else {
-                let umi_bytes = if let Some(r1) = template.r1() {
-                    if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
-                        bytes
-                    } else {
-                        bail!("UMI tag is not a string");
-                    }
-                } else if let Some(r2) = template.r2() {
-                    if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
-                        bytes
-                    } else {
-                        bail!("UMI tag is not a string");
-                    }
-                } else {
-                    bail!("Template has no reads");
-                };
-                let umi_str = std::str::from_utf8(umi_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
-                let earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
-                    is_r1_genomically_earlier(r1, r2)?
-                } else {
-                    true
-                };
-                (umi_str, earlier)
+                None
+            };
+            let umi_bytes = umi_bytes.ok_or_else(|| anyhow::anyhow!("No UMI tag found"))?;
+            let umi_str = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8: {e}"))?;
+            let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
+                is_r1_genomically_earlier_raw(r1, r2)
+            } else {
+                true
             };
 
-            umi_for_read(umi_str_ref, is_r1_earlier, assigner)?
+            umi_for_read(umi_str, is_r1_earlier, assigner)?
         };
 
         umis.push(processed_umi);
@@ -834,19 +647,10 @@ fn mark_duplicates_in_family(templates: &mut [&mut Template], dedup_metrics: &mu
 
 /// Marks all reads in a template as duplicates.
 fn mark_template_as_duplicate(template: &mut Template, dedup_metrics: &mut DedupMetrics) {
-    if let Some(raw_records) = template.all_raw_records_mut() {
-        for raw in raw_records.iter_mut() {
-            let flg = RawRecordView::new(raw.as_ref()).flags();
-            bam_fields::set_flags(raw, flg | DUPLICATE_FLAG);
-            dedup_metrics.duplicate_reads += 1;
-        }
-    } else {
-        for record in &mut template.records {
-            let current_flags = u16::from(record.flags());
-            let new_flags = Flags::from(current_flags | DUPLICATE_FLAG);
-            *record.flags_mut() = new_flags;
-            dedup_metrics.duplicate_reads += 1;
-        }
+    for raw in template.records_mut().iter_mut() {
+        let flg = RawRecordView::new(raw.as_ref()).flags();
+        bam_fields::set_flags(raw, flg | DUPLICATE_FLAG);
+        dedup_metrics.duplicate_reads += 1;
     }
 }
 
@@ -871,16 +675,9 @@ fn process_position_group(
 
     // Filter templates
     let mut filter_metrics = FilterMetrics::new();
-    let raw_mode = all_templates.first().is_some_and(Template::is_raw_byte_mode);
     let filtered_templates: Vec<Template> = all_templates
         .into_iter()
-        .filter(|t| {
-            if raw_mode {
-                filter_template_raw(t, filter_config, &mut filter_metrics)
-            } else {
-                filter_template(t, filter_config, &mut filter_metrics)
-            }
-        })
+        .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
         .collect();
 
     dedup_metrics.filter_metrics = filter_metrics;
@@ -899,17 +696,9 @@ fn process_position_group(
     let mut templates: Vec<Template> = filtered_templates
         .into_iter()
         .map(|mut t| {
-            if let Some(raw_records) = t.all_raw_records_mut() {
-                for raw in raw_records.iter_mut() {
-                    let flg = RawRecordView::new(raw.as_ref()).flags();
-                    bam_fields::set_flags(raw, flg & !DUPLICATE_FLAG);
-                }
-            } else {
-                for record in &mut t.records {
-                    let current_flags = u16::from(record.flags());
-                    let new_flags = Flags::from(current_flags & !DUPLICATE_FLAG);
-                    *record.flags_mut() = new_flags;
-                }
+            for raw in t.records_mut().iter_mut() {
+                let flg = RawRecordView::new(raw.as_ref()).flags();
+                bam_fields::set_flags(raw, flg & !DUPLICATE_FLAG);
             }
             t
         })
@@ -965,41 +754,21 @@ fn process_position_group(
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;
-        if let Some(raw_records) = template.all_raw_records() {
-            for raw in raw_records {
-                dedup_metrics.total_reads += 1;
-                let flg = RawRecordView::new(raw.as_ref()).flags();
-                let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
-                let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+        for raw in template.records() {
+            dedup_metrics.total_reads += 1;
+            let flg = RawRecordView::new(raw.as_ref()).flags();
+            let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
+            let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
 
-                if is_secondary {
-                    dedup_metrics.secondary_reads += 1;
-                }
-                if is_supplementary {
-                    dedup_metrics.supplementary_reads += 1;
-                }
-                if is_secondary || is_supplementary {
-                    let aux = bam_fields::aux_data_slice(raw);
-                    if bam_fields::find_tag_type(aux, &tc_tag_bytes).is_none() {
-                        dedup_metrics.missing_tc_tag += 1;
-                    }
-                }
+            if is_secondary {
+                dedup_metrics.secondary_reads += 1;
             }
-        } else {
-            for record in &template.records {
-                dedup_metrics.total_reads += 1;
-                let flags = record.flags();
-                let is_secondary = flags.is_secondary();
-                let is_supplementary = flags.is_supplementary();
-
-                if is_secondary {
-                    dedup_metrics.secondary_reads += 1;
-                }
-                if is_supplementary {
-                    dedup_metrics.supplementary_reads += 1;
-                }
-                // Single TC_TAG lookup for both secondary and supplementary
-                if (is_secondary || is_supplementary) && record.data().get(&TC_TAG).is_none() {
+            if is_supplementary {
+                dedup_metrics.supplementary_reads += 1;
+            }
+            if is_secondary || is_supplementary {
+                let aux = bam_fields::aux_data_slice(raw);
+                if bam_fields::find_tag_type(aux, &tc_tag_bytes).is_none() {
                     dedup_metrics.missing_tc_tag += 1;
                 }
             }
@@ -1023,25 +792,6 @@ fn process_position_group(
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Set MI tag on record
-//////////////////////////////////////////////////////////////////////////////
-
-/// Set MI tag on a single record.
-#[inline]
-fn set_mi_tag_on_record(
-    record: &mut noodles::sam::alignment::RecordBuf,
-    mi: MoleculeId,
-    assign_tag: Tag,
-    base_mi: u64,
-) {
-    if !mi.is_assigned() {
-        return;
-    }
-    let mi_string = mi.to_string_with_offset(base_mi);
-    record.data_mut().insert(assign_tag, DataValue::String(BString::from(mi_string)));
-}
-
-//////////////////////////////////////////////////////////////////////////////
 // Command definition
 //////////////////////////////////////////////////////////////////////////////
 
@@ -1052,7 +802,7 @@ fn set_mi_tag_on_record(
     about = "\x1b[38;5;151m[DEDUP]\x1b[0m         \x1b[36mMark or remove PCR duplicates using UMI information\x1b[0m",
     long_about = r#"
 Marks or removes PCR duplicates from a BAM file using UMI information.
-Requires template-coordinate sorted input with `tc` tags on secondary/supplementary
+Requires template-coordinate sorted input with `pa` tags on secondary/supplementary
 reads (added by `fgumi zipper`).
 
 Within each UMI family, the template with the highest sum of base qualities
@@ -1060,12 +810,12 @@ is selected as the representative; all others are marked as duplicates.
 
 # Input Requirements
 
-- Must be processed with `fgumi zipper` (adds `tc` tag for secondary/supplementary reads)
+- Must be processed with `fgumi zipper` (adds `pa` tag for secondary/supplementary reads)
 - Must be sorted with `fgumi sort --order template-coordinate`
 - UMI tags on reads (RX tag), unless `--no-umi` is specified
 
 Note: Using `samtools sort` will NOT work correctly because it doesn't use the
-`tc` tag for template-coordinate ordering of secondary/supplementary reads.
+`pa` tag for template-coordinate ordering of secondary/supplementary reads.
 
 # Output Modes
 
@@ -1199,10 +949,7 @@ impl Command for MarkDuplicates {
         info!("{}", self.threading.log_message());
 
         // Open input BAM
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         if !is_template_coordinate_sorted(&header) {
             bail!(
@@ -1253,9 +1000,8 @@ impl Command for MarkDuplicates {
         info!("Scheduler: {:?}", self.scheduler_opts.strategy());
         info!("Using pipeline with {num_threads} threads");
 
-        // Enable raw-byte mode: skip noodles decode/encode for ~30% CPU savings
         let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Counter for contiguous MI assignment (incremented in the serial serialize step).
         let next_mi_base = std::sync::atomic::AtomicU64::new(0);
@@ -1286,7 +1032,7 @@ impl Command for MarkDuplicates {
             },
             // Serialize function (parallel, output ordered by serial numbers)
             move |processed: ProcessedDedupGroup,
-                  header: &Header,
+                  _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
                 // Collect metrics
@@ -1306,69 +1052,39 @@ impl Command for MarkDuplicates {
                 // consecutive 0..N-1 (see issue #269).
                 let base_mi = next_mi_base
                     .fetch_add(processed.distinct_mi_count, std::sync::atomic::Ordering::Relaxed);
-                let assign_tag = Tag::from(assign_tag_bytes);
-
                 // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
                 output.reserve(processed.templates.len() * 2 * 400);
                 // Serialize templates
-                let raw_mode = processed.templates.first().is_some_and(Template::is_raw_byte_mode);
-                if raw_mode {
-                    let mut scratch = Vec::with_capacity(512);
-                    let mut mi_buf = String::with_capacity(16);
-                    for template in &processed.templates {
-                        let mi = template.mi;
-                        let has_mi = mi.is_assigned();
-                        if has_mi {
-                            mi.write_with_offset(base_mi, &mut mi_buf);
-                        }
-                        let raw_records = template.all_raw_records();
-                        debug_assert!(
-                            raw_records.is_some(),
-                            "raw_mode template missing raw_records"
-                        );
-                        if let Some(raw_records) = raw_records {
-                            for raw in raw_records {
-                                // Skip duplicates if remove mode
-                                if remove_duplicates
-                                    && (RawRecordView::new(raw).flags() & DUPLICATE_FLAG) != 0
-                                {
-                                    continue;
-                                }
-                                if has_mi {
-                                    scratch.clear();
-                                    scratch.extend_from_slice(raw);
-                                    bam_fields::update_string_tag(
-                                        &mut scratch,
-                                        &assign_tag_bytes,
-                                        mi_buf.as_bytes(),
-                                    );
-                                    let block_size = scratch.len() as u32;
-                                    output.extend_from_slice(&block_size.to_le_bytes());
-                                    output.extend_from_slice(&scratch);
-                                } else {
-                                    let block_size = raw.len() as u32;
-                                    output.extend_from_slice(&block_size.to_le_bytes());
-                                    output.extend_from_slice(raw);
-                                }
-                            }
-                        }
+                let mut scratch = Vec::with_capacity(512);
+                let mut mi_buf = String::with_capacity(16);
+                for template in &processed.templates {
+                    let mi = template.mi;
+                    let has_mi = mi.is_assigned();
+                    if has_mi {
+                        mi.write_with_offset(base_mi, &mut mi_buf);
                     }
-                } else {
-                    for template in processed.templates {
-                        let mi = template.mi;
-                        for mut record in template.records {
-                            // Skip duplicates if remove mode is enabled
-                            if remove_duplicates
-                                && (u16::from(record.flags()) & DUPLICATE_FLAG) != 0
-                            {
-                                continue;
-                            }
-
-                            // Set MI tag
-                            set_mi_tag_on_record(&mut record, mi, assign_tag, base_mi);
-
-                            // Serialize to output buffer
-                            serialize_bam_records_into(&[record], header, output)?;
+                    for raw in template.records() {
+                        // Skip duplicates if remove mode
+                        if remove_duplicates
+                            && (RawRecordView::new(raw).flags() & DUPLICATE_FLAG) != 0
+                        {
+                            continue;
+                        }
+                        if has_mi {
+                            scratch.clear();
+                            scratch.extend_from_slice(raw);
+                            bam_fields::update_string_tag(
+                                &mut scratch,
+                                &assign_tag_bytes,
+                                mi_buf.as_bytes(),
+                            );
+                            let block_size = scratch.len() as u32;
+                            output.extend_from_slice(&block_size.to_le_bytes());
+                            output.extend_from_slice(&scratch);
+                        } else {
+                            let block_size = raw.len() as u32;
+                            output.extend_from_slice(&block_size.to_le_bytes());
+                            output.extend_from_slice(raw);
                         }
                     }
                 }
@@ -1405,8 +1121,8 @@ impl Command for MarkDuplicates {
 
         if final_metrics.missing_tc_tag > 0 {
             bail!(
-                "{} secondary/supplementary reads are missing the `tc` tag.\n\n\
-                The `tc` tag is required for correct UMI-aware deduplication of \
+                "{} secondary/supplementary reads are missing the `pa` tag.\n\n\
+                The `pa` tag is required for correct UMI-aware deduplication of \
                 secondary and supplementary alignments. This tag is added by \
                 `fgumi zipper` during the merge of unmapped and mapped BAMs.\n\n\
                 To fix this, re-run your pipeline starting from `fgumi zipper`:\n  \
@@ -1450,18 +1166,16 @@ fn write_family_size_histogram(family_sizes: &AHashMap<usize, u64>, path: &PathB
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
 
     // Helper to create a simple template for testing
     fn create_test_template(name: &str, qualities: &[u8]) -> Template {
-        let record = RecordBuilder::new()
-            .name(name)
-            .sequence("ACGT")
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGT")
             .qualities(qualities)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
-
-        Template::from_records(vec![record]).expect("test template construction should not fail")
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        Template::from_records(vec![b.build()]).expect("test template construction should not fail")
     }
 
     #[test]
@@ -1487,20 +1201,22 @@ mod tests {
         r1_qualities: &[u8],
         r2_qualities: &[u8],
     ) -> Template {
-        let r1 = RecordBuilder::new()
-            .name(name)
-            .sequence("ACGT")
-            .qualities(r1_qualities)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
-
-        let r2 = RecordBuilder::new()
-            .name(name)
-            .sequence("TGCA")
-            .qualities(r2_qualities)
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .build();
-
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGT")
+                .qualities(r1_qualities)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"TGCA")
+                .qualities(r2_qualities)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.build()
+        };
         Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
     }
 
@@ -1573,7 +1289,7 @@ mod tests {
 
     /// Helper to check if a template is marked as duplicate
     fn is_duplicate(template: &Template) -> bool {
-        template.records.iter().any(|r| (u16::from(r.flags()) & DUPLICATE_FLAG) != 0)
+        template.records.iter().any(|r| (r.flags() & DUPLICATE_FLAG) != 0)
     }
 
     #[test]
@@ -1821,17 +1537,17 @@ mod tests {
 
     /// Helper to create a mapped template with UMI tag
     fn create_mapped_template_with_umi(name: &str, umi: &str, mapq: u8) -> Template {
-        let record = RecordBuilder::new()
-            .name(name)
-            .sequence("ACGT")
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .sequence(b"ACGT")
             .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(mapq)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .tag("RX", umi.to_string())
-            .build();
+            .ref_id(0)
+            .pos(99)
+            .cigar_ops(&[encode_op(0, 4)])
+            .mapq(mapq)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+        b.add_string_tag(b"RX", umi.as_bytes());
+        let record = b.build();
         Template::from_records(vec![record]).expect("test template construction should not fail")
     }
 
@@ -1882,16 +1598,18 @@ mod tests {
         let mut metrics = FilterMetrics::new();
 
         // Create template without RX tag
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
+        let record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
         let template = Template::from_records(vec![record])
             .expect("test template construction should not fail");
 
@@ -1904,17 +1622,19 @@ mod tests {
         let config = default_filter_config(); // include_non_pf = false
         let mut metrics = FilterMetrics::new();
 
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::QC_FAIL)
-            .tag("RX", "ACGTACGT".to_string())
-            .build();
+        let record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::QC_FAIL);
+            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.build()
+        };
         let template = Template::from_records(vec![record])
             .expect("test template construction should not fail");
 
@@ -1928,17 +1648,19 @@ mod tests {
         config.include_non_pf = true; // Include QC-fail reads
         let mut metrics = FilterMetrics::new();
 
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::QC_FAIL)
-            .tag("RX", "ACGTACGT".to_string())
-            .build();
+        let record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::QC_FAIL);
+            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.build()
+        };
         let template = Template::from_records(vec![record])
             .expect("test template construction should not fail");
 
@@ -1951,13 +1673,15 @@ mod tests {
         let config = default_filter_config();
         let mut metrics = FilterMetrics::new();
 
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::UNMAPPED)
-            .tag("RX", "ACGTACGT".to_string())
-            .build();
+        let record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
+            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.build()
+        };
         let template = Template::from_records(vec![record])
             .expect("test template construction should not fail");
 
@@ -2036,29 +1760,33 @@ mod tests {
 
     #[test]
     fn test_get_pair_orientation_both_forward() {
-        // Both R1 and R2 on forward strand (no REVERSE_COMPLEMENTED flag)
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .tag("RX", "ACGT-TGCA".to_string())
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .tag("RX", "ACGT-TGCA".to_string())
-            .build();
+        // Both R1 and R2 on forward strand (no REVERSE flag)
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.build()
+        };
         let template = Template::from_records(vec![r1, r2])
             .expect("test template construction should not fail");
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
@@ -2069,28 +1797,32 @@ mod tests {
     #[test]
     fn test_get_pair_orientation_r1_reverse() {
         // R1 on reverse strand, R2 on forward strand
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
-            .tag("RX", "ACGT-TGCA".to_string())
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .tag("RX", "ACGT-TGCA".to_string())
-            .build();
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE);
+            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.build()
+        };
         let template = Template::from_records(vec![r1, r2])
             .expect("test template construction should not fail");
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
@@ -2101,28 +1833,32 @@ mod tests {
     #[test]
     fn test_get_pair_orientation_both_reverse() {
         // Both R1 and R2 on reverse strand
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
-            .tag("RX", "ACGT-TGCA".to_string())
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
-            .tag("RX", "ACGT-TGCA".to_string())
-            .build();
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE);
+            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE);
+            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.build()
+        };
         let template = Template::from_records(vec![r1, r2])
             .expect("test template construction should not fail");
         let (r1_positive, r2_positive) = get_pair_orientation(&template);
@@ -2137,75 +1873,85 @@ mod tests {
     #[test]
     fn test_is_r1_earlier_true() {
         // R1 at position 100, R2 at position 200
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .build();
-        assert!(is_r1_genomically_earlier(&r1, &r2).expect("mapped records should have positions"));
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.build()
+        };
+        assert!(is_r1_genomically_earlier_raw(&r1, &r2));
     }
 
     #[test]
     fn test_is_r1_earlier_false() {
         // R1 at position 200, R2 at position 100
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .build();
-        assert!(
-            !is_r1_genomically_earlier(&r1, &r2).expect("mapped records should have positions")
-        );
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.build()
+        };
+        assert!(!is_r1_genomically_earlier_raw(&r1, &r2));
     }
 
     #[test]
     fn test_is_r1_earlier_equal_position() {
         // Both at position 100 -> true (<=)
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .build();
-        assert!(is_r1_genomically_earlier(&r1, &r2).expect("mapped records should have positions"));
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.build()
+        };
+        assert!(is_r1_genomically_earlier_raw(&r1, &r2));
     }
 
     // ========================================================================
@@ -2243,51 +1989,6 @@ mod tests {
     }
 
     // ========================================================================
-    // set_mi_tag_on_record tests
-    // ========================================================================
-
-    #[test]
-    fn test_set_mi_tag_assigned() {
-        let mut record =
-            RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
-        let mi = MoleculeId::Single(42);
-        let assign_tag = Tag::from(SamTag::MI);
-        set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
-
-        let Some(DataValue::String(val)) = record.data().get(&assign_tag) else {
-            unreachable!("MI tag should be a string value");
-        };
-        assert_eq!(AsRef::<[u8]>::as_ref(val), b"42");
-    }
-
-    #[test]
-    fn test_set_mi_tag_unassigned() {
-        let mut record =
-            RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
-        let mi = MoleculeId::None;
-        let assign_tag = Tag::from(SamTag::MI);
-        set_mi_tag_on_record(&mut record, mi, assign_tag, 0);
-
-        let mi_value = record.data().get(&assign_tag);
-        assert!(mi_value.is_none(), "Unassigned MoleculeId should not set MI tag");
-    }
-
-    #[test]
-    fn test_set_mi_tag_with_base_offset() {
-        let mut record =
-            RecordBuilder::new().name("q1").sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
-        let mi = MoleculeId::Single(42);
-        let assign_tag = Tag::from(SamTag::MI);
-        set_mi_tag_on_record(&mut record, mi, assign_tag, 100);
-
-        let Some(DataValue::String(val)) = record.data().get(&assign_tag) else {
-            unreachable!("MI tag should be a string value");
-        };
-        // 100 (base) + 42 (id) = 142
-        assert_eq!(AsRef::<[u8]>::as_ref(val), b"142");
-    }
-
-    // ========================================================================
     // filter_template for paired reads tests
     // ========================================================================
 
@@ -2298,28 +1999,32 @@ mod tests {
         r1_mapq: u8,
         r2_mapq: u8,
     ) -> Template {
-        let r1 = RecordBuilder::new()
-            .name(name)
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(r1_mapq)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .tag("RX", umi.to_string())
-            .build();
-        let r2 = RecordBuilder::new()
-            .name(name)
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .mapping_quality(r2_mapq)
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .tag("RX", umi.to_string())
-            .build();
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(r1_mapq)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.add_string_tag(b"RX", umi.as_bytes());
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(r2_mapq)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.add_string_tag(b"RX", umi.as_bytes());
+            b.build()
+        };
         Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
     }
 
@@ -2348,28 +2053,32 @@ mod tests {
         let config = default_filter_config();
         let mut metrics = FilterMetrics::new();
         // R1 has valid UMI, but R2 has N in UMI
-        let r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .tag("RX", "ACGTACGT".to_string())
-            .build();
-        let r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .tag("RX", "ACNTACGT".to_string())
-            .build();
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.build()
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"TGCA")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT);
+            b.add_string_tag(b"RX", b"ACNTACGT");
+            b.build()
+        };
         let template = Template::from_records(vec![r1, r2])
             .expect("test template construction should not fail");
 
@@ -2487,7 +2196,7 @@ mod tests {
 
     /// Helper to create a minimal raw BAM record bytes for testing.
     /// The record has mapq=30 so it passes the Phase 1 MAPQ check.
-    fn make_raw_bam_record_truncated_aux() -> Vec<u8> {
+    fn make_raw_bam_record_truncated_aux() -> RawRecord {
         // Create a BAM record where aux_data_offset will be beyond the record length
         let mut rec = vec![0u8; 40]; // Small record
 
@@ -2500,7 +2209,7 @@ mod tests {
         rec[16..20].copy_from_slice(&1000u32.to_le_bytes()); // l_seq = 1000 (too large)
         rec[32..36].copy_from_slice(b"tst\0"); // read name
 
-        rec
+        RawRecord::from(rec)
     }
 
     #[test]
@@ -2509,8 +2218,8 @@ mod tests {
         // (rejected as poor alignment due to missing UMI tag).
 
         let raw = make_raw_bam_record_truncated_aux();
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
@@ -2522,7 +2231,7 @@ mod tests {
         let mut metrics = FilterMetrics::new();
 
         // Should not panic; should reject gracefully due to missing UMI
-        let result = filter_template_raw(&template, &config, &mut metrics);
+        let result = filter_template(&template, &config, &mut metrics);
         assert!(!result, "Truncated record should be rejected");
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -2553,7 +2262,7 @@ mod tests {
         rec.extend_from_slice(b"MQc"); // tag=MQ, type=c (signed byte)
         rec.push(10); // MAPQ = 10 (< min_mapq of 20)
 
-        let template = Template::from_raw_records(vec![rec].into_iter().map(Into::into).collect())
+        let template = Template::from_records(vec![RawRecord::from(rec)])
             .expect("test template construction should not fail");
 
         let config = DedupFilterConfig {
@@ -2567,7 +2276,7 @@ mod tests {
 
         // After fix: filter_template_raw now uses find_int_tag which handles all integer types.
         // The template should be REJECTED because mate MAPQ=10 < min_mapq=20.
-        let result = filter_template_raw(&template, &config, &mut metrics);
+        let result = filter_template(&template, &config, &mut metrics);
 
         assert!(!result, "Template with low mate MAPQ should be rejected");
         assert_eq!(metrics.accepted_templates, 0);
@@ -2586,7 +2295,7 @@ mod tests {
         seq_len: usize,
         qualities: &[u8],
         umi: &[u8],
-    ) -> Vec<u8> {
+    ) -> RawRecord {
         use crate::sort::bam_fields;
 
         let l_read_name = (name.len() + 1) as u8;
@@ -2630,7 +2339,7 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
-        buf
+        RawRecord::from(buf)
     }
 
     // ========================================================================
@@ -2648,9 +2357,9 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
-        assert_eq!(score_template_raw(&template), 60);
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
+        assert_eq!(score_template(&template), 60);
     }
 
     #[test]
@@ -2664,9 +2373,9 @@ mod tests {
             &[10, 10, 10, 10],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
-        assert_eq!(score_template_raw(&template), 40);
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
+        assert_eq!(score_template(&template), 40);
     }
 
     #[test]
@@ -2688,10 +2397,9 @@ mod tests {
             &[10, 10, 10, 10],
             b"ACGT",
         );
-        let template =
-            Template::from_raw_records(vec![r1, r2].into_iter().map(Into::into).collect())
-                .expect("test template construction should not fail");
-        assert_eq!(score_template_raw(&template), 100);
+        let template = Template::from_records(vec![r1, r2])
+            .expect("test template construction should not fail");
+        assert_eq!(score_template(&template), 100);
     }
 
     #[test]
@@ -2709,8 +2417,7 @@ mod tests {
                 qualities,
                 b"ACGT",
             );
-            Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-                .expect("test template construction should not fail")
+            Template::from_records(vec![raw]).expect("test template construction should not fail")
         };
         assert_eq!(score_template(&template_rb), score_template(&template_raw));
     }
@@ -2731,8 +2438,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 20,
@@ -2741,7 +2448,7 @@ mod tests {
             no_umi: false,
         };
         let mut metrics = FilterMetrics::new();
-        assert!(filter_template_raw(&template, &config, &mut metrics));
+        assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
 
@@ -2757,8 +2464,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 20,
@@ -2767,7 +2474,7 @@ mod tests {
             no_umi: false,
         };
         let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
 
@@ -2784,8 +2491,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 0,
@@ -2794,7 +2501,7 @@ mod tests {
             no_umi: false,
         };
         let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_non_pf, 1);
     }
 
@@ -2810,8 +2517,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 0,
@@ -2820,7 +2527,7 @@ mod tests {
             no_umi: false,
         };
         let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_ns_in_umi, 1);
     }
 
@@ -2836,8 +2543,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 0,
@@ -2846,7 +2553,7 @@ mod tests {
             no_umi: false,
         };
         let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_umi_too_short, 1);
     }
 
@@ -2861,8 +2568,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 0,
@@ -2871,7 +2578,7 @@ mod tests {
             no_umi: false,
         };
         let mut metrics = FilterMetrics::new();
-        assert!(!filter_template_raw(&template, &config, &mut metrics));
+        assert!(!filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
 
@@ -2934,16 +2641,18 @@ mod tests {
         let mut metrics = FilterMetrics::new();
 
         // Create template without RX tag
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .mapping_quality(30)
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-            .build();
+        let record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .sequence(b"ACGT")
+                .qualities(&[30, 30, 30, 30])
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)])
+                .mapq(30)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
         let template = Template::from_records(vec![record])
             .expect("test template construction should not fail");
 
@@ -2988,7 +2697,7 @@ mod tests {
         mapq: u8,
         seq_len: usize,
         qualities: &[u8],
-    ) -> Vec<u8> {
+    ) -> RawRecord {
         use crate::sort::bam_fields;
 
         let l_read_name = (name.len() + 1) as u8;
@@ -3023,7 +2732,7 @@ mod tests {
         let copy_len = std::cmp::min(qualities.len(), seq_len);
         buf[qo..qo + copy_len].copy_from_slice(&qualities[..copy_len]);
 
-        buf
+        RawRecord::from(buf)
     }
 
     #[test]
@@ -3037,8 +2746,8 @@ mod tests {
             4,
             &[20, 20, 20, 20],
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 20,
@@ -3049,7 +2758,7 @@ mod tests {
         let mut metrics = FilterMetrics::new();
 
         // In no_umi mode, templates without UMI tags should be accepted
-        assert!(filter_template_raw(&template, &config, &mut metrics));
+        assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
 
@@ -3065,8 +2774,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 0,
@@ -3077,7 +2786,7 @@ mod tests {
         let mut metrics = FilterMetrics::new();
 
         // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
-        assert!(filter_template_raw(&template, &config, &mut metrics));
+        assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
 
@@ -3093,8 +2802,8 @@ mod tests {
             &[20, 20, 20, 20],
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("test template construction should not fail");
+        let template =
+            Template::from_records(vec![raw]).expect("test template construction should not fail");
         let config = DedupFilterConfig {
             umi_tag: *SamTag::RX,
             min_mapq: 0,
@@ -3105,7 +2814,7 @@ mod tests {
         let mut metrics = FilterMetrics::new();
 
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
-        assert!(filter_template_raw(&template, &config, &mut metrics));
+        assert!(filter_template(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
 
@@ -3121,11 +2830,14 @@ mod tests {
     /// group to verify the pipeline completes without unbounded memory growth.
     #[test]
     fn test_dedup_no_umi_large_position_group() {
+        use bstr::BString;
+        use fgumi_raw_bam::raw_record_to_record_buf;
         use noodles::bam;
         use noodles::sam::Header;
         use noodles::sam::alignment::io::Write as AlignmentWrite;
         use noodles::sam::alignment::record::data::field::Tag;
         use noodles::sam::alignment::record_buf::RecordBuf;
+        use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
         use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
         use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;
         use noodles::sam::header::record::value::{
@@ -3168,46 +2880,52 @@ mod tests {
                 bam::io::Writer::new(std::fs::File::create(&input_bam).expect("create input BAM"));
             writer.write_header(&header).expect("write header");
 
+            // PROPERLY_PAIRED flag = 0x2 (not exposed as a named constant in flags module)
+            const PROPERLY_PAIRED: u16 = 0x2;
+
             for i in 0..NUM_TEMPLATES {
                 let name = format!("read_{i:05}");
 
-                let r1 = RecordBuilder::new()
-                    .name(&name)
-                    .sequence("ACGTACGT")
-                    .qualities(&[30; 8])
-                    .paired(true)
-                    .first_segment(true)
-                    .properly_paired(true)
-                    .reference_sequence_id(0)
-                    .alignment_start(100)
-                    .mapping_quality(60)
-                    .cigar("8M")
-                    .mate_reference_sequence_id(0)
-                    .mate_alignment_start(200)
-                    .template_length(108)
-                    .tag("MC", "8M")
-                    .build();
+                let r1 = {
+                    let mut b = RawSamBuilder::new();
+                    b.read_name(name.as_bytes())
+                        .sequence(b"ACGTACGT")
+                        .qualities(&[30; 8])
+                        .flags(flags::PAIRED | PROPERLY_PAIRED | flags::FIRST_SEGMENT)
+                        .ref_id(0)
+                        .pos(99)
+                        .mapq(60)
+                        .cigar_ops(&[encode_op(0, 8)])
+                        .mate_ref_id(0)
+                        .mate_pos(199)
+                        .template_length(108);
+                    b.add_string_tag(b"MC", b"8M");
+                    b.build()
+                };
 
-                let r2 = RecordBuilder::new()
-                    .name(&name)
-                    .sequence("ACGTACGT")
-                    .qualities(&[30; 8])
-                    .paired(true)
-                    .first_segment(false)
-                    .properly_paired(true)
-                    .reverse_complement(true)
-                    .reference_sequence_id(0)
-                    .alignment_start(200)
-                    .mapping_quality(60)
-                    .cigar("8M")
-                    .mate_reference_sequence_id(0)
-                    .mate_alignment_start(100)
-                    .template_length(-108)
-                    .tag("MC", "8M")
-                    .build();
+                let r2 = {
+                    let mut b = RawSamBuilder::new();
+                    b.read_name(name.as_bytes())
+                        .sequence(b"ACGTACGT")
+                        .qualities(&[30; 8])
+                        .flags(
+                            flags::PAIRED | PROPERLY_PAIRED | flags::REVERSE | flags::LAST_SEGMENT,
+                        )
+                        .ref_id(0)
+                        .pos(199)
+                        .mapq(60)
+                        .cigar_ops(&[encode_op(0, 8)])
+                        .mate_ref_id(0)
+                        .mate_pos(99)
+                        .template_length(-108);
+                    b.add_string_tag(b"MC", b"8M");
+                    b.build()
+                };
 
-                writer.write_alignment_record(&header, &r1).expect("write R1");
-                writer.write_alignment_record(&header, &r2).expect("write R2");
+                let r1_buf = raw_record_to_record_buf(&r1, &header).expect("convert R1");
+                let r2_buf = raw_record_to_record_buf(&r2, &header).expect("convert R2");
+                writer.write_alignment_record(&header, &r1_buf).expect("write R1");
+                writer.write_alignment_record(&header, &r2_buf).expect("write R2");
             }
             writer.try_finish().expect("finish BAM");
         }

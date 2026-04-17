@@ -740,6 +740,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "fgoxide",
+ "fgumi-raw-bam",
  "fgumi-sam",
  "noodles",
  "serde",

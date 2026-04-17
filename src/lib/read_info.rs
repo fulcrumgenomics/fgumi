@@ -20,13 +20,7 @@ use std::sync::Arc;
 use bstr::ByteSlice;
 
 use crate::sam::SamTag;
-use crate::sam::record_utils::{
-    mate_unclipped_end, mate_unclipped_start, unclipped_five_prime_position,
-};
 use crate::template::Template;
-use crate::unified_pipeline::GroupKey;
-use noodles::sam;
-use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 
 /// A lookup table mapping read group IDs to library names.
 ///
@@ -42,8 +36,8 @@ use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 /// - `LibraryLookup`: String-based lookup returning library names. Used by
 ///   [`ReadInfo::from`] where the actual library name string is needed.
 /// - [`LibraryIndex`]: Hash-based lookup returning numeric indices. Used by
-///   [`compute_group_key`] in the hot path where only equality comparison matters,
-///   avoiding string allocations.
+///   `compute_group_key_from_raw` in the hot path where only equality comparison
+///   matters, avoiding string allocations.
 pub type LibraryLookup = Arc<HashMap<String, Arc<str>>>;
 
 /// Shared "unknown" library string to avoid repeated allocations.
@@ -194,118 +188,6 @@ impl Default for LibraryIndex {
             unknown_idx: 0,
         }
     }
-}
-
-// ============================================================================
-// compute_group_key - Pre-compute GroupKey from a single BAM record
-// ============================================================================
-
-/// Compute a `GroupKey` from a single BAM record.
-///
-/// This computes all grouping information from a single record:
-/// - Own position (`ref_id`, unclipped 5' position, strand)
-/// - Mate position (from MC tag, or UNKNOWN if unpaired/missing)
-/// - Library index (from RG tag)
-/// - Cell barcode hash
-/// - Name hash
-///
-/// For paired-end reads with MC tag, both positions are computed and normalized
-/// so the lower position comes first (matching `ReadInfo` behavior).
-///
-/// For unpaired reads or reads without MC tag, mate position uses UNKNOWN sentinels.
-#[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-pub fn compute_group_key(
-    record: &sam::alignment::RecordBuf,
-    library_index: &LibraryIndex,
-    cell_tag: Option<Tag>,
-) -> GroupKey {
-    // Extract name hash
-    let name_hash = LibraryIndex::hash_name(record.name().map(AsRef::as_ref));
-
-    // Skip secondary and supplementary alignments - they get a default key with UNKNOWN_REF.
-    // RecordPositionGrouper either skips them or coalesces them by name_hash.
-    let flags = record.flags();
-    if flags.is_secondary() || flags.is_supplementary() {
-        return GroupKey { name_hash, ..GroupKey::default() };
-    }
-
-    // Own position
-    let ref_id =
-        record.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
-    let pos = get_unclipped_position_for_groupkey(record);
-    let strand = u8::from(flags.is_reverse_complemented());
-
-    // Extract library index from RG tag
-    let library_idx =
-        if let Some(DataValue::String(rg_bytes)) = record.data().get(&Tag::from(SamTag::RG)) {
-            let rg_hash = LibraryIndex::hash_rg(rg_bytes);
-            library_index.get(rg_hash)
-        } else {
-            0 // unknown
-        };
-
-    // Extract cell barcode hash
-    let cell_hash = if let Some(tag) = cell_tag {
-        if let Some(DataValue::String(cb_bytes)) = record.data().get(&tag) {
-            LibraryIndex::hash_cell_barcode(Some(cb_bytes))
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    // Check if paired and has mate info
-    let is_paired = flags.is_segmented();
-    if !is_paired {
-        return GroupKey::single(ref_id, pos, strand, library_idx, cell_hash, name_hash);
-    }
-
-    // Try to get mate position from MC tag
-    let mate_strand = u8::from(flags.is_mate_reverse_complemented());
-    let mate_ref_id =
-        record.mate_reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
-
-    // Get mate unclipped 5' position based on strand
-    let mate_pos = if mate_strand == 1 {
-        // Reverse strand - 5' is at the end
-        mate_unclipped_end(record).map(|p| p as i32)
-    } else {
-        // Forward strand - 5' is at the start
-        mate_unclipped_start(record).map(|p| p as i32)
-    };
-
-    match mate_pos {
-        Some(mp) => GroupKey::paired(
-            ref_id,
-            pos,
-            strand,
-            mate_ref_id,
-            mp,
-            mate_strand,
-            library_idx,
-            cell_hash,
-            name_hash,
-        ),
-        None => {
-            // No MC tag - fall back to single-end behavior
-            GroupKey::single(ref_id, pos, strand, library_idx, cell_hash, name_hash)
-        }
-    }
-}
-
-/// Get unclipped 5' position for `GroupKey` computation.
-///
-/// Returns 0 for unmapped reads. Returns `i32::MAX` for malformed mapped reads
-/// (those missing alignment start) to avoid incorrectly grouping them at position 0.
-/// Used in the hot path where we need a numeric value for grouping.
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn get_unclipped_position_for_groupkey(record: &sam::alignment::RecordBuf) -> i32 {
-    if record.flags().is_unmapped() {
-        return 0;
-    }
-    unclipped_five_prime_position(record).map_or(i32::MAX, |pos| pos as i32)
 }
 
 /// Information about read positions needed for grouping and ordering.
@@ -521,10 +403,13 @@ impl ReadInfo {
         cell_tag: Tag,
         library_lookup: &LibraryLookup,
     ) -> Result<Self> {
-        // Get reads once and reuse (avoid calling r1()/r2() twice)
+        use crate::sort::bam_fields;
+        use fgumi_raw_bam::{RawRecord, RawRecordView, TagValue};
+
+        // Get primary reads (Option<&RawRecord>)
         let r1 = template.r1();
         let r2 = template.r2();
-        let record = r1.as_ref().or(r2.as_ref()).ok_or_else(|| {
+        let record: &RawRecord = r1.or(r2).ok_or_else(|| {
             anyhow::anyhow!(
                 "Template '{}' has no records (empty template)",
                 String::from_utf8_lossy(&template.name)
@@ -536,32 +421,33 @@ impl ReadInfo {
         // not the read group ID.
         // Uses Arc<str> to avoid cloning strings - Arc::clone is just a reference count increment.
         let library: Arc<str> =
-            if let Some(DataValue::String(rg_bytes)) = record.data().get(&Tag::from(SamTag::RG)) {
-                // Convert bytes to str for lookup without allocating a String
+            if let Some(TagValue::String(rg_bytes)) = record.tags().get(SamTag::RG.as_ref()) {
                 let rg_id = std::str::from_utf8(rg_bytes).unwrap_or("unknown");
                 library_lookup.get(rg_id).cloned().unwrap_or_else(|| Arc::clone(&UNKNOWN_LIBRARY))
             } else {
                 Arc::clone(&UNKNOWN_LIBRARY)
             };
 
-        // Extract cell barcode
-        let cell_barcode = if let Some(DataValue::String(cb_str)) = record.data().get(&cell_tag) {
-            Some(String::from_utf8_lossy(cb_str).into_owned())
-        } else {
-            None
-        };
+        // Extract cell barcode using the raw tag bytes
+        let cell_barcode =
+            if let Some(TagValue::String(cb_bytes)) = record.tags().get(cell_tag.as_ref()) {
+                Some(String::from_utf8_lossy(cb_bytes).into_owned())
+            } else {
+                None
+            };
 
         // For paired-end, extract both positions using UNCLIPPED positions
-        // Reuse r1/r2 bindings instead of calling template.r1()/r2() again
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        if let (Some(r1), Some(r2)) = (&r1, &r2) {
-            let ref_index1 = r1.reference_sequence_id().map_or(-1, |id| id as i32);
-            let start1 = get_unclipped_position(r1)?;
-            let strand1 = u8::from(r1.flags().is_reverse_complemented());
+        if let (Some(r1), Some(r2)) = (r1, r2) {
+            let ref_index1 = bam_fields::ref_id(r1.as_ref());
+            let start1 = get_unclipped_position_raw(r1)?;
+            let strand1 =
+                u8::from((RawRecordView::new(r1).flags() & bam_fields::flags::REVERSE) != 0);
 
-            let ref_index2 = r2.reference_sequence_id().map_or(-1, |id| id as i32);
-            let start2 = get_unclipped_position(r2)?;
-            let strand2 = u8::from(r2.flags().is_reverse_complemented());
+            let ref_index2 = bam_fields::ref_id(r2.as_ref());
+            let start2 = get_unclipped_position_raw(r2)?;
+            let strand2 =
+                u8::from((RawRecordView::new(r2).flags() & bam_fields::flags::REVERSE) != 0);
 
             Ok(ReadInfo::new(
                 ref_index1,
@@ -576,9 +462,10 @@ impl ReadInfo {
         } else {
             // Single-end: use ReadInfo::single() which correctly sets UNKNOWN values for R2
             // This matches fgbio's behavior where missing R2 uses (Int.MaxValue, Int.MaxValue, Byte.MaxValue)
-            let ref_index = record.reference_sequence_id().map_or(-1, |id| id as i32);
-            let start = get_unclipped_position(record)?;
-            let strand = u8::from(record.flags().is_reverse_complemented());
+            let ref_index = bam_fields::ref_id(record.as_ref());
+            let start = get_unclipped_position_raw(record)?;
+            let strand =
+                u8::from((RawRecordView::new(record).flags() & bam_fields::flags::REVERSE) != 0);
 
             Ok(ReadInfo::single(ref_index, start, strand, library, cell_barcode))
         }
@@ -626,20 +513,22 @@ impl Ord for ReadInfo {
 ///
 /// The unclipped 5' position (0 for unmapped reads)
 ///
+/// Returns the unclipped 5' position (1-based) from raw BAM bytes.
+///
+/// Returns 0 for unmapped reads. Returns an error if the record is mapped but
+/// has no CIGAR (returns `i32::MAX` from the raw helper, which we treat as an error).
+///
 /// # Errors
 ///
 /// Returns an error if the record is mapped but missing required alignment information
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn get_unclipped_position(record: &sam::alignment::RecordBuf) -> Result<i32> {
-    if record.flags().is_unmapped() {
-        return Ok(0);
+fn get_unclipped_position_raw(record: &fgumi_raw_bam::RawRecord) -> Result<i32> {
+    let pos = fgumi_raw_bam::unclipped_5prime_from_raw_bam(record.as_ref());
+    if pos == i32::MAX {
+        let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(record.as_ref()));
+        Err(anyhow::anyhow!("Mapped read '{read_name}' missing alignment start position"))
+    } else {
+        Ok(pos)
     }
-
-    unclipped_five_prime_position(record).map(|pos| pos as i32).ok_or_else(|| {
-        let read_name =
-            record.name().map_or_else(|| "unknown".into(), |n| String::from_utf8_lossy(n.as_ref()));
-        anyhow::anyhow!("Mapped read '{read_name}' missing alignment start position")
-    })
 }
 
 #[cfg(test)]
@@ -813,17 +702,71 @@ mod tests {
 
     mod get_unclipped_position_tests {
         use super::*;
-        use crate::sam::builder::RecordBuilder;
-        use noodles::sam::alignment::RecordBuf;
+        use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags as raw_flags};
+
+        /// Parse a CIGAR string to raw BAM u32 ops.
+        ///
+        /// Encoding: `(len << 4) | op_type` where `op_type` is:
+        /// 0=M,1=I,2=D,3=N,4=S,5=H,6=P,7==,8=X
+        fn parse_cigar_to_raw(cigar: &str) -> Vec<u32> {
+            let mut ops = Vec::new();
+            let mut num_str = String::new();
+            for c in cigar.chars() {
+                if c.is_ascii_digit() {
+                    num_str.push(c);
+                } else {
+                    let len: u32 = num_str.parse().expect("Invalid CIGAR: expected number");
+                    let op_type: u32 = match c {
+                        'M' => 0,
+                        'I' => 1,
+                        'D' => 2,
+                        'N' => 3,
+                        'S' => 4,
+                        'H' => 5,
+                        'P' => 6,
+                        '=' => 7,
+                        'X' => 8,
+                        _ => panic!("Unknown CIGAR operation: {c}"),
+                    };
+                    ops.push((len << 4) | op_type);
+                    num_str.clear();
+                }
+            }
+            ops
+        }
+
+        /// Compute the read sequence length from a CIGAR string
+        /// (sum of M, I, S, =, X ops — operations that consume the query).
+        fn cigar_query_len(cigar: &str) -> usize {
+            let mut num_str = String::new();
+            let mut total = 0usize;
+            for c in cigar.chars() {
+                if c.is_ascii_digit() {
+                    num_str.push(c);
+                } else {
+                    let len: usize = num_str.parse().expect("number");
+                    if matches!(c, 'M' | 'I' | 'S' | '=' | 'X') {
+                        total += len;
+                    }
+                    num_str.clear();
+                }
+            }
+            total
+        }
 
         /// Helper to build a test record with specific CIGAR and strand
-        fn build_record(alignment_start: usize, cigar: &str, reverse: bool) -> RecordBuf {
-            RecordBuilder::new()
-                .sequence("ACGT") // Minimal sequence
-                .alignment_start(alignment_start)
-                .cigar(cigar)
-                .reverse_complement(reverse)
-                .build()
+        fn build_record(alignment_start: usize, cigar: &str, reverse: bool) -> RawRecord {
+            let raw_cigar = parse_cigar_to_raw(cigar);
+            let qlen = cigar_query_len(cigar).max(1);
+            let flags: u16 = if reverse { raw_flags::REVERSE } else { 0 };
+            let mut b = RawSamBuilder::new();
+            b.sequence(&vec![b'A'; qlen])
+                .qualities(&vec![30u8; qlen])
+                .flags(flags)
+                .ref_id(0)
+                .pos(i32::try_from(alignment_start).expect("alignment_start fits i32") - 1)
+                .cigar_ops(&raw_cigar);
+            b.build()
         }
 
         #[test]
@@ -831,8 +774,8 @@ mod tests {
             // Forward strand with 5S at start: alignment_start=100, CIGAR=5S50M
             // unclipped_start = 100 - 5 = 95
             let record = build_record(100, "5S50M", false);
-            let pos =
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
+            let pos = get_unclipped_position_raw(&record)
+                .expect("get_unclipped_position_raw should succeed");
             assert_eq!(pos, 95);
         }
 
@@ -841,8 +784,8 @@ mod tests {
             // Forward strand with 10H at start: alignment_start=100, CIGAR=10H50M
             // unclipped_start = 100 - 10 = 90
             let record = build_record(100, "10H50M", false);
-            let pos =
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
+            let pos = get_unclipped_position_raw(&record)
+                .expect("get_unclipped_position_raw should succeed");
             assert_eq!(pos, 90);
         }
 
@@ -851,8 +794,8 @@ mod tests {
             // Forward strand with 10H5S at start: alignment_start=100, CIGAR=10H5S50M
             // unclipped_start = 100 - 10 - 5 = 85
             let record = build_record(100, "10H5S50M", false);
-            let pos =
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
+            let pos = get_unclipped_position_raw(&record)
+                .expect("get_unclipped_position_raw should succeed");
             assert_eq!(pos, 85);
         }
 
@@ -862,8 +805,8 @@ mod tests {
             // alignment_end = 100 + 50 - 1 = 149
             // unclipped_end = 149 + 5 = 154
             let record = build_record(100, "50M5S", true);
-            let pos =
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
+            let pos = get_unclipped_position_raw(&record)
+                .expect("get_unclipped_position_raw should succeed");
             assert_eq!(pos, 154);
         }
 
@@ -873,8 +816,8 @@ mod tests {
             // alignment_end = 100 + 50 - 1 = 149
             // unclipped_end = 149 + 10 = 159
             let record = build_record(100, "50M10H", true);
-            let pos =
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
+            let pos = get_unclipped_position_raw(&record)
+                .expect("get_unclipped_position_raw should succeed");
             assert_eq!(pos, 159);
         }
 
@@ -884,8 +827,8 @@ mod tests {
             // alignment_end = 100 + 50 - 1 = 149
             // unclipped_end = 149 + 5 + 10 = 164
             let record = build_record(100, "50M5S10H", true);
-            let pos =
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed");
+            let pos = get_unclipped_position_raw(&record)
+                .expect("get_unclipped_position_raw should succeed");
             assert_eq!(pos, 164);
         }
 
@@ -895,25 +838,28 @@ mod tests {
             // Forward: unclipped_start = 100
             let forward_record = build_record(100, "50M", false);
             assert_eq!(
-                get_unclipped_position(&forward_record)
-                    .expect("get_unclipped_position should succeed"),
+                get_unclipped_position_raw(&forward_record)
+                    .expect("get_unclipped_position_raw should succeed"),
                 100
             );
 
             // Reverse: unclipped_end = 100 + 50 - 1 = 149
             let reverse_record = build_record(100, "50M", true);
             assert_eq!(
-                get_unclipped_position(&reverse_record)
-                    .expect("get_unclipped_position should succeed"),
+                get_unclipped_position_raw(&reverse_record)
+                    .expect("get_unclipped_position_raw should succeed"),
                 149
             );
         }
 
         #[test]
         fn test_unmapped_read() {
-            let record = RecordBuilder::new().sequence("ACGT").unmapped(true).build();
+            let mut b = RawSamBuilder::new();
+            b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::UNMAPPED);
+            let record = b.build();
             assert_eq!(
-                get_unclipped_position(&record).expect("get_unclipped_position should succeed"),
+                get_unclipped_position_raw(&record)
+                    .expect("get_unclipped_position_raw should succeed"),
                 0
             );
         }
@@ -926,8 +872,8 @@ mod tests {
             // unclipped_start = 100 - 8 = 92
             let forward_record = build_record(100, "5H3S10M2I5M3D10M4S6H", false);
             assert_eq!(
-                get_unclipped_position(&forward_record)
-                    .expect("get_unclipped_position should succeed"),
+                get_unclipped_position_raw(&forward_record)
+                    .expect("get_unclipped_position_raw should succeed"),
                 92
             );
 
@@ -938,8 +884,8 @@ mod tests {
             // unclipped_end = 127 + 10 = 137
             let reverse_record = build_record(100, "5H3S10M2I5M3D10M4S6H", true);
             assert_eq!(
-                get_unclipped_position(&reverse_record)
-                    .expect("get_unclipped_position should succeed"),
+                get_unclipped_position_raw(&reverse_record)
+                    .expect("get_unclipped_position_raw should succeed"),
                 137
             );
         }

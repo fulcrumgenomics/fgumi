@@ -39,7 +39,7 @@ use super::deadlock::{
     DeadlockAction, DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore,
 };
 use super::scheduler::{BackpressureState, SchedulerStrategy};
-use crate::read_info::{LibraryIndex, compute_group_key};
+use crate::read_info::LibraryIndex;
 use crate::sort::bam_fields;
 use fgumi_raw_bam::RawRecordView;
 
@@ -368,55 +368,33 @@ pub fn decode_records(
             ));
         }
 
-        // Skip the 4-byte block_size prefix
-        let record_data = &batch.buffer[start + 4..end];
-
-        if group_key_config.raw_byte_mode {
-            // Raw-byte path: zero-copy GroupKey computation without the noodles RecordBuf
-            // round-trip. Activated only when raw_byte_mode = true (via GroupKeyConfig::new_raw).
-            // Used by `dedup`, `group`, and other commands that opt in via GroupKeyConfig::new_raw;
-            // other commands use the noodles path below via the default config.
-            let raw = record_data.to_vec();
-            if raw.len() < 32 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("BAM record too short: len={}", raw.len()),
-                ));
-            }
-            // Validate l_read_name fits within the record to prevent
-            // panics in read_name() and downstream CIGAR/aux access.
-            let l_rn = raw[8] as usize;
-            if raw.len() < 32 + l_rn {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "BAM record truncated: len={}, l_read_name={l_rn} (need >= {})",
-                        raw.len(),
-                        32 + l_rn
-                    ),
-                ));
-            }
-            let key = compute_group_key_from_raw(
-                &raw,
-                &group_key_config.library_index,
-                group_key_config.cell_tag,
-            );
-            records.push(DecodedRecord::from_raw_bytes(raw, key));
-        } else {
-            // Noodles decode path: retained for commands (e.g. clip) that need typed
-            // RecordBuf access in downstream Template processing (CIGAR edits, flag API).
-            // Uses noodles Reader::from per maintainer recommendation (noodles#364).
-            let mut reader = noodles::bam::io::Reader::from(&batch.buffer[start..end]);
-            let mut record = RecordBuf::default();
-            reader.read_record_buf(&noodles::sam::Header::default(), &mut record)?;
-
-            let key = compute_group_key(
-                &record,
-                &group_key_config.library_index,
-                group_key_config.cell_tag,
-            );
-            records.push(DecodedRecord::new(record, key));
+        // Skip the 4-byte block_size prefix and copy record data.
+        let raw = batch.buffer[start + 4..end].to_vec();
+        if raw.len() < 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("BAM record too short: len={}", raw.len()),
+            ));
         }
+        // Validate l_read_name fits within the record to prevent
+        // panics in read_name() and downstream CIGAR/aux access.
+        let l_rn = raw[8] as usize;
+        if raw.len() < 32 + l_rn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BAM record truncated: len={}, l_read_name={l_rn} (need >= {})",
+                    raw.len(),
+                    32 + l_rn
+                ),
+            ));
+        }
+        let key = compute_group_key_from_raw(
+            &raw,
+            &group_key_config.library_index,
+            group_key_config.cell_tag,
+        );
+        records.push(DecodedRecord::from_raw_bytes(raw, key));
     }
 
     Ok(records)

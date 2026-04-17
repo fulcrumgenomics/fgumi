@@ -5,14 +5,14 @@
 //! errors introduced during sample preparation.
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
+    create_bam_reader_for_pipeline, create_bam_writer, create_optional_bam_writer,
+    create_raw_bam_reader,
 };
 use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
 };
 use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
 use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
@@ -250,10 +250,7 @@ impl Command for Simplex {
         // Get threading configuration
         let writer_threads = self.threading.num_threads();
 
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         // Create output header (cleared for unmapped consensus reads)
         let output_header = create_unmapped_consensus_header(
@@ -369,8 +366,7 @@ impl Command for Simplex {
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         // Create the MI group iterator for single-threaded streaming (raw bytes)
-        let (mut raw_reader, _) =
-            create_raw_bam_reader_with_opts(&self.io.input, 1, self.io.pipeline_reader_opts())?;
+        let (mut raw_reader, _) = create_raw_bam_reader(&self.io.input, 1)?;
         let raw_record_iter = std::iter::from_fn(move || {
             let mut record = RawRecord::new();
             match raw_reader.read_record(&mut record) {
@@ -379,8 +375,7 @@ impl Command for Simplex {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter =
-            RawMiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
+        let mi_group_iter = MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
         // Single-threaded streaming processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -400,8 +395,7 @@ impl Command for Simplex {
                 apply_overlapping_consensus(&mut records, oc)?;
             }
 
-            // Call consensus — mi_group now yields Vec<RawRecord> directly, which is
-            // what ConsensusCaller::consensus_reads expects.
+            // Call consensus directly — records are already RawRecord values.
             let output = caller
                 .consensus_reads(records)
                 .with_context(|| format!("Failed to call consensus for UMI: {umi}"))?;
@@ -534,9 +528,8 @@ impl Simplex {
         // Clone input_header before pipeline (needed for rejects writing)
         let rejects_header = input_header.clone();
 
-        // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -545,13 +538,13 @@ impl Simplex {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create RawMiGrouper ==========
+            // ========== grouper_fn: Create MiGrouper ==========
             move |_header: &Header| {
-                Box::new(RawMiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
-                    as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
+                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
+                    as Box<dyn Grouper<Group = MiGroupBatch> + Send>
             },
             // ========== process_fn: Consensus calling ==========
-            move |batch: RawMiGroupBatch| -> io::Result<SimplexProcessedBatch> {
+            move |batch: MiGroupBatch| -> io::Result<SimplexProcessedBatch> {
                 // Create per-thread consensus caller
                 let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
                     read_name_prefix.clone(),
@@ -581,7 +574,7 @@ impl Simplex {
                 let mut batch_overlapping = CorrectionStats::new();
                 let groups_count = batch.groups.len() as u64;
 
-                for RawMiGroup { mi, records: mut raw_records } in batch.groups {
+                for MiGroup { mi, records: mut raw_records } in batch.groups {
                     caller.clear();
 
                     // Skip if below min_reads threshold
@@ -615,7 +608,7 @@ impl Simplex {
                         batch_overlapping.merge(oc.stats());
                     }
 
-                    // Call consensus — mi_group now yields Vec<RawRecord> directly.
+                    // Call consensus directly — records are already RawRecord values.
                     match caller.consensus_reads(raw_records) {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
@@ -759,7 +752,7 @@ mod tests {
     /// Creates a Simplex command with the given input/output paths and default parameters.
     fn create_simplex_with_paths(input: PathBuf, output: PathBuf) -> Simplex {
         Simplex {
-            io: BamIoOptions::new(input, output),
+            io: BamIoOptions { input, output, async_reader: false },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions::default(),

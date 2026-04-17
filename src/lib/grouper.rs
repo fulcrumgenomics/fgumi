@@ -3,18 +3,17 @@
 //! Each grouper is responsible for grouping decoded BAM records according
 //! to command-specific rules and emitting complete groups for processing.
 //!
-//! Note: BAM record parsing is now handled by the Decode step in the pipeline.
-//! Groupers receive pre-decoded `RecordBuf` vectors.
+//! Note: BAM record parsing is handled by the Decode step in the pipeline.
+//! Groupers receive pre-decoded raw-byte records.
 
 use std::io;
 
 use noodles::sam::alignment::RecordBuf;
 
-use crate::sam::SamTag;
 use crate::sort::bam_fields;
 use crate::template::{Template, TemplateBatch};
 use crate::unified_pipeline::{BatchWeight, DecodedRecord, Grouper, MemoryEstimate};
-use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::{RawRecord, raw_record_to_record_buf};
 
 // ============================================================================
 // BatchWeight Implementations
@@ -80,16 +79,13 @@ impl Grouper for SingleRecordGrouper {
     type Group = RecordBuf;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
-        // Each record is its own group - extract and return them directly
+        // Decode each raw record into a RecordBuf. Uses a default header because
+        // the reference-sequence name lookup is not required for pass-through pipelines.
+        let header = noodles::sam::Header::default();
         records
             .into_iter()
             .map(|d| {
-                d.into_record().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "SingleRecordGrouper requires parsed records, got raw bytes",
-                    )
-                })
+                raw_record_to_record_buf(&d.into_raw_bytes(), &header).map_err(io::Error::other)
             })
             .collect()
     }
@@ -128,17 +124,7 @@ impl Grouper for SingleRawRecordGrouper {
     type Group = RawRecord;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
-        records
-            .into_iter()
-            .map(|d| {
-                d.into_raw_bytes().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "SingleRawRecordGrouper requires raw bytes, got parsed record",
-                    )
-                })
-            })
-            .collect()
+        Ok(records.into_iter().map(DecodedRecord::into_raw_bytes).collect())
     }
 
     fn finish(&mut self) -> io::Result<Option<Self::Group>> {
@@ -178,9 +164,7 @@ pub struct TemplateGrouper {
     current_name: Option<Vec<u8>>,
     /// Hash of current template name (for fast comparison).
     current_name_hash: Option<u64>,
-    /// Records for current template (non-raw mode).
-    current_records: Vec<RecordBuf>,
-    /// Raw records for current template (raw-byte mode).
+    /// Raw records for the current template being built.
     current_raw_records: Vec<RawRecord>,
     /// Completed templates waiting to be batched.
     pending_templates: VecDeque<Template>,
@@ -197,7 +181,6 @@ impl TemplateGrouper {
             batch_size: batch_size.max(1),
             current_name: None,
             current_name_hash: None,
-            current_records: Vec::new(),
             current_raw_records: Vec::new(),
             pending_templates: VecDeque::new(),
         }
@@ -205,19 +188,8 @@ impl TemplateGrouper {
 
     /// Flush current template to pending queue if non-empty.
     fn flush_current_template(&mut self) -> io::Result<()> {
-        debug_assert!(
-            self.current_raw_records.is_empty() || self.current_records.is_empty(),
-            "mixed raw/parsed records in same template group"
-        );
         if !self.current_raw_records.is_empty() {
-            let template =
-                Template::from_raw_records(std::mem::take(&mut self.current_raw_records))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            self.pending_templates.push_back(template);
-            self.current_name = None;
-            self.current_name_hash = None;
-        } else if !self.current_records.is_empty() {
-            let template = Template::from_records(std::mem::take(&mut self.current_records))
+            let template = Template::from_records(std::mem::take(&mut self.current_raw_records))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.pending_templates.push_back(template);
             self.current_name = None;
@@ -248,40 +220,19 @@ impl Grouper for TemplateGrouper {
     type Group = TemplateBatch;
 
     fn add_records(&mut self, records: Vec<DecodedRecord>) -> io::Result<Vec<Self::Group>> {
-        use crate::unified_pipeline::DecodedRecordData;
-
         // Group records by QNAME (using pre-computed name_hash for fast comparison)
         for decoded in records {
             let name_hash = decoded.key.name_hash;
-
-            match decoded.data {
-                DecodedRecordData::Raw(raw) => {
-                    // Raw-byte mode: only extract name when starting a new template
-                    match (self.current_name_hash, name_hash) {
-                        (Some(current_hash), new_hash) if current_hash == new_hash => {
-                            self.current_raw_records.push(raw);
-                        }
-                        _ => {
-                            self.flush_current_template()?;
-                            self.current_name = Some(bam_fields::read_name(&raw).to_vec());
-                            self.current_name_hash = Some(name_hash);
-                            self.current_raw_records.push(raw);
-                        }
-                    }
+            let raw = decoded.data;
+            match (self.current_name_hash, name_hash) {
+                (Some(current_hash), new_hash) if current_hash == new_hash => {
+                    self.current_raw_records.push(raw);
                 }
-                DecodedRecordData::Parsed(record) => {
-                    let name = record.name().map(|n| Vec::from(<_ as AsRef<[u8]>>::as_ref(n)));
-                    match (self.current_name_hash, name_hash) {
-                        (Some(current_hash), new_hash) if current_hash == new_hash => {
-                            self.current_records.push(record);
-                        }
-                        _ => {
-                            self.flush_current_template()?;
-                            self.current_name = name;
-                            self.current_name_hash = Some(name_hash);
-                            self.current_records.push(record);
-                        }
-                    }
+                _ => {
+                    self.flush_current_template()?;
+                    self.current_name = Some(bam_fields::read_name(&raw).to_vec());
+                    self.current_name_hash = Some(name_hash);
+                    self.current_raw_records.push(raw);
                 }
             }
         }
@@ -310,11 +261,8 @@ impl Grouper for TemplateGrouper {
         self.current_name.is_some()
             || !self.pending_templates.is_empty()
             || !self.current_raw_records.is_empty()
-            || !self.current_records.is_empty()
     }
 }
-
-use noodles::sam::alignment::record::data::field::Tag;
 
 use crate::unified_pipeline::GroupKey;
 
@@ -495,59 +443,31 @@ impl RecordPositionGrouper {
     /// Skips validation for records that are unmapped or whose mates are unmapped,
     /// since unmapped reads have no CIGAR to report in an MC tag.
     fn validate_mc_tag(&mut self, decoded: &DecodedRecord) -> io::Result<()> {
-        use crate::sort::bam_fields;
-        use crate::unified_pipeline::DecodedRecordData;
         use fgumi_raw_bam::RawRecordView;
 
         if self.mc_validated {
             return Ok(());
         }
 
-        match &decoded.data {
-            DecodedRecordData::Raw(raw) => {
-                let flg = RawRecordView::new(raw).flags();
-                let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
-                let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
-                let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
-                let is_unmapped = (flg & bam_fields::flags::UNMAPPED) != 0;
-                let is_mate_unmapped = (flg & bam_fields::flags::MATE_UNMAPPED) != 0;
+        let raw = &decoded.data;
+        let flg = RawRecordView::new(raw).flags();
+        let is_paired = (flg & bam_fields::flags::PAIRED) != 0;
+        let is_secondary = (flg & bam_fields::flags::SECONDARY) != 0;
+        let is_supplementary = (flg & bam_fields::flags::SUPPLEMENTARY) != 0;
+        let is_unmapped = (flg & bam_fields::flags::UNMAPPED) != 0;
+        let is_mate_unmapped = (flg & bam_fields::flags::MATE_UNMAPPED) != 0;
 
-                if is_paired
-                    && !is_secondary
-                    && !is_supplementary
-                    && !is_unmapped
-                    && !is_mate_unmapped
-                {
-                    if bam_fields::find_mc_tag_in_record(raw).is_none() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "RecordPositionGrouper requires MC tags on paired-end reads. \
-                             Run `fgumi zipper` to add MC tags before `fgumi group`.",
-                        ));
-                    }
-                    self.mc_validated = true;
-                }
+        if is_paired && !is_secondary && !is_supplementary && !is_unmapped && !is_mate_unmapped {
+            if bam_fields::find_mc_tag_in_record(raw).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RecordPositionGrouper requires MC tags on paired-end reads. \
+                     Run `fgumi zipper` to add MC tags before `fgumi group`.",
+                ));
             }
-            DecodedRecordData::Parsed(record) => {
-                let flags = record.flags();
-                if flags.is_segmented()
-                    && !flags.is_secondary()
-                    && !flags.is_supplementary()
-                    && !flags.is_unmapped()
-                    && !flags.is_mate_unmapped()
-                {
-                    let mc_tag = Tag::from(SamTag::MC);
-                    if record.data().get(&mc_tag).is_none() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "RecordPositionGrouper requires MC tags on paired-end reads. \
-                             Run `fgumi zipper` to add MC tags before `fgumi group`.",
-                        ));
-                    }
-                    self.mc_validated = true;
-                }
-            }
+            self.mc_validated = true;
         }
+
         Ok(())
     }
 
@@ -708,39 +628,7 @@ fn group_by_name_and_build<T>(
 ///
 /// Returns an error if template construction from records fails.
 pub fn build_templates_from_records(records: Vec<DecodedRecord>) -> io::Result<Vec<Template>> {
-    use crate::unified_pipeline::DecodedRecordData;
-
-    if records.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let raw_byte_mode = matches!(records[0].data, DecodedRecordData::Raw(_));
-
-    if raw_byte_mode {
-        group_by_name_and_build(
-            records,
-            |d| match d.data {
-                DecodedRecordData::Raw(v) => Ok(v),
-                DecodedRecordData::Parsed(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected raw-byte record but found parsed record",
-                )),
-            },
-            Template::from_raw_records,
-        )
-    } else {
-        group_by_name_and_build(
-            records,
-            |d| match d.data {
-                DecodedRecordData::Parsed(r) => Ok(r),
-                DecodedRecordData::Raw(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected parsed record but found raw-byte record",
-                )),
-            },
-            Template::from_records,
-        )
-    }
+    group_by_name_and_build(records, |d| Ok(d.data), Template::from_records)
 }
 
 use crate::fastq_parse::{FastqRecord, parse_fastq_records, strip_read_suffix};
@@ -1030,19 +918,6 @@ mod tests {
         assert_eq!(groups[1], raw2);
     }
 
-    #[test]
-    fn test_single_raw_record_grouper_rejects_parsed() {
-        use crate::sam::builder::RecordBuilder;
-        use crate::unified_pipeline::{DecodedRecord, GroupKey};
-
-        let mut grouper = SingleRawRecordGrouper::new();
-        let rec = RecordBuilder::new().sequence("ACGT").build();
-        let records = vec![DecodedRecord::new(rec, GroupKey::default())];
-
-        let result = grouper.add_records(records);
-        assert!(result.is_err());
-    }
-
     // FastqGrouper tests
     #[test]
     fn test_fastq_grouper_paired() {
@@ -1139,7 +1014,7 @@ mod tests {
     // RecordPositionGrouper tests
     // ========================================================================
 
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
 
     /// Helper: create a `DecodedRecord` with the given `GroupKey` and flags/tags.
     fn make_decoded(
@@ -1148,33 +1023,34 @@ mod tests {
         first_segment: bool,
         mc: Option<&str>,
     ) -> DecodedRecord {
-        let mut builder = RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .cigar("4M")
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .paired(paired);
+        use fgumi_raw_bam::testutil::encode_op;
+        let mut flags: u16 = 0;
+        if paired {
+            flags |= raw_flags::PAIRED;
+        }
         if first_segment {
-            builder = builder.first_segment(true);
+            flags |= raw_flags::FIRST_SEGMENT;
         }
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(flags)
+            .ref_id(0)
+            .pos(99) // alignment_start=100 in 1-based => 0-based pos=99
+            .cigar_ops(&[encode_op(0, 4)]);
         if let Some(mc_val) = mc {
-            builder = builder.tag("MC", mc_val);
+            b.add_string_tag(b"MC", mc_val.as_bytes());
         }
-        DecodedRecord::new(builder.build(), key)
+        DecodedRecord::from_raw_bytes(b.build(), key)
     }
 
     /// Helper: create a secondary/supplementary `DecodedRecord` with UNKNOWN key.
     fn make_secondary_decoded(name_hash: u64) -> DecodedRecord {
         let key = GroupKey { name_hash, ..GroupKey::default() };
-        let record = RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .secondary(true)
-            .build();
-        DecodedRecord::new(record, key)
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1").sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::SECONDARY);
+        DecodedRecord::from_raw_bytes(b.build(), key)
     }
 
     #[test]
@@ -1334,32 +1210,27 @@ mod tests {
         // R1: mapped at chr5:100, mate unmapped — no MC tag
         let r1_key = GroupKey::single(5, 100, 0, 0, 0, name_hash);
         let r1 = {
-            let record = RecordBuilder::new()
-                .name("read1")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .cigar("4M")
-                .reference_sequence_id(5)
-                .alignment_start(100)
-                .paired(true)
-                .first_segment(true)
-                .mate_unmapped(true)
-                .build();
-            DecodedRecord::new(record, r1_key)
+            use fgumi_raw_bam::testutil::encode_op;
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_UNMAPPED)
+                .ref_id(5)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)]);
+            DecodedRecord::from_raw_bytes(b.build(), r1_key)
         };
 
         // R2: unmapped, mate mapped — different position key
         let r2_key = GroupKey::single(-1, 0, 0, 0, 0, name_hash);
         let r2 = {
-            let record = RecordBuilder::new()
-                .name("read1")
-                .sequence("TGCA")
-                .qualities(&[30, 30, 30, 30])
-                .paired(true)
-                .first_segment(false)
-                .unmapped(true)
-                .build();
-            DecodedRecord::new(record, r2_key)
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"TGCA")
+                .qualities(&[30; 4])
+                .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::UNMAPPED);
+            DecodedRecord::from_raw_bytes(b.build(), r2_key)
         };
 
         // Verify position keys differ (this is the bug scenario)
@@ -1397,20 +1268,18 @@ mod tests {
     #[test]
     fn test_record_position_grouper_mc_validation_skips_unmapped_mate() {
         // Paired records with unmapped mates have no MC tag — validation should skip them.
+        use fgumi_raw_bam::testutil::encode_op;
         let mut grouper = RecordPositionGrouper::new();
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
-        let record = RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .cigar("4M")
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .paired(true)
-            .first_segment(true)
-            .mate_unmapped(true)
-            .build();
-        let decoded = DecodedRecord::new(record, key);
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_UNMAPPED)
+            .ref_id(0)
+            .pos(99)
+            .cigar_ops(&[encode_op(0, 4)]);
+        let decoded = DecodedRecord::from_raw_bytes(b.build(), key);
 
         // Should NOT error even though there's no MC tag
         let result = grouper.add_records(vec![decoded]);
@@ -1471,19 +1340,18 @@ mod tests {
 
     #[test]
     fn test_build_templates_single_record() {
+        use fgumi_raw_bam::testutil::encode_op;
         let key = GroupKey::single(0, 100, 0, 0, 0, 12345);
-        let record = RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .cigar("4M")
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .paired(true)
-            .first_segment(true)
-            .build();
-        let decoded = DecodedRecord::new(record, key);
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 4)]);
+        let decoded = DecodedRecord::from_raw_bytes(b.build(), key);
 
         let templates =
             build_templates_from_records(vec![decoded]).expect("build templates from records");
@@ -1493,35 +1361,32 @@ mod tests {
     #[test]
     fn test_build_templates_paired_same_name_hash() {
         // R1 and R2 with same name_hash should produce one template
+        use fgumi_raw_bam::testutil::encode_op;
         let r1_key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
         let r2_key = GroupKey::paired(0, 100, 0, 0, 200, 1, 0, 0, 12345);
 
-        let r1 = DecodedRecord::new(
-            RecordBuilder::new()
-                .name("read1")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .cigar("4M")
-                .reference_sequence_id(0)
-                .alignment_start(100)
-                .paired(true)
-                .first_segment(true)
-                .build(),
-            r1_key,
-        );
-        let r2 = DecodedRecord::new(
-            RecordBuilder::new()
-                .name("read1")
-                .sequence("TGCA")
-                .qualities(&[30, 30, 30, 30])
-                .cigar("4M")
-                .reference_sequence_id(0)
-                .alignment_start(200)
-                .paired(true)
-                .reverse_complement(true)
-                .build(),
-            r2_key,
-        );
+        let r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)]);
+            DecodedRecord::from_raw_bytes(b.build(), r1_key)
+        };
+        let r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"TGCA")
+                .qualities(&[30; 4])
+                .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .cigar_ops(&[encode_op(0, 4)]);
+            DecodedRecord::from_raw_bytes(b.build(), r2_key)
+        };
 
         let templates =
             build_templates_from_records(vec![r1, r2]).expect("build templates from records");
@@ -1531,44 +1396,27 @@ mod tests {
     #[test]
     fn test_build_templates_multiple_qnames() {
         // Records with different name_hashes should produce separate templates
+        use fgumi_raw_bam::testutil::encode_op;
         let key1 = GroupKey::single(0, 100, 0, 0, 0, 11111);
         let key2 = GroupKey::single(0, 100, 0, 0, 0, 22222);
         let key3 = GroupKey::single(0, 100, 0, 0, 0, 33333);
 
+        let make_rec = |name: &[u8]| {
+            let mut b = RawSamBuilder::new();
+            b.read_name(name)
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .flags(0)
+                .ref_id(0)
+                .pos(99)
+                .cigar_ops(&[encode_op(0, 4)]);
+            b.build()
+        };
+
         let records: Vec<DecodedRecord> = vec![
-            DecodedRecord::new(
-                RecordBuilder::new()
-                    .name("readA")
-                    .sequence("ACGT")
-                    .qualities(&[30, 30, 30, 30])
-                    .cigar("4M")
-                    .reference_sequence_id(0)
-                    .alignment_start(100)
-                    .build(),
-                key1,
-            ),
-            DecodedRecord::new(
-                RecordBuilder::new()
-                    .name("readB")
-                    .sequence("ACGT")
-                    .qualities(&[30, 30, 30, 30])
-                    .cigar("4M")
-                    .reference_sequence_id(0)
-                    .alignment_start(100)
-                    .build(),
-                key2,
-            ),
-            DecodedRecord::new(
-                RecordBuilder::new()
-                    .name("readC")
-                    .sequence("ACGT")
-                    .qualities(&[30, 30, 30, 30])
-                    .cigar("4M")
-                    .reference_sequence_id(0)
-                    .alignment_start(100)
-                    .build(),
-                key3,
-            ),
+            DecodedRecord::from_raw_bytes(make_rec(b"readA"), key1),
+            DecodedRecord::from_raw_bytes(make_rec(b"readB"), key2),
+            DecodedRecord::from_raw_bytes(make_rec(b"readC"), key3),
         ];
 
         let templates =

@@ -557,12 +557,12 @@ impl Grouper for FailAfterNGrouper {
                 format!("Grouper error after {} records", self.count),
             ));
         }
+        let header = noodles::sam::Header::default();
         records
             .into_iter()
             .map(|d| {
-                d.into_record().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Expected parsed record")
-                })
+                fgumi_raw_bam::raw_record_to_record_buf(&d.into_raw_bytes(), &header)
+                    .map_err(io::Error::other)
             })
             .collect()
     }

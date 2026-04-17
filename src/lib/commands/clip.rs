@@ -4,12 +4,11 @@
 //! This is useful for variant calling to avoid double-counting evidence from
 //! overlapping portions of paired reads.
 
-use crate::alignment_tags::regenerate_alignment_tags;
+use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_reader_with_opts, create_bam_writer,
-    is_stdin_path,
+    create_bam_reader_for_pipeline, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
 };
-use crate::clipper::{ClippingMode, SamRecordClipper};
+use crate::clipper::{ClippingMode, RawRecordClipper};
 use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
@@ -18,20 +17,15 @@ use crate::progress::ProgressTracker;
 use crate::reference::ReferenceReader;
 use crate::template::{TemplateBatch, TemplateIterator};
 use crate::unified_pipeline::{
-    Grouper, MemoryEstimate, run_bam_pipeline_from_reader, serialize_bam_records_into,
+    GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_queue::SegQueue;
+use fgumi_raw_bam::RawRecord;
 use log::info;
 use noodles::sam::Header;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-// RecordBuf retained: SamRecordClipper (T2.9) requires typed CIGAR/sequence editing on RecordBuf;
-// all record flow in clip.rs is driven by that clipper and Template.records (T2.1).
-use noodles::sam::alignment::record::Cigar as CigarTrait;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -170,8 +164,7 @@ pub struct Clip {
 /// Result from processing a batch of templates through clipping.
 struct ClipProcessedBatch {
     /// Clipped records to write to output BAM.
-    // RecordBuf retained: SamRecordClipper (T2.9) mutates typed CIGAR/sequence on RecordBuf.
-    clipped_records: Vec<RecordBuf>,
+    clipped_records: Vec<RawRecord>,
     /// Number of templates processed.
     templates_count: u64,
     /// Number of templates with overlap clipping applied.
@@ -183,7 +176,7 @@ struct ClipProcessedBatch {
 impl MemoryEstimate for ClipProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
         self.clipped_records.iter().map(MemoryEstimate::estimate_heap_size).sum::<usize>()
-            + self.clipped_records.capacity() * std::mem::size_of::<RecordBuf>()
+            + self.clipped_records.capacity() * std::mem::size_of::<RawRecord>()
     }
 }
 
@@ -241,10 +234,7 @@ impl Command for Clip {
         // ========================================================================
         let total_records = if let Some(threads) = self.threading.threads {
             // Read header for the 7-step pipeline (supports stdin)
-            let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-                &self.io.input,
-                self.io.pipeline_reader_opts(),
-            )?;
+            let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
             // Load reference (always required for clip)
             let reference = Arc::new(ReferenceReader::new(&self.reference)?);
@@ -271,9 +261,9 @@ impl Clip {
     fn execute_single_threaded(&self, mode: ClippingMode, command_line: &str) -> Result<u64> {
         // Create clipper
         let clipper = if self.auto_clip_attributes {
-            SamRecordClipper::with_auto_clip(mode, true)
+            RawRecordClipper::with_auto_clip(mode, true)
         } else {
-            SamRecordClipper::new(mode)
+            RawRecordClipper::new(mode)
         };
 
         // Create metrics collection if metrics output requested
@@ -285,11 +275,7 @@ impl Clip {
 
         // Open input BAM with MT BGZF decompression
         let reader_threads = self.threading.num_threads();
-        let (mut reader, header) = create_bam_reader_with_opts(
-            &self.io.input,
-            reader_threads,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let (reader, header) = create_raw_bam_reader(&self.io.input, reader_threads)?;
 
         // Update header sort order if specified
         let header = self.update_header_sort_order(header)?;
@@ -299,7 +285,7 @@ impl Clip {
 
         // Create output BAM writer with multi-threaded BGZF compression
         let writer_threads = self.threading.num_threads();
-        let mut writer = create_bam_writer(
+        let mut writer = create_raw_bam_writer(
             &self.io.output,
             &header,
             writer_threads,
@@ -314,13 +300,12 @@ impl Clip {
         let mut total_clipped_mate_extension: u64 = 0;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        // Single-threaded processing
-        let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-        let template_iter = TemplateIterator::new(record_iter);
+        // Single-threaded processing: iterate raw templates, clip in place
+        let template_iter = TemplateIterator::new(reader);
 
         for template in template_iter {
             let template = template?;
-            let mut records = template.records;
+            let mut records: Vec<RawRecord> = template.into_records();
 
             // Process based on template type
             #[allow(clippy::len_zero)] // We specifically want len() == 1, not !is_empty()
@@ -344,21 +329,21 @@ impl Clip {
                     total_clipped_mate_extension += 1;
                 }
 
-                // Update mate info (MC and MQ tags)
-                update_mate_info(r1, r2);
-                update_mate_info(r2, r1);
+                // Update mate info (MC and MQ tags) using raw tag API
+                update_mate_info_raw(r1, r2);
+                update_mate_info_raw(r2, r1);
             }
 
             // Regenerate alignment tags (always done to match Scala fgbio behavior)
             for record in &mut records {
-                regenerate_alignment_tags(record, &header, &reference_reader)?;
+                regenerate_alignment_tags_raw(record.as_mut_vec(), &header, &reference_reader)?;
             }
 
             // Count and write records
             let batch_size = records.len();
             total_records += batch_size;
             for record in &records {
-                writer.write_alignment_record(&header, record)?;
+                writer.write_raw_record(record.as_ref())?;
             }
             progress.log_if_needed(batch_size as u64);
         }
@@ -380,7 +365,7 @@ impl Clip {
         }
 
         // Flush and finish the writer
-        writer.into_inner().finish()?;
+        writer.finish()?;
 
         info!("Done!");
         Ok(total_records as u64)
@@ -408,19 +393,17 @@ impl Clip {
     /// # Errors
     ///
     /// Returns an error if clipping operations fail.
-    // RecordBuf retained throughout clip_fragment / clip_pair / update_mate_info:
-    // SamRecordClipper (T2.9) requires typed CIGAR editing on RecordBuf.
     fn clip_fragment(
         &self,
-        clipper: &SamRecordClipper,
-        record: &mut noodles::sam::alignment::RecordBuf,
+        clipper: &RawRecordClipper,
+        record: &mut RawRecord,
         metrics: Option<&mut ClippingMetricsCollection>,
     ) -> Result<()> {
-        let prior_bases_clipped = SamRecordClipper::clipped_bases(record);
+        let prior_bases_clipped = clipped_bases_raw(record);
 
         // Upgrade existing clipping if requested
         if self.upgrade_clipping {
-            clipper.upgrade_all_clipping(record)?;
+            clipper.upgrade_all_clipping_raw(record)?;
         }
 
         // Apply fixed-position clipping
@@ -438,7 +421,7 @@ impl Clip {
 
         // Update metrics
         if let Some(metrics) = metrics {
-            metrics.fragment.update(
+            metrics.fragment.update_raw(
                 record,
                 ClipCounts {
                     prior: prior_bases_clipped,
@@ -481,23 +464,22 @@ impl Clip {
     /// Returns an error if clipping operations fail.
     fn clip_pair(
         &self,
-        clipper: &SamRecordClipper,
-        r1: &mut noodles::sam::alignment::RecordBuf,
-        r2: &mut noodles::sam::alignment::RecordBuf,
+        clipper: &RawRecordClipper,
+        r1: &mut RawRecord,
+        r2: &mut RawRecord,
         metrics: Option<&mut ClippingMetricsCollection>,
     ) -> Result<(bool, bool)> {
-        let prior_bases_clipped_r1 = SamRecordClipper::clipped_bases(r1);
-        let prior_bases_clipped_r2 = SamRecordClipper::clipped_bases(r2);
+        let prior_bases_clipped_r1 = clipped_bases_raw(r1);
+        let prior_bases_clipped_r2 = clipped_bases_raw(r2);
 
         // Upgrade existing clipping if requested
         if self.upgrade_clipping {
-            clipper.upgrade_all_clipping(r1)?;
-            clipper.upgrade_all_clipping(r2)?;
+            clipper.upgrade_all_clipping_raw(r1)?;
+            clipper.upgrade_all_clipping_raw(r2)?;
         }
 
-        // Determine read types
-        let (is_r1_first, is_r2_last) =
-            (r1.flags().is_first_segment(), r2.flags().is_last_segment());
+        // Determine read types (raw flags: bit 6 = first segment, bit 7 = last segment)
+        let (is_r1_first, is_r2_last) = (r1.is_first_segment(), r2.is_last_segment());
 
         // Apply fixed-position clipping for R1
         let num_r1_five_prime = if is_r1_first && self.read_one_five_prime > 0 {
@@ -566,15 +548,15 @@ impl Clip {
 
             // Determine which metric to update based on read flags
             if is_r1_first {
-                metrics.read_one.update(r1, r1_counts);
+                metrics.read_one.update_raw(r1, r1_counts);
             } else {
-                metrics.read_two.update(r1, r1_counts);
+                metrics.read_two.update_raw(r1, r1_counts);
             }
 
             if is_r2_last {
-                metrics.read_two.update(r2, r2_counts);
+                metrics.read_two.update_raw(r2, r2_counts);
             } else {
-                metrics.read_one.update(r2, r2_counts);
+                metrics.read_one.update_raw(r2, r2_counts);
             }
         }
 
@@ -639,12 +621,15 @@ impl Clip {
         reference: Arc<ReferenceReader>,
     ) -> Result<u64> {
         // Configure pipeline - clip is writer-heavy workload
-        let pipeline_config = build_pipeline_config(
+        let mut pipeline_config = build_pipeline_config(
             &self.scheduler_opts,
             &self.compression,
             &self.queue_memory,
             num_threads,
         )?;
+        // Clip uses raw-byte mode so TemplateGrouper receives RawRecord items.
+        pipeline_config.group_key_config =
+            Some(GroupKeyConfig::new_raw_no_cell(crate::read_info::LibraryIndex::default()));
 
         // Lock-free metrics collection
         let collected_metrics: Arc<SegQueue<CollectedClipMetrics>> = Arc::new(SegQueue::new());
@@ -678,9 +663,9 @@ impl Clip {
         let process_fn = move |batch: TemplateBatch| -> io::Result<ClipProcessedBatch> {
             // Create per-worker clipper
             let clipper = if auto_clip_attributes {
-                SamRecordClipper::with_auto_clip(clipping_mode, true)
+                RawRecordClipper::with_auto_clip(clipping_mode, true)
             } else {
-                SamRecordClipper::new(clipping_mode)
+                RawRecordClipper::new(clipping_mode)
             };
 
             let mut clipped_records = Vec::new();
@@ -689,15 +674,15 @@ impl Clip {
             let mut extend_clipped_count = 0u64;
 
             for template in batch {
-                let mut records = template.records;
                 templates_count += 1;
+                let mut records: Vec<RawRecord> = template.into_records();
 
                 #[allow(clippy::len_zero)]
                 if records.len() == 1 {
                     // Fragment - apply fixed-position clipping
                     let record = &mut records[0];
                     if upgrade_clipping {
-                        let _ = clipper.upgrade_all_clipping(record);
+                        let _ = clipper.upgrade_all_clipping_raw(record);
                     }
                     if read_one_five_prime > 0 {
                         clipper.clip_5_prime_end_of_alignment(record, read_one_five_prime);
@@ -712,13 +697,13 @@ impl Clip {
                     let r2 = &mut r2_slice[0];
 
                     if upgrade_clipping {
-                        let _ = clipper.upgrade_all_clipping(r1);
-                        let _ = clipper.upgrade_all_clipping(r2);
+                        let _ = clipper.upgrade_all_clipping_raw(r1);
+                        let _ = clipper.upgrade_all_clipping_raw(r2);
                     }
 
-                    // Determine read types
-                    let is_r1_first = r1.flags().is_first_segment();
-                    let is_r2_last = r2.flags().is_last_segment();
+                    // Determine read types (raw flags)
+                    let is_r1_first = r1.is_first_segment();
+                    let is_r2_last = r2.is_last_segment();
 
                     // Apply fixed-position clipping for R1
                     if is_r1_first && read_one_five_prime > 0 {
@@ -760,15 +745,19 @@ impl Clip {
                         }
                     }
 
-                    // Update mate info
-                    update_mate_info(r1, r2);
-                    update_mate_info(r2, r1);
+                    // Update mate info (MC and MQ tags) using raw tag API
+                    update_mate_info_raw(r1, r2);
+                    update_mate_info_raw(r2, r1);
                 }
 
                 // Regenerate alignment tags (always done to match fgbio behavior)
                 for record in &mut records {
-                    regenerate_alignment_tags(record, &header_for_process, &reference_for_process)
-                        .map_err(io::Error::other)?;
+                    regenerate_alignment_tags_raw(
+                        record.as_mut_vec(),
+                        &header_for_process,
+                        &reference_for_process,
+                    )
+                    .map_err(io::Error::other)?;
                 }
 
                 clipped_records.extend(records);
@@ -789,9 +778,9 @@ impl Clip {
             })
         };
 
-        // Serialize function: convert records to bytes and collect metrics
+        // Serialize function: write raw records directly into the output buffer
         let serialize_fn = move |processed: ClipProcessedBatch,
-                                 header: &Header,
+                                 _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
             // Push metrics to lock-free queue
@@ -801,8 +790,10 @@ impl Clip {
                 extend_clipped: processed.extend_clipped_count,
             });
 
-            // Serialize clipped records into the provided buffer
-            serialize_bam_records_into(&processed.clipped_records, header, output)
+            // Write raw records directly (4-byte block_size + bytes per record)
+            let count = processed.clipped_records.len() as u64;
+            fgumi_raw_bam::write_raw_records(output, &processed.clipped_records)?;
+            Ok(count)
         };
 
         // Run the 7-step pipeline
@@ -857,45 +848,29 @@ impl Clip {
 ///
 /// * `record` - The record to update (mutable)
 /// * `mate` - The mate record to read information from
-// RecordBuf retained: records here are the same SamRecordClipper-mutated RecordBuf objects;
-// converting to raw bytes for tag ops and back would add overhead with no benefit until T2.9.
-#[allow(clippy::similar_names)] // mc_tag and mq_tag are standard SAM tags
-#[allow(clippy::cast_lossless)] // u8 to i32 cast is intentional for SAM tag format
-fn update_mate_info(
-    record: &mut noodles::sam::alignment::RecordBuf,
-    mate: &noodles::sam::alignment::RecordBuf,
-) {
-    use noodles::sam::alignment::record::cigar::op::Kind;
-    use std::fmt::Write;
+fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
+    // Update MC tag: build CIGAR string from raw bytes
+    let cigar_str = mate.cigar_to_string();
+    let mut editor = record.tags_editor();
+    editor.update_string(b"MC", cigar_str.as_bytes());
 
-    // Update MC tag (mate CIGAR)
-    // Build CIGAR string manually since Cigar doesn't implement Display
-    let mate_cigar = mate.cigar();
-    let mut cigar_string = String::new();
-    for op in mate_cigar.iter().flatten() {
-        let kind_char = match op.kind() {
-            Kind::Match => 'M',
-            Kind::Insertion => 'I',
-            Kind::Deletion => 'D',
-            Kind::Skip => 'N',
-            Kind::SoftClip => 'S',
-            Kind::HardClip => 'H',
-            Kind::Pad => 'P',
-            Kind::SequenceMatch => '=',
-            Kind::SequenceMismatch => 'X',
-        };
-        let _ = write!(cigar_string, "{}{}", op.len(), kind_char);
-    }
+    // Update MQ tag: mate mapping quality
+    let mapq = mate.mapq();
+    editor.update_int(b"MQ", i32::from(mapq));
+}
 
-    let mc_tag = Tag::from([b'M', b'C']);
-    let _ = record.data_mut().insert(mc_tag, cigar_string.into());
-
-    // Update MQ tag (mate mapping quality)
-    if let Some(mate_mapq) = mate.mapping_quality() {
-        let mq_tag = Tag::from([b'M', b'Q']);
-        let mapq_value: u8 = mate_mapq.into();
-        let _ = record.data_mut().insert(mq_tag, (mapq_value as i32).into());
-    }
+/// Returns the number of clipped bases (soft + hard) in a raw record's CIGAR.
+fn clipped_bases_raw(record: &RawRecord) -> usize {
+    record
+        .cigar_ops_typed()
+        .filter(|op| {
+            matches!(
+                op.kind(),
+                fgumi_raw_bam::CigarKind::SoftClip | fgumi_raw_bam::CigarKind::HardClip
+            )
+        })
+        .map(|op| op.len() as usize)
+        .sum()
 }
 
 #[cfg(test)]
@@ -907,7 +882,11 @@ mod tests {
     #[test]
     fn test_default_clip_parameters() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -935,7 +914,11 @@ mod tests {
     #[test]
     fn test_clip_with_fixed_positions() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -964,7 +947,11 @@ mod tests {
     #[test]
     fn test_clip_with_overlapping_enabled() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -992,7 +979,11 @@ mod tests {
     #[test]
     fn test_clip_with_metrics_output() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: false,
@@ -1020,7 +1011,11 @@ mod tests {
     #[test]
     fn test_clip_with_tag_regeneration() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1047,7 +1042,11 @@ mod tests {
     #[test]
     fn test_clip_all_modes_enabled() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1079,7 +1078,11 @@ mod tests {
     fn test_clipping_mode_enum_values() {
         // Test that clipping_mode enum variants are set properly
         let soft = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
@@ -1105,7 +1108,11 @@ mod tests {
     #[test]
     fn test_clip_with_sort_order_specification() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1131,7 +1138,11 @@ mod tests {
     #[test]
     fn test_clip_asymmetric_fixed_positions() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
@@ -1161,7 +1172,11 @@ mod tests {
     #[test]
     fn test_clip_with_upgrade_all_clipping() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1189,7 +1204,11 @@ mod tests {
     #[test]
     fn test_clip_extending_past_mate_only() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1217,7 +1236,11 @@ mod tests {
     #[test]
     fn test_clip_overlapping_reads_only() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1245,7 +1268,11 @@ mod tests {
     #[test]
     fn test_clip_modes_with_auto_clip_attributes() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1273,7 +1300,11 @@ mod tests {
     #[test]
     fn test_clip_zero_bases_all_positions() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1303,7 +1334,11 @@ mod tests {
     #[test]
     fn test_clip_soft_with_mask_mode() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: true,
@@ -1331,7 +1366,11 @@ mod tests {
     #[test]
     fn test_clip_large_fixed_positions() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1361,7 +1400,11 @@ mod tests {
     #[test]
     fn test_clip_combination_overlapping_and_fixed() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1390,7 +1433,11 @@ mod tests {
     #[test]
     fn test_clip_all_three_modes_comparison() {
         let soft = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
@@ -1411,7 +1458,11 @@ mod tests {
         };
 
         let soft_mask = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: false,
@@ -1432,7 +1483,11 @@ mod tests {
         };
 
         let hard = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1461,7 +1516,11 @@ mod tests {
     #[test]
     fn test_clip_with_queryname_sort_order() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1487,7 +1546,11 @@ mod tests {
     #[test]
     fn test_clip_with_unsorted_sort_order() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1513,7 +1576,11 @@ mod tests {
     #[test]
     fn test_clip_single_read_end_clipping() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1543,7 +1610,11 @@ mod tests {
     #[test]
     fn test_clip_with_metrics_and_upgrade() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1571,7 +1642,11 @@ mod tests {
     #[test]
     fn test_clip_both_extending_and_overlapping() {
         let clip = Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
@@ -1598,7 +1673,6 @@ mod tests {
     // Integration tests
     use crate::sam::SamBuilder;
     use anyhow::Result;
-    use noodles::sam::alignment::record_buf::RecordBuf;
     use tempfile::TempDir;
 
     fn create_test_reference(dir: &TempDir) -> PathBuf {
@@ -1613,7 +1687,7 @@ mod tests {
         ref_path
     }
 
-    fn read_bam_records(path: &std::path::Path) -> Result<Vec<RecordBuf>> {
+    fn read_bam_records(path: &std::path::Path) -> Result<Vec<noodles::sam::alignment::RecordBuf>> {
         let mut reader = noodles::bam::io::reader::Builder.build_from_path(path)?;
         let header = reader.read_header()?;
         let records: Vec<_> = reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?;
@@ -1641,7 +1715,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1688,7 +1766,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: true,
@@ -1734,7 +1816,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::SoftWithMask,
             clip_overlapping_reads: true,
@@ -1780,7 +1866,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1826,7 +1916,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1872,7 +1966,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -1919,7 +2017,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -1966,7 +2068,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2012,7 +2118,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -2059,7 +2169,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2106,7 +2220,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2153,7 +2271,7 @@ mod tests {
         builder.write(&input_path).expect("failed to write test BAM");
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path),
+            io: BamIoOptions { input: input_path, output: output_path, async_reader: false },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: false,
@@ -2206,7 +2324,11 @@ mod tests {
         builder.write(&input_path)?;
 
         let clip = Clip {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: ref_path,
             clipping_mode: ClippingMode::Hard,
             clip_overlapping_reads: true,
@@ -2233,12 +2355,16 @@ mod tests {
         Ok(())
     }
 
+    /// Build a `RawRecord` from `fgumi_raw_bam::SamBuilder` for test use.
+    fn build_raw_record(b: &mut fgumi_raw_bam::SamBuilder) -> RawRecord {
+        b.build()
+    }
+
     #[test]
     fn test_clip_processed_batch_memory_estimate() {
-        use crate::sam::builder::RecordBuilder;
-        use noodles::sam::alignment::record_buf::RecordBuf;
-
-        let record = RecordBuilder::new().sequence("ACGT").qualities(&[30, 30, 30, 30]).build();
+        let record = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new().sequence(b"ACGT").qualities(&[30, 30, 30, 30]),
+        );
         let mut records = Vec::with_capacity(10);
         records.push(record);
 
@@ -2250,11 +2376,11 @@ mod tests {
         };
 
         let estimate = batch.estimate_heap_size();
-        // Should include Vec overhead for capacity * size_of::<RecordBuf>()
-        let vec_overhead = 10 * std::mem::size_of::<RecordBuf>();
+        // Should include Vec overhead for capacity * size_of::<RawRecord>()
+        let vec_overhead = 10 * std::mem::size_of::<RawRecord>();
         assert!(
             estimate >= vec_overhead,
-            "estimate {estimate} should include Vec<RecordBuf> overhead {vec_overhead}"
+            "estimate {estimate} should include Vec<RawRecord> overhead {vec_overhead}"
         );
     }
 
@@ -2267,7 +2393,11 @@ mod tests {
         read_two_three_prime: usize,
     ) -> Clip {
         Clip {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: PathBuf::from("reference.fa"),
             clipping_mode: ClippingMode::Soft,
             clip_overlapping_reads: false,
@@ -2290,23 +2420,23 @@ mod tests {
 
     #[test]
     fn test_clip_fragment_with_metrics() {
-        use crate::clipper::{ClippingMode, SamRecordClipper};
         use crate::metrics::clip::ClippingMetricsCollection;
-        use crate::sam::builder::RecordBuilder;
 
         let clip = make_clip(3, 2, 0, 0);
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawRecordClipper::new(ClippingMode::Soft);
         let mut metrics = ClippingMetricsCollection::new();
 
         // Build a mapped fragment record with 20M CIGAR
-        let mut record = RecordBuilder::new()
-            .sequence("ACGTACGTACGTACGTACGT")
-            .qualities(&[30; 20])
-            .cigar("20M")
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .build();
+        // SamBuilder pos is 0-based; alignment_start 100 → pos 99
+        let mut record = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new()
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4]) // 20M
+                .ref_id(0)
+                .pos(99) // 0-based (alignment_start 100)
+                .mapq(60),
+        );
 
         clip.clip_fragment(&clipper, &mut record, Some(&mut metrics))
             .expect("clip_fragment should succeed");
@@ -2321,24 +2451,22 @@ mod tests {
 
     #[test]
     fn test_clip_fragment_no_clipping_with_metrics() {
-        use crate::clipper::{ClippingMode, SamRecordClipper};
         use crate::metrics::clip::ClippingMetricsCollection;
-        use crate::sam::builder::RecordBuilder;
 
         let clip = make_clip(0, 0, 0, 0);
-        // Need at least one clipping option active for the Clip struct to be valid,
-        // but clip_fragment only uses read_one_*; we just test the method directly.
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        // clip_fragment only uses read_one_*; we just test the method directly.
+        let clipper = RawRecordClipper::new(ClippingMode::Soft);
         let mut metrics = ClippingMetricsCollection::new();
 
-        let mut record = RecordBuilder::new()
-            .sequence("ACGTACGTACGT")
-            .qualities(&[30; 12])
-            .cigar("12M")
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .build();
+        let mut record = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new()
+                .sequence(b"ACGTACGTACGT")
+                .qualities(&[30; 12])
+                .cigar_ops(&[12u32 << 4]) // 12M
+                .ref_id(0)
+                .pos(99) // 0-based (alignment_start 100)
+                .mapq(60),
+        );
 
         clip.clip_fragment(&clipper, &mut record, Some(&mut metrics))
             .expect("clip_fragment should succeed");
@@ -2351,46 +2479,45 @@ mod tests {
 
     #[test]
     fn test_clip_pair_with_metrics() {
-        use crate::clipper::{ClippingMode, SamRecordClipper};
         use crate::metrics::clip::ClippingMetricsCollection;
-        use crate::sam::builder::RecordBuilder;
+        use fgumi_raw_bam::flags as raw_flags;
 
         let clip = make_clip(2, 1, 1, 2);
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawRecordClipper::new(ClippingMode::Soft);
         let mut metrics = ClippingMetricsCollection::new();
 
         // R1: first segment, forward strand, 20M
-        let mut r1 = RecordBuilder::new()
-            .name("pair1")
-            .sequence("ACGTACGTACGTACGTACGT")
-            .qualities(&[30; 20])
-            .cigar("20M")
-            .paired(true)
-            .first_segment(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .template_length(120)
-            .build();
+        // SamBuilder pos is 0-based; alignment_start 100 → pos 99
+        let mut r1 = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"pair1")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4]) // 20M
+                .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(99) // 0-based (alignment_start 100)
+                .mapq(60)
+                .mate_ref_id(0)
+                .mate_pos(199) // 0-based (mate_alignment_start 200)
+                .template_length(120),
+        );
 
         // R2: last segment, reverse strand, 20M (non-overlapping)
-        let mut r2 = RecordBuilder::new()
-            .name("pair1")
-            .sequence("ACGTACGTACGTACGTACGT")
-            .qualities(&[30; 20])
-            .cigar("20M")
-            .paired(true)
-            .first_segment(false)
-            .reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .template_length(-120)
-            .build();
+        let mut r2 = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"pair1")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4]) // 20M
+                .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+                .ref_id(0)
+                .pos(199) // 0-based (alignment_start 200)
+                .mapq(60)
+                .mate_ref_id(0)
+                .mate_pos(99) // 0-based (mate_alignment_start 100)
+                .template_length(-120),
+        );
 
         let (overlap, extend) = clip
             .clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics))
@@ -2412,48 +2539,46 @@ mod tests {
 
     #[test]
     fn test_clip_pair_with_metrics_swapped_flags() {
-        use crate::clipper::{ClippingMode, SamRecordClipper};
         use crate::metrics::clip::ClippingMetricsCollection;
-        use crate::sam::builder::RecordBuilder;
+        use fgumi_raw_bam::flags as raw_flags;
 
         // Test the !is_r1_first and !is_r2_last branches:
         // r1 is NOT first_segment, r2 is NOT last_segment
         let clip = make_clip(2, 1, 1, 2);
-        let clipper = SamRecordClipper::new(ClippingMode::Soft);
+        let clipper = RawRecordClipper::new(ClippingMode::Soft);
         let mut metrics = ClippingMetricsCollection::new();
 
         // r1: last segment (not first)
-        let mut r1 = RecordBuilder::new()
-            .name("pair1")
-            .sequence("ACGTACGTACGTACGTACGT")
-            .qualities(&[30; 20])
-            .cigar("20M")
-            .paired(true)
-            .first_segment(false)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .template_length(120)
-            .build();
+        let mut r1 = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"pair1")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4]) // 20M
+                .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT)
+                .ref_id(0)
+                .pos(99) // 0-based (alignment_start 100)
+                .mapq(60)
+                .mate_ref_id(0)
+                .mate_pos(199) // 0-based (mate_alignment_start 200)
+                .template_length(120),
+        );
 
         // r2: first segment (not last)
-        let mut r2 = RecordBuilder::new()
-            .name("pair1")
-            .sequence("ACGTACGTACGTACGTACGT")
-            .qualities(&[30; 20])
-            .cigar("20M")
-            .paired(true)
-            .first_segment(true)
-            .reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .template_length(-120)
-            .build();
+        let mut r2 = build_raw_record(
+            fgumi_raw_bam::SamBuilder::new()
+                .read_name(b"pair1")
+                .sequence(b"ACGTACGTACGTACGTACGT")
+                .qualities(&[30; 20])
+                .cigar_ops(&[20u32 << 4]) // 20M
+                .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::REVERSE)
+                .ref_id(0)
+                .pos(199) // 0-based (alignment_start 200)
+                .mapq(60)
+                .mate_ref_id(0)
+                .mate_pos(99) // 0-based (mate_alignment_start 100)
+                .template_length(-120),
+        );
 
         let (overlap, extend) = clip
             .clip_pair(&clipper, &mut r1, &mut r2, Some(&mut metrics))

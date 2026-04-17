@@ -9,7 +9,7 @@
 //!    (min reads, max read error rate, max no-calls, min mean quality)
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
-use crate::bam_io::create_bam_reader_for_pipeline_with_opts;
+use crate::bam_io::create_bam_reader_for_pipeline;
 use crate::consensus_filter::{
     FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
     check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats, filter_duplex_read,
@@ -344,10 +344,7 @@ impl Command for Filter {
         }
 
         // Open input using streaming-capable reader for pipeline use
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
@@ -637,9 +634,7 @@ impl Filter {
             let mut bases_masked = 0u64;
 
             for template in batch {
-                let mut template_records: Vec<RawRecord> = template
-                    .into_raw_records()
-                    .ok_or_else(|| io::Error::other("template has no raw records"))?;
+                let mut template_records: Vec<RawRecord> = template.into_records();
                 let mut pass_map: AHashMap<usize, bool> = AHashMap::new();
 
                 for (idx, record) in template_records.iter_mut().enumerate() {
@@ -1094,15 +1089,14 @@ impl Filter {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
-    use noodles::sam::alignment::io::Write as AlignmentWrite;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
 
     /// Helper function to create a Filter command with commonly used test defaults.
     fn create_filter_with_paths(input: PathBuf, output: PathBuf, reference: PathBuf) -> Filter {
         Filter {
-            io: BamIoOptions::new(input, output),
+            io: BamIoOptions { input, output, async_reader: false },
             reference: Some(reference),
             min_reads: vec![1],
             max_read_error_rate: vec![0.025],
@@ -1166,7 +1160,11 @@ mod tests {
     #[test]
     fn test_default_filter_parameters() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1198,7 +1196,11 @@ mod tests {
     #[test]
     fn test_multithreaded_filter_configuration() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1228,7 +1230,11 @@ mod tests {
     #[test]
     fn test_filter_with_optional_outputs() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1260,7 +1266,11 @@ mod tests {
     #[test]
     fn test_validate_parameters_too_many_values() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![1, 2, 3, 4], // Too many values
             max_read_error_rate: vec![0.1],
@@ -1290,7 +1300,11 @@ mod tests {
     #[test]
     fn test_validate_parameters_invalid_stringency_order() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![1, 10], // Invalid: AB > CC
             max_read_error_rate: vec![0.1],
@@ -1387,8 +1401,6 @@ mod tests {
     }
 
     // Integration tests for filtering logic
-
-    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
 
     /// Creates a raw BAM test record for filtering tests.
     ///
@@ -1678,13 +1690,11 @@ mod tests {
     fn test_template_passes_all_pass() {
         use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
-        use fgumi_raw_bam::RawRecord;
 
         let r1 = create_r1_record(b"ACGT", &[30, 30, 30, 30]);
         let r2 = create_r2_record(b"GGGG", &[30, 30, 30, 30]);
 
-        let records: Vec<RawRecord> =
-            vec![RawRecord::from(r1.into_inner()), RawRecord::from(r2.into_inner())];
+        let records = vec![r1, r2];
         let mut pass_map = AHashMap::new();
         pass_map.insert(0, true);
         pass_map.insert(1, true);
@@ -1696,13 +1706,11 @@ mod tests {
     fn test_template_passes_one_fails() {
         use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
-        use fgumi_raw_bam::RawRecord;
 
         let r1 = create_r1_record(b"ACGT", &[30, 30, 30, 30]);
         let r2 = create_r2_record(b"GGGG", &[30, 30, 30, 30]);
 
-        let records: Vec<RawRecord> =
-            vec![RawRecord::from(r1.into_inner()), RawRecord::from(r2.into_inner())];
+        let records = vec![r1, r2];
         let mut pass_map = AHashMap::new();
         pass_map.insert(0, true);
         pass_map.insert(1, false); // One fails
@@ -1742,7 +1750,11 @@ mod tests {
     fn test_validate_max_no_call_fraction_integer() {
         // When max_no_call_fraction >= 1.0, it should be an integer
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1778,7 +1790,11 @@ mod tests {
     fn test_validate_max_no_call_fraction_integer_valid() {
         // When max_no_call_fraction >= 1.0 and IS an integer, it should pass
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1812,7 +1828,11 @@ mod tests {
     #[test]
     fn test_filter_with_rejects_output() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1843,7 +1863,11 @@ mod tests {
     #[test]
     fn test_filter_with_stats_output() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1874,7 +1898,11 @@ mod tests {
     #[test]
     fn test_filter_multithreaded() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1904,7 +1932,11 @@ mod tests {
     #[test]
     fn test_filter_require_single_strand_agreement() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1934,7 +1966,11 @@ mod tests {
     #[test]
     fn test_filter_by_read_not_template() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1964,7 +2000,11 @@ mod tests {
     #[test]
     fn test_filter_reverse_per_base_tags_disabled() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -1994,7 +2034,11 @@ mod tests {
     #[test]
     fn test_filter_high_min_base_quality() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2024,7 +2068,11 @@ mod tests {
     #[test]
     fn test_filter_with_min_mean_base_quality() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2054,7 +2102,11 @@ mod tests {
     #[test]
     fn test_filter_strict_error_rates() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.01],
@@ -2086,7 +2138,11 @@ mod tests {
     #[test]
     fn test_filter_lenient_error_rates() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.5],
@@ -2118,7 +2174,11 @@ mod tests {
     #[test]
     fn test_filter_high_min_reads_threshold() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![10],
             max_read_error_rate: vec![0.1],
@@ -2149,7 +2209,11 @@ mod tests {
     fn test_filter_duplex_different_thresholds() {
         // Test duplex with different thresholds for CC, AB, BA
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 3, 3], // CC=5, AB=3, BA=3
             max_read_error_rate: vec![0.05, 0.1, 0.1],
@@ -2182,7 +2246,11 @@ mod tests {
     #[test]
     fn test_filter_all_optional_outputs() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2214,7 +2282,11 @@ mod tests {
     #[test]
     fn test_filter_zero_no_call_fraction() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2244,7 +2316,11 @@ mod tests {
     #[test]
     fn test_filter_low_min_base_quality() {
         let filter = Filter {
-            io: BamIoOptions::new(PathBuf::from("input.bam"), PathBuf::from("output.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("input.bam"),
+                output: PathBuf::from("output.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![3],
             max_read_error_rate: vec![0.1],
@@ -2275,7 +2351,6 @@ mod tests {
     // Integration Tests for Filter Command (execute())
     // ========================================================================
 
-    use crate::sam::builder::SamBuilder;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -2288,6 +2363,12 @@ mod tests {
         writeln!(file, "{}", "A".repeat(1000)).expect("failed to write FASTA sequence");
         file.flush().expect("failed to flush reference file");
         ref_path
+    }
+
+    /// Convert a raw BAM record to a `RecordBuf` using the default (empty) header.
+    fn to_record_buf_default(raw: RawRecord) -> RecordBuf {
+        fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf should succeed in test")
     }
 
     /// Read all records from a BAM file
@@ -2305,35 +2386,63 @@ mod tests {
         Ok(records)
     }
 
-    /// Creates a consensus read with simplex tags for filtering tests
+    /// Helper: build a minimal chr1 noodles `Header` for use with the noodles BAM writer.
+    fn test_bam_header() -> noodles::sam::Header {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+        noodles::sam::Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero")),
+            )
+            .build()
+    }
+
+    /// Write a list of raw records as a BAM file with a single chr1 reference.
+    fn write_test_bam(path: &std::path::Path, records: Vec<RawRecord>) -> Result<()> {
+        use noodles::bam;
+        use noodles::sam::alignment::io::Write as AlignmentWrite;
+
+        let header = test_bam_header();
+        let mut writer = bam::io::writer::Builder.build_from_path(path)?;
+        writer.write_header(&header)?;
+        for rec in records {
+            writer.write_alignment_record(&header, &to_record_buf_default(rec))?;
+        }
+        Ok(())
+    }
+
+    /// Creates a simplex consensus raw record for filtering tests.
     #[allow(clippy::too_many_arguments)]
     fn create_simplex_consensus_record(
-        builder: &mut SamBuilder,
         name: &str,
-        pos: usize,
-        bases: &str,
+        pos: i32,
+        bases: &[u8],
         quals: &[u8],
         read_depth: u8,
         read_error: f32,
         base_depths: &[i16],
         base_errors: &[i16],
-    ) {
-        let _ = builder
-            .add_frag()
-            .name(name)
-            .bases(bases)
-            .quals(quals)
-            .contig(0) // chr1
-            .start(pos)
-            .attr("cD", read_depth)
-            .attr("cM", read_depth)
-            .attr("cE", read_error)
-            .attr("cd", base_depths.to_vec()) // Vec<i16> converts to Array
-            .attr("ce", base_errors.to_vec()) // Vec<i16> converts to Array
-            .build();
+    ) -> RawRecord {
+        let n = bases.len() as u32;
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .ref_id(0)
+            .pos(pos - 1) // 1-based → 0-based
+            .mapq(60)
+            .cigar_ops(&[n << 4]) // nM
+            .sequence(bases)
+            .qualities(quals);
+        b.add_int_tag(b"cD", i32::from(read_depth));
+        b.add_int_tag(b"cM", i32::from(read_depth));
+        b.add_float_tag(b"cE", read_error);
+        b.add_array_i16(b"cd", base_depths);
+        b.add_array_i16(b"ce", base_errors);
+        b.build()
     }
 
-    /// Helper to get read name as string
+    /// Helper to get read name as string from a `RecordBuf`.
     fn get_read_name(record: &RecordBuf) -> Option<String> {
         record.name().map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
     }
@@ -2351,7 +2460,11 @@ mod tests {
         min_base_quality: Option<u8>,
     ) -> Result<()> {
         let cmd = Filter {
-            io: BamIoOptions::new(input.to_path_buf(), output.to_path_buf()),
+            io: BamIoOptions {
+                input: input.to_path_buf(),
+                output: output.to_path_buf(),
+                async_reader: false,
+            },
             reference: Some(reference.to_path_buf()),
             min_reads,
             max_read_error_rate,
@@ -2385,48 +2498,42 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         // Create test BAM with consensus reads
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Read 1: High depth, low error - should pass
-        create_simplex_consensus_record(
-            &mut builder,
-            "read1",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,   // depth = 10
-            0.01, // error = 1%
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0], // no errors
-        );
-
-        // Read 2: Low depth - should be filtered
-        create_simplex_consensus_record(
-            &mut builder,
-            "read2",
-            200,
-            "AAAA",
-            &[30, 30, 30, 30],
-            2, // depth = 2 (below threshold of 5)
-            0.01,
-            &[2, 2, 2, 2],
-            &[0, 0, 0, 0],
-        );
-
-        // Read 3: High error rate - should be filtered
-        create_simplex_consensus_record(
-            &mut builder,
-            "read3",
-            300,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.5, // error = 50% (above threshold of 10%)
-            &[10, 10, 10, 10],
-            &[5, 5, 5, 5], // 50% error at each position
-        );
-
-        builder.write(&input_path)?;
+        let records = vec![
+            // Read 1: High depth, low error - should pass
+            create_simplex_consensus_record(
+                "read1",
+                100,
+                b"AAAA",
+                &[30, 30, 30, 30],
+                10,   // depth = 10
+                0.01, // error = 1%
+                &[10, 10, 10, 10],
+                &[0, 0, 0, 0],
+            ),
+            // Read 2: Low depth - should be filtered
+            create_simplex_consensus_record(
+                "read2",
+                200,
+                b"AAAA",
+                &[30, 30, 30, 30],
+                2, // depth = 2 (below threshold of 5)
+                0.01,
+                &[2, 2, 2, 2],
+                &[0, 0, 0, 0],
+            ),
+            // Read 3: High error rate - should be filtered
+            create_simplex_consensus_record(
+                "read3",
+                300,
+                b"AAAA",
+                &[30, 30, 30, 30],
+                10,
+                0.5, // error = 50% (above threshold of 10%)
+                &[10, 10, 10, 10],
+                &[5, 5, 5, 5], // 50% error at each position
+            ),
+        ];
+        write_test_bam(&input_path, records)?;
 
         // Run filter
         run_filter_command(
@@ -2456,26 +2563,28 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
         // Create a read with one low-quality base that should be masked
         // Use 10 bases so 1 masked = 10% which is below max_no_call_fraction of 20%
-        create_simplex_consensus_record(
-            &mut builder,
-            "read1",
-            100,
-            "AAAAAAAAAA",                             // 10 bases
-            &[30, 5, 30, 30, 30, 30, 30, 30, 30, 30], // position 1 has low quality
-            10,
-            0.01,
-            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
-            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![create_simplex_consensus_record(
+                "read1",
+                100,
+                b"AAAAAAAAAA",                            // 10 bases
+                &[30, 5, 30, 30, 30, 30, 30, 30, 30, 30], // position 1 has low quality
+                10,
+                0.01,
+                &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
+                &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            )],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![0.5],
@@ -2524,26 +2633,23 @@ mod tests {
         let output_multi = dir.path().join("output_multi.bam");
 
         // Create test data with multiple reads
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        for i in 0..50 {
-            let depth: u8 = if i % 3 == 0 { 3 } else { 10 }; // Some reads below min_reads
-            let error: f32 = if i % 5 == 0 { 0.3 } else { 0.01 }; // Some reads with high error
-
-            create_simplex_consensus_record(
-                &mut builder,
-                &format!("read{i}"),
-                (i * 10 + 100) % 800 + 1, // Keep positions within 1-800 range
-                "AAAA",
-                &[30, 30, 30, 30],
-                depth,
-                error,
-                &[depth as i16, depth as i16, depth as i16, depth as i16],
-                &[0, 0, 0, 0],
-            );
-        }
-
-        builder.write(&input_path)?;
+        let records: Vec<RawRecord> = (0..50)
+            .map(|i| {
+                let depth: u8 = if i % 3 == 0 { 3 } else { 10 };
+                let error: f32 = if i % 5 == 0 { 0.3 } else { 0.01 };
+                create_simplex_consensus_record(
+                    &format!("read{i}"),
+                    (i * 10 + 100) % 800 + 1,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    depth,
+                    error,
+                    &[depth as i16; 4],
+                    &[0, 0, 0, 0],
+                )
+            })
+            .collect();
+        write_test_bam(&input_path, records)?;
 
         // Run with single thread
         run_filter_command(
@@ -2601,38 +2707,40 @@ mod tests {
         let output_path = dir.path().join("output.bam");
         let rejects_path = dir.path().join("rejects.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Read that passes
-        create_simplex_consensus_record(
-            &mut builder,
-            "pass",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        // Read that fails (low depth)
-        create_simplex_consensus_record(
-            &mut builder,
-            "fail",
-            200,
-            "AAAA",
-            &[30, 30, 30, 30],
-            2,
-            0.01,
-            &[2, 2, 2, 2],
-            &[0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![
+                // Read that passes
+                create_simplex_consensus_record(
+                    "pass",
+                    100,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                ),
+                // Read that fails (low depth)
+                create_simplex_consensus_record(
+                    "fail",
+                    200,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    2,
+                    0.01,
+                    &[2, 2, 2, 2],
+                    &[0, 0, 0, 0],
+                ),
+            ],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -2677,38 +2785,40 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Read 1: Low quality bases will be masked, but not too many Ns
-        create_simplex_consensus_record(
-            &mut builder,
-            "pass",
-            100,
-            "AAAAAAAAAA",                             // 10 bases
-            &[30, 30, 5, 30, 30, 30, 30, 30, 30, 30], // 1 low quality = 10% masked
-            10,
-            0.01,
-            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
-            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        );
-
-        // Read 2: Many low quality bases - will have too many Ns after masking
-        create_simplex_consensus_record(
-            &mut builder,
-            "fail",
-            200,
-            "AAAAAAAAAA",                         // 10 bases
-            &[5, 5, 5, 5, 5, 30, 30, 30, 30, 30], // 5 low quality = 50% will be masked
-            10,
-            0.01,
-            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
-            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![
+                // Read 1: Low quality bases will be masked, but not too many Ns
+                create_simplex_consensus_record(
+                    "pass",
+                    100,
+                    b"AAAAAAAAAA",                            // 10 bases
+                    &[30, 30, 5, 30, 30, 30, 30, 30, 30, 30], // 1 low quality = 10% masked
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
+                    &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ),
+                // Read 2: Many low quality bases - will have too many Ns after masking
+                create_simplex_consensus_record(
+                    "fail",
+                    200,
+                    b"AAAAAAAAAA",                        // 10 bases
+                    &[5, 5, 5, 5, 5, 30, 30, 30, 30, 30], // 5 low quality = 50% will be masked
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
+                    &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ),
+            ],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -2747,38 +2857,40 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Read 1: High quality (mean = 30)
-        create_simplex_consensus_record(
-            &mut builder,
-            "high_qual",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        // Read 2: Low quality (mean = 15)
-        create_simplex_consensus_record(
-            &mut builder,
-            "low_qual",
-            200,
-            "AAAA",
-            &[15, 15, 15, 15],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![
+                // Read 1: High quality (mean = 30)
+                create_simplex_consensus_record(
+                    "high_qual",
+                    100,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                ),
+                // Read 2: Low quality (mean = 15)
+                create_simplex_consensus_record(
+                    "low_qual",
+                    200,
+                    b"AAAA",
+                    &[15, 15, 15, 15],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                ),
+            ],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -2810,13 +2922,12 @@ mod tests {
         Ok(())
     }
 
-    /// Creates a duplex consensus read with AB/BA tags for filtering tests
+    /// Creates a duplex consensus raw record with AB/BA tags for filtering tests.
     #[allow(clippy::too_many_arguments)]
     fn create_duplex_consensus_record(
-        builder: &mut SamBuilder,
         name: &str,
-        pos: usize,
-        bases: &str,
+        pos: i32,
+        bases: &[u8],
         quals: &[u8],
         ab_depth: u8,
         ba_depth: u8,
@@ -2824,27 +2935,30 @@ mod tests {
         ba_error: f32,
         ab_base_depths: &[i16],
         ba_base_depths: &[i16],
-    ) {
-        let _ = builder
-            .add_frag()
-            .name(name)
-            .bases(bases)
-            .quals(quals)
-            .contig(0) // chr1
-            .start(pos)
-            // Per-read duplex tags
-            .attr("aD", ab_depth)
-            .attr("bD", ba_depth)
-            .attr("aM", ab_depth)
-            .attr("bM", ba_depth)
-            .attr("aE", ab_error)
-            .attr("bE", ba_error)
-            // Per-base duplex tags
-            .attr("ad", ab_base_depths.to_vec())
-            .attr("bd", ba_base_depths.to_vec())
-            .attr("ae", vec![0i16; bases.len()]) // no errors
-            .attr("be", vec![0i16; bases.len()]) // no errors
-            .build();
+    ) -> RawRecord {
+        let n = bases.len() as u32;
+        let zero_errors = vec![0i16; bases.len()];
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .ref_id(0)
+            .pos(pos - 1) // 1-based → 0-based
+            .mapq(60)
+            .cigar_ops(&[n << 4]) // nM
+            .sequence(bases)
+            .qualities(quals);
+        // Per-read duplex tags
+        b.add_int_tag(b"aD", i32::from(ab_depth));
+        b.add_int_tag(b"bD", i32::from(ba_depth));
+        b.add_int_tag(b"aM", i32::from(ab_depth));
+        b.add_int_tag(b"bM", i32::from(ba_depth));
+        b.add_float_tag(b"aE", ab_error);
+        b.add_float_tag(b"bE", ba_error);
+        // Per-base duplex tags
+        b.add_array_i16(b"ad", ab_base_depths);
+        b.add_array_i16(b"bd", ba_base_depths);
+        b.add_array_i16(b"ae", &zero_errors);
+        b.add_array_i16(b"be", &zero_errors);
+        b.build()
     }
 
     #[test]
@@ -2854,58 +2968,58 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Duplex read 1: Both strands have good depth - should pass
-        create_duplex_consensus_record(
-            &mut builder,
-            "duplex_pass",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            10, // AB and BA depths
-            0.01,
-            0.01, // AB and BA error rates
-            &[10, 10, 10, 10],
-            &[10, 10, 10, 10],
-        );
-
-        // Duplex read 2: AB strand has low depth - should fail with 3-value thresholds
-        create_duplex_consensus_record(
-            &mut builder,
-            "duplex_fail_ab",
-            200,
-            "AAAA",
-            &[30, 30, 30, 30],
-            2,
-            10, // AB low, BA good
-            0.01,
-            0.01,
-            &[2, 2, 2, 2],
-            &[10, 10, 10, 10],
-        );
-
-        // Duplex read 3: BA strand has low depth - should fail
-        create_duplex_consensus_record(
-            &mut builder,
-            "duplex_fail_ba",
-            300,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            2, // AB good, BA low
-            0.01,
-            0.01,
-            &[10, 10, 10, 10],
-            &[2, 2, 2, 2],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![
+                // Duplex read 1: Both strands have good depth - should pass
+                create_duplex_consensus_record(
+                    "duplex_pass",
+                    100,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    10, // AB and BA depths
+                    0.01,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[10, 10, 10, 10],
+                ),
+                // Duplex read 2: AB strand has low depth - should fail
+                create_duplex_consensus_record(
+                    "duplex_fail_ab",
+                    200,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    2,
+                    10, // AB low, BA good
+                    0.01,
+                    0.01,
+                    &[2, 2, 2, 2],
+                    &[10, 10, 10, 10],
+                ),
+                // Duplex read 3: BA strand has low depth - should fail
+                create_duplex_consensus_record(
+                    "duplex_fail_ba",
+                    300,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    2, // AB good, BA low
+                    0.01,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[2, 2, 2, 2],
+                ),
+            ],
+        )?;
 
         // Use 3-value thresholds: duplex=5, AB=5, BA=5 (must be high-to-low)
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds (duplex >= AB >= BA)
             max_read_error_rate: vec![0.1],
@@ -2944,40 +3058,42 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Create paired reads with same name but different qualities
-        // In non-template mode, each read is filtered independently
-        create_simplex_consensus_record(
-            &mut builder,
-            "pair1",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        // Same name but low depth - would fail individually
-        create_simplex_consensus_record(
-            &mut builder,
-            "pair1",
-            200,
-            "AAAA",
-            &[30, 30, 30, 30],
-            2, // low depth
-            0.01,
-            &[2, 2, 2, 2],
-            &[0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![
+                // Create paired reads with same name but different qualities
+                // In non-template mode, each read is filtered independently
+                create_simplex_consensus_record(
+                    "pair1",
+                    100,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                ),
+                // Same name but low depth - would fail individually
+                create_simplex_consensus_record(
+                    "pair1",
+                    200,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    2, // low depth
+                    0.01,
+                    &[2, 2, 2, 2],
+                    &[0, 0, 0, 0],
+                ),
+            ],
+        )?;
 
         // With filter_by_template: false, reads are filtered independently
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3018,36 +3134,38 @@ mod tests {
         let output_path = dir.path().join("output.bam");
         let stats_path = dir.path().join("stats.txt");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        create_simplex_consensus_record(
-            &mut builder,
-            "pass1",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        create_simplex_consensus_record(
-            &mut builder,
-            "fail1",
-            200,
-            "AAAA",
-            &[30, 30, 30, 30],
-            2,
-            0.01,
-            &[2, 2, 2, 2],
-            &[0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![
+                create_simplex_consensus_record(
+                    "pass1",
+                    100,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                ),
+                create_simplex_consensus_record(
+                    "fail1",
+                    200,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    2,
+                    0.01,
+                    &[2, 2, 2, 2],
+                    &[0, 0, 0, 0],
+                ),
+            ],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3096,32 +3214,32 @@ mod tests {
         let output_multi = dir.path().join("output_multi.bam");
 
         // Create enough templates to trigger batch processing
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Create 125 single-end reads to ensure batching kicks in
         // 125 = 2 full batches of 50 + 25 remaining (tests both batch paths)
-        for i in 0..125 {
-            let depth: u8 = if i % 4 == 0 { 3 } else { 10 };
-            let error: f32 = if i % 7 == 0 { 0.25 } else { 0.02 };
-
-            create_simplex_consensus_record(
-                &mut builder,
-                &format!("read{i}"),
-                (i * 2 + 10) % 900 + 1,
-                "AAAAAAAA",
-                &[30, 30, 30, 30, 30, 30, 30, 30],
-                depth,
-                error,
-                &[depth as i16; 8],
-                &[0; 8],
-            );
-        }
-
-        builder.write(&input_path)?;
+        let records: Vec<RawRecord> = (0..125)
+            .map(|i| {
+                let depth: u8 = if i % 4 == 0 { 3 } else { 10 };
+                let error: f32 = if i % 7 == 0 { 0.25 } else { 0.02 };
+                create_simplex_consensus_record(
+                    &format!("read{i}"),
+                    (i * 2 + 10) % 900 + 1,
+                    b"AAAAAAAA",
+                    &[30, 30, 30, 30, 30, 30, 30, 30],
+                    depth,
+                    error,
+                    &[depth as i16; 8],
+                    &[0; 8],
+                )
+            })
+            .collect();
+        write_test_bam(&input_path, records)?;
 
         // Run single-threaded
         let cmd_single = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_single.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_single.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3148,7 +3266,11 @@ mod tests {
 
         // Run multi-threaded with 4 threads
         let cmd_multi = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_multi.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_multi.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3197,25 +3319,27 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
         // Create a read that matches the reference (all A's)
-        create_simplex_consensus_record(
-            &mut builder,
-            "read1",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![create_simplex_consensus_record(
+                "read1",
+                100,
+                b"AAAA",
+                &[30, 30, 30, 30],
+                10,
+                0.01,
+                &[10, 10, 10, 10],
+                &[0, 0, 0, 0],
+            )],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -3255,25 +3379,27 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
         // Create a read with consensus tags
-        create_simplex_consensus_record(
-            &mut builder,
-            "read1",
-            100,
-            "AAAA",
-            &[30, 30, 30, 30],
-            10,
-            0.01,
-            &[10, 10, 10, 10],
-            &[0, 0, 0, 0],
-        );
-
-        builder.write(&input_path)?;
+        write_test_bam(
+            &input_path,
+            vec![create_simplex_consensus_record(
+                "read1",
+                100,
+                b"AAAA",
+                &[30, 30, 30, 30],
+                10,
+                0.01,
+                &[10, 10, 10, 10],
+                &[0, 0, 0, 0],
+            )],
+        )?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![1],
             max_read_error_rate: vec![1.0],
@@ -3312,29 +3438,31 @@ mod tests {
         let output_path = dir.path().join("output.bam");
         let rejects_path = dir.path().join("rejects.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
         // Create 75 reads (1 batch of 50 + 25 remaining) with some that will fail
-        for i in 0..75 {
-            let depth: u8 = if i % 3 == 0 { 2 } else { 10 }; // 1/3 will fail
-            create_simplex_consensus_record(
-                &mut builder,
-                &format!("read{i}"),
-                (i * 5 + 10) % 900 + 1,
-                "AAAA",
-                &[30, 30, 30, 30],
-                depth,
-                0.01,
-                &[depth as i16; 4],
-                &[0; 4],
-            );
-        }
-
-        builder.write(&input_path)?;
+        let records: Vec<RawRecord> = (0..75)
+            .map(|i| {
+                let depth: u8 = if i % 3 == 0 { 2 } else { 10 }; // 1/3 will fail
+                create_simplex_consensus_record(
+                    &format!("read{i}"),
+                    (i * 5 + 10) % 900 + 1,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    depth,
+                    0.01,
+                    &[depth as i16; 4],
+                    &[0; 4],
+                )
+            })
+            .collect();
+        write_test_bam(&input_path, records)?;
 
         // Run multi-threaded with rejects output
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3378,33 +3506,34 @@ mod tests {
         let output_single = dir.path().join("output_single.bam");
         let output_multi = dir.path().join("output_multi.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
         // Create duplex reads with varying depths
-        for i in 0..50 {
-            let ab_depth: u8 = if i % 3 == 0 { 3 } else { 10 };
-            let ba_depth: u8 = if i % 5 == 0 { 2 } else { 8 };
-
-            create_duplex_consensus_record(
-                &mut builder,
-                &format!("duplex{i}"),
-                (i * 10 + 100) % 800 + 1,
-                "AAAA",
-                &[30, 30, 30, 30],
-                ab_depth,
-                ba_depth,
-                0.01,
-                0.01,
-                &[ab_depth as i16; 4],
-                &[ba_depth as i16; 4],
-            );
-        }
-
-        builder.write(&input_path)?;
+        let records: Vec<RawRecord> = (0..50)
+            .map(|i| {
+                let ab_depth: u8 = if i % 3 == 0 { 3 } else { 10 };
+                let ba_depth: u8 = if i % 5 == 0 { 2 } else { 8 };
+                create_duplex_consensus_record(
+                    &format!("duplex{i}"),
+                    (i * 10 + 100) % 800 + 1,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    ab_depth,
+                    ba_depth,
+                    0.01,
+                    0.01,
+                    &[ab_depth as i16; 4],
+                    &[ba_depth as i16; 4],
+                )
+            })
+            .collect();
+        write_test_bam(&input_path, records)?;
 
         // Run single-threaded
         let cmd_single = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_single.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_single.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA (must be high-to-low)
             max_read_error_rate: vec![0.1],
@@ -3431,7 +3560,11 @@ mod tests {
 
         // Run multi-threaded
         let cmd_multi = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_multi.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_multi.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1],
@@ -3477,32 +3610,28 @@ mod tests {
         let output_path = dir.path().join("output.bam");
         let rejects_path = dir.path().join("rejects.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Create duplex reads that pass
-        for i in 0..5 {
-            create_duplex_consensus_record(
-                &mut builder,
-                &format!("duplex_pass{i}"),
-                100 + i * 10,
-                "AAAA",
-                &[30, 30, 30, 30],
-                10, // AB depth
-                8,  // BA depth
-                0.01,
-                0.01,
-                &[10, 10, 10, 10],
-                &[8, 8, 8, 8],
-            );
-        }
-
+        let mut records: Vec<RawRecord> = (0..5)
+            .map(|i| {
+                create_duplex_consensus_record(
+                    &format!("duplex_pass{i}"),
+                    100 + i * 10,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10, // AB depth
+                    8,  // BA depth
+                    0.01,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[8, 8, 8, 8],
+                )
+            })
+            .collect();
         // Create duplex reads that fail (low AB depth)
-        for i in 0..5 {
+        records.extend((0..5).map(|i| {
             create_duplex_consensus_record(
-                &mut builder,
                 &format!("duplex_fail{i}"),
                 200 + i * 10,
-                "AAAA",
+                b"AAAA",
                 &[30, 30, 30, 30],
                 2, // Low AB depth
                 8,
@@ -3510,13 +3639,16 @@ mod tests {
                 0.01,
                 &[2, 2, 2, 2],
                 &[8, 8, 8, 8],
-            );
-        }
-
-        builder.write(&input_path)?;
+            )
+        }));
+        write_test_bam(&input_path, records)?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds
             max_read_error_rate: vec![0.1],
@@ -3553,23 +3685,17 @@ mod tests {
     #[test]
     fn test_filter_execute_with_supplementary_records() -> Result<()> {
         // Test filtering with supplementary alignments
-        use crate::sam::builder::RecordBuilder;
-
         let dir = TempDir::new()?;
         let ref_path = create_test_reference(&dir);
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
         let rejects_path = dir.path().join("rejects.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Create a template with primary and supplementary reads
         // Primary read that passes
-        create_simplex_consensus_record(
-            &mut builder,
+        let primary = create_simplex_consensus_record(
             "read_with_supp",
             100,
-            "AAAA",
+            b"AAAA",
             &[30, 30, 30, 30],
             10,
             0.01,
@@ -3577,59 +3703,52 @@ mod tests {
             &[0, 0, 0, 0],
         );
 
-        builder.write(&input_path)?;
+        // Passing supplementary for the same template
+        let supp = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"read_with_supp")
+                .ref_id(0)
+                .pos(499)
+                .mapq(60)
+                .flags(flags::SUPPLEMENTARY)
+                .cigar_ops(&[4 << 4]) // 4M
+                .sequence(b"CCCC")
+                .qualities(&[30, 30, 30, 30]);
+            b.add_int_tag(b"cD", 10)
+                .add_int_tag(b"cM", 10)
+                .add_float_tag(b"cE", 0.01_f32)
+                .add_array_i16(b"cd", &[10, 10, 10, 10])
+                .add_array_i16(b"ce", &[0, 0, 0, 0]);
+            b.build()
+        };
 
-        // Now add supplementary alignment manually
-        let bam_path = input_path.clone();
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&bam_path)?;
-        let header = reader.read_header()?;
-        let records: Vec<_> = reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?;
+        // Supplementary that would fail filtering (low depth, high error)
+        let supp_fail = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"read_with_supp")
+                .ref_id(0)
+                .pos(599)
+                .mapq(60)
+                .flags(flags::SUPPLEMENTARY)
+                .cigar_ops(&[4 << 4]) // 4M
+                .sequence(b"GGGG")
+                .qualities(&[30, 30, 30, 30]);
+            b.add_int_tag(b"cD", 2) // Low depth — fails
+                .add_int_tag(b"cM", 2)
+                .add_float_tag(b"cE", 0.5_f32) // High error — fails
+                .add_array_i16(b"cd", &[2, 2, 2, 2])
+                .add_array_i16(b"ce", &[0, 0, 0, 0]);
+            b.build()
+        };
 
-        // Create a new BAM with the primary and a supplementary alignment
-        let mut writer = noodles::bam::io::writer::Builder.build_from_path(&input_path)?;
-        writer.write_header(&header)?;
-
-        // Write original primary
-        for record in &records {
-            writer.write_alignment_record(&header, record)?;
-        }
-
-        // Create and write supplementary for the same template
-        let supp = RecordBuilder::new()
-            .name("read_with_supp")
-            .sequence("CCCC")
-            .qualities(&[30, 30, 30, 30])
-            .supplementary(true)
-            .reference_sequence_id(0)
-            .alignment_start(500)
-            .tag("cD", 10u8)
-            .tag("cM", 10u8)
-            .tag("cE", 0.01f32)
-            .tag("cd", vec![10i16, 10, 10, 10])
-            .tag("ce", vec![0i16, 0, 0, 0])
-            .build();
-        writer.write_alignment_record(&header, &supp)?;
-
-        // Also add a supplementary that would fail filtering
-        let supp_fail = RecordBuilder::new()
-            .name("read_with_supp")
-            .sequence("GGGG")
-            .qualities(&[30, 30, 30, 30])
-            .supplementary(true)
-            .reference_sequence_id(0)
-            .alignment_start(600)
-            .tag("cD", 2u8) // Low depth - fails
-            .tag("cM", 2u8)
-            .tag("cE", 0.5f32) // High error - fails
-            .tag("cd", vec![2i16, 2, 2, 2])
-            .tag("ce", vec![0i16, 0, 0, 0])
-            .build();
-        writer.write_alignment_record(&header, &supp_fail)?;
-
-        drop(writer);
+        write_test_bam(&input_path, vec![primary, supp, supp_fail])?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3667,88 +3786,79 @@ mod tests {
     #[test]
     fn test_filter_execute_parallel_with_supplementary() -> Result<()> {
         // Test supplementary records in parallel template mode
-        use crate::sam::builder::RecordBuilder;
-
         let dir = TempDir::new()?;
         let ref_path = create_test_reference(&dir);
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
         let rejects_path = dir.path().join("rejects.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Create many templates to trigger parallel processing
+        // Create 75 primary reads. For names ending in '0' or '5' (indices 0, 5, 10, ..., 70),
+        // add a passing and a failing supplementary — 15 templates have supplementaries.
+        let mut records: Vec<RawRecord> = Vec::new();
         for i in 0..75 {
-            create_simplex_consensus_record(
-                &mut builder,
+            records.push(create_simplex_consensus_record(
                 &format!("read{i}"),
                 100 + i * 10,
-                "AAAA",
+                b"AAAA",
                 &[30, 30, 30, 30],
                 10,
                 0.01,
                 &[10, 10, 10, 10],
                 &[0, 0, 0, 0],
-            );
-        }
+            ));
 
-        builder.write(&input_path)?;
+            let name = format!("read{i}");
+            if name.ends_with('0') || name.ends_with('5') {
+                // Passing supplementary
+                let supp = {
+                    let mut b = RawSamBuilder::new();
+                    b.read_name(name.as_bytes())
+                        .ref_id(0)
+                        .pos(799)
+                        .mapq(60)
+                        .flags(flags::SUPPLEMENTARY)
+                        .cigar_ops(&[4 << 4])
+                        .sequence(b"CCCC")
+                        .qualities(&[30, 30, 30, 30]);
+                    b.add_int_tag(b"cD", 10)
+                        .add_int_tag(b"cM", 10)
+                        .add_float_tag(b"cE", 0.01_f32)
+                        .add_array_i16(b"cd", &[10, 10, 10, 10])
+                        .add_array_i16(b"ce", &[0, 0, 0, 0]);
+                    b.build()
+                };
+                records.push(supp);
 
-        // Add supplementary alignments
-        let bam_path = input_path.clone();
-        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&bam_path)?;
-        let header = reader.read_header()?;
-        let records: Vec<_> = reader.record_bufs(&header).collect::<std::io::Result<Vec<_>>>()?;
-
-        let mut writer = noodles::bam::io::writer::Builder.build_from_path(&input_path)?;
-        writer.write_header(&header)?;
-
-        for record in &records {
-            writer.write_alignment_record(&header, record)?;
-
-            // Add supplementary for some reads
-            let name = record.name().map(|n| String::from_utf8_lossy(n.as_ref()).to_string());
-            if let Some(ref n) = name {
-                if n.ends_with('0') || n.ends_with('5') {
-                    // Add passing supplementary
-                    let supp = RecordBuilder::new()
-                        .name(n)
-                        .sequence("CCCC")
-                        .qualities(&[30, 30, 30, 30])
-                        .supplementary(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(800)
-                        .tag("cD", 10u8)
-                        .tag("cM", 10u8)
-                        .tag("cE", 0.01f32)
-                        .tag("cd", vec![10i16, 10, 10, 10])
-                        .tag("ce", vec![0i16, 0, 0, 0])
-                        .build();
-                    writer.write_alignment_record(&header, &supp)?;
-
-                    // Add failing supplementary
-                    let supp_fail = RecordBuilder::new()
-                        .name(n)
-                        .sequence("GGGG")
-                        .qualities(&[30, 30, 30, 30])
-                        .supplementary(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(900)
-                        .tag("cD", 2u8) // Fails min_reads
-                        .tag("cM", 2u8)
-                        .tag("cE", 0.5f32)
-                        .tag("cd", vec![2i16, 2, 2, 2])
-                        .tag("ce", vec![0i16, 0, 0, 0])
-                        .build();
-                    writer.write_alignment_record(&header, &supp_fail)?;
-                }
+                // Failing supplementary (low depth)
+                let supp_fail = {
+                    let mut b = RawSamBuilder::new();
+                    b.read_name(name.as_bytes())
+                        .ref_id(0)
+                        .pos(899)
+                        .mapq(60)
+                        .flags(flags::SUPPLEMENTARY)
+                        .cigar_ops(&[4 << 4])
+                        .sequence(b"GGGG")
+                        .qualities(&[30, 30, 30, 30]);
+                    b.add_int_tag(b"cD", 2) // Fails min_reads
+                        .add_int_tag(b"cM", 2)
+                        .add_float_tag(b"cE", 0.5_f32)
+                        .add_array_i16(b"cd", &[2, 2, 2, 2])
+                        .add_array_i16(b"ce", &[0, 0, 0, 0]);
+                    b.build()
+                };
+                records.push(supp_fail);
             }
         }
 
-        drop(writer);
+        write_test_bam(&input_path, records)?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3788,7 +3898,11 @@ mod tests {
     fn test_validate_error_rate_ordering_ab_ba() {
         // Test validation of error rate ordering (AB <= BA)
         let cmd = Filter {
-            io: BamIoOptions::new(PathBuf::from("test.bam"), PathBuf::from("out.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("test.bam"),
+                output: PathBuf::from("out.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1, 0.2, 0.1], // AB (0.2) > BA (0.1) - invalid!
@@ -3823,7 +3937,11 @@ mod tests {
     fn test_validate_base_error_rate_ordering_ab_ba() {
         // Test validation of base error rate ordering (AB <= BA)
         let cmd = Filter {
-            io: BamIoOptions::new(PathBuf::from("test.bam"), PathBuf::from("out.bam")),
+            io: BamIoOptions {
+                input: PathBuf::from("test.bam"),
+                output: PathBuf::from("out.bam"),
+                async_reader: false,
+            },
             reference: Some(PathBuf::from("ref.fa")),
             min_reads: vec![5, 5, 5],
             max_read_error_rate: vec![0.1],
@@ -3862,27 +3980,29 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
         // Create templates to trigger parallel processing
-        for i in 0..75 {
-            create_simplex_consensus_record(
-                &mut builder,
-                &format!("read{i}"),
-                100 + i * 10,
-                "AAAA",
-                &[30, 30, 30, 30],
-                10,
-                0.01,
-                &[10, 10, 10, 10],
-                &[0, 0, 0, 0],
-            );
-        }
-
-        builder.write(&input_path)?;
+        let records: Vec<RawRecord> = (0..75)
+            .map(|i| {
+                create_simplex_consensus_record(
+                    &format!("read{i}"),
+                    100 + i * 10,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    10,
+                    0.01,
+                    &[10, 10, 10, 10],
+                    &[0, 0, 0, 0],
+                )
+            })
+            .collect();
+        write_test_bam(&input_path, records)?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5],
             max_read_error_rate: vec![0.1],
@@ -3921,32 +4041,32 @@ mod tests {
         let input_path = dir.path().join("input.bam");
         let output_path = dir.path().join("output.bam");
 
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-
-        // Create enough duplex records to trigger parallel processing
-        for i in 0..75 {
-            let ab_depth: u8 = if i % 3 == 0 { 3 } else { 10 }; // Some will fail
-            let ba_depth: u8 = if i % 5 == 0 { 2 } else { 8 };
-
-            create_duplex_consensus_record(
-                &mut builder,
-                &format!("duplex{i}"),
-                100 + i * 10,
-                "AAAA",
-                &[30, 30, 30, 30],
-                ab_depth,
-                ba_depth,
-                0.01,
-                0.01,
-                &[ab_depth as i16; 4],
-                &[ba_depth as i16; 4],
-            );
-        }
-
-        builder.write(&input_path)?;
+        let records: Vec<RawRecord> = (0..75)
+            .map(|i| {
+                let ab_depth: u8 = if i % 3 == 0 { 3 } else { 10 }; // Some will fail
+                let ba_depth: u8 = if i % 5 == 0 { 2 } else { 8 };
+                create_duplex_consensus_record(
+                    &format!("duplex{i}"),
+                    100 + i * 10,
+                    b"AAAA",
+                    &[30, 30, 30, 30],
+                    ab_depth,
+                    ba_depth,
+                    0.01,
+                    0.01,
+                    &[ab_depth as i16; 4],
+                    &[ba_depth as i16; 4],
+                )
+            })
+            .collect();
+        write_test_bam(&input_path, records)?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path.clone(), output_path.clone()),
+            io: BamIoOptions {
+                input: input_path.clone(),
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path.clone()),
             min_reads: vec![5, 5, 5], // duplex, AB, BA thresholds
             max_read_error_rate: vec![0.1],
@@ -3998,22 +4118,24 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         // Create simple test data
-        let mut builder = SamBuilder::with_single_ref("chr1", 1000);
-        create_simplex_consensus_record(
-            &mut builder,
+        let records = vec![create_simplex_consensus_record(
             "read1",
             100,
-            "AAAAAAAAAA",
+            b"AAAAAAAAAA",
             &[30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
             10,
             0.01,
             &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
             &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        );
-        builder.write(&input_path)?;
+        )];
+        write_test_bam(&input_path, records)?;
 
         let cmd = Filter {
-            io: BamIoOptions::new(input_path, output_path.clone()),
+            io: BamIoOptions {
+                input: input_path,
+                output: output_path.clone(),
+                async_reader: false,
+            },
             reference: Some(ref_path),
             min_reads: vec![1],
             max_read_error_rate: vec![0.5],
@@ -4051,28 +4173,15 @@ mod tests {
         // Test fraction mode (threshold < 1.0) with max_no_call_fraction = 0.2
         // Build a record with 10 bases, 2 Ns => 0.2 fraction => should pass
         use crate::consensus_filter::FilterThresholds;
-        use crate::sam::builder::RecordBuilder;
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let mut record = RecordBuilder::new()
-            .sequence("AANNTTGGCC") // 10 bases, 2 Ns
-            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
-            .build();
-
-        // Add required cD and cE tags for filter_read to pass
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'E']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
-        );
-
-        let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record)?;
+        let raw_record = {
+            let mut b = RawSamBuilder::new();
+            b.sequence(b"AANNTTGGCC") // 10 bases, 2 Ns
+                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
+            b.add_int_tag(b"cD", 10).add_float_tag(b"cE", 0.01_f32);
+            b.build()
+        };
+        let raw = raw_record.into_inner();
 
         let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
@@ -4094,28 +4203,15 @@ mod tests {
         // Test count mode (threshold >= 1.0) with max_no_call_fraction = 5.0
         // Build a record with 10 bases, 3 Ns => 3 < 5 => should pass
         use crate::consensus_filter::FilterThresholds;
-        use crate::sam::builder::RecordBuilder;
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let mut record = RecordBuilder::new()
-            .sequence("AANNNTTGGC") // 10 bases, 3 Ns
-            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
-            .build();
-
-        // Add required cD and cE tags
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'E']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
-        );
-
-        let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record)?;
+        let raw_record = {
+            let mut b = RawSamBuilder::new();
+            b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
+                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
+            b.add_int_tag(b"cD", 10).add_float_tag(b"cE", 0.01_f32);
+            b.build()
+        };
+        let raw = raw_record.into_inner();
 
         let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
@@ -4137,28 +4233,15 @@ mod tests {
         // Test count mode (threshold >= 1.0) with max_no_call_fraction = 2.0
         // Build a record with 10 bases, 3 Ns => 3 > 2 => should fail
         use crate::consensus_filter::FilterThresholds;
-        use crate::sam::builder::RecordBuilder;
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let mut record = RecordBuilder::new()
-            .sequence("AANNNTTGGC") // 10 bases, 3 Ns
-            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
-            .build();
-
-        // Add required cD and cE tags
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'c', b'E']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
-        );
-
-        let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record)?;
+        let raw_record = {
+            let mut b = RawSamBuilder::new();
+            b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
+                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
+            b.add_int_tag(b"cD", 10).add_float_tag(b"cE", 0.01_f32);
+            b.build()
+        };
+        let raw = raw_record.into_inner();
 
         let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
@@ -4175,44 +4258,21 @@ mod tests {
     fn test_check_duplex_filters_raw_no_call_count_mode() -> Result<()> {
         // Test duplex filtering with count mode for no-call counting
         use crate::consensus_filter::FilterThresholds;
-        use crate::sam::builder::RecordBuilder;
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let mut record = RecordBuilder::new()
-            .sequence("AANNNTTGGC") // 10 bases, 3 Ns
-            .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
-            .build();
-
-        // Add required duplex tags: aD, bD, aE, bE, aM, bM
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'a', b'D']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'b', b'D']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(8u8),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'a', b'E']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'b', b'E']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(0.01f32),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'a', b'M']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(10u8),
-        );
-        record.data_mut().insert(
-            noodles::sam::alignment::record::data::field::Tag::from([b'b', b'M']),
-            noodles::sam::alignment::record_buf::data::field::Value::from(8u8),
-        );
-
-        let header = Header::default();
-        let mut raw = Vec::new();
-        encode_record_buf(&mut raw, &header, &record)?;
+        let raw_record = {
+            let mut b = RawSamBuilder::new();
+            b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
+                .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
+            // Add required duplex tags: aD, bD, aE, bE, aM, bM
+            b.add_int_tag(b"aD", 10)
+                .add_int_tag(b"bD", 8)
+                .add_float_tag(b"aE", 0.01_f32)
+                .add_float_tag(b"bE", 0.01_f32)
+                .add_int_tag(b"aM", 10)
+                .add_int_tag(b"bM", 8);
+            b.build()
+        };
+        let raw = raw_record.into_inner();
 
         let aux = crate::sort::bam_fields::aux_data_slice(&raw);
         let thresholds =
@@ -4250,26 +4310,19 @@ mod tests {
     /// to regenerate alignment tags.
     #[test]
     fn test_process_record_raw_no_reference() -> Result<()> {
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
-
         // Build an unmapped record with consensus tags
-        let record = RecordBuilder::new()
-            .name("unmapped_read")
-            .sequence("ACGTACGT")
-            .qualities(&[35, 35, 35, 35, 35, 35, 35, 35])
-            .unmapped(true)
-            .consensus_tags(
-                crate::sam::builder::ConsensusTagsBuilder::new()
-                    .per_base_depths(&[10; 8])
-                    .per_base_errors(&[0; 8]),
-            )
-            .build();
+        let raw_record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"unmapped_read")
+                .flags(flags::UNMAPPED)
+                .sequence(b"ACGTACGT")
+                .qualities(&[35, 35, 35, 35, 35, 35, 35, 35]);
+            b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+            b.build()
+        };
+        let mut raw = raw_record;
 
         let header = Header::default();
-        let mut raw_bytes = Vec::new();
-        encode_record_buf(&mut raw_bytes, &header, &record)?;
-        let mut raw = RawRecord::from(raw_bytes);
-
         let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
 
         let (bases_masked, pass) = Filter::process_record_raw(
@@ -4299,35 +4352,27 @@ mod tests {
     /// and the record is mapped, since NM/UQ/MD tags would become stale.
     #[test]
     fn test_process_record_raw_no_reference_mapped_fails() -> Result<()> {
-        use crate::vendored::bam_codec::encoder::encode_record_buf;
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"mapped_read")
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .sequence(b"ACGTACGT")
+                .qualities(&[35; 8]);
+            b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+            b.build()
+        };
 
-        let sam_builder = crate::sam::builder::SamBuilder::with_single_ref("chr1", 1000);
-        let record = RecordBuilder::new()
-            .name("mapped_read")
-            .sequence("ACGTACGT")
-            .qualities(&[35; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .cigar("8M")
-            .consensus_tags(
-                crate::sam::builder::ConsensusTagsBuilder::new()
-                    .per_base_depths(&[10; 8])
-                    .per_base_errors(&[0; 8]),
-            )
-            .build();
-
-        let mut raw_bytes = Vec::new();
-        encode_record_buf(&mut raw_bytes, &sam_builder.header, &record)?;
-        let mut raw = RawRecord::from(raw_bytes);
-
+        let header = test_bam_header();
         let config = FilterConfig::new(&[1], &[0.025], &[0.1], None, None, 0.2);
 
         let result = Filter::process_record_raw(
             &mut raw,
             &config,
             None, // no reference
-            &sam_builder.header,
+            &header,
             false,
             None,
             false,
