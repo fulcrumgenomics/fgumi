@@ -110,6 +110,77 @@ impl ClippingMetrics {
         }
     }
 
+    /// Updates metrics from a raw BAM record after clipping.
+    ///
+    /// Equivalent to [`Self::update`] but reads alignment information directly from
+    /// the raw BAM bytes, avoiding a noodles decode round-trip.
+    ///
+    /// # Arguments
+    /// * `record` - The raw BAM record after clipping
+    /// * `counts` - The clip counts for this operation
+    #[cfg(feature = "clip")]
+    pub fn update_raw(&mut self, record: &fgumi_raw_bam::RawRecord, counts: ClipCounts) {
+        use fgumi_raw_bam::get_cigar_ops;
+
+        self.reads += 1;
+
+        // Count aligned bases (M/=/X ops) from raw CIGAR
+        let cigar_ops = get_cigar_ops(record.as_ref());
+        let aligned_bases: usize = cigar_ops
+            .iter()
+            .filter(|&&op| {
+                matches!(op & 0xF, 0 | 7 | 8) // Match, SequenceMatch, SequenceMismatch
+            })
+            .map(|&op| (op >> 4) as usize)
+            .sum();
+        self.bases += aligned_bases;
+
+        // Track pre-clipping
+        if counts.prior > 0 {
+            self.reads_clipped_pre += 1;
+            self.bases_clipped_pre += counts.prior;
+        }
+
+        // Track 5' clipping
+        if counts.five_prime > 0 {
+            self.reads_clipped_five_prime += 1;
+            self.bases_clipped_five_prime += counts.five_prime;
+        }
+
+        // Track 3' clipping
+        if counts.three_prime > 0 {
+            self.reads_clipped_three_prime += 1;
+            self.bases_clipped_three_prime += counts.three_prime;
+        }
+
+        // Track overlapping clipping
+        if counts.overlapping > 0 {
+            self.reads_clipped_overlapping += 1;
+            self.bases_clipped_overlapping += counts.overlapping;
+        }
+
+        // Track extending clipping
+        if counts.extending > 0 {
+            self.reads_clipped_extending += 1;
+            self.bases_clipped_extending += counts.extending;
+        }
+
+        // Total clipping after ClipBam
+        let additional_clipped =
+            counts.five_prime + counts.three_prime + counts.overlapping + counts.extending;
+        let total_clipped = additional_clipped + counts.prior;
+
+        if total_clipped > 0 {
+            self.reads_clipped_post += 1;
+            self.bases_clipped_post += total_clipped;
+
+            // Check if read became unmapped
+            if record.is_unmapped() && additional_clipped > 0 {
+                self.reads_unmapped += 1;
+            }
+        }
+    }
+
     /// Updates metrics based on a clipping operation
     ///
     /// # Arguments

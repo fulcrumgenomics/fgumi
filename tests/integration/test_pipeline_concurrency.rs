@@ -538,11 +538,12 @@ fn test_error_propagation_serialize_fn_multithreaded() {
 struct FailAfterNGrouper {
     count: usize,
     fail_after: usize,
+    header: Header,
 }
 
 impl FailAfterNGrouper {
-    fn new(fail_after: usize) -> Self {
-        Self { count: 0, fail_after }
+    fn new(fail_after: usize, header: Header) -> Self {
+        Self { count: 0, fail_after, header }
     }
 }
 
@@ -560,9 +561,8 @@ impl Grouper for FailAfterNGrouper {
         records
             .into_iter()
             .map(|d| {
-                d.into_record().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Expected parsed record")
-                })
+                fgumi_raw_bam::raw_record_to_record_buf(&d.into_raw_bytes(), &self.header)
+                    .map_err(io::Error::other)
             })
             .collect()
     }
@@ -590,7 +590,7 @@ fn test_error_propagation_grouper_multithreaded() {
         config,
         &input_bam,
         &output_bam,
-        |_header: &Header| Box::new(FailAfterNGrouper::new(50)),
+        |header: &Header| Box::new(FailAfterNGrouper::new(50, header.clone())),
         |record: RecordBuf| Ok(record),
         |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
             serialize_bam_record_into(&record, header, output)
@@ -647,7 +647,7 @@ fn test_error_does_not_cause_hang() {
             config,
             &input_clone2,
             &output_bam2,
-            |_header: &Header| Box::new(FailAfterNGrouper::new(30)),
+            |header: &Header| Box::new(FailAfterNGrouper::new(30, header.clone())),
             |record: RecordBuf| Ok(record),
             |record: RecordBuf, header: &Header, output: &mut Vec<u8>| {
                 serialize_bam_record_into(&record, header, output)

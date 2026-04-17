@@ -4,60 +4,10 @@
 //! reversed to match the orientation of the sequence in the BAM file.
 
 use anyhow::{Result, bail};
-use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::consensus_tags::per_base;
 use crate::sort::bam_fields;
 use fgumi_raw_bam::RawRecordView;
-
-/// Reverses per-base tags for a negative-strand read
-///
-/// This function reverses array-based per-base tags (cd, ce, ad, bd, ae, be, aq, bq)
-/// to match the reversed sequence orientation in negative-strand reads.
-///
-/// # Arguments
-/// * `record` - The record to reverse tags for (modified in place)
-///
-/// # Returns
-/// True if tags were reversed, false if not needed
-///
-/// # Errors
-///
-/// Currently infallible; returns `Result` for API consistency with
-/// [`reverse_per_base_tags_raw`].
-pub fn reverse_per_base_tags(record: &mut RecordBuf) -> Result<bool> {
-    // Check if read is mapped to negative strand
-    let flags = record.flags();
-    if !flags.is_reverse_complemented() {
-        return Ok(false);
-    }
-
-    // Get list of tags to reverse
-    let tags_to_reverse = per_base::tags_to_reverse();
-
-    for tag_str in tags_to_reverse {
-        let tag = per_base::tag(tag_str);
-
-        if let Some(value) = record.data().get(&tag) {
-            let reversed = fgumi_sam::reverse_buf_value(value);
-            record.data_mut().insert(tag, reversed);
-        }
-    }
-
-    // Handle tags that need reverse complement (ac, bc)
-    let tags_to_revcomp = per_base::tags_to_reverse_complement();
-
-    for tag_str in tags_to_revcomp {
-        let tag = per_base::tag(tag_str);
-
-        if let Some(value) = record.data().get(&tag) {
-            let revcomp = fgumi_sam::revcomp_buf_value(value);
-            record.data_mut().insert(tag, revcomp);
-        }
-    }
-
-    Ok(true)
-}
 
 /// Reverses per-base tags for a negative-strand read using raw BAM bytes.
 ///
@@ -118,61 +68,17 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{
+        SamBuilder as RawSamBuilder, flags as raw_flags, raw_record_to_record_buf,
+    };
+    use noodles::sam::Header;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::data::field::Value;
-    use noodles::sam::alignment::record_buf::data::field::value::Array;
     use rstest::rstest;
 
-    #[test]
-    fn test_reverse_per_base_tags_positive_strand() {
-        let mut record = RecordBuilder::new().sequence("ACGT").build();
-
-        let tag = Tag::from([b'c', b'd']);
-        record.data_mut().insert(tag, Value::from(vec![1u16, 2, 3]));
-
-        let reversed =
-            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
-        assert!(!reversed); // Should not reverse for positive strand
-
-        if let Some(Value::Array(Array::UInt16(arr))) = record.data().get(&tag) {
-            assert_eq!(arr.clone(), vec![1, 2, 3]);
-        }
-    }
-
-    #[test]
-    fn test_reverse_per_base_tags_negative_strand() {
-        let mut record = RecordBuilder::new().sequence("ACGT").reverse_complement(true).build();
-
-        let tag = Tag::from([b'c', b'd']);
-        record.data_mut().insert(tag, Value::from(vec![1u16, 2, 3]));
-
-        let reversed =
-            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
-        assert!(reversed); // Should reverse for negative strand
-
-        if let Some(Value::Array(Array::UInt16(arr))) = record.data().get(&tag) {
-            assert_eq!(arr.clone(), vec![3, 2, 1]);
-        }
-    }
-
-    #[test]
-    fn test_reverse_complement_tag() {
-        let mut record = RecordBuilder::new()
-            .sequence("ACGT")
-            .reverse_complement(true)
-            .tag("ac", "ACGT")
-            .build();
-
-        let reversed =
-            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
-        assert!(reversed);
-
-        let tag = Tag::from([b'a', b'c']);
-        if let Some(Value::String(bases)) = record.data().get(&tag) {
-            let bases_vec: Vec<u8> = bases.iter().copied().collect();
-            assert_eq!(bases_vec, b"ACGT");
-        }
+    fn to_record_buf(raw: &fgumi_raw_bam::RawRecord) -> noodles::sam::alignment::RecordBuf {
+        raw_record_to_record_buf(raw, &Header::default())
+            .expect("raw_record_to_record_buf failed in test")
     }
 
     #[rstest]
@@ -196,38 +102,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reverse_string_tag_aq() {
-        // aq is a Z-type quality string — should be reversed on negative strand
-        let mut record = RecordBuilder::new()
-            .sequence("ACGT")
-            .reverse_complement(true)
-            .tag("aq", "IIHG")
-            .build();
-
-        let reversed =
-            reverse_per_base_tags(&mut record).expect("reverse_per_base_tags should succeed");
-        assert!(reversed);
-
-        let tag = Tag::from([b'a', b'q']);
-        let Some(Value::String(s)) = record.data().get(&tag) else {
-            unreachable!("Expected aq tag to be present as String");
-        };
-        let bytes: Vec<u8> = s.iter().copied().collect();
-        assert_eq!(bytes, b"GHII");
-    }
-
-    #[test]
     fn test_reverse_per_base_tags_raw_string_tag_aq() {
         // Verify aq Z-type tag is reversed via the raw path too
         use crate::sort::bam_fields;
         use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let record_buf = RecordBuilder::new()
-            .sequence("ACGT")
-            .reverse_complement(true)
-            .tag("aq", "IIHG")
-            .build();
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
+        b.add_string_tag(b"aq", b"IIHG");
+        let record_buf = to_record_buf(&b.build());
 
         let header = Header::default();
         let mut raw = Vec::new();
@@ -255,9 +138,10 @@ mod tests {
     fn test_reverse_per_base_tags_raw_positive_strand() {
         // Build a valid raw record on positive strand — should return Ok(false)
         use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let record_buf = RecordBuilder::new().sequence("ACGT").build();
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGT").qualities(&[30; 4]).flags(0);
+        let record_buf = to_record_buf(&b.build());
         let header = Header::default();
         let mut raw = Vec::new();
         encode_record_buf(&mut raw, &header, &record_buf).expect("encoding record should succeed");
@@ -272,9 +156,10 @@ mod tests {
         // Build a valid raw record on negative strand with a cd tag — should reverse it
         use crate::sort::bam_fields;
         use crate::vendored::bam_codec::encoder::encode_record_buf;
-        use noodles::sam::Header;
 
-        let mut record_buf = RecordBuilder::new().sequence("ACGT").reverse_complement(true).build();
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
+        let mut record_buf = to_record_buf(&b.build());
         let tag = Tag::from([b'c', b'd']);
         record_buf.data_mut().insert(tag, Value::from(vec![1u16, 2, 3, 4]));
 
