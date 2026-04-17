@@ -14,6 +14,7 @@ use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use crate::metrics::writer::write_metrics as write_metrics_tsv;
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
 use crate::reference::ReferenceReader;
 use crate::template::{TemplateBatch, TemplateIterator};
@@ -23,7 +24,6 @@ use crate::unified_pipeline::{
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -641,8 +641,8 @@ impl Clip {
             num_threads,
         )?;
 
-        // Lock-free metrics collection
-        let collected_metrics: Arc<SegQueue<CollectedClipMetrics>> = Arc::new(SegQueue::new());
+        // Per-thread metrics accumulator: bounded memory, no unbounded queue.
+        let collected_metrics = PerThreadAccumulator::<CollectedClipMetrics>::new(num_threads);
         let collected_for_serialize = Arc::clone(&collected_metrics);
 
         // Configuration for closures
@@ -789,11 +789,11 @@ impl Clip {
                                  header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
-            // Push metrics to lock-free queue
-            collected_for_serialize.push(CollectedClipMetrics {
-                total_templates: processed.templates_count,
-                overlap_clipped: processed.overlap_clipped_count,
-                extend_clipped: processed.extend_clipped_count,
+            // Merge per-batch counts into this worker's accumulator slot
+            collected_for_serialize.with_slot(|m| {
+                m.total_templates += processed.templates_count;
+                m.overlap_clipped += processed.overlap_clipped_count;
+                m.extend_clipped += processed.extend_clipped_count;
             });
 
             // Serialize clipped records into the provided buffer
@@ -817,10 +817,11 @@ impl Clip {
         let mut total_overlap_clipped = 0u64;
         let mut total_extend_clipped = 0u64;
 
-        while let Some(metrics) = collected_metrics.pop() {
-            total_templates += metrics.total_templates;
-            total_overlap_clipped += metrics.overlap_clipped;
-            total_extend_clipped += metrics.extend_clipped;
+        for slot in collected_metrics.slots() {
+            let m = slot.lock();
+            total_templates += m.total_templates;
+            total_overlap_clipped += m.overlap_clipped;
+            total_extend_clipped += m.extend_clipped;
         }
 
         info!("Total templates processed: {total_templates}");
