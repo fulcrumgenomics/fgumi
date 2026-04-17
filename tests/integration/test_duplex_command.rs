@@ -182,6 +182,156 @@ fn test_duplex_command_basic() {
     assert!(count > 0, "Should have produced duplex consensus reads");
 }
 
+/// Test duplex command with rejects output.
+///
+/// Runs the multi-threaded pipeline with `--min-reads 2` and a singleton /A
+/// template that fails the single-strand `min-reads` check. Verifies that:
+///
+/// 1. The rejects BAM is created and has its `@HD` header rewritten to
+///    `SO:unsorted` because reject writes are emitted in mutex-acquisition
+///    order rather than input order.
+/// 2. The singleton template's raw records are actually streamed to the
+///    rejects BAM rather than being silently dropped.
+#[test]
+fn test_duplex_command_with_rejects() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // Kept molecule: 3 /A pairs + 3 /B pairs
+    let kept = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    // Singleton /A pair (fails the /A strand's min-reads=2 check)
+    let singleton = vec![create_duplex_read_pair("solo", "2/A", "ACGTACGT", 30, 500, false)];
+    create_duplex_bam(&input_bam, vec![kept, singleton]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run duplex command");
+
+    assert!(status.success(), "Duplex command with rejects failed");
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+
+    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+
+    // The singleton /A template (R1 + R2) should be streamed to the rejects BAM.
+    let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let mut reject_count = 0;
+    for result in reader.records() {
+        result.expect("Failed to read reject record");
+        reject_count += 1;
+    }
+    assert_eq!(
+        reject_count, 2,
+        "Singleton paired-end /A template should be streamed to rejects BAM (R1 + R2)"
+    );
+}
+
+/// Regression test: each rejected input record must appear in the rejects BAM
+/// exactly once.
+///
+/// The duplex caller accumulates rejects from two sources: records dropped at
+/// the single-strand (ss) layer, and records dropped at the duplex layer. When
+/// the duplex layer rejects a group it returns every raw input record — which
+/// already includes anything the ss layer would have rejected. Appending both
+/// sources naively would emit the overlapping records twice.
+///
+/// This test drives several independent rejection paths in a single pipeline
+/// run and asserts that the rejects BAM contains each `(read_name, flags)`
+/// tuple at most once, with the total record count matching the expected
+/// input-record count.
+#[test]
+fn test_duplex_command_rejects_contain_no_duplicates() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+
+    // Kept molecule: produces a consensus, contributes zero rejects.
+    let kept = create_duplex_molecule("1", "ACGTACGT", 30, 100, 3);
+    // Four singleton molecules (2 records each) — two on each strand — that
+    // reject via the insufficient-reads path. Using molecule IDs in a single
+    // `singletons` vec avoids the similar_names clippy lint.
+    let singletons: Vec<Vec<(RecordBuf, RecordBuf)>> = vec![
+        vec![create_duplex_read_pair("soloA1", "2/A", "ACGTACGT", 30, 500, false)],
+        vec![create_duplex_read_pair("soloA2", "3/A", "ACGTACGT", 30, 800, false)],
+        vec![create_duplex_read_pair("soloB1", "4/B", "ACGTACGT", 30, 1100, true)],
+        vec![create_duplex_read_pair("soloB2", "5/B", "ACGTACGT", 30, 1400, true)],
+    ];
+
+    // Expected rejects = 4 singletons × 2 records = 8. The kept molecule
+    // contributes 0 rejects.
+    let expected_rejects = u32::try_from(singletons.len() * 2).expect("rejects count fits in u32");
+
+    let mut molecules = vec![kept];
+    molecules.extend(singletons);
+    create_duplex_bam(&input_bam, molecules);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "duplex",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--min-reads",
+            "2",
+            "--threads",
+            "2",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run duplex command");
+
+    assert!(status.success(), "Duplex command with rejects failed");
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+
+    crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
+    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let mut seen: std::collections::HashMap<(String, u16), u32> = std::collections::HashMap::new();
+    let mut total = 0u32;
+    for result in reader.records() {
+        let record = result.expect("Failed to read reject record");
+        let name = record.name().expect("reject record missing read name").to_string();
+        let flags = u16::from(record.flags());
+        *seen.entry((name, flags)).or_insert(0) += 1;
+        total += 1;
+    }
+
+    assert_eq!(
+        total, expected_rejects,
+        "rejects BAM record count should match the expected rejected-input count",
+    );
+    for ((name, flags), count) in &seen {
+        assert_eq!(
+            *count, 1,
+            "record ({name}, flags={flags}) appears {count} times in the rejects BAM",
+        );
+    }
+}
+
 /// Test duplex command with statistics output.
 #[test]
 fn test_duplex_command_with_stats() {
