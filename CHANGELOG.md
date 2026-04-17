@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Cap `fgumi group` metric memory by merging per-position-group counts into per-thread accumulators instead of a `SegQueue` that grew one `AHashMap` per position group ([#285](https://github.com/fulcrumgenomics/fgumi/issues/285)).
+- Replace unbounded `SegQueue<CollectedXxxMetrics>` buffering in `filter`, `clip`, `correct`, `simplex`, `duplex`, and `codec` with a shared `PerThreadAccumulator` helper, capping retained metric memory at `O(threads × distinct keys)` across all pipeline commands. Rejects buffering in the consensus commands is unchanged and tracked separately.
 
 ### Breaking Changes
 
