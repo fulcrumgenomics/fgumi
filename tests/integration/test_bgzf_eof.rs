@@ -4,11 +4,10 @@
 //! GitHub issue #125: BAM files written by pipeline-based commands were missing
 //! the BGZF EOF block, causing `samtools quickcheck` to fail.
 
-use fgumi_lib::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use std::fs;
 use std::path::Path;
@@ -17,23 +16,25 @@ use tempfile::TempDir;
 
 use crate::helpers::assertions::assert_has_bgzf_eof;
 use crate::helpers::bam_generator::{
-    create_minimal_header, create_test_reference, create_umi_family,
+    create_minimal_header, create_test_reference, create_umi_family, to_record_buf,
 };
 
 /// Write a BAM file with the given records using the standard test header.
-fn write_test_bam(path: &Path, records: &[RecordBuf]) {
+fn write_test_bam(path: &Path, records: &[RawRecord]) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
     for record in records {
-        writer.write_alignment_record(&header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Write a BAM file with MI-tagged records (grouped input for consensus callers).
-fn write_grouped_bam(path: &Path, families: &[(&str, &[RecordBuf])]) {
+fn write_grouped_bam(path: &Path, families: &[(&str, &[RawRecord])]) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
@@ -42,68 +43,65 @@ fn write_grouped_bam(path: &Path, families: &[(&str, &[RecordBuf])]) {
     let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
     for &(mi, records) in families {
         for record in records {
-            let mut rec = record.clone();
-            rec.data_mut().insert(mi_tag, Value::from(mi));
-            writer.write_alignment_record(&header, &rec).expect("Failed to write record");
+            let mut buf = to_record_buf(record);
+            buf.data_mut().insert(mi_tag, Value::from(mi));
+            writer.write_alignment_record(&header, &buf).expect("Failed to write record");
         }
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Create paired-end duplicate reads at a given position with MC tags.
-fn create_dedup_reads(name: &str, umi: &str, start: usize) -> Vec<RecordBuf> {
-    let cigar = "8M";
-    let r1 = RecordBuilder::new()
-        .name(name)
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(true)
-        .properly_paired(true)
-        .reference_sequence_id(0)
-        .alignment_start(start)
-        .mapping_quality(60)
-        .cigar(cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(start + 100)
-        .template_length(108)
-        .tag("RX", umi)
-        .tag("MC", cigar)
-        .build();
+fn create_dedup_reads(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> {
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(start - 1)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(start + 99)
+            .template_length(108)
+            .add_string_tag(b"RX", umi.as_bytes())
+            .add_string_tag(b"MC", b"8M");
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name(name)
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(false)
-        .properly_paired(true)
-        .reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(start + 100)
-        .mapping_quality(60)
-        .cigar(cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(start)
-        .template_length(-108)
-        .tag("RX", umi)
-        .tag("MC", cigar)
-        .build();
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(start + 99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(start - 1)
+            .template_length(-108)
+            .add_string_tag(b"RX", umi.as_bytes())
+            .add_string_tag(b"MC", b"8M");
+        b.build()
+    };
 
     vec![r1, r2]
 }
 
 /// Create a duplex read pair with /A or /B strand MI suffix.
 fn create_duplex_pair(
-    name: &str,
+    name: &[u8],
     mi_tag: &str,
-    sequence: &str,
-    ref_start: usize,
+    sequence: &[u8],
+    ref_start: i32,
     is_b_strand: bool,
-) -> (RecordBuf, RecordBuf) {
+) -> (RawRecord, RawRecord) {
     let read_len = sequence.len();
-    let cigar = format!("{read_len}M");
-
+    let cigar_op = u32::try_from(read_len).expect("read_len fits u32") << 4; // NM
     let (r1_start, r2_start, r1_rev, r2_rev) = if is_b_strand {
         (ref_start + 100, ref_start, true, false)
     } else {
@@ -117,137 +115,131 @@ fn create_duplex_pair(
     )]
     let tlen: i32 = if is_b_strand { -((read_len + 100) as i32) } else { (read_len + 100) as i32 };
 
-    let mi = Tag::from(fgumi_lib::sam::SamTag::MI);
+    let r1_flags = flags::PAIRED
+        | flags::FIRST_SEGMENT
+        | if r1_rev { flags::REVERSE } else { 0 }
+        | if r2_rev { flags::MATE_REVERSE } else { 0 };
 
-    let mut r1 = RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![30; read_len])
-        .paired(true)
-        .first_segment(true)
-        .reverse_complement(r1_rev)
-        .mate_reverse_complement(r2_rev)
-        .reference_sequence_id(0)
-        .alignment_start(r1_start)
-        .mapping_quality(60)
-        .cigar(&cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(r2_start)
-        .template_length(tlen)
-        .build();
-    r1.data_mut().insert(mi, Value::from(mi_tag));
+    let r2_flags = flags::PAIRED
+        | flags::LAST_SEGMENT
+        | if r2_rev { flags::REVERSE } else { 0 }
+        | if r1_rev { flags::MATE_REVERSE } else { 0 };
 
-    let mut r2 = RecordBuilder::new()
-        .name(name)
-        .sequence(sequence)
-        .qualities(&vec![30; read_len])
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(r2_rev)
-        .mate_reverse_complement(r1_rev)
-        .reference_sequence_id(0)
-        .alignment_start(r2_start)
-        .mapping_quality(60)
-        .cigar(&cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(r1_start)
-        .template_length(-tlen)
-        .build();
-    r2.data_mut().insert(mi, Value::from(mi_tag));
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(sequence)
+            .qualities(&vec![30; read_len])
+            .flags(r1_flags)
+            .ref_id(0)
+            .pos(r1_start - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(r2_start - 1)
+            .template_length(tlen)
+            .add_string_tag(b"MI", mi_tag.as_bytes());
+        b.build()
+    };
+
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(sequence)
+            .qualities(&vec![30; read_len])
+            .flags(r2_flags)
+            .ref_id(0)
+            .pos(r2_start - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar_op])
+            .mate_ref_id(0)
+            .mate_pos(r1_start - 1)
+            .template_length(-tlen)
+            .add_string_tag(b"MI", mi_tag.as_bytes());
+        b.build()
+    };
 
     (r1, r2)
 }
 
 /// Create a single-template family (will be rejected by --min-reads > 1).
-fn create_rejected_family(name: &str, umi: &str, start: usize) -> Vec<RecordBuf> {
-    let cigar = "8M";
-    let r1 = RecordBuilder::new()
-        .name(name)
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(true)
-        .properly_paired(true)
-        .reference_sequence_id(0)
-        .alignment_start(start)
-        .mapping_quality(60)
-        .cigar(cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(start + 100)
-        .template_length(108)
-        .tag("RX", umi)
-        .tag("MC", cigar)
-        .build();
+fn create_rejected_family(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> {
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(start - 1)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(start + 99)
+            .template_length(108)
+            .add_string_tag(b"RX", umi.as_bytes())
+            .add_string_tag(b"MC", b"8M");
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name(name)
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(false)
-        .properly_paired(true)
-        .reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(start + 100)
-        .mapping_quality(60)
-        .cigar(cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(start)
-        .template_length(-108)
-        .tag("RX", umi)
-        .tag("MC", cigar)
-        .build();
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(start + 99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(start - 1)
+            .template_length(-108)
+            .add_string_tag(b"RX", umi.as_bytes())
+            .add_string_tag(b"MC", b"8M");
+        b.build()
+    };
 
     vec![r1, r2]
 }
 
 /// Create a CODEC read pair (FR orientation, same position).
-fn create_codec_pair(name: &str, umi: &str, ref_start: usize) -> (RecordBuf, RecordBuf) {
-    let cigar = "8M";
+fn create_codec_pair(name: &[u8], umi: &str, ref_start: i32) -> (RawRecord, RawRecord) {
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(ref_start - 1)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(ref_start - 1)
+            .template_length(8)
+            .add_string_tag(b"MI", umi.as_bytes())
+            .add_string_tag(b"MC", b"8M");
+        b.build()
+    };
 
-    let mut r1 = RecordBuilder::new()
-        .name(name)
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(true)
-        .mate_reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(ref_start)
-        .mapping_quality(60)
-        .cigar(cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(ref_start)
-        .tag("MI", umi)
-        .tag("MC", cigar)
-        .build();
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    {
-        *r1.template_length_mut() = 8;
-    }
-
-    let mut r2 = RecordBuilder::new()
-        .name(name)
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(ref_start)
-        .mapping_quality(60)
-        .cigar(cigar)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(ref_start)
-        .tag("MI", umi)
-        .tag("MC", cigar)
-        .build();
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    {
-        *r2.template_length_mut() = -8;
-    }
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(ref_start - 1)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(ref_start - 1)
+            .template_length(-8)
+            .add_string_tag(b"MI", umi.as_bytes())
+            .add_string_tag(b"MC", b"8M");
+        b.build()
+    };
 
     (r1, r2)
 }
@@ -294,8 +286,8 @@ fn test_dedup_output_has_bgzf_eof() {
     let input_bam = temp_dir.path().join("input.bam");
     let output_bam = temp_dir.path().join("output.bam");
 
-    let mut records = create_dedup_reads("dup_0", "ACGTACGT", 100);
-    records.extend(create_dedup_reads("dup_1", "ACGTACGT", 100));
+    let mut records = create_dedup_reads(b"dup_0", "ACGTACGT", 100);
+    records.extend(create_dedup_reads(b"dup_1", "ACGTACGT", 100));
     write_test_bam(&input_bam, &records);
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
@@ -356,12 +348,14 @@ fn test_duplex_output_has_bgzf_eof() {
     // Create a duplex molecule: 3 /A pairs and 3 /B pairs
     let mut records = Vec::new();
     for i in 0..3 {
-        let (r1, r2) = create_duplex_pair(&format!("a_{i}"), "1/A", "ACGTACGT", 100, false);
+        let (r1, r2) =
+            create_duplex_pair(format!("a_{i}").as_bytes(), "1/A", b"ACGTACGT", 100, false);
         records.push(r1);
         records.push(r2);
     }
     for i in 0..3 {
-        let (r1, r2) = create_duplex_pair(&format!("b_{i}"), "1/B", "ACGTACGT", 100, true);
+        let (r1, r2) =
+            create_duplex_pair(format!("b_{i}").as_bytes(), "1/B", b"ACGTACGT", 100, true);
         records.push(r1);
         records.push(r2);
     }
@@ -396,7 +390,7 @@ fn test_codec_output_has_bgzf_eof() {
 
     let mut records = Vec::new();
     for i in 0..3 {
-        let (r1, r2) = create_codec_pair(&format!("read{i}"), "1", 100);
+        let (r1, r2) = create_codec_pair(format!("read{i}").as_bytes(), "1", 100);
         records.push(r1);
         records.push(r2);
     }
@@ -430,18 +424,19 @@ fn test_filter_output_has_bgzf_eof() {
     let output_bam = temp_dir.path().join("output.bam");
     let ref_path = create_test_reference(temp_dir.path());
 
-    let record = RecordBuilder::new()
-        .name("cons1")
-        .sequence("ACGTACGT")
-        .qualities(&[35; 8])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .consensus_tags(
-            ConsensusTagsBuilder::new().per_base_depths(&[10; 8]).per_base_errors(&[0; 8]),
-        )
-        .build();
+    let record = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"cons1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[35; 8])
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .add_array_u16(b"cd", &[10; 8])
+            .add_array_u16(b"ce", &[0; 8]);
+        b.build()
+    };
 
     write_test_bam(&input_bam, &[record]);
 
@@ -475,36 +470,37 @@ fn test_clip_output_has_bgzf_eof() {
     let output_bam = temp_dir.path().join("output.bam");
     let ref_path = create_test_reference(temp_dir.path());
 
-    let r1 = RecordBuilder::new()
-        .name("read1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(true)
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .cigar("8M")
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(104)
-        .template_length(12)
-        .build();
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(103)
+            .template_length(12);
+        b.build()
+    };
 
-    let r2 = RecordBuilder::new()
-        .name("read1")
-        .sequence("ACGTACGT")
-        .qualities(&[30; 8])
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(true)
-        .reference_sequence_id(0)
-        .alignment_start(104)
-        .mapping_quality(60)
-        .cigar("8M")
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(100)
-        .template_length(-12)
-        .build();
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(103)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .template_length(-12);
+        b.build()
+    };
 
     write_test_bam(&input_bam, &[r1, r2]);
 
@@ -647,7 +643,7 @@ fn test_simplex_rejects_has_bgzf_eof() {
 
     // One family with 3 reads (kept) and one singleton family (rejected by --min-reads 2)
     let kept = create_umi_family("ACGT", 3, "kept", "ACGTACGT", 30);
-    let rejected = create_rejected_family("reject", "TTTT", 500);
+    let rejected = create_rejected_family(b"reject", "TTTT", 500);
     write_grouped_bam(&input_bam, &[("1", &kept), ("2", &rejected)]);
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
@@ -684,17 +680,19 @@ fn test_duplex_rejects_has_bgzf_eof() {
     // 3 /A pairs and 3 /B pairs (kept), plus a singleton /A pair (rejected by --min-reads 2)
     let mut records = Vec::new();
     for i in 0..3 {
-        let (r1, r2) = create_duplex_pair(&format!("a_{i}"), "1/A", "ACGTACGT", 100, false);
+        let (r1, r2) =
+            create_duplex_pair(format!("a_{i}").as_bytes(), "1/A", b"ACGTACGT", 100, false);
         records.push(r1);
         records.push(r2);
     }
     for i in 0..3 {
-        let (r1, r2) = create_duplex_pair(&format!("b_{i}"), "1/B", "ACGTACGT", 100, true);
+        let (r1, r2) =
+            create_duplex_pair(format!("b_{i}").as_bytes(), "1/B", b"ACGTACGT", 100, true);
         records.push(r1);
         records.push(r2);
     }
     // Singleton family that will be rejected
-    let (r1, r2) = create_duplex_pair("reject_a", "2/A", "ACGTACGT", 500, false);
+    let (r1, r2) = create_duplex_pair(b"reject_a", "2/A", b"ACGTACGT", 500, false);
     records.push(r1);
     records.push(r2);
     write_test_bam(&input_bam, &records);
@@ -733,11 +731,11 @@ fn test_codec_rejects_has_bgzf_eof() {
     // One family with 3 reads (kept) and one singleton (rejected by --min-reads 2)
     let mut records = Vec::new();
     for i in 0..3 {
-        let (r1, r2) = create_codec_pair(&format!("read{i}"), "1", 100);
+        let (r1, r2) = create_codec_pair(format!("read{i}").as_bytes(), "1", 100);
         records.push(r1);
         records.push(r2);
     }
-    let (r1, r2) = create_codec_pair("reject", "2", 500);
+    let (r1, r2) = create_codec_pair(b"reject", "2", 500);
     records.push(r1);
     records.push(r2);
     write_test_bam(&input_bam, &records);

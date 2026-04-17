@@ -9,7 +9,6 @@ use bstr::BString;
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
@@ -19,20 +18,21 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family};
+use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
 
 /// Write grouped BAM file (reads grouped by MI tag).
-fn create_grouped_bam(path: &Path, families: Vec<(&str, Vec<RecordBuf>)>) {
+fn create_grouped_bam(path: &Path, families: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
     for (mi, records) in families {
-        for mut record in records {
-            // Add MI tag for molecule identity (simplex expects grouped reads with MI)
+        for raw in &records {
+            // Convert to RecordBuf, add MI tag, write
             use noodles::sam::alignment::record::data::field::Tag;
             use noodles::sam::alignment::record_buf::data::field::Value;
+            let mut record = to_record_buf(raw);
             let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
             record.data_mut().insert(mi_tag, Value::from(mi));
             writer.write_alignment_record(&header, &record).expect("Failed to write record");
@@ -199,16 +199,17 @@ fn create_header_with_read_groups(ref_name: &str, ref_len: usize) -> Header {
 fn create_grouped_bam_with_header(
     path: &Path,
     header: &Header,
-    families: Vec<(&str, Vec<RecordBuf>)>,
+    families: Vec<(&str, Vec<fgumi_raw_bam::RawRecord>)>,
 ) {
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(header).expect("Failed to write header");
 
     for (mi, records) in families {
-        for mut record in records {
+        for raw in &records {
             use noodles::sam::alignment::record::data::field::Tag;
             use noodles::sam::alignment::record_buf::data::field::Value;
+            let mut record = to_record_buf(raw);
             let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
             record.data_mut().insert(mi_tag, Value::from(mi));
             writer.write_alignment_record(header, &record).expect("Failed to write record");

@@ -619,19 +619,28 @@ mod tests {
         }
     }
 
-    // Tests for paired read generation using RecordBuilder
+    // Tests for paired read generation using RawSamBuilder
+    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> noodles::sam::alignment::RecordBuf {
+        fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
+
     #[test]
     fn test_paired_read_r1_flags() {
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
         // R1 should have flag 77: UNMAPPED | SEGMENTED | FIRST_SEGMENT | MATE_UNMAPPED
-        let r1 = RecordBuilder::new()
-            .name("test_read")
-            .sequence("ACGT")
-            .paired(true)
-            .first_segment(true)
-            .unmapped(true)
-            .mate_unmapped(true)
-            .tag("RX", "AAAAAAAA")
-            .build();
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"test_read")
+            .flags(
+                raw_flags::PAIRED
+                    | raw_flags::FIRST_SEGMENT
+                    | raw_flags::UNMAPPED
+                    | raw_flags::MATE_UNMAPPED,
+            )
+            .sequence(b"ACGT");
+        b.add_string_tag(b"RX", b"AAAAAAAA");
+        let r1 = to_record_buf(b.build());
 
         assert!(r1.flags().is_unmapped());
         assert!(r1.flags().is_segmented());
@@ -646,16 +655,20 @@ mod tests {
 
     #[test]
     fn test_paired_read_r2_flags() {
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
         // R2 should have flag 141: UNMAPPED | SEGMENTED | LAST_SEGMENT | MATE_UNMAPPED
-        let r2 = RecordBuilder::new()
-            .name("test_read")
-            .sequence("ACGT")
-            .paired(true)
-            .first_segment(false)
-            .unmapped(true)
-            .mate_unmapped(true)
-            .tag("RX", "AAAAAAAA")
-            .build();
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"test_read")
+            .flags(
+                raw_flags::PAIRED
+                    | raw_flags::LAST_SEGMENT
+                    | raw_flags::UNMAPPED
+                    | raw_flags::MATE_UNMAPPED,
+            )
+            .sequence(b"ACGT");
+        b.add_string_tag(b"RX", b"AAAAAAAA");
+        let r2 = to_record_buf(b.build());
 
         assert!(r2.flags().is_unmapped());
         assert!(r2.flags().is_segmented());
@@ -670,52 +683,63 @@ mod tests {
 
     #[test]
     fn test_paired_reads_same_name_and_umi() {
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+
         let read_name = "test_pair";
         let umi = "ACGTACGT";
 
-        let r1 = RecordBuilder::new()
-            .name(read_name)
-            .sequence("AAAA")
-            .paired(true)
-            .first_segment(true)
-            .unmapped(true)
-            .mate_unmapped(true)
-            .tag("RX", umi)
-            .build();
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(read_name.as_bytes())
+            .flags(
+                raw_flags::PAIRED
+                    | raw_flags::FIRST_SEGMENT
+                    | raw_flags::UNMAPPED
+                    | raw_flags::MATE_UNMAPPED,
+            )
+            .sequence(b"AAAA");
+        b1.add_string_tag(b"RX", umi.as_bytes());
+        let r1 = to_record_buf(b1.build());
 
-        let r2 = RecordBuilder::new()
-            .name(read_name)
-            .sequence("CCCC")
-            .paired(true)
-            .first_segment(false)
-            .unmapped(true)
-            .mate_unmapped(true)
-            .tag("RX", umi)
-            .build();
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(read_name.as_bytes())
+            .flags(
+                raw_flags::PAIRED
+                    | raw_flags::LAST_SEGMENT
+                    | raw_flags::UNMAPPED
+                    | raw_flags::MATE_UNMAPPED,
+            )
+            .sequence(b"CCCC");
+        b2.add_string_tag(b"RX", umi.as_bytes());
+        let r2 = to_record_buf(b2.build());
 
         // Both should have the same read name
         assert_eq!(r1.name(), r2.name());
 
-        // Both should have the same RX tag
+        // Both should have the same RX tag with the same value.
         let rx_tag: Tag = Tag::from(SamTag::RX);
         assert!(r1.data().get(&rx_tag).is_some());
         assert!(r2.data().get(&rx_tag).is_some());
+        assert_eq!(r1.data().get(&rx_tag), r2.data().get(&rx_tag));
     }
 
     #[test]
     fn test_paired_read_qualities() {
-        let quality: u8 = 35;
-        let seq = "ACGTACGT";
+        use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
 
-        let r1 = RecordBuilder::new()
-            .name("read")
+        let quality: u8 = 35;
+        let seq = b"ACGTACGT";
+
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read")
+            .flags(
+                raw_flags::PAIRED
+                    | raw_flags::FIRST_SEGMENT
+                    | raw_flags::UNMAPPED
+                    | raw_flags::MATE_UNMAPPED,
+            )
             .sequence(seq)
-            .qualities(&vec![quality; seq.len()])
-            .paired(true)
-            .first_segment(true)
-            .unmapped(true)
-            .mate_unmapped(true)
-            .build();
+            .qualities(&vec![quality; seq.len()]);
+        let r1 = to_record_buf(b.build());
 
         let quals: Vec<u8> = r1.quality_scores().iter().collect();
         assert_eq!(quals.len(), 8);

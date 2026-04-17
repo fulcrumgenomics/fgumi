@@ -14,9 +14,6 @@ use std::collections::HashSet;
 
 #[test]
 fn test_identity_assigner_basic_workflow() {
-    use noodles::sam::alignment::record::data::field::Tag;
-    use noodles::sam::alignment::record_buf::data::field::Value;
-
     // Create test data: 3 UMI families with 5, 3, and 2 reads respectively
     let mut all_reads = Vec::new();
 
@@ -29,11 +26,10 @@ fn test_identity_assigner_basic_workflow() {
     // Family 3: GGGGGGGG - 2 reads
     all_reads.extend(create_umi_family("GGGGGGGG", 2, "family3", "CCCCCCCCCC", 30));
 
-    let rx_tag = Tag::from([b'R', b'X']);
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.data().get(&rx_tag).expect("RX tag should exist") {
-            Value::String(s) => String::from_utf8_lossy(s.as_ref()).to_string(),
+        .map(|record| match record.tags().get(b"RX").expect("RX tag should exist") {
+            fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
         .collect();
@@ -68,9 +64,6 @@ fn test_identity_assigner_basic_workflow() {
 
 #[test]
 fn test_adjacency_assigner_with_error_correction() {
-    use noodles::sam::alignment::record::data::field::Tag;
-    use noodles::sam::alignment::record_buf::data::field::Value;
-
     // Create test data with intentional sequencing errors
     // Base UMI: AAAAAAAA (50 reads)
     // Error UMI: AAAAAAAC (5 reads, 1bp error)
@@ -82,11 +75,10 @@ fn test_adjacency_assigner_with_error_correction() {
     // Add another distinct UMI family that should NOT be merged
     all_reads.extend(create_umi_family("TTTTTTTT", 30, "distinct", "TGCATGCATGCA", 30));
 
-    let rx_tag = Tag::from([b'R', b'X']);
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.data().get(&rx_tag).expect("RX tag") {
-            Value::String(s) => String::from_utf8_lossy(s.as_ref()).to_string(),
+        .map(|record| match record.tags().get(b"RX").expect("RX tag") {
+            fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
         .collect();
@@ -126,9 +118,6 @@ fn test_adjacency_assigner_with_error_correction() {
 
 #[test]
 fn test_adjacency_respects_count_gradient() {
-    use noodles::sam::alignment::record::data::field::Tag;
-    use noodles::sam::alignment::record_buf::data::field::Value;
-
     // Test that adjacency method does NOT merge UMIs when count gradient prevents it
     // Base UMI: GGGGGGGG (30 reads)
     // Similar UMI: GGGGGGGC (20 reads, 1bp error)
@@ -137,11 +126,10 @@ fn test_adjacency_respects_count_gradient() {
 
     all_reads.extend(create_umi_family_with_errors("GGGGGGGG", "GGGGGGGC", 30, 20, "ACGTACGT"));
 
-    let rx_tag = Tag::from([b'R', b'X']);
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.data().get(&rx_tag).expect("RX tag") {
-            Value::String(s) => String::from_utf8_lossy(s.as_ref()).to_string(),
+        .map(|record| match record.tags().get(b"RX").expect("RX tag") {
+            fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
         .collect();
@@ -169,9 +157,6 @@ fn test_adjacency_respects_count_gradient() {
 
 #[test]
 fn test_paired_end_umi_workflow() {
-    use noodles::sam::alignment::record::data::field::Tag;
-    use noodles::sam::alignment::record_buf::data::field::Value;
-
     // Create paired-end reads with UMIs
     let family1 = create_paired_umi_family(
         "AAAA-CCCC",
@@ -192,13 +177,13 @@ fn test_paired_end_umi_workflow() {
     );
 
     // Verify proper pairing
-    assert_proper_pairing(&family1[0], &family1[1]);
-    assert_proper_pairing(&family2[0], &family2[1]);
+    assert_proper_pairing(&to_record_buf(&family1[0]), &to_record_buf(&family1[1]));
+    assert_proper_pairing(&to_record_buf(&family2[0]), &to_record_buf(&family2[1]));
 
     // Verify R1 and R2 have different sequences
     assert_ne!(
-        family1[0].sequence().as_ref(),
-        family1[1].sequence().as_ref(),
+        family1[0].sequence_vec(),
+        family1[1].sequence_vec(),
         "R1 and R2 should have different sequences"
     );
 
@@ -206,11 +191,10 @@ fn test_paired_end_umi_workflow() {
     all_reads.extend(family1);
     all_reads.extend(family2);
 
-    let rx_tag = Tag::from([b'R', b'X']);
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.data().get(&rx_tag).expect("RX tag") {
-            Value::String(s) => String::from_utf8_lossy(s.as_ref()).to_string(),
+        .map(|record| match record.tags().get(b"RX").expect("RX tag") {
+            fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
         .collect();

@@ -1216,8 +1216,7 @@ pub fn check_conversion_fraction_raw_with_ref_bases_and_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_sam::builder::RecordBuilder;
-    use noodles::sam::alignment::record_buf::RecordBuf;
+    use fgumi_raw_bam::SamBuilder as RawSamBuilder;
 
     #[test]
     fn test_filter_result_to_rejection_reason() {
@@ -1490,40 +1489,6 @@ mod tests {
     // Methylation filter tests
     // ========================================================================
 
-    /// Helper: build a raw BAM record with methylation tags from a `RecordBuf`.
-    fn build_raw_with_methylation_tags(
-        header: &noodles::sam::Header,
-        record: &RecordBuf,
-    ) -> Vec<u8> {
-        fgumi_raw_bam::encode_record_buf_to_raw(record, header)
-            .expect("encode_record_buf_to_raw should succeed")
-            .into_inner()
-    }
-
-    /// Helper: create a SAM header with a single reference sequence for mapped record tests.
-    fn header_for_methylation_tests() -> noodles::sam::Header {
-        //                  0123456789
-        // Reference:       ACGTCGATCG
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::ReferenceSequence;
-        use std::num::NonZeroUsize;
-        noodles::sam::Header::builder()
-            .add_reference_sequence(
-                "chr1",
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero")),
-            )
-            .build()
-    }
-
-    /// Helper: add an i16 array tag to a `RecordBuf`.
-    fn add_i16_array_tag(record: &mut RecordBuf, tag_str: &str, values: &[i16]) {
-        use noodles::sam::alignment::record::data::field::Tag;
-        use noodles::sam::alignment::record_buf::data::field::Value;
-        use noodles::sam::alignment::record_buf::data::field::value::Array;
-        let tag = Tag::from([tag_str.as_bytes()[0], tag_str.as_bytes()[1]]);
-        record.data_mut().insert(tag, Value::Array(Array::Int16(values.to_vec())));
-    }
-
     // -- MethylationDepthThresholds tests --
 
     #[test]
@@ -1554,60 +1519,41 @@ mod tests {
 
     #[test]
     fn test_mask_methylation_depth_simplex_all_pass() {
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("4M")
-            .build();
         // cu+ct = 5+3=8 at each position, min_depth=5 -> all pass
-        add_i16_array_tag(&mut record, "cu", &[5, 5, 5, 5]);
-        add_i16_array_tag(&mut record, "ct", &[3, 3, 3, 3]);
-
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            b.add_array_i16(b"cu", &[5, 5, 5, 5]).add_array_i16(b"ct", &[3, 3, 3, 3]);
+            b.build()
+        };
         let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
         assert_eq!(masked, 0);
     }
 
     #[test]
     fn test_mask_methylation_depth_simplex_some_fail() {
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("4M")
-            .build();
         // Position 0: cu+ct = 5+3=8 -> pass
         // Position 1: cu+ct = 1+1=2 -> fail (< 5)
         // Position 2: cu+ct = 0+0=0 -> fail
         // Position 3: cu+ct = 10+0=10 -> pass
-        add_i16_array_tag(&mut record, "cu", &[5, 1, 0, 10]);
-        add_i16_array_tag(&mut record, "ct", &[3, 1, 0, 0]);
-
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            b.add_array_i16(b"cu", &[5, 1, 0, 10]).add_array_i16(b"ct", &[3, 1, 0, 0]);
+            b.build()
+        };
         let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
         assert_eq!(masked, 2, "Positions 1 and 2 should be masked");
     }
 
     #[test]
     fn test_mask_methylation_depth_simplex_no_tags_no_masking() {
-        let header = header_for_methylation_tests();
-        let record = RecordBuilder::new()
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("4M")
-            .build();
         // No cu/ct tags
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            b.build()
+        };
         let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
         assert_eq!(masked, 0, "No methylation tags should mean no masking");
     }
@@ -1616,49 +1562,37 @@ mod tests {
 
     #[test]
     fn test_mask_methylation_depth_duplex_all_pass() {
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("4M")
-            .build();
-        add_i16_array_tag(&mut record, "cu", &[10, 10, 10, 10]);
-        add_i16_array_tag(&mut record, "ct", &[2, 2, 2, 2]);
-        add_i16_array_tag(&mut record, "au", &[5, 5, 5, 5]);
-        add_i16_array_tag(&mut record, "at", &[1, 1, 1, 1]);
-        add_i16_array_tag(&mut record, "bu", &[5, 5, 5, 5]);
-        add_i16_array_tag(&mut record, "bt", &[1, 1, 1, 1]);
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            b.add_array_i16(b"cu", &[10, 10, 10, 10])
+                .add_array_i16(b"ct", &[2, 2, 2, 2])
+                .add_array_i16(b"au", &[5, 5, 5, 5])
+                .add_array_i16(b"at", &[1, 1, 1, 1])
+                .add_array_i16(b"bu", &[5, 5, 5, 5])
+                .add_array_i16(b"bt", &[1, 1, 1, 1]);
+            b.build()
+        };
         let thresholds = MethylationDepthThresholds { duplex: 5, ab: 3, ba: 3 };
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
         let masked = mask_methylation_depth_duplex_raw(&mut raw, &thresholds).unwrap();
         assert_eq!(masked, 0);
     }
 
     #[test]
     fn test_mask_methylation_depth_duplex_ab_fails() {
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("4M")
-            .build();
         // Duplex passes (cu+ct=12), but AB fails at position 1 (au+at=1 < 3)
-        add_i16_array_tag(&mut record, "cu", &[10, 10, 10, 10]);
-        add_i16_array_tag(&mut record, "ct", &[2, 2, 2, 2]);
-        add_i16_array_tag(&mut record, "au", &[5, 0, 5, 5]);
-        add_i16_array_tag(&mut record, "at", &[1, 1, 1, 1]);
-        add_i16_array_tag(&mut record, "bu", &[5, 5, 5, 5]);
-        add_i16_array_tag(&mut record, "bt", &[1, 1, 1, 1]);
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            b.add_array_i16(b"cu", &[10, 10, 10, 10])
+                .add_array_i16(b"ct", &[2, 2, 2, 2])
+                .add_array_i16(b"au", &[5, 0, 5, 5])
+                .add_array_i16(b"at", &[1, 1, 1, 1])
+                .add_array_i16(b"bu", &[5, 5, 5, 5])
+                .add_array_i16(b"bt", &[1, 1, 1, 1]);
+            b.build()
+        };
         let thresholds = MethylationDepthThresholds { duplex: 5, ab: 3, ba: 3 };
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
         let masked = mask_methylation_depth_duplex_raw(&mut raw, &thresholds).unwrap();
         assert_eq!(masked, 1, "Position 1 should be masked (AB depth too low)");
     }
@@ -1674,23 +1608,22 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("AAAAACGAAAA")
-            .qualities(&[30; 11])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("11M")
-            .build();
         // au/at at position 5 (C): methylated (au=10, at=1)
         // bu/bt at position 6 (G): methylated (bu=10, bt=1)
-        add_i16_array_tag(&mut record, "au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "bu", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "bt", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
-
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[11 << 4])
+                .sequence(b"AAAAACGAAAA")
+                .qualities(&[30; 11]);
+            b.add_array_i16(b"au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0])
+                .add_array_i16(b"at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+                .add_array_i16(b"bu", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0])
+                .add_array_i16(b"bt", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+            b.build()
+        };
         let masked =
             mask_strand_methylation_agreement_raw(&mut raw, &reference, &ref_names).unwrap();
         assert_eq!(masked, 0, "Concordant CpG should not be masked");
@@ -1705,23 +1638,22 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("AAAAACGAAAA")
-            .qualities(&[30; 11])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("11M")
-            .build();
         // au/at at position 5 (C): methylated (au=10, at=1)
         // bu/bt at position 6 (G): unmethylated (bu=1, bt=10)
-        add_i16_array_tag(&mut record, "au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "bu", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "bt", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
-
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[11 << 4])
+                .sequence(b"AAAAACGAAAA")
+                .qualities(&[30; 11]);
+            b.add_array_i16(b"au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0])
+                .add_array_i16(b"at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+                .add_array_i16(b"bu", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+                .add_array_i16(b"bt", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
+            b.build()
+        };
         let masked =
             mask_strand_methylation_agreement_raw(&mut raw, &reference, &ref_names).unwrap();
         assert_eq!(masked, 2, "Both CpG positions should be masked when strands disagree");
@@ -1735,21 +1667,20 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACAGTGCATGA")
-            .qualities(&[30; 11])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("11M")
-            .build();
-        add_i16_array_tag(&mut record, "au", &[0; 11]);
-        add_i16_array_tag(&mut record, "at", &[0; 11]);
-        add_i16_array_tag(&mut record, "bu", &[0; 11]);
-        add_i16_array_tag(&mut record, "bt", &[0; 11]);
-
-        let mut raw = build_raw_with_methylation_tags(&header, &record);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[11 << 4])
+                .sequence(b"ACAGTGCATGA")
+                .qualities(&[30; 11]);
+            b.add_array_i16(b"au", &[0; 11])
+                .add_array_i16(b"at", &[0; 11])
+                .add_array_i16(b"bu", &[0; 11])
+                .add_array_i16(b"bt", &[0; 11]);
+            b.build()
+        };
         let masked =
             mask_strand_methylation_agreement_raw(&mut raw, &reference, &ref_names).unwrap();
         assert_eq!(masked, 0, "Non-CpG sites should not be masked");
@@ -1766,21 +1697,20 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // Non-CpG C at positions 1 and 5: high conversion (ct >> cu)
         // cu: unconverted count, ct: converted count
-        add_i16_array_tag(&mut record, "cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+            b.build()
+        };
         // 18 converted out of 20 = 90% conversion (positions 1 and 5)
         assert!(
             check_conversion_fraction_raw(
@@ -1801,20 +1731,19 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // Non-CpG C at positions 1 and 5: low conversion (cu >> ct)
-        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.build()
+        };
         // 2 converted out of 20 = 10% conversion (positions 1 and 5)
         assert!(
             !check_conversion_fraction_raw(
@@ -1836,21 +1765,20 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("AAAACGAAA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // CpG C at position 4: high unconverted (methylated) -- should be EXCLUDED
         // No non-CpG C positions -> should pass vacuously
-        add_i16_array_tag(&mut record, "cu", &[0, 0, 0, 0, 10, 0, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 0, 0, 0, 0, 0, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"AAAACGAAA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 0, 0, 0, 10, 0, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            b.build()
+        };
         assert!(
             check_conversion_fraction_raw(
                 &raw,
@@ -1870,17 +1798,17 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // No cu/ct tags
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.build()
+        };
         assert!(
             check_conversion_fraction_raw(
                 &raw,
@@ -1900,9 +1828,12 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let record = RecordBuilder::new().sequence("ACATACATA").qualities(&[30; 9]).build();
         // Unmapped record (no ref_id, no cigar)
-        let raw = build_raw_with_methylation_tags(&noodles::sam::Header::default(), &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.sequence(b"ACATACATA").qualities(&[30; 9]);
+            b.build()
+        };
         assert!(
             check_conversion_fraction_raw(
                 &raw,
@@ -1924,20 +1855,19 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // Non-CpG C at positions 1 and 5: high unconverted (cu >> ct) = good TAPs specificity
-        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.build()
+        };
         // TAPs numerator = cu: 18 out of 20 = 90%
         assert!(
             check_conversion_fraction_raw(
@@ -1958,20 +1888,19 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // Non-CpG C at positions 1 and 5: low unconverted (ct >> cu) = poor TAPs specificity
-        add_i16_array_tag(&mut record, "cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+            b.build()
+        };
         // TAPs numerator = cu: 2 out of 20 = 10%
         assert!(
             !check_conversion_fraction_raw(
@@ -1992,21 +1921,20 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // Non-CpG C at positions 1 and 5: cu=9, ct=1 at each
         // EM-Seq numerator = ct: 2/20 = 10%, TAPs numerator = cu: 18/20 = 90%
-        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.build()
+        };
         // EM-Seq should fail (10% < 80%), TAPs should pass (90% >= 80%)
         assert!(
             !check_conversion_fraction_raw(
@@ -2039,20 +1967,19 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let mut record = RecordBuilder::new()
-            .sequence("ACATACATA")
-            .qualities(&[30; 9])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("9M")
-            .build();
         // Data that would fail EM-Seq at 80% threshold
-        add_i16_array_tag(&mut record, "cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
-        add_i16_array_tag(&mut record, "ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
-
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[9 << 4])
+                .sequence(b"ACATACATA")
+                .qualities(&[30; 9]);
+            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.build()
+        };
         // Disabled mode should always pass regardless of data
         assert!(
             check_conversion_fraction_raw(
@@ -2075,16 +2002,11 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let record = RecordBuilder::new()
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(0)
-            .alignment_start(1) // 1-based -> 0-based pos=0
-            .mapping_quality(60)
-            .cigar("4M")
-            .build();
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
+            b.build()
+        };
         let bases = resolve_ref_bases_for_record(&raw, &reference, &ref_names).unwrap();
         assert_eq!(bases, vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')]);
     }
@@ -2096,16 +2018,17 @@ mod tests {
         let reference = TestRef::new(&[("chr1", ref_seq)]);
         let ref_names = vec!["chr1".to_string()];
 
-        let header = header_for_methylation_tests();
-        let record = RecordBuilder::new()
-            .sequence("ACNNGT") // 2M2I2M -> positions 2,3 are insertions
-            .qualities(&[30; 6])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60)
-            .cigar("2M2I2M")
-            .build();
-        let raw = build_raw_with_methylation_tags(&header, &record);
+        let raw = {
+            let mut b = RawSamBuilder::new();
+            // 2M2I2M -> positions 2,3 are insertions
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[2 << 4, 2 << 4 | 1, 2 << 4])
+                .sequence(b"ACNNGT")
+                .qualities(&[30; 6]);
+            b.build()
+        };
         let bases = resolve_ref_bases_for_record(&raw, &reference, &ref_names).unwrap();
         assert_eq!(bases, vec![Some(b'A'), Some(b'C'), None, None, Some(b'G'), Some(b'T')]);
     }

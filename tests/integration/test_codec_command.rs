@@ -6,12 +6,9 @@
 //! 3. Rejected reads output
 //! 4. Quality filtering options
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_lib::bam_io::create_raw_bam_writer;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
-use noodles::sam::alignment::record_buf::data::field::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -23,6 +20,7 @@ use crate::helpers::bam_generator::create_minimal_header;
 ///
 /// In CODEC sequencing, R1 and R2 come from opposite strands of the same molecule,
 /// so a single read pair can produce duplex consensus.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::too_many_arguments)]
 fn create_codec_read_pair(
     name: &str,
     r1_seq: &[u8],
@@ -31,76 +29,67 @@ fn create_codec_read_pair(
     r2_qual: &[u8],
     ref_start: usize,
     umi: &str,
-) -> (RecordBuf, RecordBuf) {
-    let read_len = r1_seq.len();
-    let cigar = format!("{read_len}M");
+    cell_barcode: Option<&str>,
+) -> (RawRecord, RawRecord) {
+    let r1_len = r1_seq.len();
+    let r2_len = r2_seq.len();
+    let r1_cigar_op = u32::try_from(r1_len).expect("r1_len fits u32") << 4; // nM
+    let r2_cigar_op = u32::try_from(r2_len).expect("r2_len fits u32") << 4; // nM
+    // SamBuilder pos is 0-based; ref_start is 1-based
+    let pos = i32::try_from(ref_start).expect("ref_start fits i32") - 1;
+    // MC is the mate's CIGAR, so b1 carries R2's tag and vice versa.
+    let r1_mc_tag = format!("{r1_len}M");
+    let r2_mc_tag = format!("{r2_len}M");
 
-    // R1: forward read
-    let mut r1 = RecordBuilder::new()
-        .name(name)
-        .sequence(&String::from_utf8_lossy(r1_seq))
+    let mut b1 = SamBuilder::new();
+    b1.read_name(name.as_bytes())
+        .sequence(r1_seq)
         .qualities(r1_qual)
-        .cigar(&cigar)
-        .reference_sequence_id(0)
-        .alignment_start(ref_start)
-        .mapping_quality(60)
-        .paired(true)
-        .first_segment(true)
-        .mate_reverse_complement(true)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(ref_start)
-        .tag("MI", umi)
-        .tag("MC", cigar.clone())
-        .build();
-
-    // Set template length for FR pair
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    {
-        *r1.template_length_mut() = read_len as i32;
+        .cigar_ops(&[r1_cigar_op])
+        .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(r1_len as i32)
+        .add_string_tag(b"MI", umi.as_bytes())
+        .add_string_tag(b"MC", r2_mc_tag.as_bytes());
+    if let Some(cb) = cell_barcode {
+        b1.add_string_tag(b"CB", cb.as_bytes());
     }
 
-    // R2: reverse read (from opposite strand)
-    let mut r2 = RecordBuilder::new()
-        .name(name)
-        .sequence(&String::from_utf8_lossy(r2_seq))
+    let mut b2 = SamBuilder::new();
+    b2.read_name(name.as_bytes())
+        .sequence(r2_seq)
         .qualities(r2_qual)
-        .cigar(&cigar)
-        .reference_sequence_id(0)
-        .alignment_start(ref_start)
-        .mapping_quality(60)
-        .paired(true)
-        .first_segment(false)
-        .reverse_complement(true)
-        .mate_reference_sequence_id(0)
-        .mate_alignment_start(ref_start)
-        .tag("MI", umi)
-        .tag("MC", cigar)
-        .build();
-
-    // Set template length for FR pair (negative for R2)
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    {
-        *r2.template_length_mut() = -(read_len as i32);
+        .cigar_ops(&[r2_cigar_op])
+        .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+        .ref_id(0)
+        .pos(pos)
+        .mapq(60)
+        .mate_ref_id(0)
+        .mate_pos(pos)
+        .template_length(-(r2_len as i32))
+        .add_string_tag(b"MI", umi.as_bytes())
+        .add_string_tag(b"MC", r1_mc_tag.as_bytes());
+    if let Some(cb) = cell_barcode {
+        b2.add_string_tag(b"CB", cb.as_bytes());
     }
 
-    (r1, r2)
+    (b1.build(), b2.build())
 }
 
 /// Helper to create a test BAM file with CODEC read pairs.
-fn create_codec_test_bam(path: &PathBuf, pairs: Vec<(RecordBuf, RecordBuf)>) {
+fn create_codec_test_bam(path: &PathBuf, pairs: Vec<(RawRecord, RawRecord)>) {
     let header = create_minimal_header("chr1", 10000);
-
     let mut writer =
-        bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
-
-    writer.write_header(&header).expect("Failed to write header");
-
+        create_raw_bam_writer(path, &header, 1, 6).expect("Failed to create raw BAM writer");
     for (r1, r2) in pairs {
-        writer.write_alignment_record(&header, &r1).expect("Failed to write R1");
-        writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
+        writer.write_raw_record(r1.as_ref()).expect("Failed to write R1");
+        writer.write_raw_record(r2.as_ref()).expect("Failed to write R2");
     }
-
-    writer.try_finish().expect("Failed to finish BAM");
+    writer.finish().expect("Failed to finish BAM");
 }
 
 /// Test basic CODEC consensus calling.
@@ -121,6 +110,7 @@ fn test_codec_command_basic_consensus() {
             &[30; 8],
             100,
             "UMI001",
+            None,
         );
         pairs.push((r1, r2));
     }
@@ -183,6 +173,7 @@ fn test_codec_command_with_stats() {
             &[30; 8],
             100,
             "UMI001",
+            None,
         );
         pairs.push((r1, r2));
     }
@@ -195,6 +186,7 @@ fn test_codec_command_with_stats() {
             &[30; 8],
             200,
             "UMI002",
+            None,
         );
         pairs.push((r1, r2));
     }
@@ -249,6 +241,7 @@ fn test_codec_command_with_rejects() {
             &[30; 8],
             100,
             "UMI_PASS",
+            None,
         );
         pairs.push((r1, r2));
     }
@@ -262,6 +255,7 @@ fn test_codec_command_with_rejects() {
         &[30; 8],
         200,
         "UMI_FAIL",
+        None,
     );
     pairs.push((r1, r2));
 
@@ -322,6 +316,7 @@ fn test_codec_command_min_duplex_length() {
             &[30; 8],
             100,
             "UMI001",
+            None,
         );
         pairs.push((r1, r2));
     }
@@ -373,6 +368,7 @@ fn test_codec_command_per_base_tags() {
             &[30; 8],
             100,
             "UMI001",
+            None,
         );
         pairs.push((r1, r2));
     }
@@ -415,31 +411,6 @@ fn test_codec_command_per_base_tags() {
     }
 }
 
-/// Creates a CODEC read pair with an optional cell barcode tag.
-#[allow(clippy::too_many_arguments)]
-fn create_codec_read_pair_with_cell_tag(
-    name: &str,
-    r1_seq: &[u8],
-    r2_seq: &[u8],
-    r1_qual: &[u8],
-    r2_qual: &[u8],
-    ref_start: usize,
-    umi: &str,
-    cell_barcode: Option<&str>,
-) -> (RecordBuf, RecordBuf) {
-    let (mut r1, mut r2) =
-        create_codec_read_pair(name, r1_seq, r2_seq, r1_qual, r2_qual, ref_start, umi);
-
-    // Add cell barcode if provided
-    if let Some(cell_bc) = cell_barcode {
-        let cb_tag = Tag::from([b'C', b'B']);
-        r1.data_mut().insert(cb_tag, Value::from(cell_bc.to_string()));
-        r2.data_mut().insert(cb_tag, Value::from(cell_bc.to_string()));
-    }
-
-    (r1, r2)
-}
-
 /// Test CODEC command preserves cell barcode tag.
 #[test]
 fn test_codec_command_cell_barcode_preservation() {
@@ -450,7 +421,7 @@ fn test_codec_command_cell_barcode_preservation() {
     // Create 3 read pairs with cell barcode
     let mut pairs = Vec::new();
     for i in 0..3 {
-        let (r1, r2) = create_codec_read_pair_with_cell_tag(
+        let (r1, r2) = create_codec_read_pair(
             &format!("read{i}"),
             b"ACGTACGT",
             b"ACGTACGT",

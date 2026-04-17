@@ -1,6 +1,6 @@
 //! Integration tests for the fastq command.
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::create_minimal_header;
+use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 
 /// Create a BAM file with paired-end reads for testing.
 fn create_paired_bam(path: &PathBuf, read_pairs: Vec<(&str, &str, &str, &str, &str, bool)>) {
@@ -22,34 +22,40 @@ fn create_paired_bam(path: &PathBuf, read_pairs: Vec<(&str, &str, &str, &str, &s
 
     // Create paired-end records
     for (name, seq1, qual1, seq2, qual2, r2_reverse) in read_pairs {
-        // R1 (forward strand)
-        let r1 = RecordBuilder::new()
-            .name(name)
-            .sequence(seq1)
-            .qualities(&qual1.bytes().map(|b| b - 33).collect::<Vec<u8>>())
-            .paired(true)
-            .first_segment(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .build();
+        let q1: Vec<u8> = qual1.bytes().map(|b| b - 33).collect();
+        let q2: Vec<u8> = qual2.bytes().map(|b| b - 33).collect();
 
-        writer.write_alignment_record(&header, &r1).expect("Failed to write R1");
+        // R1 (forward strand)
+        let r1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(seq1.as_bytes())
+                .qualities(&q1)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60);
+            b.build()
+        };
+
+        writer.write_alignment_record(&header, &to_record_buf(&r1)).expect("Failed to write R1");
 
         // R2 (optionally reverse complemented)
-        let r2 = RecordBuilder::new()
-            .name(name)
-            .sequence(seq2)
-            .qualities(&qual2.bytes().map(|b| b - 33).collect::<Vec<u8>>())
-            .paired(true)
-            .first_segment(false)
-            .reverse_complement(r2_reverse)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .build();
+        let r2_flags =
+            flags::PAIRED | flags::LAST_SEGMENT | if r2_reverse { flags::REVERSE } else { 0 };
+        let r2 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(seq2.as_bytes())
+                .qualities(&q2)
+                .flags(r2_flags)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60);
+            b.build()
+        };
 
-        writer.write_alignment_record(&header, &r2).expect("Failed to write R2");
+        writer.write_alignment_record(&header, &to_record_buf(&r2)).expect("Failed to write R2");
     }
 
     writer.try_finish().expect("Failed to finish BAM");
@@ -129,10 +135,8 @@ fn test_fastq_reverse_complement() {
     let output_fq = temp_dir.path().join("output.fq");
 
     // Create input BAM with R2 reverse complemented
-    // The stored sequence is "ACGT", but since it's reverse complemented,
-    // the output should be "ACGT" (reverse complement of "ACGT" = "ACGT")
-    // Actually, reverse complement of "ACGT" = reverse("TGCA") = "ACGT"
-    // Let me use a more obvious example: "AAAA" -> reverse complement = "TTTT"
+    // The stored sequence is "AAAA", but since it's reverse complemented,
+    // the output should be reverse complement: "TTTT"
     create_paired_bam(
         &input_bam,
         vec![
@@ -234,39 +238,51 @@ fn create_bam_with_flags(path: &PathBuf) {
     writer.write_header(&header).expect("Failed to write header");
 
     // Create a primary read
-    let primary = RecordBuilder::new()
-        .name("primary")
-        .sequence("ACGT")
-        .qualities(&[30, 30, 30, 30])
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .build();
-    writer.write_alignment_record(&header, &primary).expect("Failed to write primary");
+    let primary = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"primary")
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30])
+            .ref_id(0)
+            .pos(99)
+            .mapq(60);
+        b.build()
+    };
+    writer
+        .write_alignment_record(&header, &to_record_buf(&primary))
+        .expect("Failed to write primary");
 
     // Create a secondary read (flag 0x100)
-    let secondary = RecordBuilder::new()
-        .name("secondary")
-        .sequence("TGCA")
-        .qualities(&[30, 30, 30, 30])
-        .secondary(true)
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .build();
-    writer.write_alignment_record(&header, &secondary).expect("Failed to write secondary");
+    let secondary = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"secondary")
+            .sequence(b"TGCA")
+            .qualities(&[30, 30, 30, 30])
+            .flags(flags::SECONDARY)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60);
+        b.build()
+    };
+    writer
+        .write_alignment_record(&header, &to_record_buf(&secondary))
+        .expect("Failed to write secondary");
 
     // Create a supplementary read (flag 0x800)
-    let supplementary = RecordBuilder::new()
-        .name("supplementary")
-        .sequence("GGGG")
-        .qualities(&[30, 30, 30, 30])
-        .supplementary(true)
-        .reference_sequence_id(0)
-        .alignment_start(100)
-        .mapping_quality(60)
-        .build();
-    writer.write_alignment_record(&header, &supplementary).expect("Failed to write supplementary");
+    let supplementary = {
+        let mut b = SamBuilder::new();
+        b.read_name(b"supplementary")
+            .sequence(b"GGGG")
+            .qualities(&[30, 30, 30, 30])
+            .flags(flags::SUPPLEMENTARY)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60);
+        b.build()
+    };
+    writer
+        .write_alignment_record(&header, &to_record_buf(&supplementary))
+        .expect("Failed to write supplementary");
 
     writer.try_finish().expect("Failed to finish BAM");
 }

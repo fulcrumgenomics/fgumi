@@ -6,7 +6,7 @@
 //! 3. Error on missing input files
 
 use fgumi_lib::sam::SamTag;
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -18,37 +18,43 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_test_reference};
+use crate::helpers::bam_generator::{create_minimal_header, create_test_reference, to_record_buf};
 
 /// Create a queryname-sorted unmapped BAM with UMI tags (RX/QX).
-fn create_unmapped_bam(path: &Path, records: &[RecordBuf]) {
+fn create_unmapped_bam(path: &Path, records: &[RawRecord]) {
     let header = sam::Header::default();
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create unmapped BAM"));
     writer.write_header(&header).expect("Failed to write header");
     for record in records {
-        writer.write_alignment_record(&header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
     writer.finish(&header).expect("Failed to finish BAM");
 }
 
 /// Create a mapped SAM file with aligned reads (same read names as unmapped).
-fn create_mapped_sam(path: &Path, header: &sam::Header, records: &[RecordBuf]) {
+fn create_mapped_sam(path: &Path, header: &sam::Header, records: &[RawRecord]) {
     let file = fs::File::create(path).expect("Failed to create mapped SAM");
     let mut writer = sam::io::Writer::new(file);
     writer.write_header(header).expect("Failed to write header");
     for record in records {
-        writer.write_alignment_record(header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
 }
 
 /// Create a mapped BAM file with aligned reads (same read names as unmapped).
-fn create_mapped_bam(path: &Path, header: &sam::Header, records: &[RecordBuf]) {
+fn create_mapped_bam(path: &Path, header: &sam::Header, records: &[RawRecord]) {
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create mapped BAM"));
     writer.write_header(header).expect("Failed to write header");
     for record in records {
-        writer.write_alignment_record(header, record).expect("Failed to write record");
+        writer
+            .write_alignment_record(header, &to_record_buf(record))
+            .expect("Failed to write record");
     }
     writer.finish(header).expect("Failed to finish BAM");
 }
@@ -64,46 +70,54 @@ fn test_zipper_basic_merge() {
 
     // Unmapped reads with RX/QX tags
     let unmapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "AACCGGTT")
-            .tag("QX", "IIIIIIII")
-            .build(),
-        RecordBuilder::new()
-            .name("read2")
-            .sequence("TGCATGCA")
-            .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "GGTTCCAA")
-            .tag("QX", "IIIIIIII")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED)
+                .add_string_tag(b"RX", b"AACCGGTT")
+                .add_string_tag(b"QX", b"IIIIIIII");
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read2")
+                .sequence(b"TGCATGCA")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED)
+                .add_string_tag(b"RX", b"GGTTCCAA")
+                .add_string_tag(b"QX", b"IIIIIIII");
+            b.build()
+        },
     ];
     create_unmapped_bam(&unmapped_bam, &unmapped_records);
 
     // Mapped reads (same names, aligned to chr1)
     let mapped_header = create_minimal_header("chr1", 10000);
     let mapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
-        RecordBuilder::new()
-            .name("read2")
-            .sequence("TGCATGCA")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read2")
+                .sequence(b"TGCATGCA")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        },
     ];
     create_mapped_sam(&mapped_sam, &mapped_header, &mapped_records);
 
@@ -149,30 +163,30 @@ fn test_zipper_tag_removal() {
     let ref_path = create_test_reference(temp_dir.path());
 
     // Unmapped read with RX and a custom tag XY
-    let unmapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
+    let unmapped_records = vec![{
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
             .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "AACCGGTT")
-            .tag("XY", "REMOVE_ME")
-            .build(),
-    ];
+            .flags(flags::UNMAPPED)
+            .add_string_tag(b"RX", b"AACCGGTT")
+            .add_string_tag(b"XY", b"REMOVE_ME");
+        b.build()
+    }];
     create_unmapped_bam(&unmapped_bam, &unmapped_records);
 
     let mapped_header = create_minimal_header("chr1", 10000);
-    let mapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
+    let mapped_records = vec![{
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTACGT")
             .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
-    ];
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[8 << 4]); // 8M
+        b.build()
+    }];
     create_mapped_sam(&mapped_sam, &mapped_header, &mapped_records);
 
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
@@ -246,45 +260,53 @@ fn test_zipper_bam_mapped_input() {
     let ref_path = create_test_reference(temp_dir.path());
 
     let unmapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "AACCGGTT")
-            .tag("QX", "IIIIIIII")
-            .build(),
-        RecordBuilder::new()
-            .name("read2")
-            .sequence("TGCATGCA")
-            .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "GGTTCCAA")
-            .tag("QX", "IIIIIIII")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED)
+                .add_string_tag(b"RX", b"AACCGGTT")
+                .add_string_tag(b"QX", b"IIIIIIII");
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read2")
+                .sequence(b"TGCATGCA")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED)
+                .add_string_tag(b"RX", b"GGTTCCAA")
+                .add_string_tag(b"QX", b"IIIIIIII");
+            b.build()
+        },
     ];
     create_unmapped_bam(&unmapped_bam, &unmapped_records);
 
     let mapped_header = create_minimal_header("chr1", 10000);
     let mapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
-        RecordBuilder::new()
-            .name("read2")
-            .sequence("TGCATGCA")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read2")
+                .sequence(b"TGCATGCA")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        },
     ];
     create_mapped_bam(&mapped_bam, &mapped_header, &mapped_records);
 
@@ -344,45 +366,53 @@ fn test_zipper_bam_stdin_input() {
     let ref_path = create_test_reference(temp_dir.path());
 
     let unmapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "AACCGGTT")
-            .tag("QX", "IIIIIIII")
-            .build(),
-        RecordBuilder::new()
-            .name("read2")
-            .sequence("TGCATGCA")
-            .qualities(&[30; 8])
-            .unmapped(true)
-            .tag("RX", "GGTTCCAA")
-            .tag("QX", "IIIIIIII")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED)
+                .add_string_tag(b"RX", b"AACCGGTT")
+                .add_string_tag(b"QX", b"IIIIIIII");
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read2")
+                .sequence(b"TGCATGCA")
+                .qualities(&[30; 8])
+                .flags(flags::UNMAPPED)
+                .add_string_tag(b"RX", b"GGTTCCAA")
+                .add_string_tag(b"QX", b"IIIIIIII");
+            b.build()
+        },
     ];
     create_unmapped_bam(&unmapped_bam, &unmapped_records);
 
     let mapped_header = create_minimal_header("chr1", 10000);
     let mapped_records = vec![
-        RecordBuilder::new()
-            .name("read1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
-        RecordBuilder::new()
-            .name("read2")
-            .sequence("TGCATGCA")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mapping_quality(60)
-            .cigar("8M")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"read2")
+                .sequence(b"TGCATGCA")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]); // 8M
+            b.build()
+        },
     ];
     create_mapped_bam(&mapped_bam, &mapped_header, &mapped_records);
 

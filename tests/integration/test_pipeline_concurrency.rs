@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_minimal_header, create_umi_family};
+use crate::helpers::bam_generator::{create_minimal_header, create_umi_family, to_record_buf};
 use fgumi_lib::grouper::SingleRecordGrouper;
 use fgumi_lib::unified_pipeline::{
     BamPipelineConfig, DecodedRecord, Grouper, OrderedQueue, run_bam_pipeline_with_grouper,
@@ -58,8 +58,9 @@ fn create_test_bam_with_families(
     for &(umi, depth, base_name, sequence) in families {
         let family = create_umi_family(umi, depth, base_name, sequence, 30);
         for record in &family {
-            writer.write_alignment_record(header, record).expect("Failed to write record");
-            records.push(record.clone());
+            let record_buf = to_record_buf(record);
+            writer.write_alignment_record(header, &record_buf).expect("Failed to write record");
+            records.push(record_buf);
         }
     }
 
