@@ -42,8 +42,8 @@
 //! ```
 
 use crate::bam_io::{
-    BamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
-    create_optional_bam_writer, create_raw_bam_reader_with_opts,
+    BamWriter, RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
 use crate::bitenc::BitEnc;
 use crate::dna::reverse_complement_str;
@@ -52,19 +52,20 @@ use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
-use crate::sam::SamTag;
+use crate::sam::{SamTag, header_as_unsorted};
 use crate::sort::bam_fields;
 use crate::template::TemplateBatch;
 use crate::unified_pipeline::{Grouper, MemoryEstimate, run_bam_pipeline_from_reader};
 use crate::validation::validate_file_exists;
 use ahash::AHashMap;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
+use parking_lot::Mutex;
 use std::io;
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -298,8 +299,6 @@ struct TemplateCorrection {
 struct CorrectProcessedBatch {
     /// Raw-byte kept records.
     kept_raw_records: Vec<RawRecord>,
-    /// Raw-byte rejected records.
-    rejected_raw_records: Vec<RawRecord>,
     /// Number of templates processed.
     templates_count: u64,
     /// Number of missing UMI records.
@@ -314,15 +313,8 @@ struct CorrectProcessedBatch {
 
 impl MemoryEstimate for CorrectProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
-        let raw_size: usize = self
-            .kept_raw_records
-            .iter()
-            .chain(self.rejected_raw_records.iter())
-            .map(RawRecord::capacity)
-            .sum();
-        let raw_vec_overhead = (self.kept_raw_records.capacity()
-            + self.rejected_raw_records.capacity())
-            * std::mem::size_of::<RawRecord>();
+        let raw_size: usize = self.kept_raw_records.iter().map(RawRecord::capacity).sum();
+        let raw_vec_overhead = self.kept_raw_records.capacity() * std::mem::size_of::<RawRecord>();
         raw_size + raw_vec_overhead
     }
 }
@@ -340,8 +332,6 @@ struct CollectedCorrectMetrics {
     mismatched: u64,
     /// Per-UMI match counts (for metrics file).
     umi_matches: AHashMap<String, UmiCorrectionMetrics>,
-    /// Rejected raw records (if tracking).
-    raw_rejects: Vec<RawRecord>,
 }
 
 impl Command for CorrectUmis {
@@ -802,6 +792,31 @@ impl CorrectUmis {
         let collected_metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(num_threads);
         let collected_for_serialize = Arc::clone(&collected_metrics);
 
+        // Open rejects writer up front. Rejected records are streamed straight
+        // to disk from process_fn, per-template, so no batch-level buffering.
+        // Because workers flush under a mutex rather than through the ordered
+        // serialize stage, reject records are emitted in mutex-acquisition
+        // order, not input order; mark the rejects header as SO:unsorted so
+        // downstream tools don't assume the input's sort order carried over.
+        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
+            if let Some(path) = self.rejects_opts.rejects.as_ref() {
+                let writer_threads = self.threading.num_threads();
+                let rejects_header = header_as_unsorted(&header);
+                let w = create_raw_bam_writer(
+                    path,
+                    &rejects_header,
+                    writer_threads,
+                    self.compression.compression_level,
+                )?;
+                Some(Arc::new(Mutex::new(Some(w))))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
+
         // Configuration for closures
         const BATCH_SIZE: usize = 1000; // Templates per batch
         let max_mismatches = self.max_mismatches;
@@ -844,7 +859,6 @@ impl CorrectUmis {
                 }
 
                 let mut kept_raw_records: Vec<RawRecord> = Vec::new();
-                let mut rejected_raw_records: Vec<RawRecord> = Vec::new();
                 let mut missing_umis = 0u64;
                 let mut wrong_length = 0u64;
                 let mut mismatched = 0u64;
@@ -853,6 +867,24 @@ impl CorrectUmis {
                 // Count ALL input records for progress tracking (not just kept/rejected)
                 let mut total_input_records = 0u64;
                 let umi_tag_bytes: [u8; 2] = [umi_tag.as_ref()[0], umi_tag.as_ref()[1]];
+
+                // Stream rejected records straight to disk so they don't
+                // accumulate in a batch-level Vec. The mutex only serializes
+                // the raw-byte append; BGZF compression runs on the writer's
+                // own thread pool.
+                let flush_raw_records = |recs: Vec<RawRecord>| -> io::Result<()> {
+                    if let Some(ref rw_arc) = rejects_writer_for_process {
+                        if !recs.is_empty() {
+                            let mut guard = rw_arc.lock();
+                            if let Some(w) = guard.as_mut() {
+                                for raw in &recs {
+                                    w.write_raw_record(raw.as_ref())?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                };
 
                 for template in batch {
                     // Count input records BEFORE processing
@@ -877,7 +909,7 @@ impl CorrectUmis {
                                     });
                                 entry.total_matches += num_records;
                                 if track_rejects {
-                                    rejected_raw_records.extend(raw_records);
+                                    flush_raw_records(raw_records)?;
                                 }
                             }
                             Some(umi) => {
@@ -938,7 +970,7 @@ impl CorrectUmis {
                                         });
                                     entry.total_matches += num_records;
                                     if track_rejects {
-                                        rejected_raw_records.extend(raw_records);
+                                        flush_raw_records(raw_records)?;
                                     }
                                 }
                             }
@@ -954,7 +986,6 @@ impl CorrectUmis {
 
                 Ok(CorrectProcessedBatch {
                     kept_raw_records,
-                    rejected_raw_records,
                     templates_count,
                     missing_umis,
                     wrong_length,
@@ -969,10 +1000,10 @@ impl CorrectUmis {
                                  _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
-            // Merge per-batch counts + UMI matches + rejects into this
-            // worker's accumulator slot.
+            // Rejects were already streamed to disk in process_fn.
+            // Merge per-batch counts + UMI matches into this worker's
+            // accumulator slot.
             let umi_matches = std::mem::take(&mut processed.umi_matches);
-            let mut rejects = std::mem::take(&mut processed.rejected_raw_records);
             collected_for_serialize.with_slot(|m| {
                 m.templates_processed += processed.templates_count;
                 m.missing_umis += processed.missing_umis;
@@ -981,7 +1012,6 @@ impl CorrectUmis {
                 for (umi, counts) in umi_matches {
                     merge_umi_counts(&mut m.umi_matches, umi, &counts);
                 }
-                m.raw_rejects.append(&mut rejects);
             });
 
             // Serialize kept records
@@ -996,11 +1026,8 @@ impl CorrectUmis {
             Ok(kept_count)
         };
 
-        // Clone header before pipeline (needed for post-pipeline rejects writing)
-        let header_for_rejects = header.clone();
-
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let records_written = run_bam_pipeline_from_reader(
+        let pipeline_result = run_bam_pipeline_from_reader(
             pipeline_config,
             reader,
             header,
@@ -1009,7 +1036,30 @@ impl CorrectUmis {
             grouper_fn,
             process_fn,
             serialize_fn,
-        )?;
+        );
+
+        // Always finalize the rejects writer, even if the pipeline failed, so any
+        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
+        // finish() failures alongside any pipeline error so neither is silently
+        // dropped.
+        let rejects_finish_result = rejects_writer
+            .and_then(|rw_arc| rw_arc.lock().take())
+            .map(|writer| writer.finish().context("Failed to finish rejects file"));
+
+        let records_written = match (pipeline_result, rejects_finish_result) {
+            (Ok(records_written), Some(Ok(()))) => {
+                info!("Rejected records streamed to rejects file during processing");
+                records_written
+            }
+            (Ok(records_written), None) => records_written,
+            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
+            (Err(pipeline_err), Some(Err(finish_err))) => {
+                return Err(anyhow::anyhow!(
+                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
+                ));
+            }
+            (Err(pipeline_err), _) => return Err(pipeline_err.into()),
+        };
 
         // ========== Post-pipeline: Aggregate metrics ==========
         let mut total_templates = 0u64;
@@ -1017,7 +1067,6 @@ impl CorrectUmis {
         let mut total_wrong_length = 0u64;
         let mut total_mismatched = 0u64;
         let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-        let mut all_raw_rejects: Vec<RawRecord> = Vec::new();
 
         for slot in collected_metrics.slots() {
             let mut m = slot.lock();
@@ -1028,35 +1077,6 @@ impl CorrectUmis {
 
             for (umi, counts) in m.umi_matches.drain() {
                 merge_umi_counts(&mut merged_umi_matches, umi, &counts);
-            }
-
-            if track_rejects {
-                all_raw_rejects.append(&mut m.raw_rejects);
-            }
-        }
-
-        // Write rejects file if requested
-        if track_rejects && !all_raw_rejects.is_empty() {
-            if let Some(rejects_path) = &self.rejects_opts.rejects {
-                let writer_threads = self.threading.num_threads();
-                let mut rejects_writer = create_optional_bam_writer(
-                    Some(rejects_path),
-                    &header_for_rejects,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?
-                .expect("create_optional_bam_writer returns Some when given Some path");
-
-                for raw in &all_raw_rejects {
-                    use std::io::Write;
-                    let block_size = raw.len() as u32;
-                    rejects_writer.get_mut().write_all(&block_size.to_le_bytes())?;
-                    rejects_writer.get_mut().write_all(raw)?;
-                }
-
-                rejects_writer.into_inner().finish()?;
-                let total_reject_records = all_raw_rejects.len();
-                info!("Wrote {total_reject_records} rejected records to rejects file");
             }
         }
 
