@@ -157,6 +157,33 @@ fn bench_view_accessors(c: &mut Criterion) {
             black_box(v.tags().find_int(b"NM"))
         });
     });
+
+    // Shorter seq (below SIMD threshold)
+    let bytes_short = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 16)], 16, -1, -1, &[]);
+    c.bench_function("view::sequence_vec_16bp", |b| {
+        b.iter(|| {
+            let v = RawRecordView::new(black_box(&bytes_short));
+            black_box(v.sequence_vec());
+        });
+    });
+
+    // 150 bp read (typical Illumina short read; SIMD active)
+    let bytes_150 = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 150)], 150, -1, -1, &[]);
+    c.bench_function("view::sequence_vec_150bp", |b| {
+        b.iter(|| {
+            let v = RawRecordView::new(black_box(&bytes_150));
+            black_box(v.sequence_vec());
+        });
+    });
+
+    // 300 bp read (2× typical; SIMD loop iterations dominate)
+    let bytes_300 = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 300)], 300, -1, -1, &[]);
+    c.bench_function("view::sequence_vec_300bp", |b| {
+        b.iter(|| {
+            let v = RawRecordView::new(black_box(&bytes_300));
+            black_box(v.sequence_vec());
+        });
+    });
 }
 
 // ============================================================================

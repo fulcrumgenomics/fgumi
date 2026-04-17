@@ -278,7 +278,11 @@ pub(crate) const TAG_FIXED_SIZES: [u8; 256] = {
 };
 
 /// Calculate the size of a tag value based on its type.
-#[inline]
+// Inlining always is justified here: `tag_value_size` is the inner dispatch of
+// the hot `find_tag_position` loop and is tiny (a table lookup + match).
+// Forcing inline eliminates one call boundary per tag-scan iteration.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 #[must_use]
 pub fn tag_value_size(val_type: u8, data: &[u8]) -> Option<usize> {
     let fixed = TAG_FIXED_SIZES[val_type as usize];
@@ -455,8 +459,12 @@ pub fn aux_data_offset_from_record(bam: &[u8]) -> Option<usize> {
         return None;
     }
     let l_rn = bam[8] as usize;
-    let n_co = u16::from_le_bytes([bam[12], bam[13]]) as usize;
-    let l_s = u32::from_le_bytes([bam[16], bam[17], bam[18], bam[19]]) as usize;
+    // Single 8-byte load over offsets 12..20 covers n_cigar_op (u16 at 12),
+    // flag (u16 at 14, discarded), and l_seq (u32 at 16). Avoids three
+    // separate loads in a frequently-called header-decode path.
+    let packed = u64::from_le_bytes(bam[12..20].try_into().ok()?);
+    let n_co = (packed & 0xFFFF) as usize;
+    let l_s = ((packed >> 32) & 0xFFFF_FFFF) as usize;
     Some(aux_data_offset(l_rn, n_co, l_s))
 }
 
