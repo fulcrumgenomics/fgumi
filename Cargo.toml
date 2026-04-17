@@ -114,7 +114,8 @@ stress-tests = []
 rstest = "0"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
-fgumi-raw-bam = { workspace = true, features = ["test-utils"] }
+fgumi-raw-bam = { workspace = true, features = ["test-utils", "noodles"] }
+noodles = { version = "0.106.0", features = ["bam", "sam"] }
 
 [[bench]]
 name = "core_functions"
@@ -122,6 +123,10 @@ harness = false
 
 [[bench]]
 name = "reorder_buffer"
+harness = false
+
+[[bench]]
+name = "raw_bam"
 harness = false
 
 [build-dependencies]

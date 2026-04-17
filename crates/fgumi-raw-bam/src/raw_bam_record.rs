@@ -961,4 +961,147 @@ mod tests {
             read_raw_record(&mut reader, &mut record).expect("reading at EOF should return Ok(0)");
         assert_eq!(n, 0); // EOF
     }
+
+    // ── Edge-case tests for length-changing edits ──────────────────────────
+
+    /// A 254-byte name (+ NUL = 255 = `u8::MAX`) is the longest name the BAM
+    /// spec allows; `set_read_name` must accept it without panic.
+    #[test]
+    fn test_set_read_name_max_length_254_bytes_succeeds() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        let max_name = vec![b'A'; 254]; // + NUL = 255 = u8::MAX
+        rec.set_read_name(&max_name);
+        assert_eq!(rec.l_read_name(), 255);
+        assert_eq!(rec.read_name().len(), 254);
+        assert_eq!(rec.read_name(), max_name.as_slice());
+    }
+
+    /// A 255-byte name (+ NUL = 256) overflows `u8`; `set_read_name` must panic.
+    #[test]
+    #[should_panic(expected = "read name too long")]
+    fn test_set_read_name_over_limit_panics() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        let too_long = vec![b'A'; 255]; // + NUL = 256 > u8::MAX
+        rec.set_read_name(&too_long);
+    }
+
+    /// An empty name is valid: `l_read_name` should be 1 (just the NUL
+    /// terminator) and `read_name()` should return an empty slice.
+    #[test]
+    fn test_set_read_name_empty() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"somename", &[encode_op(0, 4)], 4, -1, -1, &[]);
+        let mut rec = RawRecord::from(bytes);
+        rec.set_read_name(b"");
+        assert_eq!(rec.l_read_name(), 1); // just the NUL
+        assert_eq!(rec.read_name(), b"");
+    }
+
+    /// `set_cigar_ops(&[])` clears the CIGAR entirely: `n_cigar_op` must be 0
+    /// and aux tags must survive the splice unchanged.
+    #[test]
+    fn test_set_cigar_ops_empty_clears_cigar() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(
+            0,
+            0,
+            0,
+            b"r",
+            &[encode_op(0, 10), encode_op(2, 1), encode_op(0, 5)],
+            15,
+            -1,
+            -1,
+            b"NMc\x05",
+        );
+        let mut rec = RawRecord::from(bytes);
+        let pre_nm = rec.tags().find_int(b"NM");
+
+        rec.set_cigar_ops(&[]);
+
+        assert_eq!(rec.n_cigar_op(), 0);
+        assert_eq!(rec.cigar_ops_vec(), Vec::<u32>::new());
+        // Aux tags survive the clear.
+        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+    }
+
+    /// `set_sequence_and_qualities(b"", &[])` is legal: `l_seq` becomes 0, the
+    /// packed-sequence and quality slices are empty, and aux tags are preserved.
+    #[test]
+    fn test_set_sequence_and_qualities_zero_length() {
+        use crate::testutil::*;
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, b"NMc\x05");
+        let mut rec = RawRecord::from(bytes);
+        let pre_nm = rec.tags().find_int(b"NM");
+
+        rec.set_sequence_and_qualities(b"", &[]);
+
+        assert_eq!(rec.l_seq(), 0);
+        assert_eq!(rec.sequence_vec(), Vec::<u8>::new());
+        assert_eq!(rec.quality_scores(), &[] as &[u8]);
+        // Aux tags survive the removal of all seq+qual bytes.
+        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+    }
+
+    /// A `B:S` (u16) array tag followed by an int tag must be byte-for-byte
+    /// identical after a seq+qual resize (grow from 10 to 16 bases).
+    #[test]
+    fn test_set_sequence_and_qualities_preserves_array_aux_tags() {
+        use crate::testutil::*;
+        // Build aux: B:S array of 4 u16 values, then NM:i:7
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"bqBS");
+        aux.extend_from_slice(&4u32.to_le_bytes());
+        for v in [100u16, 200, 300, 400] {
+            aux.extend_from_slice(&v.to_le_bytes());
+        }
+        aux.extend_from_slice(b"NMc\x07");
+
+        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 10)], 10, -1, -1, &aux);
+        let mut rec = RawRecord::from(bytes);
+        let pre_aux = rec.tags().as_bytes().to_vec();
+
+        // Grow seq from 10 to 16 bases.
+        rec.set_sequence_and_qualities(b"ACGTACGTACGTACGT", &[30u8; 16]);
+
+        // Array tag must decode identically.
+        let post_arr = rec.tags().find_array(b"bq").expect("B:S array tag should be preserved");
+        assert_eq!(post_arr.count, 4);
+        let decoded: Vec<u16> = (0..4)
+            .map(|i| u16::from_le_bytes([post_arr.data[i * 2], post_arr.data[i * 2 + 1]]))
+            .collect();
+        assert_eq!(decoded, vec![100u16, 200, 300, 400]);
+
+        assert_eq!(rec.tags().find_int(b"NM"), Some(7));
+        // Byte-for-byte preservation of the entire aux section.
+        assert_eq!(rec.tags().as_bytes(), pre_aux.as_slice());
+    }
+
+    /// A `B:i` (i32) array tag must survive a read-name grow (length-changing
+    /// edit in the variable-length section before seq/qual/aux).
+    #[test]
+    fn test_set_read_name_with_array_aux_tags() {
+        use crate::testutil::*;
+        // Build aux: B:i array of 3 i32 values.
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"bqBi");
+        aux.extend_from_slice(&3u32.to_le_bytes());
+        for v in [1_000_000i32, -2_000_000, 3_000_000] {
+            aux.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let bytes = make_bam_bytes(0, 0, 0, b"oldname", &[encode_op(0, 4)], 4, -1, -1, &aux);
+        let mut rec = RawRecord::from(bytes);
+        let pre_aux = rec.tags().as_bytes().to_vec();
+
+        // Grow the read name so the splice shifts aux.
+        rec.set_read_name(b"new_longer_name_xyz");
+
+        assert_eq!(rec.read_name(), b"new_longer_name_xyz");
+        // Aux bytes must be byte-for-byte identical after the shift.
+        assert_eq!(rec.tags().as_bytes(), pre_aux.as_slice());
+    }
 }
