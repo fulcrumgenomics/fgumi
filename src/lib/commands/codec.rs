@@ -12,9 +12,9 @@ use crate::bam_io::{
 };
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use fgoxide::io::DelimFile;
 
 use super::common::{
@@ -502,8 +502,9 @@ impl Codec {
             num_threads,
         )?;
 
-        // Lock-free metrics collection
-        let collected_metrics: Arc<SegQueue<CollectedCodecMetrics>> = Arc::new(SegQueue::new());
+        // Per-thread metrics accumulator: bounded metric memory, no unbounded
+        // queue. Rejects buffering semantics are preserved (see follow-up).
+        let collected_metrics = PerThreadAccumulator::<CollectedCodecMetrics>::new(num_threads);
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Parse cell tag
@@ -604,11 +605,14 @@ impl Codec {
                   _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
-                // Collect metrics (lock-free)
-                collected_metrics_for_serialize.push(CollectedCodecMetrics {
-                    stats: processed.stats,
-                    groups_processed: processed.groups_count,
-                    rejects: processed.rejects,
+                // Merge per-batch metrics + rejects into this worker's slot
+                let batch_stats = processed.stats;
+                let groups_count = processed.groups_count;
+                let mut batch_rejects = processed.rejects;
+                collected_metrics_for_serialize.with_slot(|m| {
+                    m.stats.merge(&batch_stats);
+                    m.groups_processed += groups_count;
+                    m.rejects.append(&mut batch_rejects);
                 });
 
                 // Serialize consensus reads
@@ -624,11 +628,12 @@ impl Codec {
         let mut merged_stats = CodecConsensusStats::default();
         let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
-        while let Some(metrics) = collected_metrics.pop() {
-            total_groups += metrics.groups_processed;
-            merged_stats.merge(&metrics.stats);
+        for slot in collected_metrics.slots() {
+            let mut m = slot.lock();
+            total_groups += m.groups_processed;
+            merged_stats.merge(&m.stats);
             if track_rejects {
-                all_rejects.extend(metrics.rejects);
+                all_rejects.append(&mut m.rejects);
             }
         }
 

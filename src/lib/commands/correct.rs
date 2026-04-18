@@ -48,6 +48,7 @@ use crate::dna::reverse_complement_str;
 use crate::grouper::TemplateGrouper;
 use crate::logging::OperationTimer;
 use crate::metrics::correct::UmiCorrectionMetrics;
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::sort::bam_fields;
@@ -57,7 +58,6 @@ use crate::validation::validate_file_exists;
 use ahash::AHashMap;
 use anyhow::{Result, bail};
 use clap::Parser;
-use crossbeam_queue::SegQueue;
 use fgumi_raw_bam::RawRecord;
 use log::{info, warn};
 use lru::LruCache;
@@ -788,8 +788,8 @@ impl CorrectUmis {
             pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw_no_cell(library_index));
         }
 
-        // Lock-free metrics collection
-        let collected_metrics: Arc<SegQueue<CollectedCorrectMetrics>> = Arc::new(SegQueue::new());
+        // Per-thread metrics accumulator: bounded memory, no unbounded queue.
+        let collected_metrics = PerThreadAccumulator::<CollectedCorrectMetrics>::new(num_threads);
         let collected_for_serialize = Arc::clone(&collected_metrics);
 
         // Configuration for closures
@@ -959,18 +959,23 @@ impl CorrectUmis {
         };
 
         // Serialize function: convert records to bytes and collect metrics
-        let serialize_fn = move |processed: CorrectProcessedBatch,
+        let serialize_fn = move |mut processed: CorrectProcessedBatch,
                                  _header: &Header,
                                  output: &mut Vec<u8>|
               -> io::Result<u64> {
-            // Push metrics to lock-free queue
-            collected_for_serialize.push(CollectedCorrectMetrics {
-                templates_processed: processed.templates_count,
-                missing_umis: processed.missing_umis,
-                wrong_length: processed.wrong_length,
-                mismatched: processed.mismatched,
-                umi_matches: processed.umi_matches,
-                raw_rejects: processed.rejected_raw_records,
+            // Merge per-batch counts + UMI matches + rejects into this
+            // worker's accumulator slot.
+            let umi_matches = std::mem::take(&mut processed.umi_matches);
+            let mut rejects = std::mem::take(&mut processed.rejected_raw_records);
+            collected_for_serialize.with_slot(|m| {
+                m.templates_processed += processed.templates_count;
+                m.missing_umis += processed.missing_umis;
+                m.wrong_length += processed.wrong_length;
+                m.mismatched += processed.mismatched;
+                for (umi, counts) in umi_matches {
+                    merge_umi_counts(&mut m.umi_matches, umi, &counts);
+                }
+                m.raw_rejects.append(&mut rejects);
             });
 
             // Serialize kept records
@@ -1008,25 +1013,19 @@ impl CorrectUmis {
         let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
         let mut all_raw_rejects: Vec<Vec<u8>> = Vec::new();
 
-        while let Some(metrics) = collected_metrics.pop() {
-            total_templates += metrics.templates_processed;
-            total_missing += metrics.missing_umis;
-            total_wrong_length += metrics.wrong_length;
-            total_mismatched += metrics.mismatched;
+        for slot in collected_metrics.slots() {
+            let mut m = slot.lock();
+            total_templates += m.templates_processed;
+            total_missing += m.missing_umis;
+            total_wrong_length += m.wrong_length;
+            total_mismatched += m.mismatched;
 
-            for (umi, counts) in metrics.umi_matches {
-                let entry = merged_umi_matches
-                    .entry(umi.clone())
-                    .or_insert_with(|| UmiCorrectionMetrics::new(umi));
-                entry.total_matches += counts.total_matches;
-                entry.perfect_matches += counts.perfect_matches;
-                entry.one_mismatch_matches += counts.one_mismatch_matches;
-                entry.two_mismatch_matches += counts.two_mismatch_matches;
-                entry.other_matches += counts.other_matches;
+            for (umi, counts) in m.umi_matches.drain() {
+                merge_umi_counts(&mut merged_umi_matches, umi, &counts);
             }
 
             if track_rejects {
-                all_raw_rejects.extend(metrics.raw_rejects);
+                all_raw_rejects.append(&mut m.raw_rejects);
             }
         }
 
@@ -1362,6 +1361,22 @@ impl CorrectUmis {
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"AAAAAT", 10), 1);
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"CCCCCC", 2), 3);
 /// ```
+/// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
+/// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
+/// not on hit.
+fn merge_umi_counts(
+    dst: &mut AHashMap<String, UmiCorrectionMetrics>,
+    umi: String,
+    counts: &UmiCorrectionMetrics,
+) {
+    let entry = dst.entry(umi).or_insert_with_key(|k| UmiCorrectionMetrics::new(k.clone()));
+    entry.total_matches += counts.total_matches;
+    entry.perfect_matches += counts.perfect_matches;
+    entry.one_mismatch_matches += counts.one_mismatch_matches;
+    entry.two_mismatch_matches += counts.two_mismatch_matches;
+    entry.other_matches += counts.other_matches;
+}
+
 #[must_use]
 pub fn count_mismatches_with_max(a: &[u8], b: &[u8], max_mismatches: usize) -> usize {
     let mut mismatches = 0;

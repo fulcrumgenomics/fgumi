@@ -146,6 +146,7 @@ pub mod metrics;
 pub mod mi_group;
 pub use fgumi_consensus::phred;
 pub mod os_hints;
+pub mod per_thread_accumulator;
 pub mod prefetch_reader;
 pub mod progress;
 pub mod read_info;

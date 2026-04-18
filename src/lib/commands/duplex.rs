@@ -29,6 +29,7 @@ use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus_raw,
 };
+use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::sam::SamTag;
@@ -38,7 +39,6 @@ use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
 };
 use crate::validation::validate_file_exists;
-use crossbeam_queue::SegQueue;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::info;
 use noodles::sam::Header;
@@ -574,8 +574,9 @@ impl Duplex {
             num_threads,
         )?;
 
-        // Lock-free metrics collection
-        let collected_metrics: Arc<SegQueue<CollectedDuplexMetrics>> = Arc::new(SegQueue::new());
+        // Per-thread metrics accumulator: bounded metric memory, no unbounded
+        // queue. Rejects buffering semantics are preserved (see follow-up).
+        let collected_metrics = PerThreadAccumulator::<CollectedDuplexMetrics>::new(num_threads);
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
         // Capture configuration for closures
@@ -731,12 +732,18 @@ impl Duplex {
                   _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
-                // Collect metrics (lock-free)
-                collected_metrics_for_serialize.push(CollectedDuplexMetrics {
-                    stats: processed.stats,
-                    overlapping_stats: processed.overlapping_stats,
-                    groups_processed: processed.groups_count,
-                    rejects: processed.rejects,
+                // Merge per-batch metrics + rejects into this worker's slot
+                let batch_stats = processed.stats;
+                let batch_overlapping = processed.overlapping_stats;
+                let groups_count = processed.groups_count;
+                let mut batch_rejects = processed.rejects;
+                collected_metrics_for_serialize.with_slot(|m| {
+                    m.stats.merge(&batch_stats);
+                    if let Some(o) = batch_overlapping {
+                        m.overlapping_stats.get_or_insert_with(CorrectionStats::new).merge(&o);
+                    }
+                    m.groups_processed += groups_count;
+                    m.rejects.append(&mut batch_rejects);
                 });
 
                 let count = processed.consensus_output.count as u64;
@@ -752,14 +759,15 @@ impl Duplex {
         let mut merged_overlapping_stats = CorrectionStats::new();
         let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
-        while let Some(metrics) = collected_metrics.pop() {
-            total_groups += metrics.groups_processed;
-            merged_stats.merge(&metrics.stats);
-            if let Some(ref ocs) = metrics.overlapping_stats {
+        for slot in collected_metrics.slots() {
+            let mut m = slot.lock();
+            total_groups += m.groups_processed;
+            merged_stats.merge(&m.stats);
+            if let Some(ref ocs) = m.overlapping_stats {
                 merged_overlapping_stats.merge(ocs);
             }
             if track_rejects {
-                all_rejects.extend(metrics.rejects);
+                all_rejects.append(&mut m.rejects);
             }
         }
 
