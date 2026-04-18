@@ -47,6 +47,7 @@ pub mod raw;
 pub mod raw_bam_reader;
 pub mod read_ahead;
 pub(crate) mod segmented_buf;
+pub mod tmp_dir_alloc;
 pub mod worker_pool;
 
 /// Buffer size for `BufReader` during merge phase.

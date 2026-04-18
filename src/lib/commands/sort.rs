@@ -165,6 +165,12 @@ EXAMPLES:
 
   # Verify a BAM file is correctly sorted
   fgumi sort -i sorted.bam --verify --order template-coordinate
+
+  # Spread spill chunks across multiple temp dirs (round-robin, free-space aware)
+  fgumi sort -i in.bam -o out.bam -T /mnt/ssd1 -T /mnt/ssd2
+
+  # Same via FGUMI_TMP_DIRS env var (PATH-style list)
+  FGUMI_TMP_DIRS=/mnt/ssd1:/mnt/ssd2 fgumi sort -i in.bam -o out.bam
 "#
 )]
 #[allow(clippy::struct_excessive_bools)]
@@ -224,12 +230,20 @@ pub struct Sort {
     #[arg(long = "memory-per-thread", default_value = "true", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub memory_per_thread: bool,
 
-    /// Temporary directory for intermediate files.
+    /// Temporary directory for intermediate files. Repeatable.
     ///
-    /// If not specified, uses the system default temp directory.
-    /// For best performance, use a fast SSD.
-    #[arg(short = 'T', long = "tmp-dir")]
-    pub tmp_dir: Option<PathBuf>,
+    /// Pass `-T <path>` one or more times to spread spill chunks across multiple
+    /// directories in free-space-aware round-robin order. Useful when one
+    /// filesystem is too small or slower than the aggregate of several.
+    ///
+    /// If no flags are given and the `FGUMI_TMP_DIRS` environment variable is
+    /// set, its value is parsed as a `PATH`-style list (colon-separated on
+    /// Unix, semicolon-separated on Windows) and used instead.
+    ///
+    /// If neither is provided, the system default temp directory is used.
+    /// For best performance, use fast SSDs.
+    #[arg(short = 'T', long = "tmp-dir", action = clap::ArgAction::Append)]
+    pub tmp_dirs: Vec<PathBuf>,
 
     /// Number of threads for parallel operations.
     ///
@@ -306,6 +320,32 @@ pub(crate) fn parse_memory(s: &str) -> Result<MemoryLimit, String> {
     }
 
     Ok(MemoryLimit::Fixed(parse_memory_bytes(s, "Memory size")?))
+}
+
+/// Environment variable name for the fallback temp-dir list, parsed as a
+/// `PATH`-style list when no `-T/--tmp-dir` flags are passed.
+const TMP_DIRS_ENV: &str = "FGUMI_TMP_DIRS";
+
+/// Resolve the final list of temp directories for a sort run.
+///
+/// Precedence: CLI flags (if non-empty) > `FGUMI_TMP_DIRS` env var > empty.
+/// Empty strings and whitespace-only entries are filtered out of the env-var
+/// value so that `FGUMI_TMP_DIRS=:` or trailing separators don't produce bogus
+/// paths.
+pub(crate) fn resolve_tmp_dirs(cli: &[PathBuf], env_value: Option<&str>) -> Vec<PathBuf> {
+    if !cli.is_empty() {
+        return cli.to_vec();
+    }
+
+    let Some(value) = env_value else { return Vec::new() };
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    std::env::split_paths(value)
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|p| !p.to_string_lossy().trim().is_empty())
+        .collect()
 }
 
 /// Parse memory reserve string (e.g., "10G", "auto").
@@ -553,8 +593,15 @@ impl Sort {
         if self.write_index {
             info!("Write index: enabled");
         }
-        if let Some(ref tmp) = self.tmp_dir {
-            info!("Temp directory: {}", tmp.display());
+        let env_value = std::env::var(TMP_DIRS_ENV).ok();
+        let resolved_tmp_dirs = resolve_tmp_dirs(&self.tmp_dirs, env_value.as_deref());
+        if !resolved_tmp_dirs.is_empty() {
+            let joined = resolved_tmp_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            info!("Temp directories: {joined}");
         }
 
         // Sort using raw-bytes sorter for optimal memory efficiency and speed
@@ -582,8 +629,8 @@ impl Sort {
             sorter = sorter.cell_tag(ct);
         }
 
-        if let Some(ref tmp) = self.tmp_dir {
-            sorter = sorter.temp_dir(tmp.clone());
+        if !resolved_tmp_dirs.is_empty() {
+            sorter = sorter.temp_dirs(resolved_tmp_dirs);
         }
 
         let stats = sorter.sort(&self.input, output)?;
@@ -694,7 +741,84 @@ impl Sort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use rstest::rstest;
+
+    // ========================================================================
+    // Temp-dir resolution tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_tmp_dirs_empty() {
+        assert!(resolve_tmp_dirs(&[], None).is_empty());
+        assert!(resolve_tmp_dirs(&[], Some("")).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_tmp_dirs_cli_only() {
+        let cli = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        let got = resolve_tmp_dirs(&cli, None);
+        assert_eq!(got, cli);
+    }
+
+    #[test]
+    fn test_resolve_tmp_dirs_env_only() {
+        #[cfg(unix)]
+        let env = "/tmp/x:/tmp/y";
+        #[cfg(windows)]
+        let env = "C:/tmp/x;C:/tmp/y";
+
+        let got = resolve_tmp_dirs(&[], Some(env));
+        assert_eq!(got.len(), 2);
+        assert!(got[0].to_string_lossy().ends_with('x'));
+        assert!(got[1].to_string_lossy().ends_with('y'));
+    }
+
+    #[test]
+    fn test_resolve_tmp_dirs_cli_overrides_env() {
+        let cli = vec![PathBuf::from("/tmp/cli")];
+        #[cfg(unix)]
+        let env = "/tmp/env1:/tmp/env2";
+        #[cfg(windows)]
+        let env = "C:/tmp/env1;C:/tmp/env2";
+
+        let got = resolve_tmp_dirs(&cli, Some(env));
+        assert_eq!(got, cli, "CLI flags must take precedence over env var");
+    }
+
+    #[test]
+    fn test_resolve_tmp_dirs_skips_empty_segments() {
+        // Trailing separator / empty segment must not produce a bogus empty PathBuf.
+        #[cfg(unix)]
+        let env = "/tmp/a::/tmp/b:";
+        #[cfg(windows)]
+        let env = "C:/tmp/a;;C:/tmp/b;";
+
+        let got = resolve_tmp_dirs(&[], Some(env));
+        assert_eq!(got.len(), 2, "empty path segments must be filtered: {got:?}");
+    }
+
+    // ========================================================================
+    // Clap parsing tests for repeatable -T flag
+    // ========================================================================
+
+    #[rstest]
+    #[case::zero(&[], vec![])]
+    #[case::single_short(&["-T", "/tmp/a"], vec![PathBuf::from("/tmp/a")])]
+    #[case::multiple_short(
+        &["-T", "/tmp/a", "-T", "/tmp/b", "-T", "/tmp/c"],
+        vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b"), PathBuf::from("/tmp/c")],
+    )]
+    #[case::multiple_long(
+        &["--tmp-dir", "/tmp/a", "--tmp-dir", "/tmp/b"],
+        vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+    )]
+    fn test_clap_tmp_dir_repeatable(#[case] extra: &[&str], #[case] expected: Vec<PathBuf>) {
+        let base = ["sort", "-i", "in.bam", "-o", "out.bam", "--order", "coordinate"];
+        let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+        let sort = Sort::try_parse_from(args).expect("parse should succeed");
+        assert_eq!(sort.tmp_dirs, expected);
+    }
 
     /// Helper to construct a `Sort` struct with a given order.
     fn make_sort(order: SortOrderArg) -> Sort {
@@ -706,7 +830,7 @@ mod tests {
             max_memory: MemoryLimit::Fixed(512 * 1024 * 1024),
             memory_reserve: MemoryReserve::Auto,
             memory_per_thread: true,
-            tmp_dir: None,
+            tmp_dirs: Vec::new(),
             threads: 1,
             compression: CompressionOptions::default(),
             temp_compression: 1,
