@@ -65,7 +65,7 @@ use crate::vendored::encode_record_buf;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use clap::Parser;
-use fgumi_raw_bam::RawRecordView;
+use fgumi_raw_bam::{RawRecord, RawRecordView};
 use log::{debug, info, warn};
 use noodles::core::Position;
 use noodles::sam::Header;
@@ -1183,37 +1183,36 @@ fn restore_unconverted_bases_in_raw_template(
     let raw_records = template.raw_records.as_mut().ok_or_else(|| {
         anyhow::anyhow!("restore_unconverted_bases_in_raw_template: template not in raw-byte mode")
     })?;
-    for record in raw_records.iter_mut() {
-        restore_unconverted_bases_in_raw_record(record, reference, header)?;
+    for bytes in raw_records.iter_mut() {
+        let mut rec = RawRecord::from(std::mem::take(bytes));
+        restore_unconverted_bases_in_raw_record(&mut rec, reference, header)?;
+        *bytes = rec.into_inner();
     }
     Ok(())
 }
 
 /// Raw-byte equivalent of `restore_unconverted_bases_in_record`.
 ///
-/// Operates on the packed BAM bytes for a single record (the body, with no
-/// `block_size` prefix) without inflating to a `RecordBuf`. Reads the CIGAR,
-/// SEQ, and `YD` tag via the `fgumi-raw-bam` accessors, walks the alignment,
-/// then rewrites converted bases via `bam_fields::set_base`. SEQ stays the
-/// same length so no record resizing is needed; only `NM` / `MD` may be
+/// Operates on a [`RawRecord`] without inflating to a [`RecordBuf`]. Reads the
+/// CIGAR, SEQ, and `YD` tag via the `fgumi-raw-bam` accessors, walks the
+/// alignment, then rewrites converted bases via [`RawRecord::set_base`]. SEQ
+/// stays the same length so no record resizing is needed; only `NM` / `MD` are
 /// removed when SEQ is actually modified.
 ///
 /// Skips unmapped records and records without a `YD` tag, just like the
 /// `RecordBuf` path.
 fn restore_unconverted_bases_in_raw_record(
-    record: &mut Vec<u8>,
+    rec: &mut RawRecord,
     reference: &ReferenceReader,
     header: &Header,
 ) -> Result<()> {
-    // Skip unmapped reads
-    let flag = RawRecordView::new(record).flags();
-    if (flag & bam_fields::flags::UNMAPPED) != 0 {
+    if rec.is_unmapped() {
         return Ok(());
     }
 
     // YD tag tells us the bisulfite strand (forward = top, reverse = bottom).
     // Anything else (missing or unexpected value) means "skip".
-    let yd_bytes = bam_fields::find_string_tag_in_record(record, &SamTag::YD);
+    let yd_bytes = rec.tags().find_string(SamTag::YD.as_ref());
     let is_top = match yd_bytes {
         Some(YD_FORWARD) => true,
         Some(YD_REVERSE) => false,
@@ -1221,7 +1220,7 @@ fn restore_unconverted_bases_in_raw_record(
     };
 
     // Reference contig + alignment start.
-    let ref_id = bam_fields::ref_id(record);
+    let ref_id = rec.ref_id();
     if ref_id < 0 {
         return Ok(());
     }
@@ -1231,17 +1230,16 @@ fn restore_unconverted_bases_in_raw_record(
         .context("reference sequence ID not found in header")?;
     let ref_name = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
 
-    let pos = bam_fields::pos(record);
+    let pos = rec.pos();
     if pos < 0 {
         return Ok(());
     }
     // BAM stores `pos` 0-based; ReferenceReader::fetch_slice expects 1-based.
     let alignment_start = (pos as usize) + 1;
 
-    // Reference span from the CIGAR. The raw helper returns it as i32; clamp
-    // to non-negative usize since negative spans don't make sense.
-    let cigar_ops = bam_fields::get_cigar_ops(record);
-    let ref_span = bam_fields::reference_length_from_cigar(&cigar_ops);
+    // Reference span from the CIGAR. The helper returns it as i32; clamp to
+    // non-negative usize since negative spans don't make sense.
+    let ref_span = rec.reference_length();
     if ref_span <= 0 {
         return Ok(());
     }
@@ -1255,8 +1253,7 @@ fn restore_unconverted_bases_in_raw_record(
     // Determine replacement parameters, accounting for reverse-complemented SEQ.
     // Same logic as the `RecordBuf` path; pre-encode the converted base to its
     // 4-bit BAM nibble so the inner loop compares nibbles directly.
-    let is_reverse = (flag & bam_fields::flags::REVERSE) != 0;
-    let (ref_target, converted_ascii, unconverted_ascii) = match (is_top, is_reverse) {
+    let (ref_target, converted_ascii, unconverted_ascii) = match (is_top, rec.is_reverse()) {
         (true, false) | (false, true) => (b'C', b'T', b'C'),
         (true, true) | (false, false) => (b'G', b'A', b'G'),
     };
@@ -1279,8 +1276,8 @@ fn restore_unconverted_bases_in_raw_record(
     // Walk CIGAR and replace converted bases in place. We don't allocate a
     // SEQ buffer at all — `set_base` rewrites the relevant 4-bit nibble in
     // the existing record bytes.
-    let l_seq = bam_fields::l_seq(record) as usize;
-    let seq_off = bam_fields::seq_offset(record);
+    let l_seq = rec.l_seq() as usize;
+    let cigar_ops = rec.cigar_ops_vec();
     let mut modified = false;
     let mut read_pos: usize = 0;
     let mut ref_offset: usize = 0; // 0-based into ref_bases
@@ -1296,12 +1293,12 @@ fn restore_unconverted_bases_in_raw_record(
                         break;
                     }
                     let rb = ref_bases[ref_offset + i];
-                    if (rb == ref_target || rb == ref_target_lower) && read_pos + i < l_seq {
-                        let nibble = bam_fields::get_base(record, seq_off, read_pos + i);
-                        if nibble == converted_nibble {
-                            bam_fields::set_base(record, seq_off, read_pos + i, unconverted_ascii);
-                            modified = true;
-                        }
+                    if (rb == ref_target || rb == ref_target_lower)
+                        && read_pos + i < l_seq
+                        && rec.get_base(read_pos + i) == converted_nibble
+                    {
+                        rec.set_base(read_pos + i, unconverted_ascii);
+                        modified = true;
                     }
                 }
                 read_pos += len;
@@ -1319,8 +1316,9 @@ fn restore_unconverted_bases_in_raw_record(
 
     // NM/MD only become stale when SEQ was actually modified.
     if modified {
-        bam_fields::remove_tag(record, &SamTag::NM);
-        bam_fields::remove_tag(record, &SamTag::MD);
+        let mut ed = rec.tags_editor();
+        ed.remove(SamTag::NM.as_ref());
+        ed.remove(SamTag::MD.as_ref());
     }
 
     Ok(())
@@ -4167,7 +4165,9 @@ mod tests {
         let mut raw = Vec::with_capacity(256);
         encode_record_buf(&mut raw, header, record)
             .map_err(|e| anyhow::anyhow!("encode_record_buf failed: {e}"))?;
-        restore_unconverted_bases_in_raw_record(&mut raw, reference, header)?;
+        let mut rec = RawRecord::from(raw);
+        restore_unconverted_bases_in_raw_record(&mut rec, reference, header)?;
+        let raw = rec.into_inner();
         let seq = bam_fields::extract_sequence(&raw);
         Ok((raw, seq))
     }
