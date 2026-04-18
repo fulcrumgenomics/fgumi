@@ -1,7 +1,7 @@
 /// Parsed BAM record for test assertions.
 ///
 /// Provides convenient access to fields extracted from raw BAM bytes
-/// produced by `UnmappedBamRecordBuilder`. Used only in tests.
+/// produced by `UnmappedSamBuilder`. Used only in tests.
 pub struct ParsedBamRecord {
     pub name: Vec<u8>,
     pub flag: u16,

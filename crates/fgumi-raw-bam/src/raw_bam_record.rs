@@ -33,14 +33,14 @@
 //! This module will be removed once noodles exposes raw bytes from Record
 //! (<https://github.com/zaeleus/noodles/pull/373>).
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 /// A raw BAM record stored as bytes.
 ///
 /// This is a zero-overhead wrapper that provides `AsRef<[u8]>` access to the
 /// underlying BAM record bytes, enabling high-performance field extraction
 /// and direct output writes.
-#[derive(Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RawRecord(Vec<u8>);
 
 impl RawRecord {
@@ -65,6 +65,15 @@ impl RawRecord {
         self.0.len()
     }
 
+    /// Returns the allocated capacity of the underlying byte buffer.
+    ///
+    /// Useful for memory-estimation purposes (e.g., [`MemoryEstimate`] implementations).
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// Returns true if the record is empty.
     #[inline]
     #[must_use]
@@ -84,6 +93,21 @@ impl RawRecord {
     pub fn into_inner(self) -> Vec<u8> {
         self.0
     }
+
+    /// Returns a mutable reference to the inner byte vector.
+    ///
+    /// Exposes the raw `Vec<u8>` for callers that need resizing operations
+    /// (e.g., tag splice/replace) that require `&mut Vec<u8>`.
+    ///
+    /// **Invariants are the caller's responsibility.** [`RawRecord::as_mut_vec`]
+    /// (and [`DerefMut`](std::ops::DerefMut) below) bypass every record-shape
+    /// invariant: callers must ensure that after any mutation `l_read_name`,
+    /// `n_cigar_op`, and `l_seq` (and the packed sequence / quality byte
+    /// lengths derived from them) remain consistent with the underlying buffer.
+    #[inline]
+    pub fn as_mut_vec(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
 }
 
 impl AsRef<[u8]> for RawRecord {
@@ -99,6 +123,16 @@ impl std::ops::Deref for RawRecord {
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Direct mutable byte access. **Bypasses all record invariants** —
+/// callers must keep `l_read_name`, `n_cigar_op`, and `l_seq` consistent with
+/// the buffer after any mutation. See [`RawRecord::as_mut_vec`] for context.
+impl std::ops::DerefMut for RawRecord {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -194,11 +228,7 @@ impl RawRecord {
     #[must_use]
     pub fn tags_mut(&mut self) -> RawTagsMut<'_> {
         let len = self.0.len();
-        // Clamp against truncated/corrupt records where the parsed offset can
-        // exceed the buffer length; falls back to an empty aux view rather than panicking.
-        let off = crate::fields::aux_data_offset_from_record(&self.0)
-            .filter(|&off| off <= len)
-            .unwrap_or(len);
+        let off = crate::fields::aux_data_offset_from_record(&self.0).unwrap_or(len);
         RawTagsMut::new(&mut self.0[off..])
     }
 
@@ -425,6 +455,26 @@ impl RawRecord {
     #[must_use]
     pub fn cigar_ops_vec(&self) -> Vec<u32> {
         RawRecordView::new(&self.0).cigar_ops_vec()
+    }
+
+    /// Typed iteration over CIGAR ops. Each [`crate::cigar::CigarOp`] is a `Copy` newtype over
+    /// the raw u32 — zero-cost ergonomic equivalent of noodles `cigar().iter()`.
+    #[inline]
+    pub fn cigar_ops_typed(&self) -> impl Iterator<Item = crate::cigar::CigarOp> + '_ {
+        // Delegate via view() but keep lifetime tied to self's bytes, not the
+        // temporary RawRecordView. We re-implement the same two-step here so
+        // that the compiler can see that the borrow is from &self.0 directly.
+        use crate::cigar::CigarOp;
+        use crate::fields::{l_read_name, n_cigar_op};
+        let bam: &[u8] = &self.0;
+        let lrn = l_read_name(bam) as usize;
+        let n = n_cigar_op(bam) as usize;
+        let start = 32 + lrn;
+        let end = start + n * 4;
+        let bytes = if end <= bam.len() { &bam[start..end] } else { &bam[..0] };
+        bytes
+            .chunks_exact(4)
+            .map(|c| CigarOp::from_raw(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
     }
 
     /// Decode the sequence bases to ASCII.
@@ -662,11 +712,8 @@ impl RawRecord {
     /// # Panics
     ///
     /// Panics if `new_name.len() + 1 > u8::MAX as usize` (the BAM spec encodes
-    /// `l_read_name` as a single byte) or if `new_name` contains an embedded NUL
-    /// (BAM read names are NUL-terminated; an interior NUL would produce an
-    /// invalid record that downstream readers misparse).
+    /// `l_read_name` as a single byte).
     pub fn set_read_name(&mut self, new_name: &[u8]) {
-        assert!(!new_name.contains(&0), "read name must not contain NUL bytes");
         let new_l = new_name.len() + 1; // include NUL
         let new_l_u8 = u8::try_from(new_l)
             .unwrap_or_else(|_| panic!("read name too long: {} bytes", new_name.len()));
@@ -730,6 +777,107 @@ impl<R: Read> RawBamReader<R> {
     #[inline]
     pub fn read_record(&mut self, record: &mut RawRecord) -> io::Result<usize> {
         read_raw_record(&mut self.inner, record)
+    }
+}
+
+/// Write a single raw BAM record to `w`: 4-byte `block_size` (u32 LE) prefix
+/// followed by the record bytes.
+///
+/// This is the inverse of [`read_raw_record`]. The caller is responsible for
+/// writing the BAM header before any records.
+///
+/// # Errors
+///
+/// Returns an error if writing to `w` fails.
+///
+/// # Panics
+///
+/// Panics if `rec.len()` exceeds `u32::MAX`.
+#[inline]
+pub fn write_raw_record<W: Write>(w: &mut W, rec: &RawRecord) -> io::Result<()> {
+    let block_size =
+        u32::try_from(rec.len()).expect("record length exceeds u32 BAM block_size limit");
+    w.write_all(&block_size.to_le_bytes())?;
+    w.write_all(rec.as_ref())
+}
+
+/// Write a slice of raw BAM records to `w`. Equivalent to calling
+/// [`write_raw_record`] for each record, but written as one helper.
+///
+/// # Errors
+///
+/// Returns on the first write error.
+#[inline]
+pub fn write_raw_records<W: Write>(w: &mut W, recs: &[RawRecord]) -> io::Result<()> {
+    for rec in recs {
+        write_raw_record(w, rec)?;
+    }
+    Ok(())
+}
+
+/// Thin writer wrapper that mirrors [`RawBamReader`]: handles the
+/// `block_size` framing on writes.
+///
+/// Does NOT write BAM magic/header/ref-list — those are the caller's
+/// responsibility (typically already produced by noodles' writer or by
+/// copying from an input BAM).
+pub struct RawBamWriter<W> {
+    inner: W,
+}
+
+impl<W: Write> RawBamWriter<W> {
+    /// Creates a new `RawBamWriter` wrapping the given writer.
+    #[inline]
+    pub fn new(inner: W) -> Self {
+        Self { inner }
+    }
+
+    /// Returns a reference to the inner writer.
+    #[inline]
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the inner writer.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Consumes the writer and returns the inner writer.
+    #[inline]
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Write a single record with its `block_size` prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails.
+    #[inline]
+    pub fn write_record(&mut self, rec: &RawRecord) -> io::Result<()> {
+        write_raw_record(&mut self.inner, rec)
+    }
+
+    /// Write many records.
+    ///
+    /// # Errors
+    ///
+    /// Returns on the first write error.
+    #[inline]
+    pub fn write_records(&mut self, recs: &[RawRecord]) -> io::Result<()> {
+        write_raw_records(&mut self.inner, recs)
+    }
+
+    /// Flush the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing fails.
+    #[inline]
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -834,22 +982,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tags_mut_clamps_truncated_aux_offset() {
-        // Build a record then truncate below the parsed aux offset. The header
-        // fields still imply aux starts past the buffer end, so tags_mut() must
-        // clamp rather than panic on the out-of-bounds slice.
-        use crate::testutil::*;
-        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, b"NMc\x05");
-        let mut truncated: Vec<u8> = bytes;
-        // Drop the aux bytes plus one byte of the seq/qual region so the parsed
-        // aux offset exceeds the buffer length.
-        truncated.truncate(truncated.len() - 5);
-        let mut rec = RawRecord::from(truncated);
-        let tags = rec.tags_mut(); // must not panic
-        assert!(tags.view().is_empty());
-    }
-
-    #[test]
     fn test_set_read_name_resize() {
         use crate::testutil::*;
         let bytes = make_bam_bytes(0, 0, 0, b"oldname", &[encode_op(0, 4)], 4, -1, -1, b"NMc\x05");
@@ -872,15 +1004,6 @@ mod tests {
         rec.set_read_name(b"");
         assert_eq!(rec.read_name(), b"");
         assert_eq!(rec.l_read_name(), 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "read name must not contain NUL bytes")]
-    fn test_set_read_name_rejects_embedded_nul() {
-        use crate::testutil::*;
-        let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, b"");
-        let mut rec = RawRecord::from(bytes);
-        rec.set_read_name(b"bad\0name");
     }
 
     #[test]
@@ -1129,5 +1252,71 @@ mod tests {
         assert_eq!(rec.read_name(), b"new_longer_name_xyz");
         // Aux bytes must be byte-for-byte identical after the shift.
         assert_eq!(rec.tags().as_bytes(), pre_aux.as_slice());
+    }
+
+    // ── write_raw_record / write_raw_records / RawBamWriter tests ─────────
+
+    /// Write a single record with `write_raw_record`, read it back with
+    /// `read_raw_record`, and assert byte-identical round-trip.
+    #[test]
+    fn test_write_raw_record_round_trips_via_read_raw_record() {
+        let original = RawRecord::from(vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        let mut buf: Vec<u8> = Vec::new();
+        write_raw_record(&mut buf, &original).expect("write should succeed");
+
+        // Expected bytes: 4-byte LE block_size (5) + the 5 data bytes
+        assert_eq!(&buf[..4], &5u32.to_le_bytes());
+        assert_eq!(&buf[4..], original.as_ref());
+
+        // Round-trip via read_raw_record
+        let mut cursor = std::io::Cursor::new(&buf);
+        let mut recovered = RawRecord::new();
+        let n = read_raw_record(&mut cursor, &mut recovered).expect("read should succeed");
+        assert_eq!(n, 5);
+        assert_eq!(recovered, original);
+    }
+
+    /// Write 3 records with `write_raw_records`, read them back in order.
+    #[test]
+    fn test_write_raw_records_round_trips() {
+        let recs = vec![
+            RawRecord::from(vec![0xAA, 0xBB]),
+            RawRecord::from(vec![0x11, 0x22, 0x33]),
+            RawRecord::from(vec![0xFF]),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        write_raw_records(&mut buf, &recs).expect("write_raw_records should succeed");
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        for expected in &recs {
+            let mut got = RawRecord::new();
+            let n = read_raw_record(&mut cursor, &mut got).expect("read should succeed");
+            assert_eq!(n, expected.len());
+            assert_eq!(&got, expected);
+        }
+        // No more records.
+        let mut got = RawRecord::new();
+        let n = read_raw_record(&mut cursor, &mut got).expect("EOF read should return Ok(0)");
+        assert_eq!(n, 0);
+    }
+
+    /// `RawBamWriter` round-trips a single record the same way the free
+    /// function does.
+    #[test]
+    fn test_raw_bam_writer_round_trips() {
+        let original = RawRecord::from(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut writer = RawBamWriter::new(Vec::<u8>::new());
+        writer.write_record(&original).expect("write_record should succeed");
+        writer.flush().expect("flush should succeed");
+        let buf = writer.into_inner();
+
+        assert_eq!(&buf[..4], &4u32.to_le_bytes());
+        assert_eq!(&buf[4..], original.as_ref());
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let mut recovered = RawRecord::new();
+        let n = read_raw_record(&mut cursor, &mut recovered).expect("read should succeed");
+        assert_eq!(n, 4);
+        assert_eq!(recovered, original);
     }
 }

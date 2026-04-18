@@ -20,13 +20,11 @@ pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op:
         3 => Kind::Skip,
         4 => Kind::SoftClip,
         5 => Kind::HardClip,
-        6 => Kind::Pad,
         7 => Kind::SequenceMatch,
         8 => Kind::SequenceMismatch,
-        _ => {
-            debug_assert!(false, "invalid BAM CIGAR op code: {op}");
-            Kind::Pad
-        }
+        // 6 => Pad; 9..=15 are reserved/invalid per the BAM spec and fall back
+        // to Pad as the documented default so callers don't need to branch.
+        _ => Kind::Pad,
     }
 }
 
@@ -51,21 +49,23 @@ pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op:
 const BAM_CIGAR_TYPE: u32 = 0x3C1A7;
 
 /// Returns true if the CIGAR op type consumes the reference (M, D, N, =, X).
+///
+/// Values outside the 0..=15 spec range are masked with `& 0xF` — keeps the
+/// shift amount bounded in case a caller passes a raw CIGAR word or a noodles
+/// conversion bug leaks a larger value.
 #[inline]
 #[must_use]
 pub const fn consumes_ref(op_type: u32) -> bool {
-    // Guard the shift: `op_type << 1 >= 32` would panic in debug mode. Any
-    // value above the defined range (0..=8) is not a reference-consuming op.
-    op_type < 9 && (BAM_CIGAR_TYPE >> (op_type << 1)) & 2 != 0
+    (BAM_CIGAR_TYPE >> ((op_type & 0xF) << 1)) & 2 != 0
 }
 
 /// Returns true if the CIGAR op type consumes the query including soft clips (M, I, S, =, X).
+///
+/// See [`consumes_ref`] for the `& 0xF` rationale.
 #[inline]
 #[must_use]
 pub const fn consumes_query(op_type: u32) -> bool {
-    // Guard the shift: `op_type << 1 >= 32` would panic in debug mode. Any
-    // value above the defined range (0..=8) is not a query-consuming op.
-    op_type < 9 && (BAM_CIGAR_TYPE >> (op_type << 1)) & 1 != 0
+    (BAM_CIGAR_TYPE >> ((op_type & 0xF) << 1)) & 1 != 0
 }
 
 /// Returns true if the CIGAR op type consumes the read/query excluding soft clips (M, I, =, X).
@@ -852,6 +852,200 @@ fn clip_cigar_end_raw(
     (result, 0) // ref_bases_consumed is 0 for end clipping (no position adjustment)
 }
 
+// ============================================================================
+// CigarKind and CigarOp — typed, zero-cost CIGAR iteration
+// ============================================================================
+
+/// BAM CIGAR operation kind. Matches the wire-format op-type low 4 bits.
+///
+/// Variant ordering is intentionally identical to the BAM spec so that
+/// `as u8` gives the correct op-type byte (useful in low-level code).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CigarKind {
+    /// Alignment match (M, op-type 0). Consumes both query and reference.
+    Match = 0,
+    /// Insertion to reference (I, op-type 1). Consumes query only.
+    Insertion = 1,
+    /// Deletion from reference (D, op-type 2). Consumes reference only.
+    Deletion = 2,
+    /// Skipped region from reference (N, op-type 3). Consumes reference only.
+    Skip = 3,
+    /// Soft clip (S, op-type 4). Consumes query only.
+    SoftClip = 4,
+    /// Hard clip (H, op-type 5). Consumes neither.
+    HardClip = 5,
+    /// Padding (P, op-type 6). Consumes neither.
+    Pad = 6,
+    /// Sequence match (=, op-type 7). Consumes both query and reference.
+    SequenceMatch = 7,
+    /// Sequence mismatch (X, op-type 8). Consumes both query and reference.
+    SequenceMismatch = 8,
+}
+
+impl CigarKind {
+    /// Single-char SAM representation (M/I/D/N/S/H/P/=/X).
+    #[inline]
+    #[must_use]
+    pub const fn as_char(self) -> char {
+        match self {
+            Self::Match => 'M',
+            Self::Insertion => 'I',
+            Self::Deletion => 'D',
+            Self::Skip => 'N',
+            Self::SoftClip => 'S',
+            Self::HardClip => 'H',
+            Self::Pad => 'P',
+            Self::SequenceMatch => '=',
+            Self::SequenceMismatch => 'X',
+        }
+    }
+
+    /// Parse from the wire-format 4-bit op-type value.
+    ///
+    /// Returns `None` for values >= 9 (reserved/invalid in the BAM spec).
+    #[inline]
+    #[must_use]
+    pub const fn from_op_type(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Match),
+            1 => Some(Self::Insertion),
+            2 => Some(Self::Deletion),
+            3 => Some(Self::Skip),
+            4 => Some(Self::SoftClip),
+            5 => Some(Self::HardClip),
+            6 => Some(Self::Pad),
+            7 => Some(Self::SequenceMatch),
+            8 => Some(Self::SequenceMismatch),
+            _ => None,
+        }
+    }
+}
+
+/// A single typed BAM CIGAR operation — `Copy` newtype over the raw u32 packing.
+///
+/// Provides the same ergonomic shape as noodles `record::cigar::op::Op` but
+/// backed by a single `u32` (no allocation, no trait dispatch, inline methods).
+///
+/// # Wire format
+///
+/// BAM encodes each CIGAR op as a u32 where:
+/// - low 4 bits (bits 0–3) encode the op type (0 = M, 1 = I, …, 8 = X)
+/// - high 28 bits (bits 4–31) encode the op length
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CigarOp(u32);
+
+impl CigarOp {
+    /// Construct from the raw 4-bit-op-type + 28-bit-length packing.
+    #[inline]
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Construct from a (kind, len) pair.
+    ///
+    /// Rejects zero-length ops: the BAM spec treats them as invalid (see
+    /// [`CigarOp::len`]), and the typed constructor should not mint what the
+    /// type claims to forbid. Use [`CigarOp::from_raw`] on a raw `u32` word if
+    /// you must preserve malformed wire data.
+    ///
+    /// # Panics
+    ///
+    /// - `len == 0`
+    /// - `len > 0x0FFF_FFFF` (28-bit limit)
+    #[inline]
+    #[must_use]
+    pub fn new(kind: CigarKind, len: u32) -> Self {
+        assert!(len > 0, "CIGAR op length must be non-zero");
+        assert!(len <= 0x0FFF_FFFF, "CIGAR op length exceeds 28-bit limit");
+        Self((len << 4) | (kind as u32))
+    }
+
+    /// The raw u32 packing, for byte-level code paths.
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Op kind (M, I, D, N, S, H, P, =, X).
+    ///
+    /// Decodes the low 4 bits of the raw u32 and returns the corresponding
+    /// [`CigarKind`] variant. Returns [`CigarKind::Pad`] for reserved/invalid
+    /// op-type values (>= 9) — same fallback used by [`cigar_op_kind`].
+    #[inline]
+    #[must_use]
+    pub fn kind(self) -> CigarKind {
+        CigarKind::from_op_type(self.0 & 0xF).unwrap_or(CigarKind::Pad)
+    }
+
+    /// Op length (number of bases).
+    ///
+    /// Note: zero-length CIGAR ops are invalid per the BAM spec, so there is
+    /// intentionally no companion `is_empty` method.
+    #[allow(clippy::len_without_is_empty)]
+    #[inline]
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.0 >> 4
+    }
+
+    /// True if this op type consumes query bases (M, I, S, =, X).
+    ///
+    /// Uses the [`BAM_CIGAR_TYPE`] bitmask for a branchless test.
+    #[inline]
+    #[must_use]
+    pub fn consumes_query(self) -> bool {
+        consumes_query(self.0 & 0xF)
+    }
+
+    /// True if this op type consumes reference bases (M, D, N, =, X).
+    ///
+    /// Uses the [`BAM_CIGAR_TYPE`] bitmask for a branchless test.
+    #[inline]
+    #[must_use]
+    pub fn consumes_ref(self) -> bool {
+        consumes_ref(self.0 & 0xF)
+    }
+}
+
+#[cfg(feature = "noodles")]
+impl From<CigarKind> for noodles::sam::alignment::record::cigar::op::Kind {
+    fn from(k: CigarKind) -> Self {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        match k {
+            CigarKind::Match => Kind::Match,
+            CigarKind::Insertion => Kind::Insertion,
+            CigarKind::Deletion => Kind::Deletion,
+            CigarKind::Skip => Kind::Skip,
+            CigarKind::SoftClip => Kind::SoftClip,
+            CigarKind::HardClip => Kind::HardClip,
+            CigarKind::Pad => Kind::Pad,
+            CigarKind::SequenceMatch => Kind::SequenceMatch,
+            CigarKind::SequenceMismatch => Kind::SequenceMismatch,
+        }
+    }
+}
+
+#[cfg(feature = "noodles")]
+impl From<noodles::sam::alignment::record::cigar::op::Kind> for CigarKind {
+    fn from(k: noodles::sam::alignment::record::cigar::op::Kind) -> Self {
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        match k {
+            Kind::Match => CigarKind::Match,
+            Kind::Insertion => CigarKind::Insertion,
+            Kind::Deletion => CigarKind::Deletion,
+            Kind::Skip => CigarKind::Skip,
+            Kind::SoftClip => CigarKind::SoftClip,
+            Kind::HardClip => CigarKind::HardClip,
+            Kind::Pad => CigarKind::Pad,
+            Kind::SequenceMatch => CigarKind::SequenceMatch,
+            Kind::SequenceMismatch => CigarKind::SequenceMismatch,
+        }
+    }
+}
+
 use crate::fields::RawRecordView;
 
 impl<'a> RawRecordView<'a> {
@@ -871,6 +1065,17 @@ impl<'a> RawRecordView<'a> {
     #[inline]
     pub fn cigar_ops_iter(&self) -> impl Iterator<Item = u32> + 'a {
         self.cigar_raw_bytes().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    }
+
+    /// Typed iteration over CIGAR ops. Ergonomically equivalent to
+    /// noodles `cigar().iter()` but zero-cost: each [`CigarOp`] is a `Copy`
+    /// newtype over the raw u32.
+    ///
+    /// The returned iterator has lifetime `'a` (tied to the underlying byte
+    /// slice, not to `&self`), so it can outlive a temporary view.
+    #[inline]
+    pub fn cigar_ops_typed(&self) -> impl Iterator<Item = CigarOp> + 'a {
+        self.cigar_ops_iter().map(CigarOp::from_raw)
     }
 
     /// Convenience: collect CIGAR ops into a `Vec<u32>`.
@@ -986,13 +1191,30 @@ mod tests {
             assert_eq!(consumes_query(op), eq, "consumes_query({op})");
             assert_eq!(consumes_ref(op), er, "consumes_ref({op})");
         }
-        // Op values >= 9 (including out-of-range >= 16) must not panic in
-        // debug mode and must return false. The naked bitmask shift would
-        // overflow for op >= 16 (since op << 1 >= 32), so `consumes_*` must
-        // guard the shift.
-        for op in 9u32..=255 {
+        // Op values >= 9 should return false for both
+        for op in 9u32..=15 {
             assert!(!consumes_query(op), "consumes_query({op}) should be false");
             assert!(!consumes_ref(op), "consumes_ref({op}) should be false");
+        }
+    }
+
+    #[test]
+    fn test_consumes_fns_mask_values_beyond_4_bits() {
+        // Without the `& 0xF` guard, op_type >= 16 overshifts (debug panic /
+        // release wrap). With the guard, the input is normalised to 0..=15 and
+        // the result matches the low-nibble equivalent. For example op=16 aliases
+        // to op=0 (M) and op=22 aliases to op=6 (P).
+        for (bad, good) in [(16u32, 0u32), (22u32, 6u32), (257u32, 1u32), (u32::MAX, 15u32)] {
+            assert_eq!(
+                consumes_query(bad),
+                consumes_query(good),
+                "consumes_query({bad}) should equal consumes_query({good})",
+            );
+            assert_eq!(
+                consumes_ref(bad),
+                consumes_ref(good),
+                "consumes_ref({bad}) should equal consumes_ref({good})",
+            );
         }
     }
 
@@ -2089,5 +2311,259 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         let v = RawRecordView::new(&rec);
         assert_eq!(v.cigar_lengths(), (0, 0));
+    }
+
+    // ========================================================================
+    // CigarKind tests
+    // ========================================================================
+
+    #[test]
+    fn test_cigar_kind_as_char_all_variants() {
+        assert_eq!(CigarKind::Match.as_char(), 'M');
+        assert_eq!(CigarKind::Insertion.as_char(), 'I');
+        assert_eq!(CigarKind::Deletion.as_char(), 'D');
+        assert_eq!(CigarKind::Skip.as_char(), 'N');
+        assert_eq!(CigarKind::SoftClip.as_char(), 'S');
+        assert_eq!(CigarKind::HardClip.as_char(), 'H');
+        assert_eq!(CigarKind::Pad.as_char(), 'P');
+        assert_eq!(CigarKind::SequenceMatch.as_char(), '=');
+        assert_eq!(CigarKind::SequenceMismatch.as_char(), 'X');
+    }
+
+    #[test]
+    fn test_cigar_kind_from_op_type_all_valid() {
+        assert_eq!(CigarKind::from_op_type(0), Some(CigarKind::Match));
+        assert_eq!(CigarKind::from_op_type(1), Some(CigarKind::Insertion));
+        assert_eq!(CigarKind::from_op_type(2), Some(CigarKind::Deletion));
+        assert_eq!(CigarKind::from_op_type(3), Some(CigarKind::Skip));
+        assert_eq!(CigarKind::from_op_type(4), Some(CigarKind::SoftClip));
+        assert_eq!(CigarKind::from_op_type(5), Some(CigarKind::HardClip));
+        assert_eq!(CigarKind::from_op_type(6), Some(CigarKind::Pad));
+        assert_eq!(CigarKind::from_op_type(7), Some(CigarKind::SequenceMatch));
+        assert_eq!(CigarKind::from_op_type(8), Some(CigarKind::SequenceMismatch));
+    }
+
+    #[test]
+    fn test_cigar_kind_from_op_type_reserved_returns_none() {
+        for v in 9u32..=15 {
+            assert_eq!(CigarKind::from_op_type(v), None, "op_type {v} should be None");
+        }
+    }
+
+    // ========================================================================
+    // CigarOp tests
+    // ========================================================================
+
+    #[test]
+    fn test_cigar_op_round_trip_from_raw() {
+        // All 9 op types with a representative length each.
+        let cases: &[(u32, u32)] = &[
+            (0, 50), // 50M
+            (1, 5),  // 5I
+            (2, 3),  // 3D
+            (3, 10), // 10N
+            (4, 4),  // 4S
+            (5, 2),  // 2H
+            (6, 1),  // 1P
+            (7, 20), // 20=
+            (8, 7),  // 7X
+        ];
+        for &(op_type, op_len) in cases {
+            let raw = (op_len << 4) | op_type;
+            let cigar_op = CigarOp::from_raw(raw);
+            assert_eq!(cigar_op.raw(), raw, "raw round-trip for op_type {op_type}");
+            assert_eq!(cigar_op.len(), op_len, "len for op_type {op_type}");
+            let expected_kind = CigarKind::from_op_type(op_type).unwrap();
+            assert_eq!(cigar_op.kind(), expected_kind, "kind for op_type {op_type}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "CIGAR op length must be non-zero")]
+    fn test_cigar_op_new_rejects_zero_length() {
+        let _ = CigarOp::new(CigarKind::Match, 0);
+    }
+
+    #[test]
+    fn test_cigar_op_from_raw_allows_zero_length_for_malformed_data() {
+        // from_raw intentionally preserves malformed wire data, so zero-length
+        // must still be constructable via the raw path even though CigarOp::new
+        // rejects it.
+        let op = CigarOp::from_raw(CigarKind::Match as u32); // len = 0
+        assert_eq!(op.len(), 0);
+    }
+
+    #[test]
+    fn test_cigar_op_new_round_trip() {
+        // Construct via CigarOp::new and verify kind/len match.
+        let cases: &[(CigarKind, u32)] = &[
+            (CigarKind::Match, 100),
+            (CigarKind::Insertion, 3),
+            (CigarKind::Deletion, 8),
+            (CigarKind::Skip, 1000),
+            (CigarKind::SoftClip, 5),
+            (CigarKind::HardClip, 2),
+            (CigarKind::Pad, 1),
+            (CigarKind::SequenceMatch, 42),
+            (CigarKind::SequenceMismatch, 7),
+        ];
+        for &(kind, len) in cases {
+            let op = CigarOp::new(kind, len);
+            assert_eq!(op.kind(), kind, "kind mismatch for {kind:?}");
+            assert_eq!(op.len(), len, "len mismatch for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_cigar_op_consumes_query_matches_free_fn() {
+        // For all 9 op types, CigarOp::consumes_query should match consumes_query(op_type).
+        for op_type in 0u32..9 {
+            let raw = (10 << 4) | op_type; // length=10, arbitrary
+            let cigar_op = CigarOp::from_raw(raw);
+            assert_eq!(
+                cigar_op.consumes_query(),
+                consumes_query(op_type),
+                "consumes_query mismatch for op_type {op_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cigar_op_consumes_ref_matches_free_fn() {
+        // For all 9 op types, CigarOp::consumes_ref should match consumes_ref(op_type).
+        for op_type in 0u32..9 {
+            let raw = (10 << 4) | op_type;
+            let cigar_op = CigarOp::from_raw(raw);
+            assert_eq!(
+                cigar_op.consumes_ref(),
+                consumes_ref(op_type),
+                "consumes_ref mismatch for op_type {op_type}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // cigar_ops_typed on RawRecordView
+    // ========================================================================
+
+    #[test]
+    fn test_cigar_ops_typed_known_cigar() {
+        // 5S10M3I2D4= 2X 1H => 8 ops
+        let raw_cigar = &[
+            encode_op(4, 5),  // 5S
+            encode_op(0, 10), // 10M
+            encode_op(1, 3),  // 3I
+            encode_op(2, 2),  // 2D
+            encode_op(7, 4),  // 4=
+            encode_op(8, 2),  // 2X
+            encode_op(5, 1),  // 1H
+        ];
+        let seq_len = 5 + 10 + 3 + 4 + 2; // query-consuming ops
+        let rec = make_bam_bytes(0, 100, 0, b"rd", raw_cigar, seq_len, -1, -1, &[]);
+        let view = RawRecordView::new(&rec);
+
+        let typed: Vec<CigarOp> = view.cigar_ops_typed().collect();
+        assert_eq!(typed.len(), 7);
+        assert_eq!(typed[0].kind(), CigarKind::SoftClip);
+        assert_eq!(typed[0].len(), 5);
+        assert_eq!(typed[1].kind(), CigarKind::Match);
+        assert_eq!(typed[1].len(), 10);
+        assert_eq!(typed[2].kind(), CigarKind::Insertion);
+        assert_eq!(typed[2].len(), 3);
+        assert_eq!(typed[3].kind(), CigarKind::Deletion);
+        assert_eq!(typed[3].len(), 2);
+        assert_eq!(typed[4].kind(), CigarKind::SequenceMatch);
+        assert_eq!(typed[4].len(), 4);
+        assert_eq!(typed[5].kind(), CigarKind::SequenceMismatch);
+        assert_eq!(typed[5].len(), 2);
+        assert_eq!(typed[6].kind(), CigarKind::HardClip);
+        assert_eq!(typed[6].len(), 1);
+    }
+
+    #[test]
+    fn test_cigar_ops_typed_empty_cigar() {
+        let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        let view = RawRecordView::new(&rec);
+        let typed: Vec<CigarOp> = view.cigar_ops_typed().collect();
+        assert!(typed.is_empty());
+    }
+
+    #[test]
+    fn test_cigar_ops_typed_matches_cigar_ops_iter() {
+        // cigar_ops_typed().map(|op| op.raw()) should equal cigar_ops_iter()
+        let raw_cigar = &[
+            encode_op(0, 30), // 30M
+            encode_op(1, 2),  // 2I
+            encode_op(0, 20), // 20M
+            encode_op(4, 5),  // 5S
+        ];
+        let rec = make_bam_bytes(0, 50, 0, b"rd", raw_cigar, 57, -1, -1, &[]);
+        let view = RawRecordView::new(&rec);
+
+        let from_raw: Vec<u32> = view.cigar_ops_iter().collect();
+        let from_typed: Vec<u32> = view.cigar_ops_typed().map(CigarOp::raw).collect();
+        assert_eq!(from_raw, from_typed);
+    }
+
+    #[cfg(feature = "noodles")]
+    mod noodles_roundtrip {
+        use super::*;
+
+        #[test]
+        fn test_cigar_kind_noodles_roundtrip_all_variants() {
+            use noodles::sam::alignment::record::cigar::op::Kind;
+
+            let kinds = [
+                CigarKind::Match,
+                CigarKind::Insertion,
+                CigarKind::Deletion,
+                CigarKind::Skip,
+                CigarKind::SoftClip,
+                CigarKind::HardClip,
+                CigarKind::Pad,
+                CigarKind::SequenceMatch,
+                CigarKind::SequenceMismatch,
+            ];
+
+            for original in kinds {
+                // CigarKind -> noodles Kind -> CigarKind
+                let noodles_kind: Kind = original.into();
+                let round_tripped: CigarKind = noodles_kind.into();
+                assert_eq!(round_tripped, original, "round-trip failed for {original:?}");
+            }
+        }
+
+        #[test]
+        fn test_noodles_kind_to_cigar_kind_all_variants() {
+            use noodles::sam::alignment::record::cigar::op::Kind;
+
+            let noodles_kinds = [
+                Kind::Match,
+                Kind::Insertion,
+                Kind::Deletion,
+                Kind::Skip,
+                Kind::SoftClip,
+                Kind::HardClip,
+                Kind::Pad,
+                Kind::SequenceMatch,
+                Kind::SequenceMismatch,
+            ];
+            let expected = [
+                CigarKind::Match,
+                CigarKind::Insertion,
+                CigarKind::Deletion,
+                CigarKind::Skip,
+                CigarKind::SoftClip,
+                CigarKind::HardClip,
+                CigarKind::Pad,
+                CigarKind::SequenceMatch,
+                CigarKind::SequenceMismatch,
+            ];
+
+            for (nk, ck) in noodles_kinds.iter().zip(expected.iter()) {
+                let converted: CigarKind = (*nk).into();
+                assert_eq!(converted, *ck, "noodles->CigarKind failed for {nk:?}");
+            }
+        }
     }
 }

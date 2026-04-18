@@ -210,7 +210,7 @@ use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{ReadType, SourceRead};
-use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedBamRecordBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedSamBuilder, flags};
 
 /// Duplex consensus read - matches fgbio's `DuplexConsensusRead`
 ///
@@ -1083,7 +1083,7 @@ impl DuplexConsensusCaller {
         reason = "Result return type kept for API consistency with other consensus record builders"
     )]
     pub(crate) fn duplex_read_into(
-        builder: &mut UnmappedBamRecordBuilder,
+        builder: &mut UnmappedSamBuilder,
         output: &mut ConsensusOutput,
         consensus: &DuplexConsensusRead,
         read_type: ReadType,
@@ -1740,7 +1740,7 @@ impl DuplexConsensusCaller {
         cell_tag: Option<Tag>,
     ) -> Result<(ConsensusOutput, ConsensusCallingStats)> {
         let mut stats = ConsensusCallingStats::new();
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         let methylation_mode = ss_caller.options.methylation_mode;
 
@@ -4534,7 +4534,7 @@ mod tests {
             is_ba_only: false,
         };
 
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
@@ -4930,7 +4930,7 @@ mod tests {
         let cell_tag = Tag::from(fgumi_sam::SamTag::CB);
         let cell_barcode = "ACGTACGT-1";
 
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
@@ -4981,7 +4981,7 @@ mod tests {
             is_ba_only: false,
         };
 
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
@@ -5112,7 +5112,7 @@ mod tests {
             is_ba_only: false,
         };
 
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
@@ -5206,7 +5206,7 @@ mod tests {
             is_ba_only: false,
         };
 
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
@@ -5267,7 +5267,7 @@ mod tests {
 
         // Helper to build and parse a single record
         let build_and_parse = |read_type: ReadType| -> ParsedBamRecord {
-            let mut builder = UnmappedBamRecordBuilder::new();
+            let mut builder = UnmappedSamBuilder::new();
             let mut output = ConsensusOutput::default();
             DuplexConsensusCaller::duplex_read_into(
                 &mut builder,
@@ -6031,7 +6031,7 @@ mod tests {
         let duplex_result = DuplexConsensusCaller::duplex_consensus(Some(&ab), Some(&ba), None);
         let duplex = duplex_result.expect("Should produce duplex consensus");
 
-        let mut builder = UnmappedBamRecordBuilder::new();
+        let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         DuplexConsensusCaller::duplex_read_into(
             &mut builder,
