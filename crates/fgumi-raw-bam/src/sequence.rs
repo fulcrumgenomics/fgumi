@@ -128,31 +128,6 @@ fn decode_chunk_32(packed: &[u8], packed_off: usize, out: &mut [u8], out_off: us
     out[out_off + 16..out_off + 32].copy_from_slice(last_16.as_array());
 }
 
-/// SIMD-accelerated sequence extraction.
-///
-/// Kept `pub(crate)` for benchmarking; external callers go through
-/// `extract_sequence`, which dispatches based on read length.
-#[inline]
-#[must_use]
-pub(crate) fn extract_sequence_simd(bam: &[u8]) -> Vec<u8> {
-    let l = l_seq(bam) as usize;
-    let off = seq_offset(bam);
-    let mut bases = vec![0u8; l];
-
-    // Process 16 packed bytes = 32 bases at a time.
-    let full_chunks = l / 32;
-    for c in 0..full_chunks {
-        decode_chunk_32(bam, off + c * 16, &mut bases, c * 32);
-    }
-
-    // Scalar tail for the remaining (l % 32) bases.
-    let processed = full_chunks * 32;
-    for (slot, i) in bases[processed..].iter_mut().zip(processed..l) {
-        *slot = BAM_BASE_TO_ASCII[get_base(bam, off, i) as usize];
-    }
-    bases
-}
-
 /// Bulk-extract the full sequence from a BAM record as ASCII bases.
 ///
 /// Decodes the packed 4-bit sequence data into a `Vec<u8>` of ASCII bases.
@@ -160,18 +135,41 @@ pub(crate) fn extract_sequence_simd(bam: &[u8]) -> Vec<u8> {
 /// reads where SIMD startup cost dominates.
 #[must_use]
 pub fn extract_sequence(bam: &[u8]) -> Vec<u8> {
-    let l = l_seq(bam) as usize;
-    if l >= 32 {
-        return extract_sequence_simd(bam);
-    }
-    // Scalar path for short sequences.
-    let off = seq_offset(bam);
-    let mut bases = Vec::with_capacity(l);
-    for i in 0..l {
-        let code = get_base(bam, off, i);
-        bases.push(BAM_BASE_TO_ASCII[code as usize]);
-    }
+    let mut bases = Vec::new();
+    extract_sequence_into(bam, &mut bases);
     bases
+}
+
+/// Decode the full sequence from a BAM record into `dst` as ASCII bases.
+///
+/// Reuses the caller's buffer: clears `dst` and resizes it to the read length
+/// before decoding. Uses SIMD for reads of 32 bp or longer; falls back to
+/// scalar for shorter reads where SIMD startup cost dominates.
+pub fn extract_sequence_into(bam: &[u8], dst: &mut Vec<u8>) {
+    let l = l_seq(bam) as usize;
+    let off = seq_offset(bam);
+
+    dst.clear();
+    dst.resize(l, 0);
+
+    if l >= 32 {
+        // Process 16 packed bytes = 32 bases at a time.
+        let full_chunks = l / 32;
+        for c in 0..full_chunks {
+            decode_chunk_32(bam, off + c * 16, dst, c * 32);
+        }
+
+        // Scalar tail for the remaining (l % 32) bases.
+        let processed = full_chunks * 32;
+        for (slot, i) in dst[processed..].iter_mut().zip(processed..l) {
+            *slot = BAM_BASE_TO_ASCII[get_base(bam, off, i) as usize];
+        }
+    } else {
+        // Scalar path for short sequences.
+        for (slot, i) in dst.iter_mut().zip(0..l) {
+            *slot = BAM_BASE_TO_ASCII[get_base(bam, off, i) as usize];
+        }
+    }
 }
 
 /// Pack ASCII bases into BAM 4-bit-per-base format, appending to `dst`.

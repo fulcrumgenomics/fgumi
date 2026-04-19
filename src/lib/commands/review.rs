@@ -16,11 +16,19 @@ use crate::variant_review::{
 };
 use anyhow::{Result, bail};
 use clap::Parser;
+use fgumi_raw_bam::{RawBamReader, RawRecord, find_string_tag_in_record};
 use log::info;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::Cigar;
+// RecordBuf retained at indexed-query sites (extract_consensus_reads, generate_review_file):
+// noodles indexed_reader::query() yields bam::Record whose inner bytes are not publicly
+// accessible as &[u8], so raw-byte helpers (find_string_tag_in_record, read_pos_at_ref_pos_raw)
+// cannot be applied there without a noodles-to-bytes serialisation round-trip that would
+// cost more than it saves.  Once noodles exposes raw bytes from bam::Record
+// (https://github.com/zaeleus/noodles/pull/373) these sites can be migrated.
 use noodles::sam::alignment::record_buf::RecordBuf;
 use std::collections::HashSet;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use super::command::Command;
@@ -617,7 +625,8 @@ impl Review {
 
             for result in query.records() {
                 let bam_record = result?;
-                // Convert to RecordBuf for processing
+                // RecordBuf retained: noodles indexed_reader::query() yields bam::Record whose
+                // inner bytes are not publicly accessible; see retention comment at the import.
                 let record = RecordBuf::try_from_alignment_record(&header, &bam_record)?;
 
                 // Check if this read has a non-reference base at the variant position
@@ -665,33 +674,41 @@ impl Review {
     fn extract_grouped_reads(&self, mi_set: &HashSet<String>, command_line: &str) -> Result<()> {
         use noodles::bam;
 
-        let mut reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&self.grouped_bam)?;
-        let header = reader.read_header()?;
+        // Use a plain (non-indexed) reader for the sequential scan; raw-byte mode avoids
+        // the noodles decode/encode round-trip on every record.
+        let mut bam_reader = bam::io::reader::Builder.build_from_path(&self.grouped_bam)?;
+        let header = bam_reader.read_header()?;
 
-        // Add @PG record with PP chaining
+        // Add @PG record with PP chaining (must happen before we consume the reader below)
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         let grouped_out_path = self.output.with_extension("grouped.bam");
         let mut writer = bam::io::writer::Builder.build_from_path(&grouped_out_path)?;
         writer.write_header(&header)?;
 
+        // Extract the inner BGZF reader and wrap in RawBamReader for zero-copy record iteration.
+        let mut raw_reader = RawBamReader::new(bam_reader.into_inner());
+        let mut raw_rec = RawRecord::new();
+
         // Read through entire grouped BAM and extract matching reads
         let progress = ProgressTracker::new("Processed grouped reads").with_interval(1_000_000);
-        let mut record = RecordBuf::default();
-        while reader.read_record_buf(&header, &mut record)? != 0 {
+        loop {
+            let bytes_read = raw_reader.read_record(&mut raw_rec)?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
             progress.log_if_needed(1);
 
-            // Extract MI tag
-            let mi_tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
-            if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi_bytes)) =
-                record.data().get(&mi_tag)
-            {
-                let mi = String::from_utf8(mi_bytes.iter().copied().collect())?;
-                let mi_base = extract_mi_base(&mi);
+            // Extract MI tag directly from raw bytes; no RecordBuf decode needed.
+            if let Some(mi_bytes) = find_string_tag_in_record(&raw_rec, &SamTag::MI) {
+                let mi = std::str::from_utf8(mi_bytes)?;
+                let mi_base = extract_mi_base(mi);
 
                 if mi_set.contains(mi_base) {
-                    writer.write_alignment_record(&header, &record)?;
+                    // Write raw record: BAM block_size prefix + record bytes.
+                    let block_size = raw_rec.len() as u32;
+                    writer.get_mut().write_all(&block_size.to_le_bytes())?;
+                    writer.get_mut().write_all(&raw_rec)?;
                 }
             }
         }
@@ -750,6 +767,8 @@ impl Review {
             let mut consensus_reads = Vec::new();
             for result in query.records() {
                 let bam_record = result?;
+                // RecordBuf retained: noodles indexed_reader::query() yields bam::Record whose
+                // inner bytes are not publicly accessible; see retention comment at the import.
                 let record = RecordBuf::try_from_alignment_record(&consensus_header, &bam_record)?;
                 consensus_reads.push(record);
             }
@@ -827,6 +846,8 @@ impl Review {
 
                     for result in query.records() {
                         let bam_record = result?;
+                        // RecordBuf retained: noodles indexed_reader::query() yields bam::Record
+                        // whose inner bytes are not publicly accessible; see import comment.
                         let record =
                             RecordBuf::try_from_alignment_record(&grouped_header, &bam_record)?;
 
@@ -913,6 +934,8 @@ impl Review {
     }
 
     /// Get the base at a specific reference position in a read
+    // RecordBuf retained: these helpers are called from indexed-query loops where bam::Record
+    // has already been decoded to RecordBuf (see retention comment at the import).
     fn get_base_at_position(&self, record: &RecordBuf, ref_pos: i32) -> Result<Option<u8>> {
         if let Some(offset) = self.calculate_read_offset(record, ref_pos)? {
             let sequence = record.sequence();

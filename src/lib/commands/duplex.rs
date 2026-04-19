@@ -424,8 +424,7 @@ impl Command for Duplex {
                 match raw_reader.read_record(&mut record) {
                     Ok(0) => return None, // EOF
                     Ok(_) => {
-                        let raw = record.into_inner();
-                        let flg = RawRecordView::new(&raw).flags();
+                        let flg = RawRecordView::new(&record).flags();
                         // Skip secondary and supplementary reads
                         if flg & bam_fields::flags::SECONDARY != 0
                             || flg & bam_fields::flags::SUPPLEMENTARY != 0
@@ -437,7 +436,7 @@ impl Command for Duplex {
                         let has_mapped_mate = flg & bam_fields::flags::PAIRED != 0
                             && flg & bam_fields::flags::MATE_UNMAPPED == 0;
                         if is_mapped || has_mapped_mate {
-                            return Some(Ok(raw));
+                            return Some(Ok(record));
                         }
                         // Skip unmapped reads without mapped mates
                     }
@@ -475,11 +474,8 @@ impl Command for Duplex {
                 }
             }
 
-            // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
-            // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
-            let raw: Vec<fgumi_raw_bam::RawRecord> =
-                records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
-            let output = consensus_caller.consensus_reads(raw)?;
+            // Call consensus — mi_group now yields Vec<RawRecord> directly.
+            let output = consensus_caller.consensus_reads(records)?;
 
             // Write pre-serialized consensus reads
             let batch_size = output.count;
@@ -703,11 +699,8 @@ impl Duplex {
                         }
                     }
 
-                    // Call duplex consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
-                    // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
-                    let group_raw: Vec<fgumi_raw_bam::RawRecord> =
-                        group_reads.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
-                    match caller.consensus_reads(group_raw) {
+                    // Call duplex consensus — mi_group yields Vec<RawRecord>.
+                    match caller.consensus_reads(group_reads) {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
                             batch_stats.merge(&caller.statistics());
@@ -838,7 +831,7 @@ impl Duplex {
 /// It examines the MI tag of each record to check for /A and /B suffixes.
 /// Returns `true` only if there is at least one read with /A suffix AND at least
 /// one read with /B suffix.
-fn has_both_strands_raw(records: &[Vec<u8>]) -> bool {
+fn has_both_strands_raw(records: &[RawRecord]) -> bool {
     if records.len() < 2 {
         return false;
     }

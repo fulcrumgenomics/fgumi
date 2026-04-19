@@ -623,7 +623,7 @@ impl Iterator for ReadMateAndRefPosIterator {
 ///
 /// Returns an error if overlapping consensus calling fails for any read pair.
 pub fn apply_overlapping_consensus(
-    records: &mut [Vec<u8>],
+    records: &mut [fgumi_raw_bam::RawRecord],
     caller: &mut OverlappingBasesConsensusCaller,
 ) -> Result<()> {
     use ahash::AHashMap;
@@ -660,7 +660,9 @@ pub fn apply_overlapping_consensus(
                 (&mut right[0], &mut left[*idx2])
             };
 
-            caller.call(r1, r2).context("Failed to call overlapping consensus on raw bytes")?;
+            caller
+                .call(r1.as_mut_vec().as_mut_slice(), r2.as_mut_vec().as_mut_slice())
+                .context("Failed to call overlapping consensus on raw bytes")?;
         }
     }
 
@@ -1214,10 +1216,26 @@ mod tests {
         // R1 (first segment): flag = PAIRED | FIRST_SEGMENT
         let cigar = [cigar_op(4, 0)]; // 4M
         let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
-        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        let r1 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r1_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[30, 30, 30, 30],
+        ));
         // R2 (last segment): flag = PAIRED | LAST_SEGMENT
         let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
-        let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        let r2 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r2_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[20, 20, 20, 20],
+        ));
 
         let mut records = vec![r1, r2];
         apply_overlapping_consensus(&mut records, &mut caller)
@@ -1239,10 +1257,26 @@ mod tests {
         // Only FIRST_SEGMENT, no matching LAST_SEGMENT for this name
         let cigar = [cigar_op(4, 0)]; // 4M
         let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
-        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        let r1 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r1_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[30, 30, 30, 30],
+        ));
         // Different name so no pairing occurs
         let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
-        let r2 = make_raw_bam(b"reb", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        let r2 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"reb",
+            r2_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[20, 20, 20, 20],
+        ));
 
         let mut records = vec![r1, r2];
         apply_overlapping_consensus(&mut records, &mut caller)
@@ -1264,9 +1298,25 @@ mod tests {
 
         let cigar = [cigar_op(4, 0)]; // 4M
         let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
-        let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        let r2 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r2_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[20, 20, 20, 20],
+        ));
         let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
-        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        let r1 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r1_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[30, 30, 30, 30],
+        ));
 
         // R2 at index 0, R1 at index 1
         let mut records = vec![r2, r1];
@@ -1294,16 +1344,40 @@ mod tests {
 
         // Primary R1
         let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
-        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        let r1 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r1_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[30, 30, 30, 30],
+        ));
         // Primary R2
         let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
-        let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        let r2 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r2_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[20, 20, 20, 20],
+        ));
         // Supplementary R1 (same name, placed AFTER the primary so it would
         // overwrite the primary index if the loop did not skip non-primary records).
         let supp_flag = fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::SUPPLEMENTARY;
-        let supp = make_raw_bam(b"rea", supp_flag, 0, 99, &cigar, b"ACGT", &[10, 10, 10, 10]);
+        let supp = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            supp_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[10, 10, 10, 10],
+        ));
 
         let mut records = vec![r1, r2, supp];
         apply_overlapping_consensus(&mut records, &mut caller)
@@ -1327,13 +1401,37 @@ mod tests {
         let cigar = [cigar_op(4, 0)]; // 4M
 
         let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
-        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        let r1 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r1_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[30, 30, 30, 30],
+        ));
         let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
-        let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        let r2 = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            r2_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[20, 20, 20, 20],
+        ));
         let sec_flag = fgumi_raw_bam::flags::PAIRED
             | fgumi_raw_bam::flags::FIRST_SEGMENT
             | fgumi_raw_bam::flags::SECONDARY;
-        let sec = make_raw_bam(b"rea", sec_flag, 0, 99, &cigar, b"ACGT", &[10, 10, 10, 10]);
+        let sec = fgumi_raw_bam::RawRecord::from(make_raw_bam(
+            b"rea",
+            sec_flag,
+            0,
+            99,
+            &cigar,
+            b"ACGT",
+            &[10, 10, 10, 10],
+        ));
 
         let mut records = vec![r1, r2, sec];
         apply_overlapping_consensus(&mut records, &mut caller)

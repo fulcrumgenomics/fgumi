@@ -741,10 +741,10 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
 
     let rr = mapped.raw_records.as_mut().unwrap();
     for record in rr.iter_mut() {
-        let f = RawRecordView::new(record.as_slice()).flags();
+        let f = RawRecordView::new(record.as_ref()).flags();
         if (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0 {
-            bam_fields::remove_tag(record, tc_tag);
-            bam_fields::append_i32_array_tag(record, tc_tag, &tc_values);
+            bam_fields::remove_tag(record.as_mut_vec(), tc_tag);
+            bam_fields::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
         }
     }
 }
@@ -762,7 +762,7 @@ fn convert_template_to_raw(template: &mut Template, header: &Header) -> Result<(
         let mut buf = Vec::with_capacity(256);
         encode_record_buf(&mut buf, header, record)
             .map_err(|e| anyhow::anyhow!("Failed to encode record: {e}"))?;
-        raw_records.push(buf);
+        raw_records.push(RawRecord::from(buf));
     }
     template.raw_records = Some(raw_records);
     // Keep records intact for read_count compatibility
@@ -831,7 +831,7 @@ pub fn merge_raw(
         for tag_str in &tag_info.remove {
             if tag_str.len() == 2 {
                 let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
-                bam_fields::remove_tag(record, &tag_bytes);
+                bam_fields::remove_tag(record.as_mut_vec(), &tag_bytes);
             }
         }
     }
@@ -885,8 +885,8 @@ pub fn merge_raw(
                     if tag_info.remove.contains(tag_str) {
                         continue;
                     }
-                    bam_fields::remove_tag(&mut rr[i], &tag_bytes);
-                    append_buf_value_raw(&mut rr[i], tag_bytes, value);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), &tag_bytes);
+                    append_buf_value_raw(rr[i].as_mut_vec(), tag_bytes, value);
                 }
             }
         }
@@ -916,9 +916,9 @@ pub fn merge_raw(
                         continue;
                     }
 
-                    bam_fields::remove_tag(&mut rr[i], &tag_bytes);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), &tag_bytes);
 
-                    append_buf_value_raw(&mut rr[i], tag_bytes, value);
+                    append_buf_value_raw(rr[i].as_mut_vec(), tag_bytes, value);
                     if has_transforms && tag_info.reverse.contains(tag_str) {
                         reverse_tag_in_place_raw(&mut rr[i], aux_offset, tag_bytes, value);
                     } else if has_transforms && tag_info.revcomp.contains(tag_str) {
@@ -945,8 +945,8 @@ pub fn merge_raw(
     // Step 6: Normalize AS/XS tags
     let rr = mapped.raw_records.as_mut().unwrap();
     for record in rr.iter_mut() {
-        bam_fields::normalize_int_tag_to_smallest_signed(record, b"AS");
-        bam_fields::normalize_int_tag_to_smallest_signed(record, b"XS");
+        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), b"AS");
+        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), b"XS");
     }
 
     // Step 7: Add TC tags
@@ -995,13 +995,16 @@ fn revcomp_tag_in_place_raw(
 }
 
 /// Encodes all records of an unmapped template to raw BAM bytes for output.
-fn encode_unmapped_template_records(template: &Template, header: &Header) -> Result<Vec<Vec<u8>>> {
+fn encode_unmapped_template_records(
+    template: &Template,
+    header: &Header,
+) -> Result<Vec<RawRecord>> {
     let mut raw = Vec::with_capacity(template.read_count());
     for record in template.all_reads() {
         let mut buf = Vec::with_capacity(256);
         encode_record_buf(&mut buf, header, record)
             .map_err(|e| anyhow::anyhow!("encode unmapped: {e}"))?;
-        raw.push(buf);
+        raw.push(RawRecord::from(buf));
     }
     Ok(raw)
 }
@@ -1183,10 +1186,8 @@ fn restore_unconverted_bases_in_raw_template(
     let raw_records = template.raw_records.as_mut().ok_or_else(|| {
         anyhow::anyhow!("restore_unconverted_bases_in_raw_template: template not in raw-byte mode")
     })?;
-    for bytes in raw_records.iter_mut() {
-        let mut rec = RawRecord::from(std::mem::take(bytes));
-        restore_unconverted_bases_in_raw_record(&mut rec, reference, header)?;
-        *bytes = rec.into_inner();
+    for rec in raw_records.iter_mut() {
+        restore_unconverted_bases_in_raw_record(rec, reference, header)?;
     }
     Ok(())
 }

@@ -363,7 +363,7 @@ impl Command for Codec {
             let mut record = RawRecord::new();
             match raw_reader.read_record(&mut record) {
                 Ok(0) => None, // EOF
-                Ok(_) => Some(Ok(record.into_inner())),
+                Ok(_) => Some(Ok(record)),
                 Err(e) => Some(Err(e.into())),
             }
         });
@@ -380,11 +380,8 @@ impl Command for Codec {
         for result in mi_group_iter {
             let (umi, records) = result.context("Failed to read MI group")?;
 
-            // Call consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
-            // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
-            let raw: Vec<fgumi_raw_bam::RawRecord> =
-                records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
-            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(raw);
+            // Call consensus — mi_group yields Vec<RawRecord>.
+            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
             match result {
                 Ok(output) => {
                     let batch_size = output.count;
@@ -575,11 +572,8 @@ impl Codec {
                 for RawMiGroup { mi, records } in batch.groups {
                     caller.clear();
 
-                    // Call CODEC consensus. Bridge Vec<Vec<u8>> → Vec<RawRecord> for the new
-                    // trait signature; the MI iterator still yields raw bytes (PR-5 scope).
-                    let raw: Vec<fgumi_raw_bam::RawRecord> =
-                        records.into_iter().map(fgumi_raw_bam::RawRecord::from).collect();
-                    let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(raw);
+                    // Call CODEC consensus — mi_group yields Vec<RawRecord>.
+                    let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
                     match result {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);

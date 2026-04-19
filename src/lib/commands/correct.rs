@@ -293,9 +293,9 @@ struct TemplateCorrection {
 /// Result from processing a batch of templates through UMI correction.
 struct CorrectProcessedBatch {
     /// Raw-byte kept records.
-    kept_raw_records: Vec<Vec<u8>>,
+    kept_raw_records: Vec<RawRecord>,
     /// Raw-byte rejected records.
-    rejected_raw_records: Vec<Vec<u8>>,
+    rejected_raw_records: Vec<RawRecord>,
     /// Number of templates processed.
     templates_count: u64,
     /// Number of missing UMI records.
@@ -314,11 +314,11 @@ impl MemoryEstimate for CorrectProcessedBatch {
             .kept_raw_records
             .iter()
             .chain(self.rejected_raw_records.iter())
-            .map(Vec::capacity)
+            .map(RawRecord::capacity)
             .sum();
         let raw_vec_overhead = (self.kept_raw_records.capacity()
             + self.rejected_raw_records.capacity())
-            * std::mem::size_of::<Vec<u8>>();
+            * std::mem::size_of::<RawRecord>();
         raw_size + raw_vec_overhead
     }
 }
@@ -337,7 +337,7 @@ struct CollectedCorrectMetrics {
     /// Per-UMI match counts (for metrics file).
     umi_matches: AHashMap<String, UmiCorrectionMetrics>,
     /// Rejected raw records (if tracking).
-    raw_rejects: Vec<Vec<u8>>,
+    raw_rejects: Vec<RawRecord>,
 }
 
 impl Command for CorrectUmis {
@@ -640,7 +640,7 @@ impl CorrectUmis {
     /// - Some records have UMIs and others don't
     /// - UMI tag has non-string type
     fn extract_and_validate_template_umi_raw(
-        raw_records: &[Vec<u8>],
+        raw_records: &[RawRecord],
         umi_tag: [u8; 2],
     ) -> anyhow::Result<Option<String>> {
         use crate::sort::bam_fields;
@@ -694,7 +694,7 @@ impl CorrectUmis {
 
     /// Apply UMI correction to a raw BAM record.
     fn apply_correction_to_raw(
-        record: &mut Vec<u8>,
+        record: &mut RawRecord,
         correction: &TemplateCorrection,
         umi_tag: [u8; 2],
         dont_store_original_umis: bool,
@@ -704,14 +704,14 @@ impl CorrectUmis {
         if correction.needs_correction {
             // Write corrected UMI first (in-place update avoids scanning past OX)
             if let Some(ref corrected) = correction.corrected_umi {
-                bam_fields::update_string_tag(record, &umi_tag, corrected.as_bytes());
+                bam_fields::update_string_tag(record.as_mut_vec(), &umi_tag, corrected.as_bytes());
             }
 
             // Store original UMI if there were actual mismatches
             // Use update_string_tag to avoid duplicate OX tags
             if !dont_store_original_umis && correction.has_mismatches {
                 bam_fields::update_string_tag(
-                    record,
+                    record.as_mut_vec(),
                     &SamTag::OX,
                     correction.original_umi.as_bytes(),
                 );
@@ -833,8 +833,8 @@ impl CorrectUmis {
                     ));
                 }
 
-                let mut kept_raw_records = Vec::new();
-                let mut rejected_raw_records: Vec<Vec<u8>> = Vec::new();
+                let mut kept_raw_records: Vec<RawRecord> = Vec::new();
+                let mut rejected_raw_records: Vec<RawRecord> = Vec::new();
                 let mut missing_umis = 0u64;
                 let mut wrong_length = 0u64;
                 let mut mismatched = 0u64;
@@ -853,7 +853,8 @@ impl CorrectUmis {
                         "Expected raw-byte mode template in pipeline; RecordBuf mode is no longer supported"
                     );
                     {
-                        let raw_records = template.into_raw_records().unwrap_or_default();
+                        let raw_records: Vec<RawRecord> =
+                            template.into_raw_records().unwrap_or_default();
                         let umi_opt = Self::extract_and_validate_template_umi_raw(
                             &raw_records,
                             umi_tag_bytes,
@@ -1011,7 +1012,7 @@ impl CorrectUmis {
         let mut total_wrong_length = 0u64;
         let mut total_mismatched = 0u64;
         let mut merged_umi_matches: AHashMap<String, UmiCorrectionMetrics> = AHashMap::new();
-        let mut all_raw_rejects: Vec<Vec<u8>> = Vec::new();
+        let mut all_raw_rejects: Vec<RawRecord> = Vec::new();
 
         for slot in collected_metrics.slots() {
             let mut m = slot.lock();
@@ -1172,7 +1173,7 @@ impl CorrectUmis {
 
         // Read raw records and group by QNAME
         let mut record = RawRecord::new();
-        let mut current_template: Vec<Vec<u8>> = Vec::new();
+        let mut current_template: Vec<RawRecord> = Vec::new();
         let mut current_name: Option<Vec<u8>> = None;
 
         loop {
@@ -1287,10 +1288,10 @@ impl CorrectUmis {
                 break;
             }
 
-            // Accumulate current record
-            let raw: &[u8] = record.as_ref();
-            current_name = Some(bam_fields::read_name(raw).to_vec());
-            current_template.push(raw.to_vec());
+            // Accumulate current record — move the reader's buffer instead of copying.
+            current_name = Some(bam_fields::read_name(record.as_ref()).to_vec());
+            let taken = std::mem::take(&mut record);
+            current_template.push(taken);
         }
 
         progress.log_final();
@@ -3022,7 +3023,7 @@ mod tests {
     // ========================================================================
 
     /// Build a minimal raw BAM record with a UMI tag for testing.
-    fn make_raw_bam_for_correct(name: &[u8], flag: u16, umi: &[u8]) -> Vec<u8> {
+    fn make_raw_bam_for_correct(name: &[u8], flag: u16, umi: &[u8]) -> RawRecord {
         let l_read_name = (name.len() + 1) as u8;
         let seq_len = 4usize;
         let cigar_ops: &[u32] = if (flag & crate::sort::bam_fields::flags::UNMAPPED) == 0 {
@@ -3060,7 +3061,7 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
-        buf
+        RawRecord::from(buf)
     }
 
     // ========================================================================
@@ -3122,15 +3123,16 @@ mod tests {
     #[test]
     fn test_extract_and_validate_template_umi_raw_no_umi_tag() {
         // Record with no UMI tag at all
-        let mut raw = vec![0u8; 42]; // minimal record
-        raw[8] = 4; // l_read_name
-        raw[14..16].copy_from_slice(
+        let mut raw_bytes = vec![0u8; 42]; // minimal record
+        raw_bytes[8] = 4; // l_read_name
+        raw_bytes[14..16].copy_from_slice(
             &(crate::sort::bam_fields::flags::PAIRED
                 | crate::sort::bam_fields::flags::FIRST_SEGMENT)
                 .to_le_bytes(),
         );
-        raw[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
-        raw[32..36].copy_from_slice(b"rea\0");
+        raw_bytes[16..20].copy_from_slice(&4u32.to_le_bytes()); // l_seq = 4
+        raw_bytes[32..36].copy_from_slice(b"rea\0");
+        let raw = RawRecord::from(raw_bytes);
         let result =
             CorrectUmis::extract_and_validate_template_umi_raw(&[raw], *SamTag::RX).unwrap();
         assert!(result.is_none());
