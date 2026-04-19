@@ -414,6 +414,51 @@ pub fn check_deadlock_and_restore(
 
     // Check for deadlock (no progress for timeout period)
     if now.saturating_sub(last_progress) >= timeout {
+        // False-positive guard. The per-queue timestamps only update when a
+        // record is pushed into or popped from one of q1..q7. If every
+        // queue is empty, no push/pop happens even when the pipeline is
+        // fundamentally healthy — the common case is a stdin pipe that
+        // intermittently stalls for longer than `timeout` because the
+        // upstream process is slow (e.g. `fgumi sort` in phase-2 merge
+        // feeding `group | codec | filter`). Absence of queue activity in
+        // that case is starvation, not deadlock.
+        //
+        // Only raise "deadlock detected" when at least one queue still has
+        // items stuck in it. With empty queues we instead bump the progress
+        // timer and return None, so we don't re-fire every monitor tick and
+        // so real pipeline progress — when it resumes — naturally updates
+        // the per-queue timestamps. A genuine upstream hang will leave
+        // every queue empty forever and the pipeline will sit idle until
+        // the user interrupts; the previous behaviour killed the process
+        // in that same scenario, so we do not lose liveness signalling
+        // that we had before.
+        // In-flight work includes both the bounded queues AND the BAM
+        // reorder buffers (FASTQ sets these to 0). Items can sit in a
+        // reorder buffer waiting for a missing sequence number while every
+        // queue.len() reads 0 — treating that as starvation would mask a
+        // real deadlock. For FASTQ, q2b_len already covers Q2.5
+        // (q2_block_parsed for bgzf, q2_5_boundaries otherwise).
+        let has_in_flight_work = snapshot.q1_len > 0
+            || snapshot.q2_len > 0
+            || snapshot.q2b_len > 0
+            || snapshot.q3_len > 0
+            || snapshot.q4_len > 0
+            || snapshot.q5_len > 0
+            || snapshot.q6_len > 0
+            || snapshot.q7_len > 0
+            || snapshot.q2_reorder_mem > 0
+            || snapshot.q3_reorder_mem > 0;
+        if !has_in_flight_work {
+            log::debug!(
+                "Deadlock detector: no queue activity for {}s but all queues \
+                 are empty (read_done={}); treating as upstream starvation, \
+                 not deadlock",
+                timeout,
+                snapshot.read_done
+            );
+            deadlock_state.last_progress_time.store(now, Ordering::Relaxed);
+            return DeadlockAction::None;
+        }
         return handle_deadlock(deadlock_state, snapshot, now);
     }
 
@@ -871,11 +916,14 @@ mod tests {
         let now = now_secs();
         state.last_progress_time.store(now.saturating_sub(5), Ordering::Relaxed);
 
+        // Populate a downstream queue so this is a genuine stuck-items
+        // deadlock, not the starvation (all-queues-empty) case that the
+        // detector now treats as benign.
         let snapshot = QueueSnapshot {
             q1_len: 0,
             q2_len: 0,
             q2b_len: 0,
-            q3_len: 0,
+            q3_len: 1,
             q4_len: 0,
             q5_len: 0,
             q6_len: 0,
@@ -905,11 +953,14 @@ mod tests {
         let now = now_secs();
         state.last_progress_time.store(now.saturating_sub(5), Ordering::Relaxed);
 
+        // Non-empty queue: this represents a genuine "items stuck in queue"
+        // deadlock (a worker is holding progress up) rather than the
+        // starvation case, which the detector now skips.
         let snapshot = QueueSnapshot {
             q1_len: 0,
             q2_len: 0,
             q2b_len: 0,
-            q3_len: 0,
+            q3_len: 1,
             q4_len: 0,
             q5_len: 0,
             q6_len: 0,
@@ -1038,11 +1089,15 @@ mod tests {
         // Set current limit to something that would result in lower stable
         state.current_memory_limit.store(256 * 1024 * 1024, Ordering::Relaxed);
 
+        // Populate q3 so this is a genuine stuck-items deadlock and reaches
+        // `handle_deadlock`, where the anti-decrease stable-limit logic
+        // lives. With all queues empty the new starvation guard returns
+        // early and the anti-oscillation path isn't exercised.
         let snapshot = QueueSnapshot {
             q1_len: 0,
             q2_len: 0,
             q2b_len: 0,
-            q3_len: 0,
+            q3_len: 1,
             q4_len: 0,
             q5_len: 0,
             q6_len: 0,
@@ -1056,7 +1111,8 @@ mod tests {
             extra_state: None,
         };
 
-        check_deadlock_and_restore(&state, &snapshot);
+        let action = check_deadlock_and_restore(&state, &snapshot);
+        assert!(matches!(action, DeadlockAction::Recovered(_)));
 
         // Stable limit should still be 1GB (never decreased)
         let current_stable = state.stable_memory_limit.load(Ordering::Relaxed);
@@ -1092,5 +1148,54 @@ mod tests {
         // Modify and verify
         state.current_memory_limit.store(1024 * 1024 * 1024, Ordering::Relaxed);
         assert_eq!(state.get_memory_limit(), 1024 * 1024 * 1024);
+    }
+
+    /// Regression: detector must NOT fire when all queues are empty, even if
+    /// the last progress timestamp is stale. Empty queues + timeout = stdin
+    /// pipe starvation (upstream is slow), not a genuine deadlock.
+    ///
+    /// Observed pre-fix on a full-depth rep1 run where `fgumi filter` died
+    /// with "pipeline deadlock detected" because `fgumi sort`'s phase-2
+    /// merge was streaming output sporadically into group|codec|filter and
+    /// leaving filter's own queues drained for longer than the 10-second
+    /// timeout even though the pipeline was fundamentally healthy.
+    #[test]
+    fn test_no_deadlock_on_empty_queues_stale_timestamp() {
+        let config = DeadlockConfig::new(1, false);
+        let state = DeadlockState::new(&config, 0);
+        let now = now_secs();
+        // Force last_progress to be well past the 1s timeout.
+        state.last_progress_time.store(now.saturating_sub(5), Ordering::Relaxed);
+        let snapshot = QueueSnapshot {
+            q1_len: 0,
+            q2_len: 0,
+            q2b_len: 0,
+            q3_len: 0,
+            q4_len: 0,
+            q5_len: 0,
+            q6_len: 0,
+            q7_len: 0,
+            q2_reorder_mem: 0,
+            q3_reorder_mem: 0,
+            memory_limit: 0,
+            read_done: false,
+            group_done: false,
+            draining: false,
+            extra_state: None,
+        };
+        let before = state.last_progress_time.load(Ordering::Relaxed);
+        let action = check_deadlock_and_restore(&state, &snapshot);
+        assert_eq!(
+            action,
+            DeadlockAction::None,
+            "empty queues + stale timestamp must be treated as starvation"
+        );
+        // The guard must bump last_progress_time so it doesn't re-fire on
+        // every monitor tick while the pipeline waits on stdin.
+        let after = state.last_progress_time.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "empty-queue starvation path should refresh last_progress_time (before={before}, after={after})"
+        );
     }
 }
