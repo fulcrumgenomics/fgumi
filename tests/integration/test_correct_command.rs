@@ -160,3 +160,81 @@ fn test_correct_command_with_rejects() {
     assert!(status.success(), "Correct command with rejects failed");
     assert!(rejects_bam.exists(), "Rejects BAM not created");
 }
+
+/// Exercises the multi-threaded rejects-streaming path end-to-end and asserts:
+/// 1. The rejects BAM is a valid BGZF stream with the terminating EOF block.
+/// 2. The `@HD` header reports `SO:unsorted` because rejects are emitted in
+///    mutex-acquisition order rather than input order.
+/// 3. Every uncorrectable input record appears exactly once in the rejects
+///    BAM — the writer does not drop records under worker contention and does
+///    not emit duplicates.
+#[test]
+fn test_correct_command_rejects_streaming_threaded_integrity() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_bam = temp_dir.path().join("input.bam");
+    let output_bam = temp_dir.path().join("output.bam");
+    let rejects_bam = temp_dir.path().join("rejects.bam");
+    let whitelist = temp_dir.path().join("whitelist.txt");
+
+    // Several uncorrectable families spread across multiple batches so more
+    // than one worker thread races to flush rejects concurrently.
+    let far_family_size: u32 = 10;
+    let corr_small = create_umi_family("ACGTACGT", 3, "c1_exact", "AAAAGGGG", 30);
+    let corr_big = create_umi_family("ACGTACGT", 30, "c2_exact", "AAAAGGGG", 30);
+    let far_a = create_umi_family("TTTTTTTT", far_family_size as usize, "far_a", "AAAAGGGG", 30);
+    let far_b = create_umi_family("GGGGGGGG", far_family_size as usize, "far_b", "AAAAGGGG", 30);
+    let far_c = create_umi_family("CCCCCCCC", far_family_size as usize, "far_c", "AAAAGGGG", 30);
+
+    let expected_rejects = far_family_size * 3;
+
+    create_umi_bam(&input_bam, vec![corr_small, corr_big, far_a, far_b, far_c]);
+    create_whitelist(&whitelist, &["ACGTACGT"]);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
+        .args([
+            "correct",
+            "--input",
+            input_bam.to_str().unwrap(),
+            "--output",
+            output_bam.to_str().unwrap(),
+            "--umi-files",
+            whitelist.to_str().unwrap(),
+            "--max-mismatches",
+            "1",
+            "--min-distance",
+            "1",
+            "--rejects",
+            rejects_bam.to_str().unwrap(),
+            "--threads",
+            "4",
+            "--compression-level",
+            "1",
+        ])
+        .status()
+        .expect("Failed to run correct command");
+
+    assert!(status.success(), "Correct command with threaded rejects failed");
+    assert!(rejects_bam.exists(), "Rejects BAM not created");
+
+    crate::helpers::assertions::assert_has_bgzf_eof(&rejects_bam);
+    crate::helpers::assertions::assert_header_unsorted(&rejects_bam);
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&rejects_bam).unwrap());
+    let _header = reader.read_header().unwrap();
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut total = 0u32;
+    for result in reader.records() {
+        let record = result.expect("Failed to read reject record");
+        let name = record.name().expect("reject record missing read name").to_string();
+        *seen.entry(name).or_insert(0) += 1;
+        total += 1;
+    }
+
+    assert_eq!(
+        total, expected_rejects,
+        "rejects BAM should contain one record per uncorrectable input read",
+    );
+    for (name, count) in &seen {
+        assert_eq!(*count, 1, "record {name} appears {count} times in the rejects BAM");
+    }
+}

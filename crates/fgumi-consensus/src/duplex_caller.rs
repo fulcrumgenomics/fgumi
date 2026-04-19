@@ -1738,15 +1738,31 @@ impl DuplexConsensusCaller {
         read_name_prefix: &str,
         read_group_id: &str,
         cell_tag: Option<Tag>,
-    ) -> Result<(ConsensusOutput, ConsensusCallingStats)> {
+        track_rejects: bool,
+    ) -> Result<(ConsensusOutput, ConsensusCallingStats, Vec<Vec<u8>>)> {
         let mut stats = ConsensusCallingStats::new();
         let mut builder = UnmappedSamBuilder::new();
         let mut output = ConsensusOutput::default();
         let methylation_mode = ss_caller.options.methylation_mode;
 
+        // Helper: move raw input records into the reject payload if rejects are being
+        // tracked. Each rejection site moves `a_records`/`b_records` into the reject
+        // vec so we never hold both the input and reject copies simultaneously.
+        // Single-strand rejections are captured separately by `ss_caller`.
+        let collect_rejected_raw =
+            |track: bool, a: Vec<Vec<u8>>, b: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+                if track {
+                    let mut v = a;
+                    v.extend(b);
+                    v
+                } else {
+                    Vec::new()
+                }
+            };
+
         // Check if we have both strands
         if a_records.is_empty() && b_records.is_empty() {
-            return Ok((ConsensusOutput::default(), stats));
+            return Ok((ConsensusOutput::default(), stats, Vec::new()));
         }
 
         // Check if we have enough input reads (matching fgbio's hasMinimumNumberOfReads)
@@ -1761,7 +1777,8 @@ impl DuplexConsensusCaller {
                 RejectionReason::InsufficientReads,
                 a_records.len() + b_records.len(),
             );
-            return Ok((ConsensusOutput::default(), stats));
+            let rejected_raw = collect_rejected_raw(track_rejects, a_records, b_records);
+            return Ok((ConsensusOutput::default(), stats, rejected_raw));
         }
 
         // Extract cell barcode from source reads (matching fgbio: recs.head.get[String](cellTag))
@@ -1819,7 +1836,9 @@ impl DuplexConsensusCaller {
                     RejectionReason::PotentialCollision,
                     a_records.len() + b_records.len(),
                 );
-                return Ok((ConsensusOutput::default(), stats));
+                drop((ab_r1s, ab_r2s, ba_r1s, ba_r2s));
+                let rejected_raw = collect_rejected_raw(track_rejects, a_records, b_records);
+                return Ok((ConsensusOutput::default(), stats, rejected_raw));
             }
 
             // Check singleStrand2 (AB-R2 + BA-R1)
@@ -1829,7 +1848,9 @@ impl DuplexConsensusCaller {
                     RejectionReason::PotentialCollision,
                     a_records.len() + b_records.len(),
                 );
-                return Ok((ConsensusOutput::default(), stats));
+                drop((ab_r1s, ab_r2s, ba_r1s, ba_r2s));
+                let rejected_raw = collect_rejected_raw(track_rejects, a_records, b_records);
+                return Ok((ConsensusOutput::default(), stats, rejected_raw));
             }
         }
 
@@ -2086,13 +2107,14 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus();
-                        return Ok((output, stats));
+                        return Ok((output, stats, Vec::new()));
                     }
                     stats.record_rejection(
                         RejectionReason::InsufficientReads,
                         a_records.len() + b_records.len(),
                     );
-                    return Ok((ConsensusOutput::default(), stats));
+                    let rejected_raw = collect_rejected_raw(track_rejects, a_records, b_records);
+                    return Ok((ConsensusOutput::default(), stats, rejected_raw));
                 }
             }
             (Some(ref r1_a), Some(ref r2_a), None, None) => {
@@ -2137,7 +2159,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus();
-                        return Ok((output, stats));
+                        return Ok((output, stats, Vec::new()));
                     }
                 }
             }
@@ -2184,7 +2206,7 @@ impl DuplexConsensusCaller {
                             cell_barcode.as_deref(),
                         )?;
                         stats.record_consensus();
-                        return Ok((output, stats));
+                        return Ok((output, stats, Vec::new()));
                     }
                 }
             }
@@ -2198,8 +2220,12 @@ impl DuplexConsensusCaller {
         debug!(
             "MI {base_mi}: No duplex consensus created - insufficient reads or conversion failed"
         );
-        stats.record_rejection(RejectionReason::InsufficientReads, 1);
-        Ok((ConsensusOutput::default(), stats))
+        stats.record_rejection(
+            RejectionReason::InsufficientReads,
+            a_records.len() + b_records.len(),
+        );
+        let rejected_raw = collect_rejected_raw(track_rejects, a_records, b_records);
+        Ok((ConsensusOutput::default(), stats, rejected_raw))
     }
 }
 
@@ -2216,7 +2242,7 @@ impl ConsensusCaller for DuplexConsensusCaller {
 
         let produce_per_base_tags = self.produce_per_base_tags;
 
-        let (output, group_stats) = Self::process_group(
+        let (output, group_stats, duplex_rejected_raw) = Self::process_group(
             base_mi,
             a_records,
             b_records,
@@ -2228,12 +2254,23 @@ impl ConsensusCaller for DuplexConsensusCaller {
             &self.read_name_prefix,
             &self.read_group_id,
             self.cell_tag,
+            self.track_rejects,
         )?;
 
         self.stats.merge(&group_stats);
 
         if self.track_rejects {
-            self.rejected_reads.extend(self.ss_caller.take_rejected_reads());
+            // When the duplex layer rejects the group, `duplex_rejected_raw`
+            // already contains every raw input record (collected via
+            // `collect_rejected_raw`), so the ss-layer rejects — which are a
+            // subset of those same records — would be duplicates. Drain the
+            // ss-caller regardless to reset its state, but only emit one source.
+            let ss_rejected_raw = self.ss_caller.take_rejected_reads();
+            if duplex_rejected_raw.is_empty() {
+                self.rejected_reads.extend(ss_rejected_raw);
+            } else {
+                self.rejected_reads.extend(duplex_rejected_raw);
+            }
         }
 
         Ok(output)

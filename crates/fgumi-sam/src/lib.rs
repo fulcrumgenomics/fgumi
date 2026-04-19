@@ -232,6 +232,44 @@ pub fn check_sort(header: &Header, path: &Path, name: &str) {
     }
 }
 
+/// Returns a copy of `header` with its sort-order metadata cleared.
+///
+/// The `SO` tag is set to `unsorted` and any `GO` (group order) or `SS`
+/// (sub-sort) tags are removed. Use this when writing records whose emission
+/// order does not match the input's advertised sort order, so downstream tools
+/// don't mistakenly assume the output is sorted.
+#[must_use]
+pub fn header_as_unsorted(header: &Header) -> Header {
+    use bstr::BString;
+    use noodles::sam::header::record::value::Map;
+    use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
+
+    let mut header_map = header
+        .header()
+        .cloned()
+        .unwrap_or_else(Map::<noodles::sam::header::record::value::map::Header>::default);
+
+    let other_fields = header_map.other_fields_mut();
+    other_fields.insert(SORT_ORDER, BString::from(UNSORTED));
+    other_fields.shift_remove(b"GO");
+    other_fields.shift_remove(b"SS");
+
+    let mut builder = Header::builder();
+    for (name, rg) in header.read_groups() {
+        builder = builder.add_read_group(name.clone(), rg.clone());
+    }
+    for (name, reference) in header.reference_sequences() {
+        builder = builder.add_reference_sequence(name.clone(), reference.clone());
+    }
+    for (id, pg) in header.programs().as_ref() {
+        builder = builder.add_program(id.clone(), pg.clone());
+    }
+    for comment in header.comments() {
+        builder = builder.add_comment(comment.clone());
+    }
+    builder.set_header(header_map).build()
+}
+
 /// Reverses a `BufValue` (array or string).
 ///
 /// This function reverses per-base tag values to match read orientation when reads
@@ -679,6 +717,55 @@ mod tests {
         use noodles::sam::header::record::value::map::header::sort_order::COORDINATE;
         let header = create_empty_header();
         assert!(!is_sorted(&header, COORDINATE));
+    }
+
+    // =========================================================================
+    // Tests for header_as_unsorted()
+    // =========================================================================
+
+    #[test]
+    fn test_header_as_unsorted_overrides_coordinate_so() {
+        let header = create_header_with_so("coordinate");
+        let unsorted = header_as_unsorted(&header);
+        assert!(is_sorted(&unsorted, UNSORTED));
+    }
+
+    #[test]
+    fn test_header_as_unsorted_sets_so_when_missing() {
+        let header = create_header_without_so();
+        let unsorted = header_as_unsorted(&header);
+        assert!(is_sorted(&unsorted, UNSORTED));
+    }
+
+    #[test]
+    fn test_header_as_unsorted_drops_go_and_ss() {
+        // Template-coordinate header has SO:unsorted, GO:query, SS:template-coordinate.
+        let header =
+            create_template_coord_header("unsorted", Some("query"), Some("template-coordinate"));
+        assert!(is_template_coordinate_sorted(&header));
+        let unsorted = header_as_unsorted(&header);
+        // GO and SS should be gone, so it no longer looks template-coordinate sorted.
+        assert!(!is_template_coordinate_sorted(&unsorted));
+        let other_fields = unsorted.header().expect("header map present").other_fields();
+        assert!(other_fields.get(b"GO").is_none());
+        assert!(other_fields.get(b"SS").is_none());
+        assert!(is_sorted(&unsorted, UNSORTED));
+    }
+
+    #[test]
+    fn test_header_as_unsorted_preserves_read_groups_and_refs() {
+        let header_str = "@HD\tVN:1.6\tSO:coordinate\n\
+                          @SQ\tSN:chr1\tLN:1000\n\
+                          @RG\tID:rg1\tSM:sample1\n\
+                          @PG\tID:prog1\tPN:tool\n";
+        let header: Header = header_str.parse().expect("parse header");
+        let unsorted = header_as_unsorted(&header);
+        assert_eq!(unsorted.reference_sequences().len(), 1);
+        assert!(unsorted.reference_sequences().contains_key(b"chr1".as_slice()));
+        assert_eq!(unsorted.read_groups().len(), 1);
+        assert!(unsorted.read_groups().contains_key(b"rg1".as_slice()));
+        assert_eq!(unsorted.programs().as_ref().len(), 1);
+        assert!(is_sorted(&unsorted, UNSORTED));
     }
 
     // =========================================================================

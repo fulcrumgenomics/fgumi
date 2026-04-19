@@ -32,6 +32,36 @@ pub fn assert_has_bgzf_eof(path: &std::path::Path) {
     );
 }
 
+/// Asserts that a BAM file's `@HD` line has `SO:unsorted` and no `GO` or `SS`
+/// tags, matching the contract of `fgumi_lib::sam::header_as_unsorted`.
+///
+/// Use this on rejects BAMs produced by the pipeline commands, whose records
+/// are emitted in mutex-acquisition order rather than input order.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened, the header cannot be read, or the
+/// sort-order tags do not match the unsorted contract.
+pub fn assert_header_unsorted(path: &std::path::Path) {
+    let mut reader = noodles::bam::io::Reader::new(
+        std::fs::File::open(path).expect("Failed to open BAM for header check"),
+    );
+    let header = reader.read_header().expect("Failed to read BAM header");
+    let hdr_map = header.header().expect("BAM header is missing an @HD line");
+    let other_fields = hdr_map.other_fields();
+
+    let so =
+        other_fields.get(b"SO").unwrap_or_else(|| panic!("@HD missing SO in {}", path.display()));
+    assert_eq!(
+        <_ as AsRef<[u8]>>::as_ref(so),
+        b"unsorted",
+        "SO should be 'unsorted' in {}",
+        path.display()
+    );
+    assert!(other_fields.get(b"GO").is_none(), "GO should be cleared in {}", path.display());
+    assert!(other_fields.get(b"SS").is_none(), "SS should be cleared in {}", path.display());
+}
+
 /// Asserts that a record has a specific MI (molecule ID) tag value.
 ///
 /// # Panics

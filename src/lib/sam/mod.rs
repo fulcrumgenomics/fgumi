@@ -17,8 +17,8 @@ pub use fgumi_sam::{TC_TAG, TemplateCoordinateInfo};
 
 // Re-export top-level functions from fgumi-sam
 pub use fgumi_sam::{
-    buf_value_to_smallest_signed_int, check_sort, is_sorted, is_template_coordinate_sorted,
-    revcomp_buf_value, reverse_buf_value, to_smallest_signed_int,
+    buf_value_to_smallest_signed_int, check_sort, header_as_unsorted, is_sorted,
+    is_template_coordinate_sorted, revcomp_buf_value, reverse_buf_value, to_smallest_signed_int,
 };
 
 // Re-export commonly used items from submodules

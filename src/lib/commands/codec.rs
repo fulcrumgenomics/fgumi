@@ -7,8 +7,8 @@
 //! allowing even a single read-pair to generate duplex consensus.
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
+    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
@@ -35,11 +35,12 @@ use crate::unified_pipeline::{
 };
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
-use crate::sam::SamTag;
+use crate::sam::{SamTag, header_as_unsorted};
 use crate::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
+use parking_lot::Mutex;
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
 
@@ -51,8 +52,6 @@ use std::sync::Arc;
 struct CodecProcessedBatch {
     /// Consensus reads to write to output BAM
     consensus_output: ConsensusOutput,
-    /// Rejected reads as raw BAM bytes (written to rejects file if enabled)
-    rejects: Vec<Vec<u8>>,
     /// Number of MI groups in this batch
     groups_count: u64,
     /// CODEC consensus calling statistics for this batch
@@ -62,20 +61,18 @@ struct CodecProcessedBatch {
 impl MemoryEstimate for CodecProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
         self.consensus_output.data.capacity()
-            + self.rejects.iter().map(Vec::capacity).sum::<usize>()
-            + self.rejects.capacity() * std::mem::size_of::<Vec<u8>>()
     }
 }
 
-/// Metrics collected from each batch during parallel processing.
+/// Per-thread accumulator for CODEC consensus metrics. Rejected records
+/// are streamed directly to the rejects BAM from `process_fn` and are not
+/// buffered in the accumulator.
 #[derive(Default)]
 struct CollectedCodecMetrics {
     /// CODEC consensus calling statistics
     stats: CodecConsensusStats,
     /// Number of MI groups processed
     groups_processed: u64,
-    /// Rejected reads as raw BAM bytes for deferred writing
-    rejects: Vec<Vec<u8>>,
 }
 
 /// Call CODEC consensus reads from template-coordinate sorted BAM
@@ -503,7 +500,7 @@ impl Codec {
         )?;
 
         // Per-thread metrics accumulator: bounded metric memory, no unbounded
-        // queue. Rejects buffering semantics are preserved (see follow-up).
+        // queue. Rejects are streamed to disk from `process_fn`, not stored here.
         let collected_metrics = PerThreadAccumulator::<CollectedCodecMetrics>::new(num_threads);
         let collected_metrics_for_serialize = Arc::clone(&collected_metrics);
 
@@ -535,15 +532,37 @@ impl Codec {
         // Use larger batch size for codec (less work per group than simplex)
         let batch_size = 1000;
 
-        // Clone input_header before pipeline (needed for rejects writing)
-        let rejects_header = input_header.clone();
+        // Open rejects writer up front; rejects are streamed from `process_fn`
+        // rather than buffered per-thread (issue #285 follow-up). Because
+        // workers flush under a mutex rather than through the ordered
+        // serialize stage, reject records are emitted in mutex-acquisition
+        // order, not input order; mark the rejects header as SO:unsorted so
+        // downstream tools don't assume the input's sort order carried over.
+        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
+            if let Some(path) = self.rejects_opts.rejects.as_ref() {
+                let writer_threads = self.threading.num_threads();
+                let rejects_header = header_as_unsorted(&input_header);
+                let w = create_raw_bam_writer(
+                    path,
+                    &rejects_header,
+                    writer_threads,
+                    self.compression.compression_level,
+                )?;
+                Some(Arc::new(Mutex::new(Some(w))))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
 
         // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let groups_processed = run_bam_pipeline_from_reader(
+        let pipeline_result = run_bam_pipeline_from_reader(
             pipeline_config,
             reader,
             input_header,
@@ -565,37 +584,60 @@ impl Codec {
                 );
 
                 let mut all_output = ConsensusOutput::default();
-                let mut all_rejects = Vec::new();
                 let mut batch_stats = CodecConsensusStats::default();
                 let groups_count = batch.groups.len() as u64;
+
+                // Stream per-MI-group rejects straight to disk so they don't
+                // accumulate in a batch-level Vec. The mutex only serializes the
+                // raw-byte append; BGZF compression runs on the writer's own
+                // thread pool.
+                let flush_rejects = |recs: &[Vec<u8>]| -> io::Result<()> {
+                    if let Some(ref rw_arc) = rejects_writer_for_process {
+                        if !recs.is_empty() {
+                            let mut guard = rw_arc.lock();
+                            if let Some(w) = guard.as_mut() {
+                                for raw in recs {
+                                    w.write_raw_record(raw)?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                };
 
                 for RawMiGroup { mi, records } in batch.groups {
                     caller.clear();
 
                     // Call CODEC consensus directly — records are already raw bytes!
                     let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
-                    match result {
+                    let should_flush_rejects = match result {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);
                             batch_stats.merge(caller.statistics());
-                            if track_rejects {
-                                all_rejects.extend(caller.take_rejected_reads());
-                            }
+                            true
                         }
                         Err(e) => {
-                            // Handle duplex disagreement errors by merging stats
+                            // Handle duplex disagreement errors by merging stats and
+                            // preserving rejects; propagate other errors so threaded
+                            // mode matches single-threaded hard-failure behavior.
                             if e.to_string().contains("duplex disagreement") {
                                 batch_stats.merge(caller.statistics());
+                                true
                             } else {
-                                log::warn!("CODEC consensus error for MI {mi}: {e}");
+                                return Err(io::Error::other(format!(
+                                    "Failed to call consensus for UMI {mi}: {e}"
+                                )));
                             }
                         }
+                    };
+
+                    if track_rejects && should_flush_rejects {
+                        flush_rejects(&caller.take_rejected_reads())?;
                     }
                 }
 
                 Ok(CodecProcessedBatch {
                     consensus_output: all_output,
-                    rejects: all_rejects,
                     groups_count,
                     stats: batch_stats,
                 })
@@ -605,14 +647,13 @@ impl Codec {
                   _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
-                // Merge per-batch metrics + rejects into this worker's slot
+                // Rejects were already streamed to disk in process_fn.
+                // Merge per-batch metrics into this worker's accumulator slot
                 let batch_stats = processed.stats;
                 let groups_count = processed.groups_count;
-                let mut batch_rejects = processed.rejects;
                 collected_metrics_for_serialize.with_slot(|m| {
                     m.stats.merge(&batch_stats);
                     m.groups_processed += groups_count;
-                    m.rejects.append(&mut batch_rejects);
                 });
 
                 // Serialize consensus reads
@@ -620,47 +661,41 @@ impl Codec {
                 output.extend_from_slice(&processed.consensus_output.data);
                 Ok(count)
             },
-        )
-        .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?;
+        );
 
-        // ========== Post-pipeline: Aggregate metrics and write rejects ==========
+        // Always finalize the rejects writer, even if the pipeline failed, so any
+        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
+        // finish() failures alongside any pipeline error so neither is silently
+        // dropped.
+        let rejects_finish_result = rejects_writer
+            .and_then(|rw_arc| rw_arc.lock().take())
+            .map(|writer| writer.finish().context("Failed to finish rejects file"));
+
+        let groups_processed = match (pipeline_result, rejects_finish_result) {
+            (Ok(groups_processed), Some(Ok(()))) => {
+                info!("Rejected reads streamed to rejects file during processing");
+                groups_processed
+            }
+            (Ok(groups_processed), None) => groups_processed,
+            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
+            (Err(pipeline_err), Some(Err(finish_err))) => {
+                return Err(anyhow::anyhow!(
+                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
+                ));
+            }
+            (Err(pipeline_err), _) => {
+                return Err(anyhow::anyhow!("Pipeline error: {pipeline_err}"));
+            }
+        };
+
+        // ========== Post-pipeline: Aggregate metrics ==========
         let mut total_groups = 0u64;
         let mut merged_stats = CodecConsensusStats::default();
-        let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
         for slot in collected_metrics.slots() {
-            let mut m = slot.lock();
+            let m = slot.lock();
             total_groups += m.groups_processed;
             merged_stats.merge(&m.stats);
-            if track_rejects {
-                all_rejects.append(&mut m.rejects);
-            }
-        }
-
-        // Write deferred rejects as raw BAM bytes
-        if track_rejects && !all_rejects.is_empty() {
-            if let Some(rejects_path) = &self.rejects_opts.rejects {
-                let writer_threads = self.threading.num_threads();
-                let rejects_writer = create_optional_bam_writer(
-                    Some(rejects_path),
-                    &rejects_header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?;
-                if let Some(mut rw) = rejects_writer {
-                    for raw_record in &all_rejects {
-                        let block_size = raw_record.len() as u32;
-                        rw.get_mut()
-                            .write_all(&block_size.to_le_bytes())
-                            .context("Failed to write rejected read block size")?;
-                        rw.get_mut()
-                            .write_all(raw_record)
-                            .context("Failed to write rejected read")?;
-                    }
-                    rw.into_inner().finish().context("Failed to finish rejects file")?;
-                    info!("Wrote {} rejected reads", all_rejects.len());
-                }
-            }
         }
 
         // Log statistics
@@ -1186,19 +1221,15 @@ mod tests {
     fn test_codec_processed_batch_memory_estimate() {
         let mut data = Vec::with_capacity(1024);
         data.extend_from_slice(&[0u8; 100]);
-        let mut reject = Vec::with_capacity(512);
-        reject.extend_from_slice(&[0u8; 50]);
 
         let batch = CodecProcessedBatch {
             consensus_output: ConsensusOutput { data, count: 1 },
-            rejects: vec![reject],
             groups_count: 1,
             stats: CodecConsensusStats::default(),
         };
 
         let estimate = batch.estimate_heap_size();
-        assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
-        assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
+        assert!(estimate >= 1024, "estimate {estimate} should be >= 1024 (capacity)");
     }
 
     /// Asserts that single-threaded and multi-threaded codec produce the same number of
@@ -1252,6 +1283,128 @@ mod tests {
         assert_eq!(
             cb_presence_st, cb_presence_mt,
             "CB tag presence should match between single-threaded and multi-threaded modes"
+        );
+
+        Ok(())
+    }
+
+    /// Creates an FR pair whose R1 sequence and the reverse-complement of its
+    /// R2 sequence deliberately disagree at every position. With
+    /// `max_duplex_disagreements` set to `0`, the codec caller will raise a
+    /// "High duplex disagreement" error for this pair.
+    fn create_codec_fr_pair_disagreeing(
+        mi_value: &str,
+        start: usize,
+        read_len: usize,
+    ) -> (RecordBuf, RecordBuf) {
+        // The codec caller revcomp's the raw R2 bases when building the
+        // source read (because R2 carries REVERSE_COMPLEMENTED) and revcomp's
+        // the R2 single-strand consensus again during the orient step. Those
+        // two revcomps cancel, so the duplex base comparison is effectively
+        // (raw_R1 vs raw_R2). Use different raw bytes for the two reads to
+        // force a disagreement at every position.
+        let r1_seq = "A".repeat(read_len);
+        let r2_seq = "C".repeat(read_len);
+        let quals = vec![30u8; read_len];
+        let insert_size = read_len as i32;
+
+        let r1 = RecordBuilder::new()
+            .name(&format!("read_{mi_value}"))
+            .sequence(&r1_seq)
+            .qualities(&quals)
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::PROPERLY_SEGMENTED
+                    | Flags::FIRST_SEGMENT
+                    | Flags::MATE_REVERSE_COMPLEMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(start)
+            .cigar(&format!("{read_len}M"))
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(start)
+            .template_length(insert_size)
+            .tag("MI", mi_value)
+            .tag("RG", "A")
+            .build();
+
+        let r2 = RecordBuilder::new()
+            .name(&format!("read_{mi_value}"))
+            .sequence(&r2_seq)
+            .qualities(&quals)
+            .flags(
+                Flags::SEGMENTED
+                    | Flags::PROPERLY_SEGMENTED
+                    | Flags::LAST_SEGMENT
+                    | Flags::REVERSE_COMPLEMENTED,
+            )
+            .reference_sequence_id(0)
+            .alignment_start(start)
+            .cigar(&format!("{read_len}M"))
+            .mate_reference_sequence_id(0)
+            .mate_alignment_start(start)
+            .template_length(-insert_size)
+            .tag("MI", mi_value)
+            .tag("RG", "A")
+            .build();
+
+        (r1, r2)
+    }
+
+    /// Single- and multi-threaded codec must handle an errored group
+    /// identically. Both paths distinguish "duplex disagreement" errors (skip
+    /// the group and continue) from other consensus errors (hard-fail); if the
+    /// threaded path were to swallow a non-disagreement error by logging it,
+    /// parity with single-threaded behavior would silently drift.
+    ///
+    /// This test exercises the only error branch reachable from user input —
+    /// the duplex-disagreement bail — with `max_duplex_disagreements=0`, mixed
+    /// with a well-formed pair that should still produce a consensus. Both
+    /// modes must succeed and emit the same number of consensus records.
+    #[test]
+    fn test_threading_parity_duplex_disagreement_skip() -> Result<()> {
+        let dir = TempDir::new()?;
+        let input_path = dir.path().join("input.bam");
+
+        // Well-formed overlapping pair — should produce a consensus.
+        let (r1_ok, r2_ok) = create_codec_fr_pair_overlapping("OK001", 100, 100, 20, &[30; 20]);
+        // Disagreeing pair — should raise "High duplex disagreement" with
+        // max_duplex_disagreements=0 and be skipped by both modes.
+        let (r1_bad, r2_bad) = create_codec_fr_pair_disagreeing("BAD001", 500, 20);
+        write_codec_bam(&input_path, vec![r1_ok, r2_ok, r1_bad, r2_bad])?;
+
+        let out_st = dir.path().join("out_st.bam");
+        let mut cmd_st = create_codec_with_paths(input_path.clone(), out_st.clone());
+        cmd_st.outer_bases_length = 0;
+        cmd_st.max_duplex_disagreements = Some(0);
+        cmd_st.threading = ThreadingOptions::none();
+        cmd_st
+            .execute("test")
+            .expect("single-threaded codec must skip disagreement errors, not fail");
+        let records_st = read_bam_records(&out_st)?;
+
+        let out_mt = dir.path().join("out_mt.bam");
+        let mut cmd_mt = create_codec_with_paths(input_path, out_mt.clone());
+        cmd_mt.outer_bases_length = 0;
+        cmd_mt.max_duplex_disagreements = Some(0);
+        cmd_mt.threading = ThreadingOptions::new(2);
+        cmd_mt
+            .execute("test")
+            .expect("multi-threaded codec must skip disagreement errors, not fail");
+        let records_mt = read_bam_records(&out_mt)?;
+
+        assert_eq!(
+            records_st.len(),
+            records_mt.len(),
+            "single- and multi-threaded codec must emit the same number of consensus records \
+             when a group triggers a duplex-disagreement error",
+        );
+        assert_eq!(
+            records_st.len(),
+            1,
+            "the well-formed OK001 pair should still produce one consensus record; \
+             got {} consensus records",
+            records_st.len(),
         );
 
         Ok(())
