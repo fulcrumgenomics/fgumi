@@ -494,8 +494,13 @@ pub fn filter_duplex_read(
     let ab_error = bam_fields::find_float_tag(aux_data, b"aE");
     let ba_error = bam_fields::find_float_tag(aux_data, b"bE");
 
-    // Sort depths to identify AB (higher) and BA (lower)
-    let (min_depth, max_depth) = match (ab_depth, ba_depth) {
+    // Pick the "best" and "worst" value per metric, independently. `best`/
+    // `worst` are per-metric extremes across the two strands — NOT the
+    // biological AB/BA strand values. `ab_thresholds` is the stricter tier
+    // (checked against the best); `ba_thresholds` is the lenient tier
+    // (checked against the worst). Matches fgbio's `abMaxDepth` / `abError`
+    // semantics.
+    let (worst_depth, best_depth) = match (ab_depth, ba_depth) {
         (Some(a), Some(b)) => {
             if a < b {
                 (a, b)
@@ -508,7 +513,7 @@ pub fn filter_duplex_read(
         (None, None) => return Ok(FilterResult::Pass),
     };
 
-    let (min_error, max_error) = match (ab_error, ba_error) {
+    let (best_error, worst_error) = match (ab_error, ba_error) {
         (Some(a), Some(b)) => {
             if a < b {
                 (a, b)
@@ -521,29 +526,29 @@ pub fn filter_duplex_read(
         (None, None) => (0.0, 0.0),
     };
 
-    // Check AB strand (max depth, min error) against AB thresholds
+    // Stricter AB tier: best-per-metric value must clear the threshold.
     #[expect(
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation,
         reason = "depth values are non-negative and fit in usize on all supported platforms"
     )]
-    if (max_depth as usize) < ab_thresholds.min_reads {
+    if (best_depth as usize) < ab_thresholds.min_reads {
         return Ok(FilterResult::InsufficientReads);
     }
-    if f64::from(min_error) > ab_thresholds.max_read_error_rate {
+    if f64::from(best_error) > ab_thresholds.max_read_error_rate {
         return Ok(FilterResult::ExcessiveErrorRate);
     }
 
-    // Check BA strand (min depth, max error) against BA thresholds
+    // Lenient BA tier: worst-per-metric value must still clear the threshold.
     #[expect(
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation,
         reason = "depth values are non-negative and fit in usize on all supported platforms"
     )]
-    if (min_depth as usize) < ba_thresholds.min_reads {
+    if (worst_depth as usize) < ba_thresholds.min_reads {
         return Ok(FilterResult::InsufficientReads);
     }
-    if f64::from(max_error) > ba_thresholds.max_read_error_rate {
+    if f64::from(worst_error) > ba_thresholds.max_read_error_rate {
         return Ok(FilterResult::ExcessiveErrorRate);
     }
 
@@ -743,16 +748,19 @@ pub fn mask_duplex_bases(
         let ab_errors = ae_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
         let ba_errors = be_vals.as_ref().map_or(0u16, |v| v.get(i).copied().unwrap_or(0));
 
-        let max_depth = std::cmp::max(ab_depth, ba_depth);
-        let min_depth = std::cmp::min(ab_depth, ba_depth);
+        // Best/worst per metric (see `filter_duplex_read_raw` for the tier
+        // semantics): AB tier = stricter, checked against best; BA tier =
+        // lenient, checked against worst.
+        let best_depth = std::cmp::max(ab_depth, ba_depth);
+        let worst_depth = std::cmp::min(ab_depth, ba_depth);
 
         let ab_error_rate =
             if ab_depth > 0 { f64::from(ab_errors) / f64::from(ab_depth) } else { 0.0 };
         let ba_error_rate =
             if ba_depth > 0 { f64::from(ba_errors) / f64::from(ba_depth) } else { 0.0 };
 
-        let min_error_rate = ab_error_rate.min(ba_error_rate);
-        let max_error_rate = ab_error_rate.max(ba_error_rate);
+        let best_error_rate = ab_error_rate.min(ba_error_rate);
+        let worst_error_rate = ab_error_rate.max(ba_error_rate);
 
         let total_depth = u32::from(ab_depth) + u32::from(ba_depth);
         let total_error_rate = if total_depth > 0 {
@@ -766,10 +774,10 @@ pub fn mask_duplex_bases(
         let should_mask = min_base_quality.is_some_and(|min_qual| qual < min_qual)
             || (total_depth as usize) < cc_thresholds.min_reads
             || total_error_rate > cc_thresholds.max_base_error_rate
-            || (max_depth as usize) < ab_thresholds.min_reads
-            || min_error_rate > ab_thresholds.max_base_error_rate
-            || (min_depth as usize) < ba_thresholds.min_reads
-            || max_error_rate > ba_thresholds.max_base_error_rate;
+            || (best_depth as usize) < ab_thresholds.min_reads
+            || best_error_rate > ab_thresholds.max_base_error_rate
+            || (worst_depth as usize) < ba_thresholds.min_reads
+            || worst_error_rate > ba_thresholds.max_base_error_rate;
 
         // Check single-strand agreement if requested.
         // Use NO_CALL_BASE as default for missing/short tags, matching RecordBuf path behavior.
