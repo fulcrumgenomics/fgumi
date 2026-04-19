@@ -9,8 +9,9 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use crate::commands::correct::CorrectUmis;
-//! use crate::commands::common::{
+//! use fgumi_lib::commands::correct::CorrectUmis;
+//! use fgumi_lib::commands::command::Command;
+//! use fgumi_lib::commands::common::{
 //!     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
 //!     SchedulerOptions, ThreadingOptions,
 //! };
@@ -36,7 +37,7 @@
 //!     queue_memory: QueueMemoryOptions::default(),
 //! };
 //!
-//! corrector.execute().expect("Failed to correct UMIs");
+//! corrector.execute("test").expect("Failed to correct UMIs");
 //! ```
 
 use crate::bam_io::{
@@ -112,8 +113,9 @@ pub struct UmiMatch {
 /// # Example
 ///
 /// ```no_run
-/// # use crate::commands::correct::CorrectUmis;
-/// # use crate::commands::common::{
+/// # use fgumi_lib::commands::correct::CorrectUmis;
+/// # use fgumi_lib::commands::command::Command;
+/// # use fgumi_lib::commands::common::{
 /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
 /// #     SchedulerOptions, ThreadingOptions,
 /// # };
@@ -367,10 +369,13 @@ impl Command for CorrectUmis {
     /// # Example
     ///
     /// ```no_run
-    /// # use crate::commands::correct::CorrectUmis;
-    /// # use crate::commands::common::{BamIoOptions, RejectsOptions, ThreadingOptions};
+    /// # use fgumi_lib::commands::correct::CorrectUmis;
+    /// # use fgumi_lib::commands::common::{
+    /// #     BamIoOptions, CompressionOptions, QueueMemoryOptions, RejectsOptions,
+    /// #     SchedulerOptions, ThreadingOptions,
+    /// # };
     /// # use std::path::PathBuf;
-    /// # use crate::commands::command::Command;
+    /// # use fgumi_lib::commands::command::Command;
     /// let corrector = CorrectUmis {
     ///     /* ... field initialization ... */
     /// #   io: BamIoOptions::new(PathBuf::new(), PathBuf::new()),
@@ -385,6 +390,9 @@ impl Command for CorrectUmis {
     /// #   min_corrected: None,
     /// #   revcomp: false,
     /// #   threading: ThreadingOptions::new(4),
+    /// #   compression: CompressionOptions::default(),
+    /// #   scheduler_opts: SchedulerOptions::default(),
+    /// #   queue_memory: QueueMemoryOptions::default(),
     /// };
     ///
     /// corrector.execute("test")?;
@@ -1338,6 +1346,22 @@ impl CorrectUmis {
     }
 }
 
+/// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
+/// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
+/// not on hit.
+fn merge_umi_counts(
+    dst: &mut AHashMap<String, UmiCorrectionMetrics>,
+    umi: String,
+    counts: &UmiCorrectionMetrics,
+) {
+    let entry = dst.entry(umi).or_insert_with_key(|k| UmiCorrectionMetrics::new(k.clone()));
+    entry.total_matches += counts.total_matches;
+    entry.perfect_matches += counts.perfect_matches;
+    entry.one_mismatch_matches += counts.one_mismatch_matches;
+    entry.two_mismatch_matches += counts.two_mismatch_matches;
+    entry.other_matches += counts.other_matches;
+}
+
 /// Counts mismatches between two sequences, stopping early if max is exceeded.
 ///
 /// Efficiently counts mismatches between two byte sequences, stopping as soon as
@@ -1357,27 +1381,11 @@ impl CorrectUmis {
 /// # Example
 ///
 /// ```
-/// # use crate::commands::correct::count_mismatches_with_max;
+/// # use fgumi_lib::commands::correct::count_mismatches_with_max;
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"AAAAAA", 10), 0);
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"AAAAAT", 10), 1);
 /// assert_eq!(count_mismatches_with_max(b"AAAAAA", b"CCCCCC", 2), 3);
 /// ```
-/// Merges `counts` into `dst[umi]`, creating a zero-initialized entry if the
-/// key is absent. Uses `or_insert_with_key` so `umi` is only cloned on insert,
-/// not on hit.
-fn merge_umi_counts(
-    dst: &mut AHashMap<String, UmiCorrectionMetrics>,
-    umi: String,
-    counts: &UmiCorrectionMetrics,
-) {
-    let entry = dst.entry(umi).or_insert_with_key(|k| UmiCorrectionMetrics::new(k.clone()));
-    entry.total_matches += counts.total_matches;
-    entry.perfect_matches += counts.perfect_matches;
-    entry.one_mismatch_matches += counts.one_mismatch_matches;
-    entry.two_mismatch_matches += counts.two_mismatch_matches;
-    entry.other_matches += counts.other_matches;
-}
-
 #[must_use]
 pub fn count_mismatches_with_max(a: &[u8], b: &[u8], max_mismatches: usize) -> usize {
     let mut mismatches = 0;
@@ -1531,7 +1539,7 @@ fn find_best_match_encoded(
 /// # Example
 ///
 /// ```
-/// # use crate::commands::correct::find_umi_pairs_within_distance;
+/// # use fgumi_lib::commands::correct::find_umi_pairs_within_distance;
 /// let umis = vec!["AAAA".to_string(), "AAAT".to_string()];
 /// let pairs = find_umi_pairs_within_distance(&umis, 2);
 /// assert_eq!(pairs.len(), 1);
