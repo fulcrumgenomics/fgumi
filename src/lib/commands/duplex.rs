@@ -238,11 +238,12 @@ impl Command for Duplex {
     /// # Example
     ///
     /// ```no_run
-    /// # use fgumi::commands::duplex::Duplex;
-    /// # use fgumi::commands::command::Command;
-    /// # use fgumi::commands::common::{
-    /// #     BamIoOptions, ConsensusCallingOptions, OverlappingConsensusOptions,
-    /// #     ReadGroupOptions, RejectsOptions, SchedulerOptions, StatsOptions, ThreadingOptions,
+    /// # use fgumi_lib::commands::duplex::Duplex;
+    /// # use fgumi_lib::commands::command::Command;
+    /// # use fgumi_lib::commands::common::{
+    /// #     BamIoOptions, CompressionOptions, ConsensusCallingOptions,
+    /// #     OverlappingConsensusOptions, QueueMemoryOptions, ReadGroupOptions, RejectsOptions,
+    /// #     SchedulerOptions, StatsOptions, ThreadingOptions,
     /// # };
     /// # use std::path::PathBuf;
     /// let duplex = Duplex {

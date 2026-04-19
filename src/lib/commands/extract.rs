@@ -303,13 +303,13 @@ impl QualityEncoding {
 /// to convert a paired-end run with an index read and where the first 5 bases of R1 are a UMI and the second
 /// five bases are monotemplate you might specify:
 ///
-/// ```
+/// ```text
 /// --input r1.fq r2.fq i1.fq --read-structures 5M5S+T +T +B
 /// ```
 ///
 /// Alternative if you know your reads are of fixed length you could specify:
 ///
-/// ```
+/// ```text
 /// --input r1.fq r2.fq i1.fq --read-structures 5M5S65T 75T 8B
 /// ```
 ///
