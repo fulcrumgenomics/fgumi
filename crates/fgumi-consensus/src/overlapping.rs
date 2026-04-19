@@ -5,9 +5,6 @@
 //! UMI consensus calling. This prevents treating them as independent observations.
 
 use anyhow::{Context, Result};
-use noodles::sam::alignment::record::Cigar;
-use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record_buf::RecordBuf;
 
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER};
 use fgumi_raw_bam::{self, RawRecordView};
@@ -108,121 +105,6 @@ impl OverlappingBasesConsensusCaller {
     /// Reset statistics
     pub fn reset_stats(&mut self) {
         self.stats.reset();
-    }
-
-    /// Process overlapping bases in a read pair
-    ///
-    /// This method modifies the reads in-place, updating bases and qualities
-    /// in the overlapping region according to the configured strategies.
-    ///
-    /// This implementation matches fgbio's `OverlappingBasesConsensusCaller`:
-    /// - Uses merge iteration to properly handle different CIGAR structures
-    /// - Only considers aligned bases (M/X/=), not soft clips or insertions
-    /// - Properly synchronizes by reference position, not read position
-    ///
-    /// # Arguments
-    /// * `r1` - First read in the pair (will be modified)
-    /// * `r2` - Second read in the pair (will be modified)
-    ///
-    /// # Returns
-    /// * `true` if overlapping bases were processed, `false` if reads don't overlap
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if CIGAR parsing or alignment position extraction fails.
-    pub fn call(&mut self, r1: &mut RecordBuf, r2: &mut RecordBuf) -> Result<bool> {
-        // Only process paired reads where both are mapped
-        if r1.flags().is_unmapped() || r2.flags().is_unmapped() {
-            return Ok(false);
-        }
-
-        // Must be on the same reference sequence (chromosome)
-        if r1.reference_sequence_id() != r2.reference_sequence_id() {
-            return Ok(false);
-        }
-
-        // Verify both have alignment positions
-        if r1.alignment_start().is_none()
-            || r1.alignment_end().is_none()
-            || r2.alignment_start().is_none()
-            || r2.alignment_end().is_none()
-        {
-            return Ok(false);
-        }
-
-        // Create merge iterator that yields positions where both reads have aligned bases
-        let Ok(overlap_iter) = ReadMateAndRefPosIterator::new(r1, r2) else { return Ok(false) };
-
-        // Collect overlapping positions
-        let overlapping_positions: Vec<_> = overlap_iter.collect();
-
-        if overlapping_positions.is_empty() {
-            return Ok(false);
-        }
-
-        // Clone sequences and qualities ONCE at the start (avoids O(n²) allocations)
-        let mut r1_seq: Vec<u8> = r1.sequence().as_ref().to_vec();
-        let mut r2_seq: Vec<u8> = r2.sequence().as_ref().to_vec();
-        let mut r1_quals: Vec<u8> = r1.quality_scores().as_ref().to_vec();
-        let mut r2_quals: Vec<u8> = r2.quality_scores().as_ref().to_vec();
-        let mut modified = false;
-
-        // Process each overlapping position
-        for pos in overlapping_positions {
-            let r1_base = r1_seq[pos.read_offset];
-            let r2_base = r2_seq[pos.mate_offset];
-
-            // Skip if either base is a no-call (N) - matches fgbio behavior
-            if is_no_call(r1_base) || is_no_call(r2_base) {
-                continue;
-            }
-
-            self.stats.overlapping_bases += 1;
-
-            let r1_qual = r1_quals[pos.read_offset];
-            let r2_qual = r2_quals[pos.mate_offset];
-
-            if r1_base == r2_base {
-                // Bases agree
-                self.stats.bases_agreeing += 1;
-                if self.process_agreement(
-                    pos.read_offset,
-                    pos.mate_offset,
-                    r1_qual,
-                    r2_qual,
-                    &mut r1_quals,
-                    &mut r2_quals,
-                ) {
-                    modified = true;
-                }
-            } else {
-                // Bases disagree
-                self.stats.bases_disagreeing += 1;
-                self.process_disagreement(
-                    pos.read_offset,
-                    pos.mate_offset,
-                    r1_base,
-                    r2_base,
-                    r1_qual,
-                    r2_qual,
-                    &mut r1_seq,
-                    &mut r2_seq,
-                    &mut r1_quals,
-                    &mut r2_quals,
-                );
-                modified = true;
-            }
-        }
-
-        // Write back modified sequences and qualities ONCE at the end
-        if modified {
-            *r1.sequence_mut() = r1_seq.into();
-            *r2.sequence_mut() = r2_seq.into();
-            *r1.quality_scores_mut() = r1_quals.into();
-            *r2.quality_scores_mut() = r2_quals.into();
-        }
-
-        Ok(true)
     }
 
     /// Process agreeing bases. Returns true if any modification was made.
@@ -340,6 +222,118 @@ impl OverlappingBasesConsensusCaller {
             }
         }
     }
+
+    /// Process overlapping bases in a read pair using raw BAM bytes.
+    ///
+    /// Modifies the raw byte records in-place.
+    ///
+    /// # Returns
+    /// * `true` if overlapping bases were processed, `false` if reads don't overlap
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if raw BAM field extraction or CIGAR parsing fails.
+    pub fn call(&mut self, r1: &mut [u8], r2: &mut [u8]) -> Result<bool> {
+        // Only process paired reads where both are mapped
+        if RawRecordView::new(r1).flags() & fgumi_raw_bam::flags::UNMAPPED != 0
+            || RawRecordView::new(r2).flags() & fgumi_raw_bam::flags::UNMAPPED != 0
+        {
+            return Ok(false);
+        }
+
+        // Must be on the same reference sequence
+        if RawRecordView::new(r1).ref_id() != RawRecordView::new(r2).ref_id() {
+            return Ok(false);
+        }
+
+        // Verify both have alignment positions and ends
+        let Some(r1_start) = fgumi_raw_bam::alignment_start_from_raw(r1) else {
+            return Ok(false);
+        };
+        let Some(r1_end) = fgumi_raw_bam::alignment_end_from_raw(r1) else { return Ok(false) };
+        let Some(r2_start) = fgumi_raw_bam::alignment_start_from_raw(r2) else {
+            return Ok(false);
+        };
+        let Some(r2_end) = fgumi_raw_bam::alignment_end_from_raw(r2) else { return Ok(false) };
+
+        // Create merge iterator that yields positions where both reads have aligned bases
+        let overlap_iter =
+            ReadMateAndRefPosIterator::new_raw(r1, r2, r1_start, r1_end, r2_start, r2_end);
+
+        let overlapping_positions: Vec<_> = overlap_iter.collect();
+
+        if overlapping_positions.is_empty() {
+            return Ok(false);
+        }
+
+        // Extract sequences and qualities for modification
+        let mut r1_seq = RawRecordView::new(r1).sequence_vec();
+        let mut r2_seq = RawRecordView::new(r2).sequence_vec();
+        let mut r1_quals: Vec<u8> = RawRecordView::new(r1).quality_scores().to_vec();
+        let mut r2_quals: Vec<u8> = RawRecordView::new(r2).quality_scores().to_vec();
+        let mut modified = false;
+
+        for pos in overlapping_positions {
+            let r1_base = r1_seq[pos.read_offset];
+            let r2_base = r2_seq[pos.mate_offset];
+
+            if is_no_call(r1_base) || is_no_call(r2_base) {
+                continue;
+            }
+
+            self.stats.overlapping_bases += 1;
+
+            let r1_qual = r1_quals[pos.read_offset];
+            let r2_qual = r2_quals[pos.mate_offset];
+
+            if r1_base == r2_base {
+                self.stats.bases_agreeing += 1;
+                if self.process_agreement(
+                    pos.read_offset,
+                    pos.mate_offset,
+                    r1_qual,
+                    r2_qual,
+                    &mut r1_quals,
+                    &mut r2_quals,
+                ) {
+                    modified = true;
+                }
+            } else {
+                self.stats.bases_disagreeing += 1;
+                self.process_disagreement(
+                    pos.read_offset,
+                    pos.mate_offset,
+                    r1_base,
+                    r2_base,
+                    r1_qual,
+                    r2_qual,
+                    &mut r1_seq,
+                    &mut r2_seq,
+                    &mut r1_quals,
+                    &mut r2_quals,
+                );
+                modified = true;
+            }
+        }
+
+        // Write back modified sequences and qualities into the raw BAM records
+        if modified {
+            let r1_seq_off = fgumi_raw_bam::seq_offset(r1);
+            let r2_seq_off = fgumi_raw_bam::seq_offset(r2);
+            for (i, &base) in r1_seq.iter().enumerate() {
+                fgumi_raw_bam::set_base(r1, r1_seq_off, i, base);
+            }
+            for (i, &base) in r2_seq.iter().enumerate() {
+                fgumi_raw_bam::set_base(r2, r2_seq_off, i, base);
+            }
+            let r1_qual_off = fgumi_raw_bam::qual_offset(r1);
+            let r2_qual_off = fgumi_raw_bam::qual_offset(r2);
+            r1[r1_qual_off..r1_qual_off + r1_quals.len()].copy_from_slice(&r1_quals);
+            r2[r2_qual_off..r2_qual_off + r2_quals.len()].copy_from_slice(&r2_quals);
+        }
+
+        Ok(true)
+    }
 }
 
 /// A position in a read with both read offset and reference position
@@ -361,7 +355,9 @@ struct ReadMateAndRefPos {
 }
 
 /// Converts a noodles CIGAR `Kind` to the BAM integer op code.
-fn kind_to_bam_op(kind: Kind) -> u8 {
+#[cfg(test)]
+fn kind_to_bam_op(kind: noodles::sam::alignment::record::cigar::op::Kind) -> u8 {
+    use noodles::sam::alignment::record::cigar::op::Kind;
     match kind {
         Kind::Match => 0,
         Kind::Insertion => 1,
@@ -382,8 +378,7 @@ fn kind_to_bam_op(kind: Kind) -> u8 {
 /// - Skips soft clips, insertions, deletions, etc.
 /// - Can be limited to a reference position range
 ///
-/// Works with both noodles `RecordBuf` and raw BAM byte records by storing
-/// CIGAR ops as BAM integer codes internally.
+/// Works with raw BAM byte records by storing CIGAR ops as BAM integer codes internally.
 struct ReadAndRefPosIterator {
     /// 1-based current read position (fgbio uses 1-based)
     cur_read_pos: i32,
@@ -412,58 +407,6 @@ struct ReadAndRefPosIterator {
     reason = "position arithmetic requires casts between BAM integer types"
 )]
 impl ReadAndRefPosIterator {
-    /// Create iterator for aligned positions overlapping with mate (noodles `RecordBuf`)
-    fn new_with_mate(record: &RecordBuf, mate: &RecordBuf) -> Result<Self> {
-        let rec_start = match record.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
-            None => return Err(anyhow::anyhow!("Record has no alignment start")),
-        };
-        let rec_end = match record.alignment_end() {
-            Some(pos) => usize::from(pos) as i32,
-            None => return Err(anyhow::anyhow!("Record has no alignment end")),
-        };
-
-        let mate_start = match mate.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
-            None => return Err(anyhow::anyhow!("Mate has no alignment start")),
-        };
-        let mate_end = match mate.alignment_end() {
-            Some(pos) => usize::from(pos) as i32,
-            None => return Err(anyhow::anyhow!("Mate has no alignment end")),
-        };
-
-        let min_ref_pos = rec_start.max(mate_start);
-        let max_ref_pos = rec_end.min(mate_end);
-        let rec_len = record.sequence().len() as i32;
-
-        let cigar = record.cigar();
-        let cigar_ops: Vec<_> = cigar
-            .iter()
-            .filter_map(std::result::Result::ok)
-            .map(|op| (kind_to_bam_op(op.kind()), op.len()))
-            .collect();
-
-        let start_read_pos = 1i32;
-        let end_read_pos = rec_len;
-        let start_ref_pos = rec_start.max(min_ref_pos);
-        let end_ref_pos = rec_end.min(max_ref_pos);
-
-        let mut iter = Self {
-            cur_read_pos: 1,
-            cur_ref_pos: rec_start,
-            cigar_ops,
-            element_index: 0,
-            in_elem_offset: 0,
-            start_ref_pos,
-            end_ref_pos,
-            start_read_pos,
-            end_read_pos,
-        };
-
-        iter.skip_to_start();
-        Ok(iter)
-    }
-
     /// Create iterator for aligned positions overlapping with mate (raw BAM bytes)
     fn new_raw_with_mate(
         bam: &[u8],
@@ -623,14 +566,6 @@ struct ReadMateAndRefPosIterator {
 }
 
 impl ReadMateAndRefPosIterator {
-    /// Create a new iterator for overlapping positions between read and mate (noodles)
-    fn new(record: &RecordBuf, mate: &RecordBuf) -> Result<Self> {
-        let rec_iter = ReadAndRefPosIterator::new_with_mate(record, mate)?.peekable();
-        let mate_iter = ReadAndRefPosIterator::new_with_mate(mate, record)?.peekable();
-
-        Ok(Self { rec_iter, mate_iter })
-    }
-
     /// Create a new iterator for overlapping positions between read and mate (raw BAM)
     fn new_raw(
         r1: &[u8],
@@ -682,189 +617,12 @@ impl Iterator for ReadMateAndRefPosIterator {
     }
 }
 
-/// Applies overlapping consensus calling to pairs of reads within a group.
-///
-/// For paired-end reads, this function:
-/// 1. Groups reads by name to find R1/R2 pairs
-/// 2. Calls overlapping consensus on each pair using the provided caller
-/// 3. Modifies reads in-place (no copying)
-///
-/// Single-end reads pass through unchanged.
-///
-/// # Arguments
-///
-/// * `reads` - Mutable slice of reads to process (modified in-place)
-/// * `caller` - The overlapping consensus caller to use
-///
-/// # Errors
-///
-/// Returns an error if consensus calling fails for any pair
-pub fn apply_overlapping_consensus(
-    reads: &mut [RecordBuf],
-    caller: &mut OverlappingBasesConsensusCaller,
-) -> Result<()> {
-    use ahash::AHashMap;
-
-    // Group reads by name for pairing
-    let mut read_pairs: AHashMap<String, (Option<usize>, Option<usize>)> = AHashMap::new();
-
-    for (idx, record) in reads.iter().enumerate() {
-        let read_name = record.name().map(std::string::ToString::to_string).unwrap_or_default();
-
-        if record.flags().is_first_segment() {
-            read_pairs.entry(read_name).or_insert((None, None)).0 = Some(idx);
-        } else if record.flags().is_last_segment() {
-            read_pairs.entry(read_name).or_insert((None, None)).1 = Some(idx);
-        }
-        // Single-end reads are not paired, they pass through unchanged
-    }
-
-    // Process pairs
-    for (r1_idx, r2_idx) in read_pairs.values() {
-        if let (Some(idx1), Some(idx2)) = (r1_idx, r2_idx) {
-            // Use split_at_mut to get two mutable references
-            let (r1, r2) = if idx1 < idx2 {
-                let (left, right) = reads.split_at_mut(*idx2);
-                (&mut left[*idx1], &mut right[0])
-            } else {
-                let (left, right) = reads.split_at_mut(*idx1);
-                (&mut right[0], &mut left[*idx2])
-            };
-
-            caller.call(r1, r2).context("Failed to call overlapping consensus")?;
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// Raw-byte overlapping consensus
-// ============================================================================
-
-impl OverlappingBasesConsensusCaller {
-    /// Process overlapping bases in a read pair using raw BAM bytes.
-    ///
-    /// Same logic as `call()` but extracts fields from raw bytes directly.
-    /// Modifies the raw byte records in-place.
-    ///
-    /// # Returns
-    /// * `true` if overlapping bases were processed, `false` if reads don't overlap
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if raw BAM field extraction or CIGAR parsing fails.
-    pub fn call_raw(&mut self, r1: &mut [u8], r2: &mut [u8]) -> Result<bool> {
-        // Only process paired reads where both are mapped
-        if RawRecordView::new(r1).flags() & fgumi_raw_bam::flags::UNMAPPED != 0
-            || RawRecordView::new(r2).flags() & fgumi_raw_bam::flags::UNMAPPED != 0
-        {
-            return Ok(false);
-        }
-
-        // Must be on the same reference sequence
-        if RawRecordView::new(r1).ref_id() != RawRecordView::new(r2).ref_id() {
-            return Ok(false);
-        }
-
-        // Verify both have alignment positions and ends
-        let Some(r1_start) = fgumi_raw_bam::alignment_start_from_raw(r1) else {
-            return Ok(false);
-        };
-        let Some(r1_end) = fgumi_raw_bam::alignment_end_from_raw(r1) else { return Ok(false) };
-        let Some(r2_start) = fgumi_raw_bam::alignment_start_from_raw(r2) else {
-            return Ok(false);
-        };
-        let Some(r2_end) = fgumi_raw_bam::alignment_end_from_raw(r2) else { return Ok(false) };
-
-        // Create merge iterator that yields positions where both reads have aligned bases
-        let overlap_iter =
-            ReadMateAndRefPosIterator::new_raw(r1, r2, r1_start, r1_end, r2_start, r2_end);
-
-        let overlapping_positions: Vec<_> = overlap_iter.collect();
-
-        if overlapping_positions.is_empty() {
-            return Ok(false);
-        }
-
-        // Extract sequences and qualities for modification
-        let mut r1_seq = RawRecordView::new(r1).sequence_vec();
-        let mut r2_seq = RawRecordView::new(r2).sequence_vec();
-        let mut r1_quals: Vec<u8> = RawRecordView::new(r1).quality_scores().to_vec();
-        let mut r2_quals: Vec<u8> = RawRecordView::new(r2).quality_scores().to_vec();
-        let mut modified = false;
-
-        for pos in overlapping_positions {
-            let r1_base = r1_seq[pos.read_offset];
-            let r2_base = r2_seq[pos.mate_offset];
-
-            if is_no_call(r1_base) || is_no_call(r2_base) {
-                continue;
-            }
-
-            self.stats.overlapping_bases += 1;
-
-            let r1_qual = r1_quals[pos.read_offset];
-            let r2_qual = r2_quals[pos.mate_offset];
-
-            if r1_base == r2_base {
-                self.stats.bases_agreeing += 1;
-                if self.process_agreement(
-                    pos.read_offset,
-                    pos.mate_offset,
-                    r1_qual,
-                    r2_qual,
-                    &mut r1_quals,
-                    &mut r2_quals,
-                ) {
-                    modified = true;
-                }
-            } else {
-                self.stats.bases_disagreeing += 1;
-                self.process_disagreement(
-                    pos.read_offset,
-                    pos.mate_offset,
-                    r1_base,
-                    r2_base,
-                    r1_qual,
-                    r2_qual,
-                    &mut r1_seq,
-                    &mut r2_seq,
-                    &mut r1_quals,
-                    &mut r2_quals,
-                );
-                modified = true;
-            }
-        }
-
-        // Write back modified sequences and qualities into the raw BAM records
-        if modified {
-            let r1_seq_off = fgumi_raw_bam::seq_offset(r1);
-            let r2_seq_off = fgumi_raw_bam::seq_offset(r2);
-            for (i, &base) in r1_seq.iter().enumerate() {
-                fgumi_raw_bam::set_base(r1, r1_seq_off, i, base);
-            }
-            for (i, &base) in r2_seq.iter().enumerate() {
-                fgumi_raw_bam::set_base(r2, r2_seq_off, i, base);
-            }
-            let r1_qual_off = fgumi_raw_bam::qual_offset(r1);
-            let r2_qual_off = fgumi_raw_bam::qual_offset(r2);
-            r1[r1_qual_off..r1_qual_off + r1_quals.len()].copy_from_slice(&r1_quals);
-            r2[r2_qual_off..r2_qual_off + r2_quals.len()].copy_from_slice(&r2_quals);
-        }
-
-        Ok(true)
-    }
-}
-
 /// Applies overlapping consensus calling to pairs of raw-byte reads within a group.
-///
-/// This is the raw-byte equivalent of `apply_overlapping_consensus`.
 ///
 /// # Errors
 ///
 /// Returns an error if overlapping consensus calling fails for any read pair.
-pub fn apply_overlapping_consensus_raw(
+pub fn apply_overlapping_consensus(
     records: &mut [Vec<u8>],
     caller: &mut OverlappingBasesConsensusCaller,
 ) -> Result<()> {
@@ -874,9 +632,16 @@ pub fn apply_overlapping_consensus_raw(
     let mut read_pairs: AHashMap<Vec<u8>, (Option<usize>, Option<usize>)> = AHashMap::new();
 
     for (idx, record) in records.iter().enumerate() {
-        let name = RawRecordView::new(record).read_name().to_vec();
-        let flg = RawRecordView::new(record).flags();
+        let view = RawRecordView::new(record);
+        let flg = view.flags();
 
+        // Only register primary alignments; secondary/supplementary records
+        // share the read name and would otherwise overwrite the primary index.
+        if flg & (fgumi_raw_bam::flags::SECONDARY | fgumi_raw_bam::flags::SUPPLEMENTARY) != 0 {
+            continue;
+        }
+
+        let name = view.read_name().to_vec();
         if flg & fgumi_raw_bam::flags::FIRST_SEGMENT != 0 {
             read_pairs.entry(name).or_insert((None, None)).0 = Some(idx);
         } else if flg & fgumi_raw_bam::flags::LAST_SEGMENT != 0 {
@@ -895,7 +660,7 @@ pub fn apply_overlapping_consensus_raw(
                 (&mut right[0], &mut left[*idx2])
             };
 
-            caller.call_raw(r1, r2).context("Failed to call overlapping consensus on raw bytes")?;
+            caller.call(r1, r2).context("Failed to call overlapping consensus on raw bytes")?;
         }
     }
 
@@ -911,354 +676,6 @@ pub fn apply_overlapping_consensus_raw(
 )]
 mod tests {
     use super::*;
-    use fgumi_sam::builder::RecordBuilder;
-    use noodles::sam::alignment::record::Flags;
-
-    /// Creates a test record with explicit sequence, qualities, position, and CIGAR.
-    fn create_test_record(seq: &[u8], qual: &[u8], start: usize, cigar: &str) -> RecordBuf {
-        RecordBuilder::mapped_read()
-            .sequence(&String::from_utf8_lossy(seq))
-            .qualities(qual)
-            .alignment_start(start)
-            .cigar(cigar)
-            .build()
-    }
-
-    #[test]
-    fn test_agreement_strategy_consensus() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        assert_eq!(caller.agreement_strategy, AgreementStrategy::Consensus);
-
-        // Test with overlapping reads
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Check that qualities were summed (30 + 20 = 50)
-        assert_eq!(r1.quality_scores().as_ref()[0], 50);
-        assert_eq!(r2.quality_scores().as_ref()[0], 50);
-    }
-
-    #[test]
-    fn test_agreement_strategy_max_qual() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::MaxQual,
-            DisagreementStrategy::Consensus,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Check that max quality was used (max(30, 20) = 30)
-        assert_eq!(r1.quality_scores().as_ref()[0], 30);
-        assert_eq!(r2.quality_scores().as_ref()[0], 30);
-    }
-
-    #[test]
-    fn test_agreement_strategy_pass_through() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::Consensus,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Check that qualities were unchanged
-        assert_eq!(r1.quality_scores().as_ref()[0], 30);
-        assert_eq!(r2.quality_scores().as_ref()[0], 20);
-    }
-
-    #[test]
-    fn test_disagreement_strategy_consensus() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::Consensus,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Higher quality base (A from r1) should be chosen, qual = 30 - 20 = 10
-        assert_eq!(r1.sequence().as_ref()[0], b'A');
-        assert_eq!(r2.sequence().as_ref()[0], b'A');
-        assert_eq!(r1.quality_scores().as_ref()[0], 10);
-        assert_eq!(r2.quality_scores().as_ref()[0], 10);
-    }
-
-    #[test]
-    fn test_disagreement_strategy_mask_both() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::MaskBoth,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Both bases should be masked to N with quality 2
-        assert_eq!(r1.sequence().as_ref()[0], b'N');
-        assert_eq!(r2.sequence().as_ref()[0], b'N');
-        assert_eq!(r1.quality_scores().as_ref()[0], 2);
-        assert_eq!(r2.quality_scores().as_ref()[0], 2);
-    }
-
-    #[test]
-    fn test_disagreement_strategy_mask_lower_qual() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::MaskLowerQual,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Only lower quality base (r2) should be masked
-        assert_eq!(r1.sequence().as_ref()[0], b'A'); // Unchanged
-        assert_eq!(r2.sequence().as_ref()[0], b'N'); // Masked
-        assert_eq!(r1.quality_scores().as_ref()[0], 30); // Unchanged
-        assert_eq!(r2.quality_scores().as_ref()[0], 2); // Masked
-    }
-
-    #[test]
-    fn test_disagreement_mask_lower_qual_r1_lower() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::MaskLowerQual,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[30, 30, 30, 30], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Only lower quality base (r1) should be masked
-        assert_eq!(r1.sequence().as_ref()[0], b'N'); // Masked
-        assert_eq!(r2.sequence().as_ref()[0], b'G'); // Unchanged
-    }
-
-    #[test]
-    fn test_disagreement_mask_lower_qual_equal_quality() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::MaskLowerQual,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[30, 30, 30, 30], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Both should be masked when qualities are equal (matches fgbio)
-        assert_eq!(r1.sequence().as_ref()[0], b'N');
-        assert_eq!(r2.sequence().as_ref()[0], b'N');
-        assert_eq!(r1.quality_scores().as_ref()[0], 2);
-        assert_eq!(r2.quality_scores().as_ref()[0], 2);
-    }
-
-    #[test]
-    fn test_disagreement_consensus_equal_quality() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::Consensus,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[30, 30, 30, 30], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Both should be masked when qualities are equal (matches fgbio)
-        assert_eq!(r1.sequence().as_ref()[0], b'N');
-        assert_eq!(r2.sequence().as_ref()[0], b'N');
-        assert_eq!(r1.quality_scores().as_ref()[0], 2);
-        assert_eq!(r2.quality_scores().as_ref()[0], 2);
-    }
-
-    #[test]
-    fn test_no_overlap() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // Reads don't overlap
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 200, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(!result); // No overlap processed
-    }
-
-    #[test]
-    fn test_unmapped_reads() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-        *r1.flags_mut() = Flags::UNMAPPED;
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(!result); // Unmapped reads not processed
-    }
-
-    #[test]
-    fn test_quality_capping_at_93() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // High qualities that would sum > 93
-        let mut r1 = create_test_record(b"ACGT", &[50, 50, 50, 50], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[50, 50, 50, 50], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Quality should be capped at 93 (not 100)
-        assert_eq!(r1.quality_scores().as_ref()[0], 93);
-    }
-
-    #[test]
-    fn test_stats_tracking() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // Create reads where all bases agree - both have "ACGT"
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // NOTE: The overlap calculation uses alignment_end() which returns the position
-        // after the last base. With exclusive end comparison (ref_pos < overlap_end),
-        // the last base may be excluded depending on exact position values.
-        // We verify that overlapping bases are tracked, without requiring an exact count.
-        assert!(caller.stats().overlapping_bases > 0);
-        assert_eq!(caller.stats().bases_agreeing, caller.stats().overlapping_bases);
-        assert_eq!(caller.stats().bases_disagreeing, 0);
-        // With Consensus strategy, agreeing bases get quality summed (corrected)
-        assert_eq!(caller.stats().bases_corrected, caller.stats().overlapping_bases);
-    }
-
-    #[test]
-    fn test_stats_tracking_with_disagreements() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::Consensus,
-        );
-
-        // Create reads where bases disagree: ACGT vs TGCA (all different)
-        // Note: N bases are skipped (fgbio behavior), so we use real bases
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"TGCA", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // All overlapping bases disagree
-        assert!(caller.stats().overlapping_bases > 0);
-        assert_eq!(caller.stats().bases_agreeing, 0);
-        assert_eq!(caller.stats().bases_disagreeing, caller.stats().overlapping_bases);
-    }
-
-    #[test]
-    fn test_stats_reset() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(caller.stats().overlapping_bases > 0);
-
-        caller.reset_stats();
-        assert_eq!(caller.stats().overlapping_bases, 0);
-        assert_eq!(caller.stats().bases_agreeing, 0);
-        assert_eq!(caller.stats().bases_disagreeing, 0);
-        assert_eq!(caller.stats().bases_corrected, 0);
-    }
-
-    #[test]
-    fn test_overlap_different_start_positions() {
-        // The merge iteration properly handles reads at different start positions
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // R1: positions 100-103 (ACGT)
-        // R2: positions 102-105 (GTAC)
-        // Overlap: positions 102-103 (GT matches GT)
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GTAC", &[20, 20, 20, 20], 102, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-
-        // Overlap should be detected at positions 102-103 (2 bases)
-        assert!(result);
-        assert_eq!(caller.stats().overlapping_bases, 2);
-        assert_eq!(caller.stats().bases_agreeing, 2); // GT == GT
-
-        // Check quality sums at overlapping positions
-        // R1[2] (pos 102) = 'G' should be summed: 30 + 20 = 50
-        // R1[3] (pos 103) = 'T' should be summed: 30 + 20 = 50
-        assert_eq!(r1.quality_scores().as_ref()[2], 50);
-        assert_eq!(r1.quality_scores().as_ref()[3], 50);
-    }
-
-    #[test]
-    fn test_full_overlap_same_position() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // Both reads start at position 100 and fully overlap
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Overlapping bases should be detected (may not be exactly 4 due to boundary handling)
-        assert!(caller.stats().overlapping_bases > 0);
-        assert_eq!(caller.stats().bases_agreeing, caller.stats().overlapping_bases);
-    }
 
     #[test]
     fn test_correction_stats() {
@@ -1277,134 +694,6 @@ mod tests {
         assert_eq!(stats.overlapping_bases, 0);
     }
 
-    #[test]
-    fn test_cigar_with_insertions() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // CIGAR with insertion: 2M2I2M
-        let mut r1 = create_test_record(b"ACTTGG", &[30, 30, 30, 30, 30, 30], 100, "2M2I2M");
-        let mut r2 = create_test_record(b"ACGG", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        // Should process the matching regions
-        assert!(result);
-    }
-
-    #[test]
-    fn test_cigar_with_deletions() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // CIGAR with deletion: 2M2D2M (read has 4 bases but spans 6 ref positions)
-        let mut r1 = create_test_record(b"ACGG", &[30, 30, 30, 30], 100, "2M2D2M");
-        let mut r2 = create_test_record(b"ACTTGG", &[20, 20, 20, 20, 20, 20], 100, "6M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        // Should process overlapping matches
-        assert!(result);
-    }
-
-    #[test]
-    fn test_cigar_with_soft_clips_different_structure() {
-        // The merge iteration properly handles different soft clip structures
-        // by only iterating aligned (M/X/=) bases and synchronizing by ref position
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // R1: 2S4M (6 bases, first 2 soft-clipped, aligned at ref 100-103)
-        // R2: 4M (4 bases, no soft clips, aligned at ref 100-103)
-        // Both have 4 aligned bases at ref 100-103, sequences ACGT match
-        let mut r1 = create_test_record(b"NNACGT", &[2, 2, 30, 30, 30, 30], 100, "2S4M");
-        let mut r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-
-        // The merge iteration properly handles this case:
-        // R1 iterator yields: (2, 100), (3, 101), (4, 102), (5, 103) - skips soft clips
-        // R2 iterator yields: (0, 100), (1, 101), (2, 102), (3, 103)
-        // All 4 positions match by ref_pos
-        assert!(result);
-        assert_eq!(caller.stats().overlapping_bases, 4);
-        assert_eq!(caller.stats().bases_agreeing, 4); // ACGT == ACGT
-
-        // Check quality sums - R1 positions 2-5 and R2 positions 0-3
-        assert_eq!(r1.quality_scores().as_ref()[2], 50); // 30 + 20
-        assert_eq!(r1.quality_scores().as_ref()[3], 50);
-        assert_eq!(r1.quality_scores().as_ref()[4], 50);
-        assert_eq!(r1.quality_scores().as_ref()[5], 50);
-    }
-
-    #[test]
-    fn test_cigar_soft_clips_both_reads_different_lengths() {
-        // Test where both reads have soft clips but different lengths
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // R1: 3S3M (6 bases, 3 soft-clipped, aligned at ref 100-102)
-        // R2: 1S3M (4 bases, 1 soft-clipped, aligned at ref 100-102)
-        let mut r1 = create_test_record(b"NNNACG", &[2, 2, 2, 30, 30, 30], 100, "3S3M");
-        let mut r2 = create_test_record(b"NACG", &[2, 20, 20, 20], 100, "1S3M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // R1 yields: (3, 100), (4, 101), (5, 102)
-        // R2 yields: (1, 100), (2, 101), (3, 102)
-        // 3 overlapping aligned positions
-        assert_eq!(caller.stats().overlapping_bases, 3);
-        assert_eq!(caller.stats().bases_agreeing, 3); // ACG == ACG
-    }
-
-    #[test]
-    fn test_cigar_soft_clips_both_reads_same_structure() {
-        // Test where both reads have the same structure including soft clips
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // Both reads have identical CIGAR structure: 1S3M
-        let mut r1 = create_test_record(b"NACG", &[2, 30, 30, 30], 100, "1S3M");
-        let mut r2 = create_test_record(b"NACG", &[2, 20, 20, 20], 100, "1S3M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Both have 3 aligned bases at ref 100-102
-        assert_eq!(caller.stats().overlapping_bases, 3);
-        assert_eq!(caller.stats().bases_agreeing, 3);
-    }
-
-    #[test]
-    fn test_disagreement_consensus_min_quality() {
-        let mut caller = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::Consensus,
-        );
-
-        // Very similar qualities - difference should be at least 2
-        let mut r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut r2 = create_test_record(b"GCTA", &[29, 29, 29, 29], 100, "4M");
-
-        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
-        assert!(result);
-
-        // Quality difference is 1, but should be at least 2
-        assert_eq!(r1.quality_scores().as_ref()[0], 2);
-        assert_eq!(r2.quality_scores().as_ref()[0], 2);
-    }
-
-    // ========================================================================
-    // Raw-byte tests
     // ========================================================================
 
     /// SAM spec 4-bit encoding for A=1, C=2, G=4, T=8, N=15.
@@ -1496,7 +785,7 @@ mod tests {
 
     /// Create a raw BAM record mirroring `create_test_record`.
     ///
-    /// `start_1based` is a 1-based alignment start (matching the `RecordBuf` tests).
+    /// `start_1based` is a 1-based alignment start.
     fn create_raw_test_record(
         seq: &[u8],
         qual: &[u8],
@@ -1519,7 +808,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Check that qualities were summed (30 + 20 = 50)
@@ -1538,7 +827,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Max quality used (max(30, 20) = 30)
@@ -1557,7 +846,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Qualities unchanged
@@ -1576,7 +865,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Higher quality base (A from r1) chosen, qual = 30 - 20 = 10
@@ -1599,7 +888,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both bases masked to N with quality 2
@@ -1622,7 +911,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Only lower quality base (r2) masked
@@ -1645,7 +934,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[30, 30, 30, 30], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Only lower quality base (r1) masked
@@ -1666,7 +955,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[30, 30, 30, 30], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both masked when qualities are equal
@@ -1689,7 +978,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[30, 30, 30, 30], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Both masked when qualities are equal
@@ -1713,7 +1002,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 200, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(!result);
     }
 
@@ -1737,7 +1026,7 @@ mod tests {
         );
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(!result);
     }
 
@@ -1753,7 +1042,7 @@ mod tests {
         let mut r1 = make_raw_bam(b"rea", 0, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
         let mut r2 = make_raw_bam(b"rea", 0, 1, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(!result);
     }
 
@@ -1768,7 +1057,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[50, 50, 50, 50], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[50, 50, 50, 50], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Quality capped at 93
@@ -1786,7 +1075,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         assert!(caller.stats().overlapping_bases > 0);
@@ -1806,7 +1095,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"TGCA", &[20, 20, 20, 20], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         assert!(caller.stats().overlapping_bases > 0);
@@ -1827,7 +1116,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GTAC", &[20, 20, 20, 20], 102, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
         assert_eq!(caller.stats().overlapping_bases, 2);
         assert_eq!(caller.stats().bases_agreeing, 2); // GT == GT
@@ -1850,7 +1139,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"NNACGT", &[2, 2, 30, 30, 30, 30], 100, &r1_cigar);
         let mut r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &r2_cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
         assert_eq!(caller.stats().overlapping_bases, 4);
         assert_eq!(caller.stats().bases_agreeing, 4); // ACGT == ACGT
@@ -1875,7 +1164,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACTTGG", &[30, 30, 30, 30, 30, 30], 100, &r1_cigar);
         let mut r2 = create_raw_test_record(b"ACGG", &[20, 20, 20, 20], 100, &r2_cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
     }
 
@@ -1892,7 +1181,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGG", &[30, 30, 30, 30], 100, &r1_cigar);
         let mut r2 = create_raw_test_record(b"ACTTGG", &[20, 20, 20, 20, 20, 20], 100, &r2_cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
     }
 
@@ -1907,7 +1196,7 @@ mod tests {
         let mut r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
         let mut r2 = create_raw_test_record(b"GCTA", &[29, 29, 29, 29], 100, &cigar);
 
-        let result = caller.call_raw(&mut r1, &mut r2).expect("call_raw should succeed");
+        let result = caller.call(&mut r1, &mut r2).expect("call should succeed");
         assert!(result);
 
         // Quality difference is 1, but minimum is 2
@@ -1915,84 +1204,8 @@ mod tests {
         assert_eq!(RawRecordView::new(&r2).quality_scores()[0], 2);
     }
 
-    /// Verify that `call_raw` produces the same results as `call` for agreement.
     #[test]
-    fn test_raw_matches_recordbuf_agreement() {
-        let mut caller_buf = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-        let mut caller_raw = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::Consensus,
-            DisagreementStrategy::Consensus,
-        );
-
-        // RecordBuf path
-        let mut rb_r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut rb_r2 = create_test_record(b"ACGT", &[20, 20, 20, 20], 100, "4M");
-        caller_buf.call(&mut rb_r1, &mut rb_r2).expect("call should succeed");
-
-        // Raw path
-        let cigar = [cigar_op(4, 0)];
-        let mut raw_r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
-        let mut raw_r2 = create_raw_test_record(b"ACGT", &[20, 20, 20, 20], 100, &cigar);
-        caller_raw.call_raw(&mut raw_r1, &mut raw_r2).expect("call_raw should succeed");
-
-        // Compare results
-        assert_eq!(rb_r1.quality_scores().as_ref(), RawRecordView::new(&raw_r1).quality_scores());
-        assert_eq!(rb_r2.quality_scores().as_ref(), RawRecordView::new(&raw_r2).quality_scores());
-        assert_eq!(caller_buf.stats().overlapping_bases, caller_raw.stats().overlapping_bases);
-        assert_eq!(caller_buf.stats().bases_agreeing, caller_raw.stats().bases_agreeing);
-        assert_eq!(caller_buf.stats().bases_corrected, caller_raw.stats().bases_corrected);
-    }
-
-    /// Verify that `call_raw` produces the same results as `call` for disagreement.
-    #[test]
-    fn test_raw_matches_recordbuf_disagreement() {
-        let mut caller_buf = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::MaskBoth,
-        );
-        let mut caller_raw = OverlappingBasesConsensusCaller::new(
-            AgreementStrategy::PassThrough,
-            DisagreementStrategy::MaskBoth,
-        );
-
-        // RecordBuf path
-        let mut rb_r1 = create_test_record(b"ACGT", &[30, 30, 30, 30], 100, "4M");
-        let mut rb_r2 = create_test_record(b"GCTA", &[20, 20, 20, 20], 100, "4M");
-        caller_buf.call(&mut rb_r1, &mut rb_r2).expect("call should succeed");
-
-        // Raw path
-        let cigar = [cigar_op(4, 0)];
-        let mut raw_r1 = create_raw_test_record(b"ACGT", &[30, 30, 30, 30], 100, &cigar);
-        let mut raw_r2 = create_raw_test_record(b"GCTA", &[20, 20, 20, 20], 100, &cigar);
-        caller_raw.call_raw(&mut raw_r1, &mut raw_r2).expect("call_raw should succeed");
-
-        // Compare sequences
-        let buf_r1_seq: Vec<u8> = rb_r1.sequence().as_ref().to_vec();
-        let buf_r2_seq: Vec<u8> = rb_r2.sequence().as_ref().to_vec();
-        let raw_r1_seq = RawRecordView::new(&raw_r1).sequence_vec();
-        let raw_r2_seq = RawRecordView::new(&raw_r2).sequence_vec();
-        assert_eq!(buf_r1_seq, raw_r1_seq);
-        assert_eq!(buf_r2_seq, raw_r2_seq);
-
-        // Compare qualities
-        assert_eq!(rb_r1.quality_scores().as_ref(), RawRecordView::new(&raw_r1).quality_scores());
-        assert_eq!(rb_r2.quality_scores().as_ref(), RawRecordView::new(&raw_r2).quality_scores());
-
-        // Compare stats
-        assert_eq!(caller_buf.stats().overlapping_bases, caller_raw.stats().overlapping_bases);
-        assert_eq!(caller_buf.stats().bases_disagreeing, caller_raw.stats().bases_disagreeing);
-        assert_eq!(caller_buf.stats().bases_corrected, caller_raw.stats().bases_corrected);
-    }
-
-    // ========================================================================
-    // apply_overlapping_consensus_raw tests
-    // ========================================================================
-
-    #[test]
-    fn test_apply_overlapping_consensus_raw_pair() {
+    fn test_apply_overlapping_consensus_pair() {
         let mut caller = OverlappingBasesConsensusCaller::new(
             AgreementStrategy::Consensus,
             DisagreementStrategy::Consensus,
@@ -2007,8 +1220,8 @@ mod tests {
         let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
         let mut records = vec![r1, r2];
-        apply_overlapping_consensus_raw(&mut records, &mut caller)
-            .expect("apply_overlapping_consensus_raw should succeed");
+        apply_overlapping_consensus(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus should succeed");
 
         // Check that qualities were summed (30 + 20 = 50)
         assert_eq!(RawRecordView::new(&records[0]).quality_scores()[0], 50);
@@ -2017,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_overlapping_consensus_raw_no_pair() {
+    fn test_apply_overlapping_consensus_no_pair() {
         let mut caller = OverlappingBasesConsensusCaller::new(
             AgreementStrategy::Consensus,
             DisagreementStrategy::Consensus,
@@ -2032,8 +1245,8 @@ mod tests {
         let r2 = make_raw_bam(b"reb", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
 
         let mut records = vec![r1, r2];
-        apply_overlapping_consensus_raw(&mut records, &mut caller)
-            .expect("apply_overlapping_consensus_raw should succeed");
+        apply_overlapping_consensus(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus should succeed");
 
         // Qualities unchanged because no matching pair
         assert_eq!(RawRecordView::new(&records[0]).quality_scores()[0], 30);
@@ -2042,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_overlapping_consensus_raw_reversed_indices() {
+    fn test_apply_overlapping_consensus_reversed_indices() {
         // Test when R2 appears before R1 in the slice (exercises the idx1 > idx2 branch)
         let mut caller = OverlappingBasesConsensusCaller::new(
             AgreementStrategy::Consensus,
@@ -2057,8 +1270,8 @@ mod tests {
 
         // R2 at index 0, R1 at index 1
         let mut records = vec![r2, r1];
-        apply_overlapping_consensus_raw(&mut records, &mut caller)
-            .expect("apply_overlapping_consensus_raw should succeed");
+        apply_overlapping_consensus(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus should succeed");
 
         // Both should have been consensus-called
         assert!(caller.stats().overlapping_bases > 0);
@@ -2066,6 +1279,69 @@ mod tests {
             RawRecordView::new(&records[0]).quality_scores()[0],
             RawRecordView::new(&records[1]).quality_scores()[0]
         );
+    }
+
+    #[test]
+    fn test_apply_overlapping_consensus_skips_supplementary() {
+        // A supplementary R1 with the same name as the primary R1 must not
+        // overwrite the primary pair in read_pairs and get consensus-called.
+        let mut caller = OverlappingBasesConsensusCaller::new(
+            AgreementStrategy::Consensus,
+            DisagreementStrategy::Consensus,
+        );
+
+        let cigar = [cigar_op(4, 0)]; // 4M
+
+        // Primary R1
+        let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
+        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        // Primary R2
+        let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
+        let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        // Supplementary R1 (same name, placed AFTER the primary so it would
+        // overwrite the primary index if the loop did not skip non-primary records).
+        let supp_flag = fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::SUPPLEMENTARY;
+        let supp = make_raw_bam(b"rea", supp_flag, 0, 99, &cigar, b"ACGT", &[10, 10, 10, 10]);
+
+        let mut records = vec![r1, r2, supp];
+        apply_overlapping_consensus(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus should succeed");
+
+        // Primary R1 and R2 were consensus-called: qualities sum to 30 + 20 = 50.
+        assert_eq!(RawRecordView::new(&records[0]).quality_scores()[0], 50);
+        assert_eq!(RawRecordView::new(&records[1]).quality_scores()[0], 50);
+        // Supplementary was skipped: its qualities remain unchanged.
+        assert_eq!(RawRecordView::new(&records[2]).quality_scores()[0], 10);
+    }
+
+    #[test]
+    fn test_apply_overlapping_consensus_skips_secondary() {
+        // Same invariant for secondary alignments.
+        let mut caller = OverlappingBasesConsensusCaller::new(
+            AgreementStrategy::Consensus,
+            DisagreementStrategy::Consensus,
+        );
+
+        let cigar = [cigar_op(4, 0)]; // 4M
+
+        let r1_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::FIRST_SEGMENT;
+        let r1 = make_raw_bam(b"rea", r1_flag, 0, 99, &cigar, b"ACGT", &[30, 30, 30, 30]);
+        let r2_flag = fgumi_raw_bam::flags::PAIRED | fgumi_raw_bam::flags::LAST_SEGMENT;
+        let r2 = make_raw_bam(b"rea", r2_flag, 0, 99, &cigar, b"ACGT", &[20, 20, 20, 20]);
+        let sec_flag = fgumi_raw_bam::flags::PAIRED
+            | fgumi_raw_bam::flags::FIRST_SEGMENT
+            | fgumi_raw_bam::flags::SECONDARY;
+        let sec = make_raw_bam(b"rea", sec_flag, 0, 99, &cigar, b"ACGT", &[10, 10, 10, 10]);
+
+        let mut records = vec![r1, r2, sec];
+        apply_overlapping_consensus(&mut records, &mut caller)
+            .expect("apply_overlapping_consensus should succeed");
+
+        assert_eq!(RawRecordView::new(&records[0]).quality_scores()[0], 50);
+        assert_eq!(RawRecordView::new(&records[1]).quality_scores()[0], 50);
+        assert_eq!(RawRecordView::new(&records[2]).quality_scores()[0], 10);
     }
 
     // ========================================================================
@@ -2169,6 +1445,7 @@ mod tests {
 
     #[test]
     fn test_kind_to_bam_op() {
+        use noodles::sam::alignment::record::cigar::op::Kind;
         assert_eq!(kind_to_bam_op(Kind::Match), 0);
         assert_eq!(kind_to_bam_op(Kind::Insertion), 1);
         assert_eq!(kind_to_bam_op(Kind::Deletion), 2);
@@ -2178,60 +1455,5 @@ mod tests {
         assert_eq!(kind_to_bam_op(Kind::Pad), 6);
         assert_eq!(kind_to_bam_op(Kind::SequenceMatch), 7);
         assert_eq!(kind_to_bam_op(Kind::SequenceMismatch), 8);
-    }
-
-    #[test]
-    fn test_unified_iterator_noodles_and_raw_agree() {
-        // Create two overlapping records via noodles RecordBuf
-        let r1 = create_test_record(b"ACGTACGT", &[30; 8], 100, "8M");
-        let r2 = create_test_record(b"ACGTACGT", &[20; 8], 104, "8M");
-
-        // Collect positions from the noodles-based iterator
-        let noodles_iter = ReadMateAndRefPosIterator::new(&r1, &r2)
-            .expect("ReadMateAndRefPosIterator::new should succeed");
-        let noodles_positions: Vec<_> = noodles_iter.collect();
-
-        // Build raw BAM bytes for the same records
-        let cigar_8m = [cigar_op(8, 0)]; // 8M
-        let r1_raw = create_raw_test_record(b"ACGTACGT", &[30; 8], 100, &cigar_8m);
-        let r2_raw = create_raw_test_record(b"ACGTACGT", &[20; 8], 104, &cigar_8m);
-
-        // r1: 100-107, r2: 104-111, overlap: 104-107
-        let raw_iter = ReadMateAndRefPosIterator::new_raw(
-            &r1_raw, &r2_raw, 100, 107, // r1 start/end
-            104, 111, // r2 start/end
-        );
-        let raw_positions: Vec<_> = raw_iter.collect();
-
-        assert_eq!(noodles_positions.len(), raw_positions.len());
-        for (n, r) in noodles_positions.iter().zip(raw_positions.iter()) {
-            assert_eq!(n.read_offset, r.read_offset);
-            assert_eq!(n.mate_offset, r.mate_offset);
-        }
-        // Overlap is 4 bases (positions 104-107)
-        assert_eq!(noodles_positions.len(), 4);
-    }
-
-    #[test]
-    fn test_unified_iterator_with_deletion() {
-        // R1: 8bp seq, CIGAR 4M2D4M = 10bp ref span, positions 100-109
-        // R2: 4bp seq, CIGAR 4M, positions 106-109
-        let r1 = create_test_record(b"ACGTACGT", &[30; 8], 100, "4M2D4M");
-        let r2 = create_test_record(b"TTTT", &[20; 4], 106, "4M");
-
-        let iter = ReadMateAndRefPosIterator::new(&r1, &r2)
-            .expect("ReadMateAndRefPosIterator::new should succeed");
-        let positions: Vec<_> = iter.collect();
-
-        // Overlap region: 106-109 (4 ref positions)
-        // R1 deletion at 104-105 means read positions 0-3 map to ref 100-103,
-        // read positions 4-7 map to ref 106-109
-        assert_eq!(positions.len(), 4);
-        // R1 read offsets should be 4,5,6,7 (after the deletion gap)
-        assert_eq!(positions[0].read_offset, 4);
-        assert_eq!(positions[3].read_offset, 7);
-        // R2 read offsets should be 0,1,2,3
-        assert_eq!(positions[0].mate_offset, 0);
-        assert_eq!(positions[3].mate_offset, 3);
     }
 }

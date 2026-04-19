@@ -12,12 +12,11 @@ use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::bam_io::create_bam_reader_for_pipeline_with_opts;
 use crate::consensus_filter::{
     FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
-    check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats_raw,
-    filter_duplex_read_raw, filter_read_raw, is_duplex_consensus_raw, mask_bases_raw,
-    mask_duplex_bases_raw, mask_methylation_depth_duplex_raw_with_tags,
-    mask_methylation_depth_simplex_raw_with_tags,
+    check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats, filter_duplex_read,
+    filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
+    mask_methylation_depth_duplex_raw_with_tags, mask_methylation_depth_simplex_raw_with_tags,
     mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, resolve_ref_bases_for_record,
-    template_passes_raw,
+    template_passes,
 };
 use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use crate::logging::OperationTimer;
@@ -668,7 +667,7 @@ impl Filter {
                     pass_map.insert(idx, pass);
                 }
 
-                let template_pass = template_passes_raw(&template_records, &pass_map);
+                let template_pass = template_passes(&template_records, &pass_map);
 
                 for (idx, record) in template_records.into_iter().enumerate() {
                     let flags = RawRecordView::new(&record).flags();
@@ -771,14 +770,14 @@ impl Filter {
 
         let is_duplex = {
             let aux = bam_fields::aux_data_slice(record);
-            is_duplex_consensus_raw(aux)
+            is_duplex_consensus(aux)
         };
 
         let mut masked_count = if is_duplex {
             let (cc_thresh, ab_thresh, ba_thresh) = config
                 .duplex_thresholds()
                 .ok_or_else(|| anyhow::anyhow!("No duplex thresholds configured"))?;
-            mask_duplex_bases_raw(
+            mask_duplex_bases(
                 record,
                 cc_thresh,
                 ab_thresh,
@@ -790,7 +789,7 @@ impl Filter {
             let thresholds = config
                 .effective_single_strand_thresholds()
                 .ok_or_else(|| anyhow::anyhow!("No thresholds configured"))?;
-            mask_bases_raw(record, thresholds, min_base_quality)?
+            mask_bases(record, thresholds, min_base_quality)?
         };
 
         // Parse methylation tags once for all EM-Seq filters
@@ -892,7 +891,7 @@ impl Filter {
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> bool {
-        let (no_calls, mean_qual) = compute_read_stats_raw(bam);
+        let (no_calls, mean_qual) = compute_read_stats(bam);
         if let Some(min_qual) = min_mean_qual {
             if mean_qual < min_qual {
                 return false;
@@ -920,7 +919,7 @@ impl Filter {
         min_mean_qual: Option<f64>,
         max_no_call_frac: f64,
     ) -> Result<bool> {
-        let filter_result = filter_read_raw(aux_data, thresholds)?;
+        let filter_result = filter_read(aux_data, thresholds)?;
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
@@ -941,7 +940,7 @@ impl Filter {
         max_no_call_frac: f64,
     ) -> Result<bool> {
         let filter_result =
-            filter_duplex_read_raw(aux_data, cc_thresholds, ab_thresholds, ba_thresholds)?;
+            filter_duplex_read(aux_data, cc_thresholds, ab_thresholds, ba_thresholds)?;
         if filter_result != FilterResult::Pass {
             return Ok(false);
         }
@@ -1096,6 +1095,7 @@ impl Filter {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::sam::builder::RecordBuilder;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
@@ -1389,112 +1389,125 @@ mod tests {
 
     // Integration tests for filtering logic
 
-    use crate::sam::builder::RecordBuilder;
-    use noodles::sam::alignment::record_buf::data::field::Value;
-    use noodles::sam::alignment::record_buf::data::field::value::Array;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
 
-    /// Creates a test record with specified properties for filtering tests.
+    /// Creates a raw BAM test record for filtering tests.
     ///
-    /// Generates a minimal BAM record with the provided sequence, quality scores,
-    /// and optional consensus depth and error tags for testing filtering logic.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Read name for the record
-    /// * `sequence` - DNA sequence string (e.g., "ACGT")
-    /// * `qualities` - Quality scores (Phred scale) for each base
-    /// * `read_depth` - Optional read depth for per-read cD tag (use for read-level filtering)
-    /// * `read_error` - Optional error rate for per-read cE tag (use for read-level filtering)
-    /// * `base_depths` - Optional per-base depths for cd tag (use for base-level masking)
-    /// * `base_errors` - Optional per-base error counts for ce tag (use for base-level masking)
-    ///
-    /// # Returns
-    ///
-    /// A `RecordBuf` configured for testing with default mapping properties
+    /// Returns a `RawRecord` with the provided sequence, quality scores,
+    /// and optional consensus depth and error tags.
     fn create_filter_test_record(
-        name: &str,
-        sequence: &str,
+        _name: &str,
+        sequence: &[u8],
         qualities: &[u8],
         read_depth: Option<u8>,
         read_error: Option<f32>,
         base_depths: Option<Vec<u16>>,
         base_errors: Option<Vec<u16>>,
-    ) -> RecordBuf {
-        let mut builder = RecordBuilder::new()
-            .name(name)
-            .sequence(sequence)
-            .qualities(qualities)
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .mapping_quality(60);
+    ) -> RawRecord {
+        let seq_len = sequence.len();
+        let cigar_op = if seq_len > 0 { (seq_len as u32) << 4 } else { 0 }; // nM
 
-        // Add per-read depth tag (cD) if provided
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0).pos(0).mapq(60).flags(0);
+        if seq_len > 0 {
+            b.cigar_ops(&[cigar_op]).sequence(sequence).qualities(qualities);
+        }
         if let Some(depth) = read_depth {
-            builder = builder.tag("cD", Value::UInt8(depth));
+            b.add_int_tag(b"cD", i32::from(depth));
         }
-
-        // Add per-read error tag (cE) if provided
         if let Some(error) = read_error {
-            builder = builder.tag("cE", Value::Float(error));
+            b.add_float_tag(b"cE", error);
         }
-
-        // Add per-base depth tag (cd) if provided
         if let Some(depths) = base_depths {
-            builder = builder.tag("cd", Value::Array(Array::UInt16(depths)));
+            b.add_array_u16(b"cd", &depths);
         }
-
-        // Add per-base error tag (ce) if provided
         if let Some(errors) = base_errors {
-            builder = builder.tag("ce", Value::Array(Array::UInt16(errors)));
+            b.add_array_u16(b"ce", &errors);
         }
+        b.build()
+    }
 
-        builder.build()
+    /// Creates a raw BAM test record with `PAIRED+FIRST_SEGMENT` flags.
+    fn create_r1_record(sequence: &[u8], qualities: &[u8]) -> RawRecord {
+        let seq_len = sequence.len();
+        let cigar_op = (seq_len as u32) << 4;
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .cigar_ops(&[cigar_op])
+            .sequence(sequence)
+            .qualities(qualities);
+        b.build()
+    }
+
+    /// Creates a raw BAM test record with `PAIRED+LAST_SEGMENT` flags.
+    fn create_r2_record(sequence: &[u8], qualities: &[u8]) -> RawRecord {
+        let seq_len = sequence.len();
+        let cigar_op = (seq_len as u32) << 4;
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .cigar_ops(&[cigar_op])
+            .sequence(sequence)
+            .qualities(qualities);
+        b.build()
     }
 
     #[test]
     fn test_count_no_calls_empty_sequence() {
-        let record = create_filter_test_record("test", "", &[], None, None, None, None);
+        let record = create_filter_test_record("test", b"", &[], None, None, None, None);
         assert_eq!(crate::consensus_filter::count_no_calls(&record), 0);
     }
 
     #[test]
     fn test_count_no_calls_no_ns() {
         let record =
-            create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
+            create_filter_test_record("test", b"ACGT", &[30, 30, 30, 30], None, None, None, None);
         assert_eq!(crate::consensus_filter::count_no_calls(&record), 0);
     }
 
     #[test]
     fn test_count_no_calls_with_ns() {
-        let record =
-            create_filter_test_record("test", "ACNTN", &[30, 30, 0, 30, 0], None, None, None, None);
+        let record = create_filter_test_record(
+            "test",
+            b"ACNTN",
+            &[30, 30, 0, 30, 0],
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(crate::consensus_filter::count_no_calls(&record), 2);
     }
 
     #[test]
     fn test_count_no_calls_all_ns() {
         let record =
-            create_filter_test_record("test", "NNNN", &[0, 0, 0, 0], None, None, None, None);
+            create_filter_test_record("test", b"NNNN", &[0, 0, 0, 0], None, None, None, None);
         assert_eq!(crate::consensus_filter::count_no_calls(&record), 4);
     }
 
     #[test]
     fn test_mean_base_quality_empty() {
-        let record = create_filter_test_record("test", "", &[], None, None, None, None);
+        let record = create_filter_test_record("test", b"", &[], None, None, None, None);
         assert!((crate::consensus_filter::mean_base_quality(&record) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_mean_base_quality_uniform() {
         let record =
-            create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
+            create_filter_test_record("test", b"ACGT", &[30, 30, 30, 30], None, None, None, None);
         assert!((crate::consensus_filter::mean_base_quality(&record) - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_mean_base_quality_mixed() {
         let record =
-            create_filter_test_record("test", "ACGT", &[10, 20, 30, 40], None, None, None, None);
+            create_filter_test_record("test", b"ACGT", &[10, 20, 30, 40], None, None, None, None);
         assert!((crate::consensus_filter::mean_base_quality(&record) - 25.0).abs() < f64::EPSILON);
     }
 
@@ -1506,7 +1519,7 @@ mod tests {
         // Qualities: A=10 (<20, mask), C=30 (ok), G=5 (<20, mask), T=30 (ok)
         let mut record = create_filter_test_record(
             "test",
-            "ACGT",
+            b"ACGT",
             &[10, 30, 5, 30],
             None,
             None,
@@ -1520,13 +1533,12 @@ mod tests {
         mask_bases(&mut record, &thresholds, Some(20)).expect("mask_bases should succeed");
 
         // Bases 0 and 2 have quality < 20, should be masked to N
-        let seq = std::str::from_utf8(record.sequence().as_ref())
-            .expect("sequence should be valid UTF-8");
-        assert_eq!(seq, "NCNT");
+        let seq = fgumi_raw_bam::RawRecordView::new(&record).sequence_vec();
+        assert_eq!(&seq, b"NCNT");
 
         // Quality scores for masked bases should be 2 (Phred MIN_VALUE, matching fgbio)
-        let quals = record.quality_scores();
-        assert_eq!(quals.as_ref(), &[2, 30, 2, 30]);
+        let quals = fgumi_raw_bam::RawRecordView::new(&record).quality_scores().to_vec();
+        assert_eq!(quals, vec![2u8, 30, 2, 30]);
     }
 
     #[test]
@@ -1535,7 +1547,7 @@ mod tests {
 
         let mut record = create_filter_test_record(
             "test",
-            "ACGT",
+            b"ACGT",
             &[30, 30, 30, 30],
             None,
             None,
@@ -1549,9 +1561,8 @@ mod tests {
         mask_bases(&mut record, &thresholds, Some(10)).expect("mask_bases should succeed");
 
         // Bases with depth < 5 should be masked to N
-        let seq = std::str::from_utf8(record.sequence().as_ref())
-            .expect("sequence should be valid UTF-8");
-        assert_eq!(seq, "NCNT");
+        let seq = fgumi_raw_bam::RawRecordView::new(&record).sequence_vec();
+        assert_eq!(&seq, b"NCNT");
     }
 
     #[test]
@@ -1560,7 +1571,7 @@ mod tests {
 
         let mut record = create_filter_test_record(
             "test",
-            "ACGT",
+            b"ACGT",
             &[30, 30, 30, 30],
             None,
             None,
@@ -1578,9 +1589,8 @@ mod tests {
 
         // Base 1 has 3/10 = 30% > 20%, should be masked
         // Base 2 has 2/10 = 20% = 20%, NOT masked (needs to be strictly greater)
-        let seq = std::str::from_utf8(record.sequence().as_ref())
-            .expect("sequence should be valid UTF-8");
-        assert_eq!(seq, "ANGT");
+        let seq = fgumi_raw_bam::RawRecordView::new(&record).sequence_vec();
+        assert_eq!(&seq, b"ANGT");
     }
 
     #[test]
@@ -1589,7 +1599,7 @@ mod tests {
 
         let record = create_filter_test_record(
             "test",
-            "ACGT",
+            b"ACGT",
             &[30, 30, 30, 30],
             Some(10),   // Per-read depth
             Some(0.05), // Per-read error rate
@@ -1600,7 +1610,8 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
+        let result =
+            filter_read(aux_data_slice(&record), &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::Pass);
     }
 
@@ -1610,7 +1621,7 @@ mod tests {
 
         let record = create_filter_test_record(
             "test",
-            "ACGT",
+            b"ACGT",
             &[30, 30, 30, 30],
             Some(3), // Below threshold
             Some(0.05),
@@ -1621,7 +1632,8 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
+        let result =
+            filter_read(aux_data_slice(&record), &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::InsufficientReads);
     }
 
@@ -1631,7 +1643,7 @@ mod tests {
 
         let record = create_filter_test_record(
             "test",
-            "ACGT",
+            b"ACGT",
             &[30, 30, 30, 30],
             Some(10),
             Some(0.3), // High error rate
@@ -1642,7 +1654,8 @@ mod tests {
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
+        let result =
+            filter_read(aux_data_slice(&record), &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::ExcessiveErrorRate);
     }
 
@@ -1652,12 +1665,13 @@ mod tests {
 
         // Record without depth/error tags should pass (tags are optional)
         let record =
-            create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
+            create_filter_test_record("test", b"ACGT", &[30, 30, 30, 30], None, None, None, None);
 
         let thresholds =
             FilterThresholds { min_reads: 5, max_read_error_rate: 0.1, max_base_error_rate: 0.2 };
 
-        let result = filter_read(&record, &thresholds).expect("filter_read should succeed");
+        let result =
+            filter_read(aux_data_slice(&record), &thresholds).expect("filter_read should succeed");
         assert_eq!(result, FilterResult::Pass);
     }
 
@@ -1666,12 +1680,10 @@ mod tests {
         use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
 
-        let r1 =
-            create_filter_test_record("read1", "ACGT", &[30, 30, 30, 30], None, None, None, None);
-        let r2 =
-            create_filter_test_record("read1", "GGGG", &[30, 30, 30, 30], None, None, None, None);
+        let r1 = create_r1_record(b"ACGT", &[30, 30, 30, 30]);
+        let r2 = create_r2_record(b"GGGG", &[30, 30, 30, 30]);
 
-        let records = vec![r1, r2];
+        let records: Vec<Vec<u8>> = vec![r1.into_inner(), r2.into_inner()];
         let mut pass_map = AHashMap::new();
         pass_map.insert(0, true);
         pass_map.insert(1, true);
@@ -1684,12 +1696,10 @@ mod tests {
         use crate::consensus_filter::template_passes;
         use ahash::AHashMap;
 
-        let r1 =
-            create_filter_test_record("read1", "ACGT", &[30, 30, 30, 30], None, None, None, None);
-        let r2 =
-            create_filter_test_record("read1", "GGGG", &[30, 30, 30, 30], None, None, None, None);
+        let r1 = create_r1_record(b"ACGT", &[30, 30, 30, 30]);
+        let r2 = create_r2_record(b"GGGG", &[30, 30, 30, 30]);
 
-        let records = vec![r1, r2];
+        let records: Vec<Vec<u8>> = vec![r1.into_inner(), r2.into_inner()];
         let mut pass_map = AHashMap::new();
         pass_map.insert(0, true);
         pass_map.insert(1, false); // One fails
@@ -1702,21 +1712,27 @@ mod tests {
         use crate::consensus_filter::is_duplex_consensus;
 
         let record =
-            create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
-        assert!(!is_duplex_consensus(&record));
+            create_filter_test_record("test", b"ACGT", &[30, 30, 30, 30], None, None, None, None);
+        assert!(!is_duplex_consensus(aux_data_slice(&record)));
     }
 
     #[test]
     fn test_is_duplex_consensus_with_tag() {
         use crate::consensus_filter::is_duplex_consensus;
 
-        let mut record =
-            create_filter_test_record("test", "ACGT", &[30, 30, 30, 30], None, None, None, None);
+        // Build a record with the aD tag included directly
+        let mut b = RawSamBuilder::new();
+        b.ref_id(0)
+            .pos(0)
+            .mapq(60)
+            .flags(0)
+            .cigar_ops(&[4 << 4]) // 4M
+            .sequence(b"ACGT")
+            .qualities(&[30, 30, 30, 30]);
+        b.add_int_tag(b"aD", 10);
+        let record = b.build();
 
-        // Add duplex consensus tags (aD per-read tag is key indicator)
-        record.data_mut().insert(crate::consensus_tags::per_read::tag("aD"), Value::UInt8(10));
-
-        assert!(is_duplex_consensus(&record));
+        assert!(is_duplex_consensus(aux_data_slice(&record)));
     }
 
     #[test]
@@ -4041,7 +4057,7 @@ mod tests {
             .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30])
             .build();
 
-        // Add required cD and cE tags for filter_read_raw to pass
+        // Add required cD and cE tags for filter_read to pass
         record.data_mut().insert(
             noodles::sam::alignment::record::data::field::Tag::from([b'c', b'D']),
             noodles::sam::alignment::record_buf::data::field::Value::from(10u8),

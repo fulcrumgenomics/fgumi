@@ -84,7 +84,7 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{self as bam_fields, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use noodles::sam::alignment::record::data::field::Tag;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -526,7 +526,7 @@ impl CodecConsensusCaller {
         clippy::too_many_lines,
         reason = "consensus pipeline has many sequential steps that are clearest in one function"
     )]
-    fn consensus_reads_raw(&mut self, records: &[Vec<u8>]) -> Result<ConsensusOutput> {
+    fn consensus_reads_raw(&mut self, records: &[RawRecord]) -> Result<ConsensusOutput> {
         self.stats.total_input_reads += records.len() as u64;
 
         if records.is_empty() {
@@ -793,7 +793,7 @@ impl CodecConsensusCaller {
         let all_paired_raws: Vec<&[u8]> = r1_infos
             .iter()
             .chain(r2_infos.iter())
-            .map(|info| records[info.raw_idx].as_slice())
+            .map(|info| records[info.raw_idx].as_ref())
             .collect();
 
         let mut output = ConsensusOutput::default();
@@ -1229,7 +1229,7 @@ impl CodecConsensusCaller {
         ss_b: &SingleStrandConsensus,
         umi: Option<&str>,
         source_raws: &[&[u8]],
-        all_records: &[Vec<u8>],
+        all_records: &[RawRecord],
     ) -> Result<()> {
         // Generate read name - use ':' delimiter to match fgbio format
         self.consensus_counter += 1;
@@ -1377,11 +1377,11 @@ impl CodecConsensusCaller {
 /// This allows `CodecConsensusCaller` to be used polymorphically with other
 /// consensus callers (e.g., `VanillaUmiConsensusCaller`, `DuplexConsensusCaller`).
 impl ConsensusCaller for CodecConsensusCaller {
-    fn consensus_reads(&mut self, records: Vec<Vec<u8>>) -> Result<ConsensusOutput> {
+    fn consensus_reads(&mut self, records: Vec<RawRecord>) -> Result<ConsensusOutput> {
         let result = self.consensus_reads_raw(&records)?;
         // When a group fails to produce consensus, all its records are rejected
         if self.track_rejects && result.count == 0 && !records.is_empty() {
-            self.rejected_reads.extend(records);
+            self.rejected_reads.extend(records.into_iter().map(RawRecord::into_inner));
         }
         Ok(result)
     }
@@ -1477,7 +1477,8 @@ impl CodecConsensusCaller {
         &mut self,
         recs: Vec<noodles::sam::alignment::RecordBuf>,
     ) -> Result<ConsensusOutput> {
-        let raw_records: Vec<Vec<u8>> = recs.iter().map(Self::record_buf_to_raw).collect();
+        let raw_records: Vec<RawRecord> =
+            recs.iter().map(|r| RawRecord::from(Self::record_buf_to_raw(r))).collect();
         self.consensus_reads(raw_records)
     }
 }
@@ -1501,7 +1502,8 @@ impl CodecConsensusCaller {
         &mut self,
         recs: Vec<noodles::sam::alignment::RecordBuf>,
     ) -> Vec<noodles::sam::alignment::RecordBuf> {
-        let raws: Vec<Vec<u8>> = recs.iter().map(Self::record_buf_to_raw).collect();
+        let raws: Vec<RawRecord> =
+            recs.iter().map(|r| RawRecord::from(Self::record_buf_to_raw(r))).collect();
         let infos: Vec<ClippedRecordInfo> =
             raws.iter().enumerate().map(|(i, raw)| Self::build_clipped_info(raw, i, 0)).collect();
         let filtered = self.filter_to_most_common_alignment_raw(infos);
