@@ -2133,12 +2133,17 @@ impl DuplexConsensusCaller {
                 }
             }
             (None, None, Some(ref r1_b), Some(ref r2_b)) => {
-                // Only BA strand - check if single-strand consensus is allowed
-                // fgbio swaps B→A when only B is present
+                // Only BA strand - check if single-strand consensus is allowed.
+                //
+                // Mirrors fgbio's mapping where full-duplex output R1 combines AB-R1
+                // with BA-R2 and output R2 combines AB-R2 with BA-R1 (AB-R1 and BA-R2
+                // sequence the same physical strand, as do AB-R2 and BA-R1). When AB
+                // is absent, output R1 therefore derives from BA-R2 and output R2 from
+                // BA-R1. BA is passed in the BA slot so is_ba_only=true is preserved
+                // and methylation tags are emitted as bm/bu/bt.
                 if min_yx_reads == 0 {
-                    // Use duplex_consensus with only BA (treated as AB)
-                    let duplex_r1 = Self::duplex_consensus(Some(r1_b), None, None);
-                    let duplex_r2 = Self::duplex_consensus(Some(r2_b), None, None);
+                    let duplex_r1 = Self::duplex_consensus(None, Some(r2_b), None);
+                    let duplex_r2 = Self::duplex_consensus(None, Some(r1_b), None);
 
                     if let (Some(dr1), Some(dr2)) = (duplex_r1, duplex_r2) {
                         let empty: &[&RawRecord] = &[];
@@ -2148,8 +2153,8 @@ impl DuplexConsensusCaller {
                             &dr1,
                             ReadType::R1,
                             &base_mi,
-                            &filtered_ba_r1_raws,
                             empty,
+                            &filtered_ba_r2_raws,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -2164,8 +2169,8 @@ impl DuplexConsensusCaller {
                             &dr2,
                             ReadType::R2,
                             &base_mi,
-                            &filtered_ba_r2_raws,
                             empty,
+                            &filtered_ba_r1_raws,
                             produce_per_base_tags,
                             read_name_prefix,
                             read_group_id,
@@ -6145,5 +6150,203 @@ mod tests {
         // bm tag (G-m format for BA bottom strand, minus = opposite strand per SAM spec)
         let bm = rec.get_string_tag(b"bm").expect("Should have bm tag");
         assert!(bm.starts_with(b"G-m"), "bm should start with G-m");
+    }
+
+    /// Regression test: when a UMI group has only B-strand reads (no A-strand) with
+    /// methylation enabled, the output must use bottom-strand methylation tags
+    /// (bm/bu/bt), not top-strand (am/au/at), because the consensus is derived from
+    /// bottom-strand data.
+    ///
+    /// The bug: the BA-only branch in `consensus_reads()` passed BA data in the
+    /// first (AB) argument of `duplex_consensus()`, which sets `is_ba_only=false`
+    /// and causes `duplex_read_into()` to emit top-strand methylation tags.
+    #[test]
+    fn test_duplex_ba_only_methylation_tags_use_bottom_strand() -> Result<()> {
+        use crate::methylation::tests::TestRef;
+        use std::sync::Arc;
+
+        // Reference at 1-based positions 100-109 is GGGGGGGGGG. A B-strand (bottom)
+        // read aligned forward at 100 reading CCCCCCCCCC is the bottom strand's view
+        // of a ref-C-on-bottom-strand (ref-G on top). Unconverted C → methylation
+        // evidence on the bottom strand.
+        let mut ref_seq = vec![b'N'; 99];
+        ref_seq.extend_from_slice(b"GGGGGGGGGG");
+
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1, 1, 0], // min total=1, AB=1, BA=0 (allow BA single-strand)
+            0,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+        caller.set_reference(
+            Arc::new(TestRef::new(&[("chr1", &ref_seq)])),
+            Arc::new(vec!["chr1".to_string()]),
+            crate::MethylationMode::EmSeq,
+        );
+
+        // 3 B-strand pairs: R1 reverse-complemented (fgbio BA-R1 convention),
+        // R2 forward. Both sequences become CCCCCCCCCC in the query-sequence field
+        // such that the aligned BA-strand view produces unconverted-C evidence.
+        let reads: Vec<RecordBuf> = (1..=3)
+            .flat_map(|i| {
+                vec![
+                    RecordBuilder::new()
+                        .name(&format!("q{i}"))
+                        .sequence("GGGGGGGGGG")
+                        .qualities(&[30; 10])
+                        .first_segment(true)
+                        .reverse_complement(true)
+                        .mate_reverse_complement(false)
+                        .reference_sequence_id(0)
+                        .alignment_start(100)
+                        .mate_reference_sequence_id(0)
+                        .mate_alignment_start(100)
+                        .cigar("10M")
+                        .tag("MI", "foo/B")
+                        .tag("RG", "A")
+                        .build(),
+                    RecordBuilder::new()
+                        .name(&format!("q{i}"))
+                        .sequence("CCCCCCCCCC")
+                        .qualities(&[30; 10])
+                        .first_segment(false)
+                        .reverse_complement(false)
+                        .mate_reverse_complement(true)
+                        .reference_sequence_id(0)
+                        .alignment_start(100)
+                        .mate_reference_sequence_id(0)
+                        .mate_alignment_start(100)
+                        .cigar("10M")
+                        .tag("MI", "foo/B")
+                        .tag("RG", "A")
+                        .build(),
+                ]
+            })
+            .collect();
+
+        let result = caller.consensus_reads_from_sam_records(reads)?;
+        assert_eq!(result.count, 2, "Should produce 2 consensus reads from B-only");
+
+        let records = ParsedBamRecord::parse_all(&result.data);
+
+        // BA-only consensus: per-strand methylation evidence arrays must use
+        // bottom-strand tags (bu/bt), not top-strand (au/at). The bug path emits
+        // au/at because it incorrectly sets is_ba_only=false.
+        for rec in &records {
+            assert!(
+                rec.get_i16_array_tag(b"bu").is_some(),
+                "BA-only consensus must have bu tag (bottom-strand unconverted counts)"
+            );
+            assert!(
+                rec.get_i16_array_tag(b"bt").is_some(),
+                "BA-only consensus must have bt tag (bottom-strand converted counts)"
+            );
+            assert!(
+                rec.get_i16_array_tag(b"au").is_none(),
+                "BA-only consensus must NOT have au tag (no top-strand data)"
+            );
+            assert!(
+                rec.get_i16_array_tag(b"at").is_none(),
+                "BA-only consensus must NOT have at tag (no top-strand data)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Regression test: BA-only consensus must map output R1 to BA-R2 and output
+    /// R2 to BA-R1, matching the fgbio full-duplex pairing (AB-R1 + BA-R2 → R1,
+    /// AB-R2 + BA-R1 → R2). AB-R1 and BA-R2 sequence the same physical strand, as
+    /// do AB-R2 and BA-R1, so a BA-only group should emit BA-R2 under the R1 slot
+    /// and BA-R1 under the R2 slot.
+    #[test]
+    fn test_duplex_ba_only_mate_pair_mapping() -> Result<()> {
+        let mut caller = DuplexConsensusCaller::new(
+            "consensus".to_string(),
+            "RG1".to_string(),
+            vec![1, 1, 0], // min total=1, AB=1, BA=0 (allow BA single-strand)
+            0,
+            false,
+            false,
+            None,
+            None,
+            false,
+            45,
+            40,
+        )?;
+
+        // BA-R1 (reverse_complement=true) stored "GGGGGGGGGG" → aligned "CCCCCCCCCC".
+        // BA-R2 (reverse_complement=false) stored "AAAAAAAAAA" → aligned "AAAAAAAAAA".
+        // Distinguishable sequences let us verify which BA read each output slot
+        // derives from.
+        let reads: Vec<RecordBuf> = (1..=3)
+            .flat_map(|i| {
+                vec![
+                    RecordBuilder::new()
+                        .name(&format!("q{i}"))
+                        .sequence("GGGGGGGGGG")
+                        .qualities(&[30; 10])
+                        .first_segment(true)
+                        .reverse_complement(true)
+                        .mate_reverse_complement(false)
+                        .reference_sequence_id(0)
+                        .alignment_start(100)
+                        .mate_reference_sequence_id(0)
+                        .mate_alignment_start(100)
+                        .cigar("10M")
+                        .tag("MI", "foo/B")
+                        .tag("RG", "A")
+                        .build(),
+                    RecordBuilder::new()
+                        .name(&format!("q{i}"))
+                        .sequence("AAAAAAAAAA")
+                        .qualities(&[30; 10])
+                        .first_segment(false)
+                        .reverse_complement(false)
+                        .mate_reverse_complement(true)
+                        .reference_sequence_id(0)
+                        .alignment_start(100)
+                        .mate_reference_sequence_id(0)
+                        .mate_alignment_start(100)
+                        .cigar("10M")
+                        .tag("MI", "foo/B")
+                        .tag("RG", "A")
+                        .build(),
+                ]
+            })
+            .collect();
+
+        let result = caller.consensus_reads_from_sam_records(reads)?;
+        assert_eq!(result.count, 2, "Should produce 2 consensus reads from B-only");
+
+        let records = ParsedBamRecord::parse_all(&result.data);
+        assert_eq!(records.len(), 2);
+
+        let r1 = records
+            .iter()
+            .find(|r| r.flag & flags::FIRST_SEGMENT != 0)
+            .expect("Should have a FIRST_SEGMENT record");
+        let r2 = records
+            .iter()
+            .find(|r| r.flag & flags::LAST_SEGMENT != 0)
+            .expect("Should have a LAST_SEGMENT record");
+
+        assert_eq!(
+            r1.bases, b"AAAAAAAAAA",
+            "Output R1 bases should match BA-R2 consensus (AAAAAAAAAA)"
+        );
+        assert_eq!(
+            r2.bases, b"CCCCCCCCCC",
+            "Output R2 bases should match BA-R1 consensus (CCCCCCCCCC)"
+        );
+
+        Ok(())
     }
 }
