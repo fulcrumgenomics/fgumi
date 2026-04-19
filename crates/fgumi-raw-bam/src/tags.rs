@@ -583,6 +583,48 @@ pub(crate) fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &
     record.extend_from_slice(values);
 }
 
+/// Append an `i8` array (`B:c`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 'c', count_u32_le, values_i8...]`
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_i8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i8]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b'c');
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
+    for &v in values {
+        record.push(v.cast_unsigned());
+    }
+}
+
+/// Append a `u32` array (`B:I`-type) tag to a BAM record.
+///
+/// Format: `[tag0, tag1, 'B', 'I', count_u32_le, values_u32_le...]`
+///
+/// # Panics
+///
+/// Panics if `values.len()` exceeds `u32::MAX`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn append_u32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u32]) {
+    record.push(tag[0]);
+    record.push(tag[1]);
+    record.push(b'B');
+    record.push(b'I');
+    record.extend_from_slice(
+        &u32::try_from(values.len()).expect("array length exceeds u32").to_le_bytes(),
+    );
+    for &v in values {
+        record.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
 /// Append a Phred+33 encoded quality string (`Z`-type) tag.
 ///
 /// Converts raw Phred scores (0-93) to ASCII (Phred+33) and writes
@@ -1486,6 +1528,18 @@ impl<'a> RawTagsEditor<'a> {
         append_i32_array_tag(self.record, tag, values);
     }
 
+    /// Append a `B:c` (i8 array) tag to the record.
+    #[inline]
+    pub fn append_array_i8(&mut self, tag: &[u8; 2], values: &[i8]) {
+        append_i8_array_tag(self.record, tag, values);
+    }
+
+    /// Append a `B:I` (u32 array) tag to the record.
+    #[inline]
+    pub fn append_array_u32(&mut self, tag: &[u8; 2], values: &[u32]) {
+        append_u32_array_tag(self.record, tag, values);
+    }
+
     // -- update / remove / normalize --
 
     /// Update an existing integer tag in place, or append it if absent.
@@ -1628,6 +1682,63 @@ impl<'a> RawTagsEditor<'a> {
             }
         }
         append_i32_array_tag(self.record, tag, values);
+    }
+
+    /// Update an existing `B:c` (i8 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_i8(&mut self, tag: &[u8; 2], values: &[i8]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b'c' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    for (i, &v) in values.iter().enumerate() {
+                        self.record[body + i] = v.cast_unsigned();
+                    }
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_i8_array_tag(self.record, tag, values);
+    }
+
+    /// Update an existing `B:I` (u32 array) tag in place if the length matches, else remove and
+    /// append.
+    pub fn update_array_u32(&mut self, tag: &[u8; 2], values: &[u32]) {
+        let off = self.aux_offset.min(self.record.len());
+        if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
+            let abs = off + p;
+            if val_type == b'B' && abs + 8 <= self.record.len() && self.record[abs + 3] == b'I' {
+                let count = u32::from_le_bytes([
+                    self.record[abs + 4],
+                    self.record[abs + 5],
+                    self.record[abs + 6],
+                    self.record[abs + 7],
+                ]) as usize;
+                if count == values.len() {
+                    let body = abs + 8;
+                    for (i, &v) in values.iter().enumerate() {
+                        let dst = body + i * 4;
+                        self.record[dst..dst + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    return;
+                }
+            }
+            if let Some(size) = tag_value_size(val_type, &self.record[abs + 3..]) {
+                self.record.drain(abs..abs + 3 + size);
+            }
+        }
+        append_u32_array_tag(self.record, tag, values);
     }
 
     /// Update an existing `B:f` (f32 array) tag in place if the length matches, else remove and
@@ -3721,6 +3832,46 @@ mod tests {
         let arr = RawRecordView::new(&rec).tags().find_array(b"sq").expect("present");
         assert_eq!(arr.elem_type, b's');
         assert_eq!(arr.count, 3);
+    }
+
+    #[test]
+    fn test_editor_update_array_i8_append_then_in_place_then_grow() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_i8(b"sb", &[-1i8, 0, 1]); // append (not present)
+            ed.update_array_i8(b"sb", &[-42i8, 7, -7]); // in-place (same length)
+            ed.update_array_i8(b"sb", &[10i8, 20, 30, 40, 50]); // grow
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"sb").expect("present");
+        assert_eq!(arr.elem_type, b'c');
+        assert_eq!(arr.count, 5);
+        assert_eq!(arr.elem_size, 1);
+        let decoded: Vec<i8> = arr.data.iter().map(|&b| b.cast_signed()).collect();
+        assert_eq!(decoded, vec![10i8, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_editor_update_array_u32_append_then_in_place_then_grow() {
+        use crate::fields::RawRecordView;
+        let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
+        {
+            let mut ed = RawTagsEditor::from_vec(&mut rec);
+            ed.update_array_u32(b"uI", &[1u32, 2, 3]); // append (not present)
+            ed.update_array_u32(b"uI", &[100u32, 200, 300]); // in-place (same length)
+            ed.update_array_u32(b"uI", &[u32::MAX, 0, u32::MAX / 2, 42]); // grow
+        }
+        let arr = RawRecordView::new(&rec).tags().find_array(b"uI").expect("present");
+        assert_eq!(arr.elem_type, b'I');
+        assert_eq!(arr.count, 4);
+        assert_eq!(arr.elem_size, 4);
+        let decoded: Vec<u32> = arr
+            .data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(decoded, vec![u32::MAX, 0, u32::MAX / 2, 42]);
     }
 
     // ========================================================================

@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mapped_builder_cigar_multple_ops() {
+    fn test_mapped_builder_cigar_multiple_ops() {
         // Build a record with a multi-op CIGAR: 10S 80M 10S
         let cigar = [cigar_op(10, 4), cigar_op(80, 0), cigar_op(10, 4)];
         let mut b = SamBuilder::new();

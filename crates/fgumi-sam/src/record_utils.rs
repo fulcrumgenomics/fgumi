@@ -6,6 +6,10 @@
 //! - Mate position calculations from MC tag
 //! - CIGAR string parsing and analysis
 
+use fgumi_raw_bam::{
+    RawRecordView, alignment_start_from_raw, consumes_query, consumes_ref, find_mc_tag_in_record,
+    flags, get_cigar_ops, mate_pos,
+};
 use noodles::sam::alignment::RecordBuf;
 use noodles::sam::alignment::record::Cigar as CigarTrait;
 use noodles::sam::alignment::record::cigar::op::Kind;
@@ -57,6 +61,7 @@ pub enum PairOrientation {
 ///   - The position is not found within the alignment
 ///   - The position falls in a deletion (when `return_last_base_if_deleted` is false)
 ///   - The record has no alignment start
+// RecordBuf kept: uses noodles typed CIGAR iterator (record.cigar().iter() -> Result<Op>); raw equivalent is read_pos_at_ref_pos_raw in fgumi-raw-bam.
 #[must_use]
 pub fn read_pos_at_ref_pos(
     record: &RecordBuf,
@@ -129,6 +134,7 @@ pub fn read_pos_at_ref_pos(
 /// - The pair is in FR orientation (positive strand 5' < negative strand 5')
 ///
 /// This matches fgbio's `isFrPair` algorithm using htsjdk's pair orientation logic.
+// RecordBuf kept: accesses flags/ref-id/mate fields via noodles typed API; raw equivalent is is_fr_pair_raw in fgumi-raw-bam.
 #[must_use]
 pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
     let flags = read.flags();
@@ -156,6 +162,7 @@ pub fn is_fr_pair_from_tags(read: &RecordBuf) -> bool {
 /// and the mate alignment start position.
 ///
 /// Returns `None` if the MC tag is missing/invalid or mate position is missing.
+// RecordBuf kept: reads MC tag via noodles typed data map (record.data().get()) returning Value::String.
 fn parse_mate_cigar(read: &RecordBuf) -> Option<(Vec<(Kind, usize)>, usize)> {
     let mc_tag = Tag::from([b'M', b'C']);
     let mc_value = read.data().get(&mc_tag)?;
@@ -184,6 +191,7 @@ fn parse_mate_cigar(read: &RecordBuf) -> Option<(Vec<(Kind, usize)>, usize)> {
 /// This matches fgbio's behavior which uses signed integers for these calculations.
 ///
 /// Returns `None` if the MC tag is missing or invalid, or if mate position is missing.
+// RecordBuf kept: delegates to parse_mate_cigar which uses noodles typed data API.
 #[must_use]
 pub fn mate_unclipped_start(read: &RecordBuf) -> Option<isize> {
     let (ops, mate_start) = parse_mate_cigar(read)?;
@@ -207,6 +215,7 @@ pub fn mate_unclipped_start(read: &RecordBuf) -> Option<isize> {
 /// Calculates: `mateUnclippedEnd = mateStart + refLen - 1 + trailingClipping`
 ///
 /// Returns `None` if the MC tag is missing or invalid, or if mate position is missing.
+// RecordBuf kept: delegates to parse_mate_cigar which uses noodles typed data API.
 #[must_use]
 pub fn mate_unclipped_end(read: &RecordBuf) -> Option<usize> {
     let (ops, mate_start) = parse_mate_cigar(read)?;
@@ -223,6 +232,7 @@ pub fn mate_unclipped_end(read: &RecordBuf) -> Option<usize> {
 /// Uses tag-based mate information (MC tag, mate position, template length).
 ///
 /// Returns 0 if not an FR pair or if required tags are missing.
+// RecordBuf kept: uses noodles typed CIGAR iterator and data API; raw equivalent is num_bases_extending_past_mate_raw in fgumi-raw-bam.
 #[must_use]
 pub fn num_bases_extending_past_mate(read: &RecordBuf) -> usize {
     // Only applies to FR pairs
@@ -340,6 +350,7 @@ pub fn num_bases_extending_past_mate(read: &RecordBuf) -> usize {
 /// Gets the read's alignment end position (1-based, inclusive).
 ///
 /// Calculated as: `alignment_start + reference_length - 1`
+// RecordBuf kept: reads alignment_start via noodles typed Position and uses typed CIGAR; raw equivalent is alignment_end_from_raw in fgumi-raw-bam.
 #[must_use]
 pub fn alignment_end(read: &RecordBuf) -> Option<usize> {
     let start = usize::from(read.alignment_start()?);
@@ -440,6 +451,7 @@ pub fn trailing_soft_clipping(ops: &[(Kind, usize)]) -> usize {
 }
 
 /// Collects CIGAR operations from a record into a Vec for use with clipping functions.
+// RecordBuf kept: accesses record.cigar() via noodles typed CigarBuf to extract ops.
 #[must_use]
 fn cigar_to_ops(record: &RecordBuf) -> Vec<(Kind, usize)> {
     record.cigar().as_ref().iter().map(|op| (op.kind(), op.len())).collect()
@@ -451,6 +463,7 @@ fn cigar_to_ops(record: &RecordBuf) -> Vec<(Kind, usize)> {
 /// both soft clips and hard clips.
 ///
 /// Returns `None` for unmapped reads.
+// RecordBuf kept: checks record.flags() and alignment_start() via noodles typed API; raw equivalent is unclipped_5prime_from_raw_bam in fgumi-raw-bam.
 #[must_use]
 pub fn unclipped_start(record: &RecordBuf) -> Option<usize> {
     if record.flags().is_unmapped() {
@@ -467,6 +480,7 @@ pub fn unclipped_start(record: &RecordBuf) -> Option<usize> {
 /// both soft clips and hard clips.
 ///
 /// Returns `None` for unmapped reads.
+// RecordBuf kept: checks record.flags() and alignment_start() via noodles typed API.
 #[must_use]
 pub fn unclipped_end(record: &RecordBuf) -> Option<usize> {
     if record.flags().is_unmapped() {
@@ -488,6 +502,7 @@ pub fn unclipped_end(record: &RecordBuf) -> Option<usize> {
 /// This matches fgbio's `positionOf` behavior in `GroupReadsByUmi`.
 ///
 /// Returns `None` for unmapped reads.
+// RecordBuf kept: delegates to unclipped_start/unclipped_end which use noodles typed API; raw equivalent is unclipped_5prime_from_raw_bam in fgumi-raw-bam.
 #[must_use]
 pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<usize> {
     if record.flags().is_unmapped() {
@@ -501,6 +516,7 @@ pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<usize> {
 }
 
 /// Counts reference-consuming operations from a CIGAR.
+// RecordBuf kept: parameterized over &impl CigarTrait (noodles trait) to accept both CigarBuf and inline Cigar; raw equivalent is reference_length_from_raw_bam in fgumi-raw-bam.
 #[expect(
     clippy::redundant_closure_for_method_calls,
     reason = "Op::len is not a method on the trait"
@@ -526,6 +542,7 @@ pub fn reference_length(cigar: &impl CigarTrait) -> usize {
 
 /// Get pair orientation using htsjdk's algorithm.
 /// This matches htsjdk's `SamPairUtil.getPairOrientation()` exactly.
+// RecordBuf kept: reads flags/positions via noodles typed Flags and Position API; serves noodles-typed callers.
 #[must_use]
 pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
     let is_reverse = record.flags().is_reverse_complemented();
@@ -570,6 +587,7 @@ pub fn get_pair_orientation(record: &RecordBuf) -> PairOrientation {
 /// with the positive strand 5' end before the negative strand 5' end.
 ///
 /// This matches the behavior of fgbio's `isFrPair` check.
+// RecordBuf kept: reads flags/ref-ids via noodles typed Flags API; serves noodles-typed callers alongside raw is_fr_pair_raw in fgumi-raw-bam.
 #[must_use]
 pub fn is_fr_pair(r1: &RecordBuf, r2: &RecordBuf) -> bool {
     let r1_flags = r1.flags();
@@ -602,6 +620,199 @@ pub fn is_fr_pair(r1: &RecordBuf, r2: &RecordBuf) -> bool {
     // This works regardless of which read is R1 vs R2
     let orientation = get_pair_orientation(r1);
     orientation == PairOrientation::FR
+}
+
+// ============================================================================
+// Raw-byte siblings — take `&[u32]` CIGAR ops or a full `&[u8]` BAM record
+// ============================================================================
+
+/// Calculates leading clipping (soft + hard) from raw u32 CIGAR operations.
+///
+/// This is the raw-byte sibling of [`leading_clipping`] that operates directly
+/// on the packed BAM CIGAR op array returned by [`get_cigar_ops`], avoiding
+/// allocation of a typed `(Kind, usize)` vector.
+#[must_use]
+pub fn leading_clipping_raw(cigar_ops: &[u32]) -> usize {
+    cigar_ops
+        .iter()
+        .take_while(|&&op| {
+            let t = op & 0xF;
+            t == 4 || t == 5 // SoftClip or HardClip
+        })
+        .map(|&op| (op >> 4) as usize)
+        .sum()
+}
+
+/// Calculates trailing clipping (soft + hard) from raw u32 CIGAR operations.
+///
+/// This is the raw-byte sibling of [`trailing_clipping`].
+#[must_use]
+pub fn trailing_clipping_raw(cigar_ops: &[u32]) -> usize {
+    cigar_ops
+        .iter()
+        .rev()
+        .take_while(|&&op| {
+            let t = op & 0xF;
+            t == 4 || t == 5 // SoftClip or HardClip
+        })
+        .map(|&op| (op >> 4) as usize)
+        .sum()
+}
+
+/// Calculates leading soft clipping only from raw u32 CIGAR operations.
+///
+/// This is the raw-byte sibling of [`leading_soft_clipping`]. Hard clips at
+/// the start are skipped; only the first soft-clip run is counted.
+#[must_use]
+pub fn leading_soft_clipping_raw(cigar_ops: &[u32]) -> usize {
+    cigar_ops
+        .iter()
+        .skip_while(|&&op| (op & 0xF) == 5) // skip leading HardClip
+        .take_while(|&&op| (op & 0xF) == 4) // count SoftClip run
+        .map(|&op| (op >> 4) as usize)
+        .sum()
+}
+
+/// Calculates trailing soft clipping only from raw u32 CIGAR operations.
+///
+/// This is the raw-byte sibling of [`trailing_soft_clipping`]. Hard clips at
+/// the end are skipped; only the last soft-clip run is counted.
+#[must_use]
+pub fn trailing_soft_clipping_raw(cigar_ops: &[u32]) -> usize {
+    cigar_ops
+        .iter()
+        .rev()
+        .skip_while(|&&op| (op & 0xF) == 5) // skip trailing HardClip
+        .take_while(|&&op| (op & 0xF) == 4) // count SoftClip run
+        .map(|&op| (op >> 4) as usize)
+        .sum()
+}
+
+/// Gets the mate's unclipped start position from a raw BAM record's MC tag and mate position.
+///
+/// This is the raw-byte sibling of [`mate_unclipped_start`].
+///
+/// Returns `None` if the MC tag is missing/invalid or mate position is missing.
+#[must_use]
+pub fn mate_unclipped_start_raw(bam: &[u8]) -> Option<isize> {
+    let mc_cigar = find_mc_tag_in_record(bam)?;
+    let mate_start_0based = mate_pos(bam);
+    if mate_start_0based < 0 {
+        return None;
+    }
+    let ops = parse_cigar_string(mc_cigar);
+    if ops.is_empty() {
+        return None;
+    }
+    // Convert 0-based BAM pos to 1-based, then subtract leading clips
+    let mate_start_1based = mate_start_0based + 1;
+    let leading = leading_clipping(&ops);
+    // Use isize to handle the rare case where unclipped start would be before pos 1
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "genomic positions fit in isize on all supported platforms (64-bit)"
+    )]
+    Some(mate_start_1based as isize - leading as isize)
+}
+
+/// Gets the mate's unclipped end position from a raw BAM record's MC tag and mate position.
+///
+/// This is the raw-byte sibling of [`mate_unclipped_end`].
+///
+/// Returns `None` if the MC tag is missing/invalid or mate position is missing.
+#[must_use]
+pub fn mate_unclipped_end_raw(bam: &[u8]) -> Option<usize> {
+    let mc_cigar = find_mc_tag_in_record(bam)?;
+    let mate_start_0based = mate_pos(bam);
+    if mate_start_0based < 0 {
+        return None;
+    }
+    // mate_start_0based >= 0 is verified above, so the cast is safe.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "mate_start_0based is verified non-negative by the guard above"
+    )]
+    let mate_start_1based = (mate_start_0based + 1) as usize;
+    let ops = parse_cigar_string(mc_cigar);
+    if ops.is_empty() {
+        return None;
+    }
+    let ref_len = cigar_reference_length(&ops);
+    let trailing = trailing_clipping(&ops);
+    Some(mate_start_1based + ref_len - 1 + trailing)
+}
+
+/// Gets the unclipped start position of a read from raw BAM bytes.
+///
+/// This is the raw-byte sibling of [`unclipped_start`].
+/// Returns `None` for unmapped reads (no alignment start).
+#[must_use]
+pub fn unclipped_start_raw(bam: &[u8]) -> Option<usize> {
+    if RawRecordView::new(bam).flags() & flags::UNMAPPED != 0 {
+        return None;
+    }
+    let start = alignment_start_from_raw(bam)?;
+    let cigar_ops = get_cigar_ops(bam);
+    let leading = leading_clipping_raw(&cigar_ops);
+    Some(start.saturating_sub(leading))
+}
+
+/// Gets the unclipped end position of a read from raw BAM bytes.
+///
+/// This is the raw-byte sibling of [`unclipped_end`].
+/// Returns `None` for unmapped reads or records with no CIGAR ops.
+#[must_use]
+pub fn unclipped_end_raw(bam: &[u8]) -> Option<usize> {
+    if RawRecordView::new(bam).flags() & flags::UNMAPPED != 0 {
+        return None;
+    }
+    let start = alignment_start_from_raw(bam)?;
+    let cigar_ops = get_cigar_ops(bam);
+    if cigar_ops.is_empty() {
+        return None;
+    }
+    let ref_len: usize = cigar_ops
+        .iter()
+        .map(|&op| {
+            let t = op & 0xF;
+            let len = (op >> 4) as usize;
+            if consumes_ref(t) { len } else { 0 }
+        })
+        .sum();
+    let trailing = trailing_clipping_raw(&cigar_ops);
+    // alignment_end = start + ref_len - 1; unclipped_end = alignment_end + trailing
+    Some(start + ref_len.saturating_sub(1) + trailing)
+}
+
+/// Returns the reference length consumed by raw u32 CIGAR operations.
+///
+/// This is the raw-byte sibling of [`cigar_reference_length`].
+/// Uses the packed BAM CIGAR op format (low 4 bits = op type, high 28 bits = length).
+#[must_use]
+pub fn cigar_reference_length_raw(cigar_ops: &[u32]) -> usize {
+    cigar_ops
+        .iter()
+        .map(|&op| {
+            let t = op & 0xF;
+            let len = (op >> 4) as usize;
+            if consumes_ref(t) { len } else { 0 }
+        })
+        .sum()
+}
+
+/// Returns the query length consumed by raw u32 CIGAR operations (includes soft clips).
+///
+/// Uses the packed BAM CIGAR op format. This counts M/I/S/=/X operations.
+#[must_use]
+pub fn cigar_query_length_raw(cigar_ops: &[u32]) -> usize {
+    cigar_ops
+        .iter()
+        .map(|&op| {
+            let t = op & 0xF;
+            let len = (op >> 4) as usize;
+            if consumes_query(t) { len } else { 0 }
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -1474,5 +1685,269 @@ mod tests {
         // alignment_end = 100 + 50 - 1 = 149
         let read = create_cigar_test_read("ins", 100, "25M5I25M");
         assert_eq!(unclipped_end(&read), Some(149));
+    }
+
+    // =========================================================================
+    // Helpers for raw-sibling tests
+    // =========================================================================
+
+    /// Encode a `RecordBuf` to raw BAM bytes for testing raw-byte helpers.
+    ///
+    /// Builds a header with a single dummy reference sequence (length 100 000) so
+    /// that records using `reference_sequence_id(0)` encode without errors.
+    fn to_raw(record: &RecordBuf) -> Vec<u8> {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        use std::num::NonZeroUsize;
+
+        let ref_seq = Map::<ReferenceSequence>::new(
+            NonZeroUsize::new(100_000).expect("ref length must be nonzero"),
+        );
+        let header =
+            noodles::sam::Header::builder().add_reference_sequence(b"chr1", ref_seq).build();
+        fgumi_raw_bam::encode_record_buf_to_raw(record, &header)
+            .expect("encode_record_buf_to_raw should succeed")
+            .into_inner()
+    }
+
+    /// Convert a typed `(Kind, usize)` CIGAR op pair to the raw u32 BAM packing.
+    ///
+    /// Encoding: high 28 bits = length, low 4 bits = op type (0=M, 1=I, …, 8=X).
+    fn kind_to_raw_op(kind: Kind, len: usize) -> u32 {
+        let op_type: u32 = match kind {
+            Kind::Match => 0,
+            Kind::Insertion => 1,
+            Kind::Deletion => 2,
+            Kind::Skip => 3,
+            Kind::SoftClip => 4,
+            Kind::HardClip => 5,
+            Kind::Pad => 6,
+            Kind::SequenceMatch => 7,
+            Kind::SequenceMismatch => 8,
+        };
+        // CIGAR op lengths are small (genomic context); the cast from usize to u32 is safe.
+        let len_u32: u32 = len.try_into().expect("CIGAR op length exceeds u32 range");
+        (len_u32 << 4) | op_type
+    }
+
+    /// Build a raw `Vec<u32>` CIGAR from a CIGAR string.
+    fn raw_ops(cigar_str: &str) -> Vec<u32> {
+        parse_cigar_string(cigar_str).into_iter().map(|(k, l)| kind_to_raw_op(k, l)).collect()
+    }
+
+    // =========================================================================
+    // Tests for leading_clipping_raw / trailing_clipping_raw
+    // =========================================================================
+
+    #[test]
+    fn test_leading_clipping_raw_matches_typed() {
+        // 5H10S50M10S5H — same fixture as test_leading_clipping
+        let cigar_str = "5H10S50M10S5H";
+        let typed_ops = parse_cigar_string(cigar_str);
+        assert_eq!(leading_clipping_raw(&raw_ops(cigar_str)), leading_clipping(&typed_ops));
+        assert_eq!(leading_clipping_raw(&raw_ops(cigar_str)), 15); // 5H + 10S
+    }
+
+    #[test]
+    fn test_trailing_clipping_raw_matches_typed() {
+        let cigar_str = "5H10S50M10S5H";
+        let typed_ops = parse_cigar_string(cigar_str);
+        assert_eq!(trailing_clipping_raw(&raw_ops(cigar_str)), trailing_clipping(&typed_ops));
+        assert_eq!(trailing_clipping_raw(&raw_ops(cigar_str)), 15); // 10S + 5H
+    }
+
+    #[test]
+    fn test_leading_soft_clipping_raw_matches_typed() {
+        let cigar_str = "5H10S50M10S5H";
+        let typed_ops = parse_cigar_string(cigar_str);
+        assert_eq!(
+            leading_soft_clipping_raw(&raw_ops(cigar_str)),
+            leading_soft_clipping(&typed_ops)
+        );
+        assert_eq!(leading_soft_clipping_raw(&raw_ops(cigar_str)), 10); // only 10S
+    }
+
+    #[test]
+    fn test_trailing_soft_clipping_raw_matches_typed() {
+        let cigar_str = "5H10S50M10S5H";
+        let typed_ops = parse_cigar_string(cigar_str);
+        assert_eq!(
+            trailing_soft_clipping_raw(&raw_ops(cigar_str)),
+            trailing_soft_clipping(&typed_ops)
+        );
+        assert_eq!(trailing_soft_clipping_raw(&raw_ops(cigar_str)), 10); // only 10S
+    }
+
+    #[test]
+    fn test_clipping_raw_no_clips() {
+        // 50M — no clipping at all
+        assert_eq!(leading_clipping_raw(&raw_ops("50M")), 0);
+        assert_eq!(trailing_clipping_raw(&raw_ops("50M")), 0);
+        assert_eq!(leading_soft_clipping_raw(&raw_ops("50M")), 0);
+        assert_eq!(trailing_soft_clipping_raw(&raw_ops("50M")), 0);
+    }
+
+    #[test]
+    fn test_clipping_raw_empty() {
+        let empty: Vec<u32> = vec![];
+        assert_eq!(leading_clipping_raw(&empty), 0);
+        assert_eq!(trailing_clipping_raw(&empty), 0);
+        assert_eq!(leading_soft_clipping_raw(&empty), 0);
+        assert_eq!(trailing_soft_clipping_raw(&empty), 0);
+    }
+
+    // =========================================================================
+    // Tests for cigar_reference_length_raw / cigar_query_length_raw
+    // =========================================================================
+
+    #[test]
+    fn test_cigar_reference_length_raw() {
+        // 10M5I20M5D10M — ref: 10+20+5+10=45
+        let cigar_str = "10M5I20M5D10M";
+        let typed_ops = parse_cigar_string(cigar_str);
+        assert_eq!(
+            cigar_reference_length_raw(&raw_ops(cigar_str)),
+            cigar_reference_length(&typed_ops)
+        );
+        assert_eq!(cigar_reference_length_raw(&raw_ops(cigar_str)), 45);
+    }
+
+    #[test]
+    fn test_cigar_query_length_raw() {
+        // 10M5I20M5D10M — query-consuming (M+I+M+M): 10+5+20+10 = 45
+        let cigar_str = "10M5I20M5D10M";
+        assert_eq!(cigar_query_length_raw(&raw_ops(cigar_str)), 45);
+    }
+
+    // =========================================================================
+    // Tests for unclipped_start_raw / unclipped_end_raw
+    // =========================================================================
+
+    #[test]
+    fn test_unclipped_start_raw_no_clips() {
+        let record = create_cigar_test_read("nosc", 100, "50M");
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_start_raw(&raw), unclipped_start(&record));
+        assert_eq!(unclipped_start_raw(&raw), Some(100));
+    }
+
+    #[test]
+    fn test_unclipped_start_raw_with_soft_clip() {
+        let record = create_cigar_test_read("sc", 100, "10S40M");
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_start_raw(&raw), unclipped_start(&record));
+        assert_eq!(unclipped_start_raw(&raw), Some(90)); // 100 - 10
+    }
+
+    #[test]
+    fn test_unclipped_start_raw_with_hard_and_soft() {
+        let record = create_cigar_test_read("hsc", 100, "5H10S35M");
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_start_raw(&raw), unclipped_start(&record));
+        assert_eq!(unclipped_start_raw(&raw), Some(85)); // 100 - 5H - 10S
+    }
+
+    #[test]
+    fn test_unclipped_start_raw_unmapped_returns_none() {
+        let record = RecordBuilder::new().name("u").sequence("ACGT").flags(Flags::UNMAPPED).build();
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_start_raw(&raw), None);
+    }
+
+    #[test]
+    fn test_unclipped_end_raw_no_clips() {
+        let record = create_cigar_test_read("nosc", 100, "50M");
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_end_raw(&raw), unclipped_end(&record));
+        assert_eq!(unclipped_end_raw(&raw), Some(149)); // 100 + 50 - 1
+    }
+
+    #[test]
+    fn test_unclipped_end_raw_with_soft_clip() {
+        let record = create_cigar_test_read("sc", 100, "40M10S");
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_end_raw(&raw), unclipped_end(&record));
+        assert_eq!(unclipped_end_raw(&raw), Some(149)); // 100+40-1+10 = 149
+    }
+
+    #[test]
+    fn test_unclipped_end_raw_with_hard_clip() {
+        let record = create_cigar_test_read("hc", 100, "45M5H");
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_end_raw(&raw), unclipped_end(&record));
+        assert_eq!(unclipped_end_raw(&raw), Some(149)); // 100+45-1+5
+    }
+
+    #[test]
+    fn test_unclipped_end_raw_unmapped_returns_none() {
+        let record = RecordBuilder::new().name("u").sequence("ACGT").flags(Flags::UNMAPPED).build();
+        let raw = to_raw(&record);
+        assert_eq!(unclipped_end_raw(&raw), None);
+    }
+
+    // =========================================================================
+    // Tests for mate_unclipped_start_raw / mate_unclipped_end_raw
+    // =========================================================================
+
+    #[test]
+    fn test_mate_unclipped_start_raw_no_clip() {
+        let record = create_mc_test_read("mc", 200, "50M");
+        let raw = to_raw(&record);
+        assert_eq!(mate_unclipped_start_raw(&raw), mate_unclipped_start(&record));
+        assert_eq!(mate_unclipped_start_raw(&raw), Some(200));
+    }
+
+    #[test]
+    fn test_mate_unclipped_start_raw_with_soft_clip() {
+        // 10S50M: leading clip = 10, unclipped start = 200 - 10 = 190
+        let record = create_mc_test_read("mc_sc", 200, "10S50M");
+        let raw = to_raw(&record);
+        assert_eq!(mate_unclipped_start_raw(&raw), mate_unclipped_start(&record));
+        assert_eq!(mate_unclipped_start_raw(&raw), Some(190));
+    }
+
+    #[test]
+    fn test_mate_unclipped_end_raw_no_clip() {
+        // 50M: ref_len=50, unclipped_end = 200 + 50 - 1 = 249
+        let record = create_mc_test_read("mc", 200, "50M");
+        let raw = to_raw(&record);
+        assert_eq!(mate_unclipped_end_raw(&raw), mate_unclipped_end(&record));
+        assert_eq!(mate_unclipped_end_raw(&raw), Some(249));
+    }
+
+    #[test]
+    fn test_mate_unclipped_end_raw_with_soft_clip() {
+        // 50M10S: ref_len=50, trailing=10, unclipped_end = 200 + 50 - 1 + 10 = 259
+        let record = create_mc_test_read("mc_sc", 200, "50M10S");
+        let raw = to_raw(&record);
+        assert_eq!(mate_unclipped_end_raw(&raw), mate_unclipped_end(&record));
+        assert_eq!(mate_unclipped_end_raw(&raw), Some(259));
+    }
+
+    #[test]
+    fn test_mate_unclipped_start_raw_no_mc_tag_returns_none() {
+        let record = RecordBuilder::new()
+            .name("no_mc")
+            .sequence(&"A".repeat(50))
+            .qualities(&[30u8; 50])
+            .cigar("50M")
+            .reference_sequence_id(0)
+            .alignment_start(100)
+            .build();
+        let raw = to_raw(&record);
+        assert_eq!(mate_unclipped_start_raw(&raw), None);
+        assert_eq!(mate_unclipped_end_raw(&raw), None);
+    }
+
+    /// Raw paths must reject empty MC CIGARs to match the typed path's `None` contract.
+    #[test]
+    fn test_mate_unclipped_raw_empty_mc_cigar_returns_none() {
+        let record = create_mc_test_read("empty_mc", 200, "");
+        let raw = to_raw(&record);
+        assert_eq!(mate_unclipped_start_raw(&raw), None);
+        assert_eq!(mate_unclipped_end_raw(&raw), None);
+        // typed path behaves the same way
+        assert_eq!(mate_unclipped_start(&record), None);
+        assert_eq!(mate_unclipped_end(&record), None);
     }
 }
