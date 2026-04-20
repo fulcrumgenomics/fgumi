@@ -12,7 +12,7 @@ use crate::consensus_caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason,
 };
 use crate::logging::{OperationTimer, log_consensus_summary};
-use crate::mi_group::{RawMiGroup, RawMiGroupBatch, RawMiGroupIterator, RawMiGrouper};
+use crate::mi_group::{MiGroup, MiGroupBatch, MiGroupIterator, MiGrouper};
 use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
@@ -381,8 +381,7 @@ impl Command for Simplex {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter =
-            RawMiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
+        let mi_group_iter = MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
         // Single-threaded streaming processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -402,8 +401,7 @@ impl Command for Simplex {
                 apply_overlapping_consensus(&mut records, oc)?;
             }
 
-            // Call consensus — mi_group now yields Vec<RawRecord> directly, which is
-            // what ConsensusCaller::consensus_reads expects.
+            // Call consensus directly — records are already RawRecord values.
             let output = caller
                 .consensus_reads(records)
                 .with_context(|| format!("Failed to call consensus for UMI: {umi}"))?;
@@ -537,9 +535,8 @@ impl Simplex {
         // Clone input_header before pipeline (needed for rejects writing)
         let rejects_header = input_header.clone();
 
-        // Enable raw-byte mode: skip noodles decode/encode for CPU savings
         let library_index = LibraryIndex::from_header(&input_header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
         let groups_processed = run_bam_pipeline_from_reader(
@@ -548,13 +545,13 @@ impl Simplex {
             input_header,
             &self.io.output,
             Some(output_header.clone()),
-            // ========== grouper_fn: Create RawMiGrouper ==========
+            // ========== grouper_fn: Create MiGrouper ==========
             move |_header: &Header| {
-                Box::new(RawMiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
-                    as Box<dyn Grouper<Group = RawMiGroupBatch> + Send>
+                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
+                    as Box<dyn Grouper<Group = MiGroupBatch> + Send>
             },
             // ========== process_fn: Consensus calling ==========
-            move |batch: RawMiGroupBatch| -> io::Result<SimplexProcessedBatch> {
+            move |batch: MiGroupBatch| -> io::Result<SimplexProcessedBatch> {
                 // Create per-thread consensus caller
                 let mut caller = VanillaUmiConsensusCaller::new_with_rejects_tracking(
                     read_name_prefix.clone(),
@@ -584,7 +581,7 @@ impl Simplex {
                 let mut batch_overlapping = CorrectionStats::new();
                 let groups_count = batch.groups.len() as u64;
 
-                for RawMiGroup { mi, records: mut raw_records } in batch.groups {
+                for MiGroup { mi, records: mut raw_records } in batch.groups {
                     caller.clear();
 
                     // Skip if below min_reads threshold
@@ -618,28 +615,16 @@ impl Simplex {
                         batch_overlapping.merge(oc.stats());
                     }
 
-                    // Call consensus — mi_group now yields Vec<RawRecord> directly.
-                    // Preserve inputs for rejection bookkeeping on Err, since
-                    // consensus_reads consumes raw_records.
-                    let num_inputs = raw_records.len();
-                    let reject_on_error: Option<Vec<Vec<u8>>> = track_rejects
-                        .then(|| raw_records.iter().map(|r| r.as_ref().to_vec()).collect());
-                    match caller.consensus_reads(raw_records) {
-                        Ok(batch_output) => {
-                            all_output.merge(batch_output);
-                            batch_stats.merge(&caller.statistics());
-                            if track_rejects {
-                                all_rejects.extend(caller.take_rejected_reads());
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Consensus error for MI {mi}: {e}");
-                            batch_stats.record_input(num_inputs);
-                            batch_stats.record_rejection(RejectionReason::Other, num_inputs);
-                            if let Some(rejects) = reject_on_error {
-                                all_rejects.extend(rejects);
-                            }
-                        }
+                    // Call consensus — mi_group yields Vec<RawRecord> directly.
+                    // Propagate errors to match the single-threaded path, which
+                    // treats consensus failures as fatal.
+                    let batch_output = caller.consensus_reads(raw_records).map_err(|e| {
+                        io::Error::other(format!("Consensus error for MI {mi}: {e}"))
+                    })?;
+                    all_output.merge(batch_output);
+                    batch_stats.merge(&caller.statistics());
+                    if track_rejects {
+                        all_rejects.extend(caller.take_rejected_reads());
                     }
                 }
 
@@ -779,7 +764,7 @@ mod tests {
     /// Creates a Simplex command with the given input/output paths and default parameters.
     fn create_simplex_with_paths(input: PathBuf, output: PathBuf) -> Simplex {
         Simplex {
-            io: BamIoOptions::new(input, output),
+            io: BamIoOptions { input, output, async_reader: false },
             rejects_opts: RejectsOptions::default(),
             stats_opts: StatsOptions::default(),
             read_group: ReadGroupOptions::default(),

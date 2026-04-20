@@ -133,70 +133,72 @@ pub fn read_number_suffix(is_first_of_pair: bool) -> &'static str {
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn format_insert_string(
-    record: &noodles::sam::alignment::RecordBuf,
+    record: &fgumi_raw_bam::RawRecord,
     header: &noodles::sam::Header,
 ) -> String {
-    let flags = record.flags();
-
     // Only generate strings for FR pairs, all other reads get "NA"
     // Must be paired, both reads mapped, and on same reference with FR orientation
-    if !flags.is_segmented() {
+    if !record.is_paired() {
         return "NA".to_string();
     }
 
-    if flags.is_unmapped() || flags.is_mate_unmapped() {
+    if record.is_unmapped() || record.is_mate_unmapped() {
         return "NA".to_string();
     }
 
     // Check that mate is on same reference
-    let Some(ref_idx) = record.reference_sequence_id() else {
+    let ref_id = record.ref_id();
+    let mate_ref_id = record.mate_ref_id();
+    if ref_id < 0 || mate_ref_id < 0 {
         return "NA".to_string();
-    };
-
-    let Some(mate_ref_idx) = record.mate_reference_sequence_id() else {
-        return "NA".to_string();
-    };
-
-    if ref_idx != mate_ref_idx {
+    }
+    if ref_id != mate_ref_id {
         return "NA".to_string();
     }
 
     // Check for FR orientation: one forward, one reverse
-    let is_reverse = flags.is_reverse_complemented();
-    let mate_is_reverse = flags.is_mate_reverse_complemented();
+    let is_reverse = record.is_reverse();
+    let mate_is_reverse = record.is_mate_reverse();
 
     if is_reverse == mate_is_reverse {
         return "NA".to_string(); // Both same orientation (FF or RR)
     }
 
-    // Get reference sequence name
-    let ref_name = match record.reference_sequence(header) {
-        Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
-        _ => return "NA".to_string(),
+    // FR requires the forward read to be leftmost and the reverse read rightmost;
+    // TLEN sign encodes this (positive for the leftmost forward read, negative for
+    // the rightmost reverse read). Reject RF / TLEN-0 layouts up front.
+    let tlen = record.template_length();
+    if tlen == 0 || (!is_reverse && tlen < 0) || (is_reverse && tlen > 0) {
+        return "NA".to_string();
+    }
+
+    // Get reference sequence name by looking up ref_id in the header.
+    // ref_id >= 0 is guaranteed by the check above; the cast is safe.
+    #[allow(clippy::cast_sign_loss)]
+    let ref_name = match header.reference_sequences().get_index(ref_id as usize) {
+        Some((name, _)) => String::from_utf8_lossy(name).to_string(),
+        None => return "NA".to_string(),
     };
 
     // Calculate outer position based on Scala logic:
     // val outer = if (r.negativeStrand) r.end else r.start
     let outer = if is_reverse {
         // If negative strand, use alignment end
-        match record.alignment_end() {
-            Some(pos) => usize::from(pos) as i32,
+        match record.alignment_end_1based() {
+            Some(pos) => pos as i32,
             None => return "NA".to_string(),
         }
     } else {
         // If positive strand, use alignment start
-        match record.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
+        match record.alignment_start_1based() {
+            Some(pos) => pos as i32,
             None => return "NA".to_string(),
         }
     };
 
-    // Get insert size (signed)
-    let isize = record.template_length();
-
     // Calculate start and end coordinates using Scala logic:
     // val Seq(start, end) = Seq(outer, outer + isize + (if (isize < 0) 1 else -1)).sorted
-    let other_coord = outer + isize + if isize < 0 { 1 } else { -1 };
+    let other_coord = outer + tlen + if tlen < 0 { 1 } else { -1 };
     let (start, end) =
         if outer < other_coord { (outer, other_coord) } else { (other_coord, outer) };
 
@@ -207,7 +209,7 @@ pub fn format_insert_string(
     //   case (false, true)  => "F2R1"
     //   case (false, false) => "F1R2"
     // }
-    let is_first = flags.is_first_segment();
+    let is_first = record.is_first_segment();
     let start_equals_outer = start == outer;
 
     let pairing = match (is_first, start_equals_outer) {
@@ -221,9 +223,8 @@ pub fn format_insert_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags as raw_flags};
     use noodles::sam::Header;
-    use noodles::sam::alignment::RecordBuf;
 
     #[test]
     fn test_read_number_suffix() {
@@ -236,8 +237,10 @@ mod tests {
         // Create a simple SAM header
         let header = Header::builder().build();
 
-        // Create an unpaired read (no segmented flag)
-        let record = RecordBuilder::new().sequence("ACGT").build();
+        // Create an unpaired read (no PAIRED flag)
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGT").qualities(&[30; 4]).flags(0);
+        let record: RawRecord = b.build();
 
         let result = format_insert_string(&record, &header);
         assert_eq!(result, "NA");
@@ -332,31 +335,41 @@ mod tests {
         mate_is_reverse: bool,
         is_first: bool,
         template_len: i32,
-    ) -> RecordBuf {
-        RecordBuilder::new()
-            .sequence(&"A".repeat(10))
-            .cigar("10M")
-            .reference_sequence_id(0)
-            .alignment_start(start)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(mate_start)
-            .template_length(template_len)
-            .first_segment(is_first)
-            .reverse_complement(is_reverse)
-            .mate_reverse_complement(mate_is_reverse)
-            .build()
+    ) -> RawRecord {
+        use fgumi_raw_bam::testutil::encode_op;
+        let mut flags: u16 = raw_flags::PAIRED;
+        if is_first {
+            flags |= raw_flags::FIRST_SEGMENT;
+        } else {
+            flags |= raw_flags::LAST_SEGMENT;
+        }
+        if is_reverse {
+            flags |= raw_flags::REVERSE;
+        }
+        if mate_is_reverse {
+            flags |= raw_flags::MATE_REVERSE;
+        }
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"AAAAAAAAAA")
+            .qualities(&[30; 10])
+            .flags(flags)
+            .ref_id(0)
+            .pos(i32::try_from(start).expect("start fits i32") - 1)
+            .cigar_ops(&[encode_op(0, 10)])
+            .mate_ref_id(0)
+            .mate_pos(i32::try_from(mate_start).expect("mate_start fits i32") - 1)
+            .template_length(template_len);
+        b.build()
     }
 
     #[test]
     fn test_format_insert_string_unmapped_returns_na() {
-        use noodles::sam::alignment::record::Flags;
-
         let header = create_test_header();
-        let mut record =
-            RecordBuilder::new().sequence("ACGT").first_segment(true).unmapped(true).build();
-
-        // Ensure SEGMENTED | UNMAPPED flags are set
-        *record.flags_mut() = Flags::SEGMENTED | Flags::UNMAPPED;
+        let mut b = RawSamBuilder::new();
+        b.sequence(b"ACGT")
+            .qualities(&[30; 4])
+            .flags(raw_flags::PAIRED | raw_flags::UNMAPPED | raw_flags::FIRST_SEGMENT);
+        let record: RawRecord = b.build();
 
         let result = format_insert_string(&record, &header);
         assert_eq!(result, "NA");
@@ -367,8 +380,9 @@ mod tests {
         let header = create_test_header();
         let mut record = create_paired_read(100, 200, false, true, true, 101);
 
-        // Set mate as unmapped
-        *record.flags_mut() |= noodles::sam::alignment::record::Flags::MATE_UNMAPPED;
+        // Set mate as unmapped via raw flags
+        let flags = record.flags() | raw_flags::MATE_UNMAPPED;
+        record.set_flags(flags);
 
         let result = format_insert_string(&record, &header);
         assert_eq!(result, "NA");
@@ -394,8 +408,8 @@ mod tests {
         let header = create_test_header();
         let mut record = create_paired_read(100, 200, false, true, true, 101);
 
-        // Set mate on different reference
-        *record.mate_reference_sequence_id_mut() = Some(1);
+        // Set mate on different reference via raw field setter
+        record.set_mate_ref_id(1);
 
         let result = format_insert_string(&record, &header);
         assert_eq!(result, "NA");
@@ -447,5 +461,28 @@ mod tests {
         let record = create_paired_read(191, 100, true, false, false, -101);
         let result = format_insert_string(&record, &header);
         assert_eq!(result, "chr1:100-200 | F1R2");
+    }
+
+    #[test]
+    fn test_format_insert_string_rf_pair_returns_na() {
+        // RF orientation: forward read is rightmost and reverse read is leftmost.
+        // Opposite-strand but TLEN sign disagrees with the FR layout — must be NA.
+        let header = create_test_header();
+
+        // Forward read at start=200 with negative TLEN → this is not FR.
+        let record_fwd = create_paired_read(200, 100, false, true, true, -101);
+        assert_eq!(format_insert_string(&record_fwd, &header), "NA");
+
+        // Reverse read at start=100 with positive TLEN → also not FR.
+        let record_rev = create_paired_read(100, 200, true, false, true, 101);
+        assert_eq!(format_insert_string(&record_rev, &header), "NA");
+    }
+
+    #[test]
+    fn test_format_insert_string_opposite_strand_tlen_zero_returns_na() {
+        // Opposite strands but TLEN = 0 (unpaired on reference) — must be NA.
+        let header = create_test_header();
+        let record = create_paired_read(100, 100, false, true, true, 0);
+        assert_eq!(format_insert_string(&record, &header), "NA");
     }
 }

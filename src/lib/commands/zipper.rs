@@ -43,39 +43,30 @@
 //! # Architecture Notes
 //!
 //! - `Template`: Represents a group of records with the same read name
-//! - `TemplateIterator`: Lazily groups records by name from a BAM reader
+//! - `TemplateIterator`: Groups raw BAM bytes from the unmapped reader into Templates
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
-//! - `merge()`: Core function that transfers metadata between templates
-use crate::bam_io::{BamReaderAuto, create_bam_reader, create_raw_bam_writer, is_stdin_path};
+//! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
+use crate::bam_io::{
+    BamReaderAuto, create_bam_reader, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
+};
 use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::reference::{ReferenceReader, find_dict_path};
-use crate::sam::{
-    SamTag, TC_TAG, TemplateCoordinateInfo, buf_value_to_smallest_signed_int, check_sort,
-    revcomp_buf_value, reverse_buf_value, unclipped_five_prime_position,
-};
+use crate::sam::{TemplateCoordinateInfo, check_sort};
 use crate::sort::bam_fields;
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
 use crate::validation::validate_file_exists;
-use crate::vendored::encode_record_buf;
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use clap::Parser;
-use fgumi_raw_bam::{RawRecord, RawRecordView};
+use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
 use log::{debug, info, warn};
 use noodles::core::Position;
 use noodles::sam::Header;
-#[cfg(test)]
-use noodles::sam::alignment::record::Cigar as CigarTrait;
-use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::Data;
-use noodles::sam::alignment::record_buf::RecordBuf;
-use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -173,11 +164,11 @@ pub struct Zipper {
     #[arg(long = "exclude-missing-reads", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub exclude_missing_reads: bool,
 
-    /// Skip adding `tc` (template-coordinate) tags to secondary/supplementary reads.
-    /// By default, zipper adds a `tc` tag containing the primary alignment's template
+    /// Skip adding `pa` (primary alignment) tags to secondary/supplementary reads.
+    /// By default, zipper adds a `pa` tag containing the primary alignment's template
     /// sort key coordinates, which enables correct template-coordinate sorting and
     /// deduplication of these reads. Use this flag if you don't need this functionality.
-    #[arg(long = "skip-tc-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    #[arg(long = "skip-pa-tags", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
     pub skip_tc_tags: bool,
 
     /// Restore unconverted bases in EM-seq consensus reads after bwameth re-alignment.
@@ -264,417 +255,9 @@ pub fn build_output_header(unmapped: &Header, mapped: &Header, dict_path: &Path)
     Ok(header.build())
 }
 
-/// Copies tags from source record to destination record
-///
-/// Copies all tags from `src` to `dest`, with special handling:
-/// - PG tag is only copied if not already present in dest
-/// - Tags in `tag_info.remove` are skipped
-///
-/// # Arguments
-///
-/// * `src` - Source record to copy tags from
-/// * `dest` - Destination record to copy tags to
-/// * `tag_info` - Information about which tags to skip
-///
-/// # Returns
-///
-/// `Ok(())` on success
-///
-/// # Errors
-///
-/// Currently never returns an error, but signature allows for future error handling
-pub fn copy_tags(src: &RecordBuf, dest: &mut Data, tag_info: &TagInfo) -> Result<()> {
-    for (tag, value) in src.data().iter() {
-        let tag_str = format!("{}{}", tag.as_ref()[0] as char, tag.as_ref()[1] as char);
-
-        if tag_str == "PG" && dest.get(&tag).is_some() {
-            continue;
-        }
-
-        if tag_info.remove.contains(&tag_str) {
-            continue;
-        }
-
-        dest.insert(tag, value.clone());
-    }
-    Ok(())
-}
-
-/// Adds the `tc` tag to secondary and supplementary reads, storing the template
-/// sort key from the primary alignments.
-///
-/// This enables downstream tools (sort, dedup) to properly handle these reads
-/// by ensuring they sort adjacent to their primary alignments.
-///
-/// # Arguments
-///
-/// * `template` - The template containing all reads (primary, secondary, supplementary)
-///
-/// # Format
-///
-/// The `tc` tag is a B:i array with 6 int32 elements: `[tid1, pos1, neg1, tid2, pos2, neg2]`
-/// where "1" is the earlier position (lower (tid, pos)) and neg is 0/1 for forward/reverse.
-///
-/// This matches the template-coordinate sort key format used by `fgumi sort`.
-///
-/// Optimized to skip all computation when there are no secondary/supplementary reads.
-fn add_template_coordinate_tags(template: &mut Template) {
-    // Fast path: check if there are any secondary/supplementary reads before doing work
-    let has_sec_supp =
-        template.records.iter().any(|r| r.flags().is_secondary() || r.flags().is_supplementary());
-
-    if !has_sec_supp {
-        return; // No secondary/supplementary reads - nothing to do
-    }
-
-    // Get R1 primary alignment info: (ref_id, unclipped_5prime_pos, is_reverse)
-    // Uses unclipped 5' position to match template-coordinate sort key calculation
-    let r1_primary_info: Option<(i32, i32, bool)> = template.r1().and_then(|r| {
-        if r.flags().is_unmapped() {
-            return None;
-        }
-        let ref_id: i32 = r.reference_sequence_id()?.try_into().ok()?;
-        // Use unclipped 5' position to match sort key calculation
-        let pos: i32 = unclipped_five_prime_position(r)?.try_into().ok()?;
-        let is_reverse = r.flags().is_reverse_complemented();
-        Some((ref_id, pos, is_reverse))
-    });
-
-    // Get R2 primary alignment info: (ref_id, unclipped_5prime_pos, is_reverse)
-    let r2_primary_info: Option<(i32, i32, bool)> = template.r2().and_then(|r| {
-        if r.flags().is_unmapped() {
-            return None;
-        }
-        let ref_id: i32 = r.reference_sequence_id()?.try_into().ok()?;
-        // Use unclipped 5' position to match sort key calculation
-        let pos: i32 = unclipped_five_prime_position(r)?.try_into().ok()?;
-        let is_reverse = r.flags().is_reverse_complemented();
-        Some((ref_id, pos, is_reverse))
-    });
-
-    // Compute the template sort key (tid1, pos1, neg1, tid2, pos2, neg2)
-    // where "1" is the earlier position (lower (tid, pos))
-    let tc_info: Option<TemplateCoordinateInfo> = match (r1_primary_info, r2_primary_info) {
-        (Some((tid1, pos1, neg1)), Some((tid2, pos2, neg2))) => {
-            // Both mapped - determine which is earlier
-            if (tid1, pos1) <= (tid2, pos2) {
-                Some(TemplateCoordinateInfo::new(tid1, pos1, neg1, tid2, pos2, neg2))
-            } else {
-                Some(TemplateCoordinateInfo::new(tid2, pos2, neg2, tid1, pos1, neg1))
-            }
-        }
-        (Some((tid, pos, neg)), None) | (None, Some((tid, pos, neg))) => {
-            // Only one mapped - use same values for both positions
-            Some(TemplateCoordinateInfo::new(tid, pos, neg, tid, pos, neg))
-        }
-        (None, None) => None,
-    };
-
-    // If we have template sort key info, add it to all secondary/supplementary reads
-    let Some(tc_info) = tc_info else {
-        return;
-    };
-
-    let tc_value = tc_info.to_tag_value();
-
-    for record in &mut template.records {
-        let flags = record.flags();
-
-        // Skip primary alignments - they don't need the tc tag
-        if !flags.is_secondary() && !flags.is_supplementary() {
-            continue;
-        }
-
-        // Add the tc tag with the template sort key
-        record.data_mut().insert(TC_TAG, tc_value.clone());
-    }
-}
-
-/// Merges tags from unmapped template into mapped template
-///
-/// This is the core merge function that:
-/// 1. Removes specified tags from mapped reads
-/// 2. Copies tags from unmapped to mapped reads
-/// 3. Applies reverse/revcomp transformations for negative strand
-/// 4. Transfers QC pass/fail flags
-///
-/// Handles both paired-end and single-end data, matching R1 to R1 and R2 to R2.
-/// Secondary and supplementary alignments are also processed.
-///
-/// # Arguments
-///
-/// * `unmapped` - Template containing unmapped reads with original tags
-/// * `mapped` - Template containing mapped reads (will be modified in place)
-/// * `tag_info` - Information about which tags to manipulate
-///
-/// # Returns
-///
-/// `Ok(())` on success
-///
-/// # Errors
-///
-/// Returns an error if tag copying fails (currently never happens)
-pub fn merge(
-    unmapped: &Template,
-    mapped: &mut Template,
-    tag_info: &TagInfo,
-    skip_tc_tags: bool,
-) -> Result<()> {
-    // Fix mate info first
-    mapped.fix_mate_info()?;
-
-    // First, remove tags from mapped reads
-    for i in 0..mapped.read_count() {
-        for tag_str in &tag_info.remove {
-            if tag_str.len() == 2 {
-                let tag = Tag::new(tag_str.as_bytes()[0], tag_str.as_bytes()[1]);
-                let _ = mapped.records[i].data_mut().remove(&tag);
-            }
-        }
-    }
-
-    // Process each primary unmapped read
-    for u in unmapped.primary_reads() {
-        let is_unpaired = !u.flags().is_segmented();
-        let is_first = u.flags().is_first_segment();
-
-        // Find corresponding mapped reads (R1 or R2)
-        let mapped_indices: Vec<usize> = if is_unpaired || is_first {
-            mapped
-                .records
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| !r.flags().is_segmented() || r.flags().is_first_segment())
-                .map(|(i, _)| i)
-                .collect()
-        } else {
-            mapped
-                .records
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.flags().is_segmented() && !r.flags().is_first_segment())
-                .map(|(i, _)| i)
-                .collect()
-        };
-
-        let has_pos_reads =
-            mapped_indices.iter().any(|&i| !mapped.records[i].flags().is_reverse_complemented());
-        let has_neg_reads =
-            mapped_indices.iter().any(|&i| mapped.records[i].flags().is_reverse_complemented());
-
-        // Copy tags to positive strand reads
-        if has_pos_reads {
-            for &i in &mapped_indices {
-                if !mapped.records[i].flags().is_reverse_complemented() {
-                    copy_tags(u, mapped.records[i].data_mut(), tag_info)?;
-                }
-            }
-        }
-
-        // Copy tags to negative strand reads (with reverse/revcomp)
-        if has_neg_reads {
-            let mut u_for_neg = u.clone();
-
-            if tag_info.has_revs_or_revcomps() {
-                for (tag, value) in u.data().iter() {
-                    let tag_str = format!("{}{}", tag.as_ref()[0] as char, tag.as_ref()[1] as char);
-
-                    if tag_info.reverse.contains(&tag_str) {
-                        let new_val = reverse_buf_value(value);
-                        u_for_neg.data_mut().insert(tag, new_val);
-                    } else if tag_info.revcomp.contains(&tag_str) {
-                        let new_val = revcomp_buf_value(value);
-                        u_for_neg.data_mut().insert(tag, new_val);
-                    }
-                }
-            }
-
-            for &i in &mapped_indices {
-                if mapped.records[i].flags().is_reverse_complemented() {
-                    copy_tags(&u_for_neg, mapped.records[i].data_mut(), tag_info)?;
-                }
-            }
-        }
-
-        // Transfer QC pass/fail flag
-        let is_qc_fail = u.flags().is_qc_fail();
-        for &i in &mapped_indices {
-            let mut flags = mapped.records[i].flags();
-            if is_qc_fail {
-                flags.insert(noodles::sam::alignment::record::Flags::QC_FAIL);
-            } else {
-                flags.remove(noodles::sam::alignment::record::Flags::QC_FAIL);
-            }
-            // Apply the modified flags back to the record
-            *mapped.records[i].flags_mut() = flags;
-        }
-    }
-
-    // Normalize alignment integer tags (AS, XS) to Int8 to match fgbio's encoding.
-    // When reading from SAM format, noodles may parse these tags with different types
-    // (e.g., Int32 or UInt8). fgbio consistently uses signed int8 (SAM type code 'c').
-    let as_tag = Tag::from(SamTag::AS);
-    let xs_tag = Tag::from(SamTag::XS);
-    for i in 0..mapped.read_count() {
-        // Normalize AS tag
-        if let Some(value) = mapped.records[i].data().get(&as_tag) {
-            if let Some(int8_value) = buf_value_to_smallest_signed_int(value) {
-                mapped.records[i].data_mut().insert(as_tag, int8_value);
-            }
-        }
-        // Normalize XS tag
-        if let Some(value) = mapped.records[i].data().get(&xs_tag) {
-            if let Some(int8_value) = buf_value_to_smallest_signed_int(value) {
-                mapped.records[i].data_mut().insert(xs_tag, int8_value);
-            }
-        }
-    }
-
-    // Add primary alignment tags to secondary and supplementary reads
-    // This enables proper template-coordinate sorting and duplicate marking
-    if !skip_tc_tags {
-        add_template_coordinate_tags(mapped);
-    }
-
-    Ok(())
-}
-
-/// Appends a noodles `BufValue` tag to a raw BAM record in BAM binary encoding.
-fn append_buf_value_raw(dest: &mut Vec<u8>, tag: [u8; 2], value: &BufValue) {
-    use noodles::sam::alignment::record_buf::data::field::value::Array;
-    match value {
-        BufValue::Character(c) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'A');
-            dest.push(*c);
-        }
-        BufValue::Int8(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'c');
-            dest.push(v.cast_unsigned());
-        }
-        BufValue::UInt8(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'C');
-            dest.push(*v);
-        }
-        BufValue::Int16(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b's');
-            dest.extend_from_slice(&v.to_le_bytes());
-        }
-        BufValue::UInt16(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'S');
-            dest.extend_from_slice(&v.to_le_bytes());
-        }
-        BufValue::Int32(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'i');
-            dest.extend_from_slice(&v.to_le_bytes());
-        }
-        BufValue::UInt32(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'I');
-            dest.extend_from_slice(&v.to_le_bytes());
-        }
-        BufValue::Float(v) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'f');
-            dest.extend_from_slice(&v.to_le_bytes());
-        }
-        BufValue::String(s) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'Z');
-            dest.extend_from_slice(s.as_bytes());
-            dest.push(0);
-        }
-        BufValue::Hex(s) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'H');
-            dest.extend_from_slice(s.as_bytes());
-            dest.push(0);
-        }
-        BufValue::Array(arr) => {
-            dest.push(tag[0]);
-            dest.push(tag[1]);
-            dest.push(b'B');
-            match arr {
-                Array::Int8(vals) => {
-                    dest.push(b'c');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    for v in vals {
-                        dest.push(v.cast_unsigned());
-                    }
-                }
-                Array::UInt8(vals) => {
-                    dest.push(b'C');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    dest.extend_from_slice(vals.as_slice());
-                }
-                Array::Int16(vals) => {
-                    dest.push(b's');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    for v in vals {
-                        dest.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                Array::UInt16(vals) => {
-                    dest.push(b'S');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    for v in vals {
-                        dest.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                Array::Int32(vals) => {
-                    dest.push(b'i');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    for v in vals {
-                        dest.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                Array::UInt32(vals) => {
-                    dest.push(b'I');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    for v in vals {
-                        dest.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                Array::Float(vals) => {
-                    dest.push(b'f');
-                    let count = u32::try_from(vals.len()).expect("BAM B-array length exceeds u32");
-                    dest.extend_from_slice(&count.to_le_bytes());
-                    for v in vals {
-                        dest.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Adds `tc` tags to secondary/supplementary reads in raw-byte mode.
+/// Adds `pa` tags to secondary/supplementary reads.
 fn add_template_coordinate_tags_raw(mapped: &mut Template) {
-    let rr = match mapped.raw_records.as_ref() {
-        Some(rr) => rr,
-        None => return,
-    };
+    let rr = &mapped.records;
 
     // Fast path: check if there are any secondary/supplementary reads
     let has_sec_supp = rr.iter().any(|r| {
@@ -739,34 +322,13 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
         i32::from(tc_info.neg2),
     ];
 
-    let rr = mapped.raw_records.as_mut().unwrap();
-    for record in rr.iter_mut() {
+    for record in mapped.records.iter_mut() {
         let f = RawRecordView::new(record.as_ref()).flags();
         if (f & bam_fields::flags::SECONDARY) != 0 || (f & bam_fields::flags::SUPPLEMENTARY) != 0 {
             bam_fields::remove_tag(record.as_mut_vec(), tc_tag);
             bam_fields::append_i32_array_tag(record.as_mut_vec(), tc_tag, &tc_values);
         }
     }
-}
-
-/// Converts a mapped `Template` from `RecordBuf` mode to raw-byte mode.
-///
-/// Encodes each `RecordBuf` to raw BAM bytes using the vendored encoder
-/// and populates `raw_records`.
-fn convert_template_to_raw(template: &mut Template, header: &Header) -> Result<()> {
-    if template.is_raw_byte_mode() {
-        return Ok(());
-    }
-    let mut raw_records = Vec::with_capacity(template.records.len());
-    for record in &template.records {
-        let mut buf = Vec::with_capacity(256);
-        encode_record_buf(&mut buf, header, record)
-            .map_err(|e| anyhow::anyhow!("Failed to encode record: {e}"))?;
-        raw_records.push(RawRecord::from(buf));
-    }
-    template.raw_records = Some(raw_records);
-    // Keep records intact for read_count compatibility
-    Ok(())
 }
 
 /// Collects the indices of mapped records corresponding to a given segment
@@ -800,18 +362,14 @@ fn collect_mapped_indices(mapped: &Template, is_first_segment: bool) -> Vec<usiz
 
 /// Merges tags from unmapped template into mapped template using raw bytes.
 ///
-/// This is the raw-byte equivalent of [`merge`]. The mapped template must
-/// be in raw-byte mode (call [`convert_template_to_raw`] first). The
-/// unmapped template uses `RecordBuf` mode.
+/// Performs 6 operations:
 ///
-/// Performs the same 7 operations as `merge()`:
-///
-/// 1. Fix mate info (raw)
+/// 1. Fix mate info
 /// 2. Remove tags from mapped records
 /// 3. Copy tags from unmapped to mapped (with reverse/revcomp for neg strand)
-/// 5. Transfer QC flags
-/// 6. Normalize AS/XS tags
-/// 7. Add TC tags
+/// 4. Transfer QC flags
+/// 5. Normalize AS/XS tags
+/// 6. Add PA tags
 pub fn merge_raw(
     unmapped: &Template,
     mapped: &mut Template,
@@ -819,15 +377,10 @@ pub fn merge_raw(
     skip_tc_tags: bool,
 ) -> Result<()> {
     // Step 1: Fix mate info
-    mapped.fix_mate_info_raw()?;
-
-    let rr = mapped
-        .raw_records
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("merge_raw: mapped not in raw mode"))?;
+    mapped.fix_mate_info()?;
 
     // Step 2: Remove tags from mapped reads
-    for record in rr.iter_mut() {
+    for record in mapped.records_mut().iter_mut() {
         for tag_str in &tag_info.remove {
             if tag_str.len() == 2 {
                 let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
@@ -836,20 +389,21 @@ pub fn merge_raw(
         }
     }
 
-    // Steps 3–5: Copy tags from unmapped to mapped, transfer QC flags
+    // Steps 3–4: Copy tags from unmapped to mapped, transfer QC flags
     let has_transforms = tag_info.has_revs_or_revcomps();
     let pg_tag: [u8; 2] = [b'P', b'G'];
 
     for u in unmapped.primary_reads() {
-        let is_unpaired = !u.flags().is_segmented();
-        let is_first = u.flags().is_first_segment();
+        let u_flags = RawRecordView::new(u).flags();
+        let is_unpaired = (u_flags & bam_fields::flags::PAIRED) == 0;
+        let is_first = (u_flags & bam_fields::flags::FIRST_SEGMENT) != 0;
 
         // Use template's known indices instead of scanning all mapped records
         let mapped_indices = collect_mapped_indices(mapped, is_unpaired || is_first);
 
         // Single pass to determine strand presence
         let (has_pos, has_neg) = {
-            let rr = mapped.raw_records.as_ref().unwrap();
+            let rr = mapped.records();
             let mut pos = false;
             let mut neg = false;
             for &i in &mapped_indices {
@@ -865,9 +419,13 @@ pub fn merge_raw(
             (pos, neg)
         };
 
+        // Collect unmapped tags once — avoids re-iterating `u.tags()` for every mapped record.
+        let u_tags: Vec<fgumi_raw_bam::TagEntry<'_>> =
+            RawRecordView::new(u).tags().iter().collect();
+
         // Copy tags to positive strand reads
         if has_pos {
-            let rr = mapped.raw_records.as_mut().unwrap();
+            let rr = mapped.records_mut();
             for &i in &mapped_indices {
                 if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) != 0 {
                     continue;
@@ -875,25 +433,24 @@ pub fn merge_raw(
                 let aux = bam_fields::aux_data_slice(&rr[i]);
                 let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
 
-                for (tag, value) in u.data().iter() {
-                    let tag_bytes: [u8; 2] = [tag.as_ref()[0], tag.as_ref()[1]];
-                    if tag_bytes == pg_tag && has_pg {
+                for entry in &u_tags {
+                    if entry.tag == pg_tag && has_pg {
                         continue;
                     }
                     // Tag bytes are always valid ASCII
-                    let tag_str = std::str::from_utf8(&tag_bytes).unwrap_or("");
+                    let tag_str = std::str::from_utf8(&entry.tag).unwrap_or("");
                     if tag_info.remove.contains(tag_str) {
                         continue;
                     }
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), &tag_bytes);
-                    append_buf_value_raw(rr[i].as_mut_vec(), tag_bytes, value);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), &entry.tag);
+                    append_raw_tag_entry(rr[i].as_mut_vec(), entry);
                 }
             }
         }
 
         // Copy tags to negative strand reads (with reverse/revcomp)
         if has_neg {
-            let rr = mapped.raw_records.as_mut().unwrap();
+            let rr = mapped.records_mut();
             for &i in &mapped_indices {
                 if (RawRecordView::new(&rr[i]).flags() & bam_fields::flags::REVERSE) == 0 {
                     continue;
@@ -901,36 +458,45 @@ pub fn merge_raw(
                 let aux = bam_fields::aux_data_slice(&rr[i]);
                 let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
 
-                // Aux offset is safe to cache here: `remove_tag` and `append_buf_value_raw`
+                // Aux offset is safe to cache here: `remove_tag` and `append_raw_tag_entry`
                 // only modify bytes within/after the aux region, so this offset stays valid.
                 let aux_offset =
                     bam_fields::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
 
-                for (tag, value) in u.data().iter() {
-                    let tag_bytes: [u8; 2] = [tag.as_ref()[0], tag.as_ref()[1]];
-                    if tag_bytes == pg_tag && has_pg {
+                for entry in &u_tags {
+                    if entry.tag == pg_tag && has_pg {
                         continue;
                     }
-                    let tag_str = std::str::from_utf8(&tag_bytes).unwrap_or("");
+                    let tag_str = std::str::from_utf8(&entry.tag).unwrap_or("");
                     if tag_info.remove.contains(tag_str) {
                         continue;
                     }
 
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), &tag_bytes);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), &entry.tag);
+                    append_raw_tag_entry(rr[i].as_mut_vec(), entry);
 
-                    append_buf_value_raw(rr[i].as_mut_vec(), tag_bytes, value);
                     if has_transforms && tag_info.reverse.contains(tag_str) {
-                        reverse_tag_in_place_raw(&mut rr[i], aux_offset, tag_bytes, value);
+                        reverse_tag_in_place_raw_by_type(
+                            &mut rr[i],
+                            aux_offset,
+                            entry.tag,
+                            entry.type_byte,
+                        );
                     } else if has_transforms && tag_info.revcomp.contains(tag_str) {
-                        revcomp_tag_in_place_raw(&mut rr[i], aux_offset, tag_bytes, value);
+                        revcomp_tag_in_place_raw_by_type(
+                            &mut rr[i],
+                            aux_offset,
+                            entry.tag,
+                            entry.type_byte,
+                        );
                     }
                 }
             }
         }
 
-        // Step 5: Transfer QC pass/fail flag
-        let is_qc_fail = u.flags().is_qc_fail();
-        let rr = mapped.raw_records.as_mut().unwrap();
+        // Step 4: Transfer QC pass/fail flag
+        let is_qc_fail = (u_flags & bam_fields::flags::QC_FAIL) != 0;
+        let rr = mapped.records_mut();
         for &i in &mapped_indices {
             let mut f = RawRecordView::new(&rr[i]).flags();
             if is_qc_fail {
@@ -942,14 +508,13 @@ pub fn merge_raw(
         }
     }
 
-    // Step 6: Normalize AS/XS tags
-    let rr = mapped.raw_records.as_mut().unwrap();
-    for record in rr.iter_mut() {
+    // Step 5: Normalize AS/XS tags
+    for record in mapped.records_mut().iter_mut() {
         bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), b"AS");
         bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), b"XS");
     }
 
-    // Step 7: Add TC tags
+    // Step 6: Add PA tags
     if !skip_tc_tags {
         add_template_coordinate_tags_raw(mapped);
     }
@@ -957,56 +522,72 @@ pub fn merge_raw(
     Ok(())
 }
 
-/// Applies the appropriate reverse operation for a tag in-place.
-fn reverse_tag_in_place_raw(
+/// Appends a raw tag entry (tag + type byte + value bytes) to the destination record.
+///
+/// This is the raw-byte equivalent of `append_buf_value_raw` — it copies the already-encoded
+/// bytes directly without going through `BufValue` decoding/re-encoding.
+#[inline]
+fn append_raw_tag_entry(dest: &mut Vec<u8>, entry: &fgumi_raw_bam::TagEntry<'_>) {
+    dest.push(entry.tag[0]);
+    dest.push(entry.tag[1]);
+    dest.push(entry.type_byte);
+    dest.extend_from_slice(entry.value_bytes);
+}
+
+/// Applies the appropriate reverse operation for a tag in-place, dispatching on BAM type byte.
+///
+/// - `b'Z'`: reverse the string bytes
+/// - `b'B'`: reverse the array elements
+/// - all other types: no-op (scalars have no meaningful reverse)
+fn reverse_tag_in_place_raw_by_type(
     record: &mut [u8],
     aux_offset: usize,
-    tag_bytes: [u8; 2],
-    value: &BufValue,
+    tag: [u8; 2],
+    type_byte: u8,
 ) {
-    match value {
-        BufValue::String(_) => {
-            bam_fields::reverse_string_tag_in_place(record, aux_offset, &tag_bytes);
+    match type_byte {
+        b'Z' => {
+            bam_fields::reverse_string_tag_in_place(record, aux_offset, &tag);
         }
-        BufValue::Array(_) => {
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag_bytes);
+        b'B' => {
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag);
         }
         _ => {}
     }
 }
 
-/// Applies the appropriate reverse-complement operation for a tag in-place.
-fn revcomp_tag_in_place_raw(
+/// Applies the appropriate reverse-complement operation for a tag in-place, dispatching on BAM
+/// type byte.
+///
+/// - `b'Z'`: reverse-complement the string bases (IUPAC-aware)
+/// - `b'B'`: reverse the array elements (no base complement for numeric arrays)
+/// - all other types: no-op
+fn revcomp_tag_in_place_raw_by_type(
     record: &mut [u8],
     aux_offset: usize,
-    tag_bytes: [u8; 2],
-    value: &BufValue,
+    tag: [u8; 2],
+    type_byte: u8,
 ) {
-    match value {
-        BufValue::String(_) => {
-            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, &tag_bytes);
+    match type_byte {
+        b'Z' => {
+            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, &tag);
         }
-        BufValue::Array(_) => {
-            // For array tags, revcomp is the same as reverse
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag_bytes);
+        b'B' => {
+            // For array tags, revcomp is the same as reverse (no base complement for
+            // numeric arrays; arrays that hold base-encoded ints are rare and numeric
+            // reversal matches the existing BufValue::Array branch behavior).
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag);
         }
         _ => {}
     }
 }
 
-/// Encodes all records of an unmapped template to raw BAM bytes for output.
+/// Returns all raw BAM records for an unmapped template by cloning them.
 fn encode_unmapped_template_records(
     template: &Template,
-    header: &Header,
+    _header: &Header,
 ) -> Result<Vec<RawRecord>> {
-    let mut raw = Vec::with_capacity(template.read_count());
-    for record in template.all_reads() {
-        let mut buf = Vec::with_capacity(256);
-        encode_record_buf(&mut buf, header, record)
-            .map_err(|e| anyhow::anyhow!("encode unmapped: {e}"))?;
-        raw.push(RawRecord::from(buf));
-    }
-    Ok(raw)
+    Ok(template.records().to_vec())
 }
 
 /// YD value for the forward (top) bisulfite strand.
@@ -1014,315 +595,230 @@ const YD_FORWARD: &[u8] = b"f";
 /// YD value for the reverse (bottom) bisulfite strand.
 const YD_REVERSE: &[u8] = b"r";
 
-/// YD tag used by bwameth to indicate the bisulfite conversion strand.
-/// Only consumed by the cfg(test) `RecordBuf` reference implementation; the
-/// raw-byte production path looks up the tag bytes directly.
-#[cfg(test)]
-const YD_TAG: Tag = Tag::new(b'Y', b'D');
-
-/// `RecordBuf`-based reference implementation kept around as an oracle for
-/// the test suite; the raw-byte path is used in production.
+/// Restore unconverted bases in EM-seq reads after bwameth re-alignment, operating
+/// directly on raw BAM bytes.
 ///
-/// Walks the CIGAR alignment for each record and replaces converted bases back
-/// to their unconverted reference form:
-///   - Top strand (`YD:Z:f`): at reference-C positions, T→C
-///   - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
+/// For each mapped record in the template, walks the CIGAR alignment and replaces
+/// converted bases back to their unconverted reference form in-place:
+/// - Top strand (`YD:Z:f`): at reference-C positions, T→C
+/// - Bottom strand (`YD:Z:r`): at reference-G positions, A→G
 ///
 /// Skips unmapped reads and reads without a `YD` tag.
-#[cfg(test)]
-#[allow(dead_code)]
-fn restore_unconverted_bases_in_template(
-    template: &mut Template,
-    reference: &ReferenceReader,
-    header: &Header,
-) -> Result<()> {
-    for record in &mut template.records {
-        restore_unconverted_bases_in_record(record, reference, header)?;
-    }
-    Ok(())
-}
-
-/// `RecordBuf`-based reference implementation kept as an oracle for the test
-/// suite; the raw-byte path is used in production.
-#[cfg(test)]
-fn restore_unconverted_bases_in_record(
-    record: &mut RecordBuf,
-    reference: &ReferenceReader,
-    header: &Header,
-) -> Result<()> {
-    // Skip unmapped reads
-    if record.flags().is_unmapped() {
-        return Ok(());
-    }
-
-    // Get the bisulfite strand from the bwameth YD tag
-    let yd_value = record.data().get(&YD_TAG);
-    let is_top = match yd_value {
-        Some(BufValue::String(s)) if AsRef::<[u8]>::as_ref(s) == YD_FORWARD => true,
-        Some(BufValue::String(s)) if AsRef::<[u8]>::as_ref(s) == YD_REVERSE => false,
-        _ => return Ok(()), // No YD tag or unexpected value; skip
-    };
-
-    // Get reference contig name
-    let ref_id = match record.reference_sequence_id() {
-        Some(id) => id,
-        None => return Ok(()),
-    };
-    let (ref_name, _) = header
-        .reference_sequences()
-        .get_index(ref_id)
-        .context("reference sequence ID not found in header")?;
-    // Borrow the contig name as &str rather than allocating a fresh String per
-    // record; `fetch_slice` only needs &str for its HashMap lookup.
-    let ref_name: &str = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
-
-    // Get alignment start (1-based)
-    let alignment_start = match record.alignment_start().map(usize::from) {
-        Some(pos) => pos,
-        None => return Ok(()),
-    };
-
-    // Compute reference span from CIGAR
-    let ref_span = crate::sam::reference_length(&record.cigar());
-
-    if ref_span == 0 {
-        return Ok(());
-    }
-
-    // Fetch the entire aligned reference region at once. Use the borrowed-slice
-    // API so we don't allocate a fresh `Vec<u8>` per record (~2 GB of churn over
-    // a 13M template run).
-    let ref_start = Position::try_from(alignment_start)?;
-    let ref_end = Position::try_from(alignment_start + ref_span - 1)?;
-    let ref_bases = reference.fetch_slice(ref_name, ref_start, ref_end)?;
-
-    // Determine replacement parameters, accounting for reverse-complemented SEQ.
-    // SAM stores SEQ reverse-complemented when 0x10 is set, so the base to find
-    // and replace flips on reverse-strand alignments.
-    let is_reverse = record.flags().is_reverse_complemented();
-    let (ref_target, converted_base, unconverted_base) = match (is_top, is_reverse) {
-        (true, false) | (false, true) => (b'C', b'T', b'C'),
-        (true, true) | (false, false) => (b'G', b'A', b'G'),
-    };
-    // Precompute lowercase variants once per record so the inner loop just does
-    // two byte equality checks instead of `to_ascii_uppercase()` per byte.
-    let ref_target_lower = ref_target.to_ascii_lowercase();
-    let converted_base_lower = converted_base.to_ascii_lowercase();
-
-    // Fast path: if no candidate reference base appears in the aligned span,
-    // the read can't have any bases to restore — skip the SEQ allocation and
-    // CIGAR walk entirely. `memchr2` is SIMD-accelerated.
-    if memchr::memchr2(ref_target, ref_target_lower, ref_bases).is_none() {
-        return Ok(());
-    }
-
-    // Walk CIGAR and replace converted bases. Defer allocating the mutable SEQ
-    // buffer until we hit the first base we actually need to change — many reads
-    // (highly methylated CpGs in EM-Seq) align to ref-C positions but already
-    // carry C in the read, so no allocation is needed.
-    let read_seq = record.sequence().as_ref();
-    let mut seq: Option<Vec<u8>> = None;
-    let mut read_pos: usize = 0;
-    let mut ref_offset: usize = 0; // 0-based offset into ref_bases
-
-    for op_result in record.cigar().iter() {
-        let op = op_result?;
-        let len = op.len();
-
-        match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                for i in 0..len {
-                    if ref_offset + i >= ref_bases.len() {
-                        break;
-                    }
-                    let rb = ref_bases[ref_offset + i];
-                    if (rb == ref_target || rb == ref_target_lower) && read_pos + i < read_seq.len()
-                    {
-                        // Consult the (possibly already-modified) SEQ buffer if present,
-                        // otherwise the original read sequence.
-                        let sb = seq.as_ref().map_or(read_seq[read_pos + i], |s| s[read_pos + i]);
-                        if sb == converted_base || sb == converted_base_lower {
-                            let s = seq.get_or_insert_with(|| read_seq.to_vec());
-                            s[read_pos + i] = unconverted_base;
-                        }
-                    }
-                }
-                read_pos += len;
-                ref_offset += len;
-            }
-            Kind::Insertion | Kind::SoftClip => {
-                read_pos += len;
-            }
-            Kind::Deletion | Kind::Skip => {
-                ref_offset += len;
-            }
-            Kind::HardClip | Kind::Pad => {}
-        }
-    }
-
-    if let Some(seq) = seq {
-        *record.sequence_mut() = seq.into();
-        // NM/MD tags are now stale since SEQ changed; remove them so downstream
-        // tools don't trust incorrect mismatch counts.
-        let data = record.data_mut();
-        data.remove(&Tag::from(SamTag::NM));
-        data.remove(&Tag::from(SamTag::MD));
-    }
-
-    Ok(())
-}
-
-/// Raw-byte equivalent of `restore_unconverted_bases_in_template`.
-///
-/// Iterates the template's `raw_records` (populated by
-/// `convert_template_to_raw`) and applies the unconverted-base restoration
-/// directly to the BAM bytes — no `RecordBuf` round-trip. Lets the methylation
-/// path stay on the same streaming raw-byte fast path TAPs uses.
 fn restore_unconverted_bases_in_raw_template(
     template: &mut Template,
     reference: &ReferenceReader,
     header: &Header,
 ) -> Result<()> {
-    let raw_records = template.raw_records.as_mut().ok_or_else(|| {
-        anyhow::anyhow!("restore_unconverted_bases_in_raw_template: template not in raw-byte mode")
-    })?;
-    for rec in raw_records.iter_mut() {
+    for rec in template.records_mut().iter_mut() {
         restore_unconverted_bases_in_raw_record(rec, reference, header)?;
     }
     Ok(())
 }
 
-/// Raw-byte equivalent of `restore_unconverted_bases_in_record`.
+/// Restore unconverted bases in a single EM-seq record after bwameth re-alignment,
+/// operating directly on raw BAM bytes.
 ///
-/// Operates on a [`RawRecord`] without inflating to a [`RecordBuf`]. Reads the
-/// CIGAR, SEQ, and `YD` tag via the `fgumi-raw-bam` accessors, walks the
-/// alignment, then rewrites converted bases via [`RawRecord::set_base`]. SEQ
-/// stays the same length so no record resizing is needed; only `NM` / `MD` are
-/// removed when SEQ is actually modified.
-///
-/// Skips unmapped records and records without a `YD` tag, just like the
-/// `RecordBuf` path.
+/// Edits the packed 4-bit nibbles in place via [`RawRecord::set_base`], avoiding
+/// a decode-mutate-reencode round-trip through `RecordBuf`.
 fn restore_unconverted_bases_in_raw_record(
     rec: &mut RawRecord,
     reference: &ReferenceReader,
     header: &Header,
 ) -> Result<()> {
+    // Skip unmapped reads
     if rec.is_unmapped() {
         return Ok(());
     }
 
-    // YD tag tells us the bisulfite strand (forward = top, reverse = bottom).
-    // Anything else (missing or unexpected value) means "skip".
-    let yd_bytes = rec.tags().find_string(SamTag::YD.as_ref());
-    let is_top = match yd_bytes {
-        Some(YD_FORWARD) => true,
-        Some(YD_REVERSE) => false,
-        _ => return Ok(()),
+    // Get the bisulfite strand from the bwameth YD tag
+    let yd_bytes = rec.tags().find_string(b"YD").map(|s| s.to_vec());
+    let is_top = match yd_bytes.as_deref() {
+        Some(s) if s == YD_FORWARD => true,
+        Some(s) if s == YD_REVERSE => false,
+        _ => return Ok(()), // No YD tag or unexpected value; skip
     };
 
-    // Reference contig + alignment start.
-    let ref_id = rec.ref_id();
-    if ref_id < 0 {
+    // Get reference contig name
+    let raw_ref_id = rec.ref_id();
+    if raw_ref_id < 0 {
         return Ok(());
     }
+    let ref_id_usize = raw_ref_id as usize;
     let (ref_name, _) = header
         .reference_sequences()
-        .get_index(ref_id as usize)
+        .get_index(ref_id_usize)
         .context("reference sequence ID not found in header")?;
-    let ref_name = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
+    let ref_name: &str = ref_name.to_str().context("reference sequence name is not valid UTF-8")?;
 
-    let pos = rec.pos();
-    if pos < 0 {
-        return Ok(());
-    }
-    // BAM stores `pos` 0-based; ReferenceReader::fetch_slice expects 1-based.
-    let alignment_start = (pos as usize) + 1;
+    // Get alignment start (1-based); pos() is 0-based
+    let alignment_start = match rec.alignment_start_1based() {
+        Some(pos) => pos,
+        None => return Ok(()),
+    };
 
-    // Reference span from the CIGAR. The helper returns it as i32; clamp to
-    // non-negative usize since negative spans don't make sense.
+    // Compute reference span from CIGAR
     let ref_span = rec.reference_length();
     if ref_span <= 0 {
         return Ok(());
     }
     let ref_span = ref_span as usize;
 
-    // Fetch the aligned reference span (borrowed slice, no per-record alloc).
+    // Fetch the entire aligned reference region at once.
     let ref_start = Position::try_from(alignment_start)?;
     let ref_end = Position::try_from(alignment_start + ref_span - 1)?;
     let ref_bases = reference.fetch_slice(ref_name, ref_start, ref_end)?;
 
-    // Determine replacement parameters, accounting for reverse-complemented SEQ.
-    // Same logic as the `RecordBuf` path; pre-encode the converted base to its
-    // 4-bit BAM nibble so the inner loop compares nibbles directly.
-    let (ref_target, converted_ascii, unconverted_ascii) = match (is_top, rec.is_reverse()) {
+    // Determine replacement parameters; SEQ is reverse-complemented when 0x10 is set.
+    let is_reverse = rec.is_reverse();
+    let (ref_target, converted_base, unconverted_base) = match (is_top, is_reverse) {
         (true, false) | (false, true) => (b'C', b'T', b'C'),
         (true, true) | (false, false) => (b'G', b'A', b'G'),
     };
     let ref_target_lower = ref_target.to_ascii_lowercase();
-    // BAM 4-bit nibble codes: A=1, C=2, G=4, T=8. SEQ codes are case-insensitive
-    // by construction (the encode table maps both cases to the same nibble),
-    // so a single nibble compare is enough.
-    let converted_nibble = match converted_ascii {
-        b'T' => 0x8u8,
-        b'A' => 0x1u8,
-        _ => unreachable!(),
-    };
+    let converted_base_lower = converted_base.to_ascii_lowercase();
 
-    // Fast path: if no candidate reference base appears in the aligned span,
-    // there's nothing to restore. `memchr2` is SIMD-accelerated.
+    // Fast path: if no candidate reference base appears in the aligned span, skip.
     if memchr::memchr2(ref_target, ref_target_lower, ref_bases).is_none() {
         return Ok(());
     }
 
-    // Walk CIGAR and replace converted bases in place. We don't allocate a
-    // SEQ buffer at all — `set_base` rewrites the relevant 4-bit nibble in
-    // the existing record bytes.
-    let l_seq = rec.l_seq() as usize;
+    // Collect CIGAR ops up front so we can interleave immutable reads (get_base)
+    // and mutable writes (set_base) without fighting the borrow checker.
     let cigar_ops = rec.cigar_ops_vec();
-    let mut modified = false;
+    let l_seq = rec.l_seq() as usize;
+
+    let mut changed = false;
     let mut read_pos: usize = 0;
-    let mut ref_offset: usize = 0; // 0-based into ref_bases
+    let mut ref_offset: usize = 0; // 0-based offset into ref_bases
 
-    for raw_op in cigar_ops {
-        let kind = bam_fields::cigar_op_kind(raw_op);
-        let len = (raw_op >> 4) as usize;
+    for op in &cigar_ops {
+        let op_type = op & 0xF;
+        let len = (op >> 4) as usize;
 
-        match kind {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+        // op_type constants (BAM CIGAR encoding):
+        //   0 = M (Match/Mismatch)
+        //   1 = I (Insertion)
+        //   2 = D (Deletion)
+        //   3 = N (Skip / reference skip)
+        //   4 = S (SoftClip)
+        //   5 = H (HardClip)
+        //   6 = P (Pad)
+        //   7 = = (SequenceMatch)
+        //   8 = X (SequenceMismatch)
+        match op_type {
+            0 | 7 | 8 => {
+                // Consumes both query and reference
                 for i in 0..len {
                     if ref_offset + i >= ref_bases.len() {
                         break;
                     }
                     let rb = ref_bases[ref_offset + i];
-                    if (rb == ref_target || rb == ref_target_lower)
-                        && read_pos + i < l_seq
-                        && rec.get_base(read_pos + i) == converted_nibble
-                    {
-                        rec.set_base(read_pos + i, unconverted_ascii);
-                        modified = true;
+                    if (rb == ref_target || rb == ref_target_lower) && read_pos + i < l_seq {
+                        let raw_code = rec.get_base(read_pos + i);
+                        let sb = BAM_BASE_TO_ASCII[raw_code as usize];
+                        if sb == converted_base || sb == converted_base_lower {
+                            rec.set_base(read_pos + i, unconverted_base);
+                            changed = true;
+                        }
                     }
                 }
                 read_pos += len;
                 ref_offset += len;
             }
-            Kind::Insertion | Kind::SoftClip => {
+            1 | 4 => {
+                // Consumes query only (Insertion, SoftClip)
                 read_pos += len;
             }
-            Kind::Deletion | Kind::Skip => {
+            2 | 3 => {
+                // Consumes reference only (Deletion, Skip)
                 ref_offset += len;
             }
-            Kind::HardClip | Kind::Pad => {}
+            5 | 6 => {
+                // HardClip, Pad — consumes neither
+            }
+            _ => {}
         }
     }
 
-    // NM/MD only become stale when SEQ was actually modified.
-    if modified {
+    if changed {
+        // NM/MD tags are now stale since SEQ changed; remove them so downstream
+        // tools don't trust incorrect mismatch counts.
         let mut ed = rec.tags_editor();
-        ed.remove(SamTag::NM.as_ref());
-        ed.remove(SamTag::MD.as_ref());
+        ed.remove(b"NM");
+        ed.remove(b"MD");
     }
 
     Ok(())
+}
+
+/// Groups consecutive `RecordBuf` records by query name into `Template` objects.
+///
+/// Used for the mapped (SAM/BAM) reader path where noodles decodes records as `RecordBuf`.
+/// Each group is encoded to raw bytes via [`RecordBufEncoder`] and assembled into a
+/// [`Template`] via [`Template::from_records`].
+fn record_bufs_to_templates<'a, I>(
+    iter: I,
+    header: &'a Header,
+) -> impl Iterator<Item = Result<Template>> + 'a
+where
+    I: Iterator<Item = Result<noodles::sam::alignment::RecordBuf>> + 'a,
+{
+    let mut encoder = RecordBufEncoder::new(header);
+    let mut pending: Option<noodles::sam::alignment::RecordBuf> = None;
+    let mut exhausted = false;
+    let mut iter = iter;
+
+    std::iter::from_fn(move || {
+        if exhausted && pending.is_none() {
+            return None;
+        }
+
+        let mut batch: Vec<noodles::sam::alignment::RecordBuf> = Vec::with_capacity(2);
+
+        if let Some(p) = pending.take() {
+            batch.push(p);
+        }
+
+        loop {
+            if exhausted {
+                break;
+            }
+            match iter.next() {
+                Some(Ok(rec)) => {
+                    if batch.is_empty() {
+                        batch.push(rec);
+                    } else {
+                        let first_name = batch[0].name().map(|n| n.to_vec());
+                        let this_name = rec.name().map(|n| n.to_vec());
+                        if first_name == this_name {
+                            batch.push(rec);
+                        } else {
+                            pending = Some(rec);
+                            break;
+                        }
+                    }
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+
+        if batch.is_empty() {
+            return None;
+        }
+
+        let mut raw_records = Vec::with_capacity(batch.len());
+        for rec in &batch {
+            match encoder.encode(rec) {
+                Ok(raw) => raw_records.push(raw),
+                Err(e) => return Some(Err(anyhow::anyhow!("Failed to encode record: {e}"))),
+            }
+        }
+        Some(Template::from_records(raw_records))
+    })
 }
 
 impl Zipper {
@@ -1361,20 +857,16 @@ impl Zipper {
 
             if let Some(ref mut mapped_template) = mapped_peek {
                 if mapped_template.name == unmapped_template.name {
-                    // Both branches now stream raw BAM bytes; the methylation
-                    // case adds a per-record `restore_unconverted_bases` step
-                    // that mutates SEQ in place via `fgumi-raw-bam` primitives.
-                    convert_template_to_raw(mapped_template, output_header)?;
                     merge_raw(&unmapped_template, mapped_template, tag_info, self.skip_tc_tags)?;
                     if let Some(ref_reader) = reference {
+                        // EM-seq: restore converted bases in-place on packed 4-bit nibbles.
                         restore_unconverted_bases_in_raw_template(
                             mapped_template,
                             ref_reader,
                             output_header,
                         )?;
                     }
-                    let rr = mapped_template.raw_records.as_ref().unwrap();
-                    for rec in rr {
+                    for rec in mapped_template.records() {
                         writer.write_raw_record(rec)?;
                         progress.log_if_needed(1);
                     }
@@ -1460,7 +952,7 @@ type BamStdinReader =
     noodles::bam::io::Reader<noodles::bgzf::io::Reader<BufReader<Box<dyn Read + Send>>>>;
 
 /// Wraps SAM and BAM readers so the mapped-reader thread can handle either format.
-/// Moved into the thread where `record_bufs()` is called, since it borrows `&self`.
+/// Moved into the thread that calls `record_bufs()`, since the iterator borrows `&self`.
 enum MappedReader {
     Sam(noodles::sam::io::Reader<Box<dyn BufRead + Send>>),
     Bam(BamReaderAuto),
@@ -1543,7 +1035,7 @@ impl Command for Zipper {
             )
         })?;
 
-        let (mut unmapped_reader, unmapped_header) = create_bam_reader(&self.unmapped, 1)?;
+        let (unmapped_raw_reader, unmapped_header) = create_raw_bam_reader(&self.unmapped, 1)?;
 
         // Read mapped input — detect format by extension.
         // The reader and header are separated here; record_bufs() is called inside
@@ -1634,13 +1126,8 @@ impl Command for Zipper {
         // Create async unmapped reader - spawn thread to read ahead
         let (unmapped_tx, unmapped_rx) =
             std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
-        let unmapped_header_for_reader = unmapped_header.clone();
         std::thread::spawn(move || {
-            let unmapped_iter = TemplateIterator::new(
-                unmapped_reader
-                    .record_bufs(&unmapped_header_for_reader)
-                    .map(|r| r.map_err(anyhow::Error::from)),
-            );
+            let unmapped_iter = TemplateIterator::new(unmapped_raw_reader);
             for template in unmapped_iter {
                 if unmapped_tx.send(template).is_err() {
                     break; // Receiver dropped, main thread done
@@ -1658,33 +1145,33 @@ impl Command for Zipper {
             // (which borrows it via record_bufs) remains valid.
             match mapped_reader {
                 MappedReader::Sam(mut r) => {
-                    let mapped_iter = TemplateIterator::new(
-                        r.record_bufs(&mapped_header_for_reader)
-                            .map(|rec| rec.map_err(anyhow::Error::from)),
-                    );
-                    for template in mapped_iter {
+                    let record_iter = r
+                        .record_bufs(&mapped_header_for_reader)
+                        .map(|rec| rec.map_err(anyhow::Error::from));
+                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
+                    {
                         if mapped_tx.send(template).is_err() {
                             break;
                         }
                     }
                 }
                 MappedReader::Bam(mut r) => {
-                    let mapped_iter = TemplateIterator::new(
-                        r.record_bufs(&mapped_header_for_reader)
-                            .map(|rec| rec.map_err(anyhow::Error::from)),
-                    );
-                    for template in mapped_iter {
+                    let record_iter = r
+                        .record_bufs(&mapped_header_for_reader)
+                        .map(|rec| rec.map_err(anyhow::Error::from));
+                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
+                    {
                         if mapped_tx.send(template).is_err() {
                             break;
                         }
                     }
                 }
                 MappedReader::StdinBam(mut r) => {
-                    let mapped_iter = TemplateIterator::new(
-                        r.record_bufs(&mapped_header_for_reader)
-                            .map(|rec| rec.map_err(anyhow::Error::from)),
-                    );
-                    for template in mapped_iter {
+                    let record_iter = r
+                        .record_bufs(&mapped_header_for_reader)
+                        .map(|rec| rec.map_err(anyhow::Error::from));
+                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
+                    {
                         if mapped_tx.send(template).is_err() {
                             break;
                         }
@@ -1711,12 +1198,14 @@ impl Command for Zipper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sam::SamTag;
     use crate::sam::builder::{
-        MAPPED_PG_ID, REFERENCE_LENGTH, RecordBuilder, SamBuilder, create_ref_dict,
+        MAPPED_PG_ID, REFERENCE_LENGTH, SamBuilder as FgSamBuilder, create_ref_dict,
     };
+    use crate::sam::{TC_TAG, TemplateCoordinateInfo};
     use anyhow::Result;
     use bstr::ByteSlice;
-    use noodles::sam::alignment::record::Flags;
+    use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::RecordBuf;
     use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
@@ -1724,6 +1213,42 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Read;
     use tempfile::TempDir;
+
+    /// Convert a `RawRecord` built with [`RawSamBuilder`] into a noodles `RecordBuf`.
+    ///
+    /// Used in tests to push raw-built records into `FgSamBuilder::push_record`.
+    fn to_record_buf(raw: RawRecord) -> RecordBuf {
+        fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf failed")
+    }
+
+    /// Extract `TemplateCoordinateInfo` from a raw BAM record's `pa` tag.
+    ///
+    /// Returns `None` if the `pa` tag is absent or malformed.
+    fn tc_info_from_raw(rec: &RawRecord) -> Option<TemplateCoordinateInfo> {
+        let arr = rec.tags().find_array(b"tc")?;
+        // pa tag is B:i with 6 int32 elements
+        if arr.elem_type != b'i' || arr.count != 6 {
+            return None;
+        }
+        let read_i32 = |idx: usize| -> i32 {
+            let off = idx * 4;
+            i32::from_le_bytes([
+                arr.data[off],
+                arr.data[off + 1],
+                arr.data[off + 2],
+                arr.data[off + 3],
+            ])
+        };
+        Some(TemplateCoordinateInfo {
+            tid1: read_i32(0),
+            pos1: read_i32(1),
+            neg1: read_i32(2) != 0,
+            tid2: read_i32(3),
+            pos2: read_i32(4),
+            neg2: read_i32(5) != 0,
+        })
+    }
 
     /// A `Read` implementation that returns at most one byte per `read` call,
     /// mimicking the behavior of a slow pipe or small kernel buffer. Used to
@@ -1824,8 +1349,8 @@ mod tests {
     ///
     /// Returns an error if any step fails
     fn run_zipper(
-        unmapped: &SamBuilder,
-        mapped: &SamBuilder,
+        unmapped: &FgSamBuilder,
+        mapped: &FgSamBuilder,
         tags_to_remove: Vec<String>,
         tags_to_reverse: Vec<String>,
         tags_to_revcomp: Vec<String>,
@@ -1876,8 +1401,8 @@ mod tests {
     /// - MC and MQ tags are properly set for paired reads
     #[test]
     fn test_basic_merge() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         // Add unmapped pairs with tags
         let mut attrs1 = HashMap::new();
@@ -1933,8 +1458,8 @@ mod tests {
     /// attempting to match R1/R2.
     #[test]
     fn test_unpaired_reads() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs1 = HashMap::new();
         attrs1.insert("RX", BufValue::from("ACGT".to_string()));
@@ -1979,8 +1504,8 @@ mod tests {
     /// - Positive strand reads are unchanged
     #[test]
     fn test_tag_removal_reverse_revcomp() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("n1", BufValue::from(vec![1i16, 2, 3, 4, 5]));
@@ -2059,8 +1584,8 @@ mod tests {
     /// transformations.
     #[test]
     fn test_consensus_tag_set() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("aD", BufValue::from("AAAGG".to_string()));
@@ -2074,19 +1599,20 @@ mod tests {
         mapped.add_frag_with_attrs("q1", Some(100), true, &mapped_attrs1.clone());
 
         // Add supplementary record
-        let mut supp_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SUPPLEMENTARY | Flags::REVERSE_COMPLEMENTED)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .build();
-        for (tag_str, value) in &mapped_attrs1 {
-            let tag = Tag::new(tag_str.as_bytes()[0], tag_str.as_bytes()[1]);
-            supp_rec.data_mut().insert(tag, value.clone());
-        }
+        let supp_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::SUPPLEMENTARY | flags::REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 77);
+            to_record_buf(b.build())
+        };
         mapped.push_record(supp_rec);
 
         let records = run_zipper(
@@ -2144,8 +1670,8 @@ mod tests {
     /// written to the output unchanged (still unmapped).
     #[test]
     fn test_unmapped_only_reads() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs1 = HashMap::new();
         attrs1.insert("RX", BufValue::from("ACGT".to_string()));
@@ -2223,8 +1749,8 @@ mod tests {
 
     #[test]
     fn test_mate_info_fixing() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
@@ -2272,26 +1798,29 @@ mod tests {
     /// - Both R1 and R2 get the correct flags
     #[test]
     fn test_qc_flag_transfer() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         // Add unmapped pair where R1 passes QC but R2 fails QC
         let mut attrs1 = HashMap::new();
         attrs1.insert("RX", BufValue::from("ACGT".to_string()));
 
         // Create R1 (passes QC - no QC_FAIL flag)
-        let r1_unmapped = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::UNMAPPED)
-            .tag("RX", "ACGT")
-            .build();
+        let r1_unmapped = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1").flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
+            b.add_string_tag(b"RX", b"ACGT");
+            to_record_buf(b.build())
+        };
 
         // Create R2 (fails QC - has QC_FAIL flag)
-        let r2_unmapped = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::UNMAPPED | Flags::QC_FAIL)
-            .tag("RX", "ACGT")
-            .build();
+        let r2_unmapped = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED | flags::QC_FAIL);
+            b.add_string_tag(b"RX", b"ACGT");
+            to_record_buf(b.build())
+        };
 
         unmapped.push_record(r1_unmapped);
         unmapped.push_record(r2_unmapped);
@@ -2334,8 +1863,8 @@ mod tests {
     /// the flag is removed from the mapped read.
     #[test]
     fn test_qc_flag_removal() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         // Add unmapped read that passes QC
         let mut attrs = HashMap::new();
@@ -2343,15 +1872,18 @@ mod tests {
         unmapped.add_frag_with_attrs("q1", None, true, &attrs);
 
         // Add mapped read with QC_FAIL flag set
-        let mapped_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::QC_FAIL)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .build();
+        let mapped_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::QC_FAIL)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            to_record_buf(b.build())
+        };
         mapped.push_record(mapped_rec);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -2376,8 +1908,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_tag_operations_on_secondary_and_supplementary() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("n1", BufValue::from(vec![1i16, 2, 3, 4, 5]));
@@ -2395,35 +1927,37 @@ mod tests {
         mapped.add_frag_with_attrs("q1", Some(100), true, &mapped_attrs.clone());
 
         // Add secondary alignment (negative strand)
-        let mut secondary_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SECONDARY | Flags::REVERSE_COMPLEMENTED)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .build();
-        for (tag_str, value) in &mapped_attrs {
-            let tag = Tag::new(tag_str.as_bytes()[0], tag_str.as_bytes()[1]);
-            secondary_rec.data_mut().insert(tag, value.clone());
-        }
+        let secondary_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::SECONDARY | flags::REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 77);
+            to_record_buf(b.build())
+        };
         mapped.push_record(secondary_rec);
 
         // Add supplementary alignment (negative strand)
-        let mut supp_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SUPPLEMENTARY | Flags::REVERSE_COMPLEMENTED)
-            .reference_sequence_id(0)
-            .alignment_start(300)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .build();
-        for (tag_str, value) in &mapped_attrs {
-            let tag = Tag::new(tag_str.as_bytes()[0], tag_str.as_bytes()[1]);
-            supp_rec.data_mut().insert(tag, value.clone());
-        }
+        let supp_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::SUPPLEMENTARY | flags::REVERSE)
+                .ref_id(0)
+                .pos(299)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 77);
+            to_record_buf(b.build())
+        };
         mapped.push_record(supp_rec);
 
         let records = run_zipper(
@@ -2544,8 +2078,8 @@ mod tests {
     /// Verifies that multi-threaded mode produces the same results as single-threaded
     #[test]
     fn test_multithreaded_processing() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         // Add multiple templates to process
         for i in 0..10 {
@@ -2615,8 +2149,8 @@ mod tests {
     /// (matching fgbio's `ZipperBams` validation)
     #[test]
     fn test_empty_unmapped() -> Result<()> {
-        let unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut mapped_attrs = HashMap::new();
         mapped_attrs.insert("PG", BufValue::from(MAPPED_PG_ID.to_string()));
@@ -2636,59 +2170,13 @@ mod tests {
         Ok(())
     }
 
-    /// Tests `copy_tags` function directly
-    ///
-    /// Verifies the tag copying logic including PG tag special handling
-    #[test]
-    fn test_copy_tags_with_pg_present() -> Result<()> {
-        let src =
-            RecordBuilder::new().sequence("ACGT").tag("PG", "old_pg").tag("XY", 123i32).build();
-
-        let mut dest_data = Data::default();
-        dest_data.insert(Tag::from(SamTag::PG), BufValue::from("new_pg".to_string()));
-
-        let tag_info = TagInfo::new(vec![], vec![], vec![]);
-        copy_tags(&src, &mut dest_data, &tag_info)?;
-
-        // PG should not be overwritten
-        if let Some(BufValue::String(s)) = dest_data.get(&Tag::from(SamTag::PG)) {
-            assert_eq!(s.to_string(), "new_pg");
-        }
-
-        // XY should be copied
-        assert!(dest_data.get(&Tag::new(b'X', b'Y')).is_some());
-
-        Ok(())
-    }
-
-    /// Tests `copy_tags` with tag removal
-    ///
-    /// Verifies that tags in the remove list are not copied
-    #[test]
-    fn test_copy_tags_with_removal() -> Result<()> {
-        let src = RecordBuilder::new().sequence("ACGT").tag("XY", 123i32).tag("AB", 456i32).build();
-
-        let mut dest_data = Data::default();
-
-        let tag_info = TagInfo::new(vec!["XY".to_string()], vec![], vec![]);
-        copy_tags(&src, &mut dest_data, &tag_info)?;
-
-        // XY should not be copied (it's in remove list)
-        assert!(dest_data.get(&Tag::new(b'X', b'Y')).is_none());
-
-        // AB should be copied
-        assert!(dest_data.get(&Tag::new(b'A', b'B')).is_some());
-
-        Ok(())
-    }
-
     /// Tests merge function with mixed read configurations
     ///
     /// Verifies handling of reads with different strand orientations
     #[test]
     fn test_merge_mixed_strands() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
@@ -2736,8 +2224,8 @@ mod tests {
     /// Verifies that multiple secondary alignments for the same read are all processed
     #[test]
     fn test_multiple_secondary_alignments() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
@@ -2749,19 +2237,19 @@ mod tests {
 
         // Add 3 secondary alignments
         for i in 0..3 {
-            let mut secondary_rec = RecordBuilder::new()
-                .name("q1")
-                .flags(Flags::SECONDARY)
-                .reference_sequence_id(0)
-                .alignment_start(200 + i * 100)
-                .cigar("100M")
-                .sequence(&"A".repeat(100))
-                .qualities(&[30u8; 100])
-                .build();
-            for (tag_str, value) in &mapped_attrs {
-                let tag = Tag::new(tag_str.as_bytes()[0], tag_str.as_bytes()[1]);
-                secondary_rec.data_mut().insert(tag, value.clone());
-            }
+            let secondary_rec = {
+                let mut b = RawSamBuilder::new();
+                b.read_name(b"q1")
+                    .flags(flags::SECONDARY)
+                    .ref_id(0)
+                    .pos(199 + i * 100)
+                    .mapq(60)
+                    .cigar_ops(&[encode_op(0, 100)])
+                    .sequence(&b"A".repeat(100))
+                    .qualities(&[30u8; 100]);
+                b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+                to_record_buf(b.build())
+            };
             mapped.push_record(secondary_rec);
         }
 
@@ -2782,24 +2270,27 @@ mod tests {
     /// Verifies correct handling when only one read of a pair is mapped
     #[test]
     fn test_r2_only_mapping() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
         unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
 
         // Only R2 is mapped
-        let r2_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .tag("PG", MAPPED_PG_ID)
-            .build();
+        let r2_mapped = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            to_record_buf(b.build())
+        };
         mapped.push_record(r2_mapped);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -2815,8 +2306,8 @@ mod tests {
 
     /// Helper to run zipper with `exclude_missing_reads` option
     fn run_zipper_with_options(
-        unmapped: &SamBuilder,
-        mapped: &SamBuilder,
+        unmapped: &FgSamBuilder,
+        mapped: &FgSamBuilder,
         exclude_missing_reads: bool,
     ) -> Result<Vec<RecordBuf>> {
         let dir = TempDir::new()?;
@@ -2852,8 +2343,8 @@ mod tests {
     /// Tests that both inputs being empty produces empty output (not an error)
     #[test]
     fn test_both_inputs_empty() -> Result<()> {
-        let unmapped = SamBuilder::new_unmapped();
-        let mapped = SamBuilder::new_mapped();
+        let unmapped = FgSamBuilder::new_unmapped();
+        let mapped = FgSamBuilder::new_mapped();
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
 
@@ -2868,8 +2359,8 @@ mod tests {
     /// When enabled, unmapped reads without matching mapped reads should be excluded from output
     #[test]
     fn test_exclude_missing_reads() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         // Add unmapped pairs - q1, q2, q3
         let mut attrs = HashMap::new();
@@ -2912,7 +2403,7 @@ mod tests {
         let output_path = dir.path().join("output.bam");
 
         // Create mapped file but not unmapped or reference
-        let mapped = SamBuilder::new_mapped();
+        let mapped = FgSamBuilder::new_mapped();
         mapped.write_sam(&mapped_path)?;
 
         let zipper = Zipper {
@@ -2944,7 +2435,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Template-Coordinate Tag (tc) Tests
+    // Primary Alignment Tag (pa) Tests
     // =========================================================================
 
     // Helper for creating records with specific flags
@@ -2955,49 +2446,52 @@ mod tests {
     const FLAG_SUPPLEMENTARY: u16 = 0x800;
     const FLAG_REVERSE: u16 = 0x10;
 
-    /// Tests that the tc tag is added to supplementary reads with template sort key
+    /// Tests that the pa tag is added to supplementary reads with template sort key
     #[test]
-    fn test_add_tc_tag_to_supplementary_r1() -> Result<()> {
+    fn test_add_pa_tag_to_supplementary_r1() -> Result<()> {
         use crate::template::Template;
 
         // Build a template with primary R1 and supplementary R1
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
 
-        let supplementary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(5)
-            .alignment_start(5000)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
-            .build();
+        let supplementary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
 
-        // Call add_template_coordinate_tags
-        add_template_coordinate_tags(&mut template);
+        // Call add_template_coordinate_tags_raw
+        add_template_coordinate_tags_raw(&mut template);
 
-        // Check that supplementary has tc tag
+        // Check that supplementary has pa tag
         let supp = template
-            .records
+            .records()
             .iter()
-            .find(|r| r.flags().is_supplementary())
+            .find(|r| r.is_supplementary())
             .expect("Should have supplementary");
 
-        let tc_value = supp.data().get(&TC_TAG).expect("Supplementary should have tc tag");
-
-        // Parse and verify the tc tag
-        let tc_info = TemplateCoordinateInfo::from_tag_value(tc_value)
-            .expect("Should be able to parse tc tag");
+        // Parse and verify the pa tag
+        let tc_info = tc_info_from_raw(supp).expect("Supplementary should have pa tag");
 
         // Only R1 mapped, so both positions should be the same
         assert_eq!(tc_info.tid1, 0, "tid1 should be R1's reference");
@@ -3007,54 +2501,54 @@ mod tests {
         assert_eq!(tc_info.pos2, 100, "pos2 should equal pos1 (single read)");
         assert!(!tc_info.neg2, "neg2 should equal neg1 (single read)");
 
-        // Check that primary does NOT have tc tag
+        // Check that primary does NOT have pa tag
         let primary = template.r1().expect("Should have primary R1");
-        assert!(primary.data().get(&TC_TAG).is_none(), "Primary should not have tc tag");
+        assert!(tc_info_from_raw(primary).is_none(), "Primary should not have pa tag");
 
         Ok(())
     }
 
-    /// Tests that the tc tag is added to secondary reads with correct strand info
+    /// Tests that the pa tag is added to secondary reads with correct strand info
     #[test]
-    fn test_add_tc_tag_to_secondary_reverse_strand() -> Result<()> {
+    fn test_add_pa_tag_to_secondary_reverse_strand() -> Result<()> {
         use crate::template::Template;
 
         // Build a template with primary R1 on reverse strand and secondary R1
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
 
-        let secondary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(3)
-            .alignment_start(3000)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SECONDARY))
-            .build();
+        let secondary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SECONDARY)
+                .ref_id(3)
+                .pos(2999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
 
-        add_template_coordinate_tags(&mut template);
+        add_template_coordinate_tags_raw(&mut template);
 
-        let secondary = template
-            .records
-            .iter()
-            .find(|r| r.flags().is_secondary())
-            .expect("Should have secondary");
+        let secondary =
+            template.records().iter().find(|r| r.is_secondary()).expect("Should have secondary");
 
-        let tc_value = secondary.data().get(&TC_TAG).expect("Secondary should have tc tag");
-
-        // Parse and verify the tc tag
-        let tc_info = TemplateCoordinateInfo::from_tag_value(tc_value)
-            .expect("Should be able to parse tc tag");
+        // Parse and verify the pa tag
+        let tc_info = tc_info_from_raw(secondary).expect("Secondary should have pa tag");
 
         // Primary is on reverse strand with 8M cigar
         // Unclipped 5' position for reverse strand = alignment_start + alignment_span - 1
@@ -3066,63 +2560,69 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that tc tag contains full template sort key for paired-end data
+    /// Tests that pa tag contains full template sort key for paired-end data
     #[test]
-    fn test_add_tc_tag_paired_end_r2_supplementary() -> Result<()> {
+    fn test_add_pa_tag_paired_end_r2_supplementary() -> Result<()> {
         use crate::template::Template;
 
         // Primary R1 at position 100 (forward strand, 8M cigar)
         // Unclipped 5' = 100 (no soft clips)
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
 
         // Primary R2 at position 300 (reverse strand, 8M cigar)
         // Unclipped 5' for reverse strand = 300 + 8 - 1 = 307
-        let primary_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(300)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE))
-            .build();
+        let primary_r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE)
+                .ref_id(0)
+                .pos(299)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACGTACGT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
 
         // Supplementary R2
-        let supplementary_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(5)
-            .alignment_start(5000)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_SUPPLEMENTARY))
-            .build();
+        let supplementary_r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_SUPPLEMENTARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, primary_r2, supplementary_r2])?;
 
-        add_template_coordinate_tags(&mut template);
+        add_template_coordinate_tags_raw(&mut template);
 
         let supp = template
-            .records
+            .records()
             .iter()
-            .find(|r| r.flags().is_supplementary())
+            .find(|r| r.is_supplementary())
             .expect("Should have supplementary");
 
-        let tc_value = supp.data().get(&TC_TAG).expect("Supplementary R2 should have tc tag");
+        // Parse and verify the pa tag
+        let tc_info = tc_info_from_raw(supp).expect("Supplementary R2 should have pa tag");
 
-        // Parse and verify the tc tag
-        let tc_info = TemplateCoordinateInfo::from_tag_value(tc_value)
-            .expect("Should be able to parse tc tag");
-
-        // tc tag should contain BOTH primaries' unclipped 5' positions (sorted by position)
+        // pa tag should contain BOTH primaries' unclipped 5' positions (sorted by position)
         // R1 forward strand at 100 with 8M -> unclipped 5' = 100
         // R2 reverse strand at 300 with 8M -> unclipped 5' = 300 + 8 - 1 = 307
         assert_eq!(tc_info.tid1, 0, "tid1 should be R1's reference (earlier)");
@@ -3135,46 +2635,49 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that no tc tag is added when there's no corresponding primary
+    /// Tests that no pa tag is added when there's no corresponding primary
     #[test]
-    fn test_no_tc_tag_when_no_primary() -> Result<()> {
+    fn test_no_pa_tag_when_no_primary() -> Result<()> {
         use crate::template::Template;
 
         // Only supplementary, no primary
-        let supplementary = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30; 4])
-            .reference_sequence_id(5)
-            .alignment_start(5000)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
-            .build();
+        let supplementary = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![supplementary])?;
 
-        add_template_coordinate_tags(&mut template);
+        add_template_coordinate_tags_raw(&mut template);
 
         let supp = template
-            .records
+            .records()
             .iter()
-            .find(|r| r.flags().is_supplementary())
+            .find(|r| r.is_supplementary())
             .expect("Should have supplementary");
 
-        // Should NOT have tc tag since there's no primary
+        // Should NOT have pa tag since there's no primary
         assert!(
-            supp.data().get(&TC_TAG).is_none(),
-            "Supplementary without primary should not have tc tag"
+            tc_info_from_raw(supp).is_none(),
+            "Supplementary without primary should not have pa tag"
         );
 
         Ok(())
     }
 
-    /// Tests that tc tag is added during full merge operation
+    /// Tests that pa tag is added during full merge operation
     #[test]
-    fn test_tc_tag_added_during_merge() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+    fn test_pa_tag_added_during_merge() -> Result<()> {
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         // Add unmapped pair with tags
         let mut attrs = HashMap::new();
@@ -3185,16 +2688,19 @@ mod tests {
         // R1 at 100, R2 at 200
         let _ = mapped.add_pair().name("q1").start1(100).start2(200).build();
 
-        // Add supplementary R1 (same ref but different pos to test tc tag)
-        let supp = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGTACGTACGT")
-            .qualities(&[30; 12])
-            .reference_sequence_id(0)
-            .alignment_start(5000)
-            .cigar("12M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
-            .build();
+        // Add supplementary R1 (same ref but different pos to test pa tag)
+        let supp = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY)
+                .ref_id(0)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 12)])
+                .sequence(b"ACGTACGTACGT")
+                .qualities(&[30u8; 12]);
+            to_record_buf(b.build())
+        };
         mapped.push_record(supp);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -3205,15 +2711,15 @@ mod tests {
             .find(|r| r.flags().is_supplementary())
             .expect("Should have supplementary in output");
 
-        // Check tc tag was added
-        let tc_value =
-            supp_record.data().get(&TC_TAG).expect("Supplementary should have tc tag after merge");
+        // Check pa tag was added
+        let pa_value =
+            supp_record.data().get(&TC_TAG).expect("Supplementary should have pa tag after merge");
 
-        // Parse and verify the tc tag
-        let tc_info = TemplateCoordinateInfo::from_tag_value(tc_value)
-            .expect("Should be able to parse tc tag");
+        // Parse and verify the pa tag
+        let tc_info = TemplateCoordinateInfo::from_tag_value(pa_value)
+            .expect("Should be able to parse pa tag");
 
-        // tc tag should contain both primaries' unclipped 5' positions
+        // pa tag should contain both primaries' unclipped 5' positions
         // R1: forward strand at 100 with 100M -> unclipped 5' = 100
         // R2: reverse strand at 200 with 100M -> unclipped 5' = 200 + 100 - 1 = 299
         assert_eq!(tc_info.tid1, 0, "tid1 should be 0");
@@ -3231,83 +2737,95 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that `add_template_coordinate_tags` returns early when there are no
+    /// Tests that `add_template_coordinate_tags_raw` returns early when there are no
     /// secondary/supplementary reads (the early exit optimization).
     #[test]
-    fn test_add_tc_tag_early_exit_no_secondary_supplementary() -> Result<()> {
+    fn test_add_pa_tag_early_exit_no_secondary_supplementary() -> Result<()> {
         use crate::template::Template;
 
         // Create a template with only primary reads (no secondary/supplementary)
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
-        let primary_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("TGCA")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE))
-            .build();
+        let primary_r2 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE)
+                .ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"TGCA")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, primary_r2])?;
 
-        // Call add_template_coordinate_tags - should return early
-        add_template_coordinate_tags(&mut template);
+        // Call add_template_coordinate_tags_raw - should return early
+        add_template_coordinate_tags_raw(&mut template);
 
-        // Verify no tc tags were added (primaries don't get tc tags)
-        for record in &template.records {
-            assert!(record.data().get(&TC_TAG).is_none(), "Primary reads should not have tc tag");
+        // Verify no pa tags were added (primaries don't get pa tags)
+        for record in template.records() {
+            assert!(tc_info_from_raw(record).is_none(), "Primary reads should not have pa tag");
         }
 
         Ok(())
     }
 
-    /// Tests that `add_template_coordinate_tags` only adds tc tag to secondary/supplementary,
+    /// Tests that `add_template_coordinate_tags_raw` only adds pa tag to secondary/supplementary,
     /// not to primary reads, even when secondary/supplementary are present.
     #[test]
-    fn test_add_tc_tag_only_to_secondary_supplementary() -> Result<()> {
+    fn test_add_pa_tag_only_to_secondary_supplementary() -> Result<()> {
         use crate::template::Template;
 
         // Create a template with primary + secondary
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
-        let secondary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(5)
-            .alignment_start(5000)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SECONDARY))
-            .build();
+        let secondary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SECONDARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, secondary_r1])?;
 
-        add_template_coordinate_tags(&mut template);
+        add_template_coordinate_tags_raw(&mut template);
 
         // Check each record
-        for record in &template.records {
-            if record.flags().is_secondary() {
-                assert!(record.data().get(&TC_TAG).is_some(), "Secondary should have tc tag");
+        for record in template.records() {
+            if record.is_secondary() {
+                assert!(tc_info_from_raw(record).is_some(), "Secondary should have pa tag");
             } else {
-                assert!(record.data().get(&TC_TAG).is_none(), "Primary should not have tc tag");
+                assert!(tc_info_from_raw(record).is_none(), "Primary should not have pa tag");
             }
         }
 
@@ -3321,48 +2839,54 @@ mod tests {
         const FLAG_UNMAPPED: u16 = 0x4;
 
         // Create a template with primary + supplementary
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
-        let supplementary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(5)
-            .alignment_start(5000)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
-            .build();
+        let supplementary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
 
         // Create unmapped template
-        let unmapped_record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED))
-            .tag("RX", "AAAA")
-            .build();
+        let unmapped_record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1").flags(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED);
+            b.add_string_tag(b"RX", b"AAAA");
+            b.sequence(b"ACGT").qualities(&[30u8; 4]);
+            b.build()
+        };
         let unmapped = Template::from_records(vec![unmapped_record])?;
 
         let tag_info = TagInfo::new(vec![], vec![], vec![]);
 
         // Test with skip_tc_tags = true
-        merge(&unmapped, &mut template, &tag_info, true)?;
+        merge_raw(&unmapped, &mut template, &tag_info, true)?;
 
-        // Supplementary should NOT have tc tag when skip_tc_tags is true
-        for record in &template.records {
+        // Supplementary should NOT have pa tag when skip_tc_tags is true
+        for record in template.records() {
             assert!(
-                record.data().get(&TC_TAG).is_none(),
-                "No records should have tc tag when skip_tc_tags=true"
+                tc_info_from_raw(record).is_none(),
+                "No records should have pa tag when skip_tc_tags=true"
             );
         }
 
@@ -3376,50 +2900,56 @@ mod tests {
         const FLAG_UNMAPPED: u16 = 0x4;
 
         // Create a template with primary + supplementary
-        let primary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
+        let primary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
-        let supplementary_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .reference_sequence_id(5)
-            .alignment_start(5000)
-            .cigar("4M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY))
-            .build();
+        let supplementary_r1 = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_SUPPLEMENTARY)
+                .ref_id(5)
+                .pos(4999)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 4)])
+                .sequence(b"ACGT")
+                .qualities(&[30u8; 4]);
+            b.build()
+        };
 
         let mut template = Template::from_records(vec![primary_r1, supplementary_r1])?;
 
         // Create unmapped template
-        let unmapped_record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACGT")
-            .qualities(&[30, 30, 30, 30])
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED))
-            .tag("RX", "AAAA")
-            .build();
+        let unmapped_record = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1").flags(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED);
+            b.add_string_tag(b"RX", b"AAAA");
+            b.sequence(b"ACGT").qualities(&[30u8; 4]);
+            b.build()
+        };
         let unmapped = Template::from_records(vec![unmapped_record])?;
 
         let tag_info = TagInfo::new(vec![], vec![], vec![]);
 
         // Test with skip_tc_tags = false
-        merge(&unmapped, &mut template, &tag_info, false)?;
+        merge_raw(&unmapped, &mut template, &tag_info, false)?;
 
-        // Supplementary SHOULD have tc tag when skip_tc_tags is false
-        let has_tc_tag = template
-            .records
+        // Supplementary SHOULD have pa tag when skip_tc_tags is false
+        let has_pa_tag = template
+            .records()
             .iter()
-            .any(|r| r.flags().is_supplementary() && r.data().get(&TC_TAG).is_some());
+            .any(|r| r.is_supplementary() && tc_info_from_raw(r).is_some());
 
-        assert!(has_tc_tag, "Supplementary should have tc tag when skip_tc_tags=false");
+        assert!(has_pa_tag, "Supplementary should have pa tag when skip_tc_tags=false");
 
         Ok(())
     }
@@ -3433,26 +2963,29 @@ mod tests {
     /// - Tags on all reads (primary, secondary, supplementary) are normalized
     #[test]
     fn test_as_xs_normalization() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
         unmapped.add_frag_with_attrs("q1", None, true, &attrs);
 
         // Add mapped read with AS as Int32(77) and XS as Int32(50)
-        let mapped_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::empty())
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 77i32)
-            .tag("XS", 50i32)
-            .build();
+        let mapped_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(0)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 77);
+            b.add_int_tag(b"XS", 50);
+            to_record_buf(b.build())
+        };
         mapped.push_record(mapped_rec);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -3474,26 +3007,29 @@ mod tests {
     /// Verifies that AS values >127 are normalized to Int16 rather than Int8
     #[test]
     fn test_as_xs_normalization_large_values() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
         unmapped.add_frag_with_attrs("q1", None, true, &attrs);
 
         // AS=200 exceeds i8 range, XS=-200 exceeds i8 range
-        let mapped_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::empty())
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("100M")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 200i32)
-            .tag("XS", -200i32)
-            .build();
+        let mapped_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(0)
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 100)])
+                .sequence(&b"A".repeat(100))
+                .qualities(&[30u8; 100]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 200);
+            b.add_int_tag(b"XS", -200);
+            to_record_buf(b.build())
+        };
         mapped.push_record(mapped_rec);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -3517,8 +3053,8 @@ mod tests {
     /// - Tags on R2 (positive strand) are copied unchanged
     #[test]
     fn test_negative_strand_r1_tag_copying() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("n1", BufValue::from(vec![1i16, 2, 3]));
@@ -3578,8 +3114,8 @@ mod tests {
     /// Verifies that tags on both reads are reversed/revcomped
     #[test]
     fn test_negative_strand_both_reads() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("n1", BufValue::from(vec![10i16, 20, 30]));
@@ -3627,41 +3163,41 @@ mod tests {
     /// - MC tag contains the mate's CIGAR string
     #[test]
     fn test_fix_mate_info_values() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
         unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
 
         // Build mapped pair with different CIGARs and mapping qualities
-        let r1_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("50M")
-            .mapping_quality(40)
-            .sequence(&"A".repeat(50))
-            .qualities(&[30u8; 50])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .build();
-        let r2_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::LAST_SEGMENT
-                    | Flags::REVERSE_COMPLEMENTED
-                    | Flags::PROPERLY_SEGMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(300)
-            .cigar("75M")
-            .mapping_quality(30)
-            .sequence(&"A".repeat(75))
-            .qualities(&[30u8; 75])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .build();
+        let r1_mapped = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(99)
+                .mapq(40)
+                .cigar_ops(&[encode_op(0, 50)])
+                .sequence(&b"A".repeat(50))
+                .qualities(&[30u8; 50]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            to_record_buf(b.build())
+        };
+        let r2_mapped = {
+            let mut b = RawSamBuilder::new();
+            // PROPERLY_SEGMENTED = 0x2
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | 0x2)
+                .ref_id(0)
+                .pos(299)
+                .mapq(30)
+                .cigar_ops(&[encode_op(0, 75)])
+                .sequence(&b"A".repeat(75))
+                .qualities(&[30u8; 75]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            to_record_buf(b.build())
+        };
         mapped.push_record(r1_mapped);
         mapped.push_record(r2_mapped);
 
@@ -3739,64 +3275,61 @@ mod tests {
     /// - ms (mate score) tag is set from mate primary's AS tag
     #[test]
     fn test_fix_mate_info_supplementary() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
         unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
 
         // Add primary pair with known CIGARs, positions, mapqs, and per-read AS tags
-        let r1_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("50M")
-            .mapping_quality(40)
-            .sequence(&"A".repeat(50))
-            .qualities(&[30u8; 50])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 77i32)
-            .build();
-        let r2_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::LAST_SEGMENT
-                    | Flags::REVERSE_COMPLEMENTED
-                    | Flags::PROPERLY_SEGMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(300)
-            .cigar("75M")
-            .mapping_quality(30)
-            .sequence(&"A".repeat(75))
-            .qualities(&[30u8; 75])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 55i32)
-            .build();
+        let r1_mapped = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(99)
+                .mapq(40)
+                .cigar_ops(&[encode_op(0, 50)])
+                .sequence(&b"A".repeat(50))
+                .qualities(&[30u8; 50]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 77);
+            to_record_buf(b.build())
+        };
+        let r2_mapped = {
+            let mut b = RawSamBuilder::new();
+            // PROPERLY_SEGMENTED = 0x2
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | 0x2)
+                .ref_id(0)
+                .pos(299)
+                .mapq(30)
+                .cigar_ops(&[encode_op(0, 75)])
+                .sequence(&b"A".repeat(75))
+                .qualities(&[30u8; 75]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 55);
+            to_record_buf(b.build())
+        };
         mapped.push_record(r1_mapped);
         mapped.push_record(r2_mapped);
 
         // Add R1 supplementary alignment
-        let supp_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::FIRST_SEGMENT
-                    | Flags::SUPPLEMENTARY
-                    | Flags::REVERSE_COMPLEMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(500)
-            .cigar("60M")
-            .mapping_quality(20)
-            .sequence(&"A".repeat(60))
-            .qualities(&[30u8; 60])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 33i32)
-            .build();
+        let supp_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::SUPPLEMENTARY | flags::REVERSE)
+                .ref_id(0)
+                .pos(499)
+                .mapq(20)
+                .cigar_ops(&[encode_op(0, 60)])
+                .sequence(&b"A".repeat(60))
+                .qualities(&[30u8; 60]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 33);
+            to_record_buf(b.build())
+        };
         mapped.push_record(supp_rec);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -3872,8 +3405,8 @@ mod tests {
     /// - TLEN is 0 for both reads
     #[test]
     fn test_fix_mate_info_one_unmapped() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
@@ -3913,63 +3446,60 @@ mod tests {
     /// from the R1 primary alignment (covers the R2 supplemental path).
     #[test]
     fn test_fix_mate_info_r2_supplementary() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
         unmapped.add_pair_with_attrs("q1", None, None, true, true, &attrs);
 
-        let r1_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::MATE_REVERSE_COMPLEMENTED)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .cigar("50M")
-            .mapping_quality(40)
-            .sequence(&"A".repeat(50))
-            .qualities(&[30u8; 50])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 77i32)
-            .build();
-        let r2_mapped = RecordBuilder::new()
-            .name("q1")
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::LAST_SEGMENT
-                    | Flags::REVERSE_COMPLEMENTED
-                    | Flags::PROPERLY_SEGMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(300)
-            .cigar("75M")
-            .mapping_quality(30)
-            .sequence(&"A".repeat(75))
-            .qualities(&[30u8; 75])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 55i32)
-            .build();
+        let r1_mapped = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .ref_id(0)
+                .pos(99)
+                .mapq(40)
+                .cigar_ops(&[encode_op(0, 50)])
+                .sequence(&b"A".repeat(50))
+                .qualities(&[30u8; 50]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 77);
+            to_record_buf(b.build())
+        };
+        let r2_mapped = {
+            let mut b = RawSamBuilder::new();
+            // PROPERLY_SEGMENTED = 0x2
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | 0x2)
+                .ref_id(0)
+                .pos(299)
+                .mapq(30)
+                .cigar_ops(&[encode_op(0, 75)])
+                .sequence(&b"A".repeat(75))
+                .qualities(&[30u8; 75]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 55);
+            to_record_buf(b.build())
+        };
         mapped.push_record(r1_mapped);
         mapped.push_record(r2_mapped);
 
         // Add R2 supplementary alignment
-        let supp_rec = RecordBuilder::new()
-            .name("q1")
-            .flags(
-                Flags::SEGMENTED
-                    | Flags::LAST_SEGMENT
-                    | Flags::SUPPLEMENTARY
-                    | Flags::REVERSE_COMPLEMENTED,
-            )
-            .reference_sequence_id(0)
-            .alignment_start(500)
-            .cigar("60M")
-            .mapping_quality(20)
-            .sequence(&"A".repeat(60))
-            .qualities(&[30u8; 60])
-            .tag("PG", MAPPED_PG_ID.to_string())
-            .tag("AS", 33i32)
-            .build();
+        let supp_rec = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::SUPPLEMENTARY | flags::REVERSE)
+                .ref_id(0)
+                .pos(499)
+                .mapq(20)
+                .cigar_ops(&[encode_op(0, 60)])
+                .sequence(&b"A".repeat(60))
+                .qualities(&[30u8; 60]);
+            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(b"AS", 33);
+            to_record_buf(b.build())
+        };
         mapped.push_record(supp_rec);
 
         let records = run_zipper(&unmapped, &mapped, vec![], vec![], vec![])?;
@@ -4028,8 +3558,8 @@ mod tests {
     /// - MQ/MC tags are removed from both reads
     #[test]
     fn test_fix_mate_info_both_unmapped() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
@@ -4064,8 +3594,8 @@ mod tests {
     /// `Int16` array, `UInt8`, `Hex`, and `Float`.
     #[test]
     fn test_varied_tag_types_roundtrip() -> Result<()> {
-        let mut unmapped = SamBuilder::new_unmapped();
-        let mut mapped = SamBuilder::new_mapped();
+        let mut unmapped = FgSamBuilder::new_unmapped();
+        let mut mapped = FgSamBuilder::new_mapped();
 
         let mut attrs = HashMap::new();
         attrs.insert("RX", BufValue::from("ACGT".to_string()));
@@ -4129,13 +3659,13 @@ mod tests {
     }
 
     #[rstest]
-    // --skip-tc-tags (default false)
+    // --skip-pa-tags (default false)
     #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam"], false)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags", "true"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags", "false"], false)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags=true"], true)]
-    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-tc-tags=false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags", "false"], false)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=true"], true)]
+    #[case(&["zipper", "-u", "u.bam", "-r", "ref.fa", "-o", "out.bam", "--skip-pa-tags=false"], false)]
     fn test_skip_tc_tags_parsing(#[case] args: &[&str], #[case] expected: bool) {
         let cmd = Zipper::try_parse_from(args).expect("failed to parse Zipper arguments");
         assert_eq!(cmd.skip_tc_tags, expected);
@@ -4154,592 +3684,294 @@ mod tests {
         assert_eq!(cmd.restore_unconverted_bases, expected);
     }
 
-    /// Helper for the raw-byte restore tests: encode a `RecordBuf` to BAM
-    /// bytes, run the raw-byte restore, and return the resulting SEQ as ASCII.
-    /// Mirrors the assertion shape of the `RecordBuf` tests so equivalence is
-    /// obvious at a glance.
-    fn run_restore_raw(
-        record: &RecordBuf,
-        reference: &ReferenceReader,
-        header: &Header,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let mut raw = Vec::with_capacity(256);
-        encode_record_buf(&mut raw, header, record)
-            .map_err(|e| anyhow::anyhow!("encode_record_buf failed: {e}"))?;
-        let mut rec = RawRecord::from(raw);
-        restore_unconverted_bases_in_raw_record(&mut rec, reference, header)?;
-        let raw = rec.into_inner();
-        let seq = bam_fields::extract_sequence(&raw);
-        Ok((raw, seq))
+    /// Helper: decode the sequence from a `RawRecord` to ASCII bytes.
+    fn raw_sequence(rec: &RawRecord) -> Vec<u8> {
+        rec.view().sequence_vec()
     }
 
-    /// Raw-byte equivalent of `test_restore_unconverted_bases_top_strand` —
-    /// asserts the new `restore_unconverted_bases_in_raw_record` (which operates
-    /// on packed BAM bytes without round-tripping through `RecordBuf`) produces
-    /// the same SEQ as the `RecordBuf` path for the canonical top-strand case.
-    #[test]
-    fn test_restore_unconverted_bases_in_raw_record_top_strand() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        // Reference: ACGTACGTACGT (chr1) — C positions: 2, 6, 10
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        // Same record as test_restore_unconverted_bases_top_strand
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ATGTATGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .build();
-
-        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
-        assert_eq!(seq, b"ACGTACGT");
-
-        Ok(())
+    /// Helper: check that a tag is absent in a `RawRecord`'s aux data.
+    fn raw_tag_absent(rec: &RawRecord, tag: [u8; 2]) -> bool {
+        fgumi_raw_bam::find_string_tag_in_record(rec.as_ref(), &tag).is_none()
+            && fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), &tag)
+                .is_none()
     }
 
-    /// Raw-byte equivalent of `test_restore_unconverted_bases_bottom_strand` —
-    /// bottom strand restores A→G at ref-G positions.
+    /// Raw-byte mirror of `test_restore_unconverted_bases_top_strand`.
     #[test]
-    fn test_restore_unconverted_bases_in_raw_record_bottom_strand() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_top_strand() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
         let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
         let reference = ReferenceReader::new(fasta.path())?;
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
 
-        // A at positions 3,7 = ref-G → restore to G
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACATACAT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2))
-            .tag("YD", "r")
-            .build();
-
-        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
-        assert_eq!(seq, b"ACGTACGT");
-
-        Ok(())
-    }
-
-    /// Raw-byte equivalent of `test_restore_unconverted_bases_top_strand_reverse` —
-    /// reverse-strand top-strand reads restore A→G (the complement of T→C) at
-    /// ref-G positions (the complement of ref-C).
-    #[test]
-    fn test_restore_unconverted_bases_in_raw_record_top_strand_reverse() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACATACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE))
-            .tag("YD", "f")
-            .build();
-
-        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
-        assert_eq!(seq, b"ACGTACGT");
-
-        Ok(())
-    }
-
-    /// Raw-byte equivalent of `test_restore_unconverted_bases_skips_no_yd_tag` —
-    /// records without a YD tag come through unchanged.
-    #[test]
-    fn test_restore_unconverted_bases_in_raw_record_skips_no_yd_tag() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
-
-        // No YD tag — function must early-exit and leave SEQ untouched.
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("TTTTTTTT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
-
-        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
-        assert_eq!(seq, b"TTTTTTTT");
-
-        Ok(())
-    }
-
-    /// Raw-byte equivalent of `test_restore_unconverted_bases_skips_unmapped` —
-    /// unmapped records come through unchanged.
-    #[test]
-    fn test_restore_unconverted_bases_in_raw_record_skips_unmapped() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
-
-        let record = RecordBuilder::new()
-            .name("q1")
-            .sequence("TTTTTTTT")
-            .qualities(&[30; 8])
-            .flags(Flags::UNMAPPED)
-            .tag("YD", "f")
-            .build();
-
-        let (_raw, seq) = run_restore_raw(&record, &reference, &header)?;
-        assert_eq!(seq, b"TTTTTTTT");
-
-        Ok(())
-    }
-
-    /// Raw-byte path with NM/MD tags present: removed only when SEQ is modified.
-    /// Mirrors the implicit contract of the `RecordBuf` path's stale-tag clearing.
-    #[test]
-    fn test_restore_unconverted_bases_in_raw_record_clears_nm_md_when_modified() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        // SEQ modified case: T at ref-C should restore, NM/MD should be removed.
-        let modified_record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ATGTATGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .tag("NM", 2i32)
-            .tag("MD", "1C3C2")
-            .build();
-        let (raw, _seq) = run_restore_raw(&modified_record, &reference, &header)?;
-        let aux = bam_fields::aux_data_slice(&raw);
-        assert!(bam_fields::find_tag_type(aux, &SamTag::NM).is_none(), "NM should be removed");
-        assert!(bam_fields::find_tag_type(aux, &SamTag::MD).is_none(), "MD should be removed");
-
-        // SEQ unchanged case: read already matches ref, NM/MD must be preserved.
-        let unchanged_record = RecordBuilder::new()
-            .name("q2")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .tag("NM", 0i32)
-            .tag("MD", "8")
-            .build();
-        let (raw, _seq) = run_restore_raw(&unchanged_record, &reference, &header)?;
-        let aux = bam_fields::aux_data_slice(&raw);
-        assert!(bam_fields::find_tag_type(aux, &SamTag::NM).is_some(), "NM should be kept");
-        assert!(bam_fields::find_tag_type(aux, &SamTag::MD).is_some(), "MD should be kept");
-
-        Ok(())
-    }
-
-    /// Parity test: the raw-byte path's own `read_pos` / `ref_offset` bookkeeping
-    /// must match the `RecordBuf` oracle across nontrivial CIGARs (`I`, `D`, `N`).
-    /// The straight-`M` raw tests wouldn't catch an off-by-one in the indel arms.
-    #[rstest]
-    #[case::match_insert_delete_match("2M1I2M1D3M", "TTNATTGT", "f", FLAG_READ1)]
-    #[case::match_insert_match("4M1I3M", "ATGTNATG", "f", FLAG_READ1)]
-    #[case::match_delete_match("4M1D3M", "ATGTATG", "f", FLAG_READ1)]
-    #[case::match_skip_match("4M1N3M", "ATGTATG", "f", FLAG_READ1)]
-    #[case::bottom_strand_indels("2M1I2M1D3M", "ACNTAGAT", "r", FLAG_READ2)]
-    fn test_restore_unconverted_bases_in_raw_record_indels_parity(
-        #[case] cigar: &str,
-        #[case] sequence: &str,
-        #[case] yd: &str,
-        #[case] flag_mate: u16,
-    ) -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        let quals = vec![30u8; sequence.len()];
-        let build = || {
-            RecordBuilder::new()
-                .name("q1")
-                .sequence(sequence)
-                .qualities(&quals)
-                .reference_sequence_id(0)
-                .alignment_start(1)
-                .cigar(cigar)
-                .flags(Flags::from(FLAG_PAIRED | flag_mate))
-                .tag("YD", yd)
-                .tag("NM", 1i32)
-                .tag("MD", "8")
-                .build()
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ATGTATGT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.build()
         };
-
-        // Oracle: RecordBuf path produces the expected SEQ.
-        let mut oracle = build();
-        restore_unconverted_bases_in_record(&mut oracle, &reference, &header)?;
-        let oracle_seq: Vec<u8> = oracle.sequence().as_ref().to_vec();
-        let oracle_modified = oracle_seq != sequence.as_bytes();
-
-        // Raw-byte path: SEQ must match the oracle byte-for-byte, and stale NM/MD
-        // must be cleared iff the oracle modified the SEQ.
-        let (raw, raw_seq) = run_restore_raw(&build(), &reference, &header)?;
-        assert_eq!(raw_seq, oracle_seq, "raw SEQ mismatch for CIGAR {cigar}");
-
-        let aux = bam_fields::aux_data_slice(&raw);
-        let nm_present = bam_fields::find_tag_type(aux, &SamTag::NM).is_some();
-        let md_present = bam_fields::find_tag_type(aux, &SamTag::MD).is_some();
-        if oracle_modified {
-            assert!(!nm_present, "NM should be removed when SEQ modified (CIGAR {cigar})");
-            assert!(!md_present, "MD should be removed when SEQ modified (CIGAR {cigar})");
-        } else {
-            assert!(nm_present, "NM should be preserved when SEQ unchanged (CIGAR {cigar})");
-            assert!(md_present, "MD should be preserved when SEQ unchanged (CIGAR {cigar})");
-        }
-
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
         Ok(())
     }
 
-    /// Tests that `restore_unconverted_bases_in_record` replaces T→C at ref-C positions
-    /// for top-strand reads (YD:Z:f).
+    /// Raw-byte mirror of `test_restore_unconverted_bases_bottom_strand`.
     #[test]
-    fn test_restore_unconverted_bases_top_strand() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_bottom_strand() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
-        // Reference: ACGTACGTACGT (chr1)
-        // Positions:  1234567890..
-        // C positions: 2, 6, 10
         let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
-        // Build a header with chr1
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
 
-        // Create a record aligned to pos 1 with 8M CIGAR
-        // Sequence: ATGTATGT (T at positions 2,6 = ref-C positions → should be restored to C)
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ATGTATGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        // Position 1: A (ref=A, no change)
-        // Position 2: T→C (ref=C, top strand, T was converted)
-        // Position 3: G (ref=G, no change)
-        // Position 4: T (ref=T, no change)
-        // Position 5: A (ref=A, no change)
-        // Position 6: T→C (ref=C, top strand, T was converted)
-        // Position 7: G (ref=G, no change)
-        // Position 8: T (ref=T, no change)
-        assert_eq!(seq, b"ACGTACGT");
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ2)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACATACAT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"r");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
         Ok(())
     }
 
-    /// Tests that `restore_unconverted_bases_in_record` replaces A→G at ref-G positions
-    /// for bottom-strand reads (YD:Z:r).
+    /// Raw-byte mirror of `test_restore_unconverted_bases_with_indels`.
     #[test]
-    fn test_restore_unconverted_bases_bottom_strand() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_with_indels() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
-        // Reference: ACGTACGTACGT (chr1)
-        // G positions: 3, 7, 11
         let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
 
-        // Record at pos 1 with 8M. A at positions 3,7 = ref-G → should be restored to G
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACATACAT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2))
-            .tag("YD", "r")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        assert_eq!(seq, b"ACGTACGT");
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[
+                    encode_op(0, 2),
+                    encode_op(1, 1),
+                    encode_op(0, 2),
+                    encode_op(2, 1),
+                    encode_op(0, 3),
+                ])
+                .sequence(b"TTNATTGT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"TCNATCGT");
         Ok(())
     }
 
-    /// Tests that `restore_unconverted_bases_in_record` handles insertions and deletions.
+    /// Raw-byte mirror of `test_restore_unconverted_bases_skips_unmapped`.
     #[test]
-    fn test_restore_unconverted_bases_with_indels() -> Result<()> {
-        use crate::sam::builder::create_test_fasta;
-
-        // Reference: ACGTACGTACGT
-        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
-        let reference = ReferenceReader::new(fasta.path())?;
-
-        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
-
-        // CIGAR: 2M1I2M1D3M → 8 read bases, 8 ref bases consumed
-        // ref_bases (pos 1-8): A C G T A C G T
-        //
-        // Walk:
-        //   2M: read[0,1] vs ref[0,1](A,C) → T stays, T→C
-        //   1I: read[2] (insertion, no ref)
-        //   2M: read[3,4] vs ref[2,3](G,T) → no change (not ref-C)
-        //   1D: ref[4](A) skipped
-        //   3M: read[5,6,7] vs ref[5,6,7](C,G,T) → T→C, G stays, T stays
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("TTNATTGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("2M1I2M1D3M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        assert_eq!(seq, b"TCNATCGT");
-
-        Ok(())
-    }
-
-    /// Tests that `restore_unconverted_bases_in_record` skips unmapped reads.
-    #[test]
-    fn test_restore_unconverted_bases_skips_unmapped() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_skips_unmapped() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
         let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
 
-        // Unmapped read — should be left unchanged
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("TTTTTTTT")
-            .qualities(&[30; 8])
-            .flags(Flags::UNMAPPED)
-            .tag("YD", "f")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        assert_eq!(seq, b"TTTTTTTT"); // Unchanged
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1").flags(flags::UNMAPPED).sequence(b"TTTTTTTT").qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"TTTTTTTT");
         Ok(())
     }
 
-    /// Tests that `restore_unconverted_bases_in_record` skips reads without YD tag.
+    /// Raw-byte mirror of `test_restore_unconverted_bases_skips_no_yd_tag`.
     #[test]
-    fn test_restore_unconverted_bases_skips_no_yd_tag() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_skips_no_yd_tag() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
         let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
 
-        // Mapped read without YD tag — should be left unchanged
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("TTTTTTTT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        assert_eq!(seq, b"TTTTTTTT"); // Unchanged
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"TTTTTTTT")
+                .qualities(&[30u8; 8]);
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"TTTTTTTT");
         Ok(())
     }
 
-    /// Tests that non-converted bases at ref-C positions are left alone.
+    /// Raw-byte mirror of `test_restore_unconverted_bases_preserves_already_unconverted`.
     #[test]
-    fn test_restore_unconverted_bases_preserves_already_unconverted() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_preserves_already_unconverted() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
-        // Reference: CCCCCCCC (all C positions)
         let fasta = create_test_fasta(&[("chr1", "CCCCCCCC")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
 
-        // Top strand: some bases already C (unconverted), some T (converted), some other
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("CTCACTGC")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        // C stays C, T→C, C stays C, A stays A (not T→C), C stays C, T→C, G stays G, C stays C
-        assert_eq!(seq, b"CCCACCGC");
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"CTCACTGC")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"CCCACCGC");
         Ok(())
     }
 
-    /// Top-strand read aligned to a span with no reference Cs: nothing to restore.
-    /// Exercises the `memchr2` early-exit fast path — record must come through
-    /// byte-for-byte unchanged (including any T's, which would only be candidates
-    /// where the reference is C).
+    /// Raw-byte mirror of `test_restore_unconverted_bases_no_target_in_span`.
+    /// When no base changes are made, NM and MD tags must be preserved.
     #[test]
-    fn test_restore_unconverted_bases_no_target_in_span() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_no_target_in_span() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
-        // Reference is all A/T/G — no C anywhere in the aligned span.
         let fasta = create_test_fasta(&[("chr1", "ATGTATGT")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:8\n".parse().unwrap();
 
-        // SEQ contains T's but they cannot be restoration candidates because
-        // the reference span has no C positions for them to align to.
-        let original_seq = b"ATGTATGT";
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence(std::str::from_utf8(original_seq)?)
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1))
-            .tag("YD", "f")
-            .tag("NM", 0i32)
-            .tag("MD", "8")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        assert_eq!(seq, original_seq);
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ATGTATGT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.add_int_tag(b"NM", 0);
+            b.add_string_tag(b"MD", b"8");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"ATGTATGT");
         // No SEQ change => NM/MD must remain present.
-        assert!(record.data().get(&Tag::from(SamTag::NM)).is_some());
-        assert!(record.data().get(&Tag::from(SamTag::MD)).is_some());
-
+        assert!(!raw_tag_absent(&raw, *b"NM"), "NM should remain when no bases were changed");
+        assert!(!raw_tag_absent(&raw, *b"MD"), "MD should remain when no bases were changed");
         Ok(())
     }
 
-    /// Tests restoration for a reverse-complemented top-strand read (YD:Z:f, 0x10 set).
-    /// SEQ is stored as the reverse complement, so at ref-G positions (complement of C),
-    /// converted A (complement of T) should be restored to G (complement of C).
+    /// Raw-byte mirror of `test_restore_unconverted_bases_top_strand_reverse`.
     #[test]
-    fn test_restore_unconverted_bases_top_strand_reverse() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_top_strand_reverse() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
-        // Reference: ACGTACGTACGT (chr1)
-        // G positions (1-based): 3, 7, 11
         let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
 
-        // Aligned at pos 1 with 8M, reverse-complemented (0x10).
-        // Reference region: ACGTACGT (pos 1-8)
-        // SEQ (stored RC'd): at ref-G positions 3,7 show A (converted) instead of G
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ACATACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE))
-            .tag("YD", "f")
-            .build();
-
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
-
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        // Positions 3,7 (ref=G): A→G restored
-        assert_eq!(seq, b"ACGTACGT");
-
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1 | FLAG_REVERSE)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ACATACGT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
         Ok(())
     }
 
-    /// Tests restoration for a reverse-complemented bottom-strand read (YD:Z:r, 0x10 set).
-    /// SEQ is stored as the reverse complement, so at ref-C positions,
-    /// converted T (complement of A) should be restored to C (complement of G).
+    /// Raw-byte mirror of `test_restore_unconverted_bases_bottom_strand_reverse`.
     #[test]
-    fn test_restore_unconverted_bases_bottom_strand_reverse() -> Result<()> {
+    fn test_raw_restore_unconverted_bases_bottom_strand_reverse() -> Result<()> {
         use crate::sam::builder::create_test_fasta;
 
-        // Reference: ACGTACGTACGT (chr1)
-        // C positions (1-based): 2, 6, 10
         let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
         let reference = ReferenceReader::new(fasta.path())?;
-
         let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
 
-        // Aligned at pos 1 with 8M, reverse-complemented (0x10).
-        // Reference region: ACGTACGT (pos 1-8)
-        // For (is_top=false, is_reverse=true): ref_target=C, converted=T, unconverted=C
-        // At ref-C positions 2,6: SEQ shows T (converted) instead of C
-        let mut record = RecordBuilder::new()
-            .name("q1")
-            .sequence("ATGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("8M")
-            .flags(Flags::from(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE))
-            .tag("YD", "r")
-            .build();
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ2 | FLAG_REVERSE)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ATGTACGT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"r");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
+        Ok(())
+    }
 
-        restore_unconverted_bases_in_record(&mut record, &reference, &header)?;
+    /// When SEQ changes are made, NM and MD tags must be removed.
+    #[test]
+    fn test_raw_restore_removes_nm_md_when_bases_changed() -> Result<()> {
+        use crate::sam::builder::create_test_fasta;
 
-        let seq: Vec<u8> = record.sequence().as_ref().to_vec();
-        // Positions 2,6 (ref=C): T→C restored
-        assert_eq!(seq, b"ACGTACGT");
+        let fasta = create_test_fasta(&[("chr1", "ACGTACGTACGT")])?;
+        let reference = ReferenceReader::new(fasta.path())?;
+        let header: Header = "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:chr1\tLN:12\n".parse().unwrap();
 
+        let mut raw = {
+            let mut b = RawSamBuilder::new();
+            b.read_name(b"q1")
+                .flags(FLAG_PAIRED | FLAG_READ1)
+                .ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .cigar_ops(&[encode_op(0, 8)])
+                .sequence(b"ATGTATGT")
+                .qualities(&[30u8; 8]);
+            b.add_string_tag(b"YD", b"f");
+            b.add_int_tag(b"NM", 2);
+            b.add_string_tag(b"MD", b"1T3T2");
+            b.build()
+        };
+        restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
+        // SEQ changed (T→C at ref-C positions) so NM/MD must be gone.
+        assert_eq!(raw_sequence(&raw), b"ACGTACGT");
+        assert!(raw_tag_absent(&raw, *b"NM"), "NM should be removed when bases were changed");
+        assert!(raw_tag_absent(&raw, *b"MD"), "MD should be removed when bases were changed");
         Ok(())
     }
 }
