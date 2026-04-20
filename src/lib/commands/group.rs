@@ -1,7 +1,7 @@
 //! Groups reads by UMI to identify reads from the same original molecule.
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
-use crate::bam_io::{create_bam_reader_for_pipeline_with_opts, create_bam_writer, is_stdin_path};
+use crate::bam_io::{create_bam_reader_for_pipeline, create_bam_writer, is_stdin_path};
 use crate::commands::command::Command;
 use crate::commands::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
@@ -16,8 +16,8 @@ use crate::metrics::group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGrou
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
-use crate::sam::{is_sorted, is_template_coordinate_sorted, unclipped_five_prime_position};
-use crate::template::{MoleculeId, Template};
+use crate::sam::{is_sorted, is_template_coordinate_sorted};
+use crate::template::Template;
 use crate::umi::parallel_assigner::{
     ParallelAdjacencyAssigner, ParallelEditAssigner, ParallelIdentityAssigner,
     ParallelPairedAssigner,
@@ -28,7 +28,6 @@ use crate::unified_pipeline::compute_group_key_from_raw;
 use crate::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
-use bstr::BString;
 use clap::Parser;
 use fgoxide::io::DelimFile;
 // MemoryEstimate is gated because it's only used in memory-debug blocks below
@@ -36,14 +35,10 @@ use crate::sam::SamTag;
 #[cfg(feature = "memory-debug")]
 use crate::unified_pipeline::MemoryEstimate;
 use crate::validation::validate_file_exists;
-use crate::vendored::bam_codec::encode_record_buf;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
 use log::{info, warn};
-use noodles::sam;
 use noodles::sam::Header;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
 use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,121 +102,6 @@ struct GroupFilterConfig {
     allow_unmapped: bool,
 }
 
-/// Filter a template based on filtering criteria using the noodles typed API.
-///
-/// Returns true if the template should be kept, false if it should be discarded.
-/// Updates `filter_metrics` with the reason for filtering.
-///
-/// **Retention:** kept as a noodles fallback for any caller that supplies parsed (non-raw)
-/// templates. The primary execution paths use `filter_template_raw` instead.
-fn filter_template(
-    template: &Template,
-    config: &GroupFilterConfig,
-    metrics: &mut FilterMetrics,
-) -> bool {
-    // Get primary reads for filtering
-    let r1 = template.r1();
-    let r2 = template.r2();
-
-    // Count records, not templates (paired template = 2 records)
-    let num_primary_reads = r1.is_some() as u64 + r2.is_some() as u64;
-    metrics.total_templates += num_primary_reads;
-
-    // Need at least one primary read
-    if r1.is_none() && r2.is_none() {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // Check if both reads are unmapped (poor alignment)
-    let both_unmapped =
-        r1.is_none_or(|r| r.flags().is_unmapped()) && r2.is_none_or(|r| r.flags().is_unmapped());
-
-    if both_unmapped && !config.allow_unmapped {
-        metrics.discarded_poor_alignment += num_primary_reads;
-        return false;
-    }
-
-    // =========================================================================
-    // Phase 1: Cheap flag-based checks for all reads (no tag lookups)
-    // =========================================================================
-    for record in [r1, r2].into_iter().flatten() {
-        let flags = record.flags();
-
-        // Filter non-PF if requested
-        if !config.include_non_pf && flags.is_qc_fail() {
-            metrics.discarded_non_pf += num_primary_reads;
-            return false;
-        }
-
-        // Check MAPQ for mapped reads
-        if !flags.is_unmapped() {
-            let mapq = record.mapping_quality().map_or(0, u8::from);
-            if mapq < config.min_mapq {
-                metrics.discarded_poor_alignment += num_primary_reads;
-                return false;
-            }
-        }
-    }
-
-    // =========================================================================
-    // Phase 2: Expensive tag lookups (only reached if phase 1 passed)
-    // =========================================================================
-    for record in [r1, r2].into_iter().flatten() {
-        let flags = record.flags();
-
-        // Check mate MAPQ via MQ tag if mate is mapped
-        if !flags.is_mate_unmapped() {
-            if let Some(data) = record.data().get(b"MQ") {
-                if let Some(mq) = data.as_int() {
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    if (mq as u8) < config.min_mapq {
-                        metrics.discarded_poor_alignment += num_primary_reads;
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Skip UMI validation in no-umi mode
-        if config.no_umi {
-            continue;
-        }
-
-        // Check UMI for Ns and minimum length using common validation
-        if let Some(data) = record.data().get(&config.umi_tag) {
-            if let DataValue::String(umi) = data {
-                match validate_umi(umi) {
-                    UmiValidation::ContainsN => {
-                        metrics.discarded_ns_in_umi += num_primary_reads;
-                        return false;
-                    }
-                    UmiValidation::Valid(base_count) => {
-                        // Check minimum UMI length
-                        if let Some(min_len) = config.min_umi_length {
-                            if base_count < min_len {
-                                metrics.discarded_umi_too_short += num_primary_reads;
-                                return false;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // UMI tag is not a string - skip template
-                metrics.discarded_poor_alignment += num_primary_reads;
-                return false;
-            }
-        } else {
-            // Missing UMI tag - skip template
-            metrics.discarded_poor_alignment += num_primary_reads;
-            return false;
-        }
-    }
-
-    metrics.accepted_templates += num_primary_reads;
-    true
-}
-
 // =============================================================================
 // Raw-byte filter and helper functions
 // =============================================================================
@@ -236,8 +116,8 @@ fn filter_template_raw(
     use crate::sort::bam_fields;
     use fgumi_raw_bam::RawRecordView;
 
-    let raw_r1 = template.raw_r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
-    let raw_r2 = template.raw_r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r1 = template.r1().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
+    let raw_r2 = template.r2().filter(|r| r.len() >= bam_fields::MIN_BAM_RECORD_LEN);
 
     let num_primary_reads = raw_r1.is_some() as u64 + raw_r2.is_some() as u64;
     metrics.total_templates += num_primary_reads;
@@ -402,10 +282,10 @@ fn get_pair_orientation_raw(template: &Template) -> (bool, bool) {
     use fgumi_raw_bam::RawRecordView;
 
     let r1_positive = template
-        .raw_r1()
+        .r1()
         .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
     let r2_positive = template
-        .raw_r2()
+        .r2()
         .is_none_or(|r| (RawRecordView::new(r).flags() & bam_fields::flags::REVERSE) == 0);
     (r1_positive, r2_positive)
 }
@@ -481,32 +361,10 @@ fn truncate_umis_impl(umis: Vec<String>, min_umi_length: Option<usize>) -> Resul
     }
 }
 
-/// Check if R1 is genomically earlier than R2 using the noodles typed API.
-///
-/// **Retention:** noodles fallback used by `assign_umi_groups_for_indices_impl` when
-/// templates carry parsed `RecordBuf` data (raw-byte mode uses `is_r1_genomically_earlier_raw`).
-fn is_r1_genomically_earlier_impl(
-    r1: &sam::alignment::RecordBuf,
-    r2: &sam::alignment::RecordBuf,
-) -> Result<bool> {
-    let ref1 = r1.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
-    let ref2 = r2.reference_sequence_id().map_or(-1, |id| i32::try_from(id).unwrap_or(i32::MAX));
-    if ref1 != ref2 {
-        return Ok(ref1 < ref2);
-    }
-    let r1_pos = unclipped_five_prime_position(r1).unwrap_or(0);
-    let r2_pos = unclipped_five_prime_position(r2).unwrap_or(0);
-    Ok(r1_pos <= r2_pos)
-}
-
-/// Get pair orientation for a template using the noodles typed API.
-///
-/// **Retention:** noodles fallback used by `assign_umi_groups_impl` when templates carry
-/// parsed `RecordBuf` data (raw-byte mode uses `get_pair_orientation_raw`).
+/// Get pair orientation for a template.
+#[cfg(test)]
 fn get_pair_orientation_impl(template: &Template) -> (bool, bool) {
-    let r1_positive = template.r1().is_none_or(|r| !r.flags().is_reverse_complemented());
-    let r2_positive = template.r2().is_none_or(|r| !r.flags().is_reverse_complemented());
-    (r1_positive, r2_positive)
+    get_pair_orientation_raw(template)
 }
 
 /// Assign UMI groups to templates (static implementation).
@@ -517,22 +375,13 @@ fn assign_umi_groups_impl(
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
-    // Determine orientation getter based on mode
-    let raw_mode = templates.first().is_some_and(Template::is_raw_byte_mode);
-    debug_assert!(
-        templates.iter().all(|t| t.is_raw_byte_mode() == raw_mode),
-        "Mixed raw/parsed templates in batch"
-    );
+    // All templates are in raw-byte mode (Template always uses RawRecord)
 
     if assigner.split_templates_by_pair_orientation() {
         // Group by pair orientation
         let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
         for (idx, template) in templates.iter().enumerate() {
-            let orientation = if raw_mode {
-                get_pair_orientation_raw(template)
-            } else {
-                get_pair_orientation_impl(template)
-            };
+            let orientation = get_pair_orientation_raw(template);
             subgroups.entry(orientation).or_default().push(idx);
         }
 
@@ -581,7 +430,6 @@ fn assign_umi_groups_for_indices_impl(
 
     // Extract UMIs from templates
     let mut umis = Vec::with_capacity(indices.len());
-    let raw_mode = templates[indices[0]].is_raw_byte_mode();
 
     for &idx in indices {
         let template = &templates[idx];
@@ -590,62 +438,30 @@ fn assign_umi_groups_for_indices_impl(
         let processed_umi = if no_umi {
             String::new()
         } else {
-            let (umi_str_ref, is_r1_earlier) = if raw_mode {
-                // Raw-byte mode: extract UMI from raw bytes
-                use crate::sort::bam_fields;
+            use crate::sort::bam_fields;
 
-                let umi_bytes = if let Some(r1_raw) = template.raw_r1() {
-                    let aux = bam_fields::aux_data_slice(r1_raw);
-                    bam_fields::find_string_tag(aux, &raw_tag)
-                        .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
-                } else if let Some(r2_raw) = template.raw_r2() {
-                    let aux = bam_fields::aux_data_slice(r2_raw);
-                    bam_fields::find_string_tag(aux, &raw_tag)
-                        .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
-                } else {
-                    bail!("Template has no reads");
-                };
-
-                let umi_s = std::str::from_utf8(umi_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in UMI: {e}"))?;
-
-                let earlier = if let (Some(r1), Some(r2)) = (template.raw_r1(), template.raw_r2()) {
-                    is_r1_genomically_earlier_raw(r1, r2)
-                } else {
-                    true
-                };
-
-                (umi_s, earlier)
+            let umi_bytes = if let Some(r1_raw) = template.r1() {
+                let aux = bam_fields::aux_data_slice(r1_raw);
+                bam_fields::find_string_tag(aux, &raw_tag)
+                    .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
+            } else if let Some(r2_raw) = template.r2() {
+                let aux = bam_fields::aux_data_slice(r2_raw);
+                bam_fields::find_string_tag(aux, &raw_tag)
+                    .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else {
-                // Noodles mode
-                let umi_bytes = if let Some(r1) = template.r1() {
-                    if let Some(DataValue::String(bytes)) = r1.data().get(&raw_tag) {
-                        bytes
-                    } else {
-                        bail!("UMI tag is not a string");
-                    }
-                } else if let Some(r2) = template.r2() {
-                    if let Some(DataValue::String(bytes)) = r2.data().get(&raw_tag) {
-                        bytes
-                    } else {
-                        bail!("UMI tag is not a string");
-                    }
-                } else {
-                    bail!("Template has no reads");
-                };
-                let umi_s = std::str::from_utf8(umi_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in UMI: {e}"))?;
-
-                let earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
-                    is_r1_genomically_earlier_impl(r1, r2)?
-                } else {
-                    true
-                };
-
-                (umi_s, earlier)
+                bail!("Template has no reads");
             };
 
-            umi_for_read_impl(umi_str_ref, is_r1_earlier, assigner)?
+            let umi_s = std::str::from_utf8(umi_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in UMI: {e}"))?;
+
+            let is_r1_earlier = if let (Some(r1), Some(r2)) = (template.r1(), template.r2()) {
+                is_r1_genomically_earlier_raw(r1, r2)
+            } else {
+                true
+            };
+
+            umi_for_read_impl(umi_s, is_r1_earlier, assigner)?
         };
 
         umis.push(processed_umi);
@@ -665,29 +481,6 @@ fn assign_umi_groups_for_indices_impl(
     }
 
     Ok(())
-}
-
-/// Set MI tag on a single record using `MoleculeId` with global offset.
-///
-/// Converts the `MoleculeId` enum to a string representation with the base offset applied,
-/// and sets the MI tag on the record. This is called just before writing to minimize
-/// memory usage (strings are not stored until write time).
-///
-/// **Retention:** noodles fallback used by the serializer's non-raw branch
-/// (`!raw_mode`) in both the pipeline and `process_and_write_position_group`. The raw-byte
-/// path injects the MI tag directly via `bam_fields::update_string_tag`.
-#[inline]
-fn set_mi_tag_on_record(
-    record: &mut noodles::sam::alignment::record_buf::RecordBuf,
-    mi: MoleculeId,
-    assign_tag: Tag,
-    base_mi: u64,
-) {
-    if !mi.is_assigned() {
-        return;
-    }
-    let mi_string = mi.to_string_with_offset(base_mi);
-    record.data_mut().insert(assign_tag, DataValue::String(BString::from(mi_string)));
 }
 
 /// Groups reads by UMI to identify reads from the same original molecule
@@ -990,10 +783,7 @@ impl Command for GroupReadsByUmi {
 
         // Open input BAM using streaming-capable reader for pipeline use
         info!("Reading input BAM");
-        let (reader, header) = create_bam_reader_for_pipeline_with_opts(
-            &self.io.input,
-            self.io.pipeline_reader_opts(),
-        )?;
+        let (reader, header) = create_bam_reader_for_pipeline(&self.io.input)?;
 
         // Check sort order - template-coordinate sorted is required,
         // but queryname-sorted is also accepted when --allow-unmapped is set
@@ -1124,9 +914,8 @@ impl Command for GroupReadsByUmi {
         // Template-based batching is enabled by default in auto_tuned() with target=500 templates.
         // This provides consistent batch sizes across datasets with varying templates-per-group ratios.
 
-        // Enable raw-byte mode: skip noodles decode/encode for ~30% CPU savings
         let library_index = LibraryIndex::from_header(&header);
-        pipeline_config.group_key_config = Some(GroupKeyConfig::new_raw(library_index, cell_tag));
+        pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Short-circuit support for memory bisection debugging.
         // Set FGUMI_SHORT_CIRCUIT=process|serialize|compress to skip downstream steps.
@@ -1156,11 +945,9 @@ impl Command for GroupReadsByUmi {
         #[cfg(feature = "memory-debug")]
         let short_circuit_compress = short_circuit == "compress";
 
-        // Counter for contiguous MI assignment. The serialize step is parallel, so each
-        // thread reserves its own block via fetch_add of the per-group
-        // `distinct_mi_count`. AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering
-        // is fine because the counter is never read out-of-band (only the values produced
-        // by fetch_add are used, and each serialize thread uses only its own reservation).
+        // Counter for contiguous MI assignment (incremented in the serial serialize step).
+        // AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering is fine because
+        // the serialize step is serial and ordered.
         let next_mi_base = std::sync::atomic::AtomicU64::new(0);
 
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
@@ -1220,17 +1007,10 @@ impl Command for GroupReadsByUmi {
                 let input_record_count: u64 =
                     all_templates.iter().map(|t| t.read_count() as u64).sum();
 
-                // Filter templates (use raw-byte filter when in raw mode)
-                let raw_mode = all_templates.first().is_some_and(Template::is_raw_byte_mode);
+                // Filter templates
                 let filtered_templates: Vec<Template> = all_templates
                     .into_iter()
-                    .filter(|t| {
-                        if raw_mode {
-                            filter_template_raw(t, &filter_config, &mut filter_metrics)
-                        } else {
-                            filter_template(t, &filter_config, &mut filter_metrics)
-                        }
-                    })
+                    .filter(|t| filter_template_raw(t, &filter_config, &mut filter_metrics))
                     .collect();
 
                 // Track filtered template memory (optimized for hot path).
@@ -1388,7 +1168,7 @@ impl Command for GroupReadsByUmi {
             },
             // serialize_fn: Serialize records + collect metrics (serial, ordered)
             move |processed: ProcessedPositionGroup,
-                  header: &Header,
+                  _header: &Header,
                   output: &mut Vec<u8>|
                   -> std::io::Result<u64> {
                 #[cfg(feature = "memory-debug")]
@@ -1424,9 +1204,6 @@ impl Command for GroupReadsByUmi {
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
-                // Convert assign_tag_bytes to Tag for setting MI
-                let assign_tag = Tag::from(assign_tag_bytes);
-
                 // Track template memory deallocation (templates are consumed here)
                 #[cfg(feature = "memory-debug")]
                 if debug_memory_flag {
@@ -1440,76 +1217,19 @@ impl Command for GroupReadsByUmi {
                 // Each record is serialized and dropped immediately, reducing per-thread peak memory.
                 // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
                 output.reserve(processed.templates.len() * 2 * 400);
-                let raw_mode = processed
-                    .templates
-                    .first()
-                    .is_some_and(Template::is_raw_byte_mode);
-                if raw_mode {
-                    // Raw-byte output: modify MI tag via scratch buffer
-                    use crate::sort::bam_fields;
-                    let mut scratch = Vec::with_capacity(512);
-                    let mut mi_buf = String::with_capacity(16);
-                    for template in &processed.templates {
-                        let mi = template.mi;
-                        // Reuse mi_buf to avoid per-template String allocation
-                        let has_mi = mi.is_assigned();
-                        if has_mi {
-                            mi.write_with_offset(base_mi, &mut mi_buf);
-                        }
-                        for raw in [template.raw_r1(), template.raw_r2()].into_iter().flatten() {
-                            if has_mi {
-                                scratch.clear();
-                                scratch.extend_from_slice(raw);
-                                bam_fields::update_string_tag(
-                                    &mut scratch,
-                                    &assign_tag_bytes,
-                                    mi_buf.as_bytes(),
-                                );
-                                let block_size = scratch.len() as u32;
-                                output.extend_from_slice(&block_size.to_le_bytes());
-                                output.extend_from_slice(&scratch);
-                            } else {
-                                let block_size = raw.len() as u32;
-                                output.extend_from_slice(&block_size.to_le_bytes());
-                                output.extend_from_slice(raw);
-                            }
-                        }
-                    }
-                } else {
-                    thread_local! {
-                        static RECORD_BUF: std::cell::RefCell<Vec<u8>> =
-                            std::cell::RefCell::new(Vec::with_capacity(512));
-                    }
-                    for template in processed.templates {
-                        let mi = template.mi;
-                        let (r1, r2) = template.into_primary_reads();
-                        if let Some(mut r1) = r1 {
-                            set_mi_tag_on_record(&mut r1, mi, assign_tag, base_mi);
-                            RECORD_BUF.with(|buf| -> std::io::Result<()> {
-                                let mut record_data = buf.borrow_mut();
-                                record_data.clear();
-                                encode_record_buf(&mut record_data, header, &r1)?;
-                                let block_size = record_data.len() as u32;
-                                output.extend_from_slice(&block_size.to_le_bytes());
-                                output.extend_from_slice(&record_data);
-                                Ok(())
-                            })?;
-                        }
-                        if let Some(mut r2) = r2 {
-                            set_mi_tag_on_record(&mut r2, mi, assign_tag, base_mi);
-                            RECORD_BUF.with(|buf| -> std::io::Result<()> {
-                                let mut record_data = buf.borrow_mut();
-                                record_data.clear();
-                                encode_record_buf(&mut record_data, header, &r2)?;
-                                let block_size = record_data.len() as u32;
-                                output.extend_from_slice(&block_size.to_le_bytes());
-                                output.extend_from_slice(&record_data);
-                                Ok(())
-                            })?;
-                        }
-                        // r1, r2, and the rest of template are dropped here
-                    }
-                }
+                let mut scratch = Vec::with_capacity(512);
+                let mut mi_buf = String::with_capacity(16);
+                emit_templates_raw_with_mi(
+                    &processed.templates,
+                    base_mi,
+                    assign_tag_bytes,
+                    &mut scratch,
+                    &mut mi_buf,
+                    |bytes| {
+                        output.extend_from_slice(bytes);
+                        Ok(())
+                    },
+                )?;
                 // Short-circuit: let serialize run fully but starve compress/write
                 #[cfg(feature = "memory-debug")]
                 if short_circuit_compress {
@@ -1634,11 +1354,8 @@ impl GroupReadsByUmi {
             let key = compute_group_key_from_raw(&raw_rec, &library_index, Some(cell_tag));
             let decoded = DecodedRecord::from_raw_bytes(raw_rec.clone(), key);
 
-            // Feed to RecordPositionGrouper - may emit completed groups
-            let completed_groups = grouper.add_records(vec![decoded])?;
-
-            // Process any completed position groups immediately
-            for group in completed_groups {
+            // Feed to RecordPositionGrouper - may emit a completed group
+            if let Some(group) = grouper.add_record(decoded)? {
                 Self::process_and_write_position_group(
                     group,
                     filter_config,
@@ -1702,10 +1419,8 @@ impl GroupReadsByUmi {
     /// Process a single position group: build templates, filter, assign UMIs, and write output.
     /// Used by `execute_single_threaded` for streaming processing.
     ///
-    /// Dispatches on raw-byte vs noodles mode based on the template storage format.
-    /// In raw-byte mode (single-threaded path after migration), uses zero-allocation filter
-    /// and direct raw-byte MI-tag injection. The noodles path is kept as a fallback for
-    /// any future code path that supplies parsed templates (e.g. tests or external callers).
+    /// Operates on raw-byte records end-to-end: zero-allocation filter and direct raw-byte
+    /// MI-tag injection, no noodles decode/encode.
     #[allow(clippy::too_many_arguments)]
     fn process_and_write_position_group(
         group: RawPositionGroup,
@@ -1720,7 +1435,7 @@ impl GroupReadsByUmi {
         family_size_counter: &mut AHashMap<usize, u64>,
         position_group_size_counter: &mut AHashMap<usize, u64>,
         next_mi_base: &mut u64,
-        header: &Header,
+        _header: &Header,
         writer: &mut crate::bam_io::BamWriter,
     ) -> Result<()> {
         // Build templates from raw records
@@ -1728,19 +1443,10 @@ impl GroupReadsByUmi {
 
         let mut filter_metrics = FilterMetrics::new();
 
-        // Dispatch filter on template storage mode
-        let raw_mode = all_templates.first().is_some_and(Template::is_raw_byte_mode);
+        // Filter templates
         let filtered_templates: Vec<Template> = all_templates
             .into_iter()
-            .filter(|t| {
-                if raw_mode {
-                    filter_template_raw(t, filter_config, &mut filter_metrics)
-                } else {
-                    // Noodles fallback: retained for any caller that supplies parsed templates
-                    // (e.g. external tests or future commands that don't opt into raw-byte mode).
-                    filter_template(t, filter_config, &mut filter_metrics)
-                }
-            })
+            .filter(|t| filter_template_raw(t, filter_config, &mut filter_metrics))
             .collect();
 
         // Merge filter metrics
@@ -1830,56 +1536,19 @@ impl GroupReadsByUmi {
         let base_mi = *next_mi_base;
         *next_mi_base += distinct_mi_count;
 
-        if raw_mode {
-            // Raw-byte output: inject MI tag directly into raw bytes, write without noodles
-            use crate::sort::bam_fields;
-            use std::io::Write as _;
-            let mut scratch = Vec::with_capacity(512);
-            let mut mi_buf = String::with_capacity(16);
-            for template in templates {
-                let mi = template.mi;
-                let has_mi = mi.is_assigned();
-                if has_mi {
-                    // write_with_offset clears the buffer before writing.
-                    mi.write_with_offset(base_mi, &mut mi_buf);
-                }
-                for raw in [template.raw_r1(), template.raw_r2()].into_iter().flatten() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    if has_mi {
-                        scratch.clear();
-                        scratch.extend_from_slice(raw);
-                        bam_fields::update_string_tag(
-                            &mut scratch,
-                            &assign_tag_bytes,
-                            mi_buf.as_bytes(),
-                        );
-                        let block_size = scratch.len() as u32;
-                        writer.get_mut().write_all(&block_size.to_le_bytes())?;
-                        writer.get_mut().write_all(&scratch)?;
-                    } else {
-                        let block_size = raw.len() as u32;
-                        writer.get_mut().write_all(&block_size.to_le_bytes())?;
-                        writer.get_mut().write_all(raw)?;
-                    }
-                }
-            }
-        } else {
-            // Noodles fallback: retained for callers that supply parsed (non-raw) templates.
-            // set_mi_tag_on_record and write_alignment_record use the typed RecordBuf API.
-            let assign_tag = Tag::from(assign_tag_bytes);
-            for template in templates {
-                let mi = template.mi;
-                let (r1, r2) = template.into_primary_reads();
-                if let Some(mut r1) = r1 {
-                    set_mi_tag_on_record(&mut r1, mi, assign_tag, base_mi);
-                    writer.write_alignment_record(header, &r1)?;
-                }
-                if let Some(mut r2) = r2 {
-                    set_mi_tag_on_record(&mut r2, mi, assign_tag, base_mi);
-                    writer.write_alignment_record(header, &r2)?;
-                }
-            }
-        }
+        // Raw-byte output: inject MI tag directly into raw bytes, write without noodles.
+        use std::io::Write as _;
+        let mut scratch = Vec::with_capacity(512);
+        let mut mi_buf = String::with_capacity(16);
+        let inner = writer.get_mut();
+        emit_templates_raw_with_mi(
+            &templates,
+            base_mi,
+            assign_tag_bytes,
+            &mut scratch,
+            &mut mi_buf,
+            |bytes| inner.write_all(bytes),
+        )?;
 
         Ok(())
     }
@@ -1929,6 +1598,51 @@ impl GroupReadsByUmi {
     }
 }
 
+/// Emit raw-byte primary reads for a batch of templates with MI tags injected.
+///
+/// For each template, if `has_mi` then the raw bytes are copied into `scratch`,
+/// the MI tag is updated in place, and the result is emitted via `emit`; otherwise
+/// the raw bytes are emitted unchanged. Each emitted record is prefixed with a
+/// 4-byte little-endian `block_size`. `mi_buf` and `scratch` are reused across
+/// templates to amortize allocations.
+///
+/// This helper is shared between the threaded-pipeline serialize step and the
+/// single-threaded writer so they can't drift in MI-injection semantics.
+#[allow(clippy::cast_possible_truncation)]
+fn emit_templates_raw_with_mi(
+    templates: &[Template],
+    base_mi: u64,
+    assign_tag_bytes: [u8; 2],
+    scratch: &mut Vec<u8>,
+    mi_buf: &mut String,
+    mut emit: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use crate::sort::bam_fields;
+    for template in templates {
+        let mi = template.mi;
+        let has_mi = mi.is_assigned();
+        if has_mi {
+            // write_with_offset clears the buffer before writing.
+            mi.write_with_offset(base_mi, mi_buf);
+        }
+        for raw in [template.r1(), template.r2()].into_iter().flatten() {
+            if has_mi {
+                scratch.clear();
+                scratch.extend_from_slice(raw);
+                bam_fields::update_string_tag(scratch, &assign_tag_bytes, mi_buf.as_bytes());
+                let block_size = scratch.len() as u32;
+                emit(&block_size.to_le_bytes())?;
+                emit(scratch)?;
+            } else {
+                let block_size = raw.len() as u32;
+                emit(&block_size.to_le_bytes())?;
+                emit(raw)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write metrics to a TSV file and log the output path.
 fn write_metrics<S: serde::Serialize>(
     path: &Path,
@@ -1954,9 +1668,12 @@ fn with_extension(prefix: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::assigner::{IdentityUmiAssigner, PairedUmiAssigner, Strategy};
-    use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
+    use bstr::BString;
+    use fgumi_raw_bam::{
+        SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
+    };
     use noodles::bam;
-    use noodles::sam::alignment::RecordBuf;
+    use noodles::sam;
     use noodles::sam::alignment::io::Write as AlignmentWrite;
     use rstest::rstest;
     use std::num::NonZeroUsize;
@@ -1990,10 +1707,11 @@ mod tests {
     /// Tests override specific fields as needed via struct update syntax.
     fn test_group_cmd(strategy: Strategy, edits: u32) -> GroupReadsByUmi {
         GroupReadsByUmi {
-            io: BamIoOptions::new(
-                std::path::PathBuf::from("/dev/null"),
-                std::path::PathBuf::from("/dev/null"),
-            ),
+            io: BamIoOptions {
+                input: std::path::PathBuf::from("/dev/null"),
+                output: std::path::PathBuf::from("/dev/null"),
+                async_reader: false,
+            },
             family_size_histogram: None,
             grouping_metrics: None,
             metrics: None,
@@ -2064,6 +1782,22 @@ mod tests {
         builder.build()
     }
 
+    /// Set or clear the REVERSE bit (0x10) in a raw BAM record's flags.
+    fn set_reverse(rec: &mut fgumi_raw_bam::RawRecord, reverse: bool) {
+        let v = rec.as_mut_vec();
+        let flags = u16::from_le_bytes([v[14], v[15]]);
+        let new_flags = if reverse { flags | 0x10 } else { flags & !0x10 };
+        let bytes = new_flags.to_le_bytes();
+        v[14] = bytes[0];
+        v[15] = bytes[1];
+    }
+
+    /// Append a string (Z-type) tag to a raw BAM record.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn append_str_tag(rec: &mut fgumi_raw_bam::RawRecord, tag: &[u8; 2], value: &[u8]) {
+        fgumi_raw_bam::RawTagsEditor::from_vec(rec.as_mut_vec()).append_string(tag, value);
+    }
+
     /// Build a test read with common parameters
     #[allow(clippy::cast_sign_loss)]
     fn build_test_read(
@@ -2071,42 +1805,24 @@ mod tests {
         ref_id: usize,
         pos: i32,
         mapq: u8,
-        flags: u16,
+        raw_flags: u16,
         umi: &str,
-    ) -> sam::alignment::RecordBuf {
-        // 100bp sequence
-        let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+    ) -> fgumi_raw_bam::RawRecord {
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let cigar = encode_op(0, 100); // 100M
+        let quals = vec![30u8; 100];
 
-        let mut builder = RecordBuilder::new()
-            .name(name)
+        let mut b = RawSamBuilder::new();
+        b.read_name(name.as_bytes())
+            .flags(raw_flags)
+            .ref_id(ref_id as i32)
+            .pos(pos - 1)
+            .mapq(mapq)
+            .cigar_ops(&[cigar])
             .sequence(seq)
-            .reference_sequence_id(ref_id)
-            .alignment_start(pos as usize)
-            .mapping_quality(mapq)
-            .cigar("100M")
-            .tag("RX", umi);
-
-        // Set flags based on raw u16
-        let sam_flags = sam::alignment::record::Flags::from(flags);
-        if sam_flags.is_segmented() {
-            builder = builder.paired(true);
-        }
-        if sam_flags.is_first_segment() {
-            builder = builder.first_segment(true);
-        } else if sam_flags.is_last_segment() {
-            builder = builder.first_segment(false);
-        }
-        if sam_flags.is_reverse_complemented() {
-            builder = builder.reverse_complement(true);
-        }
-        if sam_flags.is_unmapped() {
-            builder = builder.unmapped(true);
-        }
-        if sam_flags.is_mate_unmapped() {
-            builder = builder.mate_unmapped(true);
-        }
-
-        builder.build()
+            .qualities(&quals);
+        b.add_string_tag(b"RX", umi.as_bytes());
+        b.build()
     }
 
     /// Create a pair of reads
@@ -2117,20 +1833,44 @@ mod tests {
         pos1: i32,
         pos2: i32,
         mapq1: u8,
-        _mapq2: u8,
+        mapq2: u8,
         umi: &str,
-    ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
-        RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(ref_id)
-            .r1_start(pos1 as usize)
-            .r2_start(pos2 as usize)
-            .mapping_quality(mapq1)
-            .tag("RX", umi)
-            .tag("MC", "100M")
-            .build()
+    ) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(ref_id as i32)
+            .pos(pos1 - 1)
+            .mapq(mapq1)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos2 - 1);
+        b1.add_string_tag(b"RX", umi.as_bytes());
+        b1.add_string_tag(b"MC", b"100M");
+        let r1 = b1.build();
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(ref_id as i32)
+            .pos(pos2 - 1)
+            .mapq(mapq2)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos1 - 1);
+        b2.add_string_tag(b"RX", umi.as_bytes());
+        b2.add_string_tag(b"MC", b"100M");
+        let r2 = b2.build();
+
+        (r1, r2)
     }
 
     /// Create a pair where R1 is mapped (with specified MAPQ) and R2 is unmapped
@@ -2142,24 +1882,43 @@ mod tests {
         pos: i32,
         mapq: u8,
         umi: &str,
-    ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
-        RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(ref_id)
-            .r1_start(pos as usize) // R1 mapped
-            // R2 has no start position, so it's unmapped
-            .r1_reverse(false)
-            .r2_reverse(false)
-            .tag("RX", umi)
-            .r1_tag("MQ", 0i32) // R1's mate (R2) is unmapped, so MQ=0
-            .r2_tag("MQ", i32::from(mapq)) // R2's mate (R1) has the specified MAPQ
-            .build()
+    ) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        // R1: mapped, R2 is unmapped so MATE_UNMAPPED flag
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_UNMAPPED)
+            .ref_id(ref_id as i32)
+            .pos(pos - 1)
+            .mapq(mapq)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals);
+        b1.add_string_tag(b"RX", umi.as_bytes());
+        b1.add_int_tag(b"MQ", 0i32); // R1's mate (R2) is unmapped, so MQ=0
+        let r1 = b1.build();
+
+        // R2: unmapped
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED)
+            .ref_id(ref_id as i32)
+            .pos(pos - 1)
+            .mapq(0)
+            .sequence(&seq)
+            .qualities(&quals);
+        b2.add_string_tag(b"RX", umi.as_bytes());
+        b2.add_int_tag(b"MQ", i32::from(mapq)); // R2's mate (R1) has the specified MAPQ
+        let r2 = b2.build();
+
+        (r1, r2)
     }
 
     /// Write records to a temporary BAM file
-    fn create_test_bam(records: Vec<sam::alignment::RecordBuf>) -> Result<NamedTempFile> {
+    fn create_test_bam(records: Vec<fgumi_raw_bam::RawRecord>) -> Result<NamedTempFile> {
         let temp_file = NamedTempFile::new()?;
         let header = create_test_header();
 
@@ -2167,8 +1926,10 @@ mod tests {
 
         writer.write_header(&header)?;
 
-        for record in records {
-            writer.write_alignment_record(&header, &record)?;
+        for record in &records {
+            let record_buf =
+                raw_record_to_record_buf(record, &header).map_err(std::io::Error::other)?;
+            writer.write_alignment_record(&header, &record_buf)?;
         }
 
         drop(writer); // Ensure file is flushed
@@ -2348,7 +2109,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Edit, 1)
         };
@@ -2390,7 +2155,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2427,7 +2196,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2442,7 +2215,7 @@ mod tests {
 
     #[test]
     fn test_correctly_groups_single_end_reads() -> Result<()> {
-        let records: Vec<RecordBuf> = vec![
+        let records = vec![
             // Group 1: same position, same UMI
             build_test_read("a01", 0, 100, 60, 0, "AAAAAAAA"),
             build_test_read("a02", 0, 100, 60, 0, "AAAAAAAA"),
@@ -2461,7 +2234,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -2505,7 +2282,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             family_size_histogram: Some(paths.histogram.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2599,7 +2380,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             metrics: Some(paths.metrics_prefix.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2844,7 +2629,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             family_size_histogram: Some(paths.histogram.clone()),
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             metrics: Some(paths.metrics_prefix.clone()),
@@ -2910,7 +2699,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             metrics: Some(paths.metrics_prefix.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -2964,7 +2757,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -3002,7 +2799,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             min_umi_length: Some(6),
             ..test_group_cmd(Strategy::Edit, 0)
@@ -3044,7 +2845,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             min_umi_length: Some(5),
             ..test_group_cmd(Strategy::Edit, 0)
         };
@@ -3070,34 +2875,80 @@ mod tests {
 
         // Group A: R1 on chr1, R2 on chr2 (both forward strand)
         for i in 1..=4 {
-            let (r1, r2) = RecordPairBuilder::new()
-                .name(&format!("a{i:02}"))
-                .r1_sequence(&"A".repeat(100))
-                .r2_sequence(&"A".repeat(100))
-                .reference_sequence_id(0) // R1 on chr1
-                .r2_reference_sequence_id(1) // R2 on chr2
-                .r1_start(100)
-                .r2_start(300)
-                .r2_reverse(false) // Both reads forward (matching original test)
-                .tag("RX", "ACT-ACT")
-                .build();
+            let seq = vec![b'A'; 100];
+            let quals = vec![30u8; 100];
+            let cigar = encode_op(0, 100);
+            let name_a = format!("a{i:02}");
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(name_a.as_bytes())
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0) // R1 on chr1
+                .pos(99) // 1-based 100 -> 0-based 99
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(1) // R2 on chr2
+                .mate_pos(299); // 1-based 300 -> 0-based 299
+            b1.add_string_tag(b"RX", b"ACT-ACT");
+            b1.add_string_tag(b"MC", b"100M");
+            let r1 = b1.build();
+
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(name_a.as_bytes())
+                .flags(flags::PAIRED | flags::LAST_SEGMENT)
+                .ref_id(1) // R2 on chr2
+                .pos(299) // 1-based 300 -> 0-based 299
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0) // R1 on chr1
+                .mate_pos(99); // 1-based 100 -> 0-based 99
+            b2.add_string_tag(b"RX", b"ACT-ACT");
+            b2.add_string_tag(b"MC", b"100M");
+            let r2 = b2.build();
+
             records.push(r1);
             records.push(r2);
         }
 
         // Group B: R1 on chr2, R2 on chr1 (flipped, both forward strand)
         for i in 1..=4 {
-            let (r1, r2) = RecordPairBuilder::new()
-                .name(&format!("b{i:02}"))
-                .r1_sequence(&"A".repeat(100))
-                .r2_sequence(&"A".repeat(100))
-                .reference_sequence_id(1) // R1 on chr2
-                .r2_reference_sequence_id(0) // R2 on chr1
-                .r1_start(300)
-                .r2_start(100)
-                .r2_reverse(false) // Both reads forward (matching original test)
-                .tag("RX", "ACT-ACT")
-                .build();
+            let seq = vec![b'A'; 100];
+            let quals = vec![30u8; 100];
+            let cigar = encode_op(0, 100);
+            let name_b = format!("b{i:02}");
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(name_b.as_bytes())
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(1) // R1 on chr2
+                .pos(299) // 1-based 300 -> 0-based 299
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0) // R2 on chr1
+                .mate_pos(99); // 1-based 100 -> 0-based 99
+            b1.add_string_tag(b"RX", b"ACT-ACT");
+            b1.add_string_tag(b"MC", b"100M");
+            let r1 = b1.build();
+
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(name_b.as_bytes())
+                .flags(flags::PAIRED | flags::LAST_SEGMENT)
+                .ref_id(0) // R2 on chr1
+                .pos(99) // 1-based 100 -> 0-based 99
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(1) // R1 on chr2
+                .mate_pos(299); // 1-based 300 -> 0-based 299
+            b2.add_string_tag(b"RX", b"ACT-ACT");
+            b2.add_string_tag(b"MC", b"100M");
+            let r2 = b2.build();
+
             records.push(r1);
             records.push(r2);
         }
@@ -3106,7 +2957,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3151,8 +3006,6 @@ mod tests {
     fn test_pair_orientation_splitting() -> Result<()> {
         // Test that reads with different pair orientations are NOT grouped together
         // even if they have the same UMI - they have different start positions and orientations
-        use noodles::sam::alignment::record::Flags;
-
         let mut records = Vec::new();
 
         // F1R2: Read 1 forward at 100, Read 2 reverse at 300
@@ -3163,58 +3016,40 @@ mod tests {
         // F2R1: Read 1 reverse at 300, Read 2 forward at 100 (flipped positions and strands)
         let (mut r1, mut r2) = build_test_pair("f2r1", 0, 300, 100, 60, 60, "ACGT-TTGA");
         // Flip strands
-        let mut flags1 = r1.flags();
-        flags1.set(Flags::REVERSE_COMPLEMENTED, true);
-        *r1.flags_mut() = flags1;
-        let mut flags2 = r2.flags();
-        flags2.set(Flags::REVERSE_COMPLEMENTED, false);
-        *r2.flags_mut() = flags2;
+        set_reverse(&mut r1, true);
+        set_reverse(&mut r2, false);
         records.push(r1);
         records.push(r2);
 
         // FF: Both forward at 100 and 300
         let (r1, mut r2) = build_test_pair("ff", 0, 100, 300, 60, 60, "ACGT-TTGA");
-        let mut flags2 = r2.flags();
-        flags2.set(Flags::REVERSE_COMPLEMENTED, false);
-        *r2.flags_mut() = flags2;
+        set_reverse(&mut r2, false);
         records.push(r1);
         records.push(r2);
 
         // RR: Both reverse at 1 and 201
         let (mut r1, mut r2) = build_test_pair("rr", 0, 1, 201, 60, 60, "ACGT-TTGA");
-        let mut flags1 = r1.flags();
-        flags1.set(Flags::REVERSE_COMPLEMENTED, true);
-        *r1.flags_mut() = flags1;
-        let mut flags2 = r2.flags();
-        flags2.set(Flags::REVERSE_COMPLEMENTED, true);
-        *r2.flags_mut() = flags2;
+        set_reverse(&mut r1, true);
+        set_reverse(&mut r2, true);
         records.push(r1);
         records.push(r2);
 
         // R1F2: Read 1 reverse at 150, Read 2 forward at 350
         let (mut r1, mut r2) = build_test_pair("r1f2", 0, 150, 350, 60, 60, "ACGT-TTGA");
-        let mut flags1 = r1.flags();
-        flags1.set(Flags::REVERSE_COMPLEMENTED, true);
-        *r1.flags_mut() = flags1;
-        let mut flags2 = r2.flags();
-        flags2.set(Flags::REVERSE_COMPLEMENTED, false);
-        *r2.flags_mut() = flags2;
+        set_reverse(&mut r1, true);
+        set_reverse(&mut r2, false);
         records.push(r1);
         records.push(r2);
 
         // R2F1: Read 1 forward at 400, Read 2 reverse at 600
         let (r1, mut r2) = build_test_pair("r2f1", 0, 400, 600, 60, 60, "ACGT-TTGA");
-        let mut flags2 = r2.flags();
-        flags2.set(Flags::REVERSE_COMPLEMENTED, true);
-        *r2.flags_mut() = flags2;
+        set_reverse(&mut r2, true);
         records.push(r1);
         records.push(r2);
 
         // Add some single-end reads with different strands
         let mut frag = build_test_read("Frag", 0, 100, 60, 0, "ACGT-TTGA");
-        let mut flags = frag.flags();
-        flags.set(Flags::REVERSE_COMPLEMENTED, true);
-        *frag.flags_mut() = flags;
+        set_reverse(&mut frag, true);
         records.push(frag);
 
         let frag = build_test_read("fRag", 0, 1, 60, 0, "ACGT-TTGA");
@@ -3224,7 +3059,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -3244,14 +3083,37 @@ mod tests {
         // Test that templates with missing UMI tags are filtered out
         let mut records = Vec::new();
 
-        // Create a pair WITHOUT the RX tag
-        let (mut r1, mut r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "dummy");
+        // Create a pair WITHOUT the RX tag (build directly without UMI, but with MC)
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100);
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(b"a01")
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(299);
+        b1.add_string_tag(b"MC", b"100M");
+        let r1 = b1.build();
 
-        // Remove the RX tag
-        use noodles::sam::alignment::record::data::field::Tag;
-        let rx_tag = Tag::from([b'R', b'X']);
-        r1.data_mut().remove(&rx_tag);
-        r2.data_mut().remove(&rx_tag);
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(b"a01")
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(299)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(99);
+        b2.add_string_tag(b"MC", b"100M");
+        let r2 = b2.build();
 
         records.push(r1);
         records.push(r2);
@@ -3260,7 +3122,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3282,14 +3148,37 @@ mod tests {
         // Test that templates without UMI tags are accepted when --no-umi is used
         let mut records = Vec::new();
 
-        // Create a pair WITHOUT the RX tag
-        let (mut r1, mut r2) = build_test_pair("a01", 0, 100, 300, 60, 60, "dummy");
+        // Create a pair WITHOUT the RX tag (build directly without UMI, but with MC)
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100);
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(b"a01")
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(299);
+        b1.add_string_tag(b"MC", b"100M");
+        let r1 = b1.build();
 
-        // Remove the RX tag
-        use noodles::sam::alignment::record::data::field::Tag;
-        let rx_tag = Tag::from([b'R', b'X']);
-        r1.data_mut().remove(&rx_tag);
-        r2.data_mut().remove(&rx_tag);
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(b"a01")
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(0)
+            .pos(299)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(0)
+            .mate_pos(99);
+        b2.add_string_tag(b"MC", b"100M");
+        let r2 = b2.build();
 
         records.push(r1);
         records.push(r2);
@@ -3298,7 +3187,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = test_group_cmd(Strategy::Identity, 0);
-        cmd.io = BamIoOptions::new(input.path().to_path_buf(), paths.output.clone());
+        cmd.io = BamIoOptions {
+            input: input.path().to_path_buf(),
+            output: paths.output.clone(),
+            async_reader: false,
+        };
         cmd.no_umi = true;
 
         cmd.execute("test")?;
@@ -3335,7 +3228,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = test_group_cmd(Strategy::Adjacency, 1);
-        cmd.io = BamIoOptions::new(input.path().to_path_buf(), paths.output.clone());
+        cmd.io = BamIoOptions {
+            input: input.path().to_path_buf(),
+            output: paths.output.clone(),
+            async_reader: false,
+        };
         cmd.no_umi = true; // Will be overridden to identity
 
         cmd.execute("test")?;
@@ -3366,7 +3263,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let mut cmd = test_group_cmd(Strategy::Identity, 0);
-        cmd.io = BamIoOptions::new(input.path().to_path_buf(), paths.output.clone());
+        cmd.io = BamIoOptions {
+            input: input.path().to_path_buf(),
+            output: paths.output.clone(),
+            async_reader: false,
+        };
         cmd.no_umi = true;
 
         cmd.execute("test")?;
@@ -3396,45 +3297,45 @@ mod tests {
     #[test]
     fn test_cell_barcode_grouping() -> Result<()> {
         // Test that reads with different cell barcodes are grouped separately
-        use noodles::sam::alignment::record::data::field::Tag;
-        use noodles::sam::alignment::record_buf::data::field::Value;
-
         let mut records = Vec::new();
-        let cb_tag = Tag::from([b'C', b'B']);
 
         // Two reads with same UMI and position but same cell barcode
         let mut r1 = build_test_read("a01", 0, 100, 60, 0, "AAAAAAAA");
-        r1.data_mut().insert(cb_tag, Value::String(b"AA".into()));
+        append_str_tag(&mut r1, b"CB", b"AA");
         records.push(r1);
 
         let mut r2 = build_test_read("a02", 0, 100, 60, 0, "AAAAAAAA");
-        r2.data_mut().insert(cb_tag, Value::String(b"AA".into()));
+        append_str_tag(&mut r2, b"CB", b"AA");
         records.push(r2);
 
         // One read with similar UMI but different cell barcode
         let mut r3 = build_test_read("a03", 0, 100, 60, 0, "CACACACA");
-        r3.data_mut().insert(cb_tag, Value::String(b"CA".into()));
+        append_str_tag(&mut r3, b"CB", b"CA");
         records.push(r3);
 
         // One read with close UMI but different cell barcode
         let mut r4 = build_test_read("a04", 0, 100, 60, 0, "CACACACC");
-        r4.data_mut().insert(cb_tag, Value::String(b"NN".into()));
+        append_str_tag(&mut r4, b"CB", b"NN");
         records.push(r4);
 
         // Two reads at different position with same UMI and cell barcode
         let mut r5 = build_test_read("a05", 0, 105, 60, 0, "GTAGTAGG");
-        r5.data_mut().insert(cb_tag, Value::String(b"GT".into()));
+        append_str_tag(&mut r5, b"CB", b"GT");
         records.push(r5);
 
         let mut r6 = build_test_read("a06", 0, 105, 60, 0, "GTAGTAGG");
-        r6.data_mut().insert(cb_tag, Value::String(b"GT".into()));
+        append_str_tag(&mut r6, b"CB", b"GT");
         records.push(r6);
 
         let input = create_test_bam(records)?;
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3495,7 +3396,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3556,7 +3461,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 1)
         };
 
@@ -3604,32 +3513,81 @@ mod tests {
         records.push(r2);
 
         // Add secondary read (should be filtered out)
-        let (r1, r2) = RecordPairBuilder::new()
-            .name("a01_sec")
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(0)
-            .r1_start(100)
-            .r2_start(300)
-            .tag("RX", "AAAAAAAA")
-            .secondary(true)
-            .build();
-        records.push(r1);
-        records.push(r2);
+        {
+            let seq = vec![b'A'; 100];
+            let quals = vec![30u8; 100];
+            let cigar = encode_op(0, 100);
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(b"a01_sec")
+                .flags(
+                    flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE | flags::SECONDARY,
+                )
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(299);
+            b1.add_string_tag(b"RX", b"AAAAAAAA");
+            let r1 = b1.build();
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(b"a01_sec")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::SECONDARY)
+                .ref_id(0)
+                .pos(299)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(99);
+            b2.add_string_tag(b"RX", b"AAAAAAAA");
+            let r2 = b2.build();
+            records.push(r1);
+            records.push(r2);
+        }
 
         // Add supplementary read (should be filtered out)
-        let (r1, r2) = RecordPairBuilder::new()
-            .name("a01_sup")
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(0)
-            .r1_start(100)
-            .r2_start(300)
-            .tag("RX", "AAAAAAAA")
-            .supplementary(true)
-            .build();
-        records.push(r1);
-        records.push(r2);
+        {
+            let seq = vec![b'A'; 100];
+            let quals = vec![30u8; 100];
+            let cigar = encode_op(0, 100);
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(b"a01_sup")
+                .flags(
+                    flags::PAIRED
+                        | flags::FIRST_SEGMENT
+                        | flags::MATE_REVERSE
+                        | flags::SUPPLEMENTARY,
+                )
+                .ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(299);
+            b1.add_string_tag(b"RX", b"AAAAAAAA");
+            let r1 = b1.build();
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(b"a01_sup")
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE | flags::SUPPLEMENTARY)
+                .ref_id(0)
+                .pos(299)
+                .mapq(60)
+                .cigar_ops(&[cigar])
+                .sequence(&seq)
+                .qualities(&quals)
+                .mate_ref_id(0)
+                .mate_pos(99);
+            b2.add_string_tag(b"RX", b"AAAAAAAA");
+            let r2 = b2.build();
+            records.push(r1);
+            records.push(r2);
+        }
 
         // Add another primary read with lower MAPQ (will be marked as duplicate)
         let (r1, r2) = build_test_pair("a02", 0, 100, 300, 10, 10, "AAAAAAAA");
@@ -3640,7 +3598,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3724,7 +3686,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Adjacency, 2)
         };
 
@@ -3787,7 +3753,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             threading: ThreadingOptions::new(4), // Use 4 threads
             ..test_group_cmd(Strategy::Adjacency, 2)
         };
@@ -3832,7 +3802,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -3872,7 +3846,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             threading: ThreadingOptions::new(4), // Use 4 threads
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -3918,7 +3896,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -3964,7 +3946,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -3997,7 +3983,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 1)
         };
 
@@ -4033,7 +4023,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4069,7 +4063,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -4106,7 +4104,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
 
@@ -4135,7 +4137,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4170,7 +4176,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             min_umi_length: Some(8), // Require at least 8 bases
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4206,7 +4216,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4242,7 +4256,11 @@ mod tests {
 
         // With edits=2, all should group together
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 2)
         };
 
@@ -4259,23 +4277,20 @@ mod tests {
     #[test]
     fn test_paired_umi_missing_both_ends() -> Result<()> {
         // Test paired UMI handling when both ends are missing (just "-")
-        use noodles::sam::alignment::record::data::field::Tag;
-        use noodles::sam::alignment::record_buf::data::field::Value;
-
-        let mut r1 = build_test_read("test", 0, 100, 60, 0x41, "");
-        let mut r2 = build_test_read("test", 0, 300, 60, 0x81, "");
-
-        // Set UMI to just "-" (both ends missing)
-        let rx_tag = Tag::from([b'R', b'X']);
-        r1.data_mut().insert(rx_tag, Value::String(b"-".into()));
-        r2.data_mut().insert(rx_tag, Value::String(b"-".into()));
+        // Build with UMI "-" directly
+        let r1 = build_test_read("test", 0, 100, 60, 0x41, "-");
+        let r2 = build_test_read("test", 0, 300, 60, 0x81, "-");
 
         let records = vec![r1, r2];
         let input = create_test_bam(records)?;
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -4305,7 +4320,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Adjacency, 0) // No edits allowed
         };
 
@@ -4340,7 +4359,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Edit, 3) // Allow up to 3 edits
         };
 
@@ -4370,7 +4393,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -4405,7 +4432,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             family_size_histogram: Some(paths.histogram.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4431,7 +4462,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             grouping_metrics: Some(paths.grouping_metrics.clone()),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4463,7 +4498,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             min_map_q: Some(20), // Filter reads with mapq < 20
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4491,7 +4530,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4523,7 +4566,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4553,7 +4600,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4596,7 +4647,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             min_map_q: Some(30), // Threshold is 30, "bad" pair has MAPQ=10
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -4642,19 +4697,51 @@ mod tests {
         umi: &str,
         r1_reverse: bool,
         r2_reverse: bool,
-    ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
-        RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(ref_id)
-            .r1_start(pos1 as usize)
-            .r2_start(pos2 as usize)
-            .r1_reverse(r1_reverse)
-            .r2_reverse(r2_reverse)
-            .tag("RX", umi)
-            .tag("MC", "100M")
-            .build()
+    ) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let r1_flags = flags::PAIRED
+            | flags::FIRST_SEGMENT
+            | (if r1_reverse { flags::REVERSE } else { 0 })
+            | (if r2_reverse { flags::MATE_REVERSE } else { 0 });
+        let r2_flags = flags::PAIRED
+            | flags::LAST_SEGMENT
+            | (if r2_reverse { flags::REVERSE } else { 0 })
+            | (if r1_reverse { flags::MATE_REVERSE } else { 0 });
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(r1_flags)
+            .ref_id(ref_id as i32)
+            .pos(pos1 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos2 - 1);
+        b1.add_string_tag(b"RX", umi.as_bytes());
+        b1.add_string_tag(b"MC", b"100M");
+        let r1 = b1.build();
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(r2_flags)
+            .ref_id(ref_id as i32)
+            .pos(pos2 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos1 - 1);
+        b2.add_string_tag(b"RX", umi.as_bytes());
+        b2.add_string_tag(b"MC", b"100M");
+        let r2 = b2.build();
+
+        (r1, r2)
     }
 
     #[test]
@@ -4745,7 +4832,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Identity, 0)
         };
 
@@ -4802,7 +4893,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             ..test_group_cmd(Strategy::Paired, 0)
         };
 
@@ -4860,7 +4955,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             threading,
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -4915,7 +5014,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             threading: ThreadingOptions::new(4),
             ..test_group_cmd(strategy, edits)
         };
@@ -4959,7 +5062,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             threading: ThreadingOptions::new(4),
             min_map_q: Some(30),
             ..test_group_cmd(Strategy::Identity, 0)
@@ -5002,7 +5109,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             threading: ThreadingOptions::new(4),
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5023,7 +5134,12 @@ mod tests {
     // ========================================================================
 
     /// Build a raw BAM record with specified flags, mapq, and UMI for testing.
-    fn make_raw_bam_for_group(name: &[u8], flag: u16, mapq: u8, umi: &[u8]) -> Vec<u8> {
+    fn make_raw_bam_for_group(
+        name: &[u8],
+        flag: u16,
+        mapq: u8,
+        umi: &[u8],
+    ) -> fgumi_raw_bam::RawRecord {
         use crate::sort::bam_fields;
 
         let seq_len = 4usize;
@@ -5063,7 +5179,7 @@ mod tests {
         buf.extend_from_slice(umi);
         buf.push(0);
 
-        buf
+        fgumi_raw_bam::RawRecord::from(buf)
     }
 
     #[test]
@@ -5076,8 +5192,8 @@ mod tests {
             30,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -5101,8 +5217,8 @@ mod tests {
             10,
             b"ACGTACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 20,
@@ -5127,8 +5243,8 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -5152,8 +5268,8 @@ mod tests {
             30,
             b"ANGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -5177,8 +5293,8 @@ mod tests {
             30,
             b"AC",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -5201,8 +5317,8 @@ mod tests {
             0,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![raw].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![raw]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -5250,8 +5366,8 @@ mod tests {
             30,
             b"ACGT",
         );
-        let template = Template::from_raw_records(vec![supp].into_iter().map(Into::into).collect())
-            .expect("Template::from_raw_records should succeed");
+        let template =
+            Template::from_records(vec![supp]).expect("Template::from_raw_records should succeed");
         let config = GroupFilterConfig {
             umi_tag: [b'R', b'X'],
             min_mapq: 0,
@@ -5300,17 +5416,34 @@ mod tests {
     }
 
     /// Build a pair of fully unmapped reads with UMI tags
-    fn build_unmapped_test_pair(name: &str, umi: &str) -> (RecordBuf, RecordBuf) {
-        RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .tag("RX", umi)
-            .build()
+    fn build_unmapped_test_pair(
+        name: &str,
+        umi: &str,
+    ) -> (fgumi_raw_bam::RawRecord, fgumi_raw_bam::RawRecord) {
+        use fgumi_raw_bam::UnmappedSamBuilder;
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+
+        let r1_flags =
+            flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED;
+        let mut b1 = UnmappedSamBuilder::new();
+        b1.build_record(name.as_bytes(), r1_flags, &seq, &quals);
+        b1.append_string_tag(b"RX", umi.as_bytes());
+        let r1 = b1.build();
+
+        let r2_flags = flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED;
+        let mut b2 = UnmappedSamBuilder::new();
+        b2.build_record(name.as_bytes(), r2_flags, &seq, &quals);
+        b2.append_string_tag(b"RX", umi.as_bytes());
+        let r2 = b2.build();
+
+        (r1, r2)
     }
 
     /// Write records to a temporary BAM file with queryname sorted header
-    fn create_queryname_sorted_test_bam(records: Vec<RecordBuf>) -> Result<NamedTempFile> {
+    fn create_queryname_sorted_test_bam(
+        records: Vec<fgumi_raw_bam::RawRecord>,
+    ) -> Result<NamedTempFile> {
         let temp_file = NamedTempFile::new()?;
         let header = create_queryname_sorted_header();
 
@@ -5318,8 +5451,10 @@ mod tests {
 
         writer.write_header(&header)?;
 
-        for record in records {
-            writer.write_alignment_record(&header, &record)?;
+        for record in &records {
+            let record_buf =
+                raw_record_to_record_buf(record, &header).map_err(std::io::Error::other)?;
+            writer.write_alignment_record(&header, &record_buf)?;
         }
 
         drop(writer); // Ensure file is flushed
@@ -5342,7 +5477,7 @@ mod tests {
         };
 
         let mut metrics = FilterMetrics::new();
-        let should_keep = filter_template(&template, &config, &mut metrics);
+        let should_keep = filter_template_raw(&template, &config, &mut metrics);
 
         assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
         assert_eq!(metrics.total_templates, 2, "Should count 2 records");
@@ -5366,7 +5501,7 @@ mod tests {
         };
 
         let mut metrics = FilterMetrics::new();
-        let should_keep = filter_template(&template, &config, &mut metrics);
+        let should_keep = filter_template_raw(&template, &config, &mut metrics);
 
         assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");
         assert_eq!(metrics.total_templates, 2, "Should count 2 records");
@@ -5402,7 +5537,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5435,7 +5574,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Adjacency, 1)
         };
@@ -5470,7 +5613,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             allow_unmapped: false,
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5502,7 +5649,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             allow_unmapped: true,
             ..test_group_cmd(Strategy::Identity, 0)
         };
@@ -5537,7 +5688,11 @@ mod tests {
         let paths = TestPaths::new()?;
 
         let cmd = GroupReadsByUmi {
-            io: BamIoOptions::new(input.path().to_path_buf(), paths.output.clone()),
+            io: BamIoOptions {
+                input: input.path().to_path_buf(),
+                output: paths.output.clone(),
+                async_reader: false,
+            },
             allow_unmapped: true,
             threading,
             ..test_group_cmd(Strategy::Identity, 0)

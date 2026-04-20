@@ -5,11 +5,12 @@
 //! deterministic downsampling. Both `duplex_metrics` and `simplex_metrics` commands
 //! build on these shared primitives.
 
-use crate::bam_io::create_bam_reader;
+use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
+use fgumi_raw_bam::raw_record_to_record_buf;
 
 use log::info;
 use murmur3::murmur3_32;
@@ -266,23 +267,34 @@ pub fn overlaps_intervals(template: &TemplateInfo, intervals: &[Interval]) -> bo
 /// Returns an error if the BAM file cannot be read or if it appears to be a consensus BAM.
 pub fn validate_not_consensus_bam(input: &Path) -> Result<()> {
     use crate::consensus_tags::is_consensus;
+    use crate::sort::bam_fields;
+    use fgumi_raw_bam::{RawRecord, RawRecordView};
 
-    let (mut reader, header) = create_bam_reader(input, 1)?;
+    let (mut reader, header) = create_raw_bam_reader(input, 1)?;
 
     // Look at the first valid R1 record
-    for result in reader.record_bufs(&header) {
-        let record = result?;
+    let mut raw = RawRecord::new();
+    loop {
+        let n = reader.read_record(&mut raw).context("failed to read BAM record")?;
+        if n == 0 {
+            break; // EOF
+        }
 
-        // Only check R1 records that are paired, mapped, and primary
-        let flags = record.flags();
-        if !flags.is_segmented()
-            || !flags.is_first_segment()
-            || flags.is_secondary()
-            || flags.is_supplementary()
-            || flags.is_unmapped()
+        // Only check R1 records that are paired and primary (raw flag checks).
+        // Do not skip UNMAPPED: consensus BAMs are documented as unaligned, so
+        // excluding unmapped records here would let consensus BAMs slip past this
+        // guard unchecked.
+        let flags = RawRecordView::new(&raw).flags();
+        if (flags & bam_fields::flags::PAIRED) == 0
+            || (flags & bam_fields::flags::FIRST_SEGMENT) == 0
+            || (flags & bam_fields::flags::SECONDARY) != 0
+            || (flags & bam_fields::flags::SUPPLEMENTARY) != 0
         {
             continue;
         }
+
+        // Decode to RecordBuf for consensus-tag check and name extraction
+        let record = raw_record_to_record_buf(&raw, &header)?;
 
         // Check if this is a consensus read
         if is_consensus(&record) {
@@ -420,10 +432,9 @@ pub fn process_templates_from_bam<F>(
 where
     F: FnMut(&[TemplateInfo], &mut Vec<usize>),
 {
-    let (mut reader, header) = create_bam_reader(input, 1)?;
+    let (reader, header) = create_raw_bam_reader(input, 1)?;
 
-    let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-    let template_iter = TemplateIterator::new(record_iter);
+    let template_iter = TemplateIterator::new(reader);
 
     // Streaming approach: process groups as they arrive (assumes consecutive ReadInfo grouping)
     let mut current_group: Vec<TemplateInfo> = Vec::new();
@@ -436,12 +447,19 @@ where
 
     for template in template_iter {
         let template = template?;
-        if template.records.len() < 2 {
+        if template.records().len() < 2 {
             continue;
         }
 
+        // Decode raw records to RecordBuf for flag/tag/position access
+        let record_bufs: Vec<RecordBuf> = template
+            .records()
+            .iter()
+            .map(|r| raw_record_to_record_buf(r, &header))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         // Find R1 and R2 that pass fgbio's filtering criteria
-        let r1 = template.records.iter().find(|r| {
+        let r1 = record_bufs.iter().find(|r| {
             let f = r.flags();
             f.is_segmented()
                 && !f.is_unmapped()
@@ -450,7 +468,7 @@ where
                 && !f.is_secondary()
                 && !f.is_supplementary()
         });
-        let r2 = template.records.iter().find(|r| {
+        let r2 = record_bufs.iter().find(|r| {
             let f = r.flags();
             f.is_segmented()
                 && !f.is_unmapped()

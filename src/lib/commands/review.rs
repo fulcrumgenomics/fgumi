@@ -16,19 +16,12 @@ use crate::variant_review::{
 };
 use anyhow::{Result, bail};
 use clap::Parser;
-use fgumi_raw_bam::{RawBamReader, RawRecord, find_string_tag_in_record};
+use fgumi_raw_bam::{
+    BAM_BASE_TO_ASCII, CigarKind, IndexedRawBamReader, RawBamReader, RawRecord,
+    find_string_tag_in_record, write_raw_record,
+};
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record::Cigar;
-// RecordBuf retained at indexed-query sites (extract_consensus_reads, generate_review_file):
-// noodles indexed_reader::query() yields bam::Record whose inner bytes are not publicly
-// accessible as &[u8], so raw-byte helpers (find_string_tag_in_record, read_pos_at_ref_pos_raw)
-// cannot be applied there without a noodles-to-bytes serialisation round-trip that would
-// cost more than it saves.  Once noodles exposes raw bytes from bam::Record
-// (https://github.com/zaeleus/noodles/pull/373) these sites can be migrated.
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::collections::HashSet;
-use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use super::command::Command;
@@ -180,6 +173,29 @@ impl Command for Review {
 }
 
 impl Review {
+    /// Load a BAM index, preferring the `<prefix>.bam.bai` sidecar and falling back
+    /// to `<prefix>.bai` for callers that used samtools' default naming.
+    fn read_bam_index(path: &Path) -> Result<noodles::bam::bai::Index> {
+        use noodles::bam;
+
+        let bam_bai = path.with_extension("bam.bai");
+        if bam_bai.exists() {
+            return Ok(bam::bai::fs::read(&bam_bai)?);
+        }
+
+        let bai = path.with_extension("bai");
+        if bai.exists() {
+            return Ok(bam::bai::fs::read(&bai)?);
+        }
+
+        bail!(
+            "Missing BAM index for {}. Tried {} and {}",
+            path.display(),
+            bam_bai.display(),
+            bai.display()
+        );
+    }
+
     /// Checks if a file is a VCF file based on its extension.
     ///
     /// Determines whether a file path represents a VCF file by examining its extension.
@@ -602,8 +618,8 @@ impl Review {
     ) -> Result<HashSet<String>> {
         use noodles::bam;
 
-        let mut reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&self.consensus_bam)?;
+        let index = Self::read_bam_index(&self.consensus_bam)?;
+        let mut reader = IndexedRawBamReader::from_path(&self.consensus_bam, index)?;
         let header = reader.read_header()?;
 
         // Add @PG record with PP chaining
@@ -621,29 +637,19 @@ impl Review {
             let start = noodles::core::Position::try_from(variant.pos as usize)?;
             let region = noodles::core::Region::new(variant.chrom.as_str(), start..=start);
 
-            let query = reader.query(&header, &region)?;
-
-            for result in query.records() {
-                let bam_record = result?;
-                // RecordBuf retained: noodles indexed_reader::query() yields bam::Record whose
-                // inner bytes are not publicly accessible; see retention comment at the import.
-                let record = RecordBuf::try_from_alignment_record(&header, &bam_record)?;
+            for result in reader.query(&header, &region)? {
+                let record = result?;
 
                 // Check if this read has a non-reference base at the variant position
                 if self.has_non_reference_base(&record, variant)? {
                     // Extract MI tag
-                    let mi_tag =
-                        noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
-                    if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(
-                        mi_bytes,
-                    )) = record.data().get(&mi_tag)
-                    {
-                        let mi = String::from_utf8(mi_bytes.iter().copied().collect())?;
-                        let mi_base = extract_mi_base(&mi).to_string();
+                    if let Some(mi_bytes) = find_string_tag_in_record(&record, &SamTag::MI) {
+                        let mi = std::str::from_utf8(mi_bytes)?;
+                        let mi_base = extract_mi_base(mi).to_string();
                         mi_set.insert(mi_base);
 
-                        // Write to output BAM
-                        writer.write_alignment_record(&header, &record)?;
+                        // Write raw record to output BAM.
+                        write_raw_record(writer.get_mut(), &record)?;
                     }
                 }
             }
@@ -705,10 +711,7 @@ impl Review {
                 let mi_base = extract_mi_base(mi);
 
                 if mi_set.contains(mi_base) {
-                    // Write raw record: BAM block_size prefix + record bytes.
-                    let block_size = raw_rec.len() as u32;
-                    writer.get_mut().write_all(&block_size.to_le_bytes())?;
-                    writer.get_mut().write_all(&raw_rec)?;
+                    write_raw_record(writer.get_mut(), &raw_rec)?;
                 }
             }
         }
@@ -740,17 +743,15 @@ impl Review {
     /// - Review TSV file cannot be created or written
     /// - Record processing fails
     fn generate_review_file(&self, variants: &[Variant]) -> Result<()> {
-        use noodles::bam;
-
         let review_path = self.output.with_extension("txt");
 
-        // Open both BAMs
-        let mut consensus_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&self.consensus_bam)?;
+        // Open both BAMs with indexed readers that yield RawRecord directly.
+        let con_index = Self::read_bam_index(&self.consensus_bam)?;
+        let mut consensus_reader = IndexedRawBamReader::from_path(&self.consensus_bam, con_index)?;
         let consensus_header = consensus_reader.read_header()?;
 
-        let mut grouped_reader =
-            bam::io::indexed_reader::Builder::default().build_from_path(&self.grouped_bam)?;
+        let grp_index = Self::read_bam_index(&self.grouped_bam)?;
+        let mut grouped_reader = IndexedRawBamReader::from_path(&self.grouped_bam, grp_index)?;
         let grouped_header = grouped_reader.read_header()?;
 
         let mut all_metrics = Vec::new();
@@ -761,23 +762,18 @@ impl Review {
             let start = noodles::core::Position::try_from(variant.pos as usize)?;
             let region = noodles::core::Region::new(variant.chrom.as_str(), start..=start);
 
-            let query = consensus_reader.query(&consensus_header, &region)?;
-
             // Collect all consensus reads at this position
-            let mut consensus_reads = Vec::new();
-            for result in query.records() {
-                let bam_record = result?;
-                // RecordBuf retained: noodles indexed_reader::query() yields bam::Record whose
-                // inner bytes are not publicly accessible; see retention comment at the import.
-                let record = RecordBuf::try_from_alignment_record(&consensus_header, &bam_record)?;
-                consensus_reads.push(record);
+            let mut consensus_reads: Vec<RawRecord> = Vec::new();
+            for result in consensus_reader.query(&consensus_header, &region)? {
+                consensus_reads.push(result?);
             }
 
             // Build consensus-level base counts
             let mut consensus_counts = BaseCounts::default();
             for record in &consensus_reads {
                 if let Some(base) = self.get_base_at_position(record, variant.pos)? {
-                    consensus_counts.add_base(base);
+                    consensus_counts
+                        .add_base(Self::normalize_base_for_variant(base, variant.ref_base));
                 }
             }
 
@@ -786,7 +782,7 @@ impl Review {
                 // Get the base at the variant position
                 // If None, check if it's a spanning deletion
                 let read_base = match self.get_base_at_position(&record, variant.pos)? {
-                    Some(b) => (b as char).to_ascii_uppercase(),
+                    Some(b) => Self::normalize_base_for_variant(b, variant.ref_base) as char,
                     None => {
                         // Check if this is a spanning deletion (position is within a deletion)
                         if self.is_spanning_deletion(&record, variant.pos)? {
@@ -810,22 +806,16 @@ impl Review {
                 // Get the quality at this position
                 let read_qual = self.get_quality_at_position(&record, variant.pos)?.unwrap_or(0);
 
-                // Extract MI tag
-                let mi_tag = noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
-                let mi_str = match record.data().get(&mi_tag) {
-                    Some(noodles::sam::alignment::record_buf::data::field::Value::String(
-                        mi_bytes,
-                    )) => String::from_utf8(mi_bytes.iter().copied().collect())?,
-                    _ => continue,
+                // Extract MI tag from raw bytes
+                let mi_str = match find_string_tag_in_record(&record, &SamTag::MI) {
+                    Some(mi_bytes) => std::str::from_utf8(mi_bytes)?.to_string(),
+                    None => continue,
                 };
-
                 let mi_base = extract_mi_base(&mi_str);
 
                 // Format consensus read name with /1 or /2 suffix
-                let read_name =
-                    String::from_utf8_lossy(record.name().map_or(b"unnamed", |n| n.as_ref()))
-                        .to_string();
-                let is_first = record.flags().is_first_segment();
+                let read_name = String::from_utf8_lossy(record.read_name()).to_string();
+                let is_first = record.is_first_segment();
                 let consensus_read_name = format!("{}{}", read_name, read_number_suffix(is_first));
 
                 // Generate insert string
@@ -837,57 +827,44 @@ impl Review {
 
                     let start = noodles::core::Position::try_from(variant.pos as usize)?;
                     let region = noodles::core::Region::new(variant.chrom.as_str(), start..=start);
-                    let query = grouped_reader.query(&grouped_header, &region)?;
 
                     let mut counts = BaseCounts::default();
                     let mut seen_reads = HashSet::new();
                     let expected_read_num =
                         if consensus_read_name.ends_with("/1") { "/1" } else { "/2" };
 
-                    for result in query.records() {
-                        let bam_record = result?;
-                        // RecordBuf retained: noodles indexed_reader::query() yields bam::Record
-                        // whose inner bytes are not publicly accessible; see import comment.
-                        let record =
-                            RecordBuf::try_from_alignment_record(&grouped_header, &bam_record)?;
+                    for result in grouped_reader.query(&grouped_header, &region)? {
+                        let rec = result?;
 
-                        // Extract MI tag
-                        let mi_tag =
-                            noodles::sam::alignment::record::data::field::Tag::from(SamTag::MI);
-                        let mi_str = match record.data().get(&mi_tag) {
-                            Some(
-                                noodles::sam::alignment::record_buf::data::field::Value::String(
-                                    mi_bytes,
-                                ),
-                            ) => String::from_utf8(mi_bytes.iter().copied().collect())?,
-                            _ => continue,
+                        // Extract MI tag from raw bytes
+                        let grp_mi_str = match find_string_tag_in_record(&rec, &SamTag::MI) {
+                            Some(mi_bytes) => std::str::from_utf8(mi_bytes)?.to_string(),
+                            None => continue,
                         };
 
                         // Check if MI matches
-                        let read_mi_base = extract_mi_base(&mi_str);
+                        let read_mi_base = extract_mi_base(&grp_mi_str);
                         if read_mi_base != mi_base {
                             continue;
                         }
 
                         // Check read number matches
-                        let is_first = record.flags().is_first_segment();
+                        let is_first = rec.is_first_segment();
                         let read_num = read_number_suffix(is_first);
                         if read_num != expected_read_num {
                             continue;
                         }
 
                         // Ensure we only count each read once
-                        let read_name = String::from_utf8_lossy(
-                            record.name().map_or(b"unnamed", |n| n.as_ref()),
-                        )
-                        .to_string();
-                        if !seen_reads.insert(read_name) {
+                        let rn = String::from_utf8_lossy(rec.read_name()).to_string();
+                        if !seen_reads.insert(rn) {
                             continue;
                         }
 
                         // Get base at position
-                        if let Some(base) = self.get_base_at_position(&record, variant.pos)? {
-                            counts.add_base(base);
+                        if let Some(base) = self.get_base_at_position(&rec, variant.pos)? {
+                            counts
+                                .add_base(Self::normalize_base_for_variant(base, variant.ref_base));
                         }
                     }
 
@@ -933,50 +910,54 @@ impl Review {
         Ok(())
     }
 
-    /// Get the base at a specific reference position in a read
-    // RecordBuf retained: these helpers are called from indexed-query loops where bam::Record
-    // has already been decoded to RecordBuf (see retention comment at the import).
-    fn get_base_at_position(&self, record: &RecordBuf, ref_pos: i32) -> Result<Option<u8>> {
+    /// Get the ASCII base at a specific reference position in a read.
+    ///
+    /// Returns the ASCII byte (e.g. b'A', b'C', b'N') at `ref_pos`, or `None` if the
+    /// position is not covered by this read.
+    fn get_base_at_position(&self, record: &RawRecord, ref_pos: i32) -> Result<Option<u8>> {
         if let Some(offset) = self.calculate_read_offset(record, ref_pos)? {
-            let sequence = record.sequence();
-            if offset < sequence.len() {
-                return Ok(Some(
-                    sequence
-                        .get(offset)
-                        .expect("offset already bounds-checked against sequence length"),
-                ));
+            let l_seq = record.l_seq() as usize;
+            if offset < l_seq {
+                // record.get_base returns the 4-bit BAM code (0–15); convert to ASCII.
+                let code = record.get_base(offset) as usize;
+                return Ok(Some(BAM_BASE_TO_ASCII[code]));
             }
         }
         Ok(None)
     }
 
-    /// Get the quality score at a specific reference position in a read
-    fn get_quality_at_position(&self, record: &RecordBuf, ref_pos: i32) -> Result<Option<u8>> {
+    /// Map BAM's "same as reference" `=` sentinel to the actual reference base and
+    /// uppercase the result so downstream comparisons against `variant.ref_base` and
+    /// `BaseCounts::add_base` behave correctly.
+    fn normalize_base_for_variant(base: u8, ref_base: char) -> u8 {
+        if base == b'=' { ref_base.to_ascii_uppercase() as u8 } else { base.to_ascii_uppercase() }
+    }
+
+    /// Get the quality score at a specific reference position in a read.
+    fn get_quality_at_position(&self, record: &RawRecord, ref_pos: i32) -> Result<Option<u8>> {
         if let Some(offset) = self.calculate_read_offset(record, ref_pos)? {
-            let quality_scores = record.quality_scores();
-            if offset < quality_scores.len() {
-                return Ok(Some(quality_scores.as_ref()[offset]));
+            let qual = record.quality_scores();
+            if offset < qual.len() {
+                return Ok(Some(qual[offset]));
             }
         }
         Ok(None)
     }
 
-    /// Check if a record has a non-reference base at the variant position
-    fn has_non_reference_base(&self, record: &RecordBuf, variant: &Variant) -> Result<bool> {
+    /// Check if a record has a non-reference base at the variant position.
+    fn has_non_reference_base(&self, record: &RawRecord, variant: &Variant) -> Result<bool> {
         // Skip unmapped reads
-        if record.flags().is_unmapped() {
+        if record.is_unmapped() {
             return Ok(false);
         }
 
-        // Get alignment start
-        let start = match record.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
+        // Get alignment start / end (1-based)
+        let start = match record.alignment_start_1based() {
+            Some(pos) => pos as i32,
             None => return Ok(false),
         };
-
-        // Get alignment end
-        let end = match record.alignment_end() {
-            Some(pos) => usize::from(pos) as i32,
+        let end = match record.alignment_end_1based() {
+            Some(pos) => pos as i32,
             None => return Ok(false),
         };
 
@@ -989,12 +970,13 @@ impl Review {
         let read_offset = self.calculate_read_offset(record, variant.pos)?;
 
         if let Some(offset) = read_offset {
-            let sequence = record.sequence();
-            if offset < sequence.len() {
-                let base = sequence
-                    .get(offset)
-                    .expect("offset already bounds-checked against sequence length");
-                let base_char = (base as char).to_ascii_uppercase();
+            let l_seq = record.l_seq() as usize;
+            if offset < l_seq {
+                // record.get_base returns the 4-bit BAM code; convert to ASCII then to char.
+                let code = record.get_base(offset) as usize;
+                let base_char =
+                    Self::normalize_base_for_variant(BAM_BASE_TO_ASCII[code], variant.ref_base)
+                        as char;
 
                 // Check if base differs from reference
                 if base_char != variant.ref_base {
@@ -1006,7 +988,7 @@ impl Review {
                 }
             }
         } else {
-            // read_offset is None - check if it's a spanning deletion
+            // read_offset is None — check if it's a spanning deletion
             if self.is_spanning_deletion(record, variant.pos)? {
                 return Ok(true); // Spanning deletions are considered non-reference
             }
@@ -1015,19 +997,14 @@ impl Review {
         Ok(false)
     }
 
-    /// Calculate read offset for a reference position using CIGAR
-    /// Check if a reference position falls within a deletion in the read
-    fn is_spanning_deletion(&self, record: &RecordBuf, ref_pos: i32) -> Result<bool> {
-        use noodles::sam::alignment::record::cigar::op::Kind;
-
-        let start = match record.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
+    /// Check if a reference position falls within a deletion in the read.
+    fn is_spanning_deletion(&self, record: &RawRecord, ref_pos: i32) -> Result<bool> {
+        let start = match record.alignment_start_1based() {
+            Some(pos) => pos as i32,
             None => return Ok(false),
         };
-
-        // Check if position is within the read's reference span
-        let end = match record.alignment_end() {
-            Some(pos) => usize::from(pos) as i32,
+        let end = match record.alignment_end_1based() {
+            Some(pos) => pos as i32,
             None => return Ok(false),
         };
 
@@ -1037,26 +1014,27 @@ impl Review {
 
         let mut current_ref_pos = start;
 
-        let cigar = record.cigar();
-        let ops: Vec<_> = cigar.iter().filter_map(std::result::Result::ok).collect();
-
-        for op in ops {
-            let len = op.len();
-            let kind = op.kind();
-
-            match kind {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    current_ref_pos += len as i32;
+        for op in record.cigar_ops_typed() {
+            let len = op.len() as i32;
+            match op.kind() {
+                CigarKind::Match | CigarKind::SequenceMatch | CigarKind::SequenceMismatch => {
+                    current_ref_pos += len;
                 }
-                Kind::Deletion | Kind::Skip => {
+                CigarKind::Deletion => {
                     // Check if target position is within this deletion
-                    // Deletions span from current_ref_pos to current_ref_pos + len - 1
-                    if ref_pos >= current_ref_pos && ref_pos < current_ref_pos + len as i32 {
+                    if ref_pos >= current_ref_pos && ref_pos < current_ref_pos + len {
                         return Ok(true);
                     }
-                    current_ref_pos += len as i32;
+                    current_ref_pos += len;
                 }
-                Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {
+                CigarKind::Skip => {
+                    // N (skipped region) consumes reference but is not a deletion allele.
+                    current_ref_pos += len;
+                }
+                CigarKind::Insertion
+                | CigarKind::SoftClip
+                | CigarKind::HardClip
+                | CigarKind::Pad => {
                     // These don't affect reference positions
                 }
             }
@@ -1065,26 +1043,23 @@ impl Review {
         Ok(false)
     }
 
-    fn calculate_read_offset(&self, record: &RecordBuf, ref_pos: i32) -> Result<Option<usize>> {
-        use noodles::sam::alignment::record::cigar::op::Kind;
-
-        let start = match record.alignment_start() {
-            Some(pos) => usize::from(pos) as i32,
+    /// Calculate the read (query) offset for a reference position using CIGAR.
+    ///
+    /// Returns `None` if the reference position falls within a deletion or
+    /// is not covered by the read.
+    fn calculate_read_offset(&self, record: &RawRecord, ref_pos: i32) -> Result<Option<usize>> {
+        let start = match record.alignment_start_1based() {
+            Some(pos) => pos as i32,
             None => return Ok(None),
         };
 
         let mut current_ref_pos = start;
-        let mut current_read_pos = 0;
+        let mut current_read_pos: usize = 0;
 
-        let cigar = record.cigar();
-        let ops: Vec<_> = cigar.iter().filter_map(std::result::Result::ok).collect();
-
-        for op in ops {
-            let len = op.len();
-            let kind = op.kind();
-
-            match kind {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+        for op in record.cigar_ops_typed() {
+            let len = op.len() as usize;
+            match op.kind() {
+                CigarKind::Match | CigarKind::SequenceMatch | CigarKind::SequenceMismatch => {
                     if current_ref_pos + len as i32 > ref_pos {
                         // Target position is in this op
                         let offset_in_op = (ref_pos - current_ref_pos) as usize;
@@ -1093,17 +1068,17 @@ impl Review {
                     current_ref_pos += len as i32;
                     current_read_pos += len;
                 }
-                Kind::Insertion | Kind::SoftClip => {
+                CigarKind::Insertion | CigarKind::SoftClip => {
                     current_read_pos += len;
                 }
-                Kind::Deletion | Kind::Skip => {
+                CigarKind::Deletion | CigarKind::Skip => {
                     if current_ref_pos + len as i32 > ref_pos {
                         // Position is deleted in this read
                         return Ok(None);
                     }
                     current_ref_pos += len as i32;
                 }
-                Kind::HardClip | Kind::Pad => {
+                CigarKind::HardClip | CigarKind::Pad => {
                     // These don't affect positions
                 }
             }
@@ -1122,7 +1097,9 @@ mod tests {
     // Test utilities for creating synthetic test data
     mod test_utils {
         use super::*;
-        use crate::sam::builder::RecordBuilder;
+        use fgumi_raw_bam::{
+            SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
+        };
         use noodles::sam::Header;
         use noodles::sam::alignment::RecordBuf;
         use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
@@ -1199,8 +1176,40 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             header
         }
 
+        fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> RecordBuf {
+            raw_record_to_record_buf(&raw, &Header::default())
+                .expect("raw_record_to_record_buf failed in test")
+        }
+
+        fn parse_cigar_to_ops(cigar_str: &str) -> Vec<u32> {
+            let mut ops = Vec::new();
+            let mut len_buf = String::new();
+            for ch in cigar_str.chars() {
+                if ch.is_ascii_digit() {
+                    len_buf.push(ch);
+                } else {
+                    let len: usize = len_buf.parse().expect("valid cigar length");
+                    len_buf.clear();
+                    let op_code: u32 = match ch {
+                        'M' => 0,
+                        'I' => 1,
+                        'D' => 2,
+                        'N' => 3,
+                        'S' => 4,
+                        'H' => 5,
+                        'P' => 6,
+                        '=' => 7,
+                        'X' => 8,
+                        other => panic!("unknown CIGAR op: {other}"),
+                    };
+                    ops.push(encode_op(op_code, len));
+                }
+            }
+            ops
+        }
+
         /// Create a simple read pair
-        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
         pub fn create_read_pair(
             name: &str,
             chrom_idx: usize,
@@ -1211,37 +1220,37 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
             mi: &str,
             cigar1: Option<&str>,
         ) -> (RecordBuf, RecordBuf) {
-            use noodles::sam::alignment::record::Flags;
-
             let cigar1_str = cigar1.map_or_else(|| format!("{}M", bases1.len()), String::from);
+            let cigar1_ops = parse_cigar_to_ops(&cigar1_str);
+            let cigar2_ops = [encode_op(0, bases2.len())];
 
-            let r1 = RecordBuilder::new()
-                .name(name)
-                .flags(Flags::SEGMENTED | Flags::FIRST_SEGMENT)
-                .reference_sequence_id(chrom_idx)
-                .alignment_start(start1 as usize)
-                .mapping_quality(60)
-                .cigar(&cigar1_str)
-                .sequence(&String::from_utf8_lossy(bases1))
+            let mut b1 = RawSamBuilder::new();
+            b1.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(chrom_idx as i32)
+                .pos(start1 - 1)
+                .mapq(60)
+                .cigar_ops(&cigar1_ops)
+                .sequence(bases1)
                 .qualities(&vec![45u8; bases1.len()])
-                .mate_reference_sequence_id(chrom_idx)
-                .mate_alignment_start(start2 as usize)
-                .tag("MI", mi)
-                .build();
+                .mate_ref_id(chrom_idx as i32)
+                .mate_pos(start2 - 1);
+            b1.add_string_tag(b"MI", mi.as_bytes());
+            let r1 = to_record_buf(b1.build());
 
-            let r2 = RecordBuilder::new()
-                .name(name)
-                .flags(Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED)
-                .reference_sequence_id(chrom_idx)
-                .alignment_start(start2 as usize)
-                .mapping_quality(60)
-                .cigar(&format!("{}M", bases2.len()))
-                .sequence(&String::from_utf8_lossy(bases2))
+            let mut b2 = RawSamBuilder::new();
+            b2.read_name(name.as_bytes())
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .ref_id(chrom_idx as i32)
+                .pos(start2 - 1)
+                .mapq(60)
+                .cigar_ops(&cigar2_ops)
+                .sequence(bases2)
                 .qualities(&vec![45u8; bases2.len()])
-                .mate_reference_sequence_id(chrom_idx)
-                .mate_alignment_start(start1 as usize)
-                .tag("MI", mi)
-                .build();
+                .mate_ref_id(chrom_idx as i32)
+                .mate_pos(start1 - 1);
+            b2.add_string_tag(b"MI", mi.as_bytes());
+            let r2 = to_record_buf(b2.build());
 
             (r1, r2)
         }
