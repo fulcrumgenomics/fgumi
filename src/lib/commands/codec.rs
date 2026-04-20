@@ -7,8 +7,8 @@
 //! allowing even a single read-pair to generate duplex consensus.
 
 use crate::bam_io::{
-    create_bam_reader_for_pipeline_with_opts, create_bam_writer, create_optional_bam_writer,
-    create_raw_bam_reader_with_opts,
+    RawBamWriter, create_bam_reader_for_pipeline_with_opts, create_bam_writer,
+    create_optional_bam_writer, create_raw_bam_reader_with_opts, create_raw_bam_writer,
 };
 use crate::commands::command::Command;
 use crate::commands::consensus_runner::{ConsensusStatsOps, create_unmapped_consensus_header};
@@ -35,11 +35,12 @@ use crate::unified_pipeline::{
 };
 use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
-use crate::sam::SamTag;
+use crate::sam::{SamTag, header_as_unsorted};
 use crate::validation::validate_file_exists;
 use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
+use parking_lot::Mutex;
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
 
@@ -51,8 +52,6 @@ use std::sync::Arc;
 struct CodecProcessedBatch {
     /// Consensus reads to write to output BAM
     consensus_output: ConsensusOutput,
-    /// Rejected reads as raw BAM bytes (written to rejects file if enabled)
-    rejects: Vec<Vec<u8>>,
     /// Number of MI groups in this batch
     groups_count: u64,
     /// CODEC consensus calling statistics for this batch
@@ -62,8 +61,6 @@ struct CodecProcessedBatch {
 impl MemoryEstimate for CodecProcessedBatch {
     fn estimate_heap_size(&self) -> usize {
         self.consensus_output.data.capacity()
-            + self.rejects.iter().map(Vec::capacity).sum::<usize>()
-            + self.rejects.capacity() * std::mem::size_of::<Vec<u8>>()
     }
 }
 
@@ -74,8 +71,6 @@ struct CollectedCodecMetrics {
     stats: CodecConsensusStats,
     /// Number of MI groups processed
     groups_processed: u64,
-    /// Rejected reads as raw BAM bytes for deferred writing
-    rejects: Vec<Vec<u8>>,
 }
 
 /// Call CODEC consensus reads from template-coordinate sorted BAM
@@ -535,14 +530,36 @@ impl Codec {
         // Use larger batch size for codec (less work per group than simplex)
         let batch_size = 1000;
 
-        // Clone input_header before pipeline (needed for rejects writing)
-        let rejects_header = input_header.clone();
+        // Open rejects writer up front. Rejected records are streamed straight
+        // to disk from process_fn, per-MI-group, so no batch-level buffering.
+        // Because workers flush under a mutex rather than through the ordered
+        // serialize stage, reject records are emitted in mutex-acquisition
+        // order, not input order; mark the rejects header as SO:unsorted so
+        // downstream tools don't assume the input's sort order carried over.
+        let rejects_writer: Option<Arc<Mutex<Option<RawBamWriter>>>> = if track_rejects {
+            if let Some(path) = self.rejects_opts.rejects.as_ref() {
+                let writer_threads = self.threading.num_threads();
+                let rejects_header = header_as_unsorted(&input_header);
+                let w = create_raw_bam_writer(
+                    path,
+                    &rejects_header,
+                    writer_threads,
+                    self.compression.compression_level,
+                )?;
+                Some(Arc::new(Mutex::new(Some(w))))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let rejects_writer_for_process = rejects_writer.as_ref().map(Arc::clone);
 
         let library_index = LibraryIndex::from_header(&input_header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
         // Run the 7-step pipeline with the already-opened reader (supports streaming)
-        let groups_processed = run_bam_pipeline_from_reader(
+        let pipeline_result = run_bam_pipeline_from_reader(
             pipeline_config,
             reader,
             input_header,
@@ -564,9 +581,26 @@ impl Codec {
                 );
 
                 let mut all_output = ConsensusOutput::default();
-                let mut all_rejects = Vec::new();
                 let mut batch_stats = CodecConsensusStats::default();
                 let groups_count = batch.groups.len() as u64;
+
+                // Stream per-MI-group rejects straight to disk so they don't
+                // accumulate in a batch-level Vec. The mutex only serializes the
+                // raw-byte append; BGZF compression runs on the writer's own
+                // thread pool.
+                let flush_byte_records = |recs: &[Vec<u8>]| -> io::Result<()> {
+                    if let Some(ref rw_arc) = rejects_writer_for_process {
+                        if !recs.is_empty() {
+                            let mut guard = rw_arc.lock();
+                            if let Some(w) = guard.as_mut() {
+                                for raw in recs {
+                                    w.write_raw_record(raw)?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                };
 
                 for MiGroup { mi, records } in batch.groups {
                     caller.clear();
@@ -578,7 +612,7 @@ impl Codec {
                             all_output.merge(batch_output);
                             batch_stats.merge(caller.statistics());
                             if track_rejects {
-                                all_rejects.extend(caller.take_rejected_reads());
+                                flush_byte_records(&caller.take_rejected_reads())?;
                             }
                         }
                         Err(e) => {
@@ -587,7 +621,7 @@ impl Codec {
                             if e.to_string().contains("duplex disagreement") {
                                 batch_stats.merge(caller.statistics());
                                 if track_rejects {
-                                    all_rejects.extend(caller.take_rejected_reads());
+                                    flush_byte_records(&caller.take_rejected_reads())?;
                                 }
                             } else {
                                 return Err(io::Error::other(format!(
@@ -600,7 +634,6 @@ impl Codec {
 
                 Ok(CodecProcessedBatch {
                     consensus_output: all_output,
-                    rejects: all_rejects,
                     groups_count,
                     stats: batch_stats,
                 })
@@ -610,14 +643,13 @@ impl Codec {
                   _header: &Header,
                   output: &mut Vec<u8>|
                   -> io::Result<u64> {
-                // Merge per-batch metrics + rejects into this worker's slot
+                // Rejects were already streamed to disk in process_fn.
+                // Merge per-batch metrics into this worker's accumulator slot
                 let batch_stats = processed.stats;
                 let groups_count = processed.groups_count;
-                let mut batch_rejects = processed.rejects;
                 collected_metrics_for_serialize.with_slot(|m| {
                     m.stats.merge(&batch_stats);
                     m.groups_processed += groups_count;
-                    m.rejects.append(&mut batch_rejects);
                 });
 
                 // Serialize consensus reads
@@ -625,47 +657,41 @@ impl Codec {
                 output.extend_from_slice(&processed.consensus_output.data);
                 Ok(count)
             },
-        )
-        .map_err(|e| anyhow::anyhow!("Pipeline error: {e}"))?;
+        );
 
-        // ========== Post-pipeline: Aggregate metrics and write rejects ==========
+        // Always finalize the rejects writer, even if the pipeline failed, so any
+        // partially written rejects BAM still gets a valid BGZF EOF block. Surface
+        // finish() failures alongside any pipeline error so neither is silently
+        // dropped.
+        let rejects_finish_result = rejects_writer
+            .and_then(|rw_arc| rw_arc.lock().take())
+            .map(|writer| writer.finish().context("Failed to finish rejects file"));
+
+        let groups_processed = match (pipeline_result, rejects_finish_result) {
+            (Ok(groups_processed), Some(Ok(()))) => {
+                info!("Rejected reads streamed to rejects file during processing");
+                groups_processed
+            }
+            (Ok(groups_processed), None) => groups_processed,
+            (Ok(_), Some(Err(finish_err))) => return Err(finish_err),
+            (Err(pipeline_err), Some(Err(finish_err))) => {
+                return Err(anyhow::anyhow!(
+                    "Pipeline error: {pipeline_err}; additionally failed to finish rejects file: {finish_err}"
+                ));
+            }
+            (Err(pipeline_err), _) => {
+                return Err(anyhow::anyhow!("Pipeline error: {pipeline_err}"));
+            }
+        };
+
+        // ========== Post-pipeline: Aggregate metrics ==========
         let mut total_groups = 0u64;
         let mut merged_stats = CodecConsensusStats::default();
-        let mut all_rejects: Vec<Vec<u8>> = Vec::new();
 
         for slot in collected_metrics.slots() {
-            let mut m = slot.lock();
+            let m = slot.lock();
             total_groups += m.groups_processed;
             merged_stats.merge(&m.stats);
-            if track_rejects {
-                all_rejects.append(&mut m.rejects);
-            }
-        }
-
-        // Write deferred rejects as raw BAM bytes
-        if track_rejects && !all_rejects.is_empty() {
-            if let Some(rejects_path) = &self.rejects_opts.rejects {
-                let writer_threads = self.threading.num_threads();
-                let rejects_writer = create_optional_bam_writer(
-                    Some(rejects_path),
-                    &rejects_header,
-                    writer_threads,
-                    self.compression.compression_level,
-                )?;
-                if let Some(mut rw) = rejects_writer {
-                    for raw_record in &all_rejects {
-                        let block_size = raw_record.len() as u32;
-                        rw.get_mut()
-                            .write_all(&block_size.to_le_bytes())
-                            .context("Failed to write rejected read block size")?;
-                        rw.get_mut()
-                            .write_all(raw_record)
-                            .context("Failed to write rejected read")?;
-                    }
-                    rw.into_inner().finish().context("Failed to finish rejects file")?;
-                    info!("Wrote {} rejected reads", all_rejects.len());
-                }
-            }
         }
 
         // Log statistics
@@ -1194,19 +1220,15 @@ mod tests {
     fn test_codec_processed_batch_memory_estimate() {
         let mut data = Vec::with_capacity(1024);
         data.extend_from_slice(&[0u8; 100]);
-        let mut reject = Vec::with_capacity(512);
-        reject.extend_from_slice(&[0u8; 50]);
 
         let batch = CodecProcessedBatch {
             consensus_output: ConsensusOutput { data, count: 1 },
-            rejects: vec![reject],
             groups_count: 1,
             stats: CodecConsensusStats::default(),
         };
 
         let estimate = batch.estimate_heap_size();
-        assert!(estimate >= 1024 + 512, "estimate {estimate} should be >= 1536 (capacities)");
-        assert!(estimate > 1024 + 512, "estimate {estimate} should include Vec overhead");
+        assert_eq!(estimate, 1024, "estimate should match consensus_output capacity");
     }
 
     /// Asserts that single-threaded and multi-threaded codec produce the same number of

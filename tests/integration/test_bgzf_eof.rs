@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-use crate::helpers::assertions::assert_has_bgzf_eof;
+use crate::helpers::assertions::{assert_has_bgzf_eof, assert_header_unsorted};
 use crate::helpers::bam_generator::{
     create_minimal_header, create_test_reference, create_umi_family, to_record_buf,
 };
@@ -668,6 +668,7 @@ fn test_simplex_rejects_has_bgzf_eof() {
     assert!(status.success(), "simplex command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
+    assert_header_unsorted(&rejects_bam);
 }
 
 #[test]
@@ -697,8 +698,6 @@ fn test_duplex_rejects_has_bgzf_eof() {
     records.push(r2);
     write_test_bam(&input_bam, &records);
 
-    // Use single-threaded mode: duplex multi-threaded pipeline doesn't collect
-    // raw reject bytes, so rejects writing only happens in the single-threaded path.
     let status = Command::new(env!("CARGO_BIN_EXE_fgumi"))
         .args([
             "duplex",
@@ -710,6 +709,8 @@ fn test_duplex_rejects_has_bgzf_eof() {
             rejects_bam.to_str().unwrap(),
             "--min-reads",
             "2",
+            "--threads",
+            "2",
             "--compression-level",
             "1",
         ])
@@ -719,6 +720,7 @@ fn test_duplex_rejects_has_bgzf_eof() {
     assert!(status.success(), "duplex command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
+    assert_header_unsorted(&rejects_bam);
 }
 
 #[test]
@@ -762,6 +764,7 @@ fn test_codec_rejects_has_bgzf_eof() {
     assert!(status.success(), "codec command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
+    assert_header_unsorted(&rejects_bam);
 }
 
 #[test]
@@ -804,6 +807,7 @@ fn test_correct_rejects_has_bgzf_eof() {
     assert!(status.success(), "correct command with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
+    assert_header_unsorted(&rejects_bam);
 }
 
 #[test]
@@ -843,4 +847,6 @@ fn test_correct_single_threaded_rejects_has_bgzf_eof() {
     assert!(status.success(), "correct single-threaded with rejects failed");
     assert_has_bgzf_eof(&output_bam);
     assert_has_bgzf_eof(&rejects_bam);
+    // Single-threaded correct writes rejects in input order, so it keeps the
+    // input header as-is rather than marking it SO:unsorted.
 }
