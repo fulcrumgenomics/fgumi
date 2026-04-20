@@ -673,6 +673,7 @@ dependencies = [
  "fs4",
  "indexmap",
  "itertools 0.14.0",
+ "libc",
  "libdeflater",
  "libmimalloc-sys",
  "log",

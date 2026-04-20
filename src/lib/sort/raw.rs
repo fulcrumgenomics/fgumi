@@ -1366,6 +1366,7 @@ impl RawExternalSorter {
         rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads.max(1))
             .thread_name(|i| format!("fgumi-sort-rayon-{i}"))
+            .start_handler(|_| crate::os_hints::set_current_thread_compute_qos())
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build rayon sort pool: {e}"))
     }

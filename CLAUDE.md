@@ -135,6 +135,11 @@ The following external FFI calls are approved because they back core infrastruct
 - **`mach2`** (`src/lib/sort/memory_probe.rs`, macOS only) — `task_info(TASK_VM_INFO)`
   is the only way to read `phys_footprint` (the RSS metric mimalloc reports accurately).
   Isolated to the same sub-module as the mimalloc FFI.
+- **`libc::pthread_set_qos_class_self_np`** (`src/lib/os_hints.rs`, macOS only) —
+  Darwin public API for hinting the scheduler that the calling thread is
+  compute-bound interactive work. The FFI wrapper is isolated to a single
+  `#[allow(unsafe_code)]` sub-module. The call affects only the calling thread
+  and is safe to invoke concurrently across threads.
 
 ## Benchmarking Notes
 

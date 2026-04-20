@@ -92,6 +92,7 @@ fgumi-consensus = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
+libc = "0.2.135"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", default-features = false, features = ["fs"] }

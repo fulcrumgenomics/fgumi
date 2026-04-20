@@ -3301,6 +3301,7 @@ where
             thread::spawn(move || {
                 // Wrap worker logic in catch_unwind to handle panics gracefully
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::os_hints::set_current_thread_compute_qos();
                     let mut worker = WorkerState::new(
                         compression_level,
                         thread_id,
