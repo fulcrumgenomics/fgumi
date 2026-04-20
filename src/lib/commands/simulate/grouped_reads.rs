@@ -245,7 +245,7 @@ impl Command for GroupedReads {
                     mol_id.to_string(), // MI tag (stripped suffix matches this)
                     format!("mol{mol_id:08}"),
                 );
-                MoleculeInfo { mol_id, seed, sort_key }
+                MoleculeInfo { mol_id, seed, sort_key, is_unmapped: false }
             })
             .collect();
 

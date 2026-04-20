@@ -11,7 +11,7 @@ use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, MoleculeInfo,
     PositionDistArgs, QualityArgs, ReferenceArgs, ReferenceGenome, SimulationCommon,
-    apply_methylation_conversion, generate_random_sequence, pad_sequence,
+    apply_methylation_conversion, generate_random_sequence, pad_sequence, validate_rate,
 };
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
@@ -26,7 +26,7 @@ use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
-use rand::RngExt;
+use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -56,7 +56,14 @@ pub struct MappedReads {
     #[arg(long = "mapq", default_value = "60")]
     pub mapq: u8,
 
-    /// Fraction of reads to leave unmapped
+    /// Fraction of molecules (templates) to emit as entirely unmapped, in `[0.0, 1.0]`.
+    ///
+    /// For each molecule, a uniform random `f64` in `[0, 1)` is drawn from a
+    /// dedicated RNG; when below this fraction, all read pairs of the molecule
+    /// are emitted with `UNMAPPED` and `MATE_UNMAPPED` set on both mates (no
+    /// reference, position, CIGAR, MAPQ, or MC/MQ tags), preserving pair
+    /// consistency. Sequence, qualities, read names, and the RX tag are still
+    /// populated so downstream tools see well-formed unmapped pairs.
     #[arg(long = "unmapped-fraction", default_value = "0.0")]
     pub unmapped_fraction: f64,
 
@@ -108,6 +115,8 @@ impl Command for MappedReads {
         // Validate methylation args
         let methylation = self.methylation.resolve();
         self.methylation.validate()?;
+
+        validate_rate(self.unmapped_fraction, "unmapped-fraction")?;
 
         info!("Generating mapped reads");
         info!("  Output: {}", self.output.display());
@@ -203,6 +212,12 @@ impl Command for MappedReads {
         // Use a different seed for molecule generation to avoid correlation with positions
         let mut seed_rng = create_rng(self.common.seed.map(|s| s.wrapping_add(1)));
 
+        // Dedicated RNG for the per-molecule unmapped decision. Kept separate
+        // from `seed_rng` and `mol_rng` so that toggling `--unmapped-fraction`
+        // does not perturb UMI/sequence content for molecules that remain
+        // mapped.
+        let mut unmapped_rng = create_rng(self.common.seed.map(|s| s.wrapping_add(2)));
+
         // MEMORY-EFFICIENT APPROACH: Sort molecule IDs by template-coordinate key first,
         // then generate records in sorted order (streaming). This avoids storing all
         // records in memory before sorting.
@@ -213,32 +228,44 @@ impl Command for MappedReads {
         let mut molecules: Vec<MoleculeInfo> = (0..self.common.num_molecules)
             .map(|mol_id| {
                 let seed: u64 = seed_rng.random();
-                let pos_idx = mol_id % num_positions;
-                let (chrom_idx, local_pos) = position_table[pos_idx];
+                // Draw per-molecule unmapped decision from the dedicated RNG so it
+                // stays deterministic across builds and uncorrelated with the other
+                // streams. Always draw (no short-circuit on `unmapped_fraction`) so
+                // the stream advances identically across molecules regardless of the
+                // fraction value.
+                let is_unmapped = unmapped_rng.random::<f64>() < self.unmapped_fraction;
 
-                // Pre-compute insert_size using the molecule's seed (same RNG sequence
-                // as generation)
-                let mut mol_rng = create_rng(Some(seed));
-                // Skip UMI generation RNG calls
-                for _ in 0..params.umi_length {
-                    let _: usize = mol_rng.random_range(0..4);
-                }
-                // Skip family_size RNG call
-                let _ = params.family_dist.sample(&mut mol_rng, params.min_family_size);
-                // Get insert_size
-                let insert_size = params.insert_model.sample(&mut mol_rng);
+                let sort_key = if is_unmapped {
+                    TemplateCoordKey::for_unmapped_pair(format!("mol{mol_id:08}"))
+                } else {
+                    let pos_idx = mol_id % num_positions;
+                    let (chrom_idx, local_pos) = position_table[pos_idx];
 
-                // Sort key — for_f1r2_pair gives the canonical template-coordinate sort
-                // key. This works for both F1R2 and R1F2 orientations because the
-                // template covers the same genomic positions regardless of strand.
-                let sort_key = TemplateCoordKey::for_f1r2_pair(
-                    chrom_idx as i32, // real tid
-                    local_pos,
-                    insert_size,
-                    String::new(), // empty mid for mapped-reads (no MI tag yet)
-                    format!("mol{mol_id:08}"),
-                );
-                MoleculeInfo { mol_id, seed, sort_key }
+                    // Pre-compute insert_size using the molecule's seed (same RNG sequence
+                    // as generation)
+                    let mut mol_rng = create_rng(Some(seed));
+                    // Skip UMI generation RNG calls
+                    for _ in 0..params.umi_length {
+                        let _: usize = mol_rng.random_range(0..4);
+                    }
+                    // Skip family_size RNG call
+                    let _ = params.family_dist.sample(&mut mol_rng, params.min_family_size);
+                    // Get insert_size
+                    let insert_size = params.insert_model.sample(&mut mol_rng);
+
+                    // Sort key — for_f1r2_pair gives the canonical template-coordinate sort
+                    // key. This works for both F1R2 and R1F2 orientations because the
+                    // template covers the same genomic positions regardless of strand.
+                    TemplateCoordKey::for_f1r2_pair(
+                        chrom_idx as i32, // real tid
+                        local_pos,
+                        insert_size,
+                        String::new(), // empty mid for mapped-reads (no MI tag yet)
+                        format!("mol{mol_id:08}"),
+                    )
+                };
+
+                MoleculeInfo { mol_id, seed, sort_key, is_unmapped }
             })
             .collect();
 
@@ -281,36 +308,51 @@ impl Command for MappedReads {
                 mol_info.seed,
                 pos_chrom_idx,
                 pos_local_pos,
+                mol_info.is_unmapped,
                 &params,
                 &ref_genome,
             );
 
             for (r1, r2, read_name, umi_str, is_top_strand) in pairs {
-                // Template-coordinate order: write the record whose reference start
-                // is lower first so pairs are emitted in coordinate order. R1F2
-                // pairs have R1 (reverse read) at the higher coordinate, so emit R2
-                // first when R1's alignment_start is strictly greater.
-                let r1_pos = r1.alignment_start().map(|p| p.get()).unwrap_or(0);
-                let r2_pos = r2.alignment_start().map(|p| p.get()).unwrap_or(0);
-                let r2_first = r1_pos > r2_pos;
-                if r2_first {
-                    writer.write_alignment_record(&header, &r2)?;
+                if mol_info.is_unmapped {
+                    // Unmapped pairs: emit R1 then R2 in the conventional order.
+                    // Truth rows record unmapped-sentinel values for chrom/pos/strand
+                    // so downstream validators can distinguish unmapped from mapped
+                    // molecules.
                     writer.write_alignment_record(&header, &r1)?;
+                    writer.write_alignment_record(&header, &r2)?;
+                    writeln!(
+                        truth_writer,
+                        "{}\t{}\t{}\t*\t*\t*",
+                        read_name, umi_str, mol_info.mol_id
+                    )?;
                 } else {
-                    writer.write_alignment_record(&header, &r1)?;
-                    writer.write_alignment_record(&header, &r2)?;
+                    // Template-coordinate order: write the record whose reference start
+                    // is lower first so pairs are emitted in coordinate order. R1F2
+                    // pairs have R1 (reverse read) at the higher coordinate, so emit R2
+                    // first when R1's alignment_start is strictly greater.
+                    let r1_pos = r1.alignment_start().map(|p| p.get()).unwrap_or(0);
+                    let r2_pos = r2.alignment_start().map(|p| p.get()).unwrap_or(0);
+                    let r2_first = r1_pos > r2_pos;
+                    if r2_first {
+                        writer.write_alignment_record(&header, &r2)?;
+                        writer.write_alignment_record(&header, &r1)?;
+                    } else {
+                        writer.write_alignment_record(&header, &r1)?;
+                        writer.write_alignment_record(&header, &r2)?;
+                    }
+                    let strand_char = if is_top_strand { '+' } else { '-' };
+                    writeln!(
+                        truth_writer,
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        read_name,
+                        umi_str,
+                        mol_info.mol_id,
+                        ref_genome.name(chrom_idx),
+                        local_pos,
+                        strand_char,
+                    )?;
                 }
-                let strand_char = if is_top_strand { '+' } else { '-' };
-                writeln!(
-                    truth_writer,
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    read_name,
-                    umi_str,
-                    mol_info.mol_id,
-                    ref_genome.name(chrom_idx),
-                    local_pos,
-                    strand_char,
-                )?;
                 total_pairs += 1;
             }
         }
@@ -345,6 +387,7 @@ fn generate_molecule_reads(
     seed: u64,
     chrom_idx: usize,
     local_pos: usize,
+    is_unmapped: bool,
     params: &GenerationParams,
     ref_genome: &ReferenceGenome,
 ) -> MoleculeReadsResult {
@@ -357,11 +400,26 @@ fn generate_molecule_reads(
     // Generate family size
     let family_size = params.family_dist.sample(&mut rng, params.min_family_size);
 
-    // Generate insert size
+    // Generate insert size (drawn even for unmapped molecules so the RNG
+    // sequence matches the pre-pass insert_size pre-computation)
     let insert_size = params.insert_model.sample(&mut rng);
 
-    // 50/50 strand coin flip: determines genomic strand of origin
+    // 50/50 strand coin flip: determines genomic strand of origin (unused for
+    // unmapped pairs, but drawn to keep the RNG sequence identical to the
+    // mapped case for a given seed)
     let is_top_strand: bool = rng.random();
+
+    if is_unmapped {
+        return generate_unmapped_molecule_reads(
+            mol_id,
+            chrom_idx,
+            local_pos,
+            &umi_str,
+            family_size,
+            params,
+            &mut rng,
+        );
+    }
 
     // Get template from reference at the pre-sampled position, falling back to a
     // random position if the exact location doesn't yield a valid sequence. When
@@ -482,6 +540,80 @@ fn generate_molecule_reads(
     }
 
     (pairs, chrom_idx, local_pos)
+}
+
+/// Generate all read pairs for a molecule that has been flagged as unmapped.
+///
+/// Sequence content and qualities are still produced per-read (so BAMs contain
+/// well-formed unmapped records) but no reference lookups are performed. Every
+/// emitted pair has `UNMAPPED` and `MATE_UNMAPPED` set and carries only the RX
+/// tag — no MC/MQ, no alignment position, no CIGAR.
+fn generate_unmapped_molecule_reads(
+    mol_id: usize,
+    chrom_idx: usize,
+    local_pos: usize,
+    umi_str: &str,
+    family_size: usize,
+    params: &GenerationParams,
+    rng: &mut impl Rng,
+) -> MoleculeReadsResult {
+    let mut pairs = Vec::with_capacity(family_size);
+
+    for read_idx in 0..family_size {
+        let read_name = format!("mol{mol_id:08}_read{read_idx:04}");
+
+        let r1_seq_raw = generate_random_sequence(params.read_length, rng);
+        let r1_seq = pad_sequence(r1_seq_raw, params.read_length, rng);
+        let r2_seq_raw = generate_random_sequence(params.read_length, rng);
+        let r2_seq = pad_sequence(r2_seq_raw, params.read_length, rng);
+
+        let r1_quals = params.quality_model.generate_qualities(params.read_length, rng);
+        let r2_quals_raw = params.quality_model.generate_qualities(params.read_length, rng);
+        let r2_quals = params.quality_bias.apply_to_vec(&r2_quals_raw, true);
+
+        let r1_record = build_unmapped_record(&read_name, &r1_seq, &r1_quals, true, umi_str);
+        let r2_record = build_unmapped_record(&read_name, &r2_seq, &r2_quals, false, umi_str);
+
+        // `is_top_strand=false` for unmapped pairs: there is no meaningful
+        // strand of origin, so we report a consistent sentinel.
+        pairs.push((r1_record, r2_record, read_name, umi_str.to_string(), false));
+    }
+
+    // Unmapped molecules have no meaningful genomic coordinates; return the
+    // pre-sampled locus only so the tuple shape matches the mapped case. The
+    // caller does not use these fields for unmapped pairs (truth rows emit
+    // `*` sentinels instead).
+    (pairs, chrom_idx, local_pos)
+}
+
+fn build_unmapped_record(
+    name: &str,
+    seq: &[u8],
+    quals: &[u8],
+    is_first: bool,
+    umi: &str,
+) -> RecordBuf {
+    let seq_str = String::from_utf8_lossy(seq);
+
+    // Omit cigar/reference/position/mate-ref/mate-pos/MAPQ/TLEN/MC/MQ; only
+    // sequence, qualities, PAIRED/FIRST|LAST/UNMAPPED/MATE_UNMAPPED flags,
+    // and the RX tag are valid on an unmapped pair. `.cigar("")` forces an
+    // empty CIGAR — without it, `RecordBuilder` auto-generates `{len}M` from
+    // the sequence.
+    // `RecordBuilder::new()` defaults MAPQ to 60, which is wrong for an unmapped
+    // read (SAM spec §1.4.5: MAPQ on unmapped reads should be 0). Override.
+    RecordBuilder::new()
+        .name(name)
+        .sequence(&seq_str)
+        .qualities(quals)
+        .cigar("")
+        .mapping_quality(0)
+        .paired(true)
+        .first_segment(is_first)
+        .unmapped(true)
+        .mate_unmapped(true)
+        .tag("RX", umi)
+        .build()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -838,7 +970,8 @@ mod tests {
             },
         };
 
-        let (pairs, _chrom, _pos) = generate_molecule_reads(0, 42, 0, 500, &params, &ref_genome);
+        let (pairs, _chrom, _pos) =
+            generate_molecule_reads(0, 42, 0, 500, false, &params, &ref_genome);
         // Multiple reads should be generated (family_size >= 3)
         assert!(pairs.len() >= 3, "Expected at least 3 reads, got {}", pairs.len());
     }
@@ -890,7 +1023,7 @@ mod tests {
         // Test that generate_molecule_reads produces records with correct ref_id
         let (chrom_idx, local_pos) = positions[0];
         let (pairs, eff_chrom, eff_pos) =
-            generate_molecule_reads(0, 42, chrom_idx, local_pos, &params, &ref_genome);
+            generate_molecule_reads(0, 42, chrom_idx, local_pos, false, &params, &ref_genome);
         assert!(!pairs.is_empty());
 
         for (r1, r2, _, _, _) in &pairs {
@@ -948,7 +1081,7 @@ mod tests {
         // Generate many molecules with different seeds to verify both orientations
         for seed in 0u64..100 {
             let (pairs, _chrom, _pos) =
-                generate_molecule_reads(seed as usize, seed, 0, 500, &params, &ref_genome);
+                generate_molecule_reads(seed as usize, seed, 0, 500, false, &params, &ref_genome);
             for (r1, _, _, _, is_top) in &pairs {
                 if *is_top {
                     saw_f1r2 = true;
@@ -962,5 +1095,357 @@ mod tests {
 
         assert!(saw_f1r2, "Should see at least one F1R2 molecule");
         assert!(saw_r1f2, "Should see at least one R1F2 molecule");
+    }
+
+    // ========================================================================
+    // --unmapped-fraction tests (issue #302)
+    // ========================================================================
+
+    fn basic_unmapped_test_params(min_family_size: usize) -> GenerationParams {
+        GenerationParams {
+            read_length: 50,
+            umi_length: 8,
+            mapq: 60,
+            min_family_size,
+            quality_model: crate::simulate::PositionQualityModel::new(
+                10, 25, 37, 100, 0.08, 2, 0.0,
+            ),
+            quality_bias: crate::simulate::ReadPairQualityBias::new(0),
+            family_dist: crate::simulate::FamilySizeDistribution::log_normal(5.0, 1.0),
+            insert_model: crate::simulate::InsertSizeModel::new(100.0, 10.0, 80, 120),
+            methylation: MethylationConfig {
+                mode: fgumi_consensus::MethylationMode::Disabled,
+                cpg_methylation_rate: 0.75,
+                conversion_rate: 0.98,
+            },
+        }
+    }
+
+    /// When a molecule is flagged as unmapped, every emitted R1/R2 pair must
+    /// have `UNMAPPED` and `MATE_UNMAPPED` set, no reference/position/CIGAR/MAPQ,
+    /// and carry the same read-name, sequence length, and RX tag as a mapped
+    /// pair would.
+    #[test]
+    fn test_unmapped_molecule_produces_unmapped_records() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = basic_unmapped_test_params(3);
+
+        let (pairs, _chrom, _pos) =
+            generate_molecule_reads(0, 42, 0, 500, true, &params, &ref_genome);
+        assert!(!pairs.is_empty(), "molecule should still emit pairs when unmapped");
+
+        for (r1, r2, _, umi, _) in &pairs {
+            for r in [r1, r2] {
+                let flags = r.flags();
+                assert!(flags.is_segmented(), "PAIRED flag should be set");
+                assert!(flags.is_unmapped(), "UNMAPPED flag should be set");
+                assert!(flags.is_mate_unmapped(), "MATE_UNMAPPED flag should be set");
+                assert!(r.reference_sequence_id().is_none(), "ref_id should be unset");
+                assert!(r.alignment_start().is_none(), "pos should be unset");
+                assert!(r.mate_reference_sequence_id().is_none(), "mate_ref_id should be unset");
+                assert!(r.mate_alignment_start().is_none(), "mate_pos should be unset");
+                // SAM spec §1.4.5: MAPQ on unmapped reads should be 0.
+                assert_eq!(
+                    r.mapping_quality().map(|m| m.get()),
+                    Some(0),
+                    "MAPQ should be 0 on unmapped reads"
+                );
+                assert_eq!(r.template_length(), 0, "TLEN should be 0");
+                assert_eq!(r.cigar().as_ref().len(), 0, "CIGAR should be empty");
+                assert_eq!(r.sequence().len(), params.read_length, "sequence length preserved");
+                assert_eq!(
+                    r.quality_scores().as_ref().len(),
+                    params.read_length,
+                    "qualities length preserved"
+                );
+            }
+            assert!(r1.flags().is_first_segment(), "R1 should be FIRST_SEGMENT");
+            assert!(r2.flags().is_last_segment(), "R2 should be LAST_SEGMENT");
+            assert_eq!(umi.len(), params.umi_length, "UMI length preserved");
+        }
+    }
+
+    /// Unmapped molecules must not carry a MC/MQ tag; there is no mate
+    /// alignment to describe.
+    #[test]
+    fn test_unmapped_molecule_has_no_mate_alignment_tags() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = basic_unmapped_test_params(2);
+
+        let (pairs, _chrom, _pos) =
+            generate_molecule_reads(1, 99, 0, 500, true, &params, &ref_genome);
+        assert!(!pairs.is_empty());
+
+        let mc = Tag::from([b'M', b'C']);
+        let mq = Tag::from([b'M', b'Q']);
+        let rx = Tag::from([b'R', b'X']);
+        for (r1, r2, _, _, _) in &pairs {
+            for r in [r1, r2] {
+                assert!(r.data().get(&mc).is_none(), "MC tag must not be present");
+                assert!(r.data().get(&mq).is_none(), "MQ tag must not be present");
+                assert!(r.data().get(&rx).is_some(), "RX tag must still be present");
+            }
+        }
+    }
+
+    /// Passing `is_unmapped=false` must produce records identical to the
+    /// pre-fix (mapped) behavior: reference, position, CIGAR, and MAPQ are
+    /// all populated.
+    #[test]
+    fn test_mapped_path_unchanged_when_is_unmapped_false() {
+        use std::io::Write as IoWrite;
+        use tempfile::NamedTempFile;
+
+        let mut fasta = NamedTempFile::new().unwrap();
+        writeln!(fasta, ">chr1").unwrap();
+        fasta.write_all(&b"ACGT".repeat(500)).unwrap();
+        writeln!(fasta).unwrap();
+        fasta.flush().unwrap();
+
+        let ref_genome = ReferenceGenome::load(fasta.path()).unwrap();
+        let params = basic_unmapped_test_params(1);
+
+        let (pairs, _chrom, _pos) =
+            generate_molecule_reads(0, 42, 0, 500, false, &params, &ref_genome);
+        assert!(!pairs.is_empty());
+
+        for (r1, r2, _, _, _) in &pairs {
+            for r in [r1, r2] {
+                let flags = r.flags();
+                assert!(!flags.is_unmapped(), "mapped path should not set UNMAPPED");
+                assert!(!flags.is_mate_unmapped(), "mapped path should not set MATE_UNMAPPED");
+                assert!(r.reference_sequence_id().is_some());
+                assert!(r.alignment_start().is_some());
+                assert!(r.mapping_quality().is_some());
+                assert_ne!(r.cigar().as_ref().len(), 0, "mapped path should populate CIGAR");
+            }
+        }
+    }
+
+    /// Helper to build a minimal reference FASTA on disk for end-to-end tests.
+    fn write_minimal_fasta(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::Write as IoWrite;
+        let fasta = dir.join("ref.fa");
+        let mut f = std::fs::File::create(&fasta).unwrap();
+        writeln!(f, ">chr1").unwrap();
+        f.write_all(&b"ACGT".repeat(1500)).unwrap(); // 6000 bp
+        writeln!(f).unwrap();
+        fasta
+    }
+
+    /// End-to-end: running `mapped-reads --unmapped-fraction 1.0` must produce
+    /// a BAM in which every record has the UNMAPPED flag set.
+    #[test]
+    fn test_execute_unmapped_fraction_one_produces_all_unmapped() {
+        use clap::Parser;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fasta = write_minimal_fasta(dir.path());
+        let out_bam = dir.path().join("out.bam");
+        let truth = dir.path().join("truth.tsv");
+
+        let cmd = MappedReads::try_parse_from([
+            "mapped-reads",
+            "-o",
+            out_bam.to_str().unwrap(),
+            "--truth",
+            truth.to_str().unwrap(),
+            "-r",
+            fasta.to_str().unwrap(),
+            "--num-molecules",
+            "20",
+            "--unmapped-fraction",
+            "1.0",
+            "--seed",
+            "42",
+        ])
+        .expect("CLI parse");
+
+        cmd.execute("test").expect("execute() succeeded");
+
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&out_bam).unwrap();
+        let header = reader.read_header().unwrap();
+        let mut n_records = 0;
+        for result in reader.records() {
+            let record = result.unwrap();
+            assert!(
+                record.flags().is_unmapped(),
+                "every record must be UNMAPPED when --unmapped-fraction=1.0"
+            );
+            assert!(
+                record.flags().is_mate_unmapped(),
+                "every record must be MATE_UNMAPPED when --unmapped-fraction=1.0"
+            );
+            n_records += 1;
+            // suppress unused-header warning
+            let _ = &header;
+        }
+        assert!(n_records > 0, "expected some records, got 0");
+    }
+
+    /// End-to-end: running `mapped-reads --unmapped-fraction 0.0` (the default)
+    /// must produce a BAM with zero unmapped records — the original mapped
+    /// behavior is preserved.
+    #[test]
+    fn test_execute_unmapped_fraction_zero_produces_no_unmapped() {
+        use clap::Parser;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fasta = write_minimal_fasta(dir.path());
+        let out_bam = dir.path().join("out.bam");
+        let truth = dir.path().join("truth.tsv");
+
+        let cmd = MappedReads::try_parse_from([
+            "mapped-reads",
+            "-o",
+            out_bam.to_str().unwrap(),
+            "--truth",
+            truth.to_str().unwrap(),
+            "-r",
+            fasta.to_str().unwrap(),
+            "--num-molecules",
+            "20",
+            "--unmapped-fraction",
+            "0.0",
+            "--seed",
+            "42",
+        ])
+        .expect("CLI parse");
+
+        cmd.execute("test").expect("execute() succeeded");
+
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&out_bam).unwrap();
+        let _ = reader.read_header().unwrap();
+        for result in reader.records() {
+            let record = result.unwrap();
+            assert!(
+                !record.flags().is_unmapped(),
+                "no record should be UNMAPPED when --unmapped-fraction=0.0"
+            );
+        }
+    }
+
+    /// End-to-end: with a fractional `--unmapped-fraction`, the BAM must
+    /// contain BOTH mapped and unmapped records, and all unmapped records
+    /// must sort after all mapped records (matching the `for_unmapped_pair`
+    /// sort-key convention).
+    #[test]
+    fn test_execute_unmapped_fraction_mixed_sorts_unmapped_last() {
+        use clap::Parser;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fasta = write_minimal_fasta(dir.path());
+        let out_bam = dir.path().join("out.bam");
+        let truth = dir.path().join("truth.tsv");
+
+        let cmd = MappedReads::try_parse_from([
+            "mapped-reads",
+            "-o",
+            out_bam.to_str().unwrap(),
+            "--truth",
+            truth.to_str().unwrap(),
+            "-r",
+            fasta.to_str().unwrap(),
+            "--num-molecules",
+            "50",
+            "--unmapped-fraction",
+            "0.5",
+            "--seed",
+            "42",
+        ])
+        .expect("CLI parse");
+
+        cmd.execute("test").expect("execute() succeeded");
+
+        let mut reader = noodles::bam::io::reader::Builder.build_from_path(&out_bam).unwrap();
+        let _ = reader.read_header().unwrap();
+        let mut mapped_count = 0;
+        let mut unmapped_count = 0;
+        let mut first_unmapped_idx: Option<usize> = None;
+        let mut last_mapped_idx: Option<usize> = None;
+        for (idx, result) in reader.records().enumerate() {
+            let record = result.unwrap();
+            if record.flags().is_unmapped() {
+                unmapped_count += 1;
+                first_unmapped_idx.get_or_insert(idx);
+            } else {
+                mapped_count += 1;
+                last_mapped_idx = Some(idx);
+            }
+        }
+        assert!(mapped_count > 0, "expected some mapped records, got {mapped_count}");
+        assert!(unmapped_count > 0, "expected some unmapped records, got {unmapped_count}");
+        if let (Some(first_unmapped), Some(last_mapped)) = (first_unmapped_idx, last_mapped_idx) {
+            assert!(
+                last_mapped < first_unmapped,
+                "all mapped records must sort before any unmapped record \
+                 (last mapped idx {last_mapped}, first unmapped idx {first_unmapped})"
+            );
+        }
+    }
+
+    /// `--unmapped-fraction` outside `[0.0, 1.0]` must be rejected with a
+    /// descriptive error, not silently ignored.
+    #[rstest::rstest]
+    #[case("-0.1")]
+    #[case("1.5")]
+    #[case("NaN")]
+    fn test_execute_rejects_out_of_range_unmapped_fraction(#[case] bad: &str) {
+        use clap::Parser;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fasta = write_minimal_fasta(dir.path());
+        let out_bam = dir.path().join("out.bam");
+        let truth = dir.path().join("truth.tsv");
+
+        // Use `--flag=value` so clap doesn't mis-parse negative values as
+        // separate flags.
+        let flag_arg = format!("--unmapped-fraction={bad}");
+        let cmd = MappedReads::try_parse_from([
+            "mapped-reads",
+            "-o",
+            out_bam.to_str().unwrap(),
+            "--truth",
+            truth.to_str().unwrap(),
+            "-r",
+            fasta.to_str().unwrap(),
+            "--num-molecules",
+            "5",
+            &flag_arg,
+            "--seed",
+            "1",
+        ])
+        .expect("CLI parse");
+
+        let result = cmd.execute("test");
+        assert!(result.is_err(), "value {bad} should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--unmapped-fraction"),
+            "error message should mention the flag name, got: {msg}"
+        );
     }
 }

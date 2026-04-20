@@ -87,6 +87,25 @@ impl TemplateCoordKey {
             is_upper_of_pair: false, // R1 is always "earlier" for F1R2
         }
     }
+
+    /// Create a sort key for an entirely unmapped pair.
+    ///
+    /// Uses the samtools convention (`tid = i32::MAX`, `pos = 0`) so unmapped
+    /// pairs sort after all mapped pairs, matching `test_unmapped_reads_use_max_tid`.
+    /// `name` ties unmapped pairs to a deterministic order among themselves.
+    pub fn for_unmapped_pair(name: String) -> Self {
+        Self {
+            tid1: i32::MAX,
+            tid2: i32::MAX,
+            pos1: 0,
+            pos2: 0,
+            neg1: false,
+            neg2: false,
+            mid: String::new(),
+            name,
+            is_upper_of_pair: false,
+        }
+    }
 }
 
 /// Compare MI tags using the samtools/fgbio algorithm.

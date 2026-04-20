@@ -247,7 +247,7 @@ pub struct MethylationConfig {
 }
 
 /// Validates that a rate is a finite value in [0.0, 1.0].
-fn validate_rate(value: f64, name: &str) -> anyhow::Result<()> {
+pub(super) fn validate_rate(value: f64, name: &str) -> anyhow::Result<()> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         anyhow::bail!("--{name} must be a finite value between 0.0 and 1.0, got {value}");
     }
@@ -590,6 +590,11 @@ pub(super) struct MoleculeInfo {
     pub mol_id: usize,
     pub seed: u64,
     pub sort_key: TemplateCoordKey,
+    /// Whether this molecule should be emitted as entirely unmapped.
+    ///
+    /// Set by `mapped-reads` when `--unmapped-fraction > 0`; other simulate
+    /// subcommands leave this `false`.
+    pub is_unmapped: bool,
 }
 
 impl Ord for MoleculeInfo {
@@ -1034,6 +1039,7 @@ mod tests {
                 name: String::new(),
                 is_upper_of_pair: false,
             },
+            is_unmapped: false,
         }
     }
 
