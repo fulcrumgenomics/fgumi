@@ -344,9 +344,11 @@ impl SimplexMetrics {
 mod tests {
     use super::*;
     use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
-    use crate::sam::builder::RecordPairBuilder;
     use anyhow::Result;
     use fgoxide::io::DelimFile;
+    use fgumi_raw_bam::{
+        SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
+    };
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
@@ -373,6 +375,12 @@ mod tests {
         builder.build()
     }
 
+    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> sam::alignment::RecordBuf {
+        raw_record_to_record_buf(&raw, &sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
+
+    #[allow(clippy::cast_sign_loss)]
     fn build_test_pair(
         name: &str,
         ref_id: usize,
@@ -381,18 +389,41 @@ mod tests {
         rx_umi: &str,
         mi_tag: &str,
     ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
-        RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(ref_id)
-            .r1_start(pos1 as usize)
-            .r2_start(pos2 as usize)
-            .r1_reverse(false)
-            .r2_reverse(true)
-            .tag("RX", rx_umi)
-            .tag("MI", mi_tag)
-            .build()
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .ref_id(ref_id as i32)
+            .pos(pos1 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos2 - 1);
+        b1.add_string_tag(b"RX", rx_umi.as_bytes());
+        b1.add_string_tag(b"MI", mi_tag.as_bytes());
+        let r1 = to_record_buf(b1.build());
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .ref_id(ref_id as i32)
+            .pos(pos2 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos1 - 1);
+        b2.add_string_tag(b"RX", rx_umi.as_bytes());
+        b2.add_string_tag(b"MI", mi_tag.as_bytes());
+        let r2 = to_record_buf(b2.build());
+
+        (r1, r2)
     }
 
     fn create_test_bam(records: Vec<sam::alignment::RecordBuf>) -> Result<NamedTempFile> {
@@ -570,24 +601,22 @@ mod tests {
 
     #[test]
     fn test_reject_consensus_bam() -> Result<()> {
-        use crate::sam::builder::RecordBuilder;
-
         let temp_file = NamedTempFile::new()?;
         let header = create_test_header();
         let mut writer = bam::io::writer::Builder.build_from_path(temp_file.path())?;
         writer.write_header(&header)?;
 
-        let record = RecordBuilder::new()
-            .name("read1")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .paired(true)
-            .first_segment(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .tag("cD", "5")
-            .build();
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 100)])
+            .sequence(&[b'A'; 100])
+            .qualities(&[30u8; 100]);
+        b.add_int_tag(b"cD", 5);
+        let record = to_record_buf(b.build());
         writer.write_alignment_record(&header, &record)?;
         drop(writer);
 

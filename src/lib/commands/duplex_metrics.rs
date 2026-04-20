@@ -610,9 +610,11 @@ mod tests {
     };
     use crate::metrics::duplex::{DuplexFamilySizeMetric, DuplexUmiMetric, FamilySizeMetric};
     use crate::metrics::shared::UmiMetric;
-    use crate::sam::builder::{RecordBuilder, RecordPairBuilder};
     use anyhow::Result;
     use fgoxide::io::DelimFile;
+    use fgumi_raw_bam::{
+        SamBuilder as RawSamBuilder, flags, raw_record_to_record_buf, testutil::encode_op,
+    };
     use noodles::bam;
     use noodles::sam;
     use noodles::sam::alignment::io::Write;
@@ -644,8 +646,13 @@ mod tests {
         builder.build()
     }
 
+    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> sam::alignment::RecordBuf {
+        raw_record_to_record_buf(&raw, &sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
+
     /// Builds a pair of reads with proper mate information
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::cast_sign_loss)]
     fn build_test_pair(
         name: &str,
         ref_id: usize,
@@ -656,18 +663,50 @@ mod tests {
         strand1_plus: bool,
         strand2_plus: bool,
     ) -> (sam::alignment::RecordBuf, sam::alignment::RecordBuf) {
-        RecordPairBuilder::new()
-            .name(name)
-            .r1_sequence(&"A".repeat(100))
-            .r2_sequence(&"A".repeat(100))
-            .reference_sequence_id(ref_id)
-            .r1_start(pos1 as usize)
-            .r2_start(pos2 as usize)
-            .r1_reverse(!strand1_plus)
-            .r2_reverse(!strand2_plus)
-            .tag("RX", rx_umi)
-            .tag("MI", mi_tag)
-            .build()
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let r1_flags = flags::PAIRED
+            | flags::FIRST_SEGMENT
+            | if strand1_plus { 0 } else { flags::REVERSE }
+            | if strand2_plus { 0 } else { flags::MATE_REVERSE };
+        let r2_flags = flags::PAIRED
+            | flags::LAST_SEGMENT
+            | if strand2_plus { 0 } else { flags::REVERSE }
+            | if strand1_plus { 0 } else { flags::MATE_REVERSE };
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(r1_flags)
+            .ref_id(ref_id as i32)
+            .pos(pos1 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos2 - 1);
+        b1.add_string_tag(b"RX", rx_umi.as_bytes());
+        b1.add_string_tag(b"MI", mi_tag.as_bytes());
+        let r1 = to_record_buf(b1.build());
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(r2_flags)
+            .ref_id(ref_id as i32)
+            .pos(pos2 - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(ref_id as i32)
+            .mate_pos(pos1 - 1);
+        b2.add_string_tag(b"RX", rx_umi.as_bytes());
+        b2.add_string_tag(b"MI", mi_tag.as_bytes());
+        let r2 = to_record_buf(b2.build());
+
+        (r1, r2)
     }
 
     /// Writes records to a temporary BAM file in template-coordinate order
@@ -1585,17 +1624,17 @@ mod tests {
             .build();
 
         // Create a simplex consensus record (has cD tag)
-        let rec = RecordBuilder::new()
-            .name("read1")
-            .sequence(&"A".repeat(100))
-            .qualities(&[30u8; 100])
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mapping_quality(60)
-            .cigar("100M")
-            .first_segment(true)
-            .tag("cD", 10_i32)
-            .build();
+        let mut b = RawSamBuilder::new();
+        b.read_name(b"read1")
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .cigar_ops(&[encode_op(0, 100)])
+            .sequence(&[b'A'; 100])
+            .qualities(&[30u8; 100]);
+        b.add_int_tag(b"cD", 10_i32);
+        let rec = to_record_buf(b.build());
 
         // Write BAM
         let mut writer = noodles::bam::io::Writer::new(std::fs::File::create(&bam_path)?);

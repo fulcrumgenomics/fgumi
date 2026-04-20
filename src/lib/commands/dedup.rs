@@ -174,10 +174,6 @@ pub struct ProcessedDedupGroup {
     pub dedup_metrics: DedupMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
-    /// Number of distinct numeric molecule IDs assigned in this group. See
-    /// [`fgumi_lib::grouper::ProcessedPositionGroup::distinct_mi_count`] for
-    /// rationale; ensures emitted MI tag integers are consecutive 0..N-1.
-    pub distinct_mi_count: u64,
 }
 
 impl BatchWeight for ProcessedDedupGroup {
@@ -689,7 +685,6 @@ fn process_position_group(
             family_sizes: AHashMap::new(),
             dedup_metrics,
             input_record_count,
-            distinct_mi_count: 0,
         });
     }
 
@@ -751,7 +746,7 @@ fn process_position_group(
         }
     }
 
-    // Count reads and check for missing tc tags
+    // Count reads and check for missing pa tags
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;
@@ -778,18 +773,7 @@ fn process_position_group(
 
     dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
 
-    // Compute distinct numeric MoleculeId count for the global MI counter block
-    // size; see issue #269 / ProcessedPositionGroup::distinct_mi_count rationale.
-    let distinct_mi_count: u64 =
-        templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
-
-    Ok(ProcessedDedupGroup {
-        templates,
-        family_sizes,
-        dedup_metrics,
-        input_record_count,
-        distinct_mi_count,
-    })
+    Ok(ProcessedDedupGroup { templates, family_sizes, dedup_metrics, input_record_count })
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1050,12 +1034,13 @@ impl Command for MarkDuplicates {
 
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from the global counter. Advance by the
-                // number of distinct numeric MoleculeId IDs actually assigned in this
-                // group, not the template count, so the emitted MI integers are
-                // consecutive 0..N-1 (see issue #269).
-                let base_mi = next_mi_base
-                    .fetch_add(processed.distinct_mi_count, std::sync::atomic::Ordering::Relaxed);
+                // Assign contiguous base_mi from serial counter. Use the distinct MI
+                // count (number of families) so base_mi advances once per emitted MI,
+                // not once per template — families with multiple templates would
+                // otherwise create gaps in MI IDs.
+                let distinct_mi_count: u64 = processed.family_sizes.values().copied().sum();
+                let base_mi =
+                    next_mi_base.fetch_add(distinct_mi_count, std::sync::atomic::Ordering::Relaxed);
                 // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
                 output.reserve(processed.templates.len() * 2 * 400);
                 // Serialize templates
@@ -2544,7 +2529,6 @@ mod tests {
             family_sizes: AHashMap::new(),
             dedup_metrics: DedupMetrics::default(),
             input_record_count: 1,
-            distinct_mi_count: 0,
         };
 
         let estimate = batch.estimate_heap_size();

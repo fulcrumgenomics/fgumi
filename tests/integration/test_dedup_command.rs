@@ -5,80 +5,76 @@
 //! 2. Metrics output
 //! 3. Remove duplicates mode
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::create_minimal_header;
+use crate::helpers::bam_generator::{create_minimal_header, to_record_buf};
 
 /// Create a template-coordinate sorted BAM with UMI-tagged reads.
 ///
 /// Template-coordinate sort groups reads by position, then by name within each position.
 /// The header must have SO:unsorted GO:query SS:template-coordinate tags.
-fn create_sorted_bam(path: &PathBuf, records: Vec<RecordBuf>) {
+fn create_sorted_bam(path: &PathBuf, records: Vec<RawRecord>) {
     let header = create_minimal_header("chr1", 10000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
     for record in records {
-        writer.write_alignment_record(&header, &record).expect("Failed to write record");
+        writer
+            .write_alignment_record(&header, &to_record_buf(&record))
+            .expect("Failed to write record");
     }
     writer.try_finish().expect("Failed to finish BAM");
 }
 
 /// Create a group of paired-end reads at the same position with the same UMI
 /// (simulating PCR duplicates).
-fn create_duplicate_group(
-    base_name: &str,
-    umi: &str,
-    count: usize,
-    start: usize,
-) -> Vec<RecordBuf> {
+fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) -> Vec<RawRecord> {
     let mut records = Vec::new();
     for i in 0..count {
         let name = format!("{base_name}_{i}");
-        let r1 = RecordBuilder::new()
-            .name(&name)
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .paired(true)
-            .first_segment(true)
-            .properly_paired(true)
-            .reference_sequence_id(0)
-            .alignment_start(start)
-            .mapping_quality(60)
-            .cigar("8M")
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(start + 100)
-            .template_length(108)
-            .tag("RX", umi)
-            .tag("MC", "8M")
-            .build();
 
-        let r2 = RecordBuilder::new()
-            .name(&name)
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .paired(true)
-            .first_segment(false)
-            .properly_paired(true)
-            .reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(start + 100)
-            .mapping_quality(60)
-            .cigar("8M")
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(start)
-            .template_length(-108)
-            .tag("RX", umi)
-            .tag("MC", "8M")
-            .build();
+        let r1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .ref_id(0)
+                .pos(start - 1)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(start + 99)
+                .template_length(108)
+                .add_string_tag(b"RX", umi.as_bytes())
+                .add_string_tag(b"MC", b"8M");
+            b.build()
+        };
+
+        let r2 = {
+            let mut b = SamBuilder::new();
+            b.read_name(name.as_bytes())
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .ref_id(0)
+                .pos(start + 99)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .mate_ref_id(0)
+                .mate_pos(start - 1)
+                .template_length(-108)
+                .add_string_tag(b"RX", umi.as_bytes())
+                .add_string_tag(b"MC", b"8M");
+            b.build()
+        };
 
         records.push(r1);
         records.push(r2);
@@ -211,6 +207,7 @@ fn test_dedup_no_umi_large_position_group() {
     use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use noodles::sam::Header;
     use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::RecordBuf;
     use noodles::sam::alignment::record_buf::data::field::value::Value as DataValue;
     use noodles::sam::header::record::value::map::Map as HeaderRecordMap;
     use noodles::sam::header::record::value::map::header::tag::Tag as HeaderTag;

@@ -146,7 +146,7 @@
 //!
 //! // Process reads - should include both /A and /B MI tags
 //! // Example: "AAAA-CCCC/A" and "CCCC-AAAA/B" for same molecule
-//! let duplex_consensus = caller.consensus_reads_from_sam_records(reads)?;
+//! let duplex_consensus = caller.consensus_reads(reads)?;
 //!
 //! // Check statistics
 //! caller.log_statistics();
@@ -197,7 +197,7 @@ use bstr::BString;
 use bstr::ByteSlice;
 use log::{debug, info};
 use noodles::sam::alignment::record::data::field::Tag;
-// Used by #[cfg(test)] functions (call_duplex_from_ss_pair) and tests
+// Used by call_duplex_from_ss_pair and extract_int_tag (both #[cfg(test)])
 #[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
 
@@ -472,40 +472,6 @@ impl DuplexConsensusCaller {
         self.ss_caller.clear();
     }
 
-    /// Test helper: accepts `Vec<RecordBuf>`, encodes to raw bytes, and delegates to `consensus_reads`.
-    #[cfg(test)]
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "test helper takes ownership for convenience"
-    )]
-    pub(crate) fn consensus_reads_from_sam_records(
-        &mut self,
-        records: Vec<noodles::sam::alignment::RecordBuf>,
-    ) -> anyhow::Result<ConsensusOutput> {
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::ReferenceSequence;
-        use std::num::NonZeroUsize;
-        // Build header with a reference sequence for mapped records
-        let header = noodles::sam::Header::builder()
-            .add_reference_sequence(
-                "chr1",
-                Map::<ReferenceSequence>::new(
-                    NonZeroUsize::new(1_000_000).expect("1_000_000 is non-zero"),
-                ),
-            )
-            .build();
-        let raw: Vec<RawRecord> = records
-            .iter()
-            .map(|rec| {
-                let mut buf = Vec::new();
-                crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
-                    .map_err(|e| anyhow::anyhow!("Failed to encode RecordBuf: {e}"))?;
-                Ok(RawRecord::from(buf))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.consensus_reads(raw)
-    }
-
     /// Parses MI tag to extract base UMI and strand (/A or /B)
     ///
     /// Returns (`base_umi`, strand) where strand is 'A', 'B', or None if no suffix
@@ -566,19 +532,16 @@ impl DuplexConsensusCaller {
     /// strands are found.
     #[cfg(test)]
     #[must_use]
-    pub fn has_both_strands(reads: &[RecordBuf]) -> bool {
+    pub fn has_both_strands(reads: &[RawRecord]) -> bool {
         if reads.len() < 2 {
             return false;
         }
 
-        let mi_tag = Tag::from([b'M', b'I']);
         let mut has_a = false;
         let mut has_b = false;
 
         for read in reads {
-            if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(mi_bytes)) =
-                read.data().get(&mi_tag)
-            {
+            if let Some(mi_bytes) = RawRecordView::new(read).tags().find_string(b"MI") {
                 match Self::extract_strand_from_mi_bytes(mi_bytes) {
                     Some('A') => {
                         has_a = true;
@@ -678,24 +641,21 @@ impl DuplexConsensusCaller {
         reason = "tuple return type is clearer than a one-off struct for test grouping"
     )]
     fn group_by_mi_and_strand(
-        reads: Vec<RecordBuf>,
-    ) -> Result<AHashMap<String, (Vec<RecordBuf>, Vec<RecordBuf>)>> {
-        let mut groups: AHashMap<String, (Vec<RecordBuf>, Vec<RecordBuf>)> = AHashMap::new();
+        reads: Vec<RawRecord>,
+    ) -> Result<AHashMap<String, (Vec<RawRecord>, Vec<RawRecord>)>> {
+        let mut groups: AHashMap<String, (Vec<RawRecord>, Vec<RawRecord>)> = AHashMap::new();
 
         for read in reads {
-            // Get MI tag
-            let mi_tag = noodles::sam::alignment::record::data::field::Tag::from([b'M', b'I']);
-            let mi =
-                if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-                    read.data().get(&mi_tag)
-                {
-                    String::from_utf8(s.iter().copied().collect::<Vec<u8>>())
-                        .context("MI tag is not valid UTF-8")?
-                } else {
-                    // No MI tag, skip this read
-                    continue;
+            // Extract MI tag bytes from the raw record. Missing MI on duplex input is a
+            // fatal error: the input must be grouped with `fgumi group --strategy paired`.
+            let mi = {
+                let view = RawRecordView::new(&read);
+                let Some(mi_bytes) = view.tags().find_string(b"MI") else {
+                    let read_name = String::from_utf8_lossy(view.read_name());
+                    bail!("Read '{read_name}' is missing MI tag");
                 };
-
+                String::from_utf8(mi_bytes.to_vec()).context("MI tag is not valid UTF-8")?
+            };
             let (base_mi, strand) = Self::parse_mi_tag(&mi);
 
             let entry = groups.entry(base_mi).or_insert_with(|| (Vec::new(), Vec::new()));
@@ -1362,7 +1322,19 @@ impl DuplexConsensusCaller {
         use noodles::sam::alignment::record_buf::data::field::Value;
         use noodles::sam::alignment::record_buf::{QualityScores, Sequence};
 
-        use fgumi_sam::to_smallest_signed_int;
+        /// Encode `value` as the smallest signed integer `BufValue` type.
+        fn to_smallest_signed_int(
+            value: i32,
+        ) -> noodles::sam::alignment::record_buf::data::field::Value {
+            use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
+            if let Ok(v) = i8::try_from(value) {
+                BufValue::Int8(v)
+            } else if let Ok(v) = i16::try_from(value) {
+                BufValue::Int16(v)
+            } else {
+                BufValue::Int32(value)
+            }
+        }
 
         // Get sequences and qualities from both single-strand consensuses
         let seq_a = ss_a.sequence();
@@ -2277,17 +2249,8 @@ impl ConsensusCaller for DuplexConsensusCaller {
 )]
 mod tests {
     use super::*;
-    use fgumi_raw_bam::ParsedBamRecord;
-    use fgumi_sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{ParsedBamRecord, SamBuilder, testutil::encode_op};
     use noodles::sam::alignment::record_buf::data::field::Value;
-
-    fn encode_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> RawRecord {
-        let header = noodles::sam::Header::default();
-        let mut buf = Vec::new();
-        crate::vendored::bam_codec::encode_record_buf(&mut buf, &header, rec)
-            .expect("encode_record_buf should succeed");
-        RawRecord::from(buf)
-    }
 
     #[test]
     fn test_parse_mi_tag() {
@@ -2305,83 +2268,38 @@ mod tests {
         );
     }
 
+    /// Build a minimal raw record with the given MI tag value.
+    fn raw_with_mi(name: &[u8], mi: &[u8]) -> RawRecord {
+        let mut b = SamBuilder::new();
+        b.read_name(name).sequence(b"ACGT").qualities(&[30u8; 4]);
+        b.add_string_tag(b"MI", mi);
+        b.build()
+    }
+
     #[test]
     fn test_has_both_strands() {
         // Empty - no strands
-        let empty: Vec<RecordBuf> = vec![];
+        let empty: Vec<RawRecord> = vec![];
         assert!(!DuplexConsensusCaller::has_both_strands(&empty));
 
         // Single read - not enough
-        let single_a = vec![
-            RecordBuilder::new()
-                .name("read1")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-        ];
+        let single_a = vec![raw_with_mi(b"read1", b"UMI1/A")];
         assert!(!DuplexConsensusCaller::has_both_strands(&single_a));
 
         // Two reads, same strand - no duplex
-        let two_a = vec![
-            RecordBuilder::new()
-                .name("read1")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-            RecordBuilder::new()
-                .name("read2")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-        ];
+        let two_a = vec![raw_with_mi(b"read1", b"UMI1/A"), raw_with_mi(b"read2", b"UMI1/A")];
         assert!(!DuplexConsensusCaller::has_both_strands(&two_a));
 
         // Two reads, both strands - duplex possible
-        let both_strands = vec![
-            RecordBuilder::new()
-                .name("read1")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-            RecordBuilder::new()
-                .name("read2")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/B")
-                .build(),
-        ];
+        let both_strands = vec![raw_with_mi(b"read1", b"UMI1/A"), raw_with_mi(b"read2", b"UMI1/B")];
         assert!(DuplexConsensusCaller::has_both_strands(&both_strands));
 
         // Many reads, A strand first, B found later
         let many_a_one_b = vec![
-            RecordBuilder::new()
-                .name("read1")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-            RecordBuilder::new()
-                .name("read2")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-            RecordBuilder::new()
-                .name("read3")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/A")
-                .build(),
-            RecordBuilder::new()
-                .name("read4")
-                .sequence("ACGT")
-                .qualities(&[30, 30, 30, 30])
-                .tag("MI", "UMI1/B")
-                .build(),
+            raw_with_mi(b"read1", b"UMI1/A"),
+            raw_with_mi(b"read2", b"UMI1/A"),
+            raw_with_mi(b"read3", b"UMI1/A"),
+            raw_with_mi(b"read4", b"UMI1/B"),
         ];
         assert!(DuplexConsensusCaller::has_both_strands(&many_a_one_b));
     }
@@ -2448,13 +2366,10 @@ mod tests {
     #[test]
     fn test_group_by_mi_and_strand() -> Result<()> {
         // Create test reads with different MI tags
-        let read1 = RecordBuilder::new().sequence("ACGT").tag("MI", "UMI1/A").build();
-
-        let read2 = RecordBuilder::new().sequence("ACGT").tag("MI", "UMI1/B").build();
-
-        let read3 = RecordBuilder::new().sequence("ACGT").tag("MI", "UMI1/A").build();
-
-        let read4 = RecordBuilder::new().sequence("ACGT").tag("MI", "UMI2/A").build();
+        let read1 = raw_with_mi(b"r1", b"UMI1/A");
+        let read2 = raw_with_mi(b"r2", b"UMI1/B");
+        let read3 = raw_with_mi(b"r3", b"UMI1/A");
+        let read4 = raw_with_mi(b"r4", b"UMI2/A");
 
         let reads = vec![read1, read2, read3, read4];
         let groups = DuplexConsensusCaller::group_by_mi_and_strand(reads)?;
@@ -2472,6 +2387,22 @@ mod tests {
         assert_eq!(b_reads.len(), 0);
 
         Ok(())
+    }
+
+    /// Regression: a read without an MI tag must be a fatal error (not silently skipped),
+    /// so malformed input is surfaced rather than quietly dropping records.
+    #[test]
+    fn test_group_by_mi_and_strand_missing_mi_errors() {
+        let raw_without_mi = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"r_no_mi").sequence(b"ACGT").qualities(&[30u8; 4]);
+            b.build()
+        };
+        let err = DuplexConsensusCaller::group_by_mi_and_strand(vec![raw_without_mi])
+            .expect_err("missing MI must be an error, not a silent skip");
+        let msg = format!("{err}");
+        assert!(msg.contains("r_no_mi"), "error should identify the offending read: {msg}");
+        assert!(msg.contains("MI"), "error should mention the missing MI tag: {msg}");
     }
 
     // Helper function to create a test VanillaUmiConsensusCaller
@@ -2496,28 +2427,32 @@ mod tests {
         )
     }
 
-    // Helper function to create a test single-strand consensus record
+    // Helper function to create a test single-strand consensus RecordBuf.
+    //
+    // Builds the record as raw bytes via SamBuilder, then decodes to RecordBuf so that
+    // call_duplex_from_ss_pair (which still accepts RecordBuf) can consume it.
     fn create_ss_consensus(
-        seq: &str,
+        seq: &[u8],
         qual: &[u8],
         depth_max: i32,
         depth_min: i32,
         error_rate: f32,
     ) -> RecordBuf {
-        RecordBuilder::new()
-            .sequence(seq)
-            .qualities(qual)
-            .tag("cD", depth_max)
-            .tag("cM", depth_min)
-            .tag("cE", error_rate)
-            .build()
+        let mut b = SamBuilder::new();
+        b.sequence(seq).qualities(qual);
+        b.add_int_tag(b"cD", depth_max);
+        b.add_int_tag(b"cM", depth_min);
+        b.add_float_tag(b"cE", error_rate);
+        let raw = b.build();
+        fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf should succeed")
     }
 
     #[test]
     fn test_duplex_consensus_quality_scores_agreement() -> Result<()> {
         // Test that agreeing bases sum their qualities (capped at 93)
-        let ss_a = create_ss_consensus("AAAA", &[20, 30, 40, 50], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("AAAA", &[20, 30, 40, 50], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"AAAA", &[20, 30, 40, 50], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"AAAA", &[20, 30, 40, 50], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2544,8 +2479,8 @@ mod tests {
     #[test]
     fn test_duplex_consensus_quality_scores_disagreement_unequal() -> Result<()> {
         // Test that disagreeing bases with unequal qualities subtract lower from higher
-        let ss_a = create_ss_consensus("ACGT", &[30, 30, 30, 30], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("TGCA", &[10, 15, 20, 25], 2, 2, 0.0); // Different bases
+        let ss_a = create_ss_consensus(b"ACGT", &[30, 30, 30, 30], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"TGCA", &[10, 15, 20, 25], 2, 2, 0.0); // Different bases
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2572,8 +2507,8 @@ mod tests {
     #[test]
     fn test_duplex_consensus_quality_scores_disagreement_equal() -> Result<()> {
         // Test that disagreeing bases with equal qualities produce N with Q=2
-        let ss_a = create_ss_consensus("ACGT", &[20, 20, 20, 20], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("TGCA", &[20, 20, 20, 20], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"ACGT", &[20, 20, 20, 20], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"TGCA", &[20, 20, 20, 20], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2602,8 +2537,8 @@ mod tests {
         // Test that all per-read tags are generated correctly
         use noodles::sam::alignment::record::data::field::Tag;
 
-        let ss_a = create_ss_consensus("AAAA", &[20, 20, 20, 20], 3, 2, 0.05);
-        let ss_b = create_ss_consensus("AAAA", &[20, 20, 20, 20], 2, 1, 0.10);
+        let ss_a = create_ss_consensus(b"AAAA", &[20, 20, 20, 20], 3, 2, 0.05);
+        let ss_b = create_ss_consensus(b"AAAA", &[20, 20, 20, 20], 2, 1, 0.10);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2681,8 +2616,8 @@ mod tests {
     #[test]
     fn test_duplex_consensus_n_bases() -> Result<()> {
         // Test that N bases in either strand produce N in duplex with Q=2
-        let ss_a = create_ss_consensus("ANAA", &[20, 20, 20, 20], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("AANA", &[20, 20, 20, 20], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"ANAA", &[20, 20, 20, 20], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"AANA", &[20, 20, 20, 20], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2711,8 +2646,8 @@ mod tests {
     fn test_duplex_consensus_length_mismatch() -> Result<()> {
         // Test that length mismatches are handled by truncating to minimum length
         // This matches fgbio's behavior
-        let ss_a = create_ss_consensus("AAAA", &[20, 20, 20, 20], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("AAA", &[20, 20, 20], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"AAAA", &[20, 20, 20, 20], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"AAA", &[20, 20, 20], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2736,8 +2671,8 @@ mod tests {
     #[test]
     fn test_duplex_consensus_quality_capping() -> Result<()> {
         // Test that summed qualities are capped at 93
-        let ss_a = create_ss_consensus("AAA", &[50, 60, 93], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("AAA", &[50, 60, 93], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"AAA", &[50, 60, 93], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"AAA", &[50, 60, 93], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2761,8 +2696,8 @@ mod tests {
     fn test_duplex_consensus_quality_difference_at_threshold() -> Result<()> {
         // Test that quality differences of 2 or less mask to N
         // This tests the edge case where subtraction results in Q=2 or Q=1
-        let ss_a = create_ss_consensus("ACGT", &[5, 4, 3, 10], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("TGCA", &[3, 2, 2, 8], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"ACGT", &[5, 4, 3, 10], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"TGCA", &[3, 2, 2, 8], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2791,8 +2726,8 @@ mod tests {
     fn test_duplex_consensus_with_deep_coverage() -> Result<()> {
         // Test that qualities with deep coverage on one strand don't saturate incorrectly
         // AB strand has very high depth, BA strand has low depth
-        let ss_a = create_ss_consensus("AAAA", &[45, 45, 45, 45], 50, 50, 0.01);
-        let ss_b = create_ss_consensus("AAAA", &[20, 20, 20, 20], 1, 1, 0.0);
+        let ss_a = create_ss_consensus(b"AAAA", &[45, 45, 45, 45], 50, 50, 0.01);
+        let ss_b = create_ss_consensus(b"AAAA", &[20, 20, 20, 20], 1, 1, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -2835,8 +2770,8 @@ mod tests {
         use noodles::sam::alignment::record::data::field::Tag;
 
         // Create single-strand consensuses with per-base tags
-        let mut ss_a = create_ss_consensus("AAAA", &[20, 20, 20, 20], 3, 2, 0.05);
-        let mut ss_b = create_ss_consensus("AAAA", &[20, 20, 20, 20], 2, 1, 0.10);
+        let mut ss_a = create_ss_consensus(b"AAAA", &[20, 20, 20, 20], 3, 2, 0.05);
+        let mut ss_b = create_ss_consensus(b"AAAA", &[20, 20, 20, 20], 2, 1, 0.10);
 
         // Add per-base depth tags (cd) for both strands
         let cd_tag = Tag::from([b'c', b'd']);
@@ -2990,8 +2925,8 @@ mod tests {
     #[test]
     fn test_duplex_consensus_mixed_bases_and_n() -> Result<()> {
         // Test complex scenario with mixture of N bases and disagreements
-        let ss_a = create_ss_consensus("ANGT", &[30, 30, 30, 30], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("TNCG", &[25, 25, 25, 25], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"ANGT", &[30, 30, 30, 30], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"TNCG", &[25, 25, 25, 25], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -3025,8 +2960,8 @@ mod tests {
     #[test]
     fn test_duplex_consensus_zero_quality_difference() -> Result<()> {
         // Test that bases with same quality but different calls become N
-        let ss_a = create_ss_consensus("AAAA", &[25, 25, 25, 25], 3, 3, 0.0);
-        let ss_b = create_ss_consensus("TTTT", &[25, 25, 25, 25], 2, 2, 0.0);
+        let ss_a = create_ss_consensus(b"AAAA", &[25, 25, 25, 25], 3, 3, 0.0);
+        let ss_b = create_ss_consensus(b"TTTT", &[25, 25, 25, 25], 2, 2, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -3108,8 +3043,8 @@ mod tests {
         // At position 1: A vs G - disagreement, but one is N → no error
         // At position 2: A vs N - one is N → no error
 
-        let ss_a = create_ss_consensus("ANAA", &[30, 30, 30, 30], 1, 1, 0.0);
-        let ss_b = create_ss_consensus("GGNG", &[30, 30, 30, 30], 1, 1, 0.0);
+        let ss_a = create_ss_consensus(b"ANAA", &[30, 30, 30, 30], 1, 1, 0.0);
+        let ss_b = create_ss_consensus(b"GGNG", &[30, 30, 30, 30], 1, 1, 0.0);
 
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
             ss_a,
@@ -3141,8 +3076,8 @@ mod tests {
     #[test]
     fn test_duplex_n_base_propagation() -> Result<()> {
         // AB strand has data, BA has N's
-        let ss_ab = create_ss_consensus("AAAA", &[30, 30, 30, 30], 3, 3, 0.0);
-        let ss_ba_n = create_ss_consensus("NNNN", &[2, 2, 2, 2], 0, 0, 0.0);
+        let ss_ab = create_ss_consensus(b"AAAA", &[30, 30, 30, 30], 3, 3, 0.0);
+        let ss_ba_n = create_ss_consensus(b"NNNN", &[2, 2, 2, 2], 0, 0, 0.0);
 
         // When one strand has N, fgbio outputs N with NoCallQual (2)
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
@@ -3172,9 +3107,9 @@ mod tests {
     #[test]
     fn test_duplex_n_base_propagation_reverse() -> Result<()> {
         // Create AB with N's
-        let ss_ab_n = create_ss_consensus("NNNN", &[2, 2, 2, 2], 0, 0, 0.0);
+        let ss_ab_n = create_ss_consensus(b"NNNN", &[2, 2, 2, 2], 0, 0, 0.0);
         // Create BA with actual data
-        let ss_ba = create_ss_consensus("TTTT", &[30, 30, 30, 30], 3, 3, 0.0);
+        let ss_ba = create_ss_consensus(b"TTTT", &[30, 30, 30, 30], 3, 3, 0.0);
 
         // When one strand has N, fgbio outputs N
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
@@ -3201,8 +3136,128 @@ mod tests {
     }
 
     // ==========================================================================
-    // Integration tests using consensus_reads_from_sam_records
+    // Integration tests using consensus_reads() directly
     // ==========================================================================
+
+    /// Build an AB-strand R1 (fwd at pos1, mate at pos2).
+    /// flags: `PAIRED` | `FIRST_SEGMENT` | `MATE_REVERSE`
+    fn ab_r1(
+        b: &mut SamBuilder,
+        name: &[u8],
+        seq: &[u8],
+        qual: &[u8],
+        cigar: &[u32],
+        mi: &[u8],
+        extra_tags: &[(&[u8; 2], &[u8])],
+    ) -> RawRecord {
+        b.clear();
+        b.ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .read_name(name)
+            .cigar_ops(cigar)
+            .sequence(seq)
+            .qualities(qual);
+        b.add_string_tag(b"MI", mi);
+        b.add_string_tag(b"RG", b"A");
+        for (tag, val) in extra_tags {
+            b.add_string_tag(tag, val);
+        }
+        b.build()
+    }
+
+    /// Build an AB-strand R2 (rev at pos2, mate at pos1).
+    /// flags: `PAIRED` | `LAST_SEGMENT` | `REVERSE`
+    fn ab_r2(
+        b: &mut SamBuilder,
+        name: &[u8],
+        seq: &[u8],
+        qual: &[u8],
+        cigar: &[u32],
+        mi: &[u8],
+        extra_tags: &[(&[u8; 2], &[u8])],
+    ) -> RawRecord {
+        b.clear();
+        b.ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .read_name(name)
+            .cigar_ops(cigar)
+            .sequence(seq)
+            .qualities(qual);
+        b.add_string_tag(b"MI", mi);
+        b.add_string_tag(b"RG", b"A");
+        for (tag, val) in extra_tags {
+            b.add_string_tag(tag, val);
+        }
+        b.build()
+    }
+
+    /// Build a BA-strand R1 (rev at pos2, mate at pos1).
+    /// flags: `PAIRED` | `FIRST_SEGMENT` | `REVERSE`
+    fn ba_r1(
+        b: &mut SamBuilder,
+        name: &[u8],
+        seq: &[u8],
+        qual: &[u8],
+        cigar: &[u32],
+        mi: &[u8],
+        extra_tags: &[(&[u8; 2], &[u8])],
+    ) -> RawRecord {
+        b.clear();
+        b.ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .read_name(name)
+            .cigar_ops(cigar)
+            .sequence(seq)
+            .qualities(qual);
+        b.add_string_tag(b"MI", mi);
+        b.add_string_tag(b"RG", b"A");
+        for (tag, val) in extra_tags {
+            b.add_string_tag(tag, val);
+        }
+        b.build()
+    }
+
+    /// Build a BA-strand R2 (fwd at pos1, mate at pos2).
+    /// flags: `PAIRED` | `LAST_SEGMENT` | `MATE_REVERSE`
+    fn ba_r2(
+        b: &mut SamBuilder,
+        name: &[u8],
+        seq: &[u8],
+        qual: &[u8],
+        cigar: &[u32],
+        mi: &[u8],
+        extra_tags: &[(&[u8; 2], &[u8])],
+    ) -> RawRecord {
+        b.clear();
+        b.ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .read_name(name)
+            .cigar_ops(cigar)
+            .sequence(seq)
+            .qualities(qual);
+        b.add_string_tag(b"MI", mi);
+        b.add_string_tag(b"RG", b"A");
+        for (tag, val) in extra_tags {
+            b.add_string_tag(tag, val);
+        }
+        b.build()
+    }
 
     /// Port of fgbio test: "not create records from fragments"
     /// Tests that fragment reads (unpaired) are rejected
@@ -3222,26 +3277,38 @@ mod tests {
             40,
         )?;
 
-        // Create fragment (unpaired) reads with MI tags
-        let frag_a = RecordBuilder::new()
-            .name("frag1")
-            .sequence("AAAAAAAAAA")
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .build();
+        // Fragment reads: no PAIRED flag
+        let cigar_10m = &[encode_op(0, 10)];
+        let mut b = SamBuilder::new();
 
-        let frag_b = RecordBuilder::new()
-            .name("frag2")
-            .sequence("AAAAAAAAAA")
-            .reference_sequence_id(0)
-            .alignment_start(1)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .build();
+        let frag_a = {
+            b.clear();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .flags(0) // unpaired
+                .read_name(b"frag1")
+                .cigar_ops(cigar_10m)
+                .sequence(b"AAAAAAAAAA")
+                .qualities(&[30u8; 10]);
+            b.add_string_tag(b"MI", b"foo/A");
+            b.build()
+        };
+        let frag_b = {
+            b.clear();
+            b.ref_id(0)
+                .pos(0)
+                .mapq(60)
+                .flags(0) // unpaired
+                .read_name(b"frag2")
+                .cigar_ops(cigar_10m)
+                .sequence(b"AAAAAAAAAA")
+                .qualities(&[30u8; 10]);
+            b.add_string_tag(b"MI", b"foo/B");
+            b.build()
+        };
 
-        let result = caller.consensus_reads_from_sam_records(vec![frag_a, frag_b])?;
+        let result = caller.consensus_reads(vec![frag_a, frag_b])?;
 
         // Fragments should be rejected - no consensus output
         assert_eq!(
@@ -3271,73 +3338,18 @@ mod tests {
             40,
         )?;
 
-        // Create AB pair: R1 at pos 100 (+), R2 at pos 200 (-)
-        let ab_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("RG", "A")
-            .build();
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
 
-        let ab_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("RG", "A")
-            .build();
+        let reads = vec![
+            ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", &[]),
+            ab_r2(&mut b, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]),
+            ba_r1(&mut b, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &[]),
+            ba_r2(&mut b, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", &[]),
+        ];
 
-        // Create BA pair: R1 at pos 200 (-), R2 at pos 100 (+)
-        let ba_r1 = RecordBuilder::new()
-            .name("q2")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("RG", "A")
-            .build();
-
-        let ba_r2 = RecordBuilder::new()
-            .name("q2")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("RG", "A")
-            .build();
-
-        let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce 2 consensus reads (R1 and R2)
         assert_eq!(
@@ -3370,77 +3382,19 @@ mod tests {
             40,
         )?;
 
-        // Create AB pair with CB tag
-        let ab_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("CB", "ACGT")
-            .tag("RG", "A")
-            .build();
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+        let cb_extra: &[(&[u8; 2], &[u8])] = &[(b"CB", b"ACGT")];
 
-        let ab_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("CB", "ACGT")
-            .tag("RG", "A")
-            .build();
+        let reads = vec![
+            ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", cb_extra),
+            ab_r2(&mut b, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", cb_extra),
+            ba_r1(&mut b, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", cb_extra),
+            ba_r2(&mut b, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", cb_extra),
+        ];
 
-        // Create BA pair with CB tag
-        let ba_r1 = RecordBuilder::new()
-            .name("q2")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("CB", "ACGT")
-            .tag("RG", "A")
-            .build();
-
-        let ba_r2 = RecordBuilder::new()
-            .name("q2")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("CB", "ACGT")
-            .tag("RG", "A")
-            .build();
-
-        let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce consensus reads with CB tag preserved
         assert_eq!(result.count, 2, "Should produce 2 consensus reads");
@@ -3474,77 +3428,20 @@ mod tests {
             40,
         )?;
 
-        // Create AB pair with RX="ACT-" (right UMI absent)
-        let ab_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("RX", "ACT-")
-            .tag("RG", "A")
-            .build();
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+        let rx_a: &[(&[u8; 2], &[u8])] = &[(b"RX", b"ACT-")];
+        let rx_b: &[(&[u8; 2], &[u8])] = &[(b"RX", b"-ACT")];
 
-        let ab_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("RX", "ACT-")
-            .tag("RG", "A")
-            .build();
+        let reads = vec![
+            ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", rx_a),
+            ab_r2(&mut b, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", rx_a),
+            ba_r1(&mut b, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", rx_b),
+            ba_r2(&mut b, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", rx_b),
+        ];
 
-        // Create BA pair with RX="-ACT" (left UMI absent)
-        let ba_r1 = RecordBuilder::new()
-            .name("q2")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("RX", "-ACT")
-            .tag("RG", "A")
-            .build();
-
-        let ba_r2 = RecordBuilder::new()
-            .name("q2")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("RX", "-ACT")
-            .tag("RG", "A")
-            .build();
-
-        let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce 2 consensus reads
         assert_eq!(result.count, 2, "Should produce 2 duplex consensus reads");
@@ -3577,77 +3474,20 @@ mod tests {
             40,
         )?;
 
-        // Create AB pair with RX="-ACT" (left UMI absent)
-        let ab_r1 = RecordBuilder::new()
-            .name("q1")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("RX", "-ACT")
-            .tag("RG", "A")
-            .build();
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+        let rx_a: &[(&[u8; 2], &[u8])] = &[(b"RX", b"-ACT")];
+        let rx_b: &[(&[u8; 2], &[u8])] = &[(b"RX", b"ACT-")];
 
-        let ab_r2 = RecordBuilder::new()
-            .name("q1")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/A")
-            .tag("RX", "-ACT")
-            .tag("RG", "A")
-            .build();
+        let reads = vec![
+            ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", rx_a),
+            ab_r2(&mut b, b"q1", b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", rx_a),
+            ba_r1(&mut b, b"q2", b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", rx_b),
+            ba_r2(&mut b, b"q2", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", rx_b),
+        ];
 
-        // Create BA pair with RX="ACT-" (right UMI absent)
-        let ba_r1 = RecordBuilder::new()
-            .name("q2")
-            .sequence("CCCCCCCCCC")
-            .qualities(&[20; 10])
-            .first_segment(true)
-            .reverse_complement(true)
-            .mate_reverse_complement(false)
-            .reference_sequence_id(0)
-            .alignment_start(200)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(100)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("RX", "ACT-")
-            .tag("RG", "A")
-            .build();
-
-        let ba_r2 = RecordBuilder::new()
-            .name("q2")
-            .sequence("AAAAAAAAAA")
-            .qualities(&[20; 10])
-            .first_segment(false)
-            .reverse_complement(false)
-            .mate_reverse_complement(true)
-            .reference_sequence_id(0)
-            .alignment_start(100)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(200)
-            .cigar("10M")
-            .tag("MI", "foo/B")
-            .tag("RX", "ACT-")
-            .tag("RG", "A")
-            .build();
-
-        let result = caller.consensus_reads_from_sam_records(vec![ab_r1, ab_r2, ba_r1, ba_r2])?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce 2 consensus reads
         assert_eq!(result.count, 2, "Should produce 2 duplex consensus reads");
@@ -3682,45 +3522,22 @@ mod tests {
             40,
         )?;
 
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+
         // Create 3 A-strand pairs (no B-strand)
-        let reads: Vec<RecordBuf> = (1..=3)
+        let reads: Vec<RawRecord> = (1..=3_u8)
             .flat_map(|i| {
+                let name = [b'q', i];
                 vec![
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("AAAAAAAAAA")
-                        .qualities(&[20; 10])
-                        .first_segment(true)
-                        .reverse_complement(false)
-                        .mate_reverse_complement(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(200)
-                        .cigar("10M")
-                        .tag("MI", "foo/A")
-                        .tag("RG", "A")
-                        .build(),
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("CCCCCCCCCC")
-                        .qualities(&[20; 10])
-                        .first_segment(false)
-                        .reverse_complement(true)
-                        .mate_reverse_complement(false)
-                        .reference_sequence_id(0)
-                        .alignment_start(200)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/A")
-                        .tag("RG", "A")
-                        .build(),
+                    ab_r1(&mut b, &name, b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", &[]),
+                    ab_r2(&mut b, &name, b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]),
                 ]
             })
             .collect();
 
-        let result = caller.consensus_reads_from_sam_records(reads)?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce 2 consensus reads (R1 and R2) from single strand
         assert_eq!(result.count, 2, "Should produce 2 consensus reads from single A strand");
@@ -3761,45 +3578,22 @@ mod tests {
             40,
         )?;
 
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+
         // Create 3 B-strand pairs (no A-strand)
-        let reads: Vec<RecordBuf> = (1..=3)
+        let reads: Vec<RawRecord> = (1..=3_u8)
             .flat_map(|i| {
+                let name = [b'q', i];
                 vec![
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("CCCCCCCCCC")
-                        .qualities(&[20; 10])
-                        .first_segment(true)
-                        .reverse_complement(true)
-                        .mate_reverse_complement(false)
-                        .reference_sequence_id(0)
-                        .alignment_start(200)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/B")
-                        .tag("RG", "A")
-                        .build(),
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("AAAAAAAAAA")
-                        .qualities(&[20; 10])
-                        .first_segment(false)
-                        .reverse_complement(false)
-                        .mate_reverse_complement(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(200)
-                        .cigar("10M")
-                        .tag("MI", "foo/B")
-                        .tag("RG", "A")
-                        .build(),
+                    ba_r1(&mut b, &name, b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &[]),
+                    ba_r2(&mut b, &name, b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", &[]),
                 ]
             })
             .collect();
 
-        let result = caller.consensus_reads_from_sam_records(reads)?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce 2 consensus reads (R1 and R2) from single strand
         assert_eq!(result.count, 2, "Should produce 2 consensus reads from single B strand");
@@ -3836,45 +3630,22 @@ mod tests {
             40,
         )?;
 
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
+
         // Create 3 A-strand pairs only (no B-strand)
-        let reads: Vec<RecordBuf> = (1..=3)
+        let reads: Vec<RawRecord> = (1..=3_u8)
             .flat_map(|i| {
+                let name = [b'q', i];
                 vec![
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("AAAAAAAAAA")
-                        .qualities(&[20; 10])
-                        .first_segment(true)
-                        .reverse_complement(false)
-                        .mate_reverse_complement(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(200)
-                        .cigar("10M")
-                        .tag("MI", "foo/A")
-                        .tag("RG", "A")
-                        .build(),
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("CCCCCCCCCC")
-                        .qualities(&[20; 10])
-                        .first_segment(false)
-                        .reverse_complement(true)
-                        .mate_reverse_complement(false)
-                        .reference_sequence_id(0)
-                        .alignment_start(200)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/A")
-                        .tag("RG", "A")
-                        .build(),
+                    ab_r1(&mut b, &name, b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", &[]),
+                    ab_r2(&mut b, &name, b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]),
                 ]
             })
             .collect();
 
-        let result = caller.consensus_reads_from_sam_records(reads)?;
+        let result = caller.consensus_reads(reads)?;
 
         // Should produce empty result since BA=0 doesn't meet minReads[2]=1
         assert_eq!(
@@ -3919,125 +3690,36 @@ mod tests {
             40,
         )?;
 
-        // Create reads: 3 AB pairs + 2 BA pairs
-        let mut reads = Vec::new();
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[20u8; 10];
+        let mut b = SamBuilder::new();
 
-        // 3 AB pairs
-        for i in 1..=3 {
-            reads.push(
-                RecordBuilder::new()
-                    .name(&format!("ab{i}"))
-                    .sequence("AAAAAAAAAA")
-                    .qualities(&[20; 10])
-                    .first_segment(true)
-                    .reverse_complement(false)
-                    .mate_reverse_complement(true)
-                    .reference_sequence_id(0)
-                    .alignment_start(100)
-                    .mate_reference_sequence_id(0)
-                    .mate_alignment_start(200)
-                    .cigar("10M")
-                    .tag("MI", "foo/A")
-                    .tag("RG", "A")
-                    .build(),
-            );
-            reads.push(
-                RecordBuilder::new()
-                    .name(&format!("ab{i}"))
-                    .sequence("CCCCCCCCCC")
-                    .qualities(&[20; 10])
-                    .first_segment(false)
-                    .reverse_complement(true)
-                    .mate_reverse_complement(false)
-                    .reference_sequence_id(0)
-                    .alignment_start(200)
-                    .mate_reference_sequence_id(0)
-                    .mate_alignment_start(100)
-                    .cigar("10M")
-                    .tag("MI", "foo/A")
-                    .tag("RG", "A")
-                    .build(),
-            );
+        // Build 3 AB pairs + 2 BA pairs
+        let mut reads: Vec<RawRecord> = Vec::new();
+        for i in 1..=3_u8 {
+            let name = [b'a', b'b', i];
+            reads.push(ab_r1(&mut b, &name, b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", &[]));
+            reads.push(ab_r2(&mut b, &name, b"CCCCCCCCCC", quals, cigar_10m, b"foo/A", &[]));
         }
-
-        // 2 BA pairs
-        for i in 4..=5 {
-            reads.push(
-                RecordBuilder::new()
-                    .name(&format!("ba{i}"))
-                    .sequence("CCCCCCCCCC")
-                    .qualities(&[20; 10])
-                    .first_segment(true)
-                    .reverse_complement(true)
-                    .mate_reverse_complement(false)
-                    .reference_sequence_id(0)
-                    .alignment_start(200)
-                    .mate_reference_sequence_id(0)
-                    .mate_alignment_start(100)
-                    .cigar("10M")
-                    .tag("MI", "foo/B")
-                    .tag("RG", "A")
-                    .build(),
-            );
-            reads.push(
-                RecordBuilder::new()
-                    .name(&format!("ba{i}"))
-                    .sequence("AAAAAAAAAA")
-                    .qualities(&[20; 10])
-                    .first_segment(false)
-                    .reverse_complement(false)
-                    .mate_reverse_complement(true)
-                    .reference_sequence_id(0)
-                    .alignment_start(100)
-                    .mate_reference_sequence_id(0)
-                    .mate_alignment_start(200)
-                    .cigar("10M")
-                    .tag("MI", "foo/B")
-                    .tag("RG", "A")
-                    .build(),
-            );
+        for i in 4..=5_u8 {
+            let name = [b'b', b'a', i];
+            reads.push(ba_r1(&mut b, &name, b"CCCCCCCCCC", quals, cigar_10m, b"foo/B", &[]));
+            reads.push(ba_r2(&mut b, &name, b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", &[]));
         }
 
         // With minReads=3: should fail (BA only has 2 reads)
-        let result_3 = caller_3.consensus_reads_from_sam_records(reads.clone())?;
+        let result_3 = caller_3.consensus_reads(reads.clone())?;
         assert_eq!(result_3.count, 0, "minReads=3 should fail with only 2 BA reads");
 
         // With minReads=2: should pass
-        let result_2 = caller_2.consensus_reads_from_sam_records(reads.clone())?;
+        let result_2 = caller_2.consensus_reads(reads.clone())?;
         assert_eq!(result_2.count, 2, "minReads=2 should produce 2 consensus reads");
 
         // Now add a BA read with different CIGAR (will be filtered out)
+        let cigar_dissimilar = &[encode_op(0, 5), encode_op(2, 1), encode_op(0, 5)]; // 5M1D5M
         let dissimilar = vec![
-            RecordBuilder::new()
-                .name("ba6")
-                .sequence("CCCCCCCCCC")
-                .qualities(&[20; 10])
-                .first_segment(true)
-                .reverse_complement(true)
-                .mate_reverse_complement(false)
-                .reference_sequence_id(0)
-                .alignment_start(200)
-                .mate_reference_sequence_id(0)
-                .mate_alignment_start(100)
-                .cigar("5M1D5M") // Different CIGAR - will be filtered
-                .tag("MI", "foo/B")
-                .tag("RG", "A")
-                .build(),
-            RecordBuilder::new()
-                .name("ba6")
-                .sequence("AAAAAAAAAA")
-                .qualities(&[20; 10])
-                .first_segment(false)
-                .reverse_complement(false)
-                .mate_reverse_complement(true)
-                .reference_sequence_id(0)
-                .alignment_start(100)
-                .mate_reference_sequence_id(0)
-                .mate_alignment_start(200)
-                .cigar("10M")
-                .tag("MI", "foo/B")
-                .tag("RG", "A")
-                .build(),
+            ba_r1(&mut b, b"ba6", b"CCCCCCCCCC", quals, cigar_dissimilar, b"foo/B", &[]),
+            ba_r2(&mut b, b"ba6", b"AAAAAAAAAA", quals, cigar_10m, b"foo/B", &[]),
         ];
 
         let mut reads_with_dissimilar = reads.clone();
@@ -4060,8 +3742,7 @@ mod tests {
 
         // With dissimilar read (filtered): still only 2 BA reads pass filtering
         // minReads=3 should still fail
-        let result_dissimilar =
-            caller_3_new.consensus_reads_from_sam_records(reads_with_dissimilar)?;
+        let result_dissimilar = caller_3_new.consensus_reads(reads_with_dissimilar)?;
         assert_eq!(
             result_dissimilar.count, 0,
             "minReads=3 should still fail when dissimilar read is filtered out"
@@ -4075,8 +3756,8 @@ mod tests {
     #[test]
     fn test_swap_ab_ba_when_ab_has_zero_depth() -> Result<()> {
         // Create SS consensuses where AB has zero depth
-        let ss_ab_zero = create_ss_consensus("NNN", &[2, 2, 2], 0, 0, 0.0);
-        let ss_ba = create_ss_consensus("AAA", &[30, 30, 30], 3, 3, 0.0);
+        let ss_ab_zero = create_ss_consensus(b"NNN", &[2, 2, 2], 0, 0, 0.0);
+        let ss_ba = create_ss_consensus(b"AAA", &[30, 30, 30], 3, 3, 0.0);
 
         // Call duplex consensus - should swap AB and BA
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
@@ -4106,8 +3787,8 @@ mod tests {
     #[test]
     fn test_swap_ba_ab_when_ba_has_zero_depth() -> Result<()> {
         // Create SS consensuses where BA has zero depth
-        let ss_ab = create_ss_consensus("AAA", &[30, 30, 30], 3, 3, 0.0);
-        let ss_ba_zero = create_ss_consensus("NNN", &[2, 2, 2], 0, 0, 0.0);
+        let ss_ab = create_ss_consensus(b"AAA", &[30, 30, 30], 3, 3, 0.0);
+        let ss_ba_zero = create_ss_consensus(b"NNN", &[2, 2, 2], 0, 0, 0.0);
 
         // Call duplex consensus
         let duplex = DuplexConsensusCaller::call_duplex_from_ss_pair(
@@ -4204,7 +3885,7 @@ mod tests {
     */
     #[test]
     fn test_tie_breaking_for_simplex_consensus() -> Result<()> {
-        use fgumi_sam::builder::{SamBuilder, Strand};
+        use fgumi_raw_bam::SamBuilder;
 
         // This test reproduces the tie-breaking scenario:
         // 8 BA read pairs with 4 having 'A' at position 5 and 4 having 'C' at position 5
@@ -4212,147 +3893,112 @@ mod tests {
         // With Kahan summation for numeric stability (matching fgbio PR #1120),
         // the likelihoods are exactly equal, so we correctly return 'N' (no-call).
         // Previously, numerical instability would incorrectly break the tie.
-        let mut builder = SamBuilder::with_single_ref("chr1", 10000);
 
         // Quality array for 10 bases, all quality 38
         let quals = vec![38u8; 10];
+        // CIGAR for 10bp: 10M encoded as BAM u32 = (10 << 4) | op_code_for_M(0)
+        let cigar_10m: &[u32] = &[10u32 << 4];
 
-        // Create 8 BA read pairs (strand B): 4 with 'A' at position 5, 4 with 'C' at position 5
-        let _ = builder
-            .add_pair()
-            .name("ba1")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAACAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
+        // Build a mapped FR pair using SamBuilder.
+        //
+        // Flag constants (BAM spec):
+        //   R1 of BA pair (R1=Plus/fwd, R2=Minus/rev):
+        //     PAIRED(0x1) | FIRST_SEGMENT(0x40) | MATE_REVERSE(0x20) = 0x61
+        //   R2 of BA pair:
+        //     PAIRED(0x1) | LAST_SEGMENT(0x80) | REVERSE(0x10)       = 0x91
+        //   R1 of AB pair (R1=Minus/rev, R2=Plus/fwd):
+        //     PAIRED(0x1) | FIRST_SEGMENT(0x40) | REVERSE(0x10)      = 0x51
+        //   R2 of AB pair:
+        //     PAIRED(0x1) | LAST_SEGMENT(0x80) | MATE_REVERSE(0x20)  = 0xa1
+        //
+        // Positions are 0-based in BAM (start1=100 → pos=99, start2=200 → pos=199).
+        let mut b = SamBuilder::new();
 
-        let _ = builder
-            .add_pair()
-            .name("ba2")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAAAAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
+        /// Build one BA-strand read pair and append both records to `out`.
+        fn ba_pair(
+            b: &mut SamBuilder,
+            name: &[u8],
+            bases1: &[u8],
+            bases2: &[u8],
+            quals: &[u8],
+            cigar: &[u32],
+            out: &mut Vec<RawRecord>,
+        ) {
+            // R1: forward at pos 99, mate at pos 199
+            b.clear();
+            b.ref_id(0)
+                .pos(99)
+                .mapq(60)
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::MATE_REVERSE)
+                .mate_ref_id(0)
+                .mate_pos(199)
+                .read_name(name)
+                .cigar_ops(cigar)
+                .sequence(bases1)
+                .qualities(quals);
+            b.add_string_tag(b"RG", b"A");
+            b.add_string_tag(b"MI", b"test/B");
+            out.push(b.build());
 
-        let _ = builder
-            .add_pair()
-            .name("ba3")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAACAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
+            // R2: reverse at pos 199, mate at pos 99
+            b.clear();
+            b.ref_id(0)
+                .pos(199)
+                .mapq(60)
+                .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE)
+                .mate_ref_id(0)
+                .mate_pos(99)
+                .read_name(name)
+                .cigar_ops(cigar)
+                .sequence(bases2)
+                .qualities(quals);
+            b.add_string_tag(b"RG", b"A");
+            b.add_string_tag(b"MI", b"test/B");
+            out.push(b.build());
+        }
 
-        let _ = builder
-            .add_pair()
-            .name("ba4")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAAAAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
+        let mut raw_records: Vec<RawRecord> = Vec::new();
 
-        let _ = builder
-            .add_pair()
-            .name("ba5")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAACAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
+        // 8 BA read pairs (strand B): 4 with 'A' at position 5, 4 with 'C' at position 5
+        ba_pair(&mut b, b"ba1", b"AAAAACAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba2", b"AAAAAAAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba3", b"AAAAACAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba4", b"AAAAAAAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba5", b"AAAAACAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba6", b"AAAAAAAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba7", b"AAAAACAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
+        ba_pair(&mut b, b"ba8", b"AAAAAAAAAA", b"TTTTTTTTTT", &quals, cigar_10m, &mut raw_records);
 
-        let _ = builder
-            .add_pair()
-            .name("ba6")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAAAAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
+        // 1 AB read pair (strand A): R1=Minus/rev at pos 199, R2=Plus/fwd at pos 99
+        b.clear();
+        b.ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(99)
+            .read_name(b"ab1")
+            .cigar_ops(cigar_10m)
+            .sequence(b"TTTTTTTTTT")
+            .qualities(&quals);
+        b.add_string_tag(b"RG", b"A");
+        b.add_string_tag(b"MI", b"test/A");
+        raw_records.push(b.build());
 
-        let _ = builder
-            .add_pair()
-            .name("ba7")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAACAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
-
-        let _ = builder
-            .add_pair()
-            .name("ba8")
-            .contig(0)
-            .start1(100)
-            .start2(200)
-            .strand1(Strand::Plus)
-            .strand2(Strand::Minus)
-            .bases1("AAAAAAAAAA")
-            .bases2("TTTTTTTTTT")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/B")
-            .build();
-
-        // Add 1 AB read pair (strand A)
-        let _ = builder
-            .add_pair()
-            .name("ab1")
-            .contig(0)
-            .start1(200)
-            .start2(100)
-            .strand1(Strand::Minus)
-            .strand2(Strand::Plus)
-            .bases1("TTTTTTTTTT")
-            .bases2("AAAAAAAAAA")
-            .quals1(&quals)
-            .quals2(&quals)
-            .attr("MI", "test/A")
-            .build();
+        b.clear();
+        b.ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE)
+            .mate_ref_id(0)
+            .mate_pos(199)
+            .read_name(b"ab1")
+            .cigar_ops(cigar_10m)
+            .sequence(b"AAAAAAAAAA")
+            .qualities(&quals);
+        b.add_string_tag(b"RG", b"A");
+        b.add_string_tag(b"MI", b"test/A");
+        raw_records.push(b.build());
 
         // Create a duplex consensus caller with minimum thresholds
         let mut caller = DuplexConsensusCaller::new(
@@ -4369,9 +4015,8 @@ mod tests {
             45,                 // error_rate_post_umi
         )?;
 
-        // Call consensus on these reads
-        let consensus_output =
-            caller.consensus_reads_from_sam_records(builder.records().to_vec())?;
+        // Call consensus directly on raw records (no RecordBuf bridge needed)
+        let consensus_output = caller.consensus_reads(raw_records)?;
 
         assert_eq!(consensus_output.count, 2, "Should generate 2 consensus records (R1 and R2)");
 
@@ -4722,26 +4367,22 @@ mod tests {
         // Create 3 AB R1 reads
         let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
-                encode_to_raw(
-                    &RecordBuilder::new()
-                        .sequence("ACGT")
-                        .first_segment(true)
-                        .tag("MI", "test/A")
-                        .build(),
-                )
+                let mut b = SamBuilder::new();
+                b.sequence(b"ACGT")
+                    .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                    .add_string_tag(b"MI", b"test/A");
+                b.build()
             })
             .collect();
 
         // Create 2 BA R1 reads
         let b_reads: Vec<RawRecord> = (0..2)
             .map(|_| {
-                encode_to_raw(
-                    &RecordBuilder::new()
-                        .sequence("ACGT")
-                        .first_segment(true)
-                        .tag("MI", "test/B")
-                        .build(),
-                )
+                let mut b = SamBuilder::new();
+                b.sequence(b"ACGT")
+                    .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                    .add_string_tag(b"MI", b"test/B");
+                b.build()
             })
             .collect();
 
@@ -4765,20 +4406,22 @@ mod tests {
         // Create 3 AB R1 reads
         let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
-                encode_to_raw(
-                    &RecordBuilder::new()
-                        .sequence("ACGT")
-                        .first_segment(true)
-                        .tag("MI", "test/A")
-                        .build(),
-                )
+                let mut b = SamBuilder::new();
+                b.sequence(b"ACGT")
+                    .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                    .add_string_tag(b"MI", b"test/A");
+                b.build()
             })
             .collect();
 
         // Create 1 BA R1 read
-        let b_reads = vec![encode_to_raw(
-            &RecordBuilder::new().sequence("ACGT").first_segment(true).tag("MI", "test/B").build(),
-        )];
+        let b_reads = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT")
+                .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+                .add_string_tag(b"MI", b"test/B");
+            vec![b.build()]
+        };
 
         // [3, 2, 1]: min_total=3, min_xy=2, min_yx=1
         // A=3, B=1, xy=max(3,1)=3, yx=min(3,1)=1
@@ -4814,10 +4457,17 @@ mod tests {
     #[test]
     fn test_are_all_same_strand() {
         // Create test records
-        let fwd_raw = encode_to_raw(&RecordBuilder::new().sequence("ACGT").build());
+        let fwd_raw = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT");
+            b.build()
+        };
 
-        let rev_raw =
-            encode_to_raw(&RecordBuilder::new().sequence("ACGT").reverse_complement(true).build());
+        let rev_raw = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags::REVERSE);
+            b.build()
+        };
 
         // Empty collection
         assert!(DuplexConsensusCaller::are_all_same_strand(std::iter::empty::<&RawRecord>()));
@@ -4923,7 +4573,7 @@ mod tests {
             is_ba_only: false,
         };
 
-        let cell_tag = Tag::from(fgumi_sam::SamTag::CB);
+        let cell_tag = Tag::from([b'C', b'B']);
         let cell_barcode = "ACGTACGT-1";
 
         let mut builder = UnmappedSamBuilder::new();
@@ -5147,10 +4797,17 @@ mod tests {
     #[test]
     fn test_are_all_same_strand_mixed() {
         // Test are_all_same_strand with mixed strands
-        let fwd_raw = encode_to_raw(&RecordBuilder::new().sequence("ACGT").build());
+        let fwd_raw = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT");
+            b.build()
+        };
 
-        let rev_raw =
-            encode_to_raw(&RecordBuilder::new().sequence("ACGT").reverse_complement(true).build());
+        let rev_raw = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags::REVERSE);
+            b.build()
+        };
 
         // All forward
         assert!(DuplexConsensusCaller::are_all_same_strand([&fwd_raw, &fwd_raw].into_iter()));
@@ -5474,13 +5131,17 @@ mod tests {
         // Create mock reads with paired + first segment flags for R1 counting
         let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
-                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+                let mut b = SamBuilder::new();
+                b.sequence(b"ACGT").flags(flags::PAIRED | flags::FIRST_SEGMENT);
+                b.build()
             })
             .collect();
 
         let b_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
-                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+                let mut b = SamBuilder::new();
+                b.sequence(b"ACGT").flags(flags::PAIRED | flags::FIRST_SEGMENT);
+                b.build()
             })
             .collect();
 
@@ -5505,7 +5166,9 @@ mod tests {
         // Create 3 A reads
         let a_reads: Vec<RawRecord> = (0..3)
             .map(|_| {
-                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
+                let mut b = SamBuilder::new();
+                b.sequence(b"ACGT").flags(flags::PAIRED | flags::FIRST_SEGMENT);
+                b.build()
             })
             .collect();
 
@@ -5531,43 +5194,46 @@ mod tests {
 
     #[test]
     fn test_is_paired_r1_and_r2_predicates() {
+        let build = |flags_val: u16| -> RawRecord {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags_val);
+            b.build()
+        };
+
         // Paired R1: PAIRED | FIRST_SEGMENT.
-        let paired_r1 =
-            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build());
+        let paired_r1 = build(flags::PAIRED | flags::FIRST_SEGMENT);
         assert!(DuplexConsensusCaller::is_paired_r1(&paired_r1));
         assert!(!DuplexConsensusCaller::is_paired_r2(&paired_r1));
 
         // Paired R2: PAIRED | LAST_SEGMENT.
-        let paired_r2 =
-            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(false).build());
+        let paired_r2 = build(flags::PAIRED | flags::LAST_SEGMENT);
         assert!(!DuplexConsensusCaller::is_paired_r1(&paired_r2));
         assert!(DuplexConsensusCaller::is_paired_r2(&paired_r2));
 
         // Unpaired fragment: neither PAIRED nor any segment bit. Must not be
         // classified as R1 or R2 — this is the regression guarded by fix.
-        let fragment = encode_to_raw(&RecordBuilder::new().sequence("ACGT").build());
+        let fragment = build(0);
         assert!(!DuplexConsensusCaller::is_paired_r1(&fragment));
         assert!(!DuplexConsensusCaller::is_paired_r2(&fragment));
     }
 
     #[test]
     fn test_has_minimum_number_of_reads_ignores_unpaired_fragments() {
+        let build = |flags_val: u16| -> RawRecord {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags_val);
+            b.build()
+        };
+
         // Three R1s plus two unpaired fragments on the A strand: fragments
         // must not contribute to the R1 count.
-        let a_r1s: Vec<RawRecord> = (0..3)
-            .map(|_| {
-                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
-            })
-            .collect();
-        let a_fragments: Vec<RawRecord> =
-            (0..2).map(|_| encode_to_raw(&RecordBuilder::new().sequence("ACGT").build())).collect();
+        let a_r1s: Vec<RawRecord> =
+            (0..3).map(|_| build(flags::PAIRED | flags::FIRST_SEGMENT)).collect();
+        let a_fragments: Vec<RawRecord> = (0..2).map(|_| build(0)).collect();
         let a_reads: Vec<RawRecord> = a_r1s.into_iter().chain(a_fragments).collect();
 
-        let b_reads: Vec<RawRecord> = (0..3)
-            .map(|_| {
-                encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build())
-            })
-            .collect();
+        let b_reads: Vec<RawRecord> =
+            (0..3).map(|_| build(flags::PAIRED | flags::FIRST_SEGMENT)).collect();
 
         // With fragments excluded: total R1s = 3 + 3 = 6 -> passes min_total=6.
         assert!(DuplexConsensusCaller::has_minimum_number_of_reads(
@@ -5586,20 +5252,25 @@ mod tests {
     #[test]
     fn test_has_minimum_number_of_reads_only_counts_r1() {
         // Create R1 and R2 reads for A strand
-        let a_r1 =
-            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build());
+        let a_r1 = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
 
-        let a_r2 = encode_to_raw(
-            &RecordBuilder::new()
-                .sequence("ACGT")
-                .first_segment(false) // R2, should not be counted
-                .build(),
-        );
+        let a_r2 = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags::PAIRED | flags::LAST_SEGMENT); // R2, should not be counted
+            b.build()
+        };
 
         let a_reads = vec![a_r1, a_r2]; // Only 1 R1
 
-        let b_r1 =
-            encode_to_raw(&RecordBuilder::new().sequence("ACGT").first_segment(true).build());
+        let b_r1 = {
+            let mut b = SamBuilder::new();
+            b.sequence(b"ACGT").flags(flags::PAIRED | flags::FIRST_SEGMENT);
+            b.build()
+        };
 
         let b_reads = vec![b_r1]; // 1 R1
 
@@ -5713,30 +5384,30 @@ mod tests {
 
     #[test]
     fn test_partition_records_by_strand_basic() {
-        let a1 = encode_to_raw(
-            &RecordBuilder::new()
-                .name("r1")
-                .sequence("ACGT")
+        let a1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"r1")
+                .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .tag("MI", "UMI1/A")
-                .build(),
-        );
-        let a2 = encode_to_raw(
-            &RecordBuilder::new()
-                .name("r2")
-                .sequence("ACGT")
+                .add_string_tag(b"MI", b"UMI1/A");
+            b.build()
+        };
+        let a2 = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"r2")
+                .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .tag("MI", "UMI1/A")
-                .build(),
-        );
-        let b1 = encode_to_raw(
-            &RecordBuilder::new()
-                .name("r3")
-                .sequence("ACGT")
+                .add_string_tag(b"MI", b"UMI1/A");
+            b.build()
+        };
+        let b1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"r3")
+                .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .tag("MI", "UMI1/B")
-                .build(),
-        );
+                .add_string_tag(b"MI", b"UMI1/B");
+            b.build()
+        };
 
         let records = vec![a1, a2, b1];
         let (base_mi, a_records, b_records) =
@@ -5761,14 +5432,11 @@ mod tests {
 
     #[test]
     fn test_partition_records_by_strand_missing_suffix() {
-        let rec = encode_to_raw(
-            &RecordBuilder::new()
-                .name("r1")
-                .sequence("ACGT")
-                .qualities(&[30; 4])
-                .tag("MI", "UMI1") // No /A or /B suffix
-                .build(),
-        );
+        let rec = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"r1").sequence(b"ACGT").qualities(&[30; 4]).add_string_tag(b"MI", b"UMI1"); // No /A or /B suffix
+            b.build()
+        };
 
         let result = DuplexConsensusCaller::partition_records_by_strand(vec![rec]);
         assert!(result.is_err(), "Should error on MI tag without /A or /B suffix");
@@ -5776,14 +5444,14 @@ mod tests {
 
     #[test]
     fn test_partition_records_by_strand_a_only() {
-        let a1 = encode_to_raw(
-            &RecordBuilder::new()
-                .name("r1")
-                .sequence("ACGT")
+        let a1 = {
+            let mut b = SamBuilder::new();
+            b.read_name(b"r1")
+                .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .tag("MI", "UMI1/A")
-                .build(),
-        );
+                .add_string_tag(b"MI", b"UMI1/A");
+            b.build()
+        };
 
         let (base_mi, a_records, b_records) =
             DuplexConsensusCaller::partition_records_by_strand(vec![a1])
@@ -6194,44 +5862,47 @@ mod tests {
         // 3 B-strand pairs: R1 reverse-complemented (fgbio BA-R1 convention),
         // R2 forward. Both sequences become CCCCCCCCCC in the query-sequence field
         // such that the aligned BA-strand view produces unconverted-C evidence.
-        let reads: Vec<RecordBuf> = (1..=3)
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[30u8; 10];
+        let mut b = SamBuilder::new();
+        let reads: Vec<RawRecord> = (1..=3_u8)
             .flat_map(|i| {
-                vec![
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("GGGGGGGGGG")
-                        .qualities(&[30; 10])
-                        .first_segment(true)
-                        .reverse_complement(true)
-                        .mate_reverse_complement(false)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/B")
-                        .tag("RG", "A")
-                        .build(),
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("CCCCCCCCCC")
-                        .qualities(&[30; 10])
-                        .first_segment(false)
-                        .reverse_complement(false)
-                        .mate_reverse_complement(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/B")
-                        .tag("RG", "A")
-                        .build(),
-                ]
+                let name = [b'q', i];
+                let ba_r1 = {
+                    b.clear();
+                    b.ref_id(0)
+                        .pos(99)
+                        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE)
+                        .mate_ref_id(0)
+                        .mate_pos(99)
+                        .read_name(&name)
+                        .cigar_ops(cigar_10m)
+                        .sequence(b"GGGGGGGGGG")
+                        .qualities(quals);
+                    b.add_string_tag(b"MI", b"foo/B");
+                    b.add_string_tag(b"RG", b"A");
+                    b.build()
+                };
+                let ba_r2 = {
+                    b.clear();
+                    b.ref_id(0)
+                        .pos(99)
+                        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE)
+                        .mate_ref_id(0)
+                        .mate_pos(99)
+                        .read_name(&name)
+                        .cigar_ops(cigar_10m)
+                        .sequence(b"CCCCCCCCCC")
+                        .qualities(quals);
+                    b.add_string_tag(b"MI", b"foo/B");
+                    b.add_string_tag(b"RG", b"A");
+                    b.build()
+                };
+                vec![ba_r1, ba_r2]
             })
             .collect();
 
-        let result = caller.consensus_reads_from_sam_records(reads)?;
+        let result = caller.consensus_reads(reads)?;
         assert_eq!(result.count, 2, "Should produce 2 consensus reads from B-only");
 
         let records = ParsedBamRecord::parse_all(&result.data);
@@ -6286,44 +5957,47 @@ mod tests {
         // BA-R2 (reverse_complement=false) stored "AAAAAAAAAA" → aligned "AAAAAAAAAA".
         // Distinguishable sequences let us verify which BA read each output slot
         // derives from.
-        let reads: Vec<RecordBuf> = (1..=3)
+        let cigar_10m = &[encode_op(0, 10)];
+        let quals = &[30u8; 10];
+        let mut b = SamBuilder::new();
+        let reads: Vec<RawRecord> = (1..=3_u8)
             .flat_map(|i| {
-                vec![
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("GGGGGGGGGG")
-                        .qualities(&[30; 10])
-                        .first_segment(true)
-                        .reverse_complement(true)
-                        .mate_reverse_complement(false)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/B")
-                        .tag("RG", "A")
-                        .build(),
-                    RecordBuilder::new()
-                        .name(&format!("q{i}"))
-                        .sequence("AAAAAAAAAA")
-                        .qualities(&[30; 10])
-                        .first_segment(false)
-                        .reverse_complement(false)
-                        .mate_reverse_complement(true)
-                        .reference_sequence_id(0)
-                        .alignment_start(100)
-                        .mate_reference_sequence_id(0)
-                        .mate_alignment_start(100)
-                        .cigar("10M")
-                        .tag("MI", "foo/B")
-                        .tag("RG", "A")
-                        .build(),
-                ]
+                let name = [b'q', i];
+                let ba_r1 = {
+                    b.clear();
+                    b.ref_id(0)
+                        .pos(99)
+                        .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE)
+                        .mate_ref_id(0)
+                        .mate_pos(99)
+                        .read_name(&name)
+                        .cigar_ops(cigar_10m)
+                        .sequence(b"GGGGGGGGGG")
+                        .qualities(quals);
+                    b.add_string_tag(b"MI", b"foo/B");
+                    b.add_string_tag(b"RG", b"A");
+                    b.build()
+                };
+                let ba_r2 = {
+                    b.clear();
+                    b.ref_id(0)
+                        .pos(99)
+                        .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::MATE_REVERSE)
+                        .mate_ref_id(0)
+                        .mate_pos(99)
+                        .read_name(&name)
+                        .cigar_ops(cigar_10m)
+                        .sequence(b"AAAAAAAAAA")
+                        .qualities(quals);
+                    b.add_string_tag(b"MI", b"foo/B");
+                    b.add_string_tag(b"RG", b"A");
+                    b.build()
+                };
+                vec![ba_r1, ba_r2]
             })
             .collect();
 
-        let result = caller.consensus_reads_from_sam_records(reads)?;
+        let result = caller.consensus_reads(reads)?;
         assert_eq!(result.count, 2, "Should produce 2 consensus reads from B-only");
 
         let records = ParsedBamRecord::parse_all(&result.data);

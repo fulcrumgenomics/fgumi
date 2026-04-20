@@ -4,7 +4,7 @@
 //! 1. Missing required arguments produce a clear error
 //! 2. Basic execution with minimal valid inputs
 
-use fgumi_lib::sam::builder::RecordBuilder;
+use fgumi_raw_bam::{RawRecord, SamBuilder};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use std::fs;
@@ -13,10 +13,12 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-use crate::helpers::bam_generator::{create_coordinate_sorted_header, create_test_reference};
+use crate::helpers::bam_generator::{
+    create_coordinate_sorted_header, create_test_reference, to_record_buf,
+};
 
 /// Create a coordinate-sorted, indexed BAM file.
-fn create_indexed_bam(path: &Path, records: &[noodles::sam::alignment::record_buf::RecordBuf]) {
+fn create_indexed_bam(path: &Path, records: &[RawRecord]) {
     let header = create_coordinate_sorted_header("chr1", 10000);
 
     // Write BAM and drop to flush
@@ -25,7 +27,9 @@ fn create_indexed_bam(path: &Path, records: &[noodles::sam::alignment::record_bu
             bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
         writer.write_header(&header).expect("Failed to write header");
         for record in records {
-            writer.write_alignment_record(&header, record).expect("Failed to write record");
+            writer
+                .write_alignment_record(&header, &to_record_buf(record))
+                .expect("Failed to write record");
         }
     }
 
@@ -107,42 +111,46 @@ fn test_review_basic_execution() {
 
     // Create a consensus BAM with a read spanning the variant position,
     // with MI tag for molecule identifier
-    let consensus_records = vec![
-        RecordBuilder::new()
-            .name("cons1")
-            .sequence("ACGTACGT")
+    let consensus_records = vec![{
+        let mut b = SamBuilder::new();
+        b.read_name(b"cons1")
+            .sequence(b"ACGTACGT")
             .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(97)
-            .mapping_quality(60)
-            .cigar("8M")
-            .tag("MI", "1")
-            .build(),
-    ];
+            .ref_id(0)
+            .pos(96) // 0-based for 1-based pos 97
+            .mapq(60)
+            .cigar_ops(&[8 << 4]) // 8M
+            .add_string_tag(b"MI", b"1");
+        b.build()
+    }];
     create_indexed_bam(&consensus_bam, &consensus_records);
 
     // Create a grouped BAM with raw reads (MI tag matches consensus)
     let grouped_records = vec![
-        RecordBuilder::new()
-            .name("raw1")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(97)
-            .mapping_quality(60)
-            .cigar("8M")
-            .tag("MI", "1")
-            .build(),
-        RecordBuilder::new()
-            .name("raw2")
-            .sequence("ACGTACGT")
-            .qualities(&[30; 8])
-            .reference_sequence_id(0)
-            .alignment_start(97)
-            .mapping_quality(60)
-            .cigar("8M")
-            .tag("MI", "1")
-            .build(),
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"raw1")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(96)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .add_string_tag(b"MI", b"1");
+            b.build()
+        },
+        {
+            let mut b = SamBuilder::new();
+            b.read_name(b"raw2")
+                .sequence(b"ACGTACGT")
+                .qualities(&[30; 8])
+                .ref_id(0)
+                .pos(96)
+                .mapq(60)
+                .cigar_ops(&[8 << 4]) // 8M
+                .add_string_tag(b"MI", b"1");
+            b.build()
+        },
     ];
     create_indexed_bam(&grouped_bam, &grouped_records);
 
