@@ -21,7 +21,6 @@
 //! is merged and released, which adds the same optimization to noodles.
 use crate::errors::FgumiError;
 use anyhow::{Context, Result};
-use log::debug;
 use noodles::core::Position;
 use noodles::fasta::fai;
 use std::collections::HashMap;
@@ -29,6 +28,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::debug;
 
 /// Read a sequence from a FASTA file using FAI index metadata.
 /// Uses raw byte reading with mathematical newline handling (htsjdk-style).
@@ -378,7 +378,6 @@ impl fgumi_sam::ReferenceProvider for ReferenceReader {
     }
 }
 
-#[cfg(feature = "simplex")]
 impl fgumi_consensus::methylation::RefBaseProvider for ReferenceReader {
     fn base_at_0based(&self, chrom: &str, pos: u64) -> Option<u8> {
         let sequence = self.sequences.get(chrom)?;

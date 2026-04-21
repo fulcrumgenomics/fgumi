@@ -199,7 +199,7 @@ where
     K: Clone + Send + Sync + Ord,
     F: Fn(&RawRecord) -> K + Send + Sync,
 {
-    log::info!(
+    tracing::info!(
         "Starting parallel merge of {} chunks with {} reader threads",
         chunk_files.len(),
         config.reader_threads.min(chunk_files.len())
@@ -247,7 +247,7 @@ where
         }
     }
 
-    log::info!("Parallel merge complete: {records_merged} records merged");
+    tracing::info!("Parallel merge complete: {records_merged} records merged");
 
     Ok(records_merged)
 }
@@ -275,7 +275,7 @@ where
 {
     const OUTPUT_BUFFER_SIZE: usize = 1024;
 
-    log::info!(
+    tracing::info!(
         "Starting buffered parallel merge of {} chunks with {} reader threads",
         chunk_files.len(),
         config.reader_threads.min(chunk_files.len())
@@ -335,7 +335,7 @@ where
         writer.write_raw_record(&record)?;
     }
 
-    log::info!("Buffered parallel merge complete: {records_merged} records merged");
+    tracing::info!("Buffered parallel merge complete: {records_merged} records merged");
 
     Ok(records_merged)
 }

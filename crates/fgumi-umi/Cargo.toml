@@ -9,19 +9,14 @@ license.workspace = true
 
 [dependencies]
 ahash = "0.8"
-anyhow = "1.0"
-clap = { version = "4", features = ["derive"], optional = true }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
 fgumi-dna = { workspace = true }
 
 [dev-dependencies]
 rstest = "0.26"
 proptest = "1"
-
-[features]
-default = ["cli"]
-cli = ["dep:clap"]
-profile-adjacency = []
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

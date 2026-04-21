@@ -76,6 +76,16 @@ All notable changes to this project will be documented in this file.
 
 - Rename the template-coordinate sort-key tag written by `fgumi zipper` from `pa` to `tc` to avoid collision with bwa-mem's `pa:f` (primary-alignment score fraction) ([#268](https://github.com/fulcrumgenomics/fgumi/issues/268)). The `--skip-pa-tags` flag on `fgumi zipper` is renamed to `--skip-tc-tags`, and the `missing_pa_tag` dedup metric field is renamed to `missing_tc_tag`. Existing fgumi-zippered BAMs must be re-zippered (or the tag must be manually renamed) before `fgumi dedup` will accept them.
 
+### Changed
+
+- Unified progress tracking: new `--progress {auto,dashboard,heartbeat,none}`
+  flag on runall. Interactive runs get a multi-stage dashboard; batch runs
+  get periodic logfmt heartbeat lines and an end-of-run summary table with
+  read/written totals and consensus ratio. Standalone commands (extract,
+  sort, group, filter, etc.) now use the same tracker. ETA is shown as
+  `???` until the source reader finishes, then computed from the bottleneck
+  stage rate.
+
 ## [0.1.3] - 2026-04-11
 
 ### Bug Fixes

@@ -155,8 +155,8 @@ impl Drop for PooledBamWriter {
             if let Some(handle) = self.io_handle.take() {
                 match handle.join() {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::error!("PooledBamWriter: I/O writer thread error: {e}"),
-                    Err(_) => log::error!("PooledBamWriter: I/O writer thread panicked"),
+                    Ok(Err(e)) => tracing::error!("PooledBamWriter: I/O writer thread error: {e}"),
+                    Err(_) => tracing::error!("PooledBamWriter: I/O writer thread panicked"),
                 }
             }
         }

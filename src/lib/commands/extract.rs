@@ -24,7 +24,6 @@ use crate::fastq::FastqSet;
 use crate::fastq::ReadSetIterator;
 use crate::grouper::FastqTemplate;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::unified_pipeline::{FastqPipelineConfig, MemoryEstimate, run_fastq_pipeline};
 use crate::validation::validate_file_exists;
@@ -33,8 +32,8 @@ use bstr::{BString, ByteSlice};
 use clap::Parser;
 use fgumi_raw_bam::UnmappedSamBuilder;
 use fgumi_raw_bam::fields::flags;
-use log::{debug, info};
 use noodles_bgzf::io::MultithreadedReader;
+use tracing::{debug, info};
 
 #[cfg(test)]
 use crate::bam_io::create_bam_reader;
@@ -158,7 +157,7 @@ fn open_fastq_reader(
         let file = File::open(path)?;
         if async_reader {
             crate::os_hints::advise_sequential(&file);
-            log::info!(
+            tracing::info!(
                 "async FASTQ reader enabled: spawning fgumi-prefetch thread for {}",
                 path.display()
             );
@@ -337,6 +336,30 @@ impl QualityEncoding {
 ///
 /// The functionality is equivalent to running `fgbio FastqToBam | fgbio ExtractUmisFromBam`,
 /// but performs both operations in a single pass over the input FASTQ files.
+const EXTRACT_EXAMPLES: &str = r"EXAMPLES:
+    # Paired-end reads with an 8bp inline UMI on each of R1 and R2
+    fgumi extract \
+        --input r1.fastq.gz r2.fastq.gz \
+        --read-structures 8M+T 8M+T \
+        --sample SAMPLE1 --library LIB1 \
+        --output unmapped.bam
+
+    # UMIs embedded in Illumina read names (8th colon-delimited field)
+    fgumi extract \
+        --input r1.fastq.gz r2.fastq.gz \
+        --extract-umis-from-read-names \
+        --sample SAMPLE1 --library LIB1 \
+        --output unmapped.bam
+
+    # Inline + read-name UMIs combined (hyphenated in RX)
+    fgumi extract \
+        --input r1.fq.gz r2.fq.gz \
+        --read-structures 5M+T 5M+T \
+        --extract-umis-from-read-names \
+        --sample SAMPLE1 --library LIB1 \
+        --output unmapped.bam
+";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "extract",
@@ -389,16 +412,12 @@ values.
 
 UMIs may be extracted from the read sequences, the read names, or both. If
 `--extract-umis-from-read-names` is specified, any UMIs present in the read names are extracted;
-read names are expected to be `:`-separated and the UMI is taken from the **last** field. At
-least 8 fields must be present — the standard Illumina shape
-`@<instrument>:<run>:<flowcell>:<lane>:<tile>:<x>:<y>:<UMI>`. Names with 9+ fields (e.g.
-produced by demultiplexers that fold the sample index into the colon-separated portion) are
-also handled, with the UMI still coming from the last field. Any `+` characters in the
-extracted UMI are normalized to `-`. If UMI segments are present in the read structures those
-will also be extracted. If UMIs are present in both, the final UMIs are constructed by first
-taking the UMIs from the read names, then adding a hyphen, then the UMIs extracted from the
-reads.
-"#
+read names are expected to be `:` -separated with any UMIs present in the 8th field. If UMI
+segments are present in the read structures those will also be extracted. If UMIs are present in
+both, the final UMIs are constructed by first taking the UMIs from the read names, then adding a
+hyphen, then the UMIs extracted from the reads.
+"#,
+    after_help = EXTRACT_EXAMPLES,
 )]
 #[command(verbatim_doc_comment)]
 #[allow(clippy::struct_excessive_bools)]
@@ -445,7 +464,7 @@ pub struct Extract {
     clipping_attribute: Option<SamTag>,
 
     /// Read group ID to use in the file header
-    #[arg(long, default_value = "A")]
+    #[arg(long, default_value = crate::defaults::READ_GROUP_ID)]
     read_group_id: String,
 
     /// The name of the sequenced sample
@@ -461,7 +480,7 @@ pub struct Extract {
     barcode: Option<String>,
 
     /// Sequencing Platform
-    #[arg(long, default_value = "illumina")]
+    #[arg(long, default_value = crate::defaults::PLATFORM)]
     platform: String,
 
     /// Platform unit (e.g. 'flowcell-barcode.lane.sample-barcode')
@@ -916,7 +935,6 @@ impl Extract {
         writer: &mut RawBamWriter,
         encoding: QualityEncoding,
     ) -> Result<u64> {
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
         let mut read_pair_count: u64 = 0;
         let mut builder = UnmappedSamBuilder::new();
 
@@ -947,10 +965,11 @@ impl Extract {
             let num_records = self.make_raw_records(&read_set, encoding, &mut builder, writer)?;
 
             read_pair_count += num_records;
-            progress.log_if_needed(num_records);
+            crate::progress::records_out("extract", num_records);
         }
 
-        progress.log_final();
+        crate::progress::records_read(read_pair_count);
+        crate::progress::records_written(read_pair_count);
         Ok(read_pair_count)
     }
 
@@ -1022,7 +1041,7 @@ impl Extract {
             move |template: FastqTemplate| -> std::io::Result<ExtractedBatch> {
                 // Debug: Log template record count
                 if template.records.len() != read_structures.len() {
-                    log::warn!(
+                    tracing::warn!(
                         "Template has {} records but expected {} (read_structures.len())",
                         template.records.len(),
                         read_structures.len()
@@ -1072,7 +1091,7 @@ impl Extract {
 
                 // Debug: Check if we produce fewer records than template has
                 if result.num_records as usize != template.records.len() {
-                    log::warn!(
+                    tracing::warn!(
                         "Template with {} FASTQ records produced {} BAM records",
                         template.records.len(),
                         result.num_records
@@ -1249,6 +1268,10 @@ impl Command for Extract {
         // Validate inputs
         self.validate()?;
 
+        let _progress_guard = crate::progress::init(crate::progress::Mode::Auto);
+        crate::progress::pipeline_started("extract", None);
+        crate::progress::stage_started("extract", None);
+
         let timer = OperationTimer::new("Extracting UMIs");
         let read_structures = self.get_read_structures()?;
 
@@ -1324,6 +1347,8 @@ impl Command for Extract {
         };
 
         timer.log_completion(records_written);
+        crate::progress::stage_finished("extract");
+        crate::progress::pipeline_finished(true);
         Ok(())
     }
 }

@@ -17,8 +17,8 @@ use crate::sort::RawExternalSorter;
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
-use log::info;
 use noodles::sam::Header;
+use tracing::info;
 
 use crate::commands::command::Command;
 use crate::commands::sort::SortOrderArg;
@@ -28,6 +28,20 @@ use crate::commands::sort::SortOrderArg;
 /// Performs a k-way merge of multiple BAM files that are already sorted in
 /// the same order, similar to `samtools merge`. Input files must all be
 /// sorted in the specified order.
+const MERGE_EXAMPLES: &str = r"EXAMPLES:
+    # Merge coordinate-sorted BAMs
+    fgumi merge -o merged.bam sorted1.bam sorted2.bam sorted3.bam
+
+    # Merge template-coordinate sorted BAMs
+    fgumi merge -o merged.bam --order template-coordinate tc1.bam tc2.bam
+
+    # Merge from a file listing input BAMs (one per line)
+    fgumi merge -o merged.bam -b input_list.txt --order queryname
+
+    # Merge with multiple threads
+    fgumi merge -o merged.bam -@ 4 sorted1.bam sorted2.bam
+";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "merge",
@@ -40,22 +54,8 @@ same order, producing a single merged output that preserves the sort order.
 Similar to `samtools merge`, but supports template-coordinate order.
 
 Input files must all be sorted in the specified sort order.
-
-EXAMPLES:
-
-  # Merge coordinate-sorted BAMs
-  fgumi merge -o merged.bam sorted1.bam sorted2.bam sorted3.bam
-
-  # Merge template-coordinate sorted BAMs
-  fgumi merge -o merged.bam --order template-coordinate tc1.bam tc2.bam
-
-  # Merge from a file listing input BAMs (one per line)
-  fgumi merge -o merged.bam -b input_list.txt --order queryname
-
-  # Merge with multiple threads
-  fgumi merge -o merged.bam -@ 4 sorted1.bam sorted2.bam
-
-"#
+"#,
+    after_help = MERGE_EXAMPLES,
 )]
 pub struct Merge {
     /// Output BAM file.

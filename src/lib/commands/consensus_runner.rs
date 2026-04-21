@@ -10,13 +10,13 @@ use crate::metrics::consensus::ConsensusMetrics;
 use crate::overlapping_consensus::CorrectionStats;
 use anyhow::Result;
 use bstr::BString;
-use log::info;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::Map;
 use noodles::sam::header::record::value::map::ReadGroup;
 use noodles::sam::header::record::value::map::header::tag as header_tag;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles::sam::header::record::value::map::tag::Other;
+use tracing::info;
 
 /// Trait for converting command-specific statistics to metrics.
 pub trait ConsensusStatsOps: Clone + Default + Send {

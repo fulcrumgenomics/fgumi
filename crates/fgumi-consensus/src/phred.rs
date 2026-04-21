@@ -47,7 +47,7 @@ pub type LogProbability = f64;
 ///
 /// # Examples
 /// ```
-/// use fgumi_lib::phred::phred_to_ln_error_prob;
+/// use fgumi_consensus::phred::phred_to_ln_error_prob;
 ///
 /// // Q10 corresponds to 10% error rate
 /// let ln_error = phred_to_ln_error_prob(10);
@@ -74,7 +74,7 @@ pub fn phred_to_ln_error_prob(phred: PhredScore) -> LogProbability {
 ///
 /// # Examples
 /// ```
-/// use fgumi_lib::phred::phred_to_ln_correct_prob;
+/// use fgumi_consensus::phred::phred_to_ln_correct_prob;
 ///
 /// // Q30 = 0.1% error, so 99.9% correct
 /// let ln_correct = phred_to_ln_correct_prob(30);
@@ -100,7 +100,7 @@ pub fn phred_to_ln_correct_prob(phred: PhredScore) -> LogProbability {
 ///
 /// # Examples
 /// ```
-/// use fgumi_lib::phred::ln_prob_to_phred;
+/// use fgumi_consensus::phred::ln_prob_to_phred;
 ///
 /// // 1% error (0.01) corresponds to Q20
 /// let phred = ln_prob_to_phred(0.01_f64.ln());
@@ -217,7 +217,7 @@ fn ln_a_minus_b(a: f64, b: f64) -> f64 {
 ///
 /// # Examples
 /// ```
-/// use fgumi_lib::phred::ln_error_prob_two_trials;
+/// use fgumi_consensus::phred::ln_error_prob_two_trials;
 ///
 /// // If both trials have 10% error, combined error using 4/3 formula:
 /// // f(0.1, 0.1) = 0.1 + 0.1 - 4/3*0.1*0.1 = 0.2 - 0.0133... ≈ 0.1867
@@ -260,7 +260,7 @@ pub fn ln_error_prob_two_trials(ln_p1: LogProbability, ln_p2: LogProbability) ->
 ///
 /// # Examples
 /// ```
-/// use fgumi_lib::phred::ln_sum_exp;
+/// use fgumi_consensus::phred::ln_sum_exp;
 ///
 /// // ln(0.1) + ln(0.2) should give ln(0.3)
 /// let result = ln_sum_exp(0.1_f64.ln(), 0.2_f64.ln());
@@ -292,7 +292,7 @@ pub fn ln_sum_exp(ln_a: LogProbability, ln_b: LogProbability) -> LogProbability 
 ///
 /// # Examples
 /// ```
-/// use fgumi_lib::phred::ln_sum_exp_array;
+/// use fgumi_consensus::phred::ln_sum_exp_array;
 ///
 /// // ln(0.1) + ln(0.2) + ln(0.3) should give ln(0.6)
 /// let values = vec![0.1_f64.ln(), 0.2_f64.ln(), 0.3_f64.ln()];

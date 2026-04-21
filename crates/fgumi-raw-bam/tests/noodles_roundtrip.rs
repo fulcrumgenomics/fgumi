@@ -1,5 +1,5 @@
-#![cfg(feature = "noodles")]
 #![deny(unsafe_code)]
+#![cfg(feature = "noodles")]
 
 use fgumi_raw_bam::testutil::{encode_op, make_bam_bytes};
 use fgumi_raw_bam::{RawRecord, raw_records_to_record_bufs};

@@ -130,29 +130,29 @@ pub fn format_rate(count: u64, duration: Duration) -> String {
 /// ```
 #[allow(clippy::cast_precision_loss)]
 pub fn log_consensus_summary(metrics: &ConsensusMetrics) {
-    log::info!("Consensus Calling Summary:");
-    log::info!("  Input reads: {}", format_count(metrics.total_input_reads));
-    log::info!("  Consensus reads: {}", format_count(metrics.consensus_reads));
-    log::info!("  Filtered reads: {}", format_count(metrics.filtered_reads));
+    tracing::info!("Consensus Calling Summary:");
+    tracing::info!("  Input reads: {}", format_count(metrics.total_input_reads));
+    tracing::info!("  Consensus reads: {}", format_count(metrics.consensus_reads));
+    tracing::info!("  Filtered reads: {}", format_count(metrics.filtered_reads));
 
     if metrics.total_input_reads > 0 {
         let pass_rate = metrics.consensus_reads as f64 / metrics.total_input_reads as f64;
-        log::info!("  Pass rate: {}", format_percent(pass_rate, 2));
+        tracing::info!("  Pass rate: {}", format_percent(pass_rate, 2));
     }
 
     if metrics.consensus_reads > 0 {
-        log::info!("  Avg reads per consensus: {:.1}", metrics.avg_input_reads_per_consensus);
-        log::info!("  Avg depth: {:.1}", metrics.avg_raw_read_depth);
+        tracing::info!("  Avg reads per consensus: {:.1}", metrics.avg_input_reads_per_consensus);
+        tracing::info!("  Avg depth: {:.1}", metrics.avg_raw_read_depth);
     }
 
     if metrics.total_rejections() > 0 {
-        log::info!("  Top rejection reasons:");
+        tracing::info!("  Top rejection reasons:");
         let summary = metrics.rejection_summary();
         let mut sorted: Vec<_> = summary.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
 
         for (reason, count) in sorted.iter().take(5) {
-            log::info!("    {}: {}", reason.description(), format_count(**count));
+            tracing::info!("    {}: {}", reason.description(), format_count(**count));
         }
     }
 }
@@ -180,43 +180,43 @@ pub fn log_consensus_summary(metrics: &ConsensusMetrics) {
 /// ```
 #[allow(clippy::cast_precision_loss)]
 pub fn log_umi_grouping_summary(metrics: &UmiGroupingMetrics) {
-    log::info!("UMI Grouping Summary:");
-    log::info!("  Total records: {}", format_count(metrics.total_records));
-    log::info!("  Accepted records: {}", format_count(metrics.accepted_records));
+    tracing::info!("UMI Grouping Summary:");
+    tracing::info!("  Total records: {}", format_count(metrics.total_records));
+    tracing::info!("  Accepted records: {}", format_count(metrics.accepted_records));
 
     if metrics.total_records > 0 {
         let accept_rate = metrics.accepted_records as f64 / metrics.total_records as f64;
-        log::info!("  Accept rate: {}", format_percent(accept_rate, 2));
+        tracing::info!("  Accept rate: {}", format_percent(accept_rate, 2));
     }
 
-    log::info!("  Unique molecules: {}", format_count(metrics.unique_molecule_ids));
-    log::info!("  Total families: {}", format_count(metrics.total_families));
+    tracing::info!("  Unique molecules: {}", format_count(metrics.unique_molecule_ids));
+    tracing::info!("  Total families: {}", format_count(metrics.total_families));
 
     if metrics.total_families > 0 {
-        log::info!("  Avg reads/molecule: {:.1}", metrics.avg_reads_per_molecule);
-        log::info!("  Median reads/molecule: {}", metrics.median_reads_per_molecule);
-        log::info!("  Min reads/molecule: {}", metrics.min_reads_per_molecule);
-        log::info!("  Max reads/molecule: {}", metrics.max_reads_per_molecule);
+        tracing::info!("  Avg reads/molecule: {:.1}", metrics.avg_reads_per_molecule);
+        tracing::info!("  Median reads/molecule: {}", metrics.median_reads_per_molecule);
+        tracing::info!("  Min reads/molecule: {}", metrics.min_reads_per_molecule);
+        tracing::info!("  Max reads/molecule: {}", metrics.max_reads_per_molecule);
     }
 
     // Log filter counts (matching fgbio's logging style)
     // Non-PF only logged if > 0
     if metrics.discarded_non_pf > 0 {
-        log::info!("Filtered out {} non-PF records.", format_count(metrics.discarded_non_pf));
+        tracing::info!("Filtered out {} non-PF records.", format_count(metrics.discarded_non_pf));
     }
     // Poor alignment always logged (like fgbio)
-    log::info!(
+    tracing::info!(
         "Filtered out {} records due to mapping issues.",
         format_count(metrics.discarded_poor_alignment)
     );
     // Ns in UMI always logged (like fgbio)
-    log::info!(
+    tracing::info!(
         "Filtered out {} records that contained one or more Ns in their UMIs.",
         format_count(metrics.discarded_ns_in_umi)
     );
     // UMI too short only logged if > 0
     if metrics.discarded_umi_too_short > 0 {
-        log::info!(
+        tracing::info!(
             "Filtered out {} records that contained UMIs that were too short.",
             format_count(metrics.discarded_umi_too_short)
         );
@@ -247,14 +247,14 @@ impl OperationTimer {
     /// Creates a new operation timer and logs the start.
     #[must_use]
     pub fn new(operation: &str) -> Self {
-        log::info!("{operation} ...");
+        tracing::info!("{operation} ...");
         Self { operation: operation.to_string(), start_time: Instant::now() }
     }
 
     /// Logs the completion with item count and rate.
     pub fn log_completion(&self, count: u64) {
         let duration = self.start_time.elapsed();
-        log::info!(
+        tracing::info!(
             "{} completed: {} in {} ({})",
             self.operation,
             format_count(count),

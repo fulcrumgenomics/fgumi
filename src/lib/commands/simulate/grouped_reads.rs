@@ -24,13 +24,13 @@ use crate::simulate::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
-use log::info;
 use noodles::sam::header::Header;
 use noodles::sam::header::record::value::map::header::{self as HeaderRecord, Tag as HeaderTag};
 use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use tracing::info;
 
 /// Generate template-coordinate sorted BAM with MI tags for consensus callers.
 #[derive(Parser, Debug)]
@@ -200,7 +200,7 @@ impl Command for GroupedReads {
                 ref_genome.total_length()
             );
         } else if bases_per_position < 10.0 {
-            log::warn!(
+            tracing::warn!(
                 "Low position spacing ({bases_per_position:.1} bp/position) may cause UMI collisions."
             );
         }

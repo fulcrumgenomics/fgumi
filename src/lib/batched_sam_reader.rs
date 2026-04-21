@@ -84,7 +84,7 @@ impl<R: Read> BatchedSamReader<R> {
         // Proactive growth: if unparsed data > 50% of buffer, grow first
         if unparsed_len > self.buffer.len() / 2 {
             let new_size = self.buffer.len() * 2;
-            log::info!(
+            tracing::info!(
                 "Growing buffer (proactive): {}MB -> {}MB (unparsed: {}MB)",
                 self.buffer.len() / (1024 * 1024),
                 new_size / (1024 * 1024),
@@ -167,7 +167,7 @@ impl<R: Read> BatchedSamReader<R> {
         if needed > self.buffer.len() {
             // Round up to next power of 2 for efficiency
             let new_size = needed.next_power_of_two();
-            log::info!(
+            tracing::info!(
                 "Growing buffer (batch {}): {}MB -> {}MB ({} bytes for {} bases)",
                 self.batches_completed + 1,
                 self.buffer.len() / (1024 * 1024),
@@ -231,7 +231,7 @@ impl<R: Read> BatchedSamReader<R> {
         if bytes_read >= self.buffer.len() * 3 / 4 {
             let new_size = (self.buffer.len() * 2).min(1024 * 1024 * 1024); // Cap at 1GB
             if new_size > self.buffer.len() {
-                log::info!(
+                tracing::info!(
                     "Growing buffer (BufRead): {}MB -> {}MB (read: {}MB)",
                     self.buffer.len() / (1024 * 1024),
                     new_size / (1024 * 1024),

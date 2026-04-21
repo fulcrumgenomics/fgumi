@@ -15,13 +15,13 @@ use clap::Parser;
 use fgumi_raw_bam::{
     RawBamReader, RawRecord, aux_data_slice, find_int_tag, find_string_tag, read_name,
 };
-use log::info;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use tracing::info;
 
 use crate::commands::command::Command;
 use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
@@ -30,10 +30,25 @@ use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
 ///
 /// Reads consecutive records sharing the same MI tag, randomly samples families
 /// based on the keep fraction, and writes kept families directly to output BAM.
+const DOWNSAMPLE_EXAMPLES: &str = r"EXAMPLES:
+    # Keep 20% of UMI families (deterministic by read-name hash)
+    fgumi downsample -i grouped.bam -o downsampled.bam --fraction 0.2
+
+    # Keep 50% with an explicit seed for reproducibility across runs
+    fgumi downsample -i grouped.bam -o downsampled.bam \
+        --fraction 0.5 --seed 42
+
+    # Emit dropped families to a separate BAM (audit / regression testing)
+    fgumi downsample -i grouped.bam -o kept.bam \
+        --dropped dropped.bam \
+        --fraction 0.1 --seed 42
+";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "downsample",
     about = "\x1b[38;5;166m[UTILITIES]\x1b[0m      \x1b[36mDownsample BAM by UMI family using streaming\x1b[0m",
+    after_help = DOWNSAMPLE_EXAMPLES,
     long_about = r#"
 Downsample a BAM file by UMI family using a single-pass streaming algorithm.
 

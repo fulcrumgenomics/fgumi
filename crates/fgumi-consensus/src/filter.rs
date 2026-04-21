@@ -4,10 +4,10 @@
 //! and error rate thresholds. It supports both single-strand and duplex consensus reads.
 
 use ahash::AHashMap;
-use anyhow::Result;
 #[cfg(feature = "simplex")]
 use noodles::sam::alignment::record::cigar::op::Kind;
 
+use crate::error::Result;
 use crate::phred::{MIN_PHRED, NO_CALL_BASE};
 use fgumi_metrics::rejection::RejectionReason;
 use fgumi_raw_bam as bam_fields;
@@ -27,7 +27,8 @@ fn expand_three_from_last<T: Copy>(values: &[T]) -> [T; 3] {
 }
 
 /// Filter thresholds for consensus reads
-#[derive(Debug, Clone)]
+// PartialEq only (not Eq): contains f64 error-rate fields.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FilterThresholds {
     /// Minimum number of raw reads to support a consensus base/read
     pub min_reads: usize,
@@ -50,7 +51,9 @@ pub enum ConsensusType {
 }
 
 /// Filtering configuration for consensus reads
-#[derive(Debug, Clone)]
+// PartialEq only (not Eq): contains f64 max_no_call_fraction and
+// min_mean_base_quality fields plus nested FilterThresholds with f64 fields.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FilterConfig {
     /// Thresholds for duplex consensus reads (if applicable)
     pub duplex_thresholds: Option<FilterThresholds>,
@@ -218,6 +221,9 @@ impl FilterConfig {
         self.single_strand_thresholds.as_ref().or(self.duplex_thresholds.as_ref())
     }
 
+    // NOTE: default-parity between `fgumi filter` (see `commands::filter::Filter::build_filter_config`)
+    // and `fgumi runall` (see `commands::runall::parallel::Runall::build_filter_config`, which uses
+    // `for_single_strand`) relies on this constructor's exact empty-slice fallbacks below — keep in sync.
     /// Creates a new filter configuration from parameter vectors
     ///
     /// # Arguments
@@ -393,6 +399,79 @@ pub fn template_passes(raw_records: &[RawRecord], pass_map: &AHashMap<usize, boo
 
     has_primary && all_primary_pass
 }
+
+/// Outcome of filtering one template's records.
+///
+/// Returned by [`filter_template_records`]. Callers iterate `keep_mask` to
+/// decide which records to emit (or route to rejects), and use `bases_masked`
+/// / `pass_map` for metrics.
+#[derive(Debug, Clone)]
+pub struct TemplateFilterOutcome {
+    /// Per-record keep decision (parallel to the input records slice):
+    /// `true` means emit to primary output; `false` means reject.
+    pub keep_mask: Vec<bool>,
+    /// Per-record pass result from the caller-supplied per-record processor.
+    pub pass_map: AHashMap<usize, bool>,
+    /// Sum of bases masked across all records in this template.
+    pub bases_masked: u64,
+    /// Whether the template passed the template-level rule: at least one
+    /// primary record present and all primary records passed. Always `true`
+    /// when `filter_by_template` is `false` (the rule is skipped entirely).
+    pub template_pass: bool,
+}
+
+/// Apply per-record filtering to a template's records and decide which to emit.
+///
+/// The single shared orchestration used by both the standalone `fgumi filter`
+/// command and the pipeline `FilterStage`. Iterates `records`, invokes
+/// `per_record` on each (which masks in place and returns `(bases_masked,
+/// pass)`), then applies the template-level rule:
+///
+/// - When `filter_by_template` is `true`: if *any* primary record fails, drop
+///   *all* records of the template. Non-primary records additionally require
+///   their own per-record pass.
+/// - When `false`: each record is kept iff it individually passed.
+///
+/// # Errors
+///
+/// Propagates any error returned by `per_record`.
+pub fn filter_template_records<F, E>(
+    records: &mut [RawRecord],
+    filter_by_template: bool,
+    mut per_record: F,
+) -> std::result::Result<TemplateFilterOutcome, E>
+where
+    F: FnMut(&mut RawRecord) -> std::result::Result<(u64, bool), E>,
+{
+    let mut pass_map: AHashMap<usize, bool> = AHashMap::with_capacity(records.len());
+    let mut bases_masked: u64 = 0;
+    for (idx, record) in records.iter_mut().enumerate() {
+        let (masked, pass) = per_record(record)?;
+        bases_masked += masked;
+        pass_map.insert(idx, pass);
+    }
+
+    let template_pass = if filter_by_template { template_passes(records, &pass_map) } else { true };
+
+    let keep_mask: Vec<bool> = records
+        .iter()
+        .enumerate()
+        .map(|(idx, rec)| {
+            let flags = RawRecordView::new(rec).flags();
+            let is_primary = (flags & bam_fields::flags::SECONDARY) == 0
+                && (flags & bam_fields::flags::SUPPLEMENTARY) == 0;
+            let record_pass = pass_map.get(&idx).copied().unwrap_or(false);
+            if filter_by_template {
+                if is_primary { template_pass } else { template_pass && record_pass }
+            } else {
+                record_pass
+            }
+        })
+        .collect();
+
+    Ok(TemplateFilterOutcome { keep_mask, pass_map, bases_masked, template_pass })
+}
+
 /// Pre-parsed methylation aux tags from a raw BAM record.
 ///
 /// Avoids repeated linear scans of the aux block when multiple filters
@@ -652,7 +731,9 @@ pub fn mask_bases(
     thresholds: &FilterThresholds,
     min_base_quality: Option<u8>,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
+        return Err(crate::error::Error::InvalidRecord("BAM record too short".into()));
+    }
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
     let len = RawRecordView::new(record).l_seq() as usize;
@@ -707,7 +788,9 @@ pub fn mask_duplex_bases(
     min_base_quality: Option<u8>,
     require_ss_agreement: bool,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
+        return Err(crate::error::Error::InvalidRecord("BAM record too short".into()));
+    }
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
     let len = RawRecordView::new(record).l_seq() as usize;
@@ -852,7 +935,9 @@ pub fn mask_methylation_depth_simplex_raw_with_tags(
     min_depth: usize,
     tags: &MethylationTags,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
+        return Err(crate::error::Error::InvalidRecord("BAM record too short".into()));
+    }
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
     let len = RawRecordView::new(record).l_seq() as usize;
@@ -904,7 +989,9 @@ pub fn mask_methylation_depth_duplex_raw_with_tags(
     thresholds: &MethylationDepthThresholds,
     tags: &MethylationTags,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
+        return Err(crate::error::Error::InvalidRecord("BAM record too short".into()));
+    }
     let seq_off = bam_fields::seq_offset(record);
     let qual_off = bam_fields::qual_offset(record);
     let len = RawRecordView::new(record).l_seq() as usize;
@@ -1052,7 +1139,9 @@ pub fn mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
     ref_base_map: Option<&[Option<u8>]>,
     tags: &MethylationTags,
 ) -> Result<usize> {
-    anyhow::ensure!(record.len() >= bam_fields::MIN_BAM_RECORD_LEN, "BAM record too short");
+    if record.len() < bam_fields::MIN_BAM_RECORD_LEN {
+        return Err(crate::error::Error::InvalidRecord("BAM record too short".into()));
+    }
 
     let Some(ref_base_map) = ref_base_map else {
         return Ok(0);

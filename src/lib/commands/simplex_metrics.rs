@@ -14,8 +14,8 @@ use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use log::info;
 use std::path::PathBuf;
+use tracing::info;
 
 use super::command::Command;
 use super::shared_metrics::{
@@ -25,6 +25,17 @@ use super::shared_metrics::{
 
 /// Embedded R script for PDF plot generation (bundled with binary).
 const R_SCRIPT: &str = include_str!("../../../resources/CollectSimplexSeqMetrics.R");
+
+const SIMPLEX_METRICS_EXAMPLES: &str = r"EXAMPLES:
+    # Collect simplex metrics from a grouped BAM
+    fgumi simplex-metrics -i grouped.bam -o simplex_qc
+
+    # Restrict analysis to target intervals and require 3+ reads per SS family
+    fgumi simplex-metrics -i grouped.bam -o simplex_qc \
+        --intervals targets.bed \
+        --min-reads 3 \
+        --description 'Sample SAMPLE1'
+";
 
 /// Collects comprehensive QC metrics for simplex sequencing experiments.
 #[derive(Parser, Debug)]
@@ -63,7 +74,8 @@ Within the metrics files the prefixes `CS` and `SS` are used to mean:
 
 * **CS**: tag families where membership is defined solely on matching genome coordinates and strand
 * **SS**: single-stranded tag families where membership is defined by genome coordinates, strand and UMI
-"#
+"#,
+    after_help = SIMPLEX_METRICS_EXAMPLES,
 )]
 pub struct SimplexMetrics {
     /// Input BAM file (UMI-grouped, from `group`).
@@ -191,19 +203,19 @@ impl Command for SimplexMetrics {
             ) {
                 Ok(()) => info!("Generated PDF plots: {pdf_path}"),
                 Err(e) => {
-                    log::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");
-                    log::warn!(
+                    tracing::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");
+                    tracing::warn!(
                         "To enable PDF generation, ensure R is installed with ggplot2 and scales packages:"
                     );
-                    log::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
+                    tracing::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
                 }
             }
         } else {
-            log::warn!(
+            tracing::warn!(
                 "R or required packages (ggplot2, scales) not available. Skipping PDF generation."
             );
-            log::warn!("To enable PDF generation, install R and required packages:");
-            log::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
+            tracing::warn!("To enable PDF generation, install R and required packages:");
+            tracing::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
         }
 
         info!("Done!");

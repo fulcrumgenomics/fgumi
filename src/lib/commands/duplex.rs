@@ -40,13 +40,13 @@ use crate::unified_pipeline::{
 };
 use crate::validation::validate_file_exists;
 use fgumi_raw_bam::{RawRecord, RawRecordView};
-use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use parking_lot::Mutex;
 use std::io;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
+use tracing::info;
 
 use super::command::Command;
 
@@ -85,11 +85,28 @@ struct CollectedDuplexMetrics {
     groups_processed: u64,
 }
 
+const DUPLEX_EXAMPLES: &str = r"EXAMPLES:
+    # Basic duplex consensus calling from paired-UMI grouped reads
+    fgumi duplex -i grouped.bam -o consensus.bam --min-reads 1
+
+    # Require 3 reads for duplex, 2 per strand minimum
+    fgumi duplex -i grouped.bam -o consensus.bam \
+        --min-reads 3,2,1 \
+        --rejects rejected.bam \
+        --stats duplex.stats.tsv
+
+    # Downsample very deep families to control runtime
+    fgumi duplex -i grouped.bam -o consensus.bam \
+        --min-reads 1 \
+        --max-reads-per-strand 100
+";
+
 /// Call duplex consensus reads from grouped reads with /A and /B MI tags
 #[derive(Parser, Debug)]
 #[command(
     name = "duplex",
     about = "\x1b[38;5;180m[CONSENSUS]\x1b[0m      \x1b[36mCall duplex consensus sequences from UMI-grouped reads\x1b[0m",
+    after_help = DUPLEX_EXAMPLES,
     long_about = r#"
 Calls duplex consensus sequences from reads generated from the same double-stranded source molecule. Prior
 to running this tool, reads must have been grouped with `group` using the `paired` strategy. Doing

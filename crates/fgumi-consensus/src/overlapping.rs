@@ -4,8 +4,7 @@
 //! the same original molecule positions and should be consensus called before
 //! UMI consensus calling. This prevents treating them as independent observations.
 
-use anyhow::{Context, Result};
-
+use crate::error::Result;
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER};
 use fgumi_raw_bam::{self, RawRecordView};
 
@@ -660,7 +659,7 @@ pub fn apply_overlapping_consensus(
                 (&mut right[0], &mut left[*idx2])
             };
 
-            caller.call(r1, r2).context("Failed to call overlapping consensus on raw bytes")?;
+            caller.call(r1, r2)?;
         }
     }
 

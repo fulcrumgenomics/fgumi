@@ -116,9 +116,6 @@ Several Cargo features exist for development and debugging purposes. These are *
 | Feature | Purpose | Usage |
 |---------|---------|-------|
 | `memory-debug` | Enables comprehensive memory debugging infrastructure: a monitor thread, hot-path atomic counters, and additional CLI arguments for memory tracking. Requires `libmimalloc-sys` and `sysinfo` dependencies. | `cargo build --features memory-debug` |
-| `dhat-heap` | Enables heap profiling via the `dhat` crate. Replaces the default `mimalloc` allocator with `dhat::Alloc`. | `cargo build --features dhat-heap` |
-| `profile-adjacency` | Enables profiling output for the adjacency UMI assigner. | `cargo build --features profile-adjacency` |
-| `stress-tests` | Enables slow stress tests for concurrency testing. | `cargo nextest run --features stress-tests` |
 | `compare` | Enables the `compare` subcommand for BAM and metrics developer tools. | `cargo build --features compare` |
 | `simulate` | Enables the `simulate` command for generating synthetic test data. | `cargo build --features simulate` |
 

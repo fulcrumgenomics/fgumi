@@ -14,7 +14,6 @@ use crate::logging::OperationTimer;
 use crate::metrics::clip::{ClipCounts, ClippingMetricsCollection};
 use crate::metrics::writer::write_metrics as write_metrics_tsv;
 use crate::per_thread_accumulator::PerThreadAccumulator;
-use crate::progress::ProgressTracker;
 use crate::reference::ReferenceReader;
 use crate::sam::SamTag;
 use crate::template::{TemplateBatch, TemplateIterator};
@@ -25,18 +24,39 @@ use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
 use fgumi_raw_bam::RawRecord;
-use log::info;
 use noodles::sam::Header;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::info;
 
 use super::command::Command;
 use super::common::{
     BamIoOptions, CompressionOptions, QueueMemoryOptions, SchedulerOptions, ThreadingOptions,
     build_pipeline_config, parse_bool,
 };
+
+const CLIP_EXAMPLES: &str = r"EXAMPLES:
+    # Hard-clip overlapping FR read pairs using hard clipping
+    fgumi clip -i consensus.bam -o clipped.bam \
+        --ref ref.fa \
+        --clip-overlapping-reads \
+        --clipping-mode hard
+
+    # Clip a fixed 3bp from the 5' end of R1 and R2
+    fgumi clip -i consensus.bam -o clipped.bam \
+        --ref ref.fa \
+        --read-one-five-prime 3 \
+        --read-two-five-prime 3
+
+    # Soft-with-mask clipping of overlaps, output queryname-sorted
+    fgumi clip -i consensus.bam -o clipped.bam \
+        --ref ref.fa \
+        --clip-overlapping-reads \
+        --clipping-mode soft-with-mask \
+        --sort-order queryname
+";
 
 /// Clips reads in a BAM file to remove overlaps
 #[derive(Parser, Debug)]
@@ -73,7 +93,8 @@ Three clipping modes are supported:
 The --upgrade-clipping parameter will convert all existing clipping in the input to the given more stringent mode:
 from `soft` to either `soft-with-mask` or `hard`, and `soft-with-mask` to `hard`. In all other cases, clipping remains
 the same prior to applying any other clipping criteria.
-"#
+"#,
+    after_help = CLIP_EXAMPLES,
 )]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Clip {
@@ -201,6 +222,10 @@ impl Command for Clip {
         }
         validate_file_exists(&self.reference, "Reference FASTA")?;
 
+        let _progress_guard = crate::progress::init(crate::progress::Mode::Auto);
+        crate::progress::pipeline_started("clip", None);
+        crate::progress::stage_started("clip", None);
+
         info!("Clip");
         info!("  Input: {}", self.io.input.display());
         info!("  Output: {}", self.io.output.display());
@@ -264,6 +289,8 @@ impl Command for Clip {
         };
 
         timer.log_completion(total_records);
+        crate::progress::stage_finished("clip");
+        crate::progress::pipeline_finished(true);
         Ok(())
     }
 }
@@ -311,7 +338,6 @@ impl Clip {
         let mut total_records: usize = 0;
         let mut total_clipped_overlap: u64 = 0;
         let mut total_clipped_mate_extension: u64 = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         // Single-threaded processing: iterate raw templates, clip in place
         let template_iter = TemplateIterator::new(reader);
@@ -358,10 +384,11 @@ impl Clip {
             for record in &records {
                 writer.write_raw_record(record.as_ref())?;
             }
-            progress.log_if_needed(batch_size as u64);
+            crate::progress::records_out("clip", batch_size as u64);
         }
 
-        progress.log_final();
+        crate::progress::records_read(total_records as u64);
+        crate::progress::records_written(total_records as u64);
         info!("Total records processed: {total_records}");
         info!("Templates with overlap clipping: {total_clipped_overlap}");
         info!("Templates with mate extension clipping: {total_clipped_mate_extension}");

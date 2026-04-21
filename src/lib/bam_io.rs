@@ -177,8 +177,13 @@ fn make_bgzf_writer(
 /// `noodles::bam::io::Writer::write_header` because the noodles encoder
 /// produces subtly different output that causes read-back failures with
 /// some writer backends (e.g. `MultithreadedWriter`).
+///
+/// # Errors
+///
+/// Returns an error if writing to `writer` fails or if the SAM header
+/// cannot be serialized.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-pub(crate) fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
+pub fn write_bam_header(writer: &mut impl Write, header: &Header) -> io::Result<()> {
     // BAM magic
     writer.write_all(fgumi_raw_bam::BAM_MAGIC)?;
 
@@ -691,7 +696,7 @@ pub fn create_bam_reader_with_opts<P: AsRef<Path>>(
 
     crate::os_hints::advise_sequential(&file);
     let reader: Box<dyn Read + Send> = if opts.async_reader {
-        log::info!(
+        tracing::info!(
             "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
             path_ref.display()
         );
@@ -756,7 +761,7 @@ pub fn create_raw_bam_reader_with_opts<P: AsRef<Path>>(
 
     crate::os_hints::advise_sequential(&file);
     let reader: Box<dyn Read + Send> = if opts.async_reader {
-        log::info!(
+        tracing::info!(
             "async raw BAM reader enabled: spawning fgumi-prefetch thread for {}",
             path_ref.display()
         );
@@ -858,7 +863,7 @@ pub fn create_raw_bam_reader_pool_integrated<P: AsRef<Path>>(
 
         let reader: Box<dyn io::Read + Send> = if async_reader {
             crate::os_hints::advise_sequential(&file);
-            log::info!(
+            tracing::info!(
                 "async sort reader enabled: spawning fgumi-prefetch thread for {}",
                 path_ref.display()
             );
@@ -1209,7 +1214,7 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
         let chained = ChainedReader::new(buffered_bytes, stdin);
 
         if opts.async_reader {
-            log::info!("async BAM reader enabled: spawning fgumi-prefetch thread for stdin");
+            tracing::info!("async BAM reader enabled: spawning fgumi-prefetch thread for stdin");
             let prefetch = crate::prefetch_reader::PrefetchReader::new(chained);
             Ok((Box::new(prefetch), header))
         } else {
@@ -1236,7 +1241,7 @@ pub fn create_bam_reader_for_pipeline_with_opts<P: AsRef<Path>>(
             .with_context(|| format!("Failed to seek in file: {}", path_ref.display()))?;
 
         if opts.async_reader {
-            log::info!(
+            tracing::info!(
                 "async BAM reader enabled: spawning fgumi-prefetch thread for {}",
                 path_ref.display()
             );

@@ -44,12 +44,20 @@ pub struct PerThreadAccumulator<A> {
     slots: Vec<Mutex<A>>,
 }
 
-impl<A: Default + Send> PerThreadAccumulator<A> {
-    /// Allocates `num_slots` default-initialized slots. `num_slots` is clamped
-    /// to at least 1; callers typically pass the pipeline's worker count.
+impl<A: Send> PerThreadAccumulator<A> {
+    /// Allocates `num_slots` slots seeded by `init` (called once per slot).
+    /// `num_slots` is clamped to at least 1; callers typically pass the
+    /// pipeline's worker count.
+    ///
+    /// Use this when `A` has no natural `Default` (e.g. an enum whose variant
+    /// is only known at runtime). For types that do implement `Default`, use
+    /// [`Self::new`].
     #[must_use]
-    pub fn new(num_slots: usize) -> Arc<Self> {
-        let slots = (0..num_slots.max(1)).map(|_| Mutex::new(A::default())).collect();
+    pub fn with_init<F>(num_slots: usize, mut init: F) -> Arc<Self>
+    where
+        F: FnMut() -> A,
+    {
+        let slots = (0..num_slots.max(1)).map(|_| Mutex::new(init())).collect();
         Arc::new(Self { slots })
     }
 
@@ -75,6 +83,15 @@ impl<A: Default + Send> PerThreadAccumulator<A> {
     #[must_use]
     pub fn slots(&self) -> &[Mutex<A>] {
         &self.slots
+    }
+}
+
+impl<A: Default + Send> PerThreadAccumulator<A> {
+    /// Allocates `num_slots` default-initialized slots. `num_slots` is clamped
+    /// to at least 1; callers typically pass the pipeline's worker count.
+    #[must_use]
+    pub fn new(num_slots: usize) -> Arc<Self> {
+        Self::with_init(num_slots, A::default)
     }
 
     /// Consumes the accumulator and yields each slot's inner value.

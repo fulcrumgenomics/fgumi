@@ -6,12 +6,12 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::is_cpg_context;
-use log::info;
 use noodles::fasta;
 use rand::{Rng, RngExt};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use tracing::info;
 
 /// Common simulation options shared across all simulate subcommands.
 #[derive(Args, Debug, Clone)]

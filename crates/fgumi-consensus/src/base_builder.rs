@@ -106,7 +106,7 @@
 //! Consensus callers typically use `ConsensusBaseBuilder` as follows:
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::base_builder::ConsensusBaseBuilder;
+//! use fgumi_consensus::base_builder::ConsensusBaseBuilder;
 //!
 //! // Create builder with error rates
 //! let mut builder = ConsensusBaseBuilder::new(

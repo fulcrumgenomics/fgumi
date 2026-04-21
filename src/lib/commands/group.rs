@@ -38,12 +38,12 @@ use crate::sam::SamTag;
 use crate::unified_pipeline::MemoryEstimate;
 use crate::validation::validate_file_exists;
 use fgumi_raw_bam::{RawBamReader, RawRecord};
-use log::{info, warn};
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::header::record::value::map::header::sort_order::QUERY_NAME;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Estimate total heap size of a template slice using sampling for large batches.
 /// For small batches (<=10), computes exact total. For larger batches, samples the
@@ -492,10 +492,24 @@ fn assign_umi_groups_for_indices_impl(
     Ok(())
 }
 
+const GROUP_EXAMPLES: &str = r"EXAMPLES:
+    # Adjacency-based UMI grouping (recommended default)
+    fgumi group -i tc_sorted.bam -o grouped.bam --strategy adjacency --edits 1
+
+    # Paired UMIs (duplex): /A and /B suffixes on MI tag
+    fgumi group -i tc_sorted.bam -o grouped.bam --strategy paired --edits 1
+
+    # Emit grouping metrics alongside the output BAM
+    fgumi group -i tc_sorted.bam -o grouped.bam \
+        --strategy adjacency --edits 1 \
+        --metrics group_metrics
+";
+
 /// Groups reads by UMI to identify reads from the same original molecule
 #[derive(Debug, Parser)]
 #[command(
     about = "\x1b[38;5;151m[GROUP]\x1b[0m          \x1b[36mGroup reads by UMI to identify reads from the same original molecule\x1b[0m",
+    after_help = GROUP_EXAMPLES,
     long_about = r#"
 Groups reads together that appear to have come from the same original molecule. Reads
 are grouped by template, and then templates are sorted by the 5' mapping positions of
@@ -934,7 +948,7 @@ impl Command for GroupReadsByUmi {
         if !short_circuit.is_empty() {
             match short_circuit.as_str() {
                 "process" | "serialize" | "compress" => {
-                    log::warn!(
+                    tracing::warn!(
                         "SHORT-CIRCUIT mode: pipeline truncated at '{}' — OUTPUT WILL BE INVALID",
                         short_circuit
                     );
@@ -986,12 +1000,12 @@ impl Command for GroupReadsByUmi {
                     return Ok(ProcessedPositionGroup {
                         templates: Vec::new(),
                         family_sizes: AHashMap::new(),
-                        filter_metrics: FilterMetrics::new(),
+                        filter_metrics: FilterMetrics::default(),
                         input_record_count,
                         distinct_mi_count: 0,
                     });
                 }
-                let mut filter_metrics = FilterMetrics::new();
+                let mut filter_metrics = FilterMetrics::default();
 
                 // Track memory usage if debug mode is enabled (optimized for hot path)
                 #[cfg(feature = "memory-debug")]
@@ -1006,7 +1020,7 @@ impl Command for GroupReadsByUmi {
 
                         if record_count > 200 {
                             let group_size_gb = size as f64 / 1e9;
-                            log::debug!("Processing large position group: {:.2}GB ({} records) on thread {}",
+                            tracing::debug!("Processing large position group: {:.2}GB ({} records) on thread {}",
                                        group_size_gb, record_count, thread_id);
                         }
                     }
@@ -1044,7 +1058,7 @@ impl Command for GroupReadsByUmi {
                         if filtered_templates.len() > 50 {
                             let estimated_total_mb = estimated_size as f64 / 1e6;
                             if estimated_total_mb > 10.0 {
-                                log::debug!("Filtered templates: ~{:.1}MB ({} templates) on thread {}",
+                                tracing::debug!("Filtered templates: ~{:.1}MB ({} templates) on thread {}",
                                            estimated_total_mb, filtered_templates.len(), thread_id);
                             }
                         }
@@ -1101,7 +1115,7 @@ impl Command for GroupReadsByUmi {
                     filter_config.min_umi_length,
                     no_umi,
                 ) {
-                    log::warn!("UMI assignment failed, returning empty group: {e}");
+                    tracing::warn!("UMI assignment failed, returning empty group: {e}");
                     #[cfg(feature = "memory-debug")]
                     if debug_memory_flag {
                         if let Some(stats) = stats_for_tracking.as_ref() {
@@ -1299,7 +1313,7 @@ impl Command for GroupReadsByUmi {
         // requiring unique ownership.
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_metrics = FilterMetrics::default();
 
         for slot in accumulators.slots() {
             let acc = slot.lock();
@@ -1328,6 +1342,24 @@ impl Command for GroupReadsByUmi {
 }
 
 impl GroupReadsByUmi {
+    /// Build a public [`crate::grouper::GroupFilterConfig`] from the CLI
+    /// options — for comparison against `fgumi runall` defaults.
+    ///
+    /// Exposed (pub) so the `test_defaults_parity` integration test can verify
+    /// that the standalone `fgumi group` defaults remain in sync with the
+    /// runall engine's `build_group_filter_config`.
+    #[must_use]
+    pub fn build_group_filter_config(&self) -> crate::grouper::GroupFilterConfig {
+        crate::grouper::GroupFilterConfig {
+            umi_tag: *crate::sam::SamTag::RX,
+            min_mapq: self.min_map_q.unwrap_or(1),
+            include_non_pf: self.include_non_pf_reads,
+            min_umi_length: self.min_umi_length,
+            no_umi: self.no_umi,
+            allow_unmapped: self.allow_unmapped,
+        }
+    }
+
     /// Execute in single-threaded mode for `--threads 1`.
     ///
     /// This provides a simpler, streaming implementation that avoids pipeline overhead
@@ -1369,7 +1401,7 @@ impl GroupReadsByUmi {
         let mut grouper = RecordPositionGrouper::new();
 
         // Metrics accumulators (no lock-free queue needed in single-threaded mode)
-        let mut total_filter_metrics = FilterMetrics::new();
+        let mut total_filter_metrics = FilterMetrics::default();
         let mut family_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut position_group_size_counter: AHashMap<usize, u64> = AHashMap::with_capacity(50);
         let mut next_mi_base: u64 = 0;
@@ -1476,7 +1508,7 @@ impl GroupReadsByUmi {
         // Build templates from raw records
         let all_templates = build_templates_from_records(group.records)?;
 
-        let mut filter_metrics = FilterMetrics::new();
+        let mut filter_metrics = FilterMetrics::default();
 
         // Filter templates
         let filtered_templates: Vec<Template> = all_templates
@@ -1517,7 +1549,7 @@ impl GroupReadsByUmi {
             filter_config.no_umi,
         ) {
             // Log error but continue processing
-            log::warn!("Failed to assign UMI groups: {e}");
+            tracing::warn!("Failed to assign UMI groups: {e}");
             return Ok(());
         }
 
@@ -5243,7 +5275,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.accepted_templates, 1);
     }
@@ -5268,7 +5300,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -5294,7 +5326,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_non_pf, 1);
     }
@@ -5319,7 +5351,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_ns_in_umi, 1);
     }
@@ -5344,7 +5376,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_umi_too_short, 1);
     }
@@ -5368,7 +5400,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert!(!filter_template_raw(&template, &config, &mut metrics));
         assert_eq!(metrics.discarded_poor_alignment, 1);
     }
@@ -5417,7 +5449,7 @@ mod tests {
             no_umi: false,
             allow_unmapped: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         // Supplementary-only template has no primary R1/R2 → raw_r1() returns None
         assert!(!filter_template_raw(&template, &config, &mut metrics));
     }
@@ -5517,7 +5549,7 @@ mod tests {
             allow_unmapped: true,
         };
 
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let should_keep = filter_template_raw(&template, &config, &mut metrics);
 
         assert!(should_keep, "Unmapped template should be kept when allow_unmapped=true");
@@ -5541,7 +5573,7 @@ mod tests {
             allow_unmapped: false,
         };
 
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let should_keep = filter_template_raw(&template, &config, &mut metrics);
 
         assert!(!should_keep, "Unmapped template should be rejected when allow_unmapped=false");

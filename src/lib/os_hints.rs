@@ -77,13 +77,13 @@ mod linux {
         // future contents). Errors are non-fatal — log and move on.
         let fd = file.as_raw_fd();
         if let Err(e) = posix_fadvise(fd, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
-            log::debug!("posix_fadvise(POSIX_FADV_SEQUENTIAL) failed on fd {fd}: {e}");
+            tracing::debug!("posix_fadvise(POSIX_FADV_SEQUENTIAL) failed on fd {fd}: {e}");
         }
     }
 
     pub(super) fn advise_willneed_raw(fd: i32, offset: i64, len: i64) {
         if let Err(e) = posix_fadvise(fd, offset, len, PosixFadviseAdvice::POSIX_FADV_WILLNEED) {
-            log::debug!("posix_fadvise(POSIX_FADV_WILLNEED) failed on fd {fd}: {e}");
+            tracing::debug!("posix_fadvise(POSIX_FADV_WILLNEED) failed on fd {fd}: {e}");
         }
     }
 }

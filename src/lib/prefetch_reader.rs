@@ -370,7 +370,7 @@ impl Drop for PrefetchReader {
         self.current = None;
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
-                log::debug!("fgumi-prefetch producer thread panicked during shutdown");
+                tracing::debug!("fgumi-prefetch producer thread panicked during shutdown");
             }
         }
     }

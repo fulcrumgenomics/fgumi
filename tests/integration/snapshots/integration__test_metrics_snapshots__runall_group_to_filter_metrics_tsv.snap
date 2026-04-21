@@ -1,0 +1,9 @@
+---
+source: tests/integration/test_metrics_snapshots.rs
+assertion_line: 38
+expression: filtered
+---
+stage	records_in	records_out
+GroupAssign	1	1
+Consensus	1	1
+Filter	1	1

@@ -14,9 +14,9 @@
 //! # Overhead
 //!
 //! All sampling and formatting is gated on
-//! `log::log_enabled!(target: "fgumi_lib::sort::memory_probe", Info)`, so when
-//! probe logging is off the hooks are a single atomic load. Enable with
-//! `RUST_LOG=fgumi_lib::sort::memory_probe=info` (or at the crate level).
+//! `tracing::enabled!(target: "fgumi_lib::sort::memory_probe", Level::INFO)`,
+//! so when probe logging is off the hooks are a single atomic load. Enable
+//! with `RUST_LOG=fgumi_lib::sort::memory_probe=info` (or at the crate level).
 //!
 //! # Usage
 //!
@@ -39,7 +39,7 @@
 //! ```
 
 use bytesize::ByteSize;
-use log::{Level, info, log_enabled};
+use tracing::{Level, info};
 
 #[cfg(feature = "memory-debug")]
 pub use platform_ffi::print_mi_stats;
@@ -150,7 +150,7 @@ mod platform_ffi {
 #[must_use]
 #[inline]
 pub fn enabled() -> bool {
-    log_enabled!(target: TARGET, Level::Info)
+    tracing::enabled!(target: TARGET, Level::INFO)
 }
 
 /// Format a byte count as a human-readable value using the `bytesize` crate.
@@ -198,7 +198,7 @@ fn collect_rss_snapshot() -> RssSnapshot {
 /// we care about — when it grows monotonically across spill cycles, untracked
 /// allocations are piling up.
 ///
-/// When probe logging is off this is a single atomic load via `log_enabled!`;
+/// When probe logging is off this is a single atomic load via `tracing::enabled!`;
 /// no RSS sampling, no formatting, no allocation.
 pub fn log_snapshot(label: &str, tracked_bytes: u64) {
     if !enabled() {
@@ -407,7 +407,7 @@ impl SpillProbe {
 ///
 /// Encapsulates a periodic sampler that logs a snapshot every
 /// `SAMPLE_INTERVAL_RECORDS` merged records during phase 2. Like `SpillProbe`,
-/// the hot path is gated on `log_enabled!` so probes off = single atomic load.
+/// the hot path is gated on `tracing::enabled!` so probes off = single atomic load.
 ///
 /// Each sample is labelled `phase2.mid_N` where N is the sample index (0..).
 /// Optional consumer-side byte accounting sampled at mid-merge boundaries.
@@ -546,8 +546,8 @@ mod tests {
 
     #[test]
     fn test_log_snapshot_does_not_panic_without_logger() {
-        // With no logger configured, log_enabled! returns false and the
-        // entire function should short-circuit cleanly.
+        // With no subscriber configured, tracing::enabled! returns false and
+        // the entire function should short-circuit cleanly.
         log_snapshot("test.label", 1024);
         log_snapshot("test.label", 0);
     }

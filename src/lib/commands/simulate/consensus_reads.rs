@@ -17,7 +17,6 @@ use fgumi_consensus::methylation::{
     MethylationAnnotation, MethylationEvidence, build_mm_ml_tags, is_cpg_context,
 };
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
-use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, LogNormal, Normal};
@@ -27,6 +26,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use tracing::info;
 
 /// Generate mapped BAM with consensus tags for `fgumi filter`.
 #[derive(Parser, Debug)]

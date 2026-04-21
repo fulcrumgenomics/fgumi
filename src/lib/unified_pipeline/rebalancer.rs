@@ -199,11 +199,11 @@ impl DynamicRebalancer {
 
     /// Log current state (for debugging/monitoring).
     pub fn log_state(&self, stats: &[QueueStats]) {
-        log::debug!("Queue memory rebalance:");
+        tracing::debug!("Queue memory rebalance:");
         for (i, name) in self.queue_names.iter().enumerate() {
             let alloc = self.current_allocations[i];
             let stat = &stats[i];
-            log::debug!(
+            tracing::debug!(
                 "  {}: {}/{} MB (peak: {} MB, blocked: {}ms)",
                 name,
                 stat.peak_bytes / (1024 * 1024),

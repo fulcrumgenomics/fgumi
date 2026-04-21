@@ -96,8 +96,8 @@ pub use record_utils::{
 pub use template_coordinate::{TC_TAG, TemplateCoordinateInfo};
 
 use bstr::ByteSlice;
-use log::warn;
 use noodles::sam::Header;
+use tracing::warn;
 
 use noodles::sam::alignment::record_buf::data::field::Value as BufValue;
 use noodles::sam::header::record::value::map::header::sort_order::{QUERY_NAME, UNSORTED};

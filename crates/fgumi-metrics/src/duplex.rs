@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::inline_collector::MetricsCollector;
 use crate::shared::{UmiCountTracker, UmiMetric};
+use crate::template_info::TemplateMetadata;
 use crate::{Metric, frac};
 
 /// Metrics quantifying the distribution of different kinds of read family sizes.
@@ -260,6 +262,24 @@ impl DuplexMetricsCollector {
         }
     }
 
+    /// Merge another collector into this one by summing all histogram counts and UMI observations.
+    pub fn merge(&mut self, other: Self) {
+        for (size, count) in other.cs_family_sizes {
+            *self.cs_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ss_family_sizes {
+            *self.ss_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (size, count) in other.ds_family_sizes {
+            *self.ds_family_sizes.entry(size).or_insert(0) += count;
+        }
+        for (key, count) in other.duplex_family_sizes {
+            *self.duplex_family_sizes.entry(key).or_insert(0) += count;
+        }
+        self.umi_counts.merge(other.umi_counts);
+        self.duplex_umi_counts.merge(other.duplex_umi_counts);
+    }
+
     /// Records a CS (Coordinate+Strand) family
     pub fn record_cs_family(&mut self, size: usize) {
         *self.cs_family_sizes.entry(size).or_insert(0) += 1;
@@ -471,6 +491,58 @@ impl DuplexMetricsCollector {
         // Sort by unique observations descending (matching Scala's sort order)
         metrics.sort_by(|a, b| b.unique_observations.cmp(&a.unique_observations));
         metrics
+    }
+}
+
+impl Default for DuplexMetricsCollector {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl MetricsCollector for DuplexMetricsCollector {
+    fn record_group(&mut self, templates: &[TemplateMetadata<'_>]) {
+        if templates.is_empty() {
+            return;
+        }
+
+        // CS family: entire coordinate group
+        self.record_cs_family(templates.len());
+
+        // SS families: group by full MI (including strand suffix)
+        let mut ss_counts: HashMap<&str, usize> = HashMap::new();
+        for m in templates {
+            *ss_counts.entry(m.template.mi.as_str()).or_insert(0) += 1;
+        }
+        for count in ss_counts.values() {
+            self.record_ss_family(*count);
+        }
+
+        // DS families: group by base_umi, count A and B strands
+        let mut ds_groups: HashMap<&str, (usize, usize)> = HashMap::new();
+        for m in templates {
+            let entry = ds_groups.entry(m.base_umi).or_insert((0, 0));
+            if m.is_a_strand {
+                entry.0 += 1;
+            }
+            if m.is_b_strand {
+                entry.1 += 1;
+            }
+        }
+        for (ab_count, ba_count) in ds_groups.values() {
+            let total = ab_count + ba_count;
+            self.record_ds_family(total);
+            self.record_duplex_family(*ab_count, *ba_count);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        // Delegate to the inherent merge method (inherent methods take priority)
+        self.merge(other);
+    }
+
+    fn write_metrics(&self, _prefix: &std::path::Path) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -758,5 +830,110 @@ mod tests {
         assert_eq!(DuplexYieldMetric::metric_name(), "duplex yield");
         assert_eq!(UmiMetric::metric_name(), "UMI");
         assert_eq!(DuplexUmiMetric::metric_name(), "duplex UMI");
+    }
+
+    #[test]
+    fn test_duplex_implements_metrics_collector() {
+        use crate::inline_collector::MetricsCollector;
+        use crate::template_info::{TemplateInfo, TemplateMetadata};
+
+        let mut collector = DuplexMetricsCollector::new(false);
+        let t1 = TemplateInfo {
+            mi: "1/A".to_string(),
+            rx: "AAAA".to_string(),
+            ref_name: Some("chr1".to_string()),
+            position: Some(100),
+            end_position: Some(200),
+            hash_fraction: 0.5,
+            read_info_key: crate::template_info::ReadInfoKey::default(),
+        };
+        let t2 = TemplateInfo {
+            mi: "1/B".to_string(),
+            rx: "AAAA".to_string(),
+            ref_name: Some("chr1".to_string()),
+            position: Some(100),
+            end_position: Some(200),
+            hash_fraction: 0.6,
+            read_info_key: crate::template_info::ReadInfoKey::default(),
+        };
+
+        let metadata: Vec<TemplateMetadata<'_>> = vec![
+            TemplateMetadata {
+                template: &t1,
+                base_umi: "1",
+                is_a_strand: true,
+                is_b_strand: false,
+            },
+            TemplateMetadata {
+                template: &t2,
+                base_umi: "1",
+                is_a_strand: false,
+                is_b_strand: true,
+            },
+        ];
+
+        collector.record_group(&metadata);
+
+        let metrics = collector.family_size_metrics();
+        // CS family: entire group = 2 templates
+        let cs2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        assert_eq!(cs2.cs_count, 1);
+        // SS families: MI "1/A" -> 1, MI "1/B" -> 1
+        let ss1 = metrics.iter().find(|m| m.family_size == 1).unwrap();
+        assert_eq!(ss1.ss_count, 2);
+
+        // DS family: base_umi "1" has 1 A-strand and 1 B-strand -> DS size 2
+        let ds2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        assert_eq!(ds2.ds_count, 1);
+
+        // Duplex family: ab=1, ba=1
+        let duplex = collector.duplex_family_size_metrics();
+        let d11 = duplex.iter().find(|m| m.ab_size == 1 && m.ba_size == 1).unwrap();
+        assert_eq!(d11.count, 1);
+    }
+
+    // =========================================================================
+    // DuplexMetricsCollector::merge tests
+    // =========================================================================
+
+    #[test]
+    fn test_duplex_metrics_collector_merge() {
+        let mut a = DuplexMetricsCollector::new(false);
+        a.record_cs_family(3);
+        a.record_ss_family(2);
+        a.record_ds_family(1);
+        a.record_duplex_family(2, 3);
+        a.record_umi("AAAA", 5, 1, true);
+
+        let mut b = DuplexMetricsCollector::new(false);
+        b.record_cs_family(3);
+        b.record_ss_family(4);
+        b.record_ds_family(1);
+        b.record_duplex_family(2, 3);
+        b.record_duplex_family(1, 1);
+        b.record_umi("AAAA", 3, 0, true);
+        b.record_umi("CCCC", 2, 0, true);
+
+        a.merge(b);
+
+        let metrics = a.family_size_metrics();
+        let cs3 = metrics.iter().find(|m| m.family_size == 3).unwrap();
+        assert_eq!(cs3.cs_count, 2);
+        let ss2 = metrics.iter().find(|m| m.family_size == 2).unwrap();
+        assert_eq!(ss2.ss_count, 1);
+        let ss4 = metrics.iter().find(|m| m.family_size == 4).unwrap();
+        assert_eq!(ss4.ss_count, 1);
+        let ds1 = metrics.iter().find(|m| m.family_size == 1).unwrap();
+        assert_eq!(ds1.ds_count, 2);
+
+        let duplex_metrics = a.duplex_family_size_metrics();
+        // record_duplex_family(2, 3) normalizes to (3, 2) since ab >= ba
+        let d32 = duplex_metrics.iter().find(|m| m.ab_size == 3 && m.ba_size == 2).unwrap();
+        assert_eq!(d32.count, 2);
+        let d11 = duplex_metrics.iter().find(|m| m.ab_size == 1 && m.ba_size == 1).unwrap();
+        assert_eq!(d11.count, 1);
+
+        let umi_metrics = a.umi_metrics();
+        assert_eq!(umi_metrics.len(), 2);
     }
 }

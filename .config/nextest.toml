@@ -1,2 +1,15 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Tests in the `heavy-parallel` group exercise real CPU parallelism (e.g.
+# the work-stealing pool's 1-worker-vs-8-worker speedup test). Running
+# them concurrently with other tests starves the workers and causes
+# timing-based assertions to flake. Pin the group to 1 test at a time.
+[test-groups]
+heavy-parallel = { max-threads = 1 }
+
+# Gate tests that measure CPU parallelism speedup: must not run
+# concurrently with other CPU-bound work.
+[[profile.default.overrides]]
+filter = "test(=pipeline_v2::test_work_stealing::test_e_throughput_scales_with_workers)"
+test-group = "heavy-parallel"

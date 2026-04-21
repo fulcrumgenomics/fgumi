@@ -66,21 +66,11 @@
 //!
 //! ### Progress Tracking
 //!
-//! ```no_run
-//! use fgumi_lib::progress::ProgressTracker;
-//!
-//! # fn main() -> anyhow::Result<()> {
-//! let tracker = ProgressTracker::new("Processing records")
-//!     .with_interval(100);
-//!
-//! for _i in 0..1000 {
-//!     // Process one record...
-//!     tracker.log_if_needed(1);  // Track incremental progress
-//! }
-//! tracker.log_final();  // Log final count if not exactly on interval
-//! # Ok(())
-//! # }
-//! ```
+//! Standalone commands and orchestrated pipelines emit progress events
+//! through [`progress`]. Callers initialize the tracker at the top of an
+//! invocation via [`progress::init`] and then emit counter events such as
+//! [`progress::records_out`] and [`progress::records_written`]. The renderer
+//! (dashboard on TTY, logfmt heartbeats otherwise) is selected automatically.
 //!
 //! ### UMI Assignment
 //!
@@ -126,6 +116,7 @@
 //! - [fgbio](https://github.com/fulcrumgenomics/fgbio) - Scala implementation
 //! - [noodles](https://github.com/zaeleus/noodles) - Rust bioinformatics I/O
 
+pub mod aligner;
 pub mod bam_io;
 pub mod batched_sam_reader;
 pub mod commands;
@@ -135,8 +126,11 @@ pub use fgumi_bgzf::writer as bgzf_writer;
 pub use fgumi_dna::bitenc;
 pub use fgumi_sam::clipper;
 pub mod consensus;
+pub mod correct;
 pub use fgumi_dna::dna;
+pub mod defaults;
 pub mod errors;
+pub mod extract;
 pub mod fastq;
 pub mod fastq_parse;
 pub mod grouper;
@@ -153,6 +147,7 @@ pub mod read_info;
 pub mod reference;
 pub use fgumi_metrics::rejection;
 pub mod reorder_buffer;
+pub mod runall;
 pub mod sam;
 pub mod sort;
 pub mod system;

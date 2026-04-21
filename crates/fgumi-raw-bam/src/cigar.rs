@@ -196,6 +196,16 @@ pub fn query_length_from_cigar(cigar_ops: &[u32]) -> usize {
 ///
 /// This is the primary entry point for raw-byte callers, replacing the pattern:
 /// `let cigar = get_cigar_ops(bam); unclipped_5prime_1based(pos, reverse, unmapped, &cigar)`
+///
+/// Return value semantics:
+/// - Unmapped record (FLAG & 0x4 != 0): returns `0`. Callers that need to
+///   distinguish unmapped from mapped-at-position-0 must check the flag
+///   themselves (see `shared_metrics::unclipped_five_prime_position`).
+/// - Mapped record with a well-formed CIGAR: returns the 1-based unclipped
+///   5' position.
+/// - Mapped record with a malformed CIGAR (`n_cigar_op` = 0 or the CIGAR
+///   region extends past the buffer): returns `i32::MAX` as a sentinel.
+///   Valid BAM never produces this, so `debug_assert!` traps it in tests.
 #[inline]
 #[must_use]
 pub fn unclipped_5prime_from_raw_bam(bam: &[u8]) -> i32 {
@@ -206,6 +216,7 @@ pub fn unclipped_5prime_from_raw_bam(bam: &[u8]) -> i32 {
     }
 
     let n_cigar_op = n_cigar_op(bam) as usize;
+    debug_assert!(n_cigar_op > 0, "mapped record with empty CIGAR is malformed BAM");
     if n_cigar_op == 0 {
         return i32::MAX;
     }
@@ -213,6 +224,11 @@ pub fn unclipped_5prime_from_raw_bam(bam: &[u8]) -> i32 {
     let l_read_name = l_read_name(bam) as usize;
     let cigar_start = 32 + l_read_name;
     let cigar_end = cigar_start + n_cigar_op * 4;
+    debug_assert!(
+        cigar_end <= bam.len(),
+        "CIGAR region ({cigar_end} bytes) exceeds record buffer ({} bytes) — malformed BAM",
+        bam.len()
+    );
     if cigar_end > bam.len() {
         return i32::MAX;
     }

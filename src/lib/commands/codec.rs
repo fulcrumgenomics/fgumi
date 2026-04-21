@@ -37,12 +37,12 @@ use fgumi_raw_bam::RawRecord;
 // RejectionTracker now used via ConsensusStatsOps trait in consensus_runner
 use crate::sam::{SamTag, header_as_unsorted};
 use crate::validation::validate_file_exists;
-use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use parking_lot::Mutex;
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
+use tracing::info;
 
 // ============================================================================
 // Types for 7-step pipeline processing
@@ -148,10 +148,28 @@ struct CollectedCodecMetrics {
 ///   -M 3 \
 ///   -d 10
 /// ```
+const CODEC_EXAMPLES: &str = r"EXAMPLES:
+    # Basic CODEC consensus with minimum 3 reads per strand and a 15bp duplex overlap
+    fgumi codec -i grouped.bam -o consensus.bam \
+        --min-reads 3 --min-duplex-length 15
+
+    # Reduce quality of outer bases (10bp) to 20, single-strand regions to 10
+    fgumi codec -i grouped.bam -o consensus.bam \
+        --min-reads 3 --min-duplex-length 15 \
+        --outer-bases-length 10 --outer-bases-qual 20 \
+        --single-strand-qual 10
+
+    # Emit rejected reads and stats TSV
+    fgumi codec -i grouped.bam -o consensus.bam \
+        --min-reads 3 --min-duplex-length 15 \
+        --rejects rejected.bam --stats codec.stats.tsv
+";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "codec",
     about = "\x1b[38;5;180m[CONSENSUS]\x1b[0m      \x1b[36mCall CODEC consensus reads from grouped BAM\x1b[0m",
+    after_help = CODEC_EXAMPLES,
     long_about = None
 )]
 pub struct Codec {
@@ -377,7 +395,7 @@ impl Command for Codec {
             let (umi, records) = result.context("Failed to read MI group")?;
 
             // Call consensus directly — records are already RawRecord values.
-            let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+            let result = caller.consensus_reads(records);
             match result {
                 Ok(output) => {
                     let batch_size = output.count;
@@ -607,7 +625,7 @@ impl Codec {
                     caller.clear();
 
                     // Call CODEC consensus directly — records are already RawRecord values.
-                    let result: anyhow::Result<ConsensusOutput> = caller.consensus_reads(records);
+                    let result = caller.consensus_reads(records);
                     match result {
                         Ok(batch_output) => {
                             all_output.merge(batch_output);

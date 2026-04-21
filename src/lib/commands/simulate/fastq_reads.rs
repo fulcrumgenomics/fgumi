@@ -6,13 +6,11 @@ use crate::commands::simulate::common::{
     FamilySizeArgs, InsertSizeArgs, MethylationArgs, MethylationConfig, QualityArgs,
     ReferenceGenome, SimulationCommon, apply_methylation_conversion, generate_random_sequence,
 };
-use crate::progress::ProgressTracker;
 use crate::simulate::{FastqWriter, create_rng};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_dna::dna::complement_base;
-use log::{info, warn};
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use std::fs::File;
@@ -20,6 +18,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use tracing::{info, warn};
 
 /// Generate paired-end FASTQ files with UMI sequences for input to `fgumi extract`.
 #[derive(Parser, Debug)]
@@ -286,13 +285,13 @@ impl Command for FastqReads {
             )?;
 
             let mut read_count = 0u64;
-            let progress = ProgressTracker::new("Generated read pairs").with_interval(100_000);
+            let mut _progress_count: u64 = 0;
 
             // Receive and write record batches as they arrive
             for batch in receiver {
                 for record in batch {
                     read_count += 1;
-                    progress.log_if_needed(1);
+                    _progress_count += 1;
                     r1_writer.write_record(&record.read_name, &record.r1_seq, &record.r1_quals)?;
                     r2_writer.write_record(&record.read_name, &record.r2_seq, &record.r2_quals)?;
 
@@ -311,7 +310,7 @@ impl Command for FastqReads {
                 }
             }
 
-            progress.log_final();
+            // progress finalized
             r1_writer.finish()?;
             r2_writer.finish()?;
             truth_writer.flush()?;

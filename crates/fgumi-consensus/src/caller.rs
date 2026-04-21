@@ -87,9 +87,9 @@
 //! To implement a custom consensus caller, implement the `ConsensusCaller` trait:
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
+//! use fgumi_consensus::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput};
+//! use fgumi_consensus::error::Result;
 //! use fgumi_raw_bam::RawRecord;
-//! use anyhow::Result;
 //!
 //! pub struct MyConsensusCaller {
 //!     stats: ConsensusCallingStats,
@@ -120,8 +120,8 @@
 //! ### Basic Consensus Calling
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::vanilla_consensus_caller::VanillaUmiConsensusCaller;
-//! use fgumi_lib::consensus::caller::ConsensusCaller;
+//! use fgumi_consensus::vanilla_caller::VanillaUmiConsensusCaller;
+//! use fgumi_consensus::caller::ConsensusCaller;
 //! use fgumi_raw_bam::RawRecord;
 //!
 //! // Create consensus caller
@@ -160,7 +160,7 @@
 //! - `duplex_caller`: Two-stage consensus for duplex sequencing
 //! - `base_builder`: Core likelihood-based consensus base calling logic
 
-use anyhow::Result;
+use crate::error::Result;
 use fgumi_raw_bam::RawRecord;
 use noodles::sam::Header;
 use std::collections::HashMap;
@@ -231,6 +231,22 @@ pub trait ConsensusCaller: Send + Sync {
 
     /// Logs statistics about consensus calling to the logger
     fn log_statistics(&self);
+
+    /// Reset all per-group transient state — statistics, rejects buffer, any
+    /// per-call RNG cursor — so a subsequent [`consensus_reads`] call behaves
+    /// as if starting from a freshly-constructed caller. Configuration and
+    /// reusable buffers (consensus builder, lookup tables, seeded RNG seed
+    /// value) are preserved.
+    ///
+    /// Callers must invoke this between consecutive MI groups when reusing a
+    /// single caller instance across multiple molecules — otherwise
+    /// group-N's RNG/stats state leaks into group-N+1 and consensus output
+    /// becomes input-order-dependent on previous groups. The standalone
+    /// `fgumi simplex` command calls this between every MI group; v2's
+    /// `ConsensusStage` does the same.
+    ///
+    /// [`consensus_reads`]: Self::consensus_reads
+    fn clear(&mut self);
 }
 
 /// Statistics tracked during consensus calling
@@ -295,15 +311,15 @@ impl Default for ConsensusCallingStats {
 ///
 /// This is a helper function to reduce duplication across consensus caller implementations.
 pub fn log_consensus_statistics(caller_name: &str, stats: &ConsensusCallingStats) {
-    log::info!("{caller_name} Consensus Calling Statistics:");
-    log::info!("  Total input reads: {}", stats.total_reads);
-    log::info!("  Consensus reads generated: {}", stats.consensus_reads);
-    log::info!("  Reads filtered: {}", stats.filtered_reads);
+    tracing::info!("{caller_name} Consensus Calling Statistics:");
+    tracing::info!("  Total input reads: {}", stats.total_reads);
+    tracing::info!("  Consensus reads generated: {}", stats.consensus_reads);
+    tracing::info!("  Reads filtered: {}", stats.filtered_reads);
 
     if !stats.rejection_reasons.is_empty() {
-        log::info!("  Rejection reasons:");
+        tracing::info!("  Rejection reasons:");
         for (reason, count) in &stats.rejection_reasons {
-            log::info!("    {reason:?}: {count}");
+            tracing::info!("    {reason:?}: {count}");
         }
     }
 }

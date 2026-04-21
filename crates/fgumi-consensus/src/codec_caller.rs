@@ -41,7 +41,7 @@
 //! ## Usage Example
 //!
 //! ```rust,ignore
-//! use fgumi_lib::consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
+//! use fgumi_consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
 //!
 //! let options = CodecConsensusOptions {
 //!     min_reads_per_strand: 1,
@@ -76,13 +76,13 @@ use crate::caller::{
     ConsensusCaller, ConsensusCallingStats, ConsensusOutput,
     RejectionReason as CallerRejectionReason,
 };
+use crate::error::{Error, Result};
 use crate::phred::{MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore};
 use crate::simple_umi::consensus_umis;
 use crate::vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
-use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::{
     self as bam_fields, RawRecord, RawRecordView, SamTag, UnmappedSamBuilder, flags,
@@ -361,7 +361,7 @@ impl CodecConsensusCaller {
     /// Creates a new CODEC consensus caller with optional rejected-reads tracking.
     ///
     /// When `track_rejects` is `true`, raw BAM bytes of rejected reads are stored
-    /// and can be retrieved via [`rejected_reads`] / [`take_rejected_reads`].
+    /// and can be retrieved via [`Self::rejected_reads`] / [`Self::take_rejected_reads`].
     #[must_use]
     pub fn new_with_rejects_tracking(
         read_name_prefix: String,
@@ -1026,6 +1026,11 @@ impl CodecConsensusCaller {
     ///
     /// Single-strand positions (where only one strand has data) preserve their
     /// original qualities from the single-strand consensus, matching fgbio's behavior.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear per-position consensus loop; extracting sub-fns would obscure the \
+                  agreement-vs-disagreement branching and the early-exit disagreement checks"
+    )]
     fn build_duplex_consensus_from_padded(
         &mut self,
         ss_a: &SingleStrandConsensus,
@@ -1158,10 +1163,14 @@ impl CodecConsensusCaller {
             self.stats.duplex_disagreement_base_count += duplex_disagreements as u64;
 
             if duplex_disagreements > self.options.max_duplex_disagreements {
-                anyhow::bail!("High duplex disagreement: {duplex_disagreements} disagreements");
+                return Err(Error::DuplexDisagreement(format!(
+                    "High duplex disagreement: {duplex_disagreements} disagreements"
+                )));
             }
             if duplex_error_rate > self.options.max_duplex_disagreement_rate {
-                anyhow::bail!("High duplex disagreement rate: {duplex_error_rate:.4}");
+                return Err(Error::DuplexDisagreement(format!(
+                    "High duplex disagreement rate: {duplex_error_rate:.4}"
+                )));
             }
         }
 
@@ -1427,19 +1436,26 @@ impl ConsensusCaller for CodecConsensusCaller {
 
     fn log_statistics(&self) {
         let stats = &self.stats;
-        log::info!("CODEC Consensus Calling Statistics:");
-        log::info!("  Total input reads: {}", stats.total_input_reads);
-        log::info!("  Consensus reads generated: {}", stats.consensus_reads_generated);
-        log::info!("  Reads filtered: {}", stats.reads_filtered);
-        log::info!("  Consensus bases emitted: {}", stats.consensus_bases_emitted);
-        log::info!("  Duplex bases emitted: {}", stats.consensus_duplex_bases_emitted);
-        log::info!("  Duplex disagreement rate: {:.4}%", stats.duplex_disagreement_rate() * 100.0);
+        tracing::info!("CODEC Consensus Calling Statistics:");
+        tracing::info!("  Total input reads: {}", stats.total_input_reads);
+        tracing::info!("  Consensus reads generated: {}", stats.consensus_reads_generated);
+        tracing::info!("  Reads filtered: {}", stats.reads_filtered);
+        tracing::info!("  Consensus bases emitted: {}", stats.consensus_bases_emitted);
+        tracing::info!("  Duplex bases emitted: {}", stats.consensus_duplex_bases_emitted);
+        tracing::info!(
+            "  Duplex disagreement rate: {:.4}%",
+            stats.duplex_disagreement_rate() * 100.0
+        );
         if !stats.rejection_reasons.is_empty() {
-            log::info!("  Rejection reasons:");
+            tracing::info!("  Rejection reasons:");
             for (reason, count) in &stats.rejection_reasons {
-                log::info!("    {reason:?}: {count}");
+                tracing::info!("    {reason:?}: {count}");
             }
         }
+    }
+
+    fn clear(&mut self) {
+        Self::clear(self);
     }
 }
 

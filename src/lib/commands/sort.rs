@@ -29,8 +29,8 @@ use anyhow::{Result, bail};
 use bytesize::ByteSize;
 use clap::Parser;
 
-use log::info;
 use std::path::PathBuf;
+use tracing::info;
 
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, detect_total_memory, parse_bool};
@@ -108,6 +108,26 @@ impl From<SortOrderArg> for SortOrder {
 ///
 /// Sorts BAM files using high-performance external merge-sort, supporting
 /// multiple sort orders required by the fgumi pipeline.
+const SORT_EXAMPLES: &str = r"EXAMPLES:
+    # Sort for fgumi group input
+    fgumi sort -i aligned.bam -o sorted.bam --order template-coordinate
+
+    # Sort by coordinate for IGV
+    fgumi sort -i input.bam -o sorted.bam --order coordinate
+
+    # Sort by queryname for zipper
+    fgumi sort -i input.bam -o sorted.bam --order queryname
+
+    # Multi-threaded sort (default 768M per thread)
+    fgumi sort -i input.bam -o sorted.bam --order template-coordinate --threads 8
+
+    # Override the per-thread memory limit
+    fgumi sort -i input.bam -o sorted.bam -m 2GiB --threads 8
+
+    # Verify a BAM file is correctly sorted
+    fgumi sort -i sorted.bam --verify --order template-coordinate
+";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sort",
@@ -139,39 +159,8 @@ PERFORMANCE:
   - Configurable temp file compression (--temp-compression)
   - Default 768M per-thread memory limit (samtools-compatible); pass
     `--max-memory auto` to detect system memory (opt-in)
-
-EXAMPLES:
-
-  # Sort for fgumi group input
-  fgumi sort -i aligned.bam -o sorted.bam --order template-coordinate
-
-  # Sort by coordinate for IGV
-  fgumi sort -i input.bam -o sorted.bam --order coordinate
-
-  # Sort by queryname for zipper
-  fgumi sort -i input.bam -o sorted.bam --order queryname
-
-  # Multi-threaded sort (default 768M per thread)
-  fgumi sort -i input.bam -o sorted.bam --order template-coordinate --threads 8
-
-  # Override the per-thread memory limit
-  fgumi sort -i input.bam -o sorted.bam -m 2GiB --threads 8
-
-  # Opt in to auto-detected system memory (subtracts --memory-reserve)
-  fgumi sort -i input.bam -o sorted.bam -m auto --threads 8
-
-  # Reserve extra memory for bwa mem running in a pipeline
-  fgumi sort -i input.bam -o sorted.bam --memory-reserve 12GiB --threads 4
-
-  # Verify a BAM file is correctly sorted
-  fgumi sort -i sorted.bam --verify --order template-coordinate
-
-  # Spread spill chunks across multiple temp dirs (round-robin, free-space aware)
-  fgumi sort -i in.bam -o out.bam -T /mnt/ssd1 -T /mnt/ssd2
-
-  # Same via FGUMI_TMP_DIRS env var (PATH-style list)
-  FGUMI_TMP_DIRS=/mnt/ssd1:/mnt/ssd2 fgumi sort -i in.bam -o out.bam
-"#
+"#,
+    after_help = SORT_EXAMPLES,
 )]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Sort {
@@ -209,7 +198,7 @@ pub struct Sort {
     /// enabled (default).
     ///
     /// When the limit is reached, sorted chunks spill to temporary files.
-    #[arg(short = 'm', long = "max-memory", default_value = "768M", value_parser = parse_memory)]
+    #[arg(short = 'm', long = "max-memory", default_value = crate::defaults::SORT_MEMORY_LIMIT_DISPLAY, value_parser = parse_memory)]
     pub max_memory: MemoryLimit,
 
     /// Memory to reserve for other processes when --max-memory=auto.
@@ -261,7 +250,7 @@ pub struct Sort {
     /// Level 0 disables compression (fastest, uses most disk space).
     /// Level 1 (default) provides fast compression with reasonable space savings.
     /// Higher levels (up to 9) provide better compression but are slower.
-    #[arg(long = "temp-compression", default_value = "1", value_parser = clap::value_parser!(u32).range(0..=9))]
+    #[arg(long = "temp-compression", default_value_t = crate::defaults::SORT_TEMP_COMPRESSION, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub temp_compression: u32,
 
     /// Write BAM index (.bai) alongside output.
@@ -497,7 +486,7 @@ fn resolve_memory_limit(
                     .checked_mul(threads)
                     .ok_or_else(|| anyhow::anyhow!("auto memory budget overflowed"))?;
                 if budget > available {
-                    log::warn!(
+                    tracing::warn!(
                         "Auto memory: total budget {} exceeds available {} \
                          ({}/thread x {} threads, reserve {}); may spill to disk earlier than expected",
                         ByteSize(budget as u64),
@@ -531,7 +520,7 @@ fn resolve_memory_limit(
 
     // Post-resolution sanity check: warn if budget exceeds the effective memory limit.
     if total_budget > total {
-        log::warn!(
+        tracing::warn!(
             "Memory budget {} exceeds total system memory {}; spill-to-disk is likely",
             ByteSize(total_budget as u64),
             ByteSize(total as u64),

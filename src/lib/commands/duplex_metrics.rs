@@ -15,9 +15,9 @@ use crate::validation::validate_file_exists;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fgoxide::io::DelimFile;
-use log::info;
 use statrs::distribution::{Binomial, DiscreteCDF};
 use std::path::PathBuf;
+use tracing::info;
 
 use super::command::Command;
 use super::shared_metrics::{
@@ -28,6 +28,21 @@ use super::shared_metrics::{
 
 /// Embedded R script for PDF plot generation (bundled with binary)
 const R_SCRIPT: &str = include_str!("../../../resources/CollectDuplexSeqMetrics.R");
+
+const DUPLEX_METRICS_EXAMPLES: &str = r"EXAMPLES:
+    # Collect duplex metrics from a grouped BAM
+    fgumi duplex-metrics -i grouped.bam -o duplex_qc
+
+    # Restrict analysis to target intervals and require 3+3 reads per strand
+    fgumi duplex-metrics -i grouped.bam -o duplex_qc \
+        --intervals targets.bed \
+        --min-ab-reads 3 --min-ba-reads 3
+
+    # Collect duplex-UMI counts with a sample label for PDF plots
+    fgumi duplex-metrics -i grouped.bam -o duplex_qc \
+        --duplex-umi-counts \
+        --description 'Sample SAMPLE1'
+";
 
 /// Collects comprehensive QC metrics for duplex sequencing experiments
 #[derive(Parser, Debug)]
@@ -81,7 +96,8 @@ Within the metrics files the prefixes `CS`, `SS` and `DS` are used to mean:
           ie. 50/A and 50/B are considered different tag families
 * **DS**: double-stranded tag families where membership is collapsed across single-stranded tag families
           from the same double-stranded source molecule; i.e. 50/A and 50/B become one family
-"#
+"#,
+    after_help = DUPLEX_METRICS_EXAMPLES,
 )]
 pub struct DuplexMetrics {
     /// Input BAM file (UMI-grouped, from `group`)
@@ -262,19 +278,19 @@ impl Command for DuplexMetrics {
             ) {
                 Ok(()) => info!("Generated PDF plots: {pdf_path}"),
                 Err(e) => {
-                    log::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");
-                    log::warn!(
+                    tracing::warn!("Failed to generate PDF plots: {e}. Continuing without plots.");
+                    tracing::warn!(
                         "To enable PDF generation, ensure R is installed with ggplot2 and scales packages:"
                     );
-                    log::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
+                    tracing::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
                 }
             }
         } else {
-            log::warn!(
+            tracing::warn!(
                 "R or required packages (ggplot2, scales) not available. Skipping PDF generation."
             );
-            log::warn!("To enable PDF generation, install R and required packages:");
-            log::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
+            tracing::warn!("To enable PDF generation, install R and required packages:");
+            tracing::warn!("  install.packages(c(\"ggplot2\", \"scales\"))");
         }
 
         info!("Done!");
@@ -1762,17 +1778,33 @@ mod tests {
             position: Some(1000),
             end_position: Some(1100),
             hash_fraction: 0.5,
+            read_info_key: fgumi_metrics::ReadInfoKey::default(),
         };
 
-        assert!(overlaps_intervals(&template, &[]));
+        assert!(overlaps_intervals(
+            template.ref_name.as_deref(),
+            template.position,
+            template.end_position,
+            &[],
+        ));
 
         // Test with matching interval
         let intervals = vec![Interval { ref_name: "chr1".to_string(), start: 900, end: 1050 }];
-        assert!(overlaps_intervals(&template, &intervals));
+        assert!(overlaps_intervals(
+            template.ref_name.as_deref(),
+            template.position,
+            template.end_position,
+            &intervals,
+        ));
 
         // Test with non-matching interval
         let intervals = vec![Interval { ref_name: "chr1".to_string(), start: 2000, end: 3000 }];
-        assert!(!overlaps_intervals(&template, &intervals));
+        assert!(!overlaps_intervals(
+            template.ref_name.as_deref(),
+            template.position,
+            template.end_position,
+            &intervals,
+        ));
 
         // Test unmapped template
         let unmapped = TemplateInfo {
@@ -1782,8 +1814,14 @@ mod tests {
             position: None,
             end_position: None,
             hash_fraction: 0.5,
+            read_info_key: fgumi_metrics::ReadInfoKey::default(),
         };
-        assert!(!overlaps_intervals(&unmapped, &intervals));
+        assert!(!overlaps_intervals(
+            unmapped.ref_name.as_deref(),
+            unmapped.position,
+            unmapped.end_position,
+            &intervals,
+        ));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! and helpers for parsing one or more records out of a byte buffer. Used by
 //! the `extract` command's BGZF/gzip FASTQ ingestion path.
 
-use std::io;
+use std::io::{self, BufRead};
 
 use crate::unified_pipeline::MemoryEstimate;
 
@@ -138,6 +138,82 @@ impl MemoryEstimate for FastqRecord {
     fn estimate_heap_size(&self) -> usize {
         self.data.capacity()
     }
+}
+
+/// Read up to `n` complete FASTQ records from a buffered reader and return
+/// them as a single contiguous byte buffer.
+///
+/// Uses `BufRead::read_until` for line-by-line reading. Each FASTQ record is
+/// four lines (`@name\n`, `seq\n`, `+\n`, `qual\n`).
+///
+/// Returns `(data, offsets, at_eof)` where:
+/// - `data`: concatenated bytes of all complete records
+/// - `offsets`: byte offset of each record boundary, including a leading `0`
+///   and a trailing `data.len()`, so `offsets.windows(2)` yields (start, end)
+///   pairs for each record. `offsets.len() == record_count + 1`.
+/// - `at_eof`: true if the reader reached EOF. May be true with fewer than
+///   `n` records returned.
+///
+/// # Errors
+///
+/// Returns an error if the underlying reader fails, a record is truncated
+/// mid-way, or line 1 of a record does not start with `@`.
+pub fn read_n_fastq_records<R: BufRead>(
+    reader: &mut R,
+    n: usize,
+) -> io::Result<(Vec<u8>, Vec<usize>, bool)> {
+    // ~300 bytes per record is typical for short-read FASTQ.
+    let mut data = Vec::with_capacity(n * 300);
+    let mut offsets = Vec::with_capacity(n + 1);
+    offsets.push(0);
+    let mut at_eof = false;
+
+    for _ in 0..n {
+        let record_start = data.len();
+        let mut lines_read = 0;
+        for _ in 0..4 {
+            let before = data.len();
+            let bytes_read = reader.read_until(b'\n', &mut data)?;
+            if bytes_read == 0 {
+                data.truncate(record_start);
+                at_eof = true;
+                break;
+            }
+            lines_read += 1;
+            if data[data.len() - 1] != b'\n' {
+                // EOF without trailing newline — synthesize one for consistency.
+                data.push(b'\n');
+                at_eof = true;
+            }
+            if lines_read == 1 && data[before] != b'@' {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Expected FASTQ record to start with '@', got '{}'",
+                        data[before] as char
+                    ),
+                ));
+            }
+        }
+
+        if lines_read < 4 {
+            if lines_read != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("truncated FASTQ: {lines_read} of 4 lines in final record"),
+                ));
+            }
+            break;
+        }
+
+        offsets.push(data.len());
+
+        if at_eof {
+            break;
+        }
+    }
+
+    Ok((data, offsets, at_eof))
 }
 
 /// Result of parsing a FASTQ record.

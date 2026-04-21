@@ -44,11 +44,11 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgoxide::io::DelimFile;
 
-use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -685,7 +685,7 @@ fn process_position_group(
     let all_templates = build_templates_from_records(group.records)?;
 
     // Filter templates
-    let mut filter_metrics = FilterMetrics::new();
+    let mut filter_metrics = FilterMetrics::default();
     let filtered_templates: Vec<Template> = all_templates
         .into_iter()
         .filter(|t| filter_template(t, filter_config, &mut filter_metrics))
@@ -809,11 +809,28 @@ fn process_position_group(
 // Command definition
 //////////////////////////////////////////////////////////////////////////////
 
+const DEDUP_EXAMPLES: &str = r"EXAMPLES:
+    # Mark PCR duplicates by UMI (adjacency strategy)
+    fgumi dedup -i tc_sorted.bam -o marked.bam --strategy adjacency --edits 1
+
+    # Remove duplicates rather than just marking them
+    fgumi dedup -i tc_sorted.bam -o deduped.bam \
+        --strategy adjacency --edits 1 \
+        --remove-duplicates
+
+    # Position-only dedup (no UMI grouping) with metrics
+    fgumi dedup -i tc_sorted.bam -o marked.bam \
+        --no-umi \
+        --metrics dedup.metrics.tsv \
+        --family-size-histogram family_sizes.tsv
+";
+
 /// UMI-aware duplicate marking command.
 #[derive(Debug, Parser)]
 #[command(
     name = "dedup",
     about = "\x1b[38;5;151m[DEDUP]\x1b[0m         \x1b[36mMark or remove PCR duplicates using UMI information\x1b[0m",
+    after_help = DEDUP_EXAMPLES,
     long_about = r#"
 Marks or removes PCR duplicates from a BAM file using UMI information.
 Requires template-coordinate sorted input with `tc` tags on secondary/supplementary
@@ -1600,7 +1617,7 @@ mod tests {
     #[test]
     fn test_filter_template_accepts_valid_template() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACGTACGT", 30);
 
         assert!(filter_template(&template, &config, &mut metrics));
@@ -1610,7 +1627,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_low_mapq() {
         let config = default_filter_config(); // min_mapq = 20
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACGTACGT", 10); // MAPQ 10 < 20
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -1620,7 +1637,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_umi_with_n() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACNTACGT", 30); // N in UMI
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -1631,7 +1648,7 @@ mod tests {
     fn test_filter_template_rejects_short_umi() {
         let mut config = default_filter_config();
         config.min_umi_length = Some(8); // Require 8 bases
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACGT", 30); // Only 4 bases
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -1641,7 +1658,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_missing_umi_tag() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // Create template without RX tag
         let record = {
@@ -1666,7 +1683,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_qc_fail() {
         let config = default_filter_config(); // include_non_pf = false
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         let record = {
             let mut b = RawSamBuilder::new();
@@ -1692,7 +1709,7 @@ mod tests {
     fn test_filter_template_accepts_qc_fail_when_included() {
         let mut config = default_filter_config();
         config.include_non_pf = true; // Include QC-fail reads
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         let record = {
             let mut b = RawSamBuilder::new();
@@ -1717,7 +1734,7 @@ mod tests {
     #[test]
     fn test_filter_template_rejects_unmapped() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         let record = {
             let mut b = RawSamBuilder::new();
@@ -1739,7 +1756,7 @@ mod tests {
     fn test_filter_template_accepts_paired_umi_with_dash() {
         // Paired UMIs have format "ACGT-TGCA" with a dash separator
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACGT-TGCA", 30);
 
         assert!(filter_template(&template, &config, &mut metrics));
@@ -2077,7 +2094,7 @@ mod tests {
     #[test]
     fn test_filter_paired_template_accepts_valid() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_paired_mapped_template_with_umi("q1", "ACGTACGT", 30, 30);
 
         assert!(filter_template(&template, &config, &mut metrics));
@@ -2087,7 +2104,7 @@ mod tests {
     #[test]
     fn test_filter_paired_template_rejects_r2_low_mapq() {
         let config = default_filter_config(); // min_mapq = 20
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_paired_mapped_template_with_umi("q1", "ACGTACGT", 30, 10);
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -2097,7 +2114,7 @@ mod tests {
     #[test]
     fn test_filter_paired_template_rejects_r2_umi_with_n() {
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         // R1 has valid UMI, but R2 has N in UMI
         let r1 = {
             let mut b = RawSamBuilder::new();
@@ -2136,7 +2153,7 @@ mod tests {
     fn test_filter_paired_no_reads_rejected() {
         // Template with no primary reads (empty records list)
         let config = default_filter_config();
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = Template::new(b"empty".to_vec());
 
         assert!(!filter_template(&template, &config, &mut metrics));
@@ -2274,7 +2291,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // Should not panic; should reject gracefully due to missing UMI
         let result = filter_template(&template, &config, &mut metrics);
@@ -2318,7 +2335,7 @@ mod tests {
             min_umi_length: None,
             no_umi: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // After fix: filter_template_raw now uses find_int_tag which handles all integer types.
         // The template should be REJECTED because mate MAPQ=10 < min_mapq=20.
@@ -2538,7 +2555,7 @@ mod tests {
             min_umi_length,
             no_umi: false,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         assert_eq!(filter_template(&template, &config, &mut metrics), expect_pass);
         match expect {
             FilterExpect::Accepted => assert_eq!(metrics.accepted_templates, 1),
@@ -2605,7 +2622,7 @@ mod tests {
     fn test_filter_template_accepts_missing_umi_when_no_umi_mode() {
         let mut config = default_filter_config();
         config.no_umi = true;
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // Create template without RX tag
         let record = {
@@ -2632,7 +2649,7 @@ mod tests {
     fn test_filter_template_accepts_umi_with_n_when_no_umi_mode() {
         let mut config = default_filter_config();
         config.no_umi = true;
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACNTACGT", 30);
 
         // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
@@ -2645,7 +2662,7 @@ mod tests {
         let mut config = default_filter_config();
         config.min_umi_length = Some(8);
         config.no_umi = true;
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
         let template = create_mapped_template_with_umi("q1", "ACGT", 30);
 
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
@@ -2722,7 +2739,7 @@ mod tests {
             min_umi_length: None,
             no_umi: true,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // In no_umi mode, templates without UMI tags should be accepted
         assert!(filter_template(&template, &config, &mut metrics));
@@ -2750,7 +2767,7 @@ mod tests {
             min_umi_length: None,
             no_umi: true,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // In no_umi mode, UMIs with N should be accepted (UMI validation is skipped)
         assert!(filter_template(&template, &config, &mut metrics));
@@ -2778,7 +2795,7 @@ mod tests {
             min_umi_length: Some(6),
             no_umi: true,
         };
-        let mut metrics = FilterMetrics::new();
+        let mut metrics = FilterMetrics::default();
 
         // In no_umi mode, short UMIs should be accepted (min_umi_length is not checked)
         assert!(filter_template(&template, &config, &mut metrics));

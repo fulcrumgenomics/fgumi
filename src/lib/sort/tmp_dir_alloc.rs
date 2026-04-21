@@ -74,13 +74,13 @@ impl TmpDirAllocator {
         for dir in dirs {
             match probe(&dir) {
                 Ok(free) if free >= min_free_bytes => active.push(dir),
-                Ok(free) => log::warn!(
+                Ok(free) => tracing::warn!(
                     "Temp dir {} dropped: only {} free (need {})",
                     dir.display(),
                     free,
                     min_free_bytes
                 ),
-                Err(e) => log::warn!("Temp dir {} dropped: probe failed: {}", dir.display(), e),
+                Err(e) => tracing::warn!("Temp dir {} dropped: probe failed: {}", dir.display(), e),
             }
         }
 
@@ -143,7 +143,7 @@ impl TmpDirAllocator {
         if let Some(pos) = self.active.iter().position(|d| d == dir) {
             self.active.remove(pos);
             self.rebase_cursor_after_remove(pos);
-            log::warn!("Temp dir {} removed from rotation", dir.display());
+            tracing::warn!("Temp dir {} removed from rotation", dir.display());
         }
     }
 
@@ -181,7 +181,7 @@ impl TmpDirAllocator {
             let drop_dir = match (self.probe)(&self.active[idx]) {
                 Ok(free) if free >= min => false,
                 Ok(free) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Temp dir {} dropped mid-sort: {} free (need {})",
                         self.active[idx].display(),
                         free,
@@ -190,7 +190,7 @@ impl TmpDirAllocator {
                     true
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Temp dir {} dropped mid-sort: probe failed: {}",
                         self.active[idx].display(),
                         e

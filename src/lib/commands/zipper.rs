@@ -64,12 +64,28 @@ use anyhow::{Context, Result};
 use bstr::ByteSlice;
 use clap::Parser;
 use fgumi_raw_bam::{BAM_BASE_TO_ASCII, RawRecord, RawRecordView, RecordBufEncoder};
-use log::{debug, info, warn};
 use noodles::core::Position;
 use noodles::sam::Header;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
+
+const ZIPPER_EXAMPLES: &str = r"EXAMPLES:
+    # Merge bwa mem SAM stream with unmapped UMI tags, writing a BAM
+    bwa mem -t 8 -p -K 150000000 -Y ref.fa reads.fq \
+        | fgumi zipper -u unmapped.bam -r ref.fa -o mapped.bam
+
+    # End-to-end streaming: bwa -> zipper -> template-coord sort
+    fgumi fastq -i unmapped.bam \
+        | bwa mem -t 8 -p ref.fa - \
+        | fgumi zipper -u unmapped.bam -r ref.fa \
+        | fgumi sort -i /dev/stdin -o sorted.bam --order template-coordinate
+
+    # Read mapped BAM from disk and drop reads missing in the mapped side
+    fgumi zipper -i mapped.bam -u unmapped.bam -r ref.fa -o merged.bam \
+        --exclude-missing-reads
+";
 
 /// Command-line arguments for `zipper`
 ///
@@ -82,6 +98,7 @@ use std::path::{Path, PathBuf};
     author,
     version,
     about = "\x1b[38;5;72m[ALIGNMENT]\x1b[0m      \x1b[36mZip unmapped BAM with aligned BAM\x1b[0m",
+    after_help = ZIPPER_EXAMPLES,
     long_about = r#"
 Merges unmapped and mapped BAM files, transferring tags and metadata.
 

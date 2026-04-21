@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use crate::bam_io::is_stdout_path;
 use crate::bgzf_reader::{BGZF_EOF, decompress_block_into, read_raw_blocks};
 use crate::bgzf_writer::InlineBgzfCompressor;
-use crate::progress::ProgressTracker;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::sam::SamTag;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -28,12 +27,11 @@ use super::base::{
     ActiveSteps, BatchWeight, CompressedBlockBatch, DecodedRecord, DecompressedBatch,
     GroupKeyConfig, HasCompressor, HasHeldBoundaries, HasHeldCompressed, HasHeldProcessed,
     HasHeldSerialized, HasRecycledBuffers, HasWorkerCore, MemoryEstimate, MonitorableState,
-    OutputPipelineQueues, OutputPipelineState, PROGRESS_LOG_INTERVAL, PipelineConfig,
-    PipelineLifecycle, PipelineStats, PipelineStep, PipelineValidationError, ProcessPipelineState,
-    QueueSample, RawBlockBatch, ReorderBufferState, SerializePipelineState, SerializedBatch,
-    StepContext, WorkerCoreState, WorkerStateCommon, WritePipelineState, finalize_pipeline,
-    generic_worker_loop, handle_worker_panic, join_monitor_thread, join_worker_threads,
-    shared_try_step_compress,
+    OutputPipelineQueues, OutputPipelineState, PipelineConfig, PipelineLifecycle, PipelineStats,
+    PipelineStep, PipelineValidationError, ProcessPipelineState, QueueSample, RawBlockBatch,
+    ReorderBufferState, SerializePipelineState, SerializedBatch, StepContext, WorkerCoreState,
+    WorkerStateCommon, WritePipelineState, finalize_pipeline, generic_worker_loop,
+    handle_worker_panic, join_monitor_thread, join_worker_threads, shared_try_step_compress,
 };
 use super::deadlock::{
     DeadlockAction, DeadlockConfig, DeadlockState, QueueSnapshot, check_deadlock_and_restore,
@@ -813,10 +811,10 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
         self.output.stats.as_deref()
     }
 
-    /// Get optional reference to progress tracker.
+    /// Stage name used when emitting progress events.
     #[must_use]
-    pub fn progress(&self) -> &ProgressTracker {
-        &self.output.progress
+    pub fn progress_stage(&self) -> &str {
+        &self.output.progress_stage
     }
 
     /// Get items written count.
@@ -1000,8 +998,8 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> PipelineLifecycle
         BamPipelineState::stats(self)
     }
 
-    fn progress(&self) -> &ProgressTracker {
-        BamPipelineState::progress(self)
+    fn progress_stage(&self) -> &str {
+        BamPipelineState::progress_stage(self)
     }
 
     fn items_written(&self) -> u64 {
@@ -3011,7 +3009,7 @@ fn try_step_write<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
             // Use actual record count from the batch
             let records_in_batch = batch.record_count;
             state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
-            state.output.progress.log_if_needed(records_in_batch);
+            crate::progress::records_out(&state.output.progress_stage, records_in_batch);
             wrote_any = true;
         }
 
@@ -3266,7 +3264,7 @@ where
     let mut buffers = SingleThreadedBuffers::new();
 
     // Progress tracking
-    let progress = ProgressTracker::new("Processed records").with_interval(PROGRESS_LOG_INTERVAL);
+    let mut records_written: u64 = 0;
 
     // Per-position-group serial counter, incremented every time a processed
     // group is handed off to `serialize_fn`. Only meaningful when
@@ -3343,7 +3341,8 @@ where
                     }
                 }
 
-                progress.log_if_needed(record_count);
+                records_written = records_written.saturating_add(record_count);
+                crate::progress::records_out("bam_pipeline_single", record_count);
             }
         }
     }
@@ -3379,7 +3378,8 @@ where
                     }
                 }
 
-                progress.log_if_needed(record_count);
+                records_written = records_written.saturating_add(record_count);
+                crate::progress::records_out("bam_pipeline_single", record_count);
             }
         }
     }
@@ -3420,7 +3420,8 @@ where
             }
         }
 
-        progress.log_if_needed(record_count);
+        records_written = records_written.saturating_add(record_count);
+        crate::progress::records_out("bam_pipeline_single", record_count);
     }
 
     // Flush any remaining data in compression buffer
@@ -3439,7 +3440,7 @@ where
         })?;
     }
 
-    Ok(progress.count())
+    Ok(records_written)
 }
 
 // ============================================================================
@@ -3697,7 +3698,7 @@ where
                 io::Error::new(e.kind(), format!("Failed to finalize secondary output: {e}"))
             }) {
                 if result.is_err() {
-                    log::error!("Secondary output finalization also failed: {e}");
+                    tracing::error!("Secondary output finalization also failed: {e}");
                 } else {
                     return Err(e);
                 }

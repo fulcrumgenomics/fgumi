@@ -1,20 +1,47 @@
 #![deny(unsafe_code)]
+#![deny(missing_docs)]
 
-//! Consensus calling and filtering for UMI-based molecular consensus reads
+//! Consensus calling and filtering for UMI-tagged sequencing reads.
 //!
-//! This crate provides comprehensive functionality for generating consensus sequences
-//! from reads grouped by Unique Molecular Identifiers (UMIs). It includes:
+//! This crate generates consensus sequences from reads grouped by Unique Molecular
+//! Identifiers (UMIs). It is consumed by the fgumi CLI and may also be used
+//! directly as a library.
 //!
-//! - **Base-level consensus calling**: Building consensus bases from multiple reads
-//! - **Duplex consensus**: Calling duplex consensus from paired single-strand consensuses
-//! - **Simple UMI consensus**: Fast consensus for non-overlapping reads
-//! - **Vanilla consensus**: Standard consensus without special features
-//! - **Overlapping consensus**: Handling overlapping read pairs
-//! - **Consensus filtering**: Quality-based filtering and masking of consensus reads
-//! - **Consensus tags**: SAM tags for tracking consensus metrics
+//! # Overview
+//!
+//! The crate is organized around a small number of concepts:
+//!
+//! - **Base-level consensus** ([`ConsensusBaseBuilder`], [`caller::ConsensusCaller`]):
+//!   aggregates evidence at each position to choose a consensus base and quality.
+//! - **Consensus callers**: higher-level wrappers that consume groups of reads and
+//!   produce consensus reads:
+//!   - [`VanillaUmiConsensusCaller`] and [`methylation`] (simplex)
+//!   - [`DuplexConsensusCaller`] (duplex)
+//!   - [`CodecConsensusCaller`] (CODEC)
+//! - **Overlap resolution** ([`overlapping`]): harmonise overlapping read pairs
+//!   before consensus.
+//! - **Filtering** ([`filter`]): apply quality and agreement thresholds to
+//!   consensus output.
+//! - **Tags** ([`tags`]): SAM/BAM tag identifiers used throughout.
+//!
+//! # Example
+//!
+//! ```
+//! use fgumi_consensus::MethylationMode;
+//!
+//! // Methylation mode defaults to disabled; callers opt into EM-seq or TAPS.
+//! assert!(!MethylationMode::default().is_enabled());
+//! assert!(MethylationMode::EmSeq.is_enabled());
+//! ```
+//!
+//! # Errors
+//!
+//! All fallible public functions return [`enum@Error`] via [`Result`]. See
+//! [`enum@Error`] for the variants consumers may pattern-match on.
 
 pub mod base_builder;
 pub mod caller;
+pub mod error;
 pub mod filter;
 pub mod overlapping;
 pub mod phred;
@@ -22,16 +49,12 @@ pub mod sequence;
 pub mod simple_umi;
 pub mod tags;
 
-#[cfg(feature = "simplex")]
 pub mod vanilla_caller;
 
-#[cfg(feature = "duplex")]
 pub mod duplex_caller;
 
-#[cfg(feature = "codec")]
 pub mod codec_caller;
 
-#[cfg(feature = "simplex")]
 pub mod methylation;
 
 /// Methylation chemistry mode for consensus calling.
@@ -62,6 +85,7 @@ impl MethylationMode {
 // Re-export commonly used items
 pub use base_builder::ConsensusBaseBuilder;
 pub use caller::{ConsensusCaller, calculate_error_rate, log_consensus_statistics};
+pub use error::{Error, Result};
 pub use filter::{
     ConsensusType, FilterConfig, FilterResult, FilterThresholds, compute_read_stats,
     count_no_calls, filter_duplex_read, filter_read, is_duplex_consensus, mask_bases,
@@ -73,18 +97,14 @@ pub use overlapping::{
 };
 pub use sequence::ConsensusSequence;
 
-#[cfg(feature = "simplex")]
 pub use vanilla_caller::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 
-#[cfg(feature = "simplex")]
 pub(crate) use vanilla_caller::{
     IndexedSourceRead, ReadType, SourceRead, select_most_common_alignment_group,
 };
 
-#[cfg(feature = "duplex")]
 pub use duplex_caller::{DuplexConsensusCaller, DuplexConsensusRead};
 
-#[cfg(feature = "codec")]
 pub use codec_caller::{CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats};

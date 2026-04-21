@@ -33,9 +33,8 @@ use crate::bgzf_reader::{
     BGZF_EOF, BGZF_FOOTER_SIZE, BGZF_HEADER_SIZE, decompress_block_slice_into, read_raw_blocks,
 };
 use crate::bgzf_writer::InlineBgzfCompressor;
-use crate::fastq_parse::FastqRecord;
+use crate::fastq_parse::{FastqRecord, read_n_fastq_records};
 use crate::grouper::FastqTemplate;
-use crate::progress::ProgressTracker;
 use crate::reorder_buffer::ReorderBuffer;
 use libdeflater::Decompressor;
 
@@ -967,75 +966,6 @@ const PENDING_BACKPRESSURE_BYTES: u64 = 256 * 1024 * 1024;
 // Helper functions (used by per-stream pipeline steps)
 // ============================================================================
 
-/// Read exactly `n` complete FASTQ records from a buffered reader.
-///
-/// Uses `BufRead::read_until` for line-by-line reading. Each FASTQ record
-/// consists of exactly 4 lines (name, sequence, plus, quality).
-///
-/// Returns `(data, offsets, at_eof)` where:
-/// - `data`: concatenated bytes of all complete records
-/// - `offsets`: byte offset of each record start (includes 0, so len = records + 1)
-/// - `at_eof`: true if the reader reached EOF
-fn read_n_fastq_records<R: BufRead>(
-    reader: &mut R,
-    n: usize,
-) -> io::Result<(Vec<u8>, Vec<usize>, bool)> {
-    // Pre-allocate: ~300 bytes per record is typical
-    let mut data = Vec::with_capacity(n * 300);
-    let mut offsets = Vec::with_capacity(n + 1);
-    offsets.push(0);
-    let mut at_eof = false;
-
-    for _ in 0..n {
-        let record_start = data.len();
-
-        // Read 4 lines per FASTQ record
-        let mut lines_read = 0;
-        for _ in 0..4 {
-            let before = data.len();
-            let bytes_read = reader.read_until(b'\n', &mut data)?;
-            if bytes_read == 0 {
-                // EOF mid-record: truncate back to record start
-                data.truncate(record_start);
-                at_eof = true;
-                break;
-            }
-            lines_read += 1;
-
-            // If the line doesn't end with \n (EOF without trailing newline),
-            // add one for consistency
-            if data[data.len() - 1] != b'\n' {
-                data.push(b'\n');
-                at_eof = true;
-            }
-
-            // Validate first line starts with '@' (name line)
-            if lines_read == 1 && data[before] != b'@' {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Expected FASTQ record to start with '@', got '{}'",
-                        data[before] as char
-                    ),
-                ));
-            }
-        }
-
-        if lines_read < 4 {
-            // Incomplete record at EOF
-            break;
-        }
-
-        offsets.push(data.len());
-
-        if at_eof {
-            break;
-        }
-    }
-
-    Ok((data, offsets, at_eof))
-}
-
 /// Estimate total uncompressed size by summing ISIZE fields from all BGZF blocks.
 ///
 /// The ISIZE field is the last 4 bytes of each BGZF block and contains the
@@ -1518,7 +1448,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
         let read_done = self.read_done.load(Ordering::Acquire);
         let group_done = self.group_done.load(Ordering::Acquire);
         if !read_done || !group_done {
-            log::trace!("is_complete: read_done={read_done}, group_done={group_done}");
+            tracing::trace!("is_complete: read_done={read_done}, group_done={group_done}");
             return false;
         }
 
@@ -1527,7 +1457,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             let block_merge_done = self.block_merge_done.load(Ordering::Acquire);
             let parse_done = self.parse_done.load(Ordering::Acquire);
             if !block_merge_done || !parse_done {
-                log::debug!(
+                tracing::debug!(
                     "is_complete: BGZF flags not done: block_merge_done={block_merge_done}, parse_done={parse_done}"
                 );
                 return false;
@@ -1544,7 +1474,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             let boundaries_done = self.boundaries_done.load(Ordering::Acquire);
             let parse_done = self.parse_done.load(Ordering::Acquire);
             if !boundaries_done || !parse_done {
-                log::debug!(
+                tracing::debug!(
                     "is_complete: gzip flags not done: boundaries_done={boundaries_done}, parse_done={parse_done}"
                 );
                 return false;
@@ -1555,7 +1485,7 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
             }
             // Check intermediate queues
             if !self.q2_5_boundaries.is_empty() {
-                log::trace!(
+                tracing::trace!(
                     "is_complete: q2_5_boundaries not empty: {}",
                     self.q2_5_boundaries.len()
                 );
@@ -1573,10 +1503,10 @@ impl<R: BufRead + Send, P: Send + MemoryEstimate> FastqPipelineState<R, P> {
         self.output.stats.as_deref()
     }
 
-    /// Get reference to progress tracker.
+    /// Name of this pipeline's stage in the progress tracker.
     #[must_use]
-    pub fn progress(&self) -> &ProgressTracker {
-        &self.output.progress
+    pub fn progress_stage(&self) -> &str {
+        &self.output.progress_stage
     }
 
     /// Get items written count.
@@ -1755,8 +1685,8 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> PipelineLi
         FastqPipelineState::stats(self)
     }
 
-    fn progress(&self) -> &ProgressTracker {
-        FastqPipelineState::progress(self)
+    fn progress_stage(&self) -> &str {
+        FastqPipelineState::progress_stage(self)
     }
 
     fn items_written(&self) -> u64 {
@@ -3029,7 +2959,7 @@ fn fastq_try_step_parse<R: BufRead + Send, P: Send + MemoryEstimate>(
             state.parse_done.store(true, Ordering::Release);
             // Group is skipped — set group_done alongside parse_done
             state.group_done.store(true, Ordering::Release);
-            log::trace!("PARSE: set parse_done=true, group_done=true");
+            tracing::trace!("PARSE: set parse_done=true, group_done=true");
         } else if let Some(stats) = state.stats() {
             // Record Q2.5 as extension of Q2
             stats.record_queue_empty(2);
@@ -3229,7 +3159,7 @@ where
             state.output.groups_heap_bytes.fetch_sub(q4_heap, Ordering::AcqRel);
         }
 
-        log::trace!(
+        tracing::trace!(
             "fastq_try_step_process: processing batch of {} templates, serial={}",
             batch.len(),
             serial
@@ -3241,14 +3171,14 @@ where
             match process_fn(template) {
                 Ok(processed) => results.push(processed),
                 Err(e) => {
-                    log::error!("fastq_try_step_process: error: {e:?}");
+                    tracing::error!("fastq_try_step_process: error: {e:?}");
                     state.set_error(e);
                     return false;
                 }
             }
         }
 
-        log::trace!("fastq_try_step_process: processed {} items successfully", results.len());
+        tracing::trace!("fastq_try_step_process: processed {} items successfully", results.len());
 
         // Calculate heap size for memory tracking
         let heap_size: usize = results.iter().map(MemoryEstimate::estimate_heap_size).sum();
@@ -3335,7 +3265,7 @@ where
     worker.core.serialization_buffer.clear();
 
     // Serialize all items directly into worker's buffer (no intermediate allocation)
-    log::trace!(
+    tracing::trace!(
         "fastq_try_step_serialize: serializing batch of {} items, serial={}",
         batch.len(),
         serial
@@ -3347,7 +3277,7 @@ where
                 total_record_count += record_count;
             }
             Err(e) => {
-                log::error!("fastq_try_step_serialize: error: {e:?}");
+                tracing::error!("fastq_try_step_serialize: error: {e:?}");
                 state.set_error(e);
                 return false;
             }
@@ -3360,7 +3290,7 @@ where
         Vec::with_capacity(SERIALIZATION_BUFFER_CAPACITY),
     );
 
-    log::trace!(
+    tracing::trace!(
         "fastq_try_step_serialize: serialized successfully, total_data_len={}, record_count={}",
         combined_data.len(),
         total_record_count
@@ -3465,7 +3395,7 @@ fn fastq_try_step_write<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 
             }
             let records_in_batch = batch.record_count;
             state.output.items_written.fetch_add(records_in_batch, Ordering::Relaxed);
-            state.output.progress.log_if_needed(records_in_batch);
+            crate::progress::records_written(records_in_batch);
             wrote_any = true;
         }
 
@@ -3677,15 +3607,15 @@ where
     PF: Fn(FastqTemplate) -> io::Result<P> + Send + Sync + 'static,
     SF: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
 {
-    log::debug!("run_fastq_pipeline: starting, num_threads={}", config.num_threads);
+    tracing::debug!("run_fastq_pipeline: starting, num_threads={}", config.num_threads);
 
     // Write BAM header first
-    log::debug!("run_fastq_pipeline: writing BAM header");
+    tracing::debug!("run_fastq_pipeline: writing BAM header");
     write_bam_header(&mut output, header)?;
-    log::debug!("run_fastq_pipeline: BAM header written successfully");
+    tracing::debug!("run_fastq_pipeline: BAM header written successfully");
 
     // Create per-stream readers based on input type
-    log::debug!(
+    tracing::debug!(
         "run_fastq_pipeline: creating readers, decompressed_readers.is_some()={}, inputs_are_bgzf={}",
         decompressed_readers.is_some(),
         config.inputs_are_bgzf,
@@ -3694,13 +3624,13 @@ where
         if let Some(readers) = decompressed_readers {
             // Gzip/plain: wrap each reader as StreamReader::Decompressed
             let num_readers = readers.len();
-            log::debug!("run_fastq_pipeline: using {num_readers} Decompressed readers");
+            tracing::debug!("run_fastq_pipeline: using {num_readers} Decompressed readers");
             readers.into_iter().map(StreamReader::Decompressed).collect()
         } else {
             // BGZF: open each file as StreamReader::Bgzf. Advise sequential
             // unconditionally on Linux to enlarge the per-fd read-ahead window, and
             // optionally wrap in a userspace async prefetch reader when enabled.
-            log::debug!(
+            tracing::debug!(
                 "run_fastq_pipeline: using {} BGZF readers (async_reader={})",
                 fastq_paths.len(),
                 config.async_reader,
@@ -3726,13 +3656,13 @@ where
         };
 
     // Create state
-    log::debug!("run_fastq_pipeline: creating pipeline state");
+    tracing::debug!("run_fastq_pipeline: creating pipeline state");
     let state = Arc::new(FastqPipelineState::<Box<dyn BufRead + Send>, P>::new(
         config.clone(),
         stream_readers,
         output,
     ));
-    log::debug!("run_fastq_pipeline: state created, spawning {} workers", config.num_threads);
+    tracing::debug!("run_fastq_pipeline: state created, spawning {} workers", config.num_threads);
 
     let process_fn = Arc::new(process_fn);
     let serialize_fn = Arc::new(serialize_fn);
@@ -3743,7 +3673,7 @@ where
     let active_steps = config.active_steps();
 
     // Spawn workers
-    log::debug!("run_fastq_pipeline: spawning {num_threads} worker threads");
+    tracing::debug!("run_fastq_pipeline: spawning {num_threads} worker threads");
     let handles: Vec<_> = (0..num_threads)
         .map(|thread_id| {
             let state = Arc::clone(&state);
@@ -3755,7 +3685,7 @@ where
             thread::spawn(move || {
                 // Wrap worker logic in catch_unwind to handle panics gracefully
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    log::debug!("Worker thread {thread_id} starting");
+                    tracing::debug!("Worker thread {thread_id} starting");
                     let mut worker = FastqWorkerState::new(
                         compression_level,
                         thread_id,
@@ -3763,7 +3693,7 @@ where
                         scheduler_strategy,
                         active_steps,
                     );
-                    log::debug!("Worker thread {thread_id} created worker state");
+                    tracing::debug!("Worker thread {thread_id} created worker state");
                     let ctx = FastqStepContext {
                         state: &state,
                         header: &header,
@@ -3772,7 +3702,7 @@ where
                         is_reader: thread_id < state.num_streams,
                     };
                     generic_worker_loop(&ctx, &mut worker);
-                    log::debug!("Worker thread {thread_id} finished");
+                    tracing::debug!("Worker thread {thread_id} finished");
                 }));
 
                 // If a panic occurred, set the error flag so other threads exit
@@ -3782,7 +3712,7 @@ where
             })
         })
         .collect();
-    log::debug!("run_fastq_pipeline: all workers spawned");
+    tracing::debug!("run_fastq_pipeline: all workers spawned");
 
     // Spawn monitor thread for deadlock detection
     let monitor_handle = if state.stats().is_some() || state.deadlock_state.is_enabled() {
@@ -3798,7 +3728,7 @@ where
                     let bf = s.batches_boundaries_found.load(Ordering::Relaxed);
                     let bp = s.batches_parsed.load(Ordering::Relaxed);
                     let bg = s.batches_grouped.load(Ordering::Relaxed);
-                    log::trace!(
+                    tracing::trace!(
                         "Parallel parse state: boundaries_done={bd}, parse_done={pd}, batches: read={br}, boundaries={bf}, parsed={bp}, grouped={bg}"
                     );
                 }
@@ -3809,13 +3739,13 @@ where
     };
 
     // Wait for completion
-    log::debug!("run_fastq_pipeline: waiting for workers to complete");
+    tracing::debug!("run_fastq_pipeline: waiting for workers to complete");
     join_worker_threads(handles)?;
-    log::debug!("run_fastq_pipeline: all workers joined");
+    tracing::debug!("run_fastq_pipeline: all workers joined");
     join_monitor_thread(monitor_handle);
 
     // Debug: Log pipeline counters
-    log::info!(
+    tracing::info!(
         "Pipeline counters: batches_read={}, batches_grouped={}, total_templates_pushed={}, total_records_serialized={}, templates_written={}",
         state.batches_read.load(Ordering::Relaxed),
         state.batches_grouped.load(Ordering::Relaxed),
