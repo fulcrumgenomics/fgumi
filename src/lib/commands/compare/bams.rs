@@ -1740,6 +1740,7 @@ impl CompareBams {
         // This controls BOTH rayon parallelism and BGZF decompression
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
+            .start_handler(|_| crate::os_hints::set_current_thread_compute_qos())
             .build()
             .map_err(|e| anyhow!("Failed to create thread pool: {e}"))?;
 

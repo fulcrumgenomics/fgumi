@@ -887,6 +887,7 @@ impl SortWorkerPool {
                 let shared = Arc::clone(&shared);
 
                 thread::spawn(move || {
+                    crate::os_hints::set_current_thread_compute_qos();
                     let mut worker = SortWorkerState {
                         worker_id,
                         compressor: InlineBgzfCompressor::new(temp_compression),

@@ -3754,6 +3754,7 @@ where
             thread::spawn(move || {
                 // Wrap worker logic in catch_unwind to handle panics gracefully
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::os_hints::set_current_thread_compute_qos();
                     log::debug!("Worker thread {thread_id} starting");
                     let mut worker = FastqWorkerState::new(
                         compression_level,

@@ -179,6 +179,16 @@ fn main() -> Result<()> {
     let default_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
 
+    // Initialize the rayon global thread pool so every rayon worker receives
+    // the Apple Silicon compute-QoS hint on first activation. This call MUST
+    // run before any rayon work is submitted; once rayon auto-initializes the
+    // global pool, `build_global` returns an error that we treat as fatal
+    // rather than silently dropping the hint.
+    rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| fgumi_lib::os_hints::set_current_thread_compute_qos())
+        .build_global()
+        .expect("rayon global thread pool already initialized");
+
     info!("Running fgumi version {}", fgumi_lib::version::VERSION.as_str());
     args.subcommand.execute(&command_line)
 }

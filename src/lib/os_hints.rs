@@ -65,6 +65,25 @@ pub fn hint_fd(_file: &File) -> Option<i32> {
     None
 }
 
+/// Hint to the Darwin scheduler that the current thread is compute-bound
+/// interactive work, preferring placement on performance (P) cores on Apple
+/// Silicon. No-op on non-macOS targets and on Intel Macs (where the OS has no
+/// P/E distinction to route).
+///
+/// Call this once at the top of a long-running compute worker thread's
+/// closure. Do NOT call from I/O-bound writer or reader threads — those
+/// should remain at default `QoS` so the scheduler is free to place them on
+/// efficiency cores, keeping P-cores hot for compute.
+///
+/// Best-effort: if the underlying `pthread_set_qos_class_self_np` call fails,
+/// the failure is logged at `debug` level and otherwise ignored. The thread
+/// remains usable at its default `QoS`.
+pub fn set_current_thread_compute_qos() {
+    #[cfg(target_os = "macos")]
+    macos_qos::set_user_initiated();
+    // Non-macOS: intentionally empty.
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs::File;
@@ -84,6 +103,23 @@ mod linux {
     pub(super) fn advise_willneed_raw(fd: i32, offset: i64, len: i64) {
         if let Err(e) = posix_fadvise(fd, offset, len, PosixFadviseAdvice::POSIX_FADV_WILLNEED) {
             log::debug!("posix_fadvise(POSIX_FADV_WILLNEED) failed on fd {fd}: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_qos {
+    use libc::qos_class_t::QOS_CLASS_USER_INITIATED;
+
+    pub(super) fn set_user_initiated() {
+        // SAFETY: pthread_set_qos_class_self_np affects only the calling
+        // thread. The `override` argument of 0 requests the default relative
+        // priority within the class. The libc binding is a thin wrapper over
+        // a stable Darwin public API and takes no pointer arguments.
+        let rc = unsafe { libc::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) };
+        if rc != 0 {
+            log::debug!("pthread_set_qos_class_self_np failed: rc={rc}");
         }
     }
 }
@@ -110,5 +146,56 @@ mod tests {
         for _ in 0..16 {
             advise_sequential(&f);
         }
+    }
+
+    #[test]
+    fn set_current_thread_compute_qos_does_not_panic() {
+        // The function is a no-op on non-macOS and a best-effort pthread call
+        // on macOS. It must not panic on any supported platform.
+        set_current_thread_compute_qos();
+    }
+
+    #[test]
+    fn set_current_thread_compute_qos_is_callable_repeatedly() {
+        for _ in 0..16 {
+            set_current_thread_compute_qos();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn set_current_thread_compute_qos_round_trip_on_macos() {
+        use libc::qos_class_t::{QOS_CLASS_UNSPECIFIED, QOS_CLASS_USER_INITIATED};
+
+        // Run on a freshly spawned thread so we don't mutate the test runner's
+        // QoS (which could affect subsequent tests on the same worker thread).
+        let actual_class = std::thread::spawn(|| {
+            set_current_thread_compute_qos();
+
+            #[allow(unsafe_code)]
+            // SAFETY: pthread_get_qos_class_np with two out-pointers to
+            // locally-owned storage. Both pointers are valid for the duration
+            // of the call.
+            unsafe {
+                let mut class: libc::qos_class_t = QOS_CLASS_UNSPECIFIED;
+                let mut relpri: std::os::raw::c_int = 0;
+                let rc = libc::pthread_get_qos_class_np(
+                    libc::pthread_self(),
+                    std::ptr::addr_of_mut!(class),
+                    std::ptr::addr_of_mut!(relpri),
+                );
+                assert_eq!(rc, 0, "pthread_get_qos_class_np failed: rc={rc}");
+                class
+            }
+        })
+        .join()
+        .expect("spawned thread should not panic");
+
+        // `qos_class_t` does not implement `PartialEq` in the libc bindings,
+        // so match on the variant instead.
+        assert!(
+            matches!(actual_class, QOS_CLASS_USER_INITIATED),
+            "expected QOS_CLASS_USER_INITIATED, got {actual_class:?}",
+        );
     }
 }
