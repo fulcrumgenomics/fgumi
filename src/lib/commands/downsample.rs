@@ -5,18 +5,17 @@
 //!
 //! Requires input BAM to be in template-coordinate order (from group).
 
-use crate::bam_io::{create_bam_reader, create_bam_writer, create_optional_bam_writer};
+use crate::bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
-use crate::sam::SamTag;
 use crate::sam::is_template_coordinate_sorted;
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
+use fgumi_raw_bam::{
+    RawBamReader, RawRecord, aux_data_slice, find_int_tag, find_string_tag, read_name,
+};
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashSet};
@@ -26,9 +25,6 @@ use std::path::PathBuf;
 
 use crate::commands::command::Command;
 use crate::commands::common::{BamIoOptions, CompressionOptions, parse_bool};
-
-/// MI tag for molecular identifier
-const MI_TAG: Tag = SamTag::MI.to_noodles_tag();
 
 /// Downsample a BAM file by UMI family using streaming.
 ///
@@ -125,8 +121,7 @@ impl Command for Downsample {
             None => rand::make_rng(),
         };
 
-        // Open input BAM
-        let (mut reader, header) = create_bam_reader(&self.io.input, 1)?;
+        let (reader, header) = create_raw_bam_reader(&self.io.input, 1)?;
 
         // Validate header - input must be template-coordinate sorted (output from group)
         if !is_template_coordinate_sorted(&header) {
@@ -143,15 +138,14 @@ impl Command for Downsample {
 
         // Create output BAM writer (single-threaded, downsample doesn't have threads parameter)
         let mut writer =
-            create_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
+            create_raw_bam_writer(&self.io.output, &header, 1, self.compression.compression_level)?;
 
         // Create optional rejects writer
-        let mut rejects_writer = create_optional_bam_writer(
-            self.rejects.as_ref(),
-            &header,
-            1,
-            self.compression.compression_level,
-        )?;
+        let mut rejects_writer: Option<RawBamWriter> = self
+            .rejects
+            .as_ref()
+            .map(|path| create_raw_bam_writer(path, &header, 1, self.compression.compression_level))
+            .transpose()?;
 
         // Statistics
         let mut total_families: u64 = 0;
@@ -170,9 +164,7 @@ impl Command for Downsample {
 
         info!("Processing reads...");
 
-        // Process families using streaming iteration
-        let record_iter = reader.record_bufs(&header).map(|r| r.map_err(Into::into));
-        let mut family_iter = FamilyIterator::new(record_iter);
+        let mut family_iter = FamilyIterator::new(raw_record_iter(reader));
 
         while let Some(family_result) = family_iter.next_family()? {
             let (mi, family) = family_result;
@@ -201,7 +193,7 @@ impl Command for Downsample {
                 *hist_kept.entry(family_size).or_insert(0) += 1;
 
                 for record in &family {
-                    writer.write_alignment_record(&header, record)?;
+                    writer.write_raw_record(record.as_ref())?;
                 }
             } else {
                 rejected_reads += family_size as u64;
@@ -209,7 +201,7 @@ impl Command for Downsample {
 
                 if let Some(ref mut rw) = rejects_writer {
                     for record in &family {
-                        rw.write_alignment_record(&header, record)?;
+                        rw.write_raw_record(record.as_ref())?;
                     }
                 }
             }
@@ -227,6 +219,13 @@ impl Command for Downsample {
         if let Some(ref path) = self.histogram_rejected {
             write_histogram(&hist_rejected, path)?;
             info!("Wrote rejected histogram to: {}", path.display());
+        }
+
+        // Finalize writers before summary so any I/O failure surfaces here rather
+        // than silently on drop (flushes buffered records + writes BGZF EOF).
+        writer.finish()?;
+        if let Some(rw) = rejects_writer {
+            rw.finish()?;
         }
 
         // Summary
@@ -261,19 +260,46 @@ fn write_histogram(histogram: &BTreeMap<usize, u64>, path: &PathBuf) -> Result<(
     Ok(())
 }
 
+/// Wrap a [`RawBamReader`] as a streaming iterator of [`RawRecord`]s.
+///
+/// Allocates a fresh `RawRecord` per iteration so downstream code can buffer
+/// records by family without stepping on each other's storage.
+fn raw_record_iter<R: std::io::Read>(
+    mut reader: RawBamReader<R>,
+) -> impl Iterator<Item = Result<RawRecord>> {
+    let mut exhausted = false;
+    std::iter::from_fn(move || {
+        if exhausted {
+            return None;
+        }
+        let mut rec = RawRecord::new();
+        match reader.read_record(&mut rec) {
+            Ok(0) => {
+                exhausted = true;
+                None
+            }
+            Ok(_) => Some(Ok(rec)),
+            Err(e) => {
+                exhausted = true;
+                Some(Err(anyhow::Error::from(e)))
+            }
+        }
+    })
+}
+
 /// Iterator that groups consecutive records by MI tag.
 ///
 /// This provides streaming iteration over UMI families without loading the entire BAM into memory.
 struct FamilyIterator<I>
 where
-    I: Iterator<Item = Result<RecordBuf>>,
+    I: Iterator<Item = Result<RawRecord>>,
 {
     records: std::iter::Peekable<I>,
 }
 
 impl<I> FamilyIterator<I>
 where
-    I: Iterator<Item = Result<RecordBuf>>,
+    I: Iterator<Item = Result<RawRecord>>,
 {
     fn new(records: I) -> Self {
         Self { records: records.peekable() }
@@ -282,7 +308,7 @@ where
     /// Get the next family of records sharing the same MI tag.
     ///
     /// Returns `Ok(Some((mi_tag`, records))) for each family, or Ok(None) when exhausted.
-    fn next_family(&mut self) -> Result<Option<(String, Vec<RecordBuf>)>> {
+    fn next_family(&mut self) -> Result<Option<(String, Vec<RawRecord>)>> {
         // Peek at the first record to get the MI tag
         let mi = match self.records.peek() {
             Some(Ok(record)) => get_mi_tag(record)?,
@@ -317,61 +343,55 @@ where
     }
 }
 
-/// Extract the MI tag value from a record.
-fn get_mi_tag(record: &RecordBuf) -> Result<String> {
-    let mi = record.data().get(&MI_TAG).ok_or_else(|| {
-        let name = record.name().map_or_else(
-            || "<unknown>".to_string(),
-            |n| String::from_utf8_lossy(n.as_ref()).to_string(),
-        );
-        anyhow::anyhow!("Read '{name}' is missing required MI tag")
-    })?;
+/// Extract the MI tag value from a raw BAM record.
+///
+/// MI is Z-typed per SAM spec, but fgbio historically also writes it as an integer.
+/// The raw path supports both: we look for a Z-type first, then fall back to any
+/// integer encoding (c/C/s/S/i/I).
+fn get_mi_tag(record: &RawRecord) -> Result<String> {
+    let aux = aux_data_slice(record.as_ref());
 
-    // MI tag can be an integer or string
-    use noodles::sam::alignment::record_buf::data::field::Value;
-    match mi {
-        Value::Int8(v) => Ok(v.to_string()),
-        Value::UInt8(v) => Ok(v.to_string()),
-        Value::Int16(v) => Ok(v.to_string()),
-        Value::UInt16(v) => Ok(v.to_string()),
-        Value::Int32(v) => Ok(v.to_string()),
-        Value::UInt32(v) => Ok(v.to_string()),
-        Value::String(s) => Ok(s.to_string()),
-        _ => bail!("Unexpected MI tag type"),
+    if let Some(bytes) = find_string_tag(aux, b"MI") {
+        return std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|e| anyhow::anyhow!("MI tag is not valid UTF-8: {e}"));
     }
+
+    if let Some(v) = find_int_tag(aux, b"MI") {
+        return Ok(v.to_string());
+    }
+
+    let name = String::from_utf8_lossy(read_name(record.as_ref())).into_owned();
+    let display_name = if name.is_empty() { "<unknown>".to_string() } else { name };
+    bail!("Read '{display_name}' is missing required MI tag")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, raw_record_to_record_buf};
+    use fgumi_raw_bam::SamBuilder as RawSamBuilder;
 
-    fn to_record_buf(raw: fgumi_raw_bam::RawRecord) -> RecordBuf {
-        raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
-            .expect("raw_record_to_record_buf failed in test")
-    }
-
-    /// Create a test record with an MI tag
-    fn create_test_record(name: &str, mi: &str) -> RecordBuf {
+    /// Create a test record with a string MI tag.
+    fn create_test_record(name: &str, mi: &str) -> RawRecord {
         let mut b = RawSamBuilder::new();
         b.read_name(name.as_bytes());
         b.add_string_tag(b"MI", mi.as_bytes());
-        to_record_buf(b.build())
+        b.build()
     }
 
-    /// Create a test record with an integer MI tag
-    fn create_test_record_int_mi(name: &str, mi: i32) -> RecordBuf {
+    /// Create a test record with an integer MI tag.
+    fn create_test_record_int_mi(name: &str, mi: i32) -> RawRecord {
         let mut b = RawSamBuilder::new();
         b.read_name(name.as_bytes());
         b.add_int_tag(b"MI", mi);
-        to_record_buf(b.build())
+        b.build()
     }
 
-    /// Create a test record without an MI tag
-    fn create_test_record_no_mi(name: &str) -> RecordBuf {
+    /// Create a test record without an MI tag.
+    fn create_test_record_no_mi(name: &str) -> RawRecord {
         let mut b = RawSamBuilder::new();
         b.read_name(name.as_bytes());
-        to_record_buf(b.build())
+        b.build()
     }
 
     /// Canonical `BamIoOptions` used by `Downsample` test constructors.
@@ -458,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_family_iterator_empty() {
-        let records: Vec<Result<RecordBuf>> = vec![];
+        let records: Vec<Result<RawRecord>> = vec![];
         let mut iter = FamilyIterator::new(records.into_iter());
 
         let family = iter.next_family().expect("next_family should succeed");

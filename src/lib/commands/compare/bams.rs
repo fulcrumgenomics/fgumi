@@ -599,9 +599,13 @@ fn start_raw_batch_reader(
 
 /// Deserialize raw BAM record bytes into a noodles `RecordBuf`.
 ///
-/// This is used only when records differ at the raw byte level and we need
-/// human-readable field values for diff reporting. The raw bytes are the BAM
-/// record body WITHOUT the 4-byte length prefix.
+/// **Intentional non-raw decode.** Other production hot paths avoid
+/// `raw_records_to_record_bufs` because it builds a synthetic BAM stream per call;
+/// here it is acceptable because this function only runs *off* the comparison hot
+/// path — after the byte/structured tiers have already flagged a pair as
+/// mismatched and we need typed field values to render a human-readable diff.
+///
+/// The raw bytes are the BAM record body WITHOUT the 4-byte length prefix.
 ///
 /// # Errors
 ///

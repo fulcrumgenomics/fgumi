@@ -20,7 +20,7 @@
 //!
 //! Use `--verify` to check if a BAM file is correctly sorted without writing output.
 
-use crate::bam_io::create_bam_reader;
+use crate::bam_io::create_raw_bam_reader;
 use crate::logging::OperationTimer;
 use crate::sam::SamTag;
 use crate::sort::{QuerynameComparator, RawExternalSorter, SortOrder};
@@ -671,8 +671,8 @@ impl Sort {
             info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
         }
 
-        // Get header using noodles reader, then use raw reader for records
-        let (_, header) = create_bam_reader(&self.input, 1)?;
+        // Get header via the raw-byte reader, then re-open for raw record iteration.
+        let (_, header) = create_raw_bam_reader(&self.input, 1)?;
 
         let file = File::open(&self.input)?;
         let mut raw_reader = RawBamRecordReader::new(file)?;
