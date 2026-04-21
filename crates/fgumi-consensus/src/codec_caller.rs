@@ -1441,45 +1441,19 @@ impl ConsensusCaller for CodecConsensusCaller {
     }
 }
 
-/// Bridge methods for encoding `RecordBuf` to raw bytes.
-/// Used by tests (both unit and integration) to call the raw-byte pipeline.
+/// Test-only bridge methods for calling the raw-byte pipeline with pre-built `RawRecord`s.
+#[cfg(test)]
 impl CodecConsensusCaller {
-    /// Encode a single `RecordBuf` to raw BAM bytes.
-    fn record_buf_to_raw(rec: &noodles::sam::alignment::RecordBuf) -> Vec<u8> {
-        use crate::vendored::bam_codec::encode_record_buf;
-        use noodles::sam::header::record::value::Map;
-        use noodles::sam::header::record::value::map::ReferenceSequence;
-        use std::num::NonZeroUsize;
-
-        let mut header = noodles::sam::Header::default();
-        // Add reference sequences so records with reference_sequence_id encode correctly
-        for name in &["chr1", "chr2", "chr3"] {
-            let rs =
-                Map::<ReferenceSequence>::new(NonZeroUsize::new(1000).expect("1000 is non-zero"));
-            header.reference_sequences_mut().insert(bstr::BString::from(*name), rs);
-        }
-
-        let mut buf = Vec::new();
-        encode_record_buf(&mut buf, &header, rec).expect("encode_record_buf failed");
-        buf
-    }
-
-    /// Encode `RecordBuf`s to raw bytes and delegate to `consensus_reads`.
+    /// Delegate a batch of already-built [`RawRecord`]s to `consensus_reads`.
     ///
     /// # Errors
     ///
     /// Returns an error if consensus calling fails on the provided records.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "matches ConsensusCaller trait signature pattern"
-    )]
     pub fn consensus_reads_from_sam_records(
         &mut self,
-        recs: Vec<noodles::sam::alignment::RecordBuf>,
+        recs: Vec<RawRecord>,
     ) -> Result<ConsensusOutput> {
-        let raw_records: Vec<RawRecord> =
-            recs.iter().map(|r| RawRecord::from(Self::record_buf_to_raw(r))).collect();
-        self.consensus_reads(raw_records)
+        self.consensus_reads(recs)
     }
 }
 
@@ -1491,34 +1465,28 @@ impl CodecConsensusCaller {
     reason = "test-only methods use owned values and numeric casts"
 )]
 impl CodecConsensusCaller {
-    /// Test-only wrapper: check if a `RecordBuf` is part of an FR pair.
-    pub fn is_fr_pair(&self, rec: &noodles::sam::alignment::RecordBuf) -> bool {
-        let raw = Self::record_buf_to_raw(rec);
-        bam_fields::is_fr_pair_raw(&raw)
+    /// Test-only wrapper: check if a `RawRecord` is part of an FR pair.
+    pub fn is_fr_pair(&self, rec: &RawRecord) -> bool {
+        bam_fields::is_fr_pair_raw(rec)
     }
 
-    /// Test-only wrapper: filter `RecordBuf`s to most common alignment.
-    pub fn filter_to_most_common_alignment(
-        &mut self,
-        recs: Vec<noodles::sam::alignment::RecordBuf>,
-    ) -> Vec<noodles::sam::alignment::RecordBuf> {
-        let raws: Vec<RawRecord> =
-            recs.iter().map(|r| RawRecord::from(Self::record_buf_to_raw(r))).collect();
+    /// Test-only wrapper: filter `RawRecord`s to most common alignment,
+    /// returning the surviving records (index-stable relative to the input).
+    pub fn filter_to_most_common_alignment(&mut self, recs: Vec<RawRecord>) -> Vec<RawRecord> {
         let infos: Vec<ClippedRecordInfo> =
-            raws.iter().enumerate().map(|(i, raw)| Self::build_clipped_info(raw, i, 0)).collect();
+            recs.iter().enumerate().map(|(i, raw)| Self::build_clipped_info(raw, i, 0)).collect();
         let filtered = self.filter_to_most_common_alignment_raw(infos);
         filtered.into_iter().map(|info| recs[info.raw_idx].clone()).collect()
     }
 
-    /// Test-only wrapper: `read_pos_at_ref_pos` on a `RecordBuf`.
+    /// Test-only wrapper: `read_pos_at_ref_pos` on a `RawRecord`.
     pub fn read_pos_at_ref_pos(
-        rec: &noodles::sam::alignment::RecordBuf,
+        rec: &RawRecord,
         ref_pos: usize,
         return_last_base_if_deleted: bool,
     ) -> Option<usize> {
-        let raw = Self::record_buf_to_raw(rec);
-        let cigar_ops = bam_fields::get_cigar_ops(&raw);
-        let alignment_start = (RawRecordView::new(&raw).pos() + 1) as usize; // 1-based
+        let cigar_ops = bam_fields::get_cigar_ops(rec);
+        let alignment_start = (RawRecordView::new(rec).pos() + 1) as usize; // 1-based
         bam_fields::read_pos_at_ref_pos_raw(
             &cigar_ops,
             alignment_start,
@@ -1527,49 +1495,41 @@ impl CodecConsensusCaller {
         )
     }
 
-    /// Test-only wrapper: `check_overlap_phase` on `RecordBuf`s.
+    /// Test-only wrapper: `check_overlap_phase` on `RawRecord`s.
     pub fn check_overlap_phase(
         &self,
-        r1: &noodles::sam::alignment::RecordBuf,
-        r2: &noodles::sam::alignment::RecordBuf,
+        r1: &RawRecord,
+        r2: &RawRecord,
         overlap_start: usize,
         overlap_end: usize,
     ) -> bool {
-        let raw1 = Self::record_buf_to_raw(r1);
-        let raw2 = Self::record_buf_to_raw(r2);
-        let info1 = Self::build_clipped_info(&raw1, 0, 0);
-        let info2 = Self::build_clipped_info(&raw2, 1, 0);
+        let info1 = Self::build_clipped_info(r1, 0, 0);
+        let info2 = Self::build_clipped_info(r2, 1, 0);
         Self::check_overlap_phase_raw(&info1, &info2, overlap_start, overlap_end)
     }
 
-    /// Test-only wrapper: `to_source_read_for_codec` on a `RecordBuf`.
-    pub(crate) fn to_source_read_for_codec(
-        rec: &noodles::sam::alignment::RecordBuf,
-        original_idx: usize,
-    ) -> SourceRead {
-        let raw = Self::record_buf_to_raw(rec);
-        Self::to_source_read_for_codec_raw(&raw, original_idx, 0, false, None)
+    /// Test-only wrapper: `to_source_read_for_codec` on a `RawRecord`.
+    pub(crate) fn to_source_read_for_codec(rec: &RawRecord, original_idx: usize) -> SourceRead {
+        Self::to_source_read_for_codec_raw(rec, original_idx, 0, false, None)
     }
 
-    /// Test-only wrapper: `compute_codec_consensus_length` on two `RecordBuf`s.
+    /// Test-only wrapper: `compute_codec_consensus_length` on two `RawRecord`s.
     pub fn compute_codec_consensus_length(
-        pos_rec: &noodles::sam::alignment::RecordBuf,
-        neg_rec: &noodles::sam::alignment::RecordBuf,
+        pos_rec: &RawRecord,
+        neg_rec: &RawRecord,
         overlap_end: usize,
     ) -> Option<usize> {
-        let raw_pos = Self::record_buf_to_raw(pos_rec);
-        let raw_neg = Self::record_buf_to_raw(neg_rec);
-        let info_pos = Self::build_clipped_info(&raw_pos, 0, 0);
-        let info_neg = Self::build_clipped_info(&raw_neg, 1, 0);
+        let info_pos = Self::build_clipped_info(pos_rec, 0, 0);
+        let info_neg = Self::build_clipped_info(neg_rec, 1, 0);
         Self::compute_consensus_length_raw(&info_pos, &info_neg, overlap_end)
     }
 
     /// Test-only wrapper: downsample pairs using `max_reads_per_strand` option.
     pub fn downsample_pairs(
         &mut self,
-        r1s: Vec<noodles::sam::alignment::RecordBuf>,
-        r2s: Vec<noodles::sam::alignment::RecordBuf>,
-    ) -> (Vec<noodles::sam::alignment::RecordBuf>, Vec<noodles::sam::alignment::RecordBuf>) {
+        r1s: Vec<RawRecord>,
+        r2s: Vec<RawRecord>,
+    ) -> (Vec<RawRecord>, Vec<RawRecord>) {
         let Some(max_reads) = self.options.max_reads_per_strand else {
             return (r1s, r2s);
         };
@@ -1593,12 +1553,10 @@ impl CodecConsensusCaller {
 )]
 mod tests {
     use super::*;
-    use fgumi_raw_bam::ParsedBamRecord;
-    use fgumi_sam::builder::RecordBuilder;
+    use fgumi_raw_bam::{
+        CigarKind, ParsedBamRecord, RawRecordView, SamBuilder, testutil::encode_op,
+    };
     use fgumi_sam::clipper::cigar_utils;
-    use noodles::sam::alignment::RecordBuf;
-    use noodles::sam::alignment::record::Cigar as CigarTrait;
-    use noodles::sam::alignment::record::Flags;
     use noodles::sam::alignment::record::cigar::op::Kind;
 
     #[test]
@@ -1649,7 +1607,7 @@ mod tests {
         assert!((stats.duplex_disagreement_rate() - 0.05).abs() < 1e-6);
     }
 
-    /// Helper function to create a test paired read
+    /// Helper function to create a test paired read as a `RawRecord`.
     #[expect(
         clippy::too_many_arguments,
         clippy::cast_possible_truncation,
@@ -1666,67 +1624,81 @@ mod tests {
         mate_is_reverse: bool,
         ref_start: usize,
         cigar_ops: &[(Kind, usize)],
-    ) -> RecordBuf {
-        // Convert CIGAR ops to string and calculate reference length
-        use std::fmt::Write;
-        let mut ref_len = 0usize;
-        let cigar_str: String = cigar_ops.iter().fold(String::new(), |mut acc, (kind, len)| {
-            // Calculate reference length consumed
-            match kind {
-                Kind::Match
-                | Kind::SequenceMatch
-                | Kind::SequenceMismatch
-                | Kind::Deletion
-                | Kind::Skip => {
-                    ref_len += len;
-                }
-                _ => {}
-            }
-            let c = match kind {
-                Kind::Match => 'M',
-                Kind::Insertion => 'I',
-                Kind::Deletion => 'D',
-                Kind::SoftClip => 'S',
-                Kind::HardClip => 'H',
-                Kind::Skip => 'N',
-                Kind::Pad => 'P',
-                Kind::SequenceMatch => '=',
-                Kind::SequenceMismatch => 'X',
-            };
-            let _ = write!(acc, "{len}{c}");
-            acc
-        });
+    ) -> RawRecord {
+        // PROPERLY_PAIRED flag (0x2) is not in the flags module, define locally.
+        const PROPERLY_PAIRED: u16 = 0x2;
 
-        // Calculate mate position and template length for FR pair detection
-        // Use a typical insert size of 200bp
+        // Build flags
+        let mut flg: u16 = flags::PAIRED | PROPERLY_PAIRED;
+        if is_first {
+            flg |= flags::FIRST_SEGMENT;
+        } else {
+            flg |= flags::LAST_SEGMENT;
+        }
+        if is_reverse {
+            flg |= flags::REVERSE;
+        }
+        if mate_is_reverse {
+            flg |= flags::MATE_REVERSE;
+        }
+
+        // Encode CIGAR ops and calculate reference length consumed
+        let mut ref_len = 0usize;
+        let raw_cigar: Vec<u32> = cigar_ops
+            .iter()
+            .map(|(kind, len)| {
+                let op_code: u32 = match kind {
+                    Kind::Match => 0,
+                    Kind::Insertion => 1,
+                    Kind::Deletion => 2,
+                    Kind::Skip => 3,
+                    Kind::SoftClip => 4,
+                    Kind::HardClip => 5,
+                    Kind::Pad => 6,
+                    Kind::SequenceMatch => 7,
+                    Kind::SequenceMismatch => 8,
+                };
+                match kind {
+                    Kind::Match
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch
+                    | Kind::Deletion
+                    | Kind::Skip => {
+                        ref_len += len;
+                    }
+                    _ => {}
+                }
+                encode_op(op_code, *len)
+            })
+            .collect();
+
+        // Calculate mate position and template length for FR pair detection.
+        // Use a typical insert size of 200bp.
         let insert_size: i32 = 200;
-        let (mate_start, tlen) = if is_reverse {
+        let (mate_pos_0based, tlen) = if is_reverse {
             // Read on reverse strand: mate should be before this read
-            let mate_pos = (ref_start as i32 - insert_size + ref_len as i32).max(1) as usize;
-            (mate_pos, -insert_size)
+            let mate_1based = (ref_start as i32 - insert_size + ref_len as i32).max(1) as usize;
+            ((mate_1based - 1) as i32, -insert_size)
         } else {
             // Read on positive strand: mate should be after this read
-            let mate_pos = ((ref_start as i32) + insert_size - (ref_len as i32)).max(1) as usize;
-            (mate_pos, insert_size)
+            let mate_1based = ((ref_start as i32) + insert_size - (ref_len as i32)).max(1) as usize;
+            ((mate_1based - 1) as i32, insert_size)
         };
 
-        let seq_str = String::from_utf8_lossy(seq);
-        RecordBuilder::new()
-            .name(name)
-            .sequence(&seq_str)
+        let mut b = SamBuilder::new();
+        b.read_name(name.as_bytes())
+            .ref_id(0)
+            .pos((ref_start - 1) as i32)
+            .mapq(60)
+            .flags(flg)
+            .cigar_ops(&raw_cigar)
+            .sequence(seq)
             .qualities(qual)
-            .reference_sequence_id(0)
-            .alignment_start(ref_start)
-            .cigar(&cigar_str)
-            .first_segment(is_first)
-            .properly_paired(true)
-            .reverse_complement(is_reverse)
-            .mate_reverse_complement(mate_is_reverse)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(mate_start)
-            .template_length(tlen)
-            .tag("MI", "UMI123")
-            .build()
+            .mate_ref_id(0)
+            .mate_pos(mate_pos_0based)
+            .template_length(tlen);
+        b.add_string_tag(b"MI", b"UMI123");
+        b.build()
     }
 
     #[test]
@@ -1774,56 +1746,6 @@ mod tests {
             &[(Kind::Match, 4)],
         );
         assert!(!caller.is_fr_pair(&r1_ff));
-    }
-
-    #[test]
-    fn test_simplify_cigar() {
-        use noodles::sam::alignment::record::cigar::op::Kind;
-
-        // Test simple match
-        let read = create_test_paired_read(
-            "read",
-            b"ACGTACGT",
-            b"########",
-            true,
-            false,
-            true,
-            100,
-            &[(Kind::Match, 8)],
-        );
-        assert_eq!(cigar_utils::simplify_cigar(read.cigar()), vec![(Kind::Match, 8)]);
-
-        // Test with indels
-        let read_indel = create_test_paired_read(
-            "read",
-            b"ACGTACGT",
-            b"########",
-            true,
-            false,
-            true,
-            100,
-            &[(Kind::Match, 4), (Kind::Deletion, 2), (Kind::Match, 4)],
-        );
-        assert_eq!(
-            cigar_utils::simplify_cigar(read_indel.cigar()),
-            vec![(Kind::Match, 4), (Kind::Deletion, 2), (Kind::Match, 4)]
-        );
-
-        // Test coalescing: soft clip + match should coalesce to match
-        let read_softclip = create_test_paired_read(
-            "read",
-            b"ACGTACGT",
-            b"########",
-            true,
-            false,
-            true,
-            100,
-            &[(Kind::SoftClip, 2), (Kind::Match, 6)],
-        );
-        assert_eq!(
-            cigar_utils::simplify_cigar(read_softclip.cigar()),
-            vec![(Kind::Match, 8)] // Should coalesce S+M to M
-        );
     }
 
     #[test]
@@ -1952,14 +1874,14 @@ mod tests {
         // (smaller CIGAR wins, and 3 < 4 in the first element comparison)
         // Verify that the filtered reads are the 3M1D1M reads (r3_del and r4_del)
         for read in &filtered {
-            let cigar = read.cigar();
-            assert_eq!(cigar.as_ref().len(), 3, "Expected 3-op cigar (3M1D1M)");
-            let ops: Vec<_> = cigar.iter().map(|r| r.expect("failed to get ops")).collect();
-            assert_eq!(ops[0].kind(), Kind::Match);
+            let view = RawRecordView::new(read);
+            let ops: Vec<_> = view.cigar_ops_typed().collect();
+            assert_eq!(ops.len(), 3, "Expected 3-op cigar (3M1D1M)");
+            assert_eq!(ops[0].kind(), CigarKind::Match);
             assert_eq!(ops[0].len(), 3);
-            assert_eq!(ops[1].kind(), Kind::Deletion);
+            assert_eq!(ops[1].kind(), CigarKind::Deletion);
             assert_eq!(ops[1].len(), 1);
-            assert_eq!(ops[2].kind(), Kind::Match);
+            assert_eq!(ops[2].kind(), CigarKind::Match);
             assert_eq!(ops[2].len(), 1);
         }
         // 2 reads should be rejected
@@ -2047,15 +1969,15 @@ mod tests {
         // Since 2 < 3, Group A wins (the 3M1I2M reads)
         // Without reversal, Group B would win
         for read in &filtered {
-            let cigar = read.cigar();
-            let ops: Vec<_> = cigar.iter().map(|r| r.expect("failed to get ops")).collect();
+            let view = RawRecordView::new(read);
+            let ops: Vec<_> = view.cigar_ops_typed().collect();
             assert_eq!(ops.len(), 3, "Expected 3-op cigar");
             // The original CIGAR should be 3M1I2M (Group A)
-            assert_eq!(ops[0].kind(), Kind::Match);
+            assert_eq!(ops[0].kind(), CigarKind::Match);
             assert_eq!(ops[0].len(), 3, "Expected first element to be 3M (Group A won)");
-            assert_eq!(ops[1].kind(), Kind::Insertion);
+            assert_eq!(ops[1].kind(), CigarKind::Insertion);
             assert_eq!(ops[1].len(), 1);
-            assert_eq!(ops[2].kind(), Kind::Match);
+            assert_eq!(ops[2].kind(), CigarKind::Match);
             assert_eq!(ops[2].len(), 2);
         }
 
@@ -2098,12 +2020,24 @@ mod tests {
         rx_tag: Option<&str>,
         strand1_reverse: bool,
         strand2_reverse: bool,
-    ) -> Vec<RecordBuf> {
+    ) -> Vec<RawRecord> {
+        // PROPERLY_PAIRED flag (0x2) is not in the flags module, define locally.
+        const PROPERLY_PAIRED: u16 = 0x2;
+
         // Calculate reference end positions based on CIGAR
         let calc_ref_length = |cigar: &[(Kind, usize)]| -> usize {
             cigar
                 .iter()
-                .filter(|(k, _)| matches!(k, Kind::Match | Kind::Deletion | Kind::Skip))
+                .filter(|(k, _)| {
+                    matches!(
+                        k,
+                        Kind::Match
+                            | Kind::SequenceMatch
+                            | Kind::SequenceMismatch
+                            | Kind::Deletion
+                            | Kind::Skip
+                    )
+                })
                 .map(|(_, len)| *len)
                 .sum()
         };
@@ -2158,28 +2092,29 @@ mod tests {
         let qual1 = vec![base_quality; seq1.len()];
         let qual2 = vec![base_quality; seq2.len()];
 
-        // Convert CIGAR ops to strings
-        let cigar_to_str = |cigar: &[(Kind, usize)]| -> String {
-            use std::fmt::Write;
-            cigar.iter().fold(String::new(), |mut acc, (kind, len)| {
-                let c = match kind {
-                    Kind::Match => 'M',
-                    Kind::Insertion => 'I',
-                    Kind::Deletion => 'D',
-                    Kind::SoftClip => 'S',
-                    Kind::HardClip => 'H',
-                    Kind::Skip => 'N',
-                    Kind::Pad => 'P',
-                    Kind::SequenceMatch => '=',
-                    Kind::SequenceMismatch => 'X',
-                };
-                let _ = write!(acc, "{len}{c}");
-                acc
-            })
+        // Encode CIGAR ops as raw u32 values
+        let encode_cigar = |cigar: &[(Kind, usize)]| -> Vec<u32> {
+            cigar
+                .iter()
+                .map(|(kind, len)| {
+                    let op_code: u32 = match kind {
+                        Kind::Match => 0,
+                        Kind::Insertion => 1,
+                        Kind::Deletion => 2,
+                        Kind::Skip => 3,
+                        Kind::SoftClip => 4,
+                        Kind::HardClip => 5,
+                        Kind::Pad => 6,
+                        Kind::SequenceMatch => 7,
+                        Kind::SequenceMismatch => 8,
+                    };
+                    encode_op(op_code, *len)
+                })
+                .collect()
         };
 
-        let cigar1_str = cigar_to_str(cigar1);
-        let cigar2_str = cigar_to_str(cigar2);
+        let raw_cigar1 = encode_cigar(cigar1);
+        let raw_cigar2 = encode_cigar(cigar2);
 
         // Calculate template length (insert size)
         // For FR pairs, template length should be positive for the leftmost read
@@ -2189,51 +2124,57 @@ mod tests {
             -((start1 + ref_len1 - start2) as i32)
         };
 
-        // Build R1
-        let seq1_str = String::from_utf8_lossy(&seq1);
-        let mut r1_builder = RecordBuilder::new()
-            .name(name)
-            .sequence(&seq1_str)
-            .qualities(&qual1)
-            .reference_sequence_id(0)
-            .alignment_start(start1)
-            .cigar(&cigar1_str)
-            .first_segment(true)
-            .properly_paired(true)
-            .reverse_complement(strand1_reverse)
-            .mate_reverse_complement(strand2_reverse)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(start2)
-            .template_length(template_len)
-            .tag("MI", mi_tag);
+        // Build R1 flags
+        let r1_flags = flags::PAIRED
+            | PROPERLY_PAIRED
+            | flags::FIRST_SEGMENT
+            | if strand1_reverse { flags::REVERSE } else { 0 }
+            | if strand2_reverse { flags::MATE_REVERSE } else { 0 };
 
+        // Build R1
+        let mut b1 = SamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(r1_flags)
+            .ref_id(0)
+            .pos((start1 - 1) as i32)
+            .mapq(60)
+            .cigar_ops(&raw_cigar1)
+            .sequence(&seq1)
+            .qualities(&qual1)
+            .mate_ref_id(0)
+            .mate_pos((start2 - 1) as i32)
+            .template_length(template_len);
+        b1.add_string_tag(b"MI", mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            r1_builder = r1_builder.tag("RX", rx);
+            b1.add_string_tag(b"RX", rx.as_bytes());
         }
-        let r1 = r1_builder.build();
+        let r1 = b1.build();
+
+        // Build R2 flags
+        let r2_flags = flags::PAIRED
+            | PROPERLY_PAIRED
+            | flags::LAST_SEGMENT
+            | if strand2_reverse { flags::REVERSE } else { 0 }
+            | if strand1_reverse { flags::MATE_REVERSE } else { 0 };
 
         // Build R2
-        let seq2_str = String::from_utf8_lossy(&seq2);
-        let mut r2_builder = RecordBuilder::new()
-            .name(name)
-            .sequence(&seq2_str)
+        let mut b2 = SamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(r2_flags)
+            .ref_id(0)
+            .pos((start2 - 1) as i32)
+            .mapq(60)
+            .cigar_ops(&raw_cigar2)
+            .sequence(&seq2)
             .qualities(&qual2)
-            .reference_sequence_id(0)
-            .alignment_start(start2)
-            .cigar(&cigar2_str)
-            .first_segment(false)
-            .properly_paired(true)
-            .reverse_complement(strand2_reverse)
-            .mate_reverse_complement(strand1_reverse)
-            .mate_reference_sequence_id(0)
-            .mate_alignment_start(start1)
-            .template_length(-template_len)
-            .tag("MI", mi_tag);
-
+            .mate_ref_id(0)
+            .mate_pos((start1 - 1) as i32)
+            .template_length(-template_len);
+        b2.add_string_tag(b"MI", mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            r2_builder = r2_builder.tag("RX", rx);
+            b2.add_string_tag(b"RX", rx.as_bytes());
         }
-        let r2 = r2_builder.build();
+        let r2 = b2.build();
 
         vec![r1, r2]
     }
@@ -2513,7 +2454,8 @@ mod tests {
 
         // Mark R2 as unmapped
         let r2 = &mut reads[1];
-        *r2.flags_mut() = r2.flags() | Flags::UNMAPPED;
+        let new_flags = r2.flags() | flags::UNMAPPED;
+        r2.view_mut().set_flags(new_flags);
 
         let output = caller
             .consensus_reads_from_sam_records(reads)
@@ -2802,10 +2744,9 @@ mod tests {
         );
 
         // Modify R1 to be on a different reference (chromosome)
-        // In noodles, reference_sequence_id is Option<usize>
-        *reads[0].reference_sequence_id_mut() = Some(2); // Different chromosome
+        reads[0].view_mut().set_ref_id(2); // Different chromosome
         // Update mate's reference for consistency
-        *reads[1].mate_reference_sequence_id_mut() = Some(2);
+        reads[1].view_mut().set_mate_ref_id(2);
 
         let output = caller
             .consensus_reads_from_sam_records(reads)
@@ -3121,15 +3062,13 @@ mod tests {
             &[(Kind::Match, 4)],
         );
 
-        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
-
         // Clip 10 bases from a 4bp read (clip_from_start = false)
-        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&raw, 0, 10, false, None);
+        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&read, 0, 10, false, None);
         assert!(source.bases.is_empty(), "Bases should be empty after over-clipping");
         assert!(source.quals.is_empty(), "Quals should be empty after over-clipping");
 
         // Clip 10 bases from start of a 4bp read (clip_from_start = true)
-        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&raw, 0, 10, true, None);
+        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&read, 0, 10, true, None);
         assert!(source.bases.is_empty(), "Bases should be empty after over-clipping from start");
     }
 
@@ -3149,8 +3088,7 @@ mod tests {
             &[(Kind::Match, 4)],
         );
 
-        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
-        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&raw, 0, 4, false, None);
+        let source = CodecConsensusCaller::to_source_read_for_codec_raw(&read, 0, 4, false, None);
         assert!(source.bases.is_empty());
         assert!(source.quals.is_empty());
     }
@@ -3173,8 +3111,7 @@ mod tests {
             100, // 1-based pos -> 0-based = 99
             &[(Kind::Match, 8)],
         );
-        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
-        let info = CodecConsensusCaller::build_clipped_info(&raw, 0, 0);
+        let info = CodecConsensusCaller::build_clipped_info(&read, 0, 0);
 
         assert_eq!(info.raw_idx, 0);
         assert_eq!(info.clip_amount, 0);
@@ -3197,8 +3134,7 @@ mod tests {
             100,
             &[(Kind::Match, 8)],
         );
-        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
-        let info = CodecConsensusCaller::build_clipped_info(&raw, 5, 3);
+        let info = CodecConsensusCaller::build_clipped_info(&read, 5, 3);
 
         assert_eq!(info.raw_idx, 5);
         assert_eq!(info.clip_amount, 3);
@@ -3221,8 +3157,7 @@ mod tests {
             100,
             &[(Kind::Match, 8)],
         );
-        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
-        let info = CodecConsensusCaller::build_clipped_info(&raw, 2, 3);
+        let info = CodecConsensusCaller::build_clipped_info(&read, 2, 3);
 
         assert_eq!(info.raw_idx, 2);
         assert_eq!(info.clip_amount, 3);
@@ -3246,8 +3181,7 @@ mod tests {
             50,
             &[(Kind::Match, 4)],
         );
-        let raw = CodecConsensusCaller::record_buf_to_raw(&read);
-        let info = CodecConsensusCaller::build_clipped_info(&raw, 0, 0);
+        let info = CodecConsensusCaller::build_clipped_info(&read, 0, 0);
 
         assert_eq!(info.clipped_seq_len, 4);
         assert_eq!(info.adjusted_pos, 50);
@@ -3730,7 +3664,7 @@ mod tests {
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Create 5 R1s and 5 R2s
-        let r1s: Vec<RecordBuf> = (0..5)
+        let r1s: Vec<RawRecord> = (0..5)
             .map(|i| {
                 create_test_paired_read(
                     &format!("r{i}"),
@@ -3744,7 +3678,7 @@ mod tests {
                 )
             })
             .collect();
-        let r2s: Vec<RecordBuf> = (0..5)
+        let r2s: Vec<RawRecord> = (0..5)
             .map(|i| {
                 create_test_paired_read(
                     &format!("r{i}"),
@@ -3772,7 +3706,7 @@ mod tests {
         let options = CodecConsensusOptions { max_reads_per_strand: None, ..Default::default() };
         let mut caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
-        let r1s: Vec<RecordBuf> = (0..5)
+        let r1s: Vec<RawRecord> = (0..5)
             .map(|i| {
                 create_test_paired_read(
                     &format!("r{i}"),
@@ -3786,7 +3720,7 @@ mod tests {
                 )
             })
             .collect();
-        let r2s: Vec<RecordBuf> = (0..5)
+        let r2s: Vec<RawRecord> = (0..5)
             .map(|i| {
                 create_test_paired_read(
                     &format!("r{i}"),
@@ -3979,11 +3913,13 @@ mod tests {
     #[test]
     fn test_read_pos_at_ref_pos_with_hard_clip() {
         // Create a read with 2H5M2H CIGAR at position 100 (hard clips don't appear in seq)
-        let record = RecordBuilder::new()
-            .sequence("ACGTA") // 5 bases for 5M
-            .alignment_start(100)
-            .cigar("2H5M2H")
-            .build();
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTA") // 5 bases for 5M
+            .qualities(&[30; 5])
+            .pos(99) // 0-based (1-based position 100)
+            .cigar_ops(&[encode_op(5, 2), encode_op(0, 5), encode_op(5, 2)]); // 2H5M2H
+        let record = b.build();
 
         // Position 100 maps to query pos 1 (hard clips don't count)
         assert_eq!(CodecConsensusCaller::read_pos_at_ref_pos(&record, 100, false), Some(1));
@@ -3996,11 +3932,13 @@ mod tests {
         // Create a read with 2D5M at position 100
         // Ref:   100 101 102 103 104 105 106
         // Query:   -   -   1   2   3   4   5
-        let record = RecordBuilder::new()
-            .sequence("ACGTA") // 5 bases for 5M
-            .alignment_start(100)
-            .cigar("2D5M")
-            .build();
+        let mut b = SamBuilder::new();
+        b.read_name(b"read1")
+            .sequence(b"ACGTA") // 5 bases for 5M
+            .qualities(&[30; 5])
+            .pos(99) // 0-based (1-based position 100)
+            .cigar_ops(&[encode_op(2, 2), encode_op(0, 5)]); // 2D5M
+        let record = b.build();
 
         // Position 100 is in deletion at start
         // return_last_base_if_deleted=true with query_offset=0 should return 1
@@ -4014,17 +3952,21 @@ mod tests {
         let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Create two reads that overlap perfectly
-        let r1 = RecordBuilder::new()
-            .sequence(&"A".repeat(50))
-            .alignment_start(100)
-            .cigar("50M")
-            .build();
+        let mut b1 = SamBuilder::new();
+        b1.read_name(b"r1")
+            .sequence(&[b'A'; 50])
+            .qualities(&[30; 50])
+            .pos(99) // 0-based (1-based position 100)
+            .cigar_ops(&[encode_op(0, 50)]); // 50M
+        let r1 = b1.build();
 
-        let r2 = RecordBuilder::new()
-            .sequence(&"A".repeat(50))
-            .alignment_start(120)
-            .cigar("50M")
-            .build();
+        let mut b2 = SamBuilder::new();
+        b2.read_name(b"r2")
+            .sequence(&[b'A'; 50])
+            .qualities(&[30; 50])
+            .pos(119) // 0-based (1-based position 120)
+            .cigar_ops(&[encode_op(0, 50)]); // 50M
+        let r2 = b2.build();
 
         // Overlap region: 120-149
         assert!(caller.check_overlap_phase(&r1, &r2, 120, 149));
@@ -4036,20 +3978,67 @@ mod tests {
         let caller = CodecConsensusCaller::new("codec".to_string(), "RG1".to_string(), options);
 
         // Create two reads where one has a deletion
-        let r1 = RecordBuilder::new()
-            .sequence(&"A".repeat(50))
-            .alignment_start(100)
-            .cigar("50M")
-            .build();
+        let mut b1 = SamBuilder::new();
+        b1.read_name(b"r1")
+            .sequence(&[b'A'; 50])
+            .qualities(&[30; 50])
+            .pos(99) // 0-based (1-based position 100)
+            .cigar_ops(&[encode_op(0, 50)]); // 50M
+        let r1 = b1.build();
 
         // r2 has a 2bp deletion in the overlap region
-        let r2 = RecordBuilder::new()
-            .sequence(&"A".repeat(48)) // 15M + 33M = 48 bases (deletion doesn't consume query)
-            .alignment_start(120)
-            .cigar("15M2D33M")
-            .build();
+        let mut b2 = SamBuilder::new();
+        b2.read_name(b"r2")
+            .sequence(&[b'A'; 48]) // 15M + 33M = 48 bases (deletion doesn't consume query)
+            .qualities(&[30; 48])
+            .pos(119) // 0-based (1-based position 120)
+            .cigar_ops(&[encode_op(0, 15), encode_op(2, 2), encode_op(0, 33)]); // 15M2D33M
+        let r2 = b2.build();
 
         // Overlap region spans the deletion - phases should differ
         assert!(!caller.check_overlap_phase(&r1, &r2, 120, 149));
+    }
+
+    /// Regression: `create_fr_pair` used to compute TLEN only from `Kind::Match`,
+    /// `Kind::Deletion`, and `Kind::Skip`, so CIGARs built from `=`/`X` produced
+    /// a reference length of 0 and the wrong insert size. `Kind::SequenceMatch`
+    /// and `Kind::SequenceMismatch` must yield the same TLEN as the equivalent
+    /// `M` CIGAR.
+    #[test]
+    fn test_create_fr_pair_tlen_with_sequence_match_cigars() {
+        let match_reads = create_fr_pair(
+            "read_m",
+            1,
+            71,
+            30,
+            35,
+            &[(Kind::Match, 30)],
+            &[(Kind::Match, 30)],
+            "mi1",
+            None,
+            false,
+            true,
+        );
+        let eq_x_reads = create_fr_pair(
+            "read_eqx",
+            1,
+            71,
+            30,
+            35,
+            &[(Kind::SequenceMatch, 25), (Kind::SequenceMismatch, 5)],
+            &[(Kind::SequenceMatch, 15), (Kind::SequenceMismatch, 15)],
+            "mi1",
+            None,
+            false,
+            true,
+        );
+
+        let match_r1_tlen = RawRecordView::new(match_reads[0].as_ref()).template_length();
+        let eq_x_r1_tlen = RawRecordView::new(eq_x_reads[0].as_ref()).template_length();
+        assert_eq!(
+            match_r1_tlen, eq_x_r1_tlen,
+            "TLEN must match between M and =/X CIGARs with identical reference consumption"
+        );
+        assert_eq!(match_r1_tlen, 100, "Expected TLEN=100 for start1=1, start2=71, ref_len=30");
     }
 }

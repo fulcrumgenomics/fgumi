@@ -904,7 +904,7 @@ impl FastqPipelineConfig {
         self
     }
 
-    /// Enable or disable the userspace async prefetch reader for BGZF FASTQ inputs.
+    /// Enable or disable the async userspace prefetch reader on BGZF FASTQ inputs.
     #[must_use]
     pub fn with_async_reader(mut self, enabled: bool) -> Self {
         self.async_reader = enabled;
@@ -3696,7 +3696,7 @@ where
             log::debug!("run_fastq_pipeline: using {num_readers} Decompressed readers");
             readers.into_iter().map(StreamReader::Decompressed).collect()
         } else {
-            // BGZF: open each file as StreamReader::Bgzf. Apply POSIX_FADV_SEQUENTIAL
+            // BGZF: open each file as StreamReader::Bgzf. Advise sequential
             // unconditionally on Linux to enlarge the per-fd read-ahead window, and
             // optionally wrap in a userspace async prefetch reader when enabled.
             log::debug!(

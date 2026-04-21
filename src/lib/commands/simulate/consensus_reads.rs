@@ -1,12 +1,12 @@
 //! Generate consensus BAM with tags for filter.
 
-use crate::bam_io::create_bam_writer;
+use crate::bam_io::create_raw_bam_writer;
 use crate::commands::command::Command;
 use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::commands::simulate::common::{MethylationArgs, ReferenceGenome, StrandBiasArgs};
+use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
-use crate::sam::builder::{ConsensusTagsBuilder, RecordBuilder};
 use crate::simulate::{StrandBiasModel, create_rng};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -15,9 +15,8 @@ use fgumi_consensus::MethylationMode;
 use fgumi_consensus::methylation::{
     MethylationAnnotation, MethylationEvidence, build_mm_ml_tags, is_cpg_context,
 };
+use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use log::info;
-use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, LogNormal, Normal};
@@ -120,8 +119,8 @@ pub struct ConsensusReads {
 /// A generated consensus read pair ready for output.
 struct ConsensusReadPair {
     read_name: String,
-    r1_record: RecordBuf,
-    r2_record: RecordBuf,
+    r1_record: RawRecord,
+    r2_record: RawRecord,
     /// Truth data: (cD, cM, cE, aD, bD, aM, bM, aE, bE)
     truth: (i32, i32, i32, i32, i32, i32, i32, i32, i32),
     /// Chromosome name for truth output.
@@ -250,8 +249,12 @@ impl Command for ConsensusReads {
 
         // Spawn writer thread with multi-threaded BGZF compression
         let writer_handle = thread::spawn(move || -> Result<u64> {
-            let mut writer =
-                create_bam_writer(&output_path, &header_clone, writer_threads, compression_level)?;
+            let mut writer = create_raw_bam_writer(
+                &output_path,
+                &header_clone,
+                writer_threads,
+                compression_level,
+            )?;
 
             // Create truth file if requested
             let mut truth_writer = if let Some(ref truth_path) = truth_path {
@@ -272,8 +275,8 @@ impl Command for ConsensusReads {
                 read_count += 1;
                 progress.log_if_needed(1);
 
-                writer.write_alignment_record(&header_clone, &pair.r1_record)?;
-                writer.write_alignment_record(&header_clone, &pair.r2_record)?;
+                writer.write_raw_record(pair.r1_record.as_ref())?;
+                writer.write_raw_record(pair.r2_record.as_ref())?;
 
                 // Write truth
                 if let Some(ref mut tw) = truth_writer {
@@ -292,6 +295,8 @@ impl Command for ConsensusReads {
             if let Some(ref mut tw) = truth_writer {
                 tw.flush()?;
             }
+
+            writer.finish()?;
 
             Ok(read_count)
         });
@@ -642,71 +647,99 @@ fn build_consensus_record(
     duplex_tags: Option<(i32, i32, i32, i32, i32, i32)>,
     methylation: Option<&MethylationData>,
     methylation_mode: MethylationMode,
-) -> RecordBuf {
-    let seq_str = String::from_utf8_lossy(seq);
+) -> RawRecord {
     let is_top_strand = !is_reverse;
 
-    // Build consensus tags (note: cE is error count in this file, not error rate)
-    let mut consensus_tags =
-        ConsensusTagsBuilder::new().depth_max(cd).depth_min(cm).tag_ce_as_int(ce);
+    // Build flags: PAIRED + PROPER_PAIR + (FIRST_SEGMENT or LAST_SEGMENT) + reverse-strand bits.
+    // Consensus records are simulated proper paired alignments; downstream tools commonly
+    // filter on the 0x2 bit, so set it explicitly.
+    let segment_flag = if is_first { raw_flags::FIRST_SEGMENT } else { raw_flags::LAST_SEGMENT };
+    let reverse_flag = if is_reverse { raw_flags::REVERSE } else { 0 };
+    let mate_reverse_flag = if is_reverse { 0 } else { raw_flags::MATE_REVERSE };
+    let flags = raw_flags::PAIRED
+        | raw_flags::PROPER_PAIR
+        | segment_flag
+        | reverse_flag
+        | mate_reverse_flag;
 
-    // Add duplex-specific tags if present
+    // Single CIGAR op: {seq.len()}M (match). Consensus records are gap-free.
+    let n = u32::try_from(seq.len()).expect("sequence length fits u32");
+    // BAM CIGAR encoding: (length << 4) | op_code. op_code 0 = M (alignment match).
+    let cigar_ops: Vec<u32> = if n > 0 { vec![n << 4] } else { Vec::new() };
+
+    // Pre-compute bin for the alignment range (use unmapped bin for empty seq).
+    let bin = if n > 0 {
+        let alignment_start_1based =
+            u32::try_from(local_pos + 1).expect("alignment start fits u32");
+        let alignment_end_1based = alignment_start_1based + n - 1;
+        region_to_bin(Some(alignment_start_1based), Some(alignment_end_1based))
+    } else {
+        region_to_bin(None, None)
+    };
+
+    let chrom_idx_i32 = i32::try_from(chrom_idx).expect("chrom_idx fits i32");
+    let local_pos_i32 = i32::try_from(local_pos).expect("local_pos fits i32");
+
+    let mut b = SamBuilder::new();
+    b.read_name(name.as_bytes())
+        .flags(flags)
+        .ref_id(chrom_idx_i32)
+        .pos(local_pos_i32)
+        .mapq(60)
+        .bin(bin)
+        .mate_ref_id(chrom_idx_i32)
+        .mate_pos(local_pos_i32) // R1 and R2 at same position
+        .template_length(0)
+        .cigar_ops(&cigar_ops)
+        .sequence(seq)
+        .qualities(quals);
+
+    // Add consensus tags (note: cE is error count in this file, not error rate).
+    b.add_int_tag(b"cD", cd).add_int_tag(b"cM", cm).add_int_tag(b"cE", ce);
+
+    // Add duplex-specific tags if present.
     if let Some((ad, bd, am, bm, ae, be)) = duplex_tags {
-        consensus_tags = consensus_tags
-            .ab_depth(ad)
-            .ba_depth(bd)
-            .ab_min_depth(am)
-            .ba_min_depth(bm)
-            .ab_errors_int(ae)
-            .ba_errors_int(be);
+        b.add_int_tag(b"aD", ad)
+            .add_int_tag(b"bD", bd)
+            .add_int_tag(b"aM", am)
+            .add_int_tag(b"bM", bm)
+            .add_int_tag(b"aE", ae)
+            .add_int_tag(b"bE", be);
     }
 
-    let mut builder = RecordBuilder::new()
-        .name(name)
-        .sequence(&seq_str)
-        .qualities(quals)
-        .paired(true)
-        .first_segment(is_first)
-        .reference_sequence_id(chrom_idx)
-        .alignment_start(local_pos + 1) // Convert 0-based to 1-based
-        .mapping_quality(60)
-        .reverse_complement(is_reverse)
-        .mate_reverse_complement(!is_reverse)
-        .mate_reference_sequence_id(chrom_idx)
-        .mate_alignment_start(local_pos + 1) // R1 and R2 at same position
-        .template_length(0)
-        .consensus_tags(consensus_tags);
-
-    // Add methylation tags if enabled
+    // Add methylation tags if enabled.
     if let Some(meth) = methylation {
-        // Add cu/ct tags (unconverted/converted counts per position)
+        // cu/ct tags (unconverted/converted counts per position).
         let cu: Vec<i16> = meth.annotation.unconverted_counts();
         let ct: Vec<i16> = meth.annotation.converted_counts();
-        builder = builder.tag("cu", cu).tag("ct", ct);
+        b.add_array_i16(b"cu", &cu).add_array_i16(b"ct", &ct);
 
-        // Add MM/ML tags (SAM spec methylation tags)
+        // MM/ML tags (SAM spec methylation tags).
         if let Some((mm, ml)) =
             build_mm_ml_tags(seq, &meth.annotation, is_top_strand, methylation_mode)
         {
-            builder = builder.tag("MM", mm).tag("ML", ml);
+            b.add_string_tag(b"MM", mm.as_bytes()).add_array_u8(b"ML", &ml);
         }
 
-        // Add duplex per-strand tags
+        // Duplex per-strand tags.
         if let (Some(ab), Some(ba)) = (&meth.ab_annotation, &meth.ba_annotation) {
             let au: Vec<i16> = ab.unconverted_counts();
             let at: Vec<i16> = ab.converted_counts();
             let bu: Vec<i16> = ba.unconverted_counts();
             let bt: Vec<i16> = ba.converted_counts();
-            builder = builder.tag("au", au).tag("at", at).tag("bu", bu).tag("bt", bt);
+            b.add_array_i16(b"au", &au)
+                .add_array_i16(b"at", &at)
+                .add_array_i16(b"bu", &bu)
+                .add_array_i16(b"bt", &bt);
 
-            // Add per-strand MM tags (am/bm)
+            // Per-strand MM tags (am/bm).
             if let Some(am) = fgumi_consensus::methylation::build_mm_tag_no_ml(
                 seq,
                 ab,
                 is_top_strand,
                 methylation_mode,
             ) {
-                builder = builder.tag("am", am);
+                b.add_string_tag(b"am", am.as_bytes());
             }
             if let Some(bm) = fgumi_consensus::methylation::build_mm_tag_no_ml(
                 seq,
@@ -714,12 +747,12 @@ fn build_consensus_record(
                 is_top_strand,
                 methylation_mode,
             ) {
-                builder = builder.tag("bm", bm);
+                b.add_string_tag(b"bm", bm.as_bytes());
             }
         }
     }
 
-    builder.build()
+    b.build()
 }
 
 #[cfg(test)]
@@ -727,6 +760,13 @@ mod tests {
     use super::*;
     use crate::commands::simulate::common::generate_random_sequence;
     use crate::simulate::create_rng;
+
+    /// Decode a raw BAM record into a noodles `RecordBuf` for higher-level test
+    /// assertions.
+    fn to_record_buf(raw: &RawRecord) -> noodles::sam::alignment::RecordBuf {
+        fgumi_raw_bam::raw_record_to_record_buf(raw, &noodles::sam::Header::default())
+            .expect("raw_record_to_record_buf failed in test")
+    }
 
     #[test]
     fn test_generate_random_sequence_length() {
@@ -793,7 +833,7 @@ mod tests {
         let seq = b"ACGTACGT";
         let quals = vec![40; 8];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test_read/1",
             seq,
             &quals,
@@ -808,6 +848,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
         let flags = record.flags();
@@ -821,7 +862,7 @@ mod tests {
         let seq = b"ACGTACGT";
         let quals = vec![40; 8];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test_read/1",
             seq,
             &quals,
@@ -836,6 +877,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
         let flags = record.flags();
@@ -847,7 +889,7 @@ mod tests {
         let seq = b"ACGT";
         let quals = vec![40; 4];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test_read/2",
             seq,
             &quals,
@@ -862,6 +904,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         let flags = record.flags();
         assert!(flags.is_last_segment());
@@ -920,7 +963,7 @@ mod tests {
         let seq = b"ACGT";
         let quals = vec![40; 4];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -935,6 +978,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         let flags = record.flags();
         assert!(!flags.is_mate_unmapped());
@@ -948,7 +992,7 @@ mod tests {
         let seq = b"ACGT";
         let quals = vec![40; 4];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -963,6 +1007,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         let flags = record.flags();
         assert!(flags.is_segmented());
@@ -973,7 +1018,7 @@ mod tests {
         let seq = b"ACGTACGTACGT";
         let quals = vec![40; 12];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -988,6 +1033,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         // Verify sequence length matches
         assert_eq!(record.sequence().len(), 12);
@@ -998,7 +1044,7 @@ mod tests {
         let seq = b"ACGT";
         let quals = vec![10, 20, 30, 40];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1013,6 +1059,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         let record_quals: Vec<u8> = record.quality_scores().iter().collect();
         assert_eq!(record_quals, quals);
@@ -1023,7 +1070,7 @@ mod tests {
         let seq: &[u8] = b"";
         let quals: Vec<u8> = vec![];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1038,6 +1085,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
     }
@@ -1047,7 +1095,7 @@ mod tests {
         let seq = vec![b'A'; 500];
         let quals = vec![40; 500];
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             &seq,
             &quals,
@@ -1062,6 +1110,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert_eq!(record.sequence().len(), 500);
     }
@@ -1072,7 +1121,7 @@ mod tests {
         let quals = vec![40; 4];
 
         // Edge case: zero depth (shouldn't happen normally but test it)
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1087,6 +1136,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
     }
@@ -1097,7 +1147,7 @@ mod tests {
         let quals = vec![40; 4];
 
         // High error count (more errors than bases)
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1112,6 +1162,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
     }
@@ -1158,7 +1209,7 @@ mod tests {
         let ad = 6;
         let bd = 4;
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1173,6 +1224,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
         // The record should be valid with these tag values
@@ -1184,7 +1236,7 @@ mod tests {
         let quals = vec![40; 4];
 
         for name in ["read1/1", "consensus_00000001/1", "test-read_123/2", "a/1"] {
-            let record = build_consensus_record(
+            let raw = build_consensus_record(
                 name,
                 seq,
                 &quals,
@@ -1199,6 +1251,7 @@ mod tests {
                 None,
                 MethylationMode::Disabled,
             );
+            let record = to_record_buf(&raw);
             assert!(record.name().is_some());
         }
     }
@@ -1293,7 +1346,7 @@ mod tests {
             &mut rng,
         );
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1308,6 +1361,7 @@ mod tests {
             Some(&meth),
             MethylationMode::EmSeq,
         );
+        let record = to_record_buf(&raw);
 
         // Verify methylation tags are present
         assert!(record.name().is_some());
@@ -1352,7 +1406,7 @@ mod tests {
         assert_eq!(ab.unconverted_counts().len(), seq.len());
         assert_eq!(ba.converted_counts().len(), seq.len());
 
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1367,6 +1421,7 @@ mod tests {
             Some(&meth),
             MethylationMode::EmSeq,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
     }
@@ -1377,7 +1432,7 @@ mod tests {
         let quals = vec![40; 8];
 
         // When no methylation data is passed, record should still build fine
-        let record = build_consensus_record(
+        let raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1392,6 +1447,7 @@ mod tests {
             None,
             MethylationMode::Disabled,
         );
+        let record = to_record_buf(&raw);
 
         assert!(record.name().is_some());
     }
@@ -1620,7 +1676,7 @@ mod tests {
         let meth = MethylationData { annotation, ab_annotation: None, ba_annotation: None };
 
         // Build R1 record (uses original methylation)
-        let r1 = build_consensus_record(
+        let r1_raw = build_consensus_record(
             "test/1",
             seq,
             &quals,
@@ -1635,11 +1691,12 @@ mod tests {
             Some(&meth),
             MethylationMode::EmSeq,
         );
+        let r1 = to_record_buf(&r1_raw);
 
         // Build R2 record with reversed methylation (as generate_consensus_pair does)
         let r2_seq = reverse_complement(seq);
         let r2_meth = meth.reverse();
-        let r2 = build_consensus_record(
+        let r2_raw = build_consensus_record(
             "test/2",
             &r2_seq,
             &quals,
@@ -1654,6 +1711,7 @@ mod tests {
             Some(&r2_meth),
             MethylationMode::EmSeq,
         );
+        let r2 = to_record_buf(&r2_raw);
 
         // Extract cu tags from both records
         let cu_tag = Tag::from([b'c', b'u']);
@@ -1724,18 +1782,20 @@ mod tests {
         let strand_bias = StrandBiasModel::new(5.0, 5.0);
 
         let pair = generate_consensus_pair(0, 42, &params, &strand_bias);
+        let r1 = to_record_buf(&pair.r1_record);
+        let r2 = to_record_buf(&pair.r2_record);
 
         // Records should be mapped
-        assert!(!pair.r1_record.flags().is_unmapped());
-        assert!(!pair.r2_record.flags().is_unmapped());
+        assert!(!r1.flags().is_unmapped());
+        assert!(!r2.flags().is_unmapped());
 
         // Records should have reference sequence ID
-        assert!(pair.r1_record.reference_sequence_id().is_some());
-        assert!(pair.r2_record.reference_sequence_id().is_some());
+        assert!(r1.reference_sequence_id().is_some());
+        assert!(r2.reference_sequence_id().is_some());
 
         // Records should have alignment start
-        assert!(pair.r1_record.alignment_start().is_some());
-        assert!(pair.r2_record.alignment_start().is_some());
+        assert!(r1.alignment_start().is_some());
+        assert!(r2.alignment_start().is_some());
 
         // Chrom name should be set
         assert_eq!(pair.chrom_name, "chr1");

@@ -746,7 +746,7 @@ fn process_position_group(
         }
     }
 
-    // Count reads and check for missing pa tags
+    // Count reads and check for missing tc tags
     let tc_tag_bytes: [u8; 2] = *TC_TAG.as_ref();
     for template in &templates {
         dedup_metrics.total_templates += 1;

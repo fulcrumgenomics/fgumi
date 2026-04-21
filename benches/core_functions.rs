@@ -24,7 +24,6 @@ use fgumi_lib::phred::{
 };
 use fgumi_lib::sam::record_utils::parse_cigar_string;
 use fgumi_lib::umi::assigner::{Strategy, count_mismatches, matches_within_threshold};
-use fgumi_lib::vendored::bam_codec::encode_record_buf;
 use fgumi_raw_bam::RawRecord;
 use noodles::core::Position;
 use noodles::sam::alignment::record::Flags;
@@ -350,11 +349,7 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
         let header = noodles::sam::Header::default();
         let raw_reads: Vec<RawRecord> = reads
             .iter()
-            .map(|rec| {
-                let mut buf = Vec::new();
-                encode_record_buf(&mut buf, &header, rec).unwrap();
-                RawRecord::from(buf)
-            })
+            .map(|rec| fgumi_raw_bam::encode_record_buf_to_raw(rec, &header).unwrap())
             .collect();
 
         group.throughput(Throughput::Elements(num_reads as u64));
@@ -381,11 +376,7 @@ fn bench_vanilla_consensus_caller(c: &mut Criterion) {
         let header = noodles::sam::Header::default();
         let raw_reads: Vec<RawRecord> = reads
             .iter()
-            .map(|rec| {
-                let mut buf = Vec::new();
-                encode_record_buf(&mut buf, &header, rec).unwrap();
-                RawRecord::from(buf)
-            })
+            .map(|rec| fgumi_raw_bam::encode_record_buf_to_raw(rec, &header).unwrap())
             .collect();
 
         group.throughput(Throughput::Bytes(read_len as u64 * 5));
