@@ -9,7 +9,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+#[cfg(test)]
 use crate::bam_io::create_bam_reader;
+use crate::bam_io::create_raw_bam_reader;
 use crate::logging::OperationTimer;
 use crate::sort::RawExternalSorter;
 use crate::validation::validate_file_exists;
@@ -176,11 +178,11 @@ fn merge_headers(input_paths: &[PathBuf]) -> Result<Header> {
         bail!("No input files to merge headers from");
     }
 
-    // Read all headers once
+    // Read all headers once (raw reader; records aren't consumed here).
     let headers: Vec<Header> = input_paths
         .iter()
         .map(|path| {
-            let (_, header) = create_bam_reader(path, 1)?;
+            let (_, header) = create_raw_bam_reader(path, 1)?;
             Ok(header)
         })
         .collect::<Result<Vec<_>>>()?;

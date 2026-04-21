@@ -47,7 +47,7 @@
 //! - `TagInfo`: Holds sets of tags to remove/reverse/revcomp
 //! - `merge_raw()`: Core function that transfers metadata between templates using raw bytes
 use crate::bam_io::{
-    BamReaderAuto, create_bam_reader, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
+    RawBamReaderAuto, create_raw_bam_reader, create_raw_bam_writer, is_stdin_path,
 };
 use crate::batched_sam_reader::BatchedSamReader;
 use crate::commands::command::Command;
@@ -943,20 +943,24 @@ impl Zipper {
     }
 }
 
-/// BAM reader for stdin: single-threaded BGZF over a buffered `Box<dyn Read + Send>`.
+/// Raw BAM reader for stdin: single-threaded BGZF over a buffered `Box<dyn Read + Send>`.
 ///
-/// Stdin is non-seekable, so we use a single-threaded BGZF reader (the multi-threaded
-/// variant in [`BamReaderAuto`] requires `Seek`). `BufReader` wraps stdin so we can peek
-/// the BGZF magic bytes for format auto-detection without consuming them.
-type BamStdinReader =
-    noodles::bam::io::Reader<noodles::bgzf::io::Reader<BufReader<Box<dyn Read + Send>>>>;
+/// Stdin is non-seekable, so we use a single-threaded BGZF reader. `BufReader` wraps
+/// stdin so we can peek the BGZF magic bytes for format auto-detection without
+/// consuming them.
+type RawBamStdinReader =
+    fgumi_raw_bam::RawBamReader<noodles::bgzf::io::Reader<BufReader<Box<dyn Read + Send>>>>;
 
 /// Wraps SAM and BAM readers so the mapped-reader thread can handle either format.
-/// Moved into the thread that calls `record_bufs()`, since the iterator borrows `&self`.
+/// Moved into the thread that iterates records, since the iterator owns the reader.
+///
+/// The SAM arm decodes via noodles `RecordBuf` (text-mode SAM has no raw-byte path).
+/// Both BAM arms use `RawBamReader` so records are yielded as raw bytes and fed
+/// directly to `TemplateIterator` without a decode/encode round-trip.
 enum MappedReader {
     Sam(noodles::sam::io::Reader<Box<dyn BufRead + Send>>),
-    Bam(BamReaderAuto),
-    StdinBam(BamStdinReader),
+    Bam(RawBamReaderAuto),
+    StdinBam(RawBamStdinReader),
 }
 
 /// First four bytes of a BGZF stream (gzip magic + extra-flag byte unique to BGZF).
@@ -1060,7 +1064,8 @@ impl Command for Zipper {
                 let bgzf = noodles::bgzf::io::Reader::new(buffered);
                 let mut bam_reader = noodles::bam::io::Reader::from(bgzf);
                 let header = bam_reader.read_header()?;
-                (MappedReader::StdinBam(bam_reader), header)
+                let bgzf = bam_reader.into_inner();
+                (MappedReader::StdinBam(fgumi_raw_bam::RawBamReader::new(bgzf)), header)
             } else {
                 info!(
                     "Reading SAM from stdin with adaptive buffer (bwa -K {})",
@@ -1078,8 +1083,8 @@ impl Command for Zipper {
                 "BAM input detected for --input. For best performance, pipe SAM directly \
                  from the aligner (e.g. bwa mem ... | fgumi zipper ...)."
             );
-            let (bam_reader, header) = create_bam_reader(&self.input, self.threads)?;
-            (MappedReader::Bam(bam_reader), header)
+            let (raw_reader, header) = create_raw_bam_reader(&self.input, self.threads)?;
+            (MappedReader::Bam(raw_reader), header)
         } else {
             // SAM file input
             let reader: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(
@@ -1141,8 +1146,8 @@ impl Command for Zipper {
         let (mapped_tx, mapped_rx) = std::sync::mpsc::sync_channel::<Result<Template>>(self.buffer);
         let mapped_header_for_reader = mapped_header.clone();
         std::thread::spawn(move || {
-            // The reader must be owned for the full duration so that the iterator
-            // (which borrows it via record_bufs) remains valid.
+            // The reader is owned by this thread so its record iterator
+            // outlives each iteration.
             match mapped_reader {
                 MappedReader::Sam(mut r) => {
                     let record_iter = r
@@ -1155,23 +1160,15 @@ impl Command for Zipper {
                         }
                     }
                 }
-                MappedReader::Bam(mut r) => {
-                    let record_iter = r
-                        .record_bufs(&mapped_header_for_reader)
-                        .map(|rec| rec.map_err(anyhow::Error::from));
-                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
-                    {
+                MappedReader::Bam(r) => {
+                    for template in TemplateIterator::new(r) {
                         if mapped_tx.send(template).is_err() {
                             break;
                         }
                     }
                 }
-                MappedReader::StdinBam(mut r) => {
-                    let record_iter = r
-                        .record_bufs(&mapped_header_for_reader)
-                        .map(|rec| rec.map_err(anyhow::Error::from));
-                    for template in record_bufs_to_templates(record_iter, &mapped_header_for_reader)
-                    {
+                MappedReader::StdinBam(r) => {
+                    for template in TemplateIterator::new(r) {
                         if mapped_tx.send(template).is_err() {
                             break;
                         }

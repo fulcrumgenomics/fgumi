@@ -6,8 +6,9 @@
 //!
 //! # Key Types
 //!
-//! - [`CoordinateKey`]: Standard genomic coordinate (tid, pos, strand)
-//! - [`QuerynameKey`]: Read name with natural numeric ordering
+//! - [`RawCoordinateKey`]: Fixed-size genomic coordinate key (tid, pos, strand)
+//! - [`RawQuerynameKey`]: Read name with natural numeric ordering
+//! - [`RawQuerynameLexKey`]: Read name with lexicographic ordering
 //! - [`TemplateKey`](super::inline_buffer::TemplateKey): Template-level position for UMI grouping
 //!
 //! # Generic Sorting Abstraction
@@ -21,9 +22,7 @@
 //! - fgbio's `SamOrder` trait (Scala)
 //! - samtools' `bam1_tag` union (C)
 
-use anyhow::Result;
 use noodles::sam::Header;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::cmp::Ordering;
 
 use crate::sort::bam_fields;
@@ -210,92 +209,6 @@ impl SortOrder {
     }
 }
 
-/// Trait for sort keys that can be extracted from BAM records.
-///
-/// The `Context` associated type allows sort keys to pre-compute data from the header
-/// once (e.g., library index mapping) and reuse it for each record extraction.
-pub trait SortKey: Ord + Clone + Send + Sync {
-    /// Context built once from header (e.g., `LibraryIndex` for template-coordinate).
-    /// Use `()` for keys that don't need context.
-    type Context: Clone + Send + Sync;
-
-    /// Build context from header (called once at sort start).
-    fn build_context(header: &Header) -> Self::Context;
-
-    /// Extract a sort key from a BAM record using pre-built context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if key extraction fails due to missing or invalid fields.
-    fn from_record(record: &RecordBuf, header: &Header, ctx: &Self::Context) -> Result<Self>;
-}
-
-// ============================================================================
-// Coordinate Sort Key
-// ============================================================================
-
-/// Sort key for coordinate ordering.
-///
-/// Sort order: reference ID → position → reverse strand flag.
-/// Unmapped reads (tid = -1) are sorted to the end.
-///
-/// Note: No read name tie-breaking is used, matching samtools behavior.
-/// Equal records maintain their original input order (stable sort).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct CoordinateKey {
-    /// Reference sequence ID (tid), or `i32::MAX` for unmapped.
-    pub tid: i32,
-    /// 0-based alignment start position.
-    pub pos: i64,
-    /// True if reverse strand.
-    pub reverse: bool,
-}
-
-impl CoordinateKey {
-    /// Create a coordinate key for an unmapped read.
-    #[must_use]
-    pub fn unmapped() -> Self {
-        Self { tid: i32::MAX, pos: i64::MAX, reverse: false }
-    }
-}
-
-impl Ord for CoordinateKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.tid
-            .cmp(&other.tid)
-            .then_with(|| self.pos.cmp(&other.pos))
-            .then_with(|| self.reverse.cmp(&other.reverse))
-    }
-}
-
-impl PartialOrd for CoordinateKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl SortKey for CoordinateKey {
-    type Context = ();
-
-    fn build_context(_header: &Header) -> Self::Context {}
-
-    fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
-        if record.flags().is_unmapped() {
-            return Ok(Self::unmapped());
-        }
-
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let tid = record.reference_sequence_id().map_or(-1, |id| id as i32);
-
-        #[allow(clippy::cast_possible_wrap)]
-        let pos = record.alignment_start().map_or(0, |p| usize::from(p) as i64);
-
-        let reverse = record.flags().is_reverse_complemented();
-
-        Ok(Self { tid, pos, reverse })
-    }
-}
-
 // ============================================================================
 // Raw Coordinate Sort Key (Fixed-size for RawSortKey trait)
 // ============================================================================
@@ -457,60 +370,6 @@ pub const fn queryname_flag_order(flags: u16) -> u16 {
 /// Names are stored with a null terminator so that `natural_compare_nul` can
 /// walk raw pointers without per-byte bounds checks, matching the performance
 /// characteristics of samtools' `strnum_cmp`.
-#[derive(Clone, Debug)]
-pub struct QuerynameKey {
-    /// Read name bytes, null-terminated for `natural_compare_nul`.
-    name: Vec<u8>,
-    /// Read pair flags for ordering R1 before R2.
-    flags: u16,
-}
-
-impl PartialEq for QuerynameKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for QuerynameKey {}
-
-impl QuerynameKey {
-    /// Returns the read name bytes (including the null terminator).
-    #[must_use]
-    pub fn name(&self) -> &[u8] {
-        &self.name
-    }
-}
-
-impl Ord for QuerynameKey {
-    #[allow(unsafe_code)]
-    fn cmp(&self, other: &Self) -> Ordering {
-        // SAFETY: `name` is always null-terminated (see `from_record`).
-        unsafe { natural_compare_nul(self.name.as_ptr(), other.name.as_ptr()) }
-            .then_with(|| self.flags.cmp(&other.flags))
-    }
-}
-
-impl PartialOrd for QuerynameKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl SortKey for QuerynameKey {
-    type Context = ();
-
-    fn build_context(_header: &Header) -> Self::Context {}
-
-    fn from_record(record: &RecordBuf, _header: &Header, _ctx: &Self::Context) -> Result<Self> {
-        let raw = record.name().map_or(&[] as &[u8], |n| <_ as AsRef<[u8]>>::as_ref(n));
-        let mut name = Vec::with_capacity(raw.len() + 1);
-        name.extend_from_slice(raw);
-        name.push(0); // null-terminate for pointer-walking comparison
-        let flags = queryname_flag_order(u16::from(record.flags()));
-        Ok(Self { name, flags })
-    }
-}
-
 // Re-export natural comparison functions from fgumi-raw-bam where the unsafe
 // implementations live (the main crate enforces `#![deny(unsafe_code)]`).
 pub use fgumi_raw_bam::sort::{natural_compare, natural_compare_nul};
@@ -809,24 +668,6 @@ impl RawSortKey for RawQuerynameLexKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_coordinate_key_ordering() {
-        let k1 = CoordinateKey { tid: 0, pos: 100, reverse: false };
-        let k2 = CoordinateKey { tid: 0, pos: 200, reverse: false };
-        let k3 = CoordinateKey { tid: 1, pos: 50, reverse: false };
-
-        assert!(k1 < k2);
-        assert!(k2 < k3);
-    }
-
-    #[test]
-    fn test_coordinate_key_unmapped_last() {
-        let mapped = CoordinateKey { tid: 0, pos: 100, reverse: false };
-        let unmapped = CoordinateKey::unmapped();
-
-        assert!(mapped < unmapped);
-    }
 
     // ========================================================================
     // queryname_flag_order tests

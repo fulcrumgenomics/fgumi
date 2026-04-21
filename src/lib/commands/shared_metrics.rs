@@ -7,17 +7,15 @@
 
 use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
-use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
-use fgumi_raw_bam::raw_record_to_record_buf;
+use fgumi_raw_bam::{
+    RawRecord, alignment_end_from_raw, aux_data_slice, find_string_tag_in_record, find_tag_type,
+    flags as raw_flags, unclipped_5prime_from_raw_bam,
+};
 
 use log::info;
 use murmur3::murmur3_32;
-use noodles::sam::alignment::record::Cigar;
-use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record::data::field::Tag;
-use noodles::sam::alignment::record_buf::RecordBuf;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -64,13 +62,13 @@ pub struct TemplateInfo {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ReadInfoKey {
     /// Reference sequence index for read 1.
-    pub ref_index1: Option<usize>,
+    pub ref_index1: usize,
     /// Unclipped 5' position for read 1.
     pub start1: i32,
     /// `true` if read 1 is reverse-complemented.
     pub strand1: bool,
     /// Reference sequence index for read 2.
-    pub ref_index2: Option<usize>,
+    pub ref_index2: usize,
     /// Unclipped 5' position for read 2.
     pub start2: i32,
     /// `true` if read 2 is reverse-complemented.
@@ -91,40 +89,18 @@ pub struct TemplateMetadata<'a> {
 
 /// Computes the unclipped 5' position for a read, matching fgbio's `positionOf`.
 ///
-/// For forward strand reads: `unclippedStart = alignmentStart - leading soft clips`
-/// For reverse strand reads: `unclippedEnd = alignmentEnd + trailing soft clips`
-pub fn unclipped_five_prime_position(record: &RecordBuf) -> Option<i32> {
-    let is_reverse = record.flags().is_reverse_complemented();
-    let cigar = record.cigar();
-
-    if is_reverse {
-        // For reverse strand, 5' is at the end
-        // unclippedEnd = alignmentEnd + trailing soft clips
-        let alignment_end = record.alignment_end().map(|p| usize::from(p) as i32)?;
-
-        // Count trailing soft clips (last element if it's S)
-        let trailing_clips: i32 = cigar
-            .iter()
-            .filter_map(std::result::Result::ok)
-            .last()
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map_or(0, |op| op.len() as i32);
-
-        Some(alignment_end + trailing_clips)
-    } else {
-        // For forward strand, 5' is at the start
-        // unclippedStart = alignmentStart - leading soft clips
-        let alignment_start = record.alignment_start().map(|p| usize::from(p) as i32)?;
-
-        // Count leading soft clips (first element if it's S)
-        let leading_clips: i32 = cigar
-            .iter()
-            .find_map(std::result::Result::ok)
-            .filter(|op| op.kind() == Kind::SoftClip)
-            .map_or(0, |op| op.len() as i32);
-
-        Some(alignment_start - leading_clips)
+/// Delegates to [`unclipped_5prime_from_raw_bam`]. Includes both soft- and hard-clip
+/// bases on the 5' side (matching htsjdk / fgbio semantics). Returns `None` for
+/// unmapped records or records missing CIGAR ops.
+fn unclipped_five_prime_position_raw(record: &RawRecord) -> Option<i32> {
+    let flags = record.flags();
+    if flags & raw_flags::UNMAPPED != 0 {
+        return None;
     }
+    if record.n_cigar_op() == 0 {
+        return None;
+    }
+    Some(unclipped_5prime_from_raw_bam(record.as_ref()))
 }
 
 /// Computes a hash value normalized to the [0, 1] range using Murmur3.
@@ -266,11 +242,7 @@ pub fn overlaps_intervals(template: &TemplateInfo, intervals: &[Interval]) -> bo
 ///
 /// Returns an error if the BAM file cannot be read or if it appears to be a consensus BAM.
 pub fn validate_not_consensus_bam(input: &Path) -> Result<()> {
-    use crate::consensus_tags::is_consensus;
-    use crate::sort::bam_fields;
-    use fgumi_raw_bam::{RawRecord, RawRecordView};
-
-    let (mut reader, header) = create_raw_bam_reader(input, 1)?;
+    let (mut reader, _header) = create_raw_bam_reader(input, 1)?;
 
     // Look at the first valid R1 record
     let mut raw = RawRecord::new();
@@ -284,30 +256,33 @@ pub fn validate_not_consensus_bam(input: &Path) -> Result<()> {
         // Do not skip UNMAPPED: consensus BAMs are documented as unaligned, so
         // excluding unmapped records here would let consensus BAMs slip past this
         // guard unchecked.
-        let flags = RawRecordView::new(&raw).flags();
-        if (flags & bam_fields::flags::PAIRED) == 0
-            || (flags & bam_fields::flags::FIRST_SEGMENT) == 0
-            || (flags & bam_fields::flags::SECONDARY) != 0
-            || (flags & bam_fields::flags::SUPPLEMENTARY) != 0
+        let flags = raw.flags();
+        if (flags & raw_flags::PAIRED) == 0
+            || (flags & raw_flags::FIRST_SEGMENT) == 0
+            || (flags & raw_flags::SECONDARY) != 0
+            || (flags & raw_flags::SUPPLEMENTARY) != 0
         {
             continue;
         }
 
-        // Decode to RecordBuf for consensus-tag check and name extraction
-        let record = raw_record_to_record_buf(&raw, &header)?;
-
-        // Check if this is a consensus read
-        if is_consensus(&record) {
+        // Consensus-tag check on raw aux bytes (mirrors
+        // fgumi_consensus::tags::is_consensus: simplex = cD without aD+bD;
+        // duplex = aD and bD). Avoids decoding the record to RecordBuf.
+        let aux = aux_data_slice(raw.as_ref());
+        let has_ad = find_tag_type(aux, b"aD").is_some();
+        let has_bd = find_tag_type(aux, b"bD").is_some();
+        let has_cd = find_tag_type(aux, b"cD").is_some();
+        let is_duplex_consensus = has_ad && has_bd;
+        let is_simplex_consensus = has_cd && !is_duplex_consensus;
+        if is_simplex_consensus || is_duplex_consensus {
+            let name = String::from_utf8_lossy(fgumi_raw_bam::read_name(raw.as_ref())).into_owned();
             anyhow::bail!(
                 "Input BAM file ({}) appears to contain consensus sequences. \
                 This metrics tool cannot run on consensus BAMs, and instead requires \
                 the UMI-grouped BAM generated by group which is run prior to consensus calling.\n\
                 First R1 record '{}' has consensus SAM tags present.",
                 input.display(),
-                record.name().map_or_else(
-                    || "<unnamed>".to_string(),
-                    |n| String::from_utf8_lossy(n.as_ref()).to_string()
-                )
+                name
             );
         }
 
@@ -442,8 +417,18 @@ where
     let mut template_count = 0;
     let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
     let mut fraction_template_counts: Vec<usize> = vec![0; num_fractions];
-    let mi_tag = Tag::from(SamTag::MI);
-    let umi_tag = Tag::from(SamTag::RX);
+
+    // fgbio R1/R2 filter: paired, both mapped, primary.
+    let passes_filter = |r: &RawRecord, is_first: bool| -> bool {
+        let f = r.flags();
+        let seg_mask = if is_first { raw_flags::FIRST_SEGMENT } else { raw_flags::LAST_SEGMENT };
+        (f & raw_flags::PAIRED) != 0
+            && (f & raw_flags::UNMAPPED) == 0
+            && (f & raw_flags::MATE_UNMAPPED) == 0
+            && (f & seg_mask) != 0
+            && (f & raw_flags::SECONDARY) == 0
+            && (f & raw_flags::SUPPLEMENTARY) == 0
+    };
 
     for template in template_iter {
         let template = template?;
@@ -451,133 +436,81 @@ where
             continue;
         }
 
-        // Decode raw records to RecordBuf for flag/tag/position access
-        let record_bufs: Vec<RecordBuf> = template
-            .records()
-            .iter()
-            .map(|r| raw_record_to_record_buf(r, &header))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        // Find R1 and R2 that pass fgbio's filtering criteria
-        let r1 = record_bufs.iter().find(|r| {
-            let f = r.flags();
-            f.is_segmented()
-                && !f.is_unmapped()
-                && !f.is_mate_unmapped()
-                && f.is_first_segment()
-                && !f.is_secondary()
-                && !f.is_supplementary()
-        });
-        let r2 = record_bufs.iter().find(|r| {
-            let f = r.flags();
-            f.is_segmented()
-                && !f.is_unmapped()
-                && !f.is_mate_unmapped()
-                && f.is_last_segment()
-                && !f.is_secondary()
-                && !f.is_supplementary()
-        });
-
+        let r1 = template.records().iter().find(|r| passes_filter(r, true));
+        let r2 = template.records().iter().find(|r| passes_filter(r, false));
         let (r1, r2) = match (r1, r2) {
             (Some(r1), Some(r2)) => (r1, r2),
             _ => continue,
         };
 
-        // Get read name
-        let read_name =
-            r1.name().map(|n| String::from_utf8_lossy(n.as_ref()).to_string()).unwrap_or_default();
+        let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(r1.as_ref())).into_owned();
+        let mi = required_z_tag(r1, *b"MI", &read_name)?;
+        let rx = required_z_tag(r1, *b"RX", &read_name)?;
 
-        // Get MI tag (molecular identifier)
-        let mi = if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-            r1.data().get(&mi_tag)
-        {
-            String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
+        // Filter already excluded unmapped reads, so tid >= 0 here; skip defensively.
+        let r1_tid = r1.ref_id();
+        let r2_tid = r2.ref_id();
+        if r1_tid < 0 || r2_tid < 0 {
+            continue;
+        }
+        let r1_ref = r1_tid as usize;
+        let r2_ref = r2_tid as usize;
+        let same_ref = r1_ref == r2_ref;
+
+        // `ref_name` is always R1's reference. Interval overlap uses R1's own range
+        // when R1 and R2 are on different chromosomes, matching fgbio
+        // CollectDuplexSeqMetrics: `if (rec.refIndex == rec.mateRefIndex)
+        // Bams.insertCoordinates(rec) else (rec.start, rec.end)`.
+        let ref_name =
+            header.reference_sequences().get_index(r1_ref).map(|(name, _)| name.to_string());
+
+        // None here implies a malformed mapped record (no CIGAR); skip defensively.
+        let (s1, s2) =
+            match (unclipped_five_prime_position_raw(r1), unclipped_five_prime_position_raw(r2)) {
+                (Some(s1), Some(s2)) => (s1, s2),
+                _ => continue,
+            };
+
+        let r1_strand = (r1.flags() & raw_flags::REVERSE) != 0;
+        let r2_strand = (r2.flags() & raw_flags::REVERSE) != 0;
+
+        let r1_start = r1.pos() + 1;
+        let r2_start = r2.pos() + 1;
+        let r1_end = alignment_end_from_raw(r1.as_ref()).map(|e| e as i32);
+        let r2_end = alignment_end_from_raw(r2.as_ref()).map(|e| e as i32);
+
+        let (position, end_position) = if same_ref {
+            match (r1_end, r2_end) {
+                (Some(re1), Some(re2)) => (r1_start.min(r2_start), re1.max(re2)),
+                _ => (r1_start.min(r2_start), r1_start.max(r2_start)),
+            }
         } else {
-            return Err(anyhow::anyhow!(
-                "Read '{}' is missing the required MI tag. \
-                 Metrics commands require standard MI/RX tags.",
-                read_name
-            ));
+            // No single insert interval spans both mates; use R1's own range so
+            // interval filters still evaluate against R1's side of the pair.
+            (r1_start, r1_end.unwrap_or(r1_start))
         };
 
-        // Get UMI tag (raw UMI)
-        let rx = if let Some(noodles::sam::alignment::record_buf::data::field::Value::String(s)) =
-            r1.data().get(&umi_tag)
-        {
-            String::from_utf8(s.iter().copied().collect::<Vec<u8>>())?
+        // ReadInfoKey fields are ordered so the earlier-mapping read comes first.
+        let read_info_key = if (r1_ref, s1) <= (r2_ref, s2) {
+            ReadInfoKey {
+                ref_index1: r1_ref,
+                start1: s1,
+                strand1: r1_strand,
+                ref_index2: r2_ref,
+                start2: s2,
+                strand2: r2_strand,
+            }
         } else {
-            return Err(anyhow::anyhow!(
-                "Read '{}' is missing the required RX tag. \
-                 Metrics commands require standard MI/RX tags.",
-                read_name
-            ));
-        };
-
-        // Get reference position and calculate insert coordinates
-        let ref_name = if let Some(ref_id) = r1.reference_sequence_id() {
-            header.reference_sequences().get_index(ref_id).map(|(name, _)| name.to_string())
-        } else {
-            None
-        };
-
-        // Calculate insert coordinates and ReadInfo key (matching fgbio)
-        let (position, end_position, read_info_key) = {
-            let r1_ref = r1.reference_sequence_id();
-            let r2_ref = r2.reference_sequence_id();
-
-            if r1_ref == r2_ref && r1_ref.is_some() {
-                // Get unclipped 5' positions (matching fgbio's positionOf)
-                let r1_5prime = unclipped_five_prime_position(r1);
-                let r2_5prime = unclipped_five_prime_position(r2);
-                let r1_strand = r1.flags().is_reverse_complemented();
-                let r2_strand = r2.flags().is_reverse_complemented();
-
-                if let (Some(s1), Some(s2)) = (r1_5prime, r2_5prime) {
-                    // For insert coordinates, use alignment positions
-                    let r1_start = r1.alignment_start().map(|p| usize::from(p) as i32);
-                    let r2_start = r2.alignment_start().map(|p| usize::from(p) as i32);
-                    let r1_end = r1.alignment_end().map(|p| usize::from(p) as i32);
-                    let r2_end = r2.alignment_end().map(|p| usize::from(p) as i32);
-
-                    let (pos, end) = match (r1_start, r2_start, r1_end, r2_end) {
-                        (Some(rs1), Some(rs2), Some(re1), Some(re2)) => {
-                            (rs1.min(rs2), re1.max(re2))
-                        }
-                        (Some(rs1), Some(rs2), _, _) => (rs1.min(rs2), rs1.max(rs2)),
-                        _ => continue,
-                    };
-
-                    // Build ReadInfo key: order by (ref, 5' position) so earlier read is first
-                    let key = if (r1_ref, s1) <= (r2_ref, s2) {
-                        ReadInfoKey {
-                            ref_index1: r1_ref,
-                            start1: s1,
-                            strand1: r1_strand,
-                            ref_index2: r2_ref,
-                            start2: s2,
-                            strand2: r2_strand,
-                        }
-                    } else {
-                        ReadInfoKey {
-                            ref_index1: r2_ref,
-                            start1: s2,
-                            strand1: r2_strand,
-                            ref_index2: r1_ref,
-                            start2: s1,
-                            strand2: r1_strand,
-                        }
-                    };
-
-                    (pos, end, key)
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
+            ReadInfoKey {
+                ref_index1: r2_ref,
+                start1: s2,
+                strand1: r2_strand,
+                ref_index2: r1_ref,
+                start2: s1,
+                strand2: r1_strand,
             }
         };
 
-        // Compute hash once for this template
         let hash_fraction = compute_hash_fraction(&read_name);
 
         let template_info = TemplateInfo {
@@ -589,15 +522,15 @@ where
             hash_fraction,
         };
 
-        // Check interval overlap
         if !overlaps_intervals(&template_info, intervals) {
             continue;
         }
 
         template_count += 1;
-        progress.log_if_needed(2); // Each template has R1 and R2
+        progress.log_if_needed(2);
 
-        // Streaming: when ReadInfo key changes, process the accumulated group
+        // Flush the accumulated group when the ReadInfo key changes — input is
+        // assumed to already be consecutively grouped by this key.
         if current_key.as_ref() != Some(&read_info_key) && !current_group.is_empty() {
             process_group(&current_group, &mut fraction_template_counts);
             current_group.clear();
@@ -607,11 +540,139 @@ where
         current_key = Some(read_info_key);
     }
 
-    // Process the final group
     if !current_group.is_empty() {
         process_group(&current_group, &mut fraction_template_counts);
     }
 
     progress.log_final();
     Ok((template_count, fraction_template_counts))
+}
+
+/// Extracts a required Z-typed aux tag from `record`, returning an error that
+/// points at `read_name` when the tag is absent or not UTF-8.
+fn required_z_tag(record: &RawRecord, tag: [u8; 2], read_name: &str) -> Result<String> {
+    let tag_name = std::str::from_utf8(&tag).unwrap_or("??");
+    let bytes = find_string_tag_in_record(record.as_ref(), &tag).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Read '{read_name}' is missing the required {tag_name} tag. \
+             Metrics commands require standard MI/RX tags."
+        )
+    })?;
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|e| anyhow::anyhow!("Read '{read_name}' {tag_name} tag is not UTF-8: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags, testutil::encode_op};
+    use noodles::bam;
+    use noodles::sam;
+    use noodles::sam::alignment::io::Write as AlignmentWrite;
+    use noodles::sam::alignment::record_buf::RecordBuf;
+    use std::num::NonZeroUsize;
+    use tempfile::NamedTempFile;
+
+    fn test_header() -> sam::Header {
+        use noodles::sam::header::record::value::Map;
+        use noodles::sam::header::record::value::map::ReferenceSequence;
+        sam::Header::builder()
+            .add_reference_sequence(
+                bstr::BString::from("chr1"),
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(248_956_422).expect("non-zero")),
+            )
+            .add_reference_sequence(
+                bstr::BString::from("chr2"),
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(242_193_529).expect("non-zero")),
+            )
+            .build()
+    }
+
+    /// Build an R1/R2 pair with independent refs/positions for each mate.
+    fn build_pair(
+        name: &str,
+        r1_ref: i32,
+        r1_pos: i32,
+        r2_ref: i32,
+        r2_pos: i32,
+        mi: &str,
+    ) -> (RecordBuf, RecordBuf) {
+        let seq = vec![b'A'; 100];
+        let quals = vec![30u8; 100];
+        let cigar = encode_op(0, 100); // 100M
+
+        let mut b1 = RawSamBuilder::new();
+        b1.read_name(name.as_bytes())
+            .flags(raw_flags::PAIRED | raw_flags::FIRST_SEGMENT | raw_flags::MATE_REVERSE)
+            .ref_id(r1_ref)
+            .pos(r1_pos - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(r2_ref)
+            .mate_pos(r2_pos - 1);
+        b1.add_string_tag(b"RX", b"ACGT-TGCA");
+        b1.add_string_tag(b"MI", mi.as_bytes());
+        let r1 = fgumi_raw_bam::raw_record_to_record_buf(&b1.build(), &sam::Header::default())
+            .expect("decode r1");
+
+        let mut b2 = RawSamBuilder::new();
+        b2.read_name(name.as_bytes())
+            .flags(raw_flags::PAIRED | raw_flags::LAST_SEGMENT | raw_flags::REVERSE)
+            .ref_id(r2_ref)
+            .pos(r2_pos - 1)
+            .mapq(60)
+            .cigar_ops(&[cigar])
+            .sequence(&seq)
+            .qualities(&quals)
+            .mate_ref_id(r1_ref)
+            .mate_pos(r1_pos - 1);
+        b2.add_string_tag(b"RX", b"ACGT-TGCA");
+        b2.add_string_tag(b"MI", mi.as_bytes());
+        let r2 = fgumi_raw_bam::raw_record_to_record_buf(&b2.build(), &sam::Header::default())
+            .expect("decode r2");
+
+        (r1, r2)
+    }
+
+    fn write_test_bam(records: Vec<RecordBuf>) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("tempfile");
+        let header = test_header();
+        let mut writer =
+            bam::io::writer::Builder.build_from_path(file.path()).expect("open writer");
+        writer.write_header(&header).expect("write header");
+        for r in &records {
+            writer.write_alignment_record(&header, r).expect("write record");
+        }
+        drop(writer);
+        file
+    }
+
+    /// Regression test for fgbio parity: pairs whose mates map to different
+    /// chromosomes must be kept (not silently dropped), matching fgbio's
+    /// `CollectDuplexSeqMetrics` which retains inter-reference pairs and uses
+    /// R1's own range for interval-overlap evaluation.
+    #[test]
+    fn test_inter_reference_pairs_are_retained() {
+        // Two same-ref pairs (chr1:100 / chr1:100) + one inter-ref pair
+        // (chr1:500 / chr2:500).  All three should be counted.
+        let (s1r1, s1r2) = build_pair("same_1", 0, 100, 0, 300, "1");
+        let (s2r1, s2r2) = build_pair("same_2", 0, 100, 0, 300, "2");
+        let (ir1, ir2) = build_pair("inter_1", 0, 500, 1, 500, "3");
+        let bam = write_test_bam(vec![s1r1, s1r2, s2r1, s2r2, ir1, ir2]);
+
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        let (total, _) = process_templates_from_bam(bam.path(), &[], 1, |group, _| {
+            groups.push(group.iter().map(|t| t.mi.clone()).collect());
+        })
+        .expect("process_templates_from_bam");
+
+        assert_eq!(total, 3, "inter-reference pair must not be dropped");
+        let mis: Vec<String> = groups.into_iter().flatten().collect();
+        assert!(mis.contains(&"1".to_string()));
+        assert!(mis.contains(&"2".to_string()));
+        assert!(mis.contains(&"3".to_string()), "inter-ref pair's MI must be in output");
+    }
 }
