@@ -8,6 +8,7 @@ use crate::fields::{
 ///
 /// Extracts the 4-bit op type from the raw u32 and maps it to the corresponding
 /// `Kind` variant. Returns `Kind::Pad` for unknown op types.
+#[cfg(feature = "noodles")]
 #[inline]
 #[must_use]
 pub fn cigar_op_kind(raw_op: u32) -> noodles::sam::alignment::record::cigar::op::Kind {
@@ -2218,6 +2219,7 @@ mod tests {
         assert_eq!(cigar_to_string_from_raw(&rec), "");
     }
 
+    #[cfg(feature = "noodles")]
     #[test]
     fn test_cigar_op_kind_all_ops() {
         use noodles::sam::alignment::record::cigar::op::Kind;
@@ -2235,6 +2237,7 @@ mod tests {
         assert_eq!(cigar_op_kind(15), Kind::Pad);
     }
 
+    #[cfg(feature = "noodles")]
     #[test]
     fn test_cigar_op_kind_with_length_bits() {
         use noodles::sam::alignment::record::cigar::op::Kind;
