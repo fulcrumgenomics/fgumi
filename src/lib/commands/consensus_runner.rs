@@ -3,6 +3,7 @@
 //! This module provides shared traits and utilities used by simplex, duplex, and codec
 //! consensus calling commands to reduce code duplication.
 
+#[cfg(feature = "codec")]
 use crate::consensus::codec_caller::CodecConsensusStats;
 use crate::consensus_caller::ConsensusCallingStats;
 use crate::metrics::consensus::ConsensusMetrics;
@@ -46,6 +47,7 @@ impl ConsensusStatsOps for ConsensusCallingStats {
     }
 }
 
+#[cfg(feature = "codec")]
 impl ConsensusStatsOps for CodecConsensusStats {
     fn merge(&mut self, other: &Self) {
         self.total_input_reads += other.total_input_reads;
