@@ -65,7 +65,6 @@ indexmap = "2"
 rand = "0.10"
 csv = "1.1"
 memchr = "2"
-murmur3 = "0.5"
 statrs = "0.18"
 bytesize = "2.3"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] } # unconditionally used by validate_against_system_memory

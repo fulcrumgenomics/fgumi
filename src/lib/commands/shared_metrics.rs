@@ -15,7 +15,6 @@ use fgumi_raw_bam::{
 };
 
 use log::info;
-use murmur3::murmur3_32;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -103,28 +102,84 @@ fn unclipped_five_prime_position_raw(record: &RawRecord) -> Option<i32> {
     Some(unclipped_5prime_from_raw_bam(record.as_ref()))
 }
 
-/// Computes a hash value normalized to the [0, 1] range using Murmur3.
+/// Computes an fgbio-compatible Murmur3 downsampling score.
 ///
-/// Hashes the read name using the Murmur3 32-bit algorithm with seed 42, then
-/// normalizes the result to a floating-point value between 0 and 1. This is used
-/// for deterministic downsampling where reads are assigned to fractions based on
-/// their hash value. Matches the Scala implementation's hashing approach.
+/// Returns a value in `[0, 1]` for every hash except the Java `Int.MinValue`
+/// overflow case, where fgbio/Scala's `math.abs` leaves `Int.MinValue`
+/// unchanged and the quotient is slightly less than `-1`. Preserving this
+/// quirk is required for byte-exact fgbio parity at every sampling fraction.
 ///
-/// # Arguments
+/// Mirrors fgbio's `CollectDuplexSeqMetrics` exactly:
 ///
-/// * `read_name` - The read name string to hash
+/// ```scala
+/// private val hasher = new htsjdk.samtools.util.Murmur3(42)
+/// val intHash    = math.abs(hasher.hashUnencodedChars(rec.name))
+/// val doubleHash = intHash / Int.MaxValue.toDouble
+/// ```
 ///
-/// # Returns
+/// The previous implementation used `murmur3::murmur3_32` over the UTF-8 bytes
+/// of the read name. htsjdk's `hashUnencodedChars` walks the Java `char`
+/// sequence (UTF-16 code units), so the two hashes diverge for every input and
+/// produced a deterministic ~1% sampling bias vs. fgbio at every fraction.
 ///
-/// A floating-point value in the range [0, 1].
+/// For fgbio parity we port htsjdk's `Murmur3.hashUnencodedChars` byte-for-byte
+/// and convert the read name to UTF-16 code units before hashing.
+#[must_use]
 pub fn compute_hash_fraction(read_name: &str) -> f64 {
-    // Use Murmur3 with seed 42 (matching Scala implementation)
-    let hash = murmur3_32(&mut std::io::Cursor::new(read_name.as_bytes()), 42).unwrap_or(0);
+    let chars: Vec<u16> = read_name.encode_utf16().collect();
+    let hash = htsjdk_murmur3_hash_unencoded_chars(&chars, 42);
+    // `wrapping_abs` mirrors Java `Math.abs` (which returns `Int.MinValue`
+    // unchanged when the input is `Int.MinValue`) so the rare edge case
+    // produces the same downsample decision as fgbio.
+    f64::from(hash.wrapping_abs()) / f64::from(i32::MAX)
+}
 
-    // Scala implementation uses Int (i32), takes absolute value, then normalizes
-    // Convert u32 to i32 first to match Scala's behavior
-    let positive_hash = (hash as i32).unsigned_abs() as f64;
-    positive_hash / i32::MAX as f64
+/// Port of htsjdk `Murmur3.hashUnencodedChars` (Apache-2.0; derived from
+/// Guava's Apache-2.0 `Murmur3_32`; original `MurmurHash3` is public domain).
+/// `chars` is the Java `CharSequence` / UTF-16 code units.
+fn htsjdk_murmur3_hash_unencoded_chars(chars: &[u16], seed: i32) -> i32 {
+    let mut h1: u32 = seed as u32;
+    let length = chars.len();
+
+    let mut i = 1;
+    while i < length {
+        let k1 = u32::from(chars[i - 1]) | (u32::from(chars[i]) << 16);
+        h1 = murmur3_mix_h1(h1, murmur3_mix_k1(k1));
+        i += 2;
+    }
+
+    if length & 1 == 1 {
+        let k1 = murmur3_mix_k1(u32::from(chars[length - 1]));
+        h1 ^= k1;
+    }
+
+    murmur3_fmix(h1, (2 * length) as u32) as i32
+}
+
+#[inline]
+fn murmur3_mix_k1(mut k1: u32) -> u32 {
+    k1 = k1.wrapping_mul(0xcc9e_2d51);
+    k1 = k1.rotate_left(15);
+    k1 = k1.wrapping_mul(0x1b87_3593);
+    k1
+}
+
+#[inline]
+fn murmur3_mix_h1(mut h1: u32, k1: u32) -> u32 {
+    h1 ^= k1;
+    h1 = h1.rotate_left(13);
+    h1.wrapping_mul(5).wrapping_add(0xe654_6b64)
+}
+
+#[inline]
+fn murmur3_fmix(mut h1: u32, length: u32) -> u32 {
+    h1 ^= length;
+    h1 ^= h1 >> 16;
+    h1 = h1.wrapping_mul(0x85eb_ca6b);
+    h1 ^= h1 >> 13;
+    h1 = h1.wrapping_mul(0xc2b2_ae35);
+    h1 ^= h1 >> 16;
+    h1
 }
 
 /// Parses an intervals file in BED or Picard interval list format.
@@ -648,6 +703,44 @@ mod tests {
         }
         drop(writer);
         file
+    }
+
+    use rstest::rstest;
+
+    /// Reference values captured directly from htsjdk `Murmur3(42)
+    /// .hashUnencodedChars(s)` against the 3.1.2 `Murmur3.class` on a set of
+    /// read-name-shaped strings.  If this test fails, the Rust port has
+    /// diverged from htsjdk; all fgbio-parity guarantees for downsampling are
+    /// invalid until the port is corrected.
+    #[rstest]
+    #[case("", 142_593_372)]
+    #[case("A", 309_601_938)]
+    #[case("AB", 1_297_118_606)]
+    #[case("ABC", 417_488_640)]
+    #[case("read1", -958_943_510)]
+    #[case("read2", 1_466_959_157)]
+    #[case("read10", -87_319_652)]
+    #[case("SRR099966.100", -1_840_920_289)]
+    #[case("M00517:73:000000000-A5AEH:1:1101:15541:1541", 1_482_717_766)]
+    #[case("NB500947:HT3JMBGX2:1:11101:19204:10048", -1_636_484_024)]
+    fn test_murmur3_matches_htsjdk_reference_vectors(#[case] name: &str, #[case] expected: i32) {
+        let chars: Vec<u16> = name.encode_utf16().collect();
+        let got = htsjdk_murmur3_hash_unencoded_chars(&chars, 42);
+        assert_eq!(got, expected, "Murmur3 mismatch on {name:?}");
+    }
+
+    /// The downsample fraction must be in `[0, 1]` for all non-`i32::MIN`
+    /// hashes, matching fgbio's `math.abs(hash) / Int.MaxValue.toDouble`.
+    #[rstest]
+    #[case("")]
+    #[case("A")]
+    #[case("read1")]
+    #[case("SRR099966.100")]
+    #[case("a much longer read name here")]
+    fn test_compute_hash_fraction_in_unit_range(#[case] name: &str) {
+        let f = compute_hash_fraction(name);
+        // Abs can produce up to Int.MaxValue, divided by itself == 1.0.
+        assert!((0.0..=1.0).contains(&f), "compute_hash_fraction({name:?}) = {f}");
     }
 
     /// Regression test for fgbio parity: pairs whose mates map to different
