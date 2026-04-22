@@ -60,6 +60,58 @@ pub enum CompareMode {
     Grouping,
 }
 
+/// Preset comparison settings for a specific fgumi pipeline stage.
+///
+/// Each variant encodes canonical `--mode` and `--ignore-order` defaults for
+/// comparing BAM output from that stage, including cases (e.g. cross-tool
+/// `group` comparison against fgbio) where MI values or record order may
+/// legitimately differ. Explicit `--mode` or `--ignore-order` flags override
+/// the preset.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CommandPreset {
+    /// Extract output: no MI tags; exact content comparison.
+    Extract,
+    /// Zipper output: preserves MI tags unchanged; exact content comparison.
+    Zipper,
+    /// Sort output: deterministic; exact content comparison.
+    Sort,
+    /// Correct output: modifies RX tag only; exact content comparison.
+    Correct,
+    /// Dedup output: deterministic; exact content comparison.
+    Dedup,
+    /// Group output: MI values and record order may differ between tools or
+    /// runs. Verifies grouping equivalence only (unordered).
+    Group,
+    /// Simplex consensus output: non-deterministic with `--threads`.
+    /// Verifies grouping equivalence only (unordered).
+    Simplex,
+    /// Duplex consensus output: non-deterministic with `--threads`.
+    /// Verifies grouping equivalence only (unordered).
+    Duplex,
+    /// CODEC consensus output: non-deterministic with `--threads`.
+    /// Verifies grouping equivalence only (unordered).
+    Codec,
+    /// Filter output: passes through MI tags unchanged; exact content comparison.
+    Filter,
+}
+
+impl CommandPreset {
+    /// Canonical `(mode, ignore_order)` defaults for this preset.
+    fn defaults(self) -> (CompareMode, bool) {
+        match self {
+            Self::Extract
+            | Self::Zipper
+            | Self::Sort
+            | Self::Correct
+            | Self::Dedup
+            | Self::Filter => (CompareMode::Content, false),
+            Self::Group | Self::Simplex | Self::Duplex | Self::Codec => {
+                (CompareMode::Grouping, true)
+            }
+        }
+    }
+}
+
 /// Compare two BAM files for equality.
 ///
 /// Compares core SAM fields (QNAME, FLAG, RNAME, POS, MAPQ, CIGAR, RNEXT, PNEXT, TLEN, SEQ, QUAL)
@@ -99,48 +151,43 @@ MODES:
     Does NOT compare other BAM content (sequence, quality, other tags).
     This proves the grouping is semantically equivalent even if MI values differ.
 
-RECOMMENDED SETTINGS BY COMMAND:
+COMMAND PRESETS (--command):
 
-  When comparing output from different fgumi commands, use these settings:
+  Use `--command <stage>` to apply canonical `--mode` and `--ignore-order`
+  defaults for comparing output from a specific fgumi pipeline stage. This is
+  especially useful for cross-tool comparisons (e.g. fgumi vs. fgbio) where
+  MI values or record order may legitimately differ. Explicit `--mode` or
+  `--ignore-order` flags override the preset.
 
   Command         --mode      --ignore-order   Notes
   ─────────────────────────────────────────────────────────────────────────
   extract         content     false            No MI tags; deterministic
   zipper          content     false            Preserves MI tags unchanged
-  group           full        false            Has MI tags; deterministic
+  sort            content     false            Deterministic
+  correct         content     false            Modifies RX tag only, not MI
+  dedup           content     false            Deterministic
+  filter          content     false            Passes through MI tags unchanged
+  group           grouping    true             MI values/order may differ (cross-tool)
   simplex         grouping    true             Non-deterministic with --threads
   duplex          grouping    true             Non-deterministic with --threads
   codec           grouping    true             Non-deterministic with --threads
-  filter          content     false            Passes through MI tags unchanged
-  clip            content     false            Does not modify MI tags
-  correct         content     false            Modifies RX tag only, not MI
-  downsample      content     false            Deterministic with seed
-  review          content     false            Preserves MI tags
 
-  For simulate subcommands:
-  mapped-reads    content     false            Template-coordinate sorted
-  grouped-reads   full        false            Has MI tags; deterministic
-  consensus-reads content     false            Unmapped with consensus tags
+  Examples:
 
-  Examples for each command:
+    # Preset equivalents of the above:
+    fgumi compare bams --command extract a.bam b.bam
+    fgumi compare bams --command group    a.bam b.bam
+    fgumi compare bams --command simplex  a.bam b.bam
 
-    # extract output (no MI tags)
-    fgumi compare bams extracted1.bam extracted2.bam --mode content
-
-    # group output (has MI tags)
-    fgumi compare bams grouped1.bam grouped2.bam --mode full
-
-    # simplex/duplex/codec output (MI grouping, non-deterministic order)
-    fgumi compare bams consensus1.bam consensus2.bam --mode grouping --ignore-order
-
-    # filter/clip/correct/downsample output (preserves content)
-    fgumi compare bams filtered1.bam filtered2.bam --mode content
+    # Preset + explicit override (e.g. same-tool group comparison):
+    fgumi compare bams --command group --mode full --ignore-order=false a.bam b.bam
 
 Example usage:
   fgumi compare bams bam1.bam bam2.bam                    # full mode (default)
   fgumi compare bams bam1.bam bam2.bam --mode content    # content only
   fgumi compare bams bam1.bam bam2.bam --mode grouping   # grouping only
   fgumi compare bams bam1.bam bam2.bam --mode grouping --ignore-order  # consensus output
+  fgumi compare bams bam1.bam bam2.bam --command simplex  # preset for simplex
   fgumi compare bams bam1.bam bam2.bam --max-diffs 20
 "#
 )]
@@ -153,11 +200,20 @@ pub struct CompareBams {
     #[arg(index = 2)]
     pub bam2: PathBuf,
 
+    /// Use preset comparison settings for a specific fgumi pipeline stage.
+    /// Sets `--mode` and `--ignore-order` to the canonical defaults for
+    /// comparing BAM output from that stage (see COMMAND PRESETS above).
+    /// Explicit `--mode` or `--ignore-order` flags override the preset.
+    #[arg(long = "command", short = 'c')]
+    pub command: Option<CommandPreset>,
+
     /// Comparison mode: 'full' (MI grouping + content, for group output),
-    /// 'content' (all fields, for extract/filter/clip/correct/downsample output),
-    /// 'grouping' (MI equivalence only, for simplex/duplex/codec output)
-    #[arg(long = "mode", default_value = "full")]
-    pub mode: CompareMode,
+    /// 'content' (all fields, for extract/zipper/sort/correct/dedup/filter output),
+    /// 'grouping' (MI equivalence only, for simplex/duplex/codec output).
+    /// Overrides `--command` preset if both given. Defaults to 'full' when
+    /// neither `--mode` nor `--command` is set.
+    #[arg(long = "mode")]
+    pub mode: Option<CompareMode>,
 
     /// Maximum number of differences to report in detail
     #[arg(short = 'm', long = "max-diffs", default_value = "10")]
@@ -171,8 +227,10 @@ pub struct CompareBams {
     /// Required for comparing output from consensus commands (simplex/duplex/codec)
     /// when run with --threads, as parallel processing causes non-deterministic ordering.
     /// Only valid with --mode grouping.
-    #[arg(long = "ignore-order", default_value = "false", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
-    pub ignore_order: bool,
+    /// Overrides `--command` preset if both given. Defaults to false when
+    /// neither `--ignore-order` nor `--command` is set.
+    #[arg(long = "ignore-order", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set, value_parser = parse_bool)]
+    pub ignore_order: Option<bool>,
 
     /// Initial buffer size for --ignore-order mode (number of records)
     #[arg(long = "buffer-size", default_value = "1000")]
@@ -889,16 +947,44 @@ impl Command for CompareBams {
         validate_file_exists(&self.bam1, "First BAM")?;
         validate_file_exists(&self.bam2, "Second BAM")?;
 
-        if self.ignore_order && !matches!(self.mode, CompareMode::Grouping) {
+        let (mode, ignore_order) = self.effective_settings();
+
+        // Only bail when the user explicitly passed `--ignore-order=true` with a
+        // non-grouping mode. Preset-inherited `ignore_order` is silently dropped
+        // by `effective_settings()` when the resolved mode isn't `Grouping`, so
+        // combinations like `--command simplex --mode content` are not user
+        // errors and must not produce an `--ignore-order` error message.
+        if self.ignore_order == Some(true) && !matches!(mode, CompareMode::Grouping) {
             anyhow::bail!("--ignore-order is only valid with --mode grouping");
+        }
+
+        if let Some(preset) = self.command {
+            let overridden = self.mode.is_some() || self.ignore_order.is_some();
+            let preset_name = preset
+                .to_possible_value()
+                .expect("CommandPreset is not skipped")
+                .get_name()
+                .to_string();
+            let mode_name = mode
+                .to_possible_value()
+                .expect("CompareMode is not skipped")
+                .get_name()
+                .to_string();
+            info!(
+                "Using --command {} preset: mode={}, ignore-order={}{}",
+                preset_name,
+                mode_name,
+                ignore_order,
+                if overridden { " (with explicit overrides)" } else { "" }
+            );
         }
 
         let timer = OperationTimer::new("Comparing BAMs");
 
-        let total_records = match self.mode {
+        let total_records = match mode {
             CompareMode::Full => self.execute_full()?,
             CompareMode::Content => self.execute_content()?,
-            CompareMode::Grouping => self.execute_grouping()?,
+            CompareMode::Grouping => self.execute_grouping_with(ignore_order)?,
         };
 
         timer.log_completion(total_records);
@@ -907,6 +993,23 @@ impl Command for CompareBams {
 }
 
 impl CompareBams {
+    /// Resolve the effective `(mode, ignore_order)` pair.
+    ///
+    /// Precedence: explicit flag > `--command` preset default > built-in default
+    /// (`full`, `false`). `ignore_order` is silently coerced to `false` when the
+    /// resolved mode isn't `Grouping`, so preset-inherited `ignore_order=true`
+    /// is dropped cleanly when an explicit `--mode` narrows to a non-grouping
+    /// comparison (e.g. `--command simplex --mode content`). An *explicit*
+    /// `--ignore-order=true` with a non-grouping mode is still rejected in
+    /// `execute()`.
+    fn effective_settings(&self) -> (CompareMode, bool) {
+        let preset = self.command.map(|p| p.defaults());
+        let mode = self.mode.or(preset.map(|(m, _)| m)).unwrap_or_default();
+        let ignore_order = self.ignore_order.or(preset.map(|(_, io)| io)).unwrap_or(false);
+        let ignore_order = ignore_order && matches!(mode, CompareMode::Grouping);
+        (mode, ignore_order)
+    }
+
     fn format_diff(left: String, right: String, leading: &str) -> String {
         let left_vec: Vec<char> = left.chars().collect();
         let right_vec: Vec<char> = right.chars().collect();
@@ -1432,11 +1535,14 @@ impl CompareBams {
     /// We validate read names and R1/R2 flags match, then verify that reads
     /// with the same MI in one file have the same MI in the other.
     /// Uses parallel batch processing with double buffering for performance.
-    fn execute_grouping(&self) -> Result<u64> {
-        if self.ignore_order {
-            return self.execute_grouping_unordered();
-        }
+    /// Dispatches between ordered and unordered grouping comparison based on
+    /// the resolved `ignore_order` flag (which may come from `--ignore-order`
+    /// directly or from a `--command` preset).
+    fn execute_grouping_with(&self, ignore_order: bool) -> Result<u64> {
+        if ignore_order { self.execute_grouping_unordered() } else { self.execute_grouping() }
+    }
 
+    fn execute_grouping(&self) -> Result<u64> {
         let mut stats = GroupingStats::default();
         let mut diff_details: Vec<DiffDetail> = Vec::new();
         let batch_size = self.batch_size;
@@ -1913,5 +2019,97 @@ impl CompareBams {
             info!("BAM groupings differ");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use rstest::rstest;
+
+    fn parse(args: &[&str]) -> CompareBams {
+        let mut argv = vec!["bams", "a.bam", "b.bam"];
+        argv.extend_from_slice(args);
+        CompareBams::try_parse_from(argv).expect("parse")
+    }
+
+    #[rstest]
+    #[case(CommandPreset::Extract)]
+    #[case(CommandPreset::Zipper)]
+    #[case(CommandPreset::Sort)]
+    #[case(CommandPreset::Correct)]
+    #[case(CommandPreset::Dedup)]
+    #[case(CommandPreset::Filter)]
+    fn preset_defaults_content_stages_map_to_content_no_ignore_order(#[case] stage: CommandPreset) {
+        let (mode, ignore) = stage.defaults();
+        assert!(matches!(mode, CompareMode::Content), "{stage:?} → {mode:?}");
+        assert!(!ignore, "{stage:?} → ignore_order {ignore}");
+    }
+
+    #[rstest]
+    #[case(CommandPreset::Group)]
+    #[case(CommandPreset::Simplex)]
+    #[case(CommandPreset::Duplex)]
+    #[case(CommandPreset::Codec)]
+    fn preset_defaults_grouping_stages_map_to_grouping_with_ignore_order(
+        #[case] stage: CommandPreset,
+    ) {
+        let (mode, ignore) = stage.defaults();
+        assert!(matches!(mode, CompareMode::Grouping), "{stage:?} → {mode:?}");
+        assert!(ignore, "{stage:?} → ignore_order {ignore}");
+    }
+
+    #[test]
+    fn effective_settings_fall_back_to_built_in_defaults() {
+        let args = parse(&[]);
+        let (mode, ignore) = args.effective_settings();
+        assert!(matches!(mode, CompareMode::Full));
+        assert!(!ignore);
+    }
+
+    #[test]
+    fn effective_settings_use_preset_when_only_command_given() {
+        let args = parse(&["--command", "group"]);
+        let (mode, ignore) = args.effective_settings();
+        assert!(matches!(mode, CompareMode::Grouping));
+        assert!(ignore);
+
+        let args = parse(&["--command", "extract"]);
+        let (mode, ignore) = args.effective_settings();
+        assert!(matches!(mode, CompareMode::Content));
+        assert!(!ignore);
+    }
+
+    #[test]
+    fn effective_settings_explicit_mode_overrides_preset() {
+        // --mode full overrides --command group's Grouping default
+        let args = parse(&["--command", "group", "--mode", "full"]);
+        let (mode, ignore) = args.effective_settings();
+        assert!(matches!(mode, CompareMode::Full));
+        // Preset-inherited ignore_order=true is silently dropped because the
+        // resolved mode isn't Grouping; without this, the later bail would
+        // blame the user for an --ignore-order flag they never passed.
+        assert!(!ignore);
+    }
+
+    #[test]
+    fn effective_settings_drops_preset_ignore_order_when_explicit_mode_not_grouping() {
+        // --command simplex presets (Grouping, true); explicit --mode content
+        // must narrow the comparison without leaking ignore_order=true through.
+        let args = parse(&["--command", "simplex", "--mode", "content"]);
+        let (mode, ignore) = args.effective_settings();
+        assert!(matches!(mode, CompareMode::Content));
+        assert!(!ignore);
+    }
+
+    #[test]
+    fn effective_settings_explicit_ignore_order_overrides_preset() {
+        // --ignore-order=false overrides --command group's true default
+        let args = parse(&["--command", "group", "--ignore-order", "false"]);
+        let (mode, ignore) = args.effective_settings();
+        // mode still inherits from preset (Grouping)
+        assert!(matches!(mode, CompareMode::Grouping));
+        assert!(!ignore);
     }
 }
