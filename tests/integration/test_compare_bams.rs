@@ -538,3 +538,145 @@ fn test_grouping_unordered_fails_when_mi_missing_in_both_bams() {
     );
     assert!(stdout.contains("DIFFER"), "Expected DIFFER in output, got:\n{stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// Paired-UMI MI strand-suffix regression tests
+//
+// Paired UMI grouping (fgumi and fgbio) emits MI as a Z-type string of the
+// form `<id>/<A|B>`, where the suffix distinguishes the two strand
+// orientations of the same double-stranded molecule. The comparator must:
+//   1. Recognise the full encoding as a valid MI (not "missing").
+//   2. Preserve the A/B distinction when checking grouping equivalence.
+// ---------------------------------------------------------------------------
+
+/// Build a paired record pair (R1 + R2) sharing a single MI tag value.
+fn paired_record_pair(name: &[u8], mi: &str) -> [RawRecord; 2] {
+    let r1 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::FIRST_SEGMENT)
+            .ref_id(0)
+            .pos(99)
+            .mapq(60)
+            .add_string_tag(b"MI", mi.as_bytes())
+            .add_string_tag(b"RX", b"AAAA");
+        b.build()
+    };
+    let r2 = {
+        let mut b = SamBuilder::new();
+        b.read_name(name)
+            .sequence(b"ACGTACGT")
+            .qualities(&[30; 8])
+            .flags(flags::PAIRED | flags::LAST_SEGMENT)
+            .ref_id(0)
+            .pos(199)
+            .mapq(60)
+            .add_string_tag(b"MI", mi.as_bytes())
+            .add_string_tag(b"RX", b"AAAA");
+        b.build()
+    };
+    [r1, r2]
+}
+
+#[test]
+fn test_grouping_mode_paired_strand_suffix_equivalent() {
+    // Two identical paired-UMI BAMs: one /A-strand pair and one /B-strand pair,
+    // same base molecule id. Comparator must recognise MI:Z:0/A and 0/B as
+    // present (not missing) and report EQUIVALENT.
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+    let mut records: Vec<RawRecord> = Vec::new();
+    records.extend(paired_record_pair(b"read1", "0/A"));
+    records.extend(paired_record_pair(b"read2", "0/B"));
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records);
+    write_bam(&bam2, &header, &records);
+
+    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert!(success, "Expected EQUIVALENT for identical paired-strand BAMs, stdout:\n{stdout}");
+    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
+    // Guards against regression to the old `parse::<i64>()` path where every
+    // /A /B record was reported as missing MI.
+    assert!(
+        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
+        "Expected zero missing-MI counts for paired-strand MIs, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_grouping_unordered_paired_strand_suffix_equivalent() {
+    // Same as above but via the --ignore-order code path that builds
+    // per-BAM MI maps in parallel.
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+    let mut records: Vec<RawRecord> = Vec::new();
+    records.extend(paired_record_pair(b"read1", "0/A"));
+    records.extend(paired_record_pair(b"read2", "0/B"));
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records);
+    write_bam(&bam2, &header, &records);
+
+    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &["--ignore-order"]);
+    assert!(success, "Expected EQUIVALENT for ignore-order paired-strand BAMs, stdout:\n{stdout}");
+    assert!(stdout.contains("EQUIVALENT"), "Expected EQUIVALENT, got:\n{stdout}");
+    assert!(
+        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
+        "Expected zero missing-MI counts for paired-strand MIs, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_grouping_mode_paired_strand_a_flipped_to_b_is_mismatch() {
+    // BAM1 groups the second read as /B; BAM2 groups it as /A. The /A vs /B
+    // swap must be surfaced as a grouping mismatch (not silently accepted).
+    let tmp = TempDir::new().unwrap();
+    let header = create_minimal_header("chr1", 10000);
+
+    let mut records1: Vec<RawRecord> = Vec::new();
+    records1.extend(paired_record_pair(b"read1", "0/A"));
+    records1.extend(paired_record_pair(b"read2", "0/B"));
+
+    let mut records2: Vec<RawRecord> = Vec::new();
+    records2.extend(paired_record_pair(b"read1", "0/A"));
+    records2.extend(paired_record_pair(b"read2", "0/A"));
+
+    let bam1 = tmp.path().join("a.bam");
+    let bam2 = tmp.path().join("b.bam");
+    write_bam(&bam1, &header, &records1);
+    write_bam(&bam2, &header, &records2);
+
+    // Ordered grouping mode (no --ignore-order) is used deliberately so that
+    // the mismatch-sample path (which prints the conflicting MI values) is
+    // exercised, letting us assert they render via Display instead of Debug.
+    let (success, stdout) = run_compare(&bam1, &bam2, "grouping", &[]);
+    assert!(!success, "Expected DIFFER when /A and /B assignments disagree, stdout:\n{stdout}");
+    assert!(stdout.contains("DIFFER"), "Expected DIFFER, got:\n{stdout}");
+    // Specifically assert the mismatch reason: the paired MIs must be parsed as
+    // present (zero missing MI) and the failure must be a grouping mismatch, so
+    // regressing to the old "every /A /B counted as missing MI" path still trips
+    // this test.
+    assert!(
+        stdout.contains("Missing MI in BAM1: 0") && stdout.contains("Missing MI in BAM2: 0"),
+        "Expected paired-strand MIs to be parsed as present, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Grouping mismatches: 1"),
+        "Expected the failure to be a grouping mismatch, got:\n{stdout}"
+    );
+    // The sampled MIs in the mismatch detail must render via Display
+    // (`0/A`, `0/B`) not Debug (`Strand { base: 0, strand: 65 }`).
+    assert!(
+        stdout.contains("0/A") && stdout.contains("0/B"),
+        "Expected Display-formatted MiKeys in mismatch detail, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Strand {"),
+        "MiKey debug-formatting leaked into user-facing output:\n{stdout}"
+    );
+}
