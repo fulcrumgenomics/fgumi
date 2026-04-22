@@ -5,6 +5,7 @@
 
 use ahash::AHashMap;
 use anyhow::Result;
+#[cfg(feature = "simplex")]
 use noodles::sam::alignment::record::cigar::op::Kind;
 
 use crate::phred::{MIN_PHRED, NO_CALL_BASE};
@@ -943,6 +944,7 @@ pub fn mask_methylation_depth_duplex_raw_with_tags(
 /// Returns a vector of `Option<u8>` mapping each query position to its reference base
 /// (uppercased), or `None` for insertions/soft-clips. Returns `None` if the record is
 /// unmapped or the reference cannot be resolved.
+#[cfg(feature = "simplex")]
 #[expect(
     clippy::cast_sign_loss,
     reason = "ref_id and pos are non-negative for mapped records (checked above)"
@@ -1025,6 +1027,7 @@ pub fn resolve_ref_bases_for_record(
 ///
 /// # Errors
 /// Returns an error if the record is too short.
+#[cfg(feature = "simplex")]
 pub fn mask_strand_methylation_agreement_raw(
     record: &mut [u8],
     reference: &dyn crate::methylation::RefBaseProvider,
@@ -1039,7 +1042,7 @@ pub fn mask_strand_methylation_agreement_raw(
     )
 }
 
-/// Like [`mask_strand_methylation_agreement_raw`] but accepts both pre-resolved reference
+/// Like `mask_strand_methylation_agreement_raw` but accepts both pre-resolved reference
 /// bases and pre-parsed methylation tags, avoiding all redundant work.
 ///
 /// # Errors
@@ -1120,6 +1123,7 @@ pub fn mask_strand_methylation_agreement_raw_with_ref_bases_and_tags(
 ///
 /// At non-CpG ref-C positions, the expected behavior is conversion (C->T).
 /// A low conversion rate suggests incomplete enzymatic conversion.
+#[cfg(feature = "simplex")]
 pub fn check_conversion_fraction_raw(
     record: &[u8],
     min_fraction: f64,
@@ -1138,7 +1142,7 @@ pub fn check_conversion_fraction_raw(
     )
 }
 
-/// Like [`check_conversion_fraction_raw`] but accepts both pre-resolved reference bases
+/// Like `check_conversion_fraction_raw` but accepts both pre-resolved reference bases
 /// and pre-parsed methylation tags, avoiding all redundant work.
 ///
 /// For EM-Seq, checks `ct / (cu + ct) >= threshold` at non-CpG ref-C positions.
