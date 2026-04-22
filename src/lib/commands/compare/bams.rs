@@ -451,8 +451,8 @@ struct GroupingCompareResult {
     key_hash: ReadKeyHash,
     /// Read name as String, only populated when needed for error reporting
     read_name_for_display: Option<String>,
-    mi1: Option<i64>,
-    mi2: Option<i64>,
+    mi1: Option<MiKey>,
+    mi2: Option<MiKey>,
     name_match: bool,
     flag_match: bool,
     diff_detail: Option<DiffDetail>,
@@ -475,11 +475,35 @@ fn hash_read_key_raw(name: &[u8], is_read1: bool) -> ReadKeyHash {
     hasher.finish()
 }
 
+/// Key used to group records by molecular identifier during comparison.
+///
+/// Paired-UMI grouping strategies (fgumi and fgbio) emit MI as a Z-type string
+/// encoded `<id>/<A|B>`, where the suffix distinguishes the two strand
+/// orientations of the same double-stranded molecule. Treating a `PairedA(n)`
+/// and a `PairedB(n)` as the same group would mask a real disagreement, so the
+/// comparator must keep the suffix distinct from the integer id.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum MiKey {
+    /// Plain integer MI (single-strand assigners, or an `MI:i:<int>` record).
+    Int(i64),
+    /// Paired-strand MI: `base` is the molecule id; `strand` is `b'A'` or `b'B'`.
+    Strand { base: i64, strand: u8 },
+}
+
+impl std::fmt::Display for MiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MiKey::Int(v) => write!(f, "{v}"),
+            MiKey::Strand { base, strand } => write!(f, "{base}/{}", *strand as char),
+        }
+    }
+}
+
 /// Build a map from MI value to set of read key hashes.
 fn build_mi_groups_compact(
-    mi_map: &AHashMap<ReadKeyHash, i64>,
-) -> AHashMap<i64, AHashSet<ReadKeyHash>> {
-    let mut groups: AHashMap<i64, AHashSet<ReadKeyHash>> = AHashMap::new();
+    mi_map: &AHashMap<ReadKeyHash, MiKey>,
+) -> AHashMap<MiKey, AHashSet<ReadKeyHash>> {
+    let mut groups: AHashMap<MiKey, AHashSet<ReadKeyHash>> = AHashMap::new();
     for (read_key_hash, mi) in mi_map {
         groups.entry(*mi).or_default().insert(*read_key_hash);
     }
@@ -489,18 +513,36 @@ fn build_mi_groups_compact(
 /// Result from parallel MI extraction for a single record
 struct MiExtractResult {
     key_hash: ReadKeyHash,
-    mi: Option<i64>,
+    mi: Option<MiKey>,
 }
 
-/// Extract MI tag from raw BAM record bytes directly as i64.
-/// Tries integer-type MI first, then falls back to string-type MI parsed as i64.
-fn get_mi_tag_raw_i64(raw: &RawRecord) -> Option<i64> {
+/// Extract the MI tag from raw BAM record bytes.
+///
+/// Accepts three forms:
+/// - Integer-typed MI (`MI:i:<int>`) → `MiKey::Int`.
+/// - String-typed integer MI (`MI:Z:<int>`) → `MiKey::Int`.
+/// - String-typed paired MI (`MI:Z:<int>/A` or `/B`) → `MiKey::Strand`.
+///
+/// Any other string payload (e.g. non-numeric prefix, unknown strand suffix)
+/// yields `None`, matching the "missing MI" treatment used by the caller.
+fn get_mi_tag_raw(raw: &RawRecord) -> Option<MiKey> {
     let aux = raw_fields::aux_data_slice(raw.as_ref());
     if let Some(v) = find_int_tag(aux, &SamTag::MI) {
-        return Some(v);
+        return Some(MiKey::Int(v));
     }
-    find_string_tag(aux, &SamTag::MI)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok()?.parse().ok())
+    let bytes = find_string_tag(aux, &SamTag::MI)?;
+    let s = std::str::from_utf8(bytes).ok()?;
+    if let Some((base_str, strand_str)) = s.rsplit_once('/') {
+        let base = base_str.parse::<i64>().ok()?;
+        let strand = match strand_str.as_bytes() {
+            b"A" => b'A',
+            b"B" => b'B',
+            _ => return None,
+        };
+        Some(MiKey::Strand { base, strand })
+    } else {
+        s.parse::<i64>().ok().map(MiKey::Int)
+    }
 }
 
 /// Build an MI map from a BAM file using parallel batch processing.
@@ -513,10 +555,10 @@ fn build_mi_map_parallel(
     path: &Path,
     threads: usize,
     batch_size: usize,
-) -> Result<(AHashMap<ReadKeyHash, i64>, u64, u64)> {
+) -> Result<(AHashMap<ReadKeyHash, MiKey>, u64, u64)> {
     let (rx, _header) = start_raw_batch_reader(path.to_path_buf(), threads, batch_size)?;
 
-    let mut mi_map: AHashMap<ReadKeyHash, i64> = AHashMap::new();
+    let mut mi_map: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
     let mut total_records: u64 = 0;
     let mut missing_mi: u64 = 0;
 
@@ -532,7 +574,7 @@ fn build_mi_map_parallel(
                         let is_read1 = is_first_segment_raw(raw);
                         let key_hash = hash_read_key_raw(name_bytes, is_read1);
 
-                        let mi = get_mi_tag_raw_i64(raw);
+                        let mi = get_mi_tag_raw(raw);
 
                         MiExtractResult { key_hash, mi }
                     })
@@ -886,8 +928,8 @@ fn compare_raw_batch_grouping_parallel(
             let flag_match = is_read1_r1 == is_read1_r2;
 
             let key_hash = hash_read_key_raw(name1_bytes, is_read1_r1);
-            let mi1 = get_mi_tag_raw_i64(r1);
-            let mi2 = get_mi_tag_raw_i64(r2);
+            let mi1 = get_mi_tag_raw(r1);
+            let mi2 = get_mi_tag_raw(r2);
 
             let diff_detail = if !name_match || !flag_match {
                 // Only allocate Strings when there is an actual mismatch to report.
@@ -1249,9 +1291,9 @@ impl CompareBams {
 
         info!("Starting full comparison with {} threads, batch size {}", self.threads, batch_size);
 
-        // Maps: read_key_hash -> MI value for each BAM (compact i64 representation)
-        let mut mi_map1: AHashMap<ReadKeyHash, i64> = AHashMap::new();
-        let mut mi_map2: AHashMap<ReadKeyHash, i64> = AHashMap::new();
+        // Maps: read_key_hash -> MI value for each BAM (compact MiKey representation)
+        let mut mi_map1: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        let mut mi_map2: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
 
         // Start double-buffered readers for both BAM files
         let (rx1, header1) = start_raw_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
@@ -1359,7 +1401,7 @@ impl CompareBams {
                 let key_hash = hash_read_key_raw(name1_bytes, is_read1);
                 // Track missing MI tags explicitly so that two ungrouped BAMs don't
                 // appear equivalent simply because neither inserts into its map.
-                match (get_mi_tag_raw_i64(r1), get_mi_tag_raw_i64(r2)) {
+                match (get_mi_tag_raw(r1), get_mi_tag_raw(r2)) {
                     (Some(mi1), Some(mi2)) => {
                         mi_map1.insert(key_hash, mi1);
                         mi_map2.insert(key_hash, mi2);
@@ -1416,18 +1458,18 @@ impl CompareBams {
 
         // For each MI group in BAM1, verify all reads have the same MI in BAM2
         for (mi1, read_hashes) in &mi_to_reads1 {
-            let mi2_values: AHashSet<i64> =
+            let mi2_values: AHashSet<MiKey> =
                 read_hashes.iter().filter_map(|k| mi_map2.get(k).copied()).collect();
 
             if mi2_values.len() > 1 {
                 grouping_stats.grouping_mismatches += 1;
                 if grouping_errors.len() < self.max_diffs {
                     grouping_errors.push(format!(
-                        "MI group '{}' in BAM1 ({} reads) maps to {} different MIs in BAM2: {:?}",
+                        "MI group '{}' in BAM1 ({} reads) maps to {} different MIs in BAM2: [{}]",
                         mi1,
                         read_hashes.len(),
                         mi2_values.len(),
-                        mi2_values.iter().take(5).collect::<Vec<_>>()
+                        mi2_values.iter().take(5).map(MiKey::to_string).join(", ")
                     ));
                 }
             }
@@ -1435,18 +1477,18 @@ impl CompareBams {
 
         // Verify the reverse: each MI group in BAM2 maps to single MI in BAM1
         for (mi2, read_hashes) in &mi_to_reads2 {
-            let mi1_values: AHashSet<i64> =
+            let mi1_values: AHashSet<MiKey> =
                 read_hashes.iter().filter_map(|k| mi_map1.get(k).copied()).collect();
 
             if mi1_values.len() > 1 {
                 grouping_stats.grouping_mismatches += 1;
                 if grouping_errors.len() < self.max_diffs {
                     grouping_errors.push(format!(
-                        "MI group '{}' in BAM2 ({} reads) maps to {} different MIs in BAM1: {:?}",
+                        "MI group '{}' in BAM2 ({} reads) maps to {} different MIs in BAM1: [{}]",
                         mi2,
                         read_hashes.len(),
                         mi1_values.len(),
-                        mi1_values.iter().take(5).collect::<Vec<_>>()
+                        mi1_values.iter().take(5).map(MiKey::to_string).join(", ")
                     ));
                 }
             }
@@ -1552,10 +1594,9 @@ impl CompareBams {
             self.threads, batch_size
         );
 
-        // Maps: read_key_hash -> MI value for each BAM (compact representation)
-        // Using u64 hash for keys and i64 for MI values saves ~80% memory
-        let mut mi_map1: AHashMap<ReadKeyHash, i64> = AHashMap::new();
-        let mut mi_map2: AHashMap<ReadKeyHash, i64> = AHashMap::new();
+        // Maps: read_key_hash -> MI value for each BAM (compact MiKey representation)
+        let mut mi_map1: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
+        let mut mi_map2: AHashMap<ReadKeyHash, MiKey> = AHashMap::new();
 
         // Start double-buffered raw readers for both BAM files
         let (rx1, _header1) = start_raw_batch_reader(self.bam1.clone(), self.threads, batch_size)?;
@@ -1728,18 +1769,18 @@ impl CompareBams {
         // Check BAM1 groups -> BAM2
         let mut grouping_errors: Vec<String> = Vec::new();
         for (mi1, read_hashes) in &bam1_groups {
-            let mi2_values: AHashSet<i64> =
+            let mi2_values: AHashSet<MiKey> =
                 read_hashes.iter().filter_map(|key_hash| mi_map2.get(key_hash).copied()).collect();
 
             if mi2_values.len() > 1 {
                 stats.grouping_mismatches += 1;
                 if grouping_errors.len() < self.max_diffs {
                     grouping_errors.push(format!(
-                        "MI group '{}' in BAM1 ({} reads) maps to {} different MIs in BAM2: {:?}",
+                        "MI group '{}' in BAM1 ({} reads) maps to {} different MIs in BAM2: [{}]",
                         mi1,
                         read_hashes.len(),
                         mi2_values.len(),
-                        mi2_values.iter().take(5).collect::<Vec<_>>()
+                        mi2_values.iter().take(5).map(MiKey::to_string).join(", ")
                     ));
                 }
             }
@@ -1747,18 +1788,18 @@ impl CompareBams {
 
         // Check BAM2 groups -> BAM1
         for (mi2, read_hashes) in &bam2_groups {
-            let mi1_values: AHashSet<i64> =
+            let mi1_values: AHashSet<MiKey> =
                 read_hashes.iter().filter_map(|key_hash| mi_map1.get(key_hash).copied()).collect();
 
             if mi1_values.len() > 1 {
                 stats.grouping_mismatches += 1;
                 if grouping_errors.len() < self.max_diffs {
                     grouping_errors.push(format!(
-                        "MI group '{}' in BAM2 ({} reads) maps to {} different MIs in BAM1: {:?}",
+                        "MI group '{}' in BAM2 ({} reads) maps to {} different MIs in BAM1: [{}]",
                         mi2,
                         read_hashes.len(),
                         mi1_values.len(),
-                        mi1_values.iter().take(5).collect::<Vec<_>>()
+                        mi1_values.iter().take(5).map(MiKey::to_string).join(", ")
                     ));
                 }
             }
@@ -1907,7 +1948,7 @@ impl CompareBams {
 
             // Check BAM1 groups -> BAM2: for each mi1, all reads should map to same mi2
             // Use a map: mi1 -> (first_mi2_seen, count, has_mismatch)
-            let mut mi1_to_mi2: AHashMap<i64, (i64, u64, bool)> = AHashMap::new();
+            let mut mi1_to_mi2: AHashMap<MiKey, (MiKey, u64, bool)> = AHashMap::new();
             for (key_hash, mi1) in &mi_map1 {
                 if let Some(&mi2) = mi_map2.get(key_hash) {
                     mi1_to_mi2
@@ -1932,7 +1973,7 @@ impl CompareBams {
                 .collect();
 
             // Check BAM2 groups -> BAM1: for each mi2, all reads should map to same mi1
-            let mut mi2_to_mi1: AHashMap<i64, (i64, u64, bool)> = AHashMap::new();
+            let mut mi2_to_mi1: AHashMap<MiKey, (MiKey, u64, bool)> = AHashMap::new();
             for (key_hash, mi2) in &mi_map2 {
                 if let Some(&mi1) = mi_map1.get(key_hash) {
                     mi2_to_mi1
@@ -2111,5 +2152,85 @@ mod tests {
         // mode still inherits from preset (Grouping)
         assert!(matches!(mode, CompareMode::Grouping));
         assert!(!ignore);
+    }
+
+    // ==================== MI tag extraction tests ====================
+
+    /// Build a minimal unmapped `RawRecord` carrying only the supplied aux bytes.
+    /// A 3-byte read name keeps the name+NUL length word-aligned for CIGAR.
+    fn raw_record_with_aux(aux: &[u8]) -> RawRecord {
+        let bytes = fgumi_raw_bam::make_bam_bytes(-1, -1, 4, b"rea", &[], 0, -1, -1, aux);
+        RawRecord::from(bytes)
+    }
+
+    fn aux_mi_string(payload: &[u8]) -> Vec<u8> {
+        let mut aux = vec![b'M', b'I', b'Z'];
+        aux.extend_from_slice(payload);
+        aux.push(0);
+        aux
+    }
+
+    fn aux_mi_i32(v: i32) -> Vec<u8> {
+        let mut aux = vec![b'M', b'I', b'i'];
+        aux.extend_from_slice(&v.to_le_bytes());
+        aux
+    }
+
+    #[test]
+    fn get_mi_tag_raw_parses_integer_string_form() {
+        let rec = raw_record_with_aux(&aux_mi_string(b"42"));
+        assert_eq!(get_mi_tag_raw(&rec), Some(MiKey::Int(42)));
+    }
+
+    #[test]
+    fn get_mi_tag_raw_parses_integer_aux_form() {
+        let rec = raw_record_with_aux(&aux_mi_i32(42));
+        assert_eq!(get_mi_tag_raw(&rec), Some(MiKey::Int(42)));
+    }
+
+    #[test]
+    fn get_mi_tag_raw_parses_paired_a_suffix() {
+        let rec = raw_record_with_aux(&aux_mi_string(b"0/A"));
+        assert_eq!(get_mi_tag_raw(&rec), Some(MiKey::Strand { base: 0, strand: b'A' }));
+    }
+
+    #[test]
+    fn get_mi_tag_raw_parses_paired_b_suffix() {
+        let rec = raw_record_with_aux(&aux_mi_string(b"7/B"));
+        assert_eq!(get_mi_tag_raw(&rec), Some(MiKey::Strand { base: 7, strand: b'B' }));
+    }
+
+    #[test]
+    fn get_mi_tag_raw_distinguishes_paired_a_from_b_with_same_base() {
+        // The essential invariant: a /A and /B grouping of the same molecule
+        // must be different keys so downstream duplex strand checks work.
+        let a = raw_record_with_aux(&aux_mi_string(b"13/A"));
+        let b = raw_record_with_aux(&aux_mi_string(b"13/B"));
+        assert_ne!(get_mi_tag_raw(&a), get_mi_tag_raw(&b));
+    }
+
+    #[test]
+    fn get_mi_tag_raw_missing_tag_returns_none() {
+        let rec = raw_record_with_aux(&[]);
+        assert_eq!(get_mi_tag_raw(&rec), None);
+    }
+
+    #[test]
+    fn get_mi_tag_raw_rejects_non_integer_non_strand_string() {
+        let rec = raw_record_with_aux(&aux_mi_string(b"nope"));
+        assert_eq!(get_mi_tag_raw(&rec), None);
+    }
+
+    #[test]
+    fn get_mi_tag_raw_rejects_unknown_strand_suffix() {
+        let rec = raw_record_with_aux(&aux_mi_string(b"5/C"));
+        assert_eq!(get_mi_tag_raw(&rec), None);
+    }
+
+    #[test]
+    fn mikey_display_matches_bam_encoding() {
+        assert_eq!(MiKey::Int(42).to_string(), "42");
+        assert_eq!(MiKey::Strand { base: 3, strand: b'A' }.to_string(), "3/A");
+        assert_eq!(MiKey::Strand { base: 3, strand: b'B' }.to_string(), "3/B");
     }
 }
