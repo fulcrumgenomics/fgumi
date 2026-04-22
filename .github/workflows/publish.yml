@@ -97,9 +97,11 @@ jobs:
             fgumi
           )
 
-          # Verify every workspace crate is in the publish list
+          # Verify every publishable workspace crate is in the publish list.
+          # Crates marked `publish = false` (serialized as `publish: []` by
+          # cargo metadata) are excluded -- e.g. internal xtask tooling.
           WORKSPACE_CRATES=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[].name' | sort)
+            | jq -r '.packages[] | select(.publish != []) | .name' | sort)
           LISTED_CRATES=$(printf '%s\n' "${CRATES[@]}" | sort)
           MISSING=$(comm -23 <(echo "$WORKSPACE_CRATES") <(echo "$LISTED_CRATES"))
           if [ -n "$MISSING" ]; then
