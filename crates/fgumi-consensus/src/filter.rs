@@ -1603,6 +1603,7 @@ mod tests {
 
     // -- mask_strand_methylation_agreement_raw tests --
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_strand_methylation_agreement_concordant() {
         use crate::methylation::tests::TestRef;
@@ -1633,6 +1634,7 @@ mod tests {
         assert_eq!(masked, 0, "Concordant CpG should not be masked");
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_strand_methylation_agreement_discordant() {
         use crate::methylation::tests::TestRef;
@@ -1663,6 +1665,7 @@ mod tests {
         assert_eq!(masked, 2, "Both CpG positions should be masked when strands disagree");
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_strand_methylation_agreement_non_cpg_ignored() {
         use crate::methylation::tests::TestRef;
@@ -1692,6 +1695,7 @@ mod tests {
 
     // -- check_conversion_fraction_raw tests --
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_passes_high_conversion() {
         use crate::methylation::tests::TestRef;
@@ -1728,6 +1732,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_fails_low_conversion() {
         use crate::methylation::tests::TestRef;
@@ -1761,6 +1766,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_skips_cpg() {
         use crate::methylation::tests::TestRef;
@@ -1795,6 +1801,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_no_methylation_tags_passes() {
         use crate::methylation::tests::TestRef;
@@ -1825,6 +1832,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_unmapped_passes() {
         use crate::methylation::tests::TestRef;
@@ -1852,6 +1860,7 @@ mod tests {
 
     // -- TAPs conversion fraction tests --
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_taps_passes_high_non_conversion() {
         use crate::methylation::tests::TestRef;
@@ -1885,6 +1894,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_taps_fails_low_non_conversion() {
         use crate::methylation::tests::TestRef;
@@ -1918,6 +1928,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_taps_vs_emseq_inverted() {
         use crate::methylation::tests::TestRef;
@@ -1964,6 +1975,7 @@ mod tests {
 
     // -- Disabled mode tests --
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_conversion_fraction_disabled_mode_passes() {
         use crate::methylation::tests::TestRef;
@@ -1999,6 +2011,7 @@ mod tests {
 
     // -- resolve_ref_bases_for_record tests --
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_resolve_ref_bases_simple_match() {
         use crate::methylation::tests::TestRef;
@@ -2015,6 +2028,7 @@ mod tests {
         assert_eq!(bases, vec![Some(b'A'), Some(b'C'), Some(b'G'), Some(b'T')]);
     }
 
+    #[cfg(feature = "simplex")]
     #[test]
     fn test_resolve_ref_bases_with_insertion() {
         use crate::methylation::tests::TestRef;
