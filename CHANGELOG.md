@@ -4,6 +4,69 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-22
+
+### Bug Fixes
+
+- Add fgumi-simd-fastq to publish list and verify completeness ([#257](https://github.com/fulcrumgenomics/fgumi/pull/257))
+- Take last `:`-separated field as UMI from read name ([#264](https://github.com/fulcrumgenomics/fgumi/pull/264))
+- [**breaking**] Rename sort-key tag from pa to tc to avoid bwa-mem pa:f collision ([#270](https://github.com/fulcrumgenomics/fgumi/pull/270))
+- Emit consecutive MI integers 0..N-1 ([#273](https://github.com/fulcrumgenomics/fgumi/pull/273))
+- Cap metric memory with per-thread accumulators ([#285](https://github.com/fulcrumgenomics/fgumi/pull/285)) ([#287](https://github.com/fulcrumgenomics/fgumi/pull/287))
+- Suppress deadlock false positive when all queues empty ([#297](https://github.com/fulcrumgenomics/fgumi/pull/297))
+- Stream rejects to disk in simplex/duplex/codec/correct ([#293](https://github.com/fulcrumgenomics/fgumi/pull/293))
+- Apply --unmapped-fraction to mapped-reads output ([#304](https://github.com/fulcrumgenomics/fgumi/pull/304))
+- Use htsjdk-compatible Murmur3 for downsample selection ([#306](https://github.com/fulcrumgenomics/fgumi/pull/306))
+- Preserve /A /B strand suffix in paired-UMI MI keys ([#308](https://github.com/fulcrumgenomics/fgumi/pull/308))
+
+### Documentation
+
+- Add EM-Seq user guide ([#171](https://github.com/fulcrumgenomics/fgumi/pull/171))
+- Add TAPs guide and update EM-Seq guide for --methylation-mode ([#174](https://github.com/fulcrumgenomics/fgumi/pull/174))
+- Correct insert complexity and add micro-bench ([#265](https://github.com/fulcrumgenomics/fgumi/pull/265))
+- Fix broken doctests in commands modules ([#300](https://github.com/fulcrumgenomics/fgumi/pull/300))
+
+### Features
+
+- Add EM-Seq methylation-aware consensus calling ([#168](https://github.com/fulcrumgenomics/fgumi/pull/168))
+- Add EM-Seq methylation filters and performance improvements ([#169](https://github.com/fulcrumgenomics/fgumi/pull/169))
+- Add --restore-unconverted-bases flag for EM-seq ([#170](https://github.com/fulcrumgenomics/fgumi/pull/170))
+- Add --methylation-mode for EM-Seq/TAPs consensus ([#172](https://github.com/fulcrumgenomics/fgumi/pull/172))
+- Add --methylation-mode to filter for conversion fraction ([#173](https://github.com/fulcrumgenomics/fgumi/pull/173))
+- Add --methylation-mode to simulate subcommands ([#263](https://github.com/fulcrumgenomics/fgumi/pull/263))
+- Auto-detect BAM input on stdin via BGZF magic ([#267](https://github.com/fulcrumgenomics/fgumi/pull/267))
+- Replace --mode with orthogonal flags + add --command preset ([#276](https://github.com/fulcrumgenomics/fgumi/pull/276))
+- Add --async-reader flag for prefetch I/O on input BAM ([#261](https://github.com/fulcrumgenomics/fgumi/pull/261))
+- Distribute spill files across multiple temp dirs ([#284](https://github.com/fulcrumgenomics/fgumi/pull/284))
+- Additive API surface ([#288](https://github.com/fulcrumgenomics/fgumi/pull/288))
+- Restore --command preset for per-stage compare defaults ([#307](https://github.com/fulcrumgenomics/fgumi/pull/307))
+
+### Performance
+
+- Speed up --restore-unconverted-bases hot path ([#271](https://github.com/fulcrumgenomics/fgumi/pull/271))
+- Async prefetch reader + POSIX_FADV_SEQUENTIAL for BAM/FASTQ inputs ([#258](https://github.com/fulcrumgenomics/fgumi/pull/258))
+- Restore unconverted bases on raw BAM bytes ([#274](https://github.com/fulcrumgenomics/fgumi/pull/274))
+- Follow-up speedups + SIMD nibble2base ([#282](https://github.com/fulcrumgenomics/fgumi/pull/282))
+- Migrate RecordBuf hot paths to raw-byte accessors ([#305](https://github.com/fulcrumgenomics/fgumi/pull/305))
+
+### Refactor
+
+- Migrate fgumi to new raw-bam view/editor API ([#279](https://github.com/fulcrumgenomics/fgumi/pull/279))
+- [**breaking**] Narrow re-exports + partial free-fn demotion ([#280](https://github.com/fulcrumgenomics/fgumi/pull/280))
+- Use RawRecord methods in restore_unconverted_bases_in_raw_record ([#286](https://github.com/fulcrumgenomics/fgumi/pull/286))
+- PerThreadAccumulator for all per-batch metric collection ([#290](https://github.com/fulcrumgenomics/fgumi/pull/290))
+- Migrate internals to RawRecord; drop RecordBuf variants ([#291](https://github.com/fulcrumgenomics/fgumi/pull/291))
+- Migrate commands, storage, and pipeline to raw-byte records ([#292](https://github.com/fulcrumgenomics/fgumi/pull/292))
+- [**breaking**] Collapse Template/DecodedRecord to raw-only; drop dead RecordBuf helpers ([#294](https://github.com/fulcrumgenomics/fgumi/pull/294))
+- Migrate workspace tests to fgumi_raw_bam SamBuilder ([#295](https://github.com/fulcrumgenomics/fgumi/pull/295))
+- [**breaking**] Delete vendored bam_codec; migrate simulate; propagate all remaining 48-commit work ([#296](https://github.com/fulcrumgenomics/fgumi/pull/296))
+
+### Testing
+
+- Benchmarks + proptests + edge cases ([#281](https://github.com/fulcrumgenomics/fgumi/pull/281))
+
+<!-- generated by git-cliff -->
+
 ### Bug Fixes
 
 - Cap `fgumi group` metric memory by merging per-position-group counts into per-thread accumulators instead of a `SegQueue` that grew one `AHashMap` per position group ([#285](https://github.com/fulcrumgenomics/fgumi/issues/285)).
