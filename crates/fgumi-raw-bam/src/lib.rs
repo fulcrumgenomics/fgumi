@@ -61,13 +61,14 @@ pub use fields::{
 pub use builder::{SamBuilder, UnmappedSamBuilder};
 
 // -- cigar --
+#[cfg(feature = "noodles")]
+pub use cigar::cigar_op_kind;
 pub use cigar::{
     // -- typed CIGAR iteration --
     CigarKind,
     CigarOp,
     alignment_end_from_raw,
     alignment_start_from_raw,
-    cigar_op_kind,
     cigar_to_string_from_raw,
     clip_cigar_ops_raw,
     consumes_query,
