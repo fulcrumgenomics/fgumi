@@ -376,7 +376,8 @@ impl Command for Simplex {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter = MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
+        let mi_group_iter =
+            MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*SamTag::CB));
         // Single-threaded streaming processing
         // Create overlapping consensus caller for single-threaded mode
         let mut overlapping_caller = if overlapping_enabled {
@@ -564,7 +565,7 @@ impl Simplex {
             Some(output_header.clone()),
             // ========== grouper_fn: Create MiGrouper ==========
             move |_header: &Header| {
-                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
+                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*SamTag::CB)))
                     as Box<dyn Grouper<Group = MiGroupBatch> + Send>
             },
             // ========== process_fn: Consensus calling ==========

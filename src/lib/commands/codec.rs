@@ -363,7 +363,8 @@ impl Command for Codec {
                 Err(e) => Some(Err(e.into())),
             }
         });
-        let mi_group_iter = MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*b"CB"));
+        let mi_group_iter =
+            MiGroupIterator::new(raw_record_iter, "MI").with_cell_tag(Some(*SamTag::CB));
 
         let mut caller = CodecConsensusCaller::new_with_rejects_tracking(
             read_name_prefix,
@@ -567,7 +568,7 @@ impl Codec {
             Some(output_header.clone()),
             // ========== grouper_fn: Create MiGrouper ==========
             move |_header: &Header| {
-                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*b"CB")))
+                Box::new(MiGrouper::new("MI", batch_size).with_cell_tag(Some(*SamTag::CB)))
                     as Box<dyn Grouper<Group = MiGroupBatch> + Send>
             },
             // ========== process_fn: CODEC consensus calling ==========
@@ -866,8 +867,8 @@ mod tests {
             .mate_ref_id(0)
             .mate_pos(start2 as i32 - 1)
             .template_length(insert_size);
-        b1.add_string_tag(b"MI", mi_value.as_bytes());
-        b1.add_string_tag(b"RG", b"A");
+        b1.add_string_tag(SamTag::MI, mi_value.as_bytes());
+        b1.add_string_tag(SamTag::RG, b"A");
         let r1 = to_record_buf(b1.build());
 
         let mut b2 = RawSamBuilder::new();
@@ -882,8 +883,8 @@ mod tests {
             .mate_ref_id(0)
             .mate_pos(start1 as i32 - 1)
             .template_length(-insert_size);
-        b2.add_string_tag(b"MI", mi_value.as_bytes());
-        b2.add_string_tag(b"RG", b"A");
+        b2.add_string_tag(SamTag::MI, mi_value.as_bytes());
+        b2.add_string_tag(SamTag::RG, b"A");
         let r2 = to_record_buf(b2.build());
 
         (r1, r2)
