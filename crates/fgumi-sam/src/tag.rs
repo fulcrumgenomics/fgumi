@@ -163,6 +163,49 @@ impl SamTag {
     pub const BM: SamTag = SamTag::new(b'b', b'M');
     /// Per-read raw-read disagreement rate vs. the BA single-strand consensus (`bE`).
     pub const BE: SamTag = SamTag::new(b'b', b'E');
+
+    // ── fgbio-style consensus tags (per-base arrays) ───────────────────────
+    //
+    // Lowercase second byte distinguishes per-base i16 arrays from the per-read
+    // scalars above. The `_BASES` suffix on the Rust identifier disambiguates
+    // from the matching per-read constant (case-insensitive identifier collision).
+
+    /// Per-base raw-read depth array for the combined consensus (`cd`, `B,s`).
+    pub const CD_BASES: SamTag = SamTag::new(b'c', b'd');
+    /// Per-base raw-read disagreement count array for the combined consensus (`ce`, `B,s`).
+    pub const CE_BASES: SamTag = SamTag::new(b'c', b'e');
+    /// Per-base raw-read depth array for the AB single-strand consensus (`ad`, `B,s`).
+    pub const AD_BASES: SamTag = SamTag::new(b'a', b'd');
+    /// Per-base raw-read disagreement count array for the AB single-strand consensus (`ae`, `B,s`).
+    pub const AE_BASES: SamTag = SamTag::new(b'a', b'e');
+    /// Per-base raw-read depth array for the BA single-strand consensus (`bd`, `B,s`).
+    pub const BD_BASES: SamTag = SamTag::new(b'b', b'd');
+    /// Per-base raw-read disagreement count array for the BA single-strand consensus (`be`, `B,s`).
+    pub const BE_BASES: SamTag = SamTag::new(b'b', b'e');
+
+    /// AB single-strand consensus base sequence (`ac`, `Z`).
+    pub const AC: SamTag = SamTag::new(b'a', b'c');
+    /// BA single-strand consensus base sequence (`bc`, `Z`).
+    pub const BC_BASES: SamTag = SamTag::new(b'b', b'c');
+    /// AB single-strand consensus Phred+33 quality string (`aq`, `Z`).
+    pub const AQ: SamTag = SamTag::new(b'a', b'q');
+    /// BA single-strand consensus Phred+33 quality string (`bq`, `Z`).
+    pub const BQ: SamTag = SamTag::new(b'b', b'q');
+
+    // ── fgbio-style EM-Seq / methylation consensus tags ────────────────────
+
+    /// Per-base unconverted-cytosine count for the combined consensus (`cu`, `B,s`).
+    pub const CU: SamTag = SamTag::new(b'c', b'u');
+    /// Per-base converted-cytosine count for the combined consensus (`ct`, `B,s`).
+    pub const CT: SamTag = SamTag::new(b'c', b't');
+    /// Per-base unconverted-cytosine count for the AB single-strand consensus (`au`, `B,s`).
+    pub const AU: SamTag = SamTag::new(b'a', b'u');
+    /// Per-base converted-cytosine count for the AB single-strand consensus (`at`, `B,s`).
+    pub const AT: SamTag = SamTag::new(b'a', b't');
+    /// Per-base unconverted-cytosine count for the BA single-strand consensus (`bu`, `B,s`).
+    pub const BU: SamTag = SamTag::new(b'b', b'u');
+    /// Per-base converted-cytosine count for the BA single-strand consensus (`bt`, `B,s`).
+    pub const BT: SamTag = SamTag::new(b'b', b't');
 }
 
 impl Deref for SamTag {
@@ -329,5 +372,41 @@ mod tests {
         assert_eq!(*SamTag::BD, [b'b', b'D']);
         assert_eq!(*SamTag::BM, [b'b', b'M']);
         assert_eq!(*SamTag::BE, [b'b', b'E']);
+    }
+
+    #[test]
+    fn test_per_base_consensus_constants() {
+        // depth/error count arrays
+        assert_eq!(*SamTag::CD_BASES, [b'c', b'd']);
+        assert_eq!(*SamTag::CE_BASES, [b'c', b'e']);
+        assert_eq!(*SamTag::AD_BASES, [b'a', b'd']);
+        assert_eq!(*SamTag::AE_BASES, [b'a', b'e']);
+        assert_eq!(*SamTag::BD_BASES, [b'b', b'd']);
+        assert_eq!(*SamTag::BE_BASES, [b'b', b'e']);
+        // single-strand consensus bases / qualities
+        assert_eq!(*SamTag::AC, [b'a', b'c']);
+        assert_eq!(*SamTag::BC_BASES, [b'b', b'c']);
+        assert_eq!(*SamTag::AQ, [b'a', b'q']);
+        assert_eq!(*SamTag::BQ, [b'b', b'q']);
+        // EM-Seq methylation conversion counts
+        assert_eq!(*SamTag::CU, [b'c', b'u']);
+        assert_eq!(*SamTag::CT, [b'c', b't']);
+        assert_eq!(*SamTag::AU, [b'a', b'u']);
+        assert_eq!(*SamTag::AT, [b'a', b't']);
+        assert_eq!(*SamTag::BU, [b'b', b'u']);
+        assert_eq!(*SamTag::BT, [b'b', b't']);
+    }
+
+    #[test]
+    fn test_per_base_constants_are_distinct_from_per_read() {
+        // Lowercase second byte = per-base array, uppercase = per-read scalar.
+        assert_ne!(SamTag::CD, SamTag::CD_BASES);
+        assert_ne!(SamTag::CE, SamTag::CE_BASES);
+        assert_ne!(SamTag::AD, SamTag::AD_BASES);
+        assert_ne!(SamTag::AE, SamTag::AE_BASES);
+        assert_ne!(SamTag::BD, SamTag::BD_BASES);
+        assert_ne!(SamTag::BE, SamTag::BE_BASES);
+        // BC_BASES collides with the SAM-spec sample-barcode BC tag.
+        assert_ne!(SamTag::BC, SamTag::BC_BASES);
     }
 }
