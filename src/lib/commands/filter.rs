@@ -1115,6 +1115,7 @@ impl Filter {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::sam::SamTag;
     use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, aux_data_slice, flags};
     use noodles::sam::alignment::record_buf::RecordBuf;
     use rstest::rstest;
@@ -1450,16 +1451,16 @@ mod tests {
             b.cigar_ops(&[cigar_op]).sequence(sequence).qualities(qualities);
         }
         if let Some(depth) = read_depth {
-            b.add_int_tag(b"cD", i32::from(depth));
+            b.add_int_tag(SamTag::CD, i32::from(depth));
         }
         if let Some(error) = read_error {
-            b.add_float_tag(b"cE", error);
+            b.add_float_tag(SamTag::CE, error);
         }
         if let Some(depths) = base_depths {
-            b.add_array_u16(b"cd", &depths);
+            b.add_array_u16(SamTag::CD_BASES, &depths);
         }
         if let Some(errors) = base_errors {
-            b.add_array_u16(b"ce", &errors);
+            b.add_array_u16(SamTag::CE_BASES, &errors);
         }
         b.build()
     }
@@ -1766,7 +1767,7 @@ mod tests {
             .cigar_ops(&[4 << 4]) // 4M
             .sequence(b"ACGT")
             .qualities(&[30, 30, 30, 30]);
-        b.add_int_tag(b"aD", 10);
+        b.add_int_tag(SamTag::AD, 10);
         let record = b.build();
 
         assert!(is_duplex_consensus(aux_data_slice(&record)));
@@ -2460,11 +2461,11 @@ mod tests {
             .cigar_ops(&[n << 4]) // nM
             .sequence(bases)
             .qualities(quals);
-        b.add_int_tag(b"cD", i32::from(read_depth));
-        b.add_int_tag(b"cM", i32::from(read_depth));
-        b.add_float_tag(b"cE", read_error);
-        b.add_array_i16(b"cd", base_depths);
-        b.add_array_i16(b"ce", base_errors);
+        b.add_int_tag(SamTag::CD, i32::from(read_depth));
+        b.add_int_tag(SamTag::CM, i32::from(read_depth));
+        b.add_float_tag(SamTag::CE, read_error);
+        b.add_array_i16(SamTag::CD_BASES, base_depths);
+        b.add_array_i16(SamTag::CE_BASES, base_errors);
         b.build()
     }
 
@@ -2973,17 +2974,17 @@ mod tests {
             .sequence(bases)
             .qualities(quals);
         // Per-read duplex tags
-        b.add_int_tag(b"aD", i32::from(ab_depth));
-        b.add_int_tag(b"bD", i32::from(ba_depth));
-        b.add_int_tag(b"aM", i32::from(ab_depth));
-        b.add_int_tag(b"bM", i32::from(ba_depth));
-        b.add_float_tag(b"aE", ab_error);
-        b.add_float_tag(b"bE", ba_error);
+        b.add_int_tag(SamTag::AD, i32::from(ab_depth));
+        b.add_int_tag(SamTag::BD, i32::from(ba_depth));
+        b.add_int_tag(SamTag::AM, i32::from(ab_depth));
+        b.add_int_tag(SamTag::BM, i32::from(ba_depth));
+        b.add_float_tag(SamTag::AE, ab_error);
+        b.add_float_tag(SamTag::BE, ba_error);
         // Per-base duplex tags
-        b.add_array_i16(b"ad", ab_base_depths);
-        b.add_array_i16(b"bd", ba_base_depths);
-        b.add_array_i16(b"ae", &zero_errors);
-        b.add_array_i16(b"be", &zero_errors);
+        b.add_array_i16(SamTag::AD_BASES, ab_base_depths);
+        b.add_array_i16(SamTag::BD_BASES, ba_base_depths);
+        b.add_array_i16(SamTag::AE_BASES, &zero_errors);
+        b.add_array_i16(SamTag::BE_BASES, &zero_errors);
         b.build()
     }
 
@@ -3740,11 +3741,11 @@ mod tests {
                 .cigar_ops(&[4 << 4]) // 4M
                 .sequence(b"CCCC")
                 .qualities(&[30, 30, 30, 30]);
-            b.add_int_tag(b"cD", 10)
-                .add_int_tag(b"cM", 10)
-                .add_float_tag(b"cE", 0.01_f32)
-                .add_array_i16(b"cd", &[10, 10, 10, 10])
-                .add_array_i16(b"ce", &[0, 0, 0, 0]);
+            b.add_int_tag(SamTag::CD, 10)
+                .add_int_tag(SamTag::CM, 10)
+                .add_float_tag(SamTag::CE, 0.01_f32)
+                .add_array_i16(SamTag::CD_BASES, &[10, 10, 10, 10])
+                .add_array_i16(SamTag::CE_BASES, &[0, 0, 0, 0]);
             b.build()
         };
 
@@ -3759,11 +3760,11 @@ mod tests {
                 .cigar_ops(&[4 << 4]) // 4M
                 .sequence(b"GGGG")
                 .qualities(&[30, 30, 30, 30]);
-            b.add_int_tag(b"cD", 2) // Low depth — fails
-                .add_int_tag(b"cM", 2)
-                .add_float_tag(b"cE", 0.5_f32) // High error — fails
-                .add_array_i16(b"cd", &[2, 2, 2, 2])
-                .add_array_i16(b"ce", &[0, 0, 0, 0]);
+            b.add_int_tag(SamTag::CD, 2) // Low depth — fails
+                .add_int_tag(SamTag::CM, 2)
+                .add_float_tag(SamTag::CE, 0.5_f32) // High error — fails
+                .add_array_i16(SamTag::CD_BASES, &[2, 2, 2, 2])
+                .add_array_i16(SamTag::CE_BASES, &[0, 0, 0, 0]);
             b.build()
         };
 
@@ -3846,11 +3847,11 @@ mod tests {
                         .cigar_ops(&[4 << 4])
                         .sequence(b"CCCC")
                         .qualities(&[30, 30, 30, 30]);
-                    b.add_int_tag(b"cD", 10)
-                        .add_int_tag(b"cM", 10)
-                        .add_float_tag(b"cE", 0.01_f32)
-                        .add_array_i16(b"cd", &[10, 10, 10, 10])
-                        .add_array_i16(b"ce", &[0, 0, 0, 0]);
+                    b.add_int_tag(SamTag::CD, 10)
+                        .add_int_tag(SamTag::CM, 10)
+                        .add_float_tag(SamTag::CE, 0.01_f32)
+                        .add_array_i16(SamTag::CD_BASES, &[10, 10, 10, 10])
+                        .add_array_i16(SamTag::CE_BASES, &[0, 0, 0, 0]);
                     b.build()
                 };
                 records.push(supp);
@@ -3866,11 +3867,11 @@ mod tests {
                         .cigar_ops(&[4 << 4])
                         .sequence(b"GGGG")
                         .qualities(&[30, 30, 30, 30]);
-                    b.add_int_tag(b"cD", 2) // Fails min_reads
-                        .add_int_tag(b"cM", 2)
-                        .add_float_tag(b"cE", 0.5_f32)
-                        .add_array_i16(b"cd", &[2, 2, 2, 2])
-                        .add_array_i16(b"ce", &[0, 0, 0, 0]);
+                    b.add_int_tag(SamTag::CD, 2) // Fails min_reads
+                        .add_int_tag(SamTag::CM, 2)
+                        .add_float_tag(SamTag::CE, 0.5_f32)
+                        .add_array_i16(SamTag::CD_BASES, &[2, 2, 2, 2])
+                        .add_array_i16(SamTag::CE_BASES, &[0, 0, 0, 0]);
                     b.build()
                 };
                 records.push(supp_fail);
@@ -4204,7 +4205,7 @@ mod tests {
             let mut b = RawSamBuilder::new();
             b.sequence(b"AANNTTGGCC") // 10 bases, 2 Ns
                 .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            b.add_int_tag(b"cD", 10).add_float_tag(b"cE", 0.01_f32);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.01_f32);
             b.build()
         };
         let raw = raw_record.into_inner();
@@ -4234,7 +4235,7 @@ mod tests {
             let mut b = RawSamBuilder::new();
             b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
                 .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            b.add_int_tag(b"cD", 10).add_float_tag(b"cE", 0.01_f32);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.01_f32);
             b.build()
         };
         let raw = raw_record.into_inner();
@@ -4264,7 +4265,7 @@ mod tests {
             let mut b = RawSamBuilder::new();
             b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
                 .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
-            b.add_int_tag(b"cD", 10).add_float_tag(b"cE", 0.01_f32);
+            b.add_int_tag(SamTag::CD, 10).add_float_tag(SamTag::CE, 0.01_f32);
             b.build()
         };
         let raw = raw_record.into_inner();
@@ -4290,12 +4291,12 @@ mod tests {
             b.sequence(b"AANNNTTGGC") // 10 bases, 3 Ns
                 .qualities(&[30, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
             // Add required duplex tags: aD, bD, aE, bE, aM, bM
-            b.add_int_tag(b"aD", 10)
-                .add_int_tag(b"bD", 8)
-                .add_float_tag(b"aE", 0.01_f32)
-                .add_float_tag(b"bE", 0.01_f32)
-                .add_int_tag(b"aM", 10)
-                .add_int_tag(b"bM", 8);
+            b.add_int_tag(SamTag::AD, 10)
+                .add_int_tag(SamTag::BD, 8)
+                .add_float_tag(SamTag::AE, 0.01_f32)
+                .add_float_tag(SamTag::BE, 0.01_f32)
+                .add_int_tag(SamTag::AM, 10)
+                .add_int_tag(SamTag::BM, 8);
             b.build()
         };
         let raw = raw_record.into_inner();
@@ -4343,7 +4344,7 @@ mod tests {
                 .flags(flags::UNMAPPED)
                 .sequence(b"ACGTACGT")
                 .qualities(&[35, 35, 35, 35, 35, 35, 35, 35]);
-            b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
             b.build()
         };
         let mut raw = raw_record;
@@ -4387,7 +4388,7 @@ mod tests {
                 .cigar_ops(&[8 << 4]) // 8M
                 .sequence(b"ACGTACGT")
                 .qualities(&[35; 8]);
-            b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+            b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
             b.build()
         };
 

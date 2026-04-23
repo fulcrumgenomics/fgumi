@@ -8,7 +8,7 @@
 use crate::bam_io::{RawBamWriter, create_raw_bam_reader, create_raw_bam_writer};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
-use crate::sam::is_template_coordinate_sorted;
+use crate::sam::{SamTag, is_template_coordinate_sorted};
 use crate::validation::validate_file_exists;
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -351,13 +351,13 @@ where
 fn get_mi_tag(record: &RawRecord) -> Result<String> {
     let aux = aux_data_slice(record.as_ref());
 
-    if let Some(bytes) = find_string_tag(aux, b"MI") {
+    if let Some(bytes) = find_string_tag(aux, SamTag::MI) {
         return std::str::from_utf8(bytes)
             .map(str::to_string)
             .map_err(|e| anyhow::anyhow!("MI tag is not valid UTF-8: {e}"));
     }
 
-    if let Some(v) = find_int_tag(aux, b"MI") {
+    if let Some(v) = find_int_tag(aux, SamTag::MI) {
         return Ok(v.to_string());
     }
 
@@ -375,7 +375,7 @@ mod tests {
     fn create_test_record(name: &str, mi: &str) -> RawRecord {
         let mut b = RawSamBuilder::new();
         b.read_name(name.as_bytes());
-        b.add_string_tag(b"MI", mi.as_bytes());
+        b.add_string_tag(SamTag::MI, mi.as_bytes());
         b.build()
     }
 
@@ -383,7 +383,7 @@ mod tests {
     fn create_test_record_int_mi(name: &str, mi: i32) -> RawRecord {
         let mut b = RawSamBuilder::new();
         b.read_name(name.as_bytes());
-        b.add_int_tag(b"MI", mi);
+        b.add_int_tag(SamTag::MI, mi);
         b.build()
     }
 

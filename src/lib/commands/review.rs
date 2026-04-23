@@ -1235,7 +1235,7 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 .qualities(&vec![45u8; bases1.len()])
                 .mate_ref_id(chrom_idx as i32)
                 .mate_pos(start2 - 1);
-            b1.add_string_tag(b"MI", mi.as_bytes());
+            b1.add_string_tag(SamTag::MI, mi.as_bytes());
             let r1 = to_record_buf(b1.build());
 
             let mut b2 = RawSamBuilder::new();
@@ -1249,7 +1249,7 @@ CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
                 .qualities(&vec![45u8; bases2.len()])
                 .mate_ref_id(chrom_idx as i32)
                 .mate_pos(start1 - 1);
-            b2.add_string_tag(b"MI", mi.as_bytes());
+            b2.add_string_tag(SamTag::MI, mi.as_bytes());
             let r2 = to_record_buf(b2.build());
 
             (r1, r2)
