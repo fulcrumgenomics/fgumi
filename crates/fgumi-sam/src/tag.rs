@@ -138,6 +138,31 @@ impl SamTag {
     /// Lowercase per the SAM specification convention for non-standard
     /// program tags. Written by `fgumi zipper`; validated by `fgumi dedup`.
     pub const TC: SamTag = SamTag::new(b't', b'c');
+
+    // ── fgbio-style consensus tags (per-read) ──────────────────────────────
+    //
+    // First letter encodes the strand: `c` = combined consensus, `a` = AB
+    // single-strand, `b` = BA single-strand. Second letter (uppercase = per-read,
+    // lowercase = per-base array) encodes the metric.
+
+    /// Per-read max raw-read depth contributing to the combined consensus (`cD`).
+    pub const CD: SamTag = SamTag::new(b'c', b'D');
+    /// Per-read min raw-read depth contributing to the combined consensus (`cM`).
+    pub const CM: SamTag = SamTag::new(b'c', b'M');
+    /// Per-read raw-read disagreement rate vs. the combined consensus (`cE`).
+    pub const CE: SamTag = SamTag::new(b'c', b'E');
+    /// Per-read max raw-read depth for the AB single-strand consensus (`aD`).
+    pub const AD: SamTag = SamTag::new(b'a', b'D');
+    /// Per-read min raw-read depth for the AB single-strand consensus (`aM`).
+    pub const AM: SamTag = SamTag::new(b'a', b'M');
+    /// Per-read raw-read disagreement rate vs. the AB single-strand consensus (`aE`).
+    pub const AE: SamTag = SamTag::new(b'a', b'E');
+    /// Per-read max raw-read depth for the BA single-strand consensus (`bD`).
+    pub const BD: SamTag = SamTag::new(b'b', b'D');
+    /// Per-read min raw-read depth for the BA single-strand consensus (`bM`).
+    pub const BM: SamTag = SamTag::new(b'b', b'M');
+    /// Per-read raw-read disagreement rate vs. the BA single-strand consensus (`bE`).
+    pub const BE: SamTag = SamTag::new(b'b', b'E');
 }
 
 impl Deref for SamTag {
@@ -291,5 +316,18 @@ mod tests {
         assert_eq!(*SamTag::ML, [b'M', b'L']);
         assert_eq!(*SamTag::UQ, [b'U', b'Q']);
         assert_eq!(*SamTag::OQ, [b'O', b'Q']);
+    }
+
+    #[test]
+    fn test_per_read_consensus_constants() {
+        assert_eq!(*SamTag::CD, [b'c', b'D']);
+        assert_eq!(*SamTag::CM, [b'c', b'M']);
+        assert_eq!(*SamTag::CE, [b'c', b'E']);
+        assert_eq!(*SamTag::AD, [b'a', b'D']);
+        assert_eq!(*SamTag::AM, [b'a', b'M']);
+        assert_eq!(*SamTag::AE, [b'a', b'E']);
+        assert_eq!(*SamTag::BD, [b'b', b'D']);
+        assert_eq!(*SamTag::BM, [b'b', b'M']);
+        assert_eq!(*SamTag::BE, [b'b', b'E']);
     }
 }
