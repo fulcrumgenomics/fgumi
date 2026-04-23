@@ -24,23 +24,8 @@
 //! per-base-quals        aq  bq  quals
 //! ```
 
-use noodles::sam::alignment::record::data::field::Tag;
+use fgumi_sam::SamTag;
 use noodles::sam::alignment::record_buf::data::field::value::Value;
-
-/// Converts a two-character tag string to a noodles `Tag`.
-///
-/// # Panics
-///
-/// Panics if `s` is not exactly 2 ASCII bytes.
-#[must_use]
-pub fn tag(s: &str) -> Tag {
-    let bytes = s.as_bytes();
-    assert!(
-        bytes.len() == 2 && bytes[0].is_ascii() && bytes[1].is_ascii(),
-        "SAM tag must be exactly 2 ASCII bytes: {s:?}"
-    );
-    Tag::from([bytes[0], bytes[1]])
-}
 
 /// Converts a sequence (`Vec<u8>`) to a String value for SAM tags.
 ///
@@ -61,192 +46,136 @@ pub fn qualities_to_tag_value(quals: &[u8]) -> Value {
 }
 
 /// Default field in which to look for UMI sequences (`RX`).
-pub const UMI_BASES: fgumi_sam::SamTag = fgumi_sam::SamTag::RX;
+pub const UMI_BASES: SamTag = SamTag::RX;
 
 /// Default field in which to look for UMI qualities (`QX`).
-pub const UMI_QUALS: fgumi_sam::SamTag = fgumi_sam::SamTag::QX;
+pub const UMI_QUALS: SamTag = SamTag::QX;
 
 /// Field in which the original UMI bases are stored post-correction (`OX`).
-pub const ORIGINAL_UMI_BASES: fgumi_sam::SamTag = fgumi_sam::SamTag::OX;
+pub const ORIGINAL_UMI_BASES: SamTag = SamTag::OX;
 
 /// Field in which the original UMI qualities are stored post-correction (`BZ`).
-pub const ORIGINAL_UMI_QUALS: fgumi_sam::SamTag = fgumi_sam::SamTag::BZ;
+pub const ORIGINAL_UMI_QUALS: SamTag = SamTag::BZ;
 
 /// Post-grouping ID that is file-wide unique per source molecule (`MI`).
-pub const MOLECULAR_ID: fgumi_sam::SamTag = fgumi_sam::SamTag::MI;
+pub const MOLECULAR_ID: SamTag = SamTag::MI;
 
-/// Per-base consensus tags
+/// Per-base consensus tag aliases.
 pub mod per_base {
-    /// Converts a tag string to a noodles Tag (delegates to top-level [`super::tag`])
-    #[must_use]
-    pub fn tag(s: &str) -> super::Tag {
-        super::tag(s)
-    }
+    use super::SamTag;
 
     /// The per-base number of raw-reads contributing to the consensus (stored as a short[])
-    pub const RAW_READ_COUNT: &str = "cd"; // consensus depth
+    pub const RAW_READ_COUNT: SamTag = SamTag::CD_BASES;
 
     /// The number of bases at each position that disagreed with the final consensus call (stored as a short[])
     /// If the final consensus call is a no call (N), then we use the most likely consensus base instead
-    pub const RAW_READ_ERRORS: &str = "ce"; // consensus errors
+    pub const RAW_READ_ERRORS: SamTag = SamTag::CE_BASES;
 
-    // Duplex versions of the above tags for the two single strand consensus reads
     /// The per-base number of raw reads contributing to the AB single-strand consensus
-    pub const AB_RAW_READ_COUNT: &str = "ad";
+    pub const AB_RAW_READ_COUNT: SamTag = SamTag::AD_BASES;
 
     /// The per-base number of raw reads contributing to the BA single-strand consensus
-    pub const BA_RAW_READ_COUNT: &str = "bd";
+    pub const BA_RAW_READ_COUNT: SamTag = SamTag::BD_BASES;
 
     /// The number of bases disagreeing with the AB single-strand consensus
-    pub const AB_RAW_READ_ERRORS: &str = "ae";
+    pub const AB_RAW_READ_ERRORS: SamTag = SamTag::AE_BASES;
 
     /// The number of bases disagreeing with the BA single-strand consensus
-    pub const BA_RAW_READ_ERRORS: &str = "be";
+    pub const BA_RAW_READ_ERRORS: SamTag = SamTag::BE_BASES;
 
-    // Duplex-specific tags
     /// The single-stranded consensus bases from the AB raw reads
-    pub const AB_CONSENSUS_BASES: &str = "ac";
+    pub const AB_CONSENSUS_BASES: SamTag = SamTag::AC;
 
     /// The single-stranded consensus bases from the BA raw reads
-    pub const BA_CONSENSUS_BASES: &str = "bc";
+    pub const BA_CONSENSUS_BASES: SamTag = SamTag::BC_BASES;
 
     /// The phred-scaled qualities (as phred-33 ascii values) of the AB single-strand consensus
-    pub const AB_CONSENSUS_QUALS: &str = "aq";
+    pub const AB_CONSENSUS_QUALS: SamTag = SamTag::AQ;
 
     /// The phred-scaled qualities (as phred-33 ascii values) of the BA single-strand consensus
-    pub const BA_CONSENSUS_QUALS: &str = "bq";
+    pub const BA_CONSENSUS_QUALS: SamTag = SamTag::BQ;
 
-    // EM-Seq methylation count tags
     /// Per-base count of unconverted bases (combined/simplex consensus)
-    pub const UNCONVERTED_COUNT: &str = "cu";
+    pub const UNCONVERTED_COUNT: SamTag = SamTag::CU;
 
     /// Per-base count of converted bases (combined/simplex consensus)
-    pub const CONVERTED_COUNT: &str = "ct";
+    pub const CONVERTED_COUNT: SamTag = SamTag::CT;
 
     /// Per-base count of unconverted bases (AB strand, duplex)
-    pub const AB_UNCONVERTED_COUNT: &str = "au";
+    pub const AB_UNCONVERTED_COUNT: SamTag = SamTag::AU;
 
     /// Per-base count of converted bases (AB strand, duplex)
-    pub const AB_CONVERTED_COUNT: &str = "at";
+    pub const AB_CONVERTED_COUNT: SamTag = SamTag::AT;
 
     /// Per-base count of unconverted bases (BA strand, duplex)
-    pub const BA_UNCONVERTED_COUNT: &str = "bu";
+    pub const BA_UNCONVERTED_COUNT: SamTag = SamTag::BU;
 
     /// Per-base count of converted bases (BA strand, duplex)
-    pub const BA_CONVERTED_COUNT: &str = "bt";
+    pub const BA_CONVERTED_COUNT: SamTag = SamTag::BT;
 
-    /// All per-base tags that need to be reversed for negative-strand reads
-    pub const TAGS_TO_REVERSE: &[&str] = &[
-        RAW_READ_COUNT,
-        RAW_READ_ERRORS,
-        AB_RAW_READ_COUNT,
-        AB_RAW_READ_ERRORS,
-        BA_RAW_READ_COUNT,
-        BA_RAW_READ_ERRORS,
-        AB_CONSENSUS_QUALS,
-        BA_CONSENSUS_QUALS,
-        UNCONVERTED_COUNT,
-        CONVERTED_COUNT,
-        AB_UNCONVERTED_COUNT,
-        AB_CONVERTED_COUNT,
-        BA_UNCONVERTED_COUNT,
-        BA_CONVERTED_COUNT,
-    ];
+    /// All per-base consensus tags, including methylation counts. Delegates to [`SamTag::PER_BASE_CONSENSUS_TAGS`].
+    pub const ALL_TAGS: &[SamTag] = SamTag::PER_BASE_CONSENSUS_TAGS;
+    /// Per-base tags that must be reversed for negative-strand reads. Delegates to [`SamTag::PER_BASE_TAGS_TO_REVERSE`].
+    pub const TAGS_TO_REVERSE: &[SamTag] = SamTag::PER_BASE_TAGS_TO_REVERSE;
+    /// Per-base tags that must be reverse-complemented for negative-strand reads. Delegates to [`SamTag::PER_BASE_TAGS_TO_REVCOMP`].
+    pub const TAGS_TO_REVERSE_COMPLEMENT: &[SamTag] = SamTag::PER_BASE_TAGS_TO_REVCOMP;
 
-    /// All per-base tags that need to be reverse complemented for negative-strand reads
-    pub const TAGS_TO_REVERSE_COMPLEMENT: &[&str] = &[AB_CONSENSUS_BASES, BA_CONSENSUS_BASES];
-
-    /// All per-base tags
-    pub const ALL_TAGS: &[&str] = &[
-        RAW_READ_COUNT,
-        RAW_READ_ERRORS,
-        AB_RAW_READ_COUNT,
-        AB_RAW_READ_ERRORS,
-        BA_RAW_READ_COUNT,
-        BA_RAW_READ_ERRORS,
-        AB_CONSENSUS_QUALS,
-        BA_CONSENSUS_QUALS,
-        AB_CONSENSUS_BASES,
-        BA_CONSENSUS_BASES,
-        UNCONVERTED_COUNT,
-        CONVERTED_COUNT,
-        AB_UNCONVERTED_COUNT,
-        AB_CONVERTED_COUNT,
-        BA_UNCONVERTED_COUNT,
-        BA_CONVERTED_COUNT,
-    ];
+    /// Returns all per-base consensus tags
+    #[must_use]
+    pub fn all_tags() -> &'static [SamTag] {
+        ALL_TAGS
+    }
 
     /// Returns all per-base tags that need to be reversed for negative-strand reads
     #[must_use]
-    pub fn tags_to_reverse() -> &'static [&'static str] {
+    pub fn tags_to_reverse() -> &'static [SamTag] {
         TAGS_TO_REVERSE
     }
 
     /// Returns all per-base tags that need to be reverse complemented for negative-strand reads
     #[must_use]
-    pub fn tags_to_reverse_complement() -> &'static [&'static str] {
+    pub fn tags_to_reverse_complement() -> &'static [SamTag] {
         TAGS_TO_REVERSE_COMPLEMENT
-    }
-
-    /// Returns all per-base tags
-    #[must_use]
-    pub fn all_tags() -> &'static [&'static str] {
-        ALL_TAGS
     }
 }
 
-/// Per-read consensus tags
+/// Per-read consensus tag aliases.
 pub mod per_read {
-    /// Converts a tag string to a noodles Tag (delegates to top-level [`super::tag`])
-    #[must_use]
-    pub fn tag(s: &str) -> super::Tag {
-        super::tag(s)
-    }
+    use super::SamTag;
 
     /// The number of raw reads that contributed to the consensus (max of per-base counts)
-    pub const RAW_READ_COUNT: &str = "cD"; // consensus Depth
+    pub const RAW_READ_COUNT: SamTag = SamTag::CD;
 
     /// The minimum number of raw reads contributing to a consensus call anywhere in the read
-    pub const MIN_RAW_READ_COUNT: &str = "cM"; // consensus Min-depth
+    pub const MIN_RAW_READ_COUNT: SamTag = SamTag::CM;
 
     /// The fraction of bases in raw reads that disagreed with the consensus call
-    pub const RAW_READ_ERROR_RATE: &str = "cE"; // consensus Error rate
+    pub const RAW_READ_ERROR_RATE: SamTag = SamTag::CE;
 
-    // Duplex versions of the above tags for the two single strand consensus reads
     /// The max depth of raw reads contributing to the AB single-strand consensus
-    pub const AB_RAW_READ_COUNT: &str = "aD";
+    pub const AB_RAW_READ_COUNT: SamTag = SamTag::AD;
 
     /// The max depth of raw reads contributing to the BA single-strand consensus
-    pub const BA_RAW_READ_COUNT: &str = "bD";
+    pub const BA_RAW_READ_COUNT: SamTag = SamTag::BD;
 
     /// The min depth of raw reads contributing to the AB single-strand consensus
-    pub const AB_MIN_RAW_READ_COUNT: &str = "aM";
+    pub const AB_MIN_RAW_READ_COUNT: SamTag = SamTag::AM;
 
     /// The min depth of raw reads contributing to the BA single-strand consensus
-    pub const BA_MIN_RAW_READ_COUNT: &str = "bM";
+    pub const BA_MIN_RAW_READ_COUNT: SamTag = SamTag::BM;
 
     /// The error rate for the AB single-strand consensus
-    pub const AB_RAW_READ_ERROR_RATE: &str = "aE";
+    pub const AB_RAW_READ_ERROR_RATE: SamTag = SamTag::AE;
 
     /// The error rate for the BA single-strand consensus
-    pub const BA_RAW_READ_ERROR_RATE: &str = "bE";
+    pub const BA_RAW_READ_ERROR_RATE: SamTag = SamTag::BE;
 
-    /// All per-read tags
-    pub const ALL_TAGS: &[&str] = &[
-        RAW_READ_COUNT,
-        MIN_RAW_READ_COUNT,
-        RAW_READ_ERROR_RATE,
-        AB_RAW_READ_COUNT,
-        BA_RAW_READ_COUNT,
-        AB_MIN_RAW_READ_COUNT,
-        BA_MIN_RAW_READ_COUNT,
-        AB_RAW_READ_ERROR_RATE,
-        BA_RAW_READ_ERROR_RATE,
-    ];
+    /// All per-read consensus tags. Delegates to [`SamTag::PER_READ_CONSENSUS_TAGS`].
+    pub const ALL_TAGS: &[SamTag] = SamTag::PER_READ_CONSENSUS_TAGS;
 
-    /// Returns all per-read tags
+    /// Returns all per-read consensus tags
     #[must_use]
-    pub fn all_tags() -> &'static [&'static str] {
+    pub fn all_tags() -> &'static [SamTag] {
         ALL_TAGS
     }
 }
@@ -256,7 +185,7 @@ pub mod per_read {
 /// A simplex consensus read has the `cD` (`RawReadCount`) tag but NOT the duplex tags (`aD` and `bD`).
 #[must_use]
 pub fn is_simplex_consensus(rec: &impl noodles::sam::alignment::Record) -> bool {
-    let has_cd = rec.data().get(&per_read::tag("cD")).is_some();
+    let has_cd = rec.data().get(&SamTag::CD.to_noodles_tag()).is_some();
     has_cd && !is_duplex_consensus(rec)
 }
 
@@ -269,8 +198,8 @@ pub fn is_simplex_consensus(rec: &impl noodles::sam::alignment::Record) -> bool 
     reason = "aD/bD tag names are domain-specific duplex strand identifiers"
 )]
 pub fn is_duplex_consensus(rec: &impl noodles::sam::alignment::Record) -> bool {
-    let has_ad = rec.data().get(&per_read::tag("aD")).is_some();
-    let has_bd = rec.data().get(&per_read::tag("bD")).is_some();
+    let has_ad = rec.data().get(&SamTag::AD.to_noodles_tag()).is_some();
+    let has_bd = rec.data().get(&SamTag::BD.to_noodles_tag()).is_some();
     has_ad && has_bd
 }
 
@@ -316,39 +245,29 @@ mod tests {
     fn test_tag_constants() {
         assert_eq!(UMI_BASES, fgumi_sam::SamTag::RX);
         assert_eq!(MOLECULAR_ID, fgumi_sam::SamTag::MI);
-        // per_base / per_read subset converted in Task 2.2 — leave string compares for now.
-        assert_eq!(per_base::RAW_READ_COUNT, "cd");
-        assert_eq!(per_read::RAW_READ_COUNT, "cD");
+        assert_eq!(per_base::RAW_READ_COUNT, fgumi_sam::SamTag::CD_BASES);
+        assert_eq!(per_read::RAW_READ_COUNT, fgumi_sam::SamTag::CD);
     }
 
     #[test]
     fn test_per_base_tags() {
         let tags = per_base::all_tags();
-        assert!(tags.contains(&"cd"));
-        assert!(tags.contains(&"ce"));
-        assert!(tags.contains(&"ad"));
-        assert!(tags.contains(&"bd"));
-        assert!(tags.contains(&"ac"));
-        assert!(tags.contains(&"bc"));
+        assert!(tags.contains(&fgumi_sam::SamTag::CD_BASES));
+        assert!(tags.contains(&fgumi_sam::SamTag::CE_BASES));
+        assert!(tags.contains(&fgumi_sam::SamTag::AD_BASES));
+        assert!(tags.contains(&fgumi_sam::SamTag::BD_BASES));
+        assert!(tags.contains(&fgumi_sam::SamTag::AC));
+        assert!(tags.contains(&fgumi_sam::SamTag::BC_BASES));
     }
 
     #[test]
     fn test_per_read_tags() {
         let tags = per_read::all_tags();
-        assert!(tags.contains(&"cD"));
-        assert!(tags.contains(&"cM"));
-        assert!(tags.contains(&"cE"));
-        assert!(tags.contains(&"aD"));
-        assert!(tags.contains(&"bD"));
-    }
-
-    #[test]
-    fn test_tag_conversion() {
-        let tag = per_base::tag("cd");
-        assert_eq!(tag, Tag::from([b'c', b'd']));
-
-        let tag = per_read::tag("cD");
-        assert_eq!(tag, Tag::from([b'c', b'D']));
+        assert!(tags.contains(&fgumi_sam::SamTag::CD));
+        assert!(tags.contains(&fgumi_sam::SamTag::CM));
+        assert!(tags.contains(&fgumi_sam::SamTag::CE));
+        assert!(tags.contains(&fgumi_sam::SamTag::AD));
+        assert!(tags.contains(&fgumi_sam::SamTag::BD));
     }
 
     #[test]
@@ -379,19 +298,6 @@ mod tests {
         assert!(!is_simplex_consensus(&rec));
         assert!(!is_duplex_consensus(&rec));
         assert!(!is_consensus(&rec));
-    }
-
-    // =====================================================================
-    // Tests for top-level tag() function
-    // =====================================================================
-
-    #[test]
-    fn test_top_level_tag_conversion() {
-        let t = tag("MI");
-        assert_eq!(t, Tag::from([b'M', b'I']));
-
-        let t = tag("RX");
-        assert_eq!(t, Tag::from([b'R', b'X']));
     }
 
     // =====================================================================
@@ -454,22 +360,24 @@ mod tests {
     #[test]
     fn test_per_base_tags_to_reverse() {
         let tags = per_base::tags_to_reverse();
-        assert!(tags.contains(&"cd"));
-        assert!(tags.contains(&"ce"));
-        assert!(tags.contains(&"ad"));
-        assert!(tags.contains(&"ae"));
-        assert!(tags.contains(&"bd"));
-        assert!(tags.contains(&"be"));
-        assert!(tags.contains(&"aq"));
-        assert!(tags.contains(&"bq"));
+        for expected in [
+            fgumi_sam::SamTag::CD_BASES,
+            fgumi_sam::SamTag::CE_BASES,
+            fgumi_sam::SamTag::AD_BASES,
+            fgumi_sam::SamTag::AE_BASES,
+            fgumi_sam::SamTag::BD_BASES,
+            fgumi_sam::SamTag::BE_BASES,
+            fgumi_sam::SamTag::AQ,
+            fgumi_sam::SamTag::BQ,
+        ] {
+            assert!(tags.contains(&expected), "missing {expected}");
+        }
     }
 
     #[test]
     fn test_per_base_tags_to_reverse_complement() {
         let tags = per_base::tags_to_reverse_complement();
-        assert!(tags.contains(&"ac"));
-        assert!(tags.contains(&"bc"));
-        assert_eq!(tags.len(), 2);
+        assert_eq!(tags, &[fgumi_sam::SamTag::AC, fgumi_sam::SamTag::BC_BASES]);
     }
 
     // =====================================================================
@@ -478,29 +386,29 @@ mod tests {
 
     #[test]
     fn test_per_read_tag_constants() {
-        assert_eq!(per_read::RAW_READ_COUNT, "cD");
-        assert_eq!(per_read::MIN_RAW_READ_COUNT, "cM");
-        assert_eq!(per_read::RAW_READ_ERROR_RATE, "cE");
-        assert_eq!(per_read::AB_RAW_READ_COUNT, "aD");
-        assert_eq!(per_read::BA_RAW_READ_COUNT, "bD");
-        assert_eq!(per_read::AB_MIN_RAW_READ_COUNT, "aM");
-        assert_eq!(per_read::BA_MIN_RAW_READ_COUNT, "bM");
-        assert_eq!(per_read::AB_RAW_READ_ERROR_RATE, "aE");
-        assert_eq!(per_read::BA_RAW_READ_ERROR_RATE, "bE");
+        assert_eq!(per_read::RAW_READ_COUNT, fgumi_sam::SamTag::CD);
+        assert_eq!(per_read::MIN_RAW_READ_COUNT, fgumi_sam::SamTag::CM);
+        assert_eq!(per_read::RAW_READ_ERROR_RATE, fgumi_sam::SamTag::CE);
+        assert_eq!(per_read::AB_RAW_READ_COUNT, fgumi_sam::SamTag::AD);
+        assert_eq!(per_read::BA_RAW_READ_COUNT, fgumi_sam::SamTag::BD);
+        assert_eq!(per_read::AB_MIN_RAW_READ_COUNT, fgumi_sam::SamTag::AM);
+        assert_eq!(per_read::BA_MIN_RAW_READ_COUNT, fgumi_sam::SamTag::BM);
+        assert_eq!(per_read::AB_RAW_READ_ERROR_RATE, fgumi_sam::SamTag::AE);
+        assert_eq!(per_read::BA_RAW_READ_ERROR_RATE, fgumi_sam::SamTag::BE);
     }
 
     #[test]
     fn test_per_base_tag_constants() {
-        assert_eq!(per_base::RAW_READ_COUNT, "cd");
-        assert_eq!(per_base::RAW_READ_ERRORS, "ce");
-        assert_eq!(per_base::AB_RAW_READ_COUNT, "ad");
-        assert_eq!(per_base::BA_RAW_READ_COUNT, "bd");
-        assert_eq!(per_base::AB_RAW_READ_ERRORS, "ae");
-        assert_eq!(per_base::BA_RAW_READ_ERRORS, "be");
-        assert_eq!(per_base::AB_CONSENSUS_BASES, "ac");
-        assert_eq!(per_base::BA_CONSENSUS_BASES, "bc");
-        assert_eq!(per_base::AB_CONSENSUS_QUALS, "aq");
-        assert_eq!(per_base::BA_CONSENSUS_QUALS, "bq");
+        assert_eq!(per_base::RAW_READ_COUNT, fgumi_sam::SamTag::CD_BASES);
+        assert_eq!(per_base::RAW_READ_ERRORS, fgumi_sam::SamTag::CE_BASES);
+        assert_eq!(per_base::AB_RAW_READ_COUNT, fgumi_sam::SamTag::AD_BASES);
+        assert_eq!(per_base::BA_RAW_READ_COUNT, fgumi_sam::SamTag::BD_BASES);
+        assert_eq!(per_base::AB_RAW_READ_ERRORS, fgumi_sam::SamTag::AE_BASES);
+        assert_eq!(per_base::BA_RAW_READ_ERRORS, fgumi_sam::SamTag::BE_BASES);
+        assert_eq!(per_base::AB_CONSENSUS_BASES, fgumi_sam::SamTag::AC);
+        assert_eq!(per_base::BA_CONSENSUS_BASES, fgumi_sam::SamTag::BC_BASES);
+        assert_eq!(per_base::AB_CONSENSUS_QUALS, fgumi_sam::SamTag::AQ);
+        assert_eq!(per_base::BA_CONSENSUS_QUALS, fgumi_sam::SamTag::BQ);
     }
 
     // =====================================================================
@@ -514,22 +422,6 @@ mod tests {
         assert_eq!(ORIGINAL_UMI_BASES, fgumi_sam::SamTag::OX);
         assert_eq!(ORIGINAL_UMI_QUALS, fgumi_sam::SamTag::BZ);
         assert_eq!(MOLECULAR_ID, fgumi_sam::SamTag::MI);
-    }
-
-    // =====================================================================
-    // Tests for per_read::tag and per_base::tag delegation
-    // =====================================================================
-
-    #[test]
-    fn test_per_read_tag_function() {
-        let t = per_read::tag("cD");
-        assert_eq!(t, Tag::from([b'c', b'D']));
-    }
-
-    #[test]
-    fn test_per_base_tag_function() {
-        let t = per_base::tag("cd");
-        assert_eq!(t, Tag::from([b'c', b'd']));
     }
 
     // =====================================================================

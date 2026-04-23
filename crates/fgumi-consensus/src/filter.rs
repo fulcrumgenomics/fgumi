@@ -431,9 +431,8 @@ impl MethylationTags {
     }
 
     /// Looks up a 2-character tag in the aux data and returns its values as `Vec<u16>`.
-    fn find_tag(aux: &[u8], tag: &str) -> Option<Vec<u16>> {
-        let tag_bytes: [u8; 2] = [tag.as_bytes()[0], tag.as_bytes()[1]];
-        bam_fields::find_array_tag(aux, &tag_bytes).map(|r| bam_fields::array_tag_to_vec_u16(&r))
+    fn find_tag(aux: &[u8], tag: fgumi_sam::SamTag) -> Option<Vec<u16>> {
+        bam_fields::find_array_tag(aux, &tag).map(|r| bam_fields::array_tag_to_vec_u16(&r))
     }
 }
 

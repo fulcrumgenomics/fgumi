@@ -44,25 +44,23 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
 
     // Tags to reverse: cd, ce, ad, ae, bd, be, aq, bq
     // These may be B-type arrays or Z-type strings (aq, bq are Phred+33 strings)
-    for tag_str in per_base::tags_to_reverse() {
-        let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
+    for tag in per_base::tags_to_reverse() {
         // Check tag type to determine reversal method
-        let tag_type = bam_fields::find_tag_type(&record[aux_off..], &tag_bytes);
+        let tag_type = bam_fields::find_tag_type(&record[aux_off..], tag);
         match tag_type {
             Some(b'B') => {
-                bam_fields::reverse_array_tag_in_place(record, aux_off, &tag_bytes);
+                bam_fields::reverse_array_tag_in_place(record, aux_off, tag);
             }
             Some(b'Z') => {
-                bam_fields::reverse_string_tag_in_place(record, aux_off, &tag_bytes);
+                bam_fields::reverse_string_tag_in_place(record, aux_off, tag);
             }
             _ => {} // Tag not found or unsupported type — skip
         }
     }
 
     // Tags to reverse-complement: ac, bc
-    for tag_str in per_base::tags_to_reverse_complement() {
-        let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
-        bam_fields::reverse_complement_string_tag_in_place(record, aux_off, &tag_bytes);
+    for tag in per_base::tags_to_reverse_complement() {
+        bam_fields::reverse_complement_string_tag_in_place(record, aux_off, tag);
     }
 
     Ok(true)
