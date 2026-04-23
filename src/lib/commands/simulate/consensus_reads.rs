@@ -7,6 +7,7 @@ use crate::commands::simulate::common::{MethylationArgs, ReferenceGenome, Strand
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::simulate::{StrandBiasModel, create_rng};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -695,16 +696,16 @@ fn build_consensus_record(
         .qualities(quals);
 
     // Add consensus tags (note: cE is error count in this file, not error rate).
-    b.add_int_tag(b"cD", cd).add_int_tag(b"cM", cm).add_int_tag(b"cE", ce);
+    b.add_int_tag(SamTag::CD, cd).add_int_tag(SamTag::CM, cm).add_int_tag(SamTag::CE, ce);
 
     // Add duplex-specific tags if present.
     if let Some((ad, bd, am, bm, ae, be)) = duplex_tags {
-        b.add_int_tag(b"aD", ad)
-            .add_int_tag(b"bD", bd)
-            .add_int_tag(b"aM", am)
-            .add_int_tag(b"bM", bm)
-            .add_int_tag(b"aE", ae)
-            .add_int_tag(b"bE", be);
+        b.add_int_tag(SamTag::AD, ad)
+            .add_int_tag(SamTag::BD, bd)
+            .add_int_tag(SamTag::AM, am)
+            .add_int_tag(SamTag::BM, bm)
+            .add_int_tag(SamTag::AE, ae)
+            .add_int_tag(SamTag::BE, be);
     }
 
     // Add methylation tags if enabled.
@@ -712,13 +713,13 @@ fn build_consensus_record(
         // cu/ct tags (unconverted/converted counts per position).
         let cu: Vec<i16> = meth.annotation.unconverted_counts();
         let ct: Vec<i16> = meth.annotation.converted_counts();
-        b.add_array_i16(b"cu", &cu).add_array_i16(b"ct", &ct);
+        b.add_array_i16(SamTag::CU, &cu).add_array_i16(SamTag::CT, &ct);
 
         // MM/ML tags (SAM spec methylation tags).
         if let Some((mm, ml)) =
             build_mm_ml_tags(seq, &meth.annotation, is_top_strand, methylation_mode)
         {
-            b.add_string_tag(b"MM", mm.as_bytes()).add_array_u8(b"ML", &ml);
+            b.add_string_tag(SamTag::MM, mm.as_bytes()).add_array_u8(SamTag::ML, &ml);
         }
 
         // Duplex per-strand tags.
@@ -727,10 +728,10 @@ fn build_consensus_record(
             let at: Vec<i16> = ab.converted_counts();
             let bu: Vec<i16> = ba.unconverted_counts();
             let bt: Vec<i16> = ba.converted_counts();
-            b.add_array_i16(b"au", &au)
-                .add_array_i16(b"at", &at)
-                .add_array_i16(b"bu", &bu)
-                .add_array_i16(b"bt", &bt);
+            b.add_array_i16(SamTag::AU, &au)
+                .add_array_i16(SamTag::AT, &at)
+                .add_array_i16(SamTag::BU, &bu)
+                .add_array_i16(SamTag::BT, &bt);
 
             // Per-strand MM tags (am/bm).
             if let Some(am) = fgumi_consensus::methylation::build_mm_tag_no_ml(
@@ -739,7 +740,7 @@ fn build_consensus_record(
                 is_top_strand,
                 methylation_mode,
             ) {
-                b.add_string_tag(b"am", am.as_bytes());
+                b.add_string_tag(SamTag::AM_BASES, am.as_bytes());
             }
             if let Some(bm) = fgumi_consensus::methylation::build_mm_tag_no_ml(
                 seq,
@@ -747,7 +748,7 @@ fn build_consensus_record(
                 is_top_strand,
                 methylation_mode,
             ) {
-                b.add_string_tag(b"bm", bm.as_bytes());
+                b.add_string_tag(SamTag::BM_BASES, bm.as_bytes());
             }
         }
     }
