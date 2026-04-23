@@ -24,7 +24,7 @@ use noodles::sam::alignment::record_buf::data::field::value::Array as NoodlesArr
 
 use fgumi_raw_bam::testutil::encode_op;
 use fgumi_raw_bam::{
-    RawRecord, SamBuilder, UnmappedSamBuilder, raw_record_to_record_buf,
+    AsTagBytes, RawRecord, SamBuilder, SamTag, UnmappedSamBuilder, raw_record_to_record_buf,
     raw_records_to_record_bufs, raw_records_to_record_bufs_with_header, write_raw_record,
 };
 
@@ -80,18 +80,21 @@ fn sam_builder_all_fields_roundtrip() {
         .sequence(seq)
         .qualities(&quals);
 
-    b.add_string_tag(b"RG", b"sample_rg"); // Z
-    b.add_int_tag(b"NM", 1); // smallest signed int
-    b.add_float_tag(b"AS", 42.5_f32); // f
+    b.add_string_tag(SamTag::RG, b"sample_rg"); // Z
+    b.add_int_tag(SamTag::NM, 1); // smallest signed int
+    b.add_float_tag(SamTag::AS, 42.5_f32); // f
     b.add_array_u8(
-        b"BD",
+        SamTag::BAQ_DELTA,
         &[10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160],
     ); // B:C
     b.add_array_u16(
         b"XU",
         &[100u16, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600],
     ); // B:S
-    b.add_array_i16(b"cd", &[-1i16, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12, -13, 14, -15, 16]); // B:s
+    b.add_array_i16(
+        SamTag::CD_BASES,
+        &[-1i16, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12, -13, 14, -15, 16],
+    ); // B:s
     b.add_array_i32(b"YI", &[-100_000i32, 200_000, -300_000, 400_000]); // B:i
     b.add_array_f32(b"YF", &[1.1_f32, 2.2, 3.3, 4.4]); // B:f
     b.add_int_tag(b"X0", 70_000); // forces S or i encoding
@@ -127,13 +130,13 @@ fn sam_builder_all_fields_roundtrip() {
     // -- tags --
     let data = buf.data();
 
-    let rg = data.get(&tag(b"RG")).expect("RG absent");
+    let rg = data.get(&tag(SamTag::RG.as_tag_bytes())).expect("RG absent");
     assert!(matches!(rg, NoodlesValue::String(s) if AsRef::<[u8]>::as_ref(s) == b"sample_rg"));
 
-    let as_ = data.get(&tag(b"AS")).expect("AS absent");
+    let as_ = data.get(&tag(SamTag::AS.as_tag_bytes())).expect("AS absent");
     assert!(matches!(as_, NoodlesValue::Float(f) if (f - 42.5).abs() < 1e-5));
 
-    let bd = data.get(&tag(b"BD")).expect("BD absent");
+    let bd = data.get(&tag(SamTag::BAQ_DELTA.as_tag_bytes())).expect("BD absent");
     if let NoodlesValue::Array(NoodlesArray::UInt8(vals)) = bd {
         assert_eq!(
             vals.as_slice(),
@@ -167,10 +170,10 @@ fn sam_builder_i16_array_tag_roundtrip() {
 
     let mut b = SamBuilder::new();
     b.read_name(b"i16test").cigar_ops(&[encode_op(0, 8)]).sequence(seq).qualities(quals);
-    b.add_array_i16(b"cd", &[-100i16, 200, -300, 400, -500, 600, -700, 800]);
+    b.add_array_i16(SamTag::CD_BASES, &[-100i16, 200, -300, 400, -500, 600, -700, 800]);
 
     let buf = decode(&b.build());
-    let cd = buf.data().get(&tag(b"cd")).expect("cd absent");
+    let cd = buf.data().get(&tag(SamTag::CD_BASES.as_tag_bytes())).expect("cd absent");
     if let NoodlesValue::Array(NoodlesArray::Int16(vals)) = cd {
         assert_eq!(vals.as_slice(), &[-100i16, 200, -300, 400, -500, 600, -700, 800]);
     } else {
@@ -240,11 +243,11 @@ fn unmapped_sam_builder_roundtrip() {
 
     let mut ub = UnmappedSamBuilder::new();
     ub.build_record(b"unmapped/1", flags::UNMAPPED | flags::PAIRED, seq, quals);
-    ub.append_string_tag(b"RG", b"sample1");
-    ub.append_int_tag(b"NM", 0);
+    ub.append_string_tag(SamTag::RG, b"sample1");
+    ub.append_int_tag(SamTag::NM, 0);
     ub.append_float_tag(b"XF", 9.75_f32);
-    ub.append_i16_array_tag(b"cd", &[5i16, 10, 15]);
-    ub.append_u8_array_tag(b"BD", &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    ub.append_i16_array_tag(SamTag::CD_BASES, &[5i16, 10, 15]);
+    ub.append_u8_array_tag(SamTag::BAQ_DELTA, &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
     let raw = RawRecord::from(ub.as_bytes().to_vec());
     let buf = decode(&raw);
@@ -263,20 +266,20 @@ fn unmapped_sam_builder_roundtrip() {
 
     let data = buf.data();
 
-    let rg = data.get(&tag(b"RG")).expect("RG absent");
+    let rg = data.get(&tag(SamTag::RG.as_tag_bytes())).expect("RG absent");
     assert!(matches!(rg, NoodlesValue::String(s) if AsRef::<[u8]>::as_ref(s) == b"sample1"));
 
     let xf = data.get(&tag(b"XF")).expect("XF absent");
     assert!(matches!(xf, NoodlesValue::Float(f) if (f - 9.75_f32).abs() < 1e-5));
 
-    let cd = data.get(&tag(b"cd")).expect("cd absent");
+    let cd = data.get(&tag(SamTag::CD_BASES.as_tag_bytes())).expect("cd absent");
     if let NoodlesValue::Array(NoodlesArray::Int16(vals)) = cd {
         assert_eq!(vals.as_slice(), &[5i16, 10, 15]);
     } else {
         panic!("cd not Int16 array: {cd:?}");
     }
 
-    let bd = data.get(&tag(b"BD")).expect("BD absent");
+    let bd = data.get(&tag(SamTag::BAQ_DELTA.as_tag_bytes())).expect("BD absent");
     if let NoodlesValue::Array(NoodlesArray::UInt8(vals)) = bd {
         assert_eq!(vals.as_slice(), &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     } else {
@@ -361,42 +364,42 @@ fn tags_editor_mutations_roundtrip() {
         .cigar_ops(&[encode_op(0, 4)])
         .sequence(b"ACGT")
         .qualities(&[30u8, 31, 32, 33]);
-    b.add_int_tag(b"NM", 5);
-    b.add_string_tag(b"RG", b"old_value");
+    b.add_int_tag(SamTag::NM, 5);
+    b.add_string_tag(SamTag::RG, b"old_value");
     let mut rec = b.build();
 
     {
         let mut ed = rec.tags_editor();
-        ed.update_int(b"NM", 99);
-        ed.update_string(b"RG", b"new_longer_value");
-        ed.append_float(b"AS", 7.5_f32);
-        ed.append_array_u8(b"BD", &[1u8, 2, 3, 4]);
-        ed.append_array_i16(b"cd", &[-10i16, 20, -30]);
+        ed.update_int(SamTag::NM, 99);
+        ed.update_string(SamTag::RG, b"new_longer_value");
+        ed.append_float(SamTag::AS, 7.5_f32);
+        ed.append_array_u8(SamTag::BAQ_DELTA, &[1u8, 2, 3, 4]);
+        ed.append_array_i16(SamTag::CD_BASES, &[-10i16, 20, -30]);
         ed.append_array_i32(b"XA", &[1000i32, -2000, 3000]);
     }
 
     let buf = decode(&rec);
     let data = buf.data();
 
-    let nm = data.get(&tag(b"NM")).expect("NM absent");
+    let nm = data.get(&tag(SamTag::NM.as_tag_bytes())).expect("NM absent");
     assert_eq!(nm.as_int(), Some(99));
 
-    let rg = data.get(&tag(b"RG")).expect("RG absent");
+    let rg = data.get(&tag(SamTag::RG.as_tag_bytes())).expect("RG absent");
     assert!(
         matches!(rg, NoodlesValue::String(s) if AsRef::<[u8]>::as_ref(s) == b"new_longer_value")
     );
 
-    let as_ = data.get(&tag(b"AS")).expect("AS absent");
+    let as_ = data.get(&tag(SamTag::AS.as_tag_bytes())).expect("AS absent");
     assert!(matches!(as_, NoodlesValue::Float(f) if (f - 7.5_f32).abs() < 1e-5));
 
-    let bd = data.get(&tag(b"BD")).expect("BD absent");
+    let bd = data.get(&tag(SamTag::BAQ_DELTA.as_tag_bytes())).expect("BD absent");
     if let NoodlesValue::Array(NoodlesArray::UInt8(vals)) = bd {
         assert_eq!(vals.as_slice(), &[1u8, 2, 3, 4]);
     } else {
         panic!("BD not UInt8 array: {bd:?}");
     }
 
-    let cd = data.get(&tag(b"cd")).expect("cd absent");
+    let cd = data.get(&tag(SamTag::CD_BASES.as_tag_bytes())).expect("cd absent");
     if let NoodlesValue::Array(NoodlesArray::Int16(vals)) = cd {
         assert_eq!(vals.as_slice(), &[-10i16, 20, -30]);
     } else {
@@ -418,16 +421,16 @@ fn tags_editor_remove_tag_roundtrip() {
         .cigar_ops(&[encode_op(0, 4)])
         .sequence(b"TTTT")
         .qualities(&[20u8, 20, 20, 20]);
-    b.add_string_tag(b"MI", b"42");
-    b.add_int_tag(b"NM", 2);
+    b.add_string_tag(SamTag::MI, b"42");
+    b.add_int_tag(SamTag::NM, 2);
     let mut rec = b.build();
 
-    rec.tags_editor().remove(b"MI");
+    rec.tags_editor().remove(SamTag::MI);
 
     let buf = decode(&rec);
     let data = buf.data();
-    assert!(data.get(&tag(b"MI")).is_none(), "MI should have been removed");
-    assert!(data.get(&tag(b"NM")).is_some(), "NM should still be present");
+    assert!(data.get(&tag(SamTag::MI.as_tag_bytes())).is_none(), "MI should have been removed");
+    assert!(data.get(&tag(SamTag::NM.as_tag_bytes())).is_some(), "NM should still be present");
 }
 
 // ============================================================================
@@ -493,8 +496,8 @@ proptest::proptest! {
          .mapq(mapq)
          .ref_id(ref_id)
          .pos(pos);
-        b.add_int_tag(b"NM", nm);
-        b.add_float_tag(b"AS", as_score);
+        b.add_int_tag(SamTag::NM, nm);
+        b.add_float_tag(SamTag::AS, as_score);
         let rec = b.build();
 
         let header = noodles::sam::Header::default();
@@ -519,11 +522,11 @@ proptest::proptest! {
         proptest::prop_assert_eq!(buf.quality_scores().as_ref(), quals.as_slice());
 
         // NM integer tag
-        let nm_val = buf.data().get(&NoodlesTag::from(*b"NM")).and_then(NoodlesValue::as_int);
+        let nm_val = buf.data().get(&NoodlesTag::from(*SamTag::NM.as_tag_bytes())).and_then(NoodlesValue::as_int);
         proptest::prop_assert_eq!(nm_val, Some(i64::from(nm)));
 
         // AS float tag
-        let as_val = buf.data().get(&NoodlesTag::from(*b"AS"));
+        let as_val = buf.data().get(&NoodlesTag::from(*SamTag::AS.as_tag_bytes()));
         proptest::prop_assert!(as_val.is_some(), "AS tag absent");
         if let Some(NoodlesValue::Float(decoded_f)) = as_val {
             proptest::prop_assert!(

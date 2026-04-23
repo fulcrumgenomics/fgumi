@@ -22,13 +22,14 @@ use crate::tags::{
 /// # Usage
 ///
 /// ```rust,ignore
+/// # use fgumi_tag::SamTag;
 /// let mut builder = UnmappedSamBuilder::new();
 ///
 /// builder.build_record(b"cons:1:ACG-TCG", my_flags, &bases, &quals);
-/// builder.append_string_tag(b"RG", b"sample1");
-/// builder.append_int_tag(b"cD", max_depth);
-/// builder.append_float_tag(b"cE", error_rate);
-/// builder.append_i16_array_tag(b"cd", &depth_array);
+/// builder.append_string_tag(SamTag::RG, b"sample1");
+/// builder.append_int_tag(SamTag::CD, max_depth);
+/// builder.append_float_tag(SamTag::CE, error_rate);
+/// builder.append_i16_array_tag(SamTag::CD_BASES, &depth_array);
 ///
 /// // Return the record as a RawRecord (moves the buffer out).
 /// let record: RawRecord = builder.build();
@@ -592,6 +593,7 @@ mod tests {
     use crate::sequence::*;
     use crate::tags::*;
     use crate::testutil::*;
+    use fgumi_tag::SamTag;
 
     #[test]
     fn test_builder_basic_unmapped_record() {
@@ -634,26 +636,26 @@ mod tests {
     fn test_builder_with_tags() {
         let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"cons:1:ACG", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
-        builder.append_string_tag(b"RG", b"sample1");
-        builder.append_string_tag(b"MI", b"42");
-        builder.append_int_tag(b"cD", 10);
-        builder.append_int_tag(b"cM", 3);
-        builder.append_float_tag(b"cE", 0.05);
-        builder.append_i16_array_tag(b"cd", &[10, 8, 12, 9]);
+        builder.append_string_tag(SamTag::RG, b"sample1");
+        builder.append_string_tag(SamTag::MI, b"42");
+        builder.append_int_tag(SamTag::CD, 10);
+        builder.append_int_tag(SamTag::CM, 3);
+        builder.append_float_tag(SamTag::CE, 0.05);
+        builder.append_i16_array_tag(SamTag::CD_BASES, &[10, 8, 12, 9]);
 
         let bam = builder.as_bytes();
         let aux = aux_data_slice(bam);
 
         // Verify string tags
-        assert_eq!(find_string_tag(aux, b"RG"), Some(b"sample1" as &[u8]));
-        assert_eq!(find_string_tag(aux, b"MI"), Some(b"42" as &[u8]));
+        assert_eq!(find_string_tag(aux, SamTag::RG), Some(b"sample1" as &[u8]));
+        assert_eq!(find_string_tag(aux, SamTag::MI), Some(b"42" as &[u8]));
 
         // Verify integer tags
-        assert_eq!(find_int_tag(aux, b"cD"), Some(10));
-        assert_eq!(find_int_tag(aux, b"cM"), Some(3));
+        assert_eq!(find_int_tag(aux, SamTag::CD), Some(10));
+        assert_eq!(find_int_tag(aux, SamTag::CM), Some(3));
 
         // Verify float tag
-        let ce = find_float_tag(aux, b"cE").expect("cE float tag should be present");
+        let ce = find_float_tag(aux, SamTag::CE).expect("cE float tag should be present");
         assert!((ce - 0.05).abs() < 1e-7);
     }
 
@@ -663,7 +665,7 @@ mod tests {
 
         // Build first record
         builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
-        builder.append_string_tag(b"MI", b"1");
+        builder.append_string_tag(SamTag::MI, b"1");
         let len1 = builder.as_bytes().len();
         assert_eq!(l_seq(builder.as_bytes()), 4);
         assert_eq!(read_name(builder.as_bytes()), b"r1");
@@ -671,13 +673,13 @@ mod tests {
         // Reuse for different-length record
         builder.clear();
         builder.build_record(b"r2", flags::UNMAPPED, b"AC", &[30, 30]);
-        builder.append_string_tag(b"MI", b"2");
+        builder.append_string_tag(SamTag::MI, b"2");
 
         let bam = builder.as_bytes();
         assert_ne!(bam.len(), len1);
         assert_eq!(l_seq(bam), 2);
         assert_eq!(read_name(bam), b"r2");
-        assert_eq!(find_string_tag(aux_data_slice(bam), b"MI"), Some(b"2" as &[u8]));
+        assert_eq!(find_string_tag(aux_data_slice(bam), SamTag::MI), Some(b"2" as &[u8]));
     }
 
     #[test]
@@ -715,11 +717,11 @@ mod tests {
     fn test_builder_empty_sequence() {
         let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"empty", flags::UNMAPPED, b"", &[]);
-        builder.append_string_tag(b"RG", b"rg0");
+        builder.append_string_tag(SamTag::RG, b"rg0");
 
         let bam = builder.as_bytes();
         assert_eq!(l_seq(bam), 0);
-        assert_eq!(find_string_tag(aux_data_slice(bam), b"RG"), Some(b"rg0" as &[u8]));
+        assert_eq!(find_string_tag(aux_data_slice(bam), SamTag::RG), Some(b"rg0" as &[u8]));
     }
 
     #[test]
@@ -778,11 +780,12 @@ mod tests {
     fn test_builder_phred33_string_tag() {
         let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"test", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
-        builder.append_phred33_string_tag(b"aq", &[0, 10, 30, 40]);
+        builder.append_phred33_string_tag(SamTag::AQ, &[0, 10, 30, 40]);
         let bytes = builder.as_bytes();
         let parsed = ParsedBamRecord::from_bytes(bytes);
-        let aq =
-            parsed.get_string_tag(b"aq").expect("aq string tag should be present in parsed record");
+        let aq = parsed
+            .get_string_tag(SamTag::AQ)
+            .expect("aq string tag should be present in parsed record");
         assert_eq!(aq, b"!+?I");
     }
 
@@ -795,10 +798,10 @@ mod tests {
             b"ACGTNN",
             &[30, 25, 20, 15, 10, 5],
         );
-        builder.append_string_tag(b"RG", b"sample1");
-        builder.append_int_tag(b"cD", 5);
-        builder.append_float_tag(b"cE", 0.01);
-        builder.append_i16_array_tag(b"cd", &[3, 4, 5, 3, 2, 1]);
+        builder.append_string_tag(SamTag::RG, b"sample1");
+        builder.append_int_tag(SamTag::CD, 5);
+        builder.append_float_tag(SamTag::CE, 0.01);
+        builder.append_i16_array_tag(SamTag::CD_BASES, &[3, 4, 5, 3, 2, 1]);
 
         let mut output = Vec::new();
         builder.write_with_block_size(&mut output);
@@ -813,12 +816,12 @@ mod tests {
         );
         assert_eq!(rec.bases, b"ACGTNN");
         assert_eq!(rec.quals, vec![30, 25, 20, 15, 10, 5]);
-        assert_eq!(rec.get_string_tag(b"RG").expect("RG tag should be present"), b"sample1");
-        assert_eq!(rec.get_int_tag(b"cD").expect("cD tag should be present"), 5);
-        let ce = rec.get_float_tag(b"cE").expect("cE float tag should be present");
+        assert_eq!(rec.get_string_tag(SamTag::RG).expect("RG tag should be present"), b"sample1");
+        assert_eq!(rec.get_int_tag(SamTag::CD).expect("cD tag should be present"), 5);
+        let ce = rec.get_float_tag(SamTag::CE).expect("cE float tag should be present");
         assert!((ce - 0.01).abs() < 0.001);
         assert_eq!(
-            rec.get_i16_array_tag(b"cd").expect("cd i16 array tag should be present"),
+            rec.get_i16_array_tag(SamTag::CD_BASES).expect("cd i16 array tag should be present"),
             vec![3, 4, 5, 3, 2, 1]
         );
     }
@@ -831,14 +834,17 @@ mod tests {
     fn test_builder_build_returns_raw_record() {
         let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
-        builder.append_string_tag(b"MI", b"7");
+        builder.append_string_tag(SamTag::MI, b"7");
 
         let record = builder.build();
 
         // Should be a valid RawRecord with the expected fields.
         assert_eq!(l_seq(record.as_ref()), 4);
         assert_eq!(read_name(record.as_ref()), b"r1");
-        assert_eq!(find_string_tag(aux_data_slice(record.as_ref()), b"MI"), Some(b"7" as &[u8]));
+        assert_eq!(
+            find_string_tag(aux_data_slice(record.as_ref()), SamTag::MI),
+            Some(b"7" as &[u8])
+        );
 
         // After build(), the builder's internal buffer should be empty (moved out).
         assert!(builder.buf.is_empty());
@@ -920,12 +926,12 @@ mod tests {
         let mut output = Vec::new();
 
         builder.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
-        builder.append_string_tag(b"MI", b"1");
+        builder.append_string_tag(SamTag::MI, b"1");
         builder.write_with_block_size(&mut output);
 
         builder.clear();
         builder.build_record(b"r2", flags::UNMAPPED, b"TGCA", &[25, 25, 25, 25]);
-        builder.append_string_tag(b"MI", b"2");
+        builder.append_string_tag(SamTag::MI, b"2");
         builder.write_with_block_size(&mut output);
 
         let records = ParsedBamRecord::parse_all(&output);
@@ -933,13 +939,13 @@ mod tests {
         assert_eq!(records[0].name, b"r1");
         assert_eq!(records[0].bases, b"ACGT");
         assert_eq!(
-            records[0].get_string_tag(b"MI").expect("MI tag should be present on record 0"),
+            records[0].get_string_tag(SamTag::MI).expect("MI tag should be present on record 0"),
             b"1"
         );
         assert_eq!(records[1].name, b"r2");
         assert_eq!(records[1].bases, b"TGCA");
         assert_eq!(
-            records[1].get_string_tag(b"MI").expect("MI tag should be present on record 1"),
+            records[1].get_string_tag(SamTag::MI).expect("MI tag should be present on record 1"),
             b"2"
         );
     }
@@ -1054,27 +1060,27 @@ mod tests {
         // Verify every add_*_tag method appends bytes that can be read back.
         let mut b = SamBuilder::new();
         b.read_name(b"tagged").sequence(b"ACGT").qualities(&[30, 30, 30, 30]);
-        b.add_string_tag(b"RG", b"lane1");
-        b.add_int_tag(b"NM", 2);
-        b.add_float_tag(b"AS", 98.5);
-        b.add_array_u8(b"BC", &[10, 20, 30]);
-        b.add_array_u16(b"QT", &[100, 200, 300]);
-        b.add_array_i16(b"cd", &[-1, 0, 1]);
+        b.add_string_tag(SamTag::RG, b"lane1");
+        b.add_int_tag(SamTag::NM, 2);
+        b.add_float_tag(SamTag::AS, 98.5);
+        b.add_array_u8(SamTag::BC, &[10, 20, 30]);
+        b.add_array_u16(SamTag::QT, &[100, 200, 300]);
+        b.add_array_i16(SamTag::CD_BASES, &[-1, 0, 1]);
         b.add_array_i32(b"id", &[-100_000, 0, 100_000]);
         b.add_array_f32(b"fd", &[1.0_f32, 2.5, -3.0]);
         let rec = b.build();
         let bam = rec.as_ref();
         let aux = aux_data_slice(bam);
 
-        assert_eq!(find_string_tag(aux, b"RG"), Some(b"lane1" as &[u8]));
-        assert_eq!(find_int_tag(aux, b"NM"), Some(2));
-        let as_val = find_float_tag(aux, b"AS").expect("AS float tag present");
+        assert_eq!(find_string_tag(aux, SamTag::RG), Some(b"lane1" as &[u8]));
+        assert_eq!(find_int_tag(aux, SamTag::NM), Some(2));
+        let as_val = find_float_tag(aux, SamTag::AS).expect("AS float tag present");
         assert!((as_val - 98.5).abs() < 1e-4);
 
         // Verify array tags exist (type byte check)
-        assert_eq!(find_tag_type(aux, b"BC"), Some(b'B'));
-        assert_eq!(find_tag_type(aux, b"QT"), Some(b'B'));
-        assert_eq!(find_tag_type(aux, b"cd"), Some(b'B'));
+        assert_eq!(find_tag_type(aux, SamTag::BC), Some(b'B'));
+        assert_eq!(find_tag_type(aux, SamTag::QT), Some(b'B'));
+        assert_eq!(find_tag_type(aux, SamTag::CD_BASES), Some(b'B'));
         assert_eq!(find_tag_type(aux, b"id"), Some(b'B'));
         assert_eq!(find_tag_type(aux, b"fd"), Some(b'B'));
     }
@@ -1149,18 +1155,18 @@ mod tests {
 
         // First record
         b.ref_id(1).pos(100).read_name(b"r1").sequence(b"ACGT").qualities(&[30; 4]);
-        b.add_string_tag(b"RG", b"sample1");
+        b.add_string_tag(SamTag::RG, b"sample1");
         let rec1 = b.build();
         let bam1 = rec1.as_ref();
         assert_eq!(ref_id(bam1), 1);
         assert_eq!(pos(bam1), 100);
         assert_eq!(read_name(bam1), b"r1");
-        assert_eq!(find_string_tag(aux_data_slice(bam1), b"RG"), Some(b"sample1" as &[u8]));
+        assert_eq!(find_string_tag(aux_data_slice(bam1), SamTag::RG), Some(b"sample1" as &[u8]));
 
         // Clear and build a second, different record
         b.clear();
         b.ref_id(2).pos(500).read_name(b"r2").sequence(b"TTTT").qualities(&[25; 4]);
-        b.add_int_tag(b"NM", 0);
+        b.add_int_tag(SamTag::NM, 0);
         let rec2 = b.build();
         let bam2 = rec2.as_ref();
 
@@ -1168,8 +1174,8 @@ mod tests {
         assert_eq!(pos(bam2), 500);
         assert_eq!(read_name(bam2), b"r2");
         // Old tag should be gone
-        assert!(find_string_tag(aux_data_slice(bam2), b"RG").is_none());
-        assert_eq!(find_int_tag(aux_data_slice(bam2), b"NM"), Some(0));
+        assert!(find_string_tag(aux_data_slice(bam2), SamTag::RG).is_none());
+        assert_eq!(find_int_tag(aux_data_slice(bam2), SamTag::NM), Some(0));
     }
 
     #[test]
@@ -1182,7 +1188,6 @@ mod tests {
 
     #[test]
     fn test_unmapped_builder_tag_methods_accept_sam_tag() {
-        use fgumi_tag::SamTag;
         let mut b = UnmappedSamBuilder::new();
         b.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
         // Accepts SamTag directly
@@ -1195,7 +1200,6 @@ mod tests {
 
     #[test]
     fn test_sam_builder_tag_methods_accept_sam_tag() {
-        use fgumi_tag::SamTag;
         let mut b = SamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30u8; 4]);
         b.add_int_tag(SamTag::CD, 7);
@@ -1220,8 +1224,8 @@ mod tests {
             .read_name(b"noodles_read")
             .sequence(b"ACGTACGT")
             .qualities(&[30, 25, 35, 40, 30, 25, 35, 40]);
-        b.add_string_tag(b"RG", b"sg1");
-        b.add_int_tag(b"NM", 1);
+        b.add_string_tag(SamTag::RG, b"sg1");
+        b.add_int_tag(SamTag::NM, 1);
         let rec = b.build();
 
         let record_buf = raw_record_to_record_buf(&rec, &header)

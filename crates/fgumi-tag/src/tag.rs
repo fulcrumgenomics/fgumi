@@ -128,6 +128,12 @@ impl SamTag {
     pub const UQ: SamTag = SamTag::new(b'U', b'Q');
     /// Original base quality scores, before recalibration (SAM spec).
     pub const OQ: SamTag = SamTag::new(b'O', b'Q');
+    /// Per-base offset to base alignment quality (BAQ), `B:C` array (SAM spec).
+    ///
+    /// Note: the Rust identifier uses a descriptive suffix to avoid a name
+    /// collision with [`SamTag::BD`], which is the fgumi-internal per-read BA
+    /// single-strand depth tag (`bD`).
+    pub const BAQ_DELTA: SamTag = SamTag::new(b'B', b'D');
 
     // ── fgumi-internal tags ─────────────────────────────────────────────────
 

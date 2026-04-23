@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 
 use fgumi_raw_bam::RawRecord;
+use fgumi_raw_bam::SamTag;
 use fgumi_raw_bam::testutil::{encode_op, make_bam_bytes};
 use proptest::prelude::*;
 
@@ -96,7 +97,7 @@ proptest! {
     /// (widened to i64) on every i32 input.
     #[test]
     fn update_int_roundtrip(v in any::<i32>()) {
-        let tag = b"NM";
+        let tag = SamTag::NM;
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
@@ -270,9 +271,9 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_u8(b"bq", &values);
+            ed.update_array_u8(SamTag::BQ, &values);
         }
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_u8");
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after update_array_u8");
         prop_assert_eq!(arr.elem_type, b'C', "elem_type should be 'C' for u8");
         prop_assert_eq!(arr.count, values.len());
         let got = decode_u8_array(arr.data, arr.count);
@@ -288,9 +289,9 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_u16(b"bq", &values);
+            ed.update_array_u16(SamTag::BQ, &values);
         }
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_u16");
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after update_array_u16");
         prop_assert_eq!(arr.elem_type, b'S', "elem_type should be 'S' for u16");
         prop_assert_eq!(arr.count, values.len());
         let got = decode_u16_array(arr.data, arr.count);
@@ -306,9 +307,9 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_i16(b"bq", &values);
+            ed.update_array_i16(SamTag::BQ, &values);
         }
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_i16");
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after update_array_i16");
         prop_assert_eq!(arr.elem_type, b's', "elem_type should be 's' for i16");
         prop_assert_eq!(arr.count, values.len());
         let got = decode_i16_array(arr.data, arr.count);
@@ -324,9 +325,9 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_i32(b"bq", &values);
+            ed.update_array_i32(SamTag::BQ, &values);
         }
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_i32");
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after update_array_i32");
         prop_assert_eq!(arr.elem_type, b'i', "elem_type should be 'i' for i32");
         prop_assert_eq!(arr.count, values.len());
         let got = decode_i32_array(arr.data, arr.count);
@@ -343,9 +344,9 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_f32(b"bq", &values);
+            ed.update_array_f32(SamTag::BQ, &values);
         }
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after update_array_f32");
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after update_array_f32");
         prop_assert_eq!(arr.elem_type, b'f', "elem_type should be 'f' for f32");
         prop_assert_eq!(arr.count, values.len());
         let got = decode_f32_bits_array(arr.data, arr.count);
@@ -366,10 +367,10 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_u8(b"bq", &initial);
+            ed.update_array_u8(SamTag::BQ, &initial);
         }
-        rec.tags_mut().set_array_element_u8(b"bq", index, new_val);
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_u8");
+        rec.tags_mut().set_array_element_u8(SamTag::BQ, index, new_val);
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after set_array_element_u8");
         let got = decode_u8_array(arr.data, arr.count);
         for (i, &v) in initial.iter().enumerate() {
             if i == index {
@@ -394,10 +395,10 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_u16(b"bq", &initial);
+            ed.update_array_u16(SamTag::BQ, &initial);
         }
-        rec.tags_mut().set_array_element_u16(b"bq", index, new_val);
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_u16");
+        rec.tags_mut().set_array_element_u16(SamTag::BQ, index, new_val);
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after set_array_element_u16");
         let got = decode_u16_array(arr.data, arr.count);
         for (i, &v) in initial.iter().enumerate() {
             if i == index {
@@ -422,10 +423,10 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_i16(b"bq", &initial);
+            ed.update_array_i16(SamTag::BQ, &initial);
         }
-        rec.tags_mut().set_array_element_i16(b"bq", index, new_val);
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_i16");
+        rec.tags_mut().set_array_element_i16(SamTag::BQ, index, new_val);
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after set_array_element_i16");
         let got = decode_i16_array(arr.data, arr.count);
         for (i, &v) in initial.iter().enumerate() {
             if i == index {
@@ -450,10 +451,10 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_i32(b"bq", &initial);
+            ed.update_array_i32(SamTag::BQ, &initial);
         }
-        rec.tags_mut().set_array_element_i32(b"bq", index, new_val);
-        let arr = rec.tags().find_array(b"bq").expect("array tag present after set_array_element_i32");
+        rec.tags_mut().set_array_element_i32(SamTag::BQ, index, new_val);
+        let arr = rec.tags().find_array(SamTag::BQ).expect("array tag present after set_array_element_i32");
         let got = decode_i32_array(arr.data, arr.count);
         for (i, &v) in initial.iter().enumerate() {
             if i == index {
@@ -480,11 +481,11 @@ proptest! {
         let mut rec = base_record(&[]);
         {
             let mut ed = rec.tags_editor();
-            ed.update_array_f32(b"bq", &initial);
+            ed.update_array_f32(SamTag::BQ, &initial);
         }
-        rec.tags_mut().set_array_element_f32(b"bq", index, new_val);
+        rec.tags_mut().set_array_element_f32(SamTag::BQ, index, new_val);
         let arr =
-            rec.tags().find_array(b"bq").expect("array tag present after set_array_element_f32");
+            rec.tags().find_array(SamTag::BQ).expect("array tag present after set_array_element_f32");
         let got = decode_f32_bits_array(arr.data, arr.count);
         for (i, &bits) in initial_bits.iter().enumerate() {
             if i == index {

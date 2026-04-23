@@ -1,4 +1,4 @@
-use fgumi_tag::AsTagBytes;
+use fgumi_tag::{AsTagBytes, SamTag};
 
 use crate::fields::{
     RawRecordMut, RawRecordView, TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice,
@@ -151,7 +151,7 @@ fn extract_int_value(aux_data: &[u8], p: usize, val_type: u8) -> Option<i64> {
 /// - Returns `None` if MI tag not found.
 #[must_use]
 pub(crate) fn find_mi_tag(aux_data: &[u8]) -> Option<(u64, bool)> {
-    let (pos, val_type) = find_tag_position(aux_data, *b"MI")?;
+    let (pos, val_type) = find_tag_position(aux_data, SamTag::MI.into())?;
     if val_type == b'Z' {
         // String type - parse "12345" or "12345/A" or "12345/B"
         let start = pos + 3;
@@ -209,7 +209,7 @@ fn parse_mi_bytes(s: &[u8]) -> Option<(u64, bool)> {
 /// Returns the CIGAR string, or None if not found.
 #[must_use]
 pub(crate) fn find_mc_tag(aux_data: &[u8]) -> Option<&str> {
-    find_string_tag(aux_data, b"MC").and_then(|v| std::str::from_utf8(v).ok())
+    find_string_tag(aux_data, SamTag::MC).and_then(|v| std::str::from_utf8(v).ok())
 }
 
 /// Find MC tag in a complete BAM record.
@@ -241,13 +241,13 @@ pub fn extract_aux_string_tags(aux_data: &[u8], cell_tag: impl AsTagBytes) -> Au
             let start = p + 3;
             if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
                 let value = &aux_data[start..start + end];
-                if t == *b"RG" {
+                if t == SamTag::RG {
                     result.rg = Some(value);
                     found |= 1;
                 } else if t == *cell_tag {
                     result.cell = Some(value);
                     found |= 2;
-                } else if t == *b"MC" {
+                } else if t == SamTag::MC {
                     result.mc = std::str::from_utf8(value).ok();
                     found |= 4;
                 }
@@ -303,7 +303,7 @@ pub fn extract_template_aux_tags<'a>(
         let t = [aux_data[p], aux_data[p + 1]];
         let val_type = aux_data[p + 2];
 
-        if t == *b"MI" {
+        if t == SamTag::MI {
             if val_type == b'Z' {
                 let start = p + 3;
                 if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
@@ -340,7 +340,7 @@ pub fn extract_template_aux_tags<'a>(
             let start = p + 3;
             if let Some(end) = aux_data[start..].iter().position(|&b| b == 0) {
                 let value = &aux_data[start..start + end];
-                if t == *b"RG" {
+                if t == SamTag::RG {
                     result.rg = Some(value);
                     found |= 2;
                 }
@@ -348,7 +348,7 @@ pub fn extract_template_aux_tags<'a>(
                     result.cell = Some(value);
                     found |= 4;
                 }
-                if t == *b"MC" {
+                if t == SamTag::MC {
                     result.mc = std::str::from_utf8(value).ok();
                     found |= 8;
                 }
@@ -1861,6 +1861,7 @@ impl<'a> RawTagsEditor<'a> {
 mod tests {
     use super::*;
     use crate::testutil::*;
+    use fgumi_tag::SamTag;
     use rstest::rstest;
 
     // ========================================================================
@@ -1981,13 +1982,13 @@ mod tests {
     #[test]
     fn test_find_string_tag_present() {
         let aux = b"RGZsample1\x00";
-        assert_eq!(find_string_tag(aux, b"RG"), Some(b"sample1".as_ref()));
+        assert_eq!(find_string_tag(aux, SamTag::RG), Some(b"sample1".as_ref()));
     }
 
     #[test]
     fn test_find_string_tag_absent() {
         let aux = b"RGZsample1\x00";
-        assert_eq!(find_string_tag(aux, b"RX"), None);
+        assert_eq!(find_string_tag(aux, SamTag::RX), None);
     }
 
     #[test]
@@ -1997,35 +1998,35 @@ mod tests {
         aux.extend_from_slice(b"NMC");
         aux.push(5);
         aux.extend_from_slice(b"RXZACGT\x00");
-        assert_eq!(find_string_tag(&aux, b"RX"), Some(b"ACGT".as_ref()));
+        assert_eq!(find_string_tag(&aux, SamTag::RX), Some(b"ACGT".as_ref()));
     }
 
     #[test]
     fn test_find_string_tag_in_record() {
         let aux = b"RXZhello\x00";
         let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), Some(b"hello".as_ref()));
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"hello".as_ref()));
     }
 
     #[test]
     fn test_find_string_tag_non_z_type_returns_none() {
         // Tag matches but type is 'C' not 'Z'
         let aux = [b'R', b'X', b'C', 42];
-        assert_eq!(find_string_tag(&aux, b"RX"), None);
+        assert_eq!(find_string_tag(&aux, SamTag::RX), None);
     }
 
     #[test]
     fn test_find_string_tag_in_record_no_aux() {
         // Record with no aux data (aux_start >= len)
         let rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), None);
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), None);
     }
 
     #[test]
     fn test_find_string_tag_truncated_z_value() {
         // RX:Z:hello but no null terminator — should return None
         let aux = b"RXZhello";
-        assert_eq!(find_string_tag(aux, b"RX"), None);
+        assert_eq!(find_string_tag(aux, SamTag::RX), None);
     }
 
     // --- Per-type find_string_tag tests ---
@@ -2050,8 +2051,8 @@ mod tests {
 
     #[test]
     fn test_find_string_tag_cannot_find_b_uint16_array() {
-        let aux = make_b_uint16_array_tag(*b"XS", &[100, 200, 300]);
-        assert_eq!(find_string_tag(&aux, b"XS"), None);
+        let aux = make_b_uint16_array_tag(SamTag::XS.into(), &[100, 200, 300]);
+        assert_eq!(find_string_tag(&aux, SamTag::XS), None);
     }
 
     // --- B:I array (uint32 array) ---
@@ -2102,7 +2103,7 @@ mod tests {
     #[test]
     fn test_find_string_tag_finds_z_type() {
         let aux: &[u8] = b"RXZhello\x00";
-        assert_eq!(find_string_tag(aux, b"RX"), Some(b"hello".as_ref()));
+        assert_eq!(find_string_tag(aux, SamTag::RX), Some(b"hello".as_ref()));
     }
 
     // --- c (int8) type ---
@@ -2136,7 +2137,7 @@ mod tests {
     fn test_find_string_tag_cannot_find_upper_s_type() {
         let val = 50_000_u16.to_le_bytes();
         let aux: &[u8] = &[b'X', b'S', b'S', val[0], val[1]];
-        assert_eq!(find_string_tag(aux, b"XS"), None);
+        assert_eq!(find_string_tag(aux, SamTag::XS), None);
     }
 
     // --- i (int32) type ---
@@ -2181,7 +2182,7 @@ mod tests {
         let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
         aux.extend_from_slice(b"RXZhello\x00");
         // Can find the Z-tag after the B-array
-        assert_eq!(find_string_tag(&aux, b"RX"), Some(b"hello".as_ref()));
+        assert_eq!(find_string_tag(&aux, SamTag::RX), Some(b"hello".as_ref()));
     }
 
     // ========================================================================
@@ -2195,20 +2196,20 @@ mod tests {
         aux.extend_from_slice(b"NMC");
         aux.push(5);
         aux.extend_from_slice(b"RXZACG\x00");
-        assert_eq!(find_tag_bounds(&aux, b"NM"), Some((0, 4)));
-        assert_eq!(find_tag_bounds(&aux, b"RX"), Some((4, 11)));
+        assert_eq!(find_tag_bounds(&aux, SamTag::NM), Some((0, 4)));
+        assert_eq!(find_tag_bounds(&aux, SamTag::RX), Some((4, 11)));
         assert_eq!(find_tag_bounds(&aux, b"XX"), None);
     }
 
     #[test]
     fn test_find_tag_bounds_empty() {
-        assert_eq!(find_tag_bounds(&[], b"RX"), None);
+        assert_eq!(find_tag_bounds(&[], SamTag::RX), None);
     }
 
     #[test]
     fn test_find_tag_bounds_truncated() {
         // Only 2 bytes — not enough for a tag entry
-        assert_eq!(find_tag_bounds(b"RX", b"RX"), None);
+        assert_eq!(find_tag_bounds(b"RX", SamTag::RX), None);
     }
 
     #[test]
@@ -2267,8 +2268,8 @@ mod tests {
 
     #[test]
     fn test_find_int_tag_cannot_find_b_uint16_array() {
-        let aux = make_b_uint16_array_tag(*b"XS", &[100, 200, 300]);
-        assert_eq!(find_int_tag(&aux, b"XS"), None);
+        let aux = make_b_uint16_array_tag(SamTag::XS.into(), &[100, 200, 300]);
+        assert_eq!(find_int_tag(&aux, SamTag::XS), None);
     }
 
     #[test]
@@ -2305,7 +2306,7 @@ mod tests {
     #[test]
     fn test_find_int_tag_cannot_find_z_type() {
         let aux: &[u8] = b"RXZhello\x00";
-        assert_eq!(find_int_tag(aux, b"RX"), None);
+        assert_eq!(find_int_tag(aux, SamTag::RX), None);
     }
 
     #[test]
@@ -2317,7 +2318,7 @@ mod tests {
     #[test]
     fn test_find_int_tag_finds_upper_c_type() {
         let aux: &[u8] = &[b'N', b'M', b'C', 42];
-        assert_eq!(find_int_tag(aux, b"NM"), Some(42));
+        assert_eq!(find_int_tag(aux, SamTag::NM), Some(42));
     }
 
     #[test]
@@ -2331,7 +2332,7 @@ mod tests {
     fn test_find_int_tag_finds_upper_s_type() {
         let val = 50_000_u16.to_le_bytes();
         let aux: &[u8] = &[b'X', b'S', b'S', val[0], val[1]];
-        assert_eq!(find_int_tag(aux, b"XS"), Some(50_000));
+        assert_eq!(find_int_tag(aux, SamTag::XS), Some(50_000));
     }
 
     #[test]
@@ -2366,7 +2367,7 @@ mod tests {
     fn test_find_int_tag_after_b_array() {
         let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
         aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
-        assert_eq!(find_int_tag(&aux, b"NM"), Some(5));
+        assert_eq!(find_int_tag(&aux, SamTag::NM), Some(5));
     }
 
     // ========================================================================
@@ -2376,7 +2377,7 @@ mod tests {
     #[test]
     fn test_find_uint8_tag() {
         let aux = [b'M', b'Q', b'C', 30];
-        assert_eq!(find_uint8_tag(&aux, b"MQ"), Some(30));
+        assert_eq!(find_uint8_tag(&aux, SamTag::MQ), Some(30));
     }
 
     #[rstest]
@@ -2391,8 +2392,8 @@ mod tests {
     ) {
         let mut aux = vec![b'M', b'Q', type_byte];
         aux.extend_from_slice(value_bytes);
-        assert_eq!(find_uint8_tag(&aux, b"MQ"), expected_uint8);
-        assert_eq!(find_int_tag(&aux, b"MQ"), expected_int);
+        assert_eq!(find_uint8_tag(&aux, SamTag::MQ), expected_uint8);
+        assert_eq!(find_int_tag(&aux, SamTag::MQ), expected_int);
     }
 
     #[test]
@@ -2400,7 +2401,7 @@ mod tests {
         // Tag exists as type 'i' not 'C' — should not match
         let mut aux = vec![b'M', b'Q', b'i'];
         aux.extend_from_slice(&42i32.to_le_bytes());
-        assert_eq!(find_uint8_tag(&aux, b"MQ"), None);
+        assert_eq!(find_uint8_tag(&aux, SamTag::MQ), None);
     }
 
     #[test]
@@ -2498,7 +2499,7 @@ mod tests {
         aux.extend_from_slice(b"RGZsample1\x00");
         aux.extend_from_slice(b"CBZcell42\x00");
         aux.extend_from_slice(b"MCZ10M5S\x00");
-        let result = extract_aux_string_tags(&aux, b"CB");
+        let result = extract_aux_string_tags(&aux, SamTag::CB);
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell42".as_ref()));
         assert_eq!(result.mc, Some("10M5S"));
@@ -2513,7 +2514,7 @@ mod tests {
         aux.extend_from_slice(b"MCZ5M\x00");
         // Add extra tags that should never be reached
         aux.extend_from_slice(&[b'X', b'Y', b'C', 99]);
-        let result = extract_aux_string_tags(&aux, b"CB");
+        let result = extract_aux_string_tags(&aux, SamTag::CB);
         assert_eq!(result.rg, Some(b"rg1".as_ref()));
         assert_eq!(result.cell, Some(b"bc1".as_ref()));
         assert_eq!(result.mc, Some("5M"));
@@ -2523,7 +2524,7 @@ mod tests {
     fn test_extract_aux_string_tags_partial() {
         // Only RG present, others missing
         let aux = b"RGZsample\x00";
-        let result = extract_aux_string_tags(aux, b"CB");
+        let result = extract_aux_string_tags(aux, SamTag::CB);
         assert_eq!(result.rg, Some(b"sample".as_ref()));
         assert!(result.cell.is_none());
         assert!(result.mc.is_none());
@@ -2537,7 +2538,7 @@ mod tests {
         aux.extend_from_slice(b"RGZlib1\x00"); // RG:Z:lib1
         aux.extend_from_slice(&[b'A', b'S', b'C', 30]); // AS:C:30
         aux.extend_from_slice(b"MCZ20M\x00"); // MC:Z:20M
-        let result = extract_aux_string_tags(&aux, b"CB");
+        let result = extract_aux_string_tags(&aux, SamTag::CB);
         assert_eq!(result.rg, Some(b"lib1".as_ref()));
         assert!(result.cell.is_none());
         assert_eq!(result.mc, Some("20M"));
@@ -2545,7 +2546,7 @@ mod tests {
 
     #[test]
     fn test_extract_aux_string_tags_empty() {
-        let result = extract_aux_string_tags(&[], b"CB");
+        let result = extract_aux_string_tags(&[], SamTag::CB);
         assert!(result.rg.is_none());
         assert!(result.cell.is_none());
         assert!(result.mc.is_none());
@@ -2558,7 +2559,7 @@ mod tests {
         aux.extend_from_slice(b"MCZ");
         aux.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8
         aux.push(0); // null terminator
-        let result = extract_aux_string_tags(&aux, b"CB");
+        let result = extract_aux_string_tags(&aux, SamTag::CB);
         assert!(result.mc.is_none()); // from_utf8 fails
     }
 
@@ -2566,7 +2567,7 @@ mod tests {
     fn test_extract_aux_string_tags_truncated_z() {
         // RG:Z:lib1 with no null → should break out, no tags found
         let aux = b"RGZlib1";
-        let result = extract_aux_string_tags(aux, b"CB");
+        let result = extract_aux_string_tags(aux, SamTag::CB);
         assert!(result.rg.is_none());
     }
 
@@ -2588,8 +2589,8 @@ mod tests {
 
     #[test]
     fn test_find_tag_type_finds_b_uint16_array() {
-        let aux = make_b_uint16_array_tag(*b"XS", &[100, 200, 300]);
-        assert_eq!(find_tag_type(&aux, b"XS"), Some(b'B'));
+        let aux = make_b_uint16_array_tag(SamTag::XS.into(), &[100, 200, 300]);
+        assert_eq!(find_tag_type(&aux, SamTag::XS), Some(b'B'));
     }
 
     #[test]
@@ -2626,7 +2627,7 @@ mod tests {
     #[test]
     fn test_find_tag_type_finds_z_type() {
         let aux: &[u8] = b"RXZhello\x00";
-        assert_eq!(find_tag_type(aux, b"RX"), Some(b'Z'));
+        assert_eq!(find_tag_type(aux, SamTag::RX), Some(b'Z'));
     }
 
     #[test]
@@ -2638,7 +2639,7 @@ mod tests {
     #[test]
     fn test_find_tag_type_finds_upper_c_type() {
         let aux: &[u8] = &[b'N', b'M', b'C', 42];
-        assert_eq!(find_tag_type(aux, b"NM"), Some(b'C'));
+        assert_eq!(find_tag_type(aux, SamTag::NM), Some(b'C'));
     }
 
     #[test]
@@ -2652,7 +2653,7 @@ mod tests {
     fn test_find_tag_type_finds_upper_s_type() {
         let val = 50_000_u16.to_le_bytes();
         let aux: &[u8] = &[b'X', b'S', b'S', val[0], val[1]];
-        assert_eq!(find_tag_type(aux, b"XS"), Some(b'S'));
+        assert_eq!(find_tag_type(aux, SamTag::XS), Some(b'S'));
     }
 
     #[test]
@@ -2686,7 +2687,7 @@ mod tests {
     fn test_find_tag_type_after_b_array() {
         let mut aux = make_b_int_array_tag(*b"pa", &[1, 2, 3]);
         aux.extend_from_slice(b"RXZhello\x00");
-        assert_eq!(find_tag_type(&aux, b"RX"), Some(b'Z'));
+        assert_eq!(find_tag_type(&aux, SamTag::RX), Some(b'Z'));
     }
 
     // ========================================================================
@@ -2697,12 +2698,12 @@ mod tests {
     fn test_append_string_tag() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let orig_len = rec.len();
-        append_string_tag(&mut rec, b"MI", b"12345");
+        append_string_tag(&mut rec, SamTag::MI, b"12345");
         assert_eq!(rec.len(), orig_len + 2 + 1 + 5 + 1); // tag(2) + type(1) + value(5) + NUL(1)
         // Verify we can find it back
         let aux_start = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        assert_eq!(find_string_tag(&rec[aux_start..], b"MI"), Some(b"12345".as_ref()));
+        assert_eq!(find_string_tag(&rec[aux_start..], SamTag::MI), Some(b"12345".as_ref()));
     }
 
     // ========================================================================
@@ -2713,16 +2714,16 @@ mod tests {
     fn test_remove_tag_present() {
         let aux = b"MIZ42\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        assert!(find_string_tag_in_record(&rec, b"MI").is_some());
-        remove_tag(&mut rec, b"MI");
-        assert!(find_string_tag_in_record(&rec, b"MI").is_none());
+        assert!(find_string_tag_in_record(&rec, SamTag::MI).is_some());
+        remove_tag(&mut rec, SamTag::MI);
+        assert!(find_string_tag_in_record(&rec, SamTag::MI).is_none());
     }
 
     #[test]
     fn test_remove_tag_absent() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let orig_len = rec.len();
-        remove_tag(&mut rec, b"MI"); // should be no-op
+        remove_tag(&mut rec, SamTag::MI); // should be no-op
         assert_eq!(rec.len(), orig_len);
     }
 
@@ -2748,7 +2749,7 @@ mod tests {
         // Record where aux_data_offset >= record length
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let orig_len = rec.len();
-        remove_tag(&mut rec, b"MI");
+        remove_tag(&mut rec, SamTag::MI);
         assert_eq!(rec.len(), orig_len); // no-op
     }
 
@@ -2760,15 +2761,15 @@ mod tests {
     fn test_update_string_tag_existing() {
         let aux = b"RXZold\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        update_string_tag(&mut rec, b"RX", b"newvalue");
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), Some(b"newvalue".as_ref()));
+        update_string_tag(&mut rec, SamTag::RX, b"newvalue");
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"newvalue".as_ref()));
     }
 
     #[test]
     fn test_update_string_tag_new() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        update_string_tag(&mut rec, b"RX", b"added");
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), Some(b"added".as_ref()));
+        update_string_tag(&mut rec, SamTag::RX, b"added");
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"added".as_ref()));
     }
 
     #[test]
@@ -2777,10 +2778,10 @@ mod tests {
         let aux = b"RXZold1\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let orig_len = rec.len();
-        update_string_tag(&mut rec, b"RX", b"new2");
+        update_string_tag(&mut rec, SamTag::RX, b"new2");
         // Record length should not change for same-length update
         assert_eq!(rec.len(), orig_len);
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), Some(b"new2".as_ref()));
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"new2".as_ref()));
     }
 
     #[test]
@@ -2788,8 +2789,8 @@ mod tests {
         // Test splice path: old value longer than new value
         let aux = b"RXZlongvalue\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        update_string_tag(&mut rec, b"RX", b"hi");
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), Some(b"hi".as_ref()));
+        update_string_tag(&mut rec, SamTag::RX, b"hi");
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"hi".as_ref()));
     }
 
     #[test]
@@ -2797,8 +2798,8 @@ mod tests {
         // Test splice path: old value shorter than new value
         let aux = b"RXZhi\x00";
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
-        update_string_tag(&mut rec, b"RX", b"longvalue");
-        assert_eq!(find_string_tag_in_record(&rec, b"RX"), Some(b"longvalue".as_ref()));
+        update_string_tag(&mut rec, SamTag::RX, b"longvalue");
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::RX), Some(b"longvalue".as_ref()));
     }
 
     #[test]
@@ -2809,19 +2810,19 @@ mod tests {
         aux.extend_from_slice(b"RXZold\x00"); // RX:Z:old
         aux.extend_from_slice(&[b'C', b'C', b'C', 2]); // CC:C:2
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
-        update_string_tag(&mut rec, b"RX", b"newval");
+        update_string_tag(&mut rec, SamTag::RX, b"newval");
         let aux_start = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
         assert_eq!(find_uint8_tag(&rec[aux_start..], b"AA"), Some(1));
-        assert_eq!(find_string_tag(&rec[aux_start..], b"RX"), Some(b"newval".as_ref()));
+        assert_eq!(find_string_tag(&rec[aux_start..], SamTag::RX), Some(b"newval".as_ref()));
         assert_eq!(find_uint8_tag(&rec[aux_start..], b"CC"), Some(2));
     }
 
     #[test]
     fn test_update_string_tag_no_aux_appends() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        update_string_tag(&mut rec, b"MI", b"42");
-        assert_eq!(find_string_tag_in_record(&rec, b"MI"), Some(b"42".as_ref()));
+        update_string_tag(&mut rec, SamTag::MI, b"42");
+        assert_eq!(find_string_tag_in_record(&rec, SamTag::MI), Some(b"42".as_ref()));
     }
 
     // ========================================================================
@@ -2831,28 +2832,28 @@ mod tests {
     #[test]
     fn test_append_int_tag_i8() {
         let mut rec = Vec::new();
-        append_int_tag(&mut rec, b"cD", 42);
+        append_int_tag(&mut rec, SamTag::CD, 42);
         assert_eq!(rec, [b'c', b'D', b'c', 42]);
     }
 
     #[test]
     fn test_append_int_tag_negative_i8() {
         let mut rec = Vec::new();
-        append_int_tag(&mut rec, b"cM", -5);
+        append_int_tag(&mut rec, SamTag::CM, -5);
         assert_eq!(rec, [b'c', b'M', b'c', (-5i8).cast_unsigned()]);
     }
 
     #[test]
     fn test_append_int_tag_u8() {
         let mut rec = Vec::new();
-        append_int_tag(&mut rec, b"cD", 200);
+        append_int_tag(&mut rec, SamTag::CD, 200);
         assert_eq!(rec, [b'c', b'D', b'C', 200]);
     }
 
     #[test]
     fn test_append_int_tag_negative_i16() {
         let mut rec = Vec::new();
-        append_int_tag(&mut rec, b"cD", -200);
+        append_int_tag(&mut rec, SamTag::CD, -200);
         let v = (-200i16).to_le_bytes();
         assert_eq!(rec, [b'c', b'D', b's', v[0], v[1]]);
     }
@@ -2860,7 +2861,7 @@ mod tests {
     #[test]
     fn test_append_int_tag_u16() {
         let mut rec = Vec::new();
-        append_int_tag(&mut rec, b"cD", 1000);
+        append_int_tag(&mut rec, SamTag::CD, 1000);
         let v = 1000u16.to_le_bytes();
         assert_eq!(rec, [b'c', b'D', b'S', v[0], v[1]]);
     }
@@ -2868,7 +2869,7 @@ mod tests {
     #[test]
     fn test_append_int_tag_i32() {
         let mut rec = Vec::new();
-        append_int_tag(&mut rec, b"cD", 100_000);
+        append_int_tag(&mut rec, SamTag::CD, 100_000);
         let v = 100_000i32.to_le_bytes();
         assert_eq!(rec, [b'c', b'D', b'i', v[0], v[1], v[2], v[3]]);
     }
@@ -2899,7 +2900,7 @@ mod tests {
     #[test]
     fn test_append_float_tag() {
         let mut rec = Vec::new();
-        append_float_tag(&mut rec, b"cE", 0.05);
+        append_float_tag(&mut rec, SamTag::CE, 0.05);
         let v = 0.05f32.to_le_bytes();
         assert_eq!(rec, [b'c', b'E', b'f', v[0], v[1], v[2], v[3]]);
     }
@@ -2911,14 +2912,14 @@ mod tests {
     #[test]
     fn test_append_i16_array_tag_empty() {
         let mut rec = Vec::new();
-        append_i16_array_tag(&mut rec, b"cd", &[]);
+        append_i16_array_tag(&mut rec, SamTag::CD_BASES, &[]);
         assert_eq!(rec, [b'c', b'd', b'B', b's', 0, 0, 0, 0]);
     }
 
     #[test]
     fn test_append_i16_array_tag_values() {
         let mut rec = Vec::new();
-        append_i16_array_tag(&mut rec, b"cd", &[10, 20, 5]);
+        append_i16_array_tag(&mut rec, SamTag::CD_BASES, &[10, 20, 5]);
         let mut expected = vec![b'c', b'd', b'B', b's'];
         expected.extend_from_slice(&3u32.to_le_bytes());
         expected.extend_from_slice(&10i16.to_le_bytes());
@@ -2934,7 +2935,7 @@ mod tests {
     #[test]
     fn test_append_phred33_string_tag() {
         let mut buf = Vec::new();
-        append_phred33_string_tag(&mut buf, b"aq", &[0, 10, 30, 40]);
+        append_phred33_string_tag(&mut buf, SamTag::AQ, &[0, 10, 30, 40]);
         assert_eq!(buf[0], b'a');
         assert_eq!(buf[1], b'q');
         assert_eq!(buf[2], b'Z');
@@ -2951,8 +2952,8 @@ mod tests {
 
     #[test]
     fn test_find_array_tag_int_array() {
-        let aux = make_b_int_array_tag(*b"cd", &[10, 20, 30]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_int_array_tag(SamTag::CD_BASES.into(), &[10, 20, 30]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(tag_ref.elem_type, b'i');
         assert_eq!(tag_ref.count, 3);
         assert_eq!(tag_ref.elem_size, 4);
@@ -2970,7 +2971,7 @@ mod tests {
 
     #[test]
     fn test_find_array_tag_not_found() {
-        let aux = make_b_int_array_tag(*b"cd", &[10]);
+        let aux = make_b_int_array_tag(SamTag::CD_BASES.into(), &[10]);
         assert!(find_array_tag(&aux, b"ZZ").is_none());
     }
 
@@ -2978,15 +2979,15 @@ mod tests {
     fn test_find_array_tag_not_b_type() {
         // Tag exists but as Z type, not B
         let aux = b"cdZhello\x00";
-        assert!(find_array_tag(aux.as_ref(), b"cd").is_none());
+        assert!(find_array_tag(aux.as_ref(), SamTag::CD_BASES).is_none());
     }
 
     #[test]
     fn test_find_array_tag_after_other_tags() {
         let mut aux = Vec::new();
         aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
-        aux.extend_from_slice(&make_b_int16_array_tag(*b"cd", &[10, 20]));
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        aux.extend_from_slice(&make_b_int16_array_tag(SamTag::CD_BASES.into(), &[10, 20]));
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(tag_ref.elem_type, b's');
         assert_eq!(tag_ref.count, 2);
     }
@@ -2997,8 +2998,8 @@ mod tests {
 
     #[test]
     fn test_array_tag_element_u16_uint8() {
-        let aux = make_b_uint8_array_tag(*b"cd", &[10, 200, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_uint8_array_tag(SamTag::CD_BASES.into(), &[10, 200, 0]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 10);
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 200);
         assert_eq!(array_tag_element_u16(&tag_ref, 2), 0);
@@ -3006,8 +3007,8 @@ mod tests {
 
     #[test]
     fn test_array_tag_element_u16_uint16() {
-        let aux = make_b_uint16_array_tag(*b"cd", &[100, 60000, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_uint16_array_tag(SamTag::CD_BASES.into(), &[100, 60000, 0]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 100);
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 60000);
         assert_eq!(array_tag_element_u16(&tag_ref, 2), 0);
@@ -3015,8 +3016,8 @@ mod tests {
 
     #[test]
     fn test_array_tag_element_u16_int16_clamped() {
-        let aux = make_b_int16_array_tag(*b"cd", &[-5, 100, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_int16_array_tag(SamTag::CD_BASES.into(), &[-5, 100, 0]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         // Negative values clamped to 0
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 0);
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 100);
@@ -3024,24 +3025,24 @@ mod tests {
 
     #[test]
     fn test_array_tag_element_u16_int8_clamped() {
-        let aux = make_b_int8_array_tag(*b"cd", &[-1, 42, 0]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_int8_array_tag(SamTag::CD_BASES.into(), &[-1, 42, 0]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 0); // clamped
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 42);
     }
 
     #[test]
     fn test_array_tag_element_u16_out_of_bounds() {
-        let aux = make_b_uint8_array_tag(*b"cd", &[10]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_uint8_array_tag(SamTag::CD_BASES.into(), &[10]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 1), 0); // out of bounds
     }
 
     #[test]
     fn test_array_tag_element_u16_unsupported_type() {
         // i32 array: not directly supported by array_tag_element_u16
-        let aux = make_b_int_array_tag(*b"cd", &[42]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_int_array_tag(SamTag::CD_BASES.into(), &[42]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(array_tag_element_u16(&tag_ref, 0), 0); // unsupported returns 0
     }
 
@@ -3051,8 +3052,8 @@ mod tests {
 
     #[test]
     fn test_array_tag_to_vec_u16() {
-        let aux = make_b_uint8_array_tag(*b"cd", &[10, 20, 30]);
-        let tag_ref = find_array_tag(&aux, b"cd").expect("cd array tag should be found");
+        let aux = make_b_uint8_array_tag(SamTag::CD_BASES.into(), &[10, 20, 30]);
+        let tag_ref = find_array_tag(&aux, SamTag::CD_BASES).expect("cd array tag should be found");
         assert_eq!(array_tag_to_vec_u16(&tag_ref), vec![10u16, 20, 30]);
     }
 
@@ -3067,9 +3068,9 @@ mod tests {
         // Manually append an i32 tag
         rec.extend_from_slice(b"NMi");
         rec.extend_from_slice(&42i32.to_le_bytes());
-        update_int_tag(&mut rec, b"NM", 99);
+        update_int_tag(&mut rec, SamTag::NM, 99);
         let aux = aux_data_slice(&rec);
-        assert_eq!(find_int_tag(aux, b"NM"), Some(99));
+        assert_eq!(find_int_tag(aux, SamTag::NM), Some(99));
     }
 
     #[test]
@@ -3077,17 +3078,17 @@ mod tests {
         // Create a record with NM:c:5 (1-byte int), update to a value needing 2 bytes
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         rec.extend_from_slice(&[b'N', b'M', b'c', 5]);
-        update_int_tag(&mut rec, b"NM", 300);
+        update_int_tag(&mut rec, SamTag::NM, 300);
         let aux = aux_data_slice(&rec);
-        assert_eq!(find_int_tag(aux, b"NM"), Some(300));
+        assert_eq!(find_int_tag(aux, SamTag::NM), Some(300));
     }
 
     #[test]
     fn test_update_int_tag_absent() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
-        update_int_tag(&mut rec, b"NM", 42);
+        update_int_tag(&mut rec, SamTag::NM, 42);
         let aux = aux_data_slice(&rec);
-        assert_eq!(find_int_tag(aux, b"NM"), Some(42));
+        assert_eq!(find_int_tag(aux, SamTag::NM), Some(42));
     }
 
     // ========================================================================
@@ -3097,12 +3098,12 @@ mod tests {
     #[test]
     fn test_reverse_array_tag_in_place_i16() {
         let mut aux = Vec::new();
-        aux.extend_from_slice(&make_b_int16_array_tag(*b"cd", &[10, 20, 30]));
+        aux.extend_from_slice(&make_b_int16_array_tag(SamTag::CD_BASES.into(), &[10, 20, 30]));
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
-        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd")
+        reverse_array_tag_in_place(&mut rec, aux_offset, SamTag::CD_BASES);
+        let tag_ref = find_array_tag(&rec[aux_offset..], SamTag::CD_BASES)
             .expect("cd array tag should be found in record");
         let values: Vec<i16> = (0..tag_ref.count)
             .map(|i| {
@@ -3116,12 +3117,12 @@ mod tests {
     #[test]
     fn test_reverse_array_tag_in_place_uint8() {
         let mut aux = Vec::new();
-        aux.extend_from_slice(&make_b_uint8_array_tag(*b"cd", &[1, 2, 3, 4]));
+        aux.extend_from_slice(&make_b_uint8_array_tag(SamTag::CD_BASES.into(), &[1, 2, 3, 4]));
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
-        let tag_ref = find_array_tag(&rec[aux_offset..], b"cd")
+        reverse_array_tag_in_place(&mut rec, aux_offset, SamTag::CD_BASES);
+        let tag_ref = find_array_tag(&rec[aux_offset..], SamTag::CD_BASES)
             .expect("cd array tag should be found in record");
         assert_eq!(tag_ref.data, &[4, 3, 2, 1]);
     }
@@ -3132,7 +3133,7 @@ mod tests {
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
         // Should be a no-op
-        reverse_array_tag_in_place(&mut rec, aux_offset, b"cd");
+        reverse_array_tag_in_place(&mut rec, aux_offset, SamTag::CD_BASES);
     }
 
     #[test]
@@ -3140,7 +3141,7 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         // aux_offset >= record.len() should be a no-op
         let offset = rec.len() + 10;
-        reverse_array_tag_in_place(&mut rec, offset, b"cd");
+        reverse_array_tag_in_place(&mut rec, offset, SamTag::CD_BASES);
     }
 
     // ========================================================================
@@ -3153,8 +3154,8 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
-        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"olleh".as_ref()));
+        reverse_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"olleh".as_ref()));
     }
 
     #[test]
@@ -3163,8 +3164,8 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
-        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"a".as_ref()));
+        reverse_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"a".as_ref()));
     }
 
     #[test]
@@ -3173,14 +3174,14 @@ mod tests {
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
         // No-op
-        reverse_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        reverse_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
     }
 
     #[test]
     fn test_reverse_string_tag_in_place_offset_past_end() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let offset = rec.len() + 10;
-        reverse_string_tag_in_place(&mut rec, offset, b"RX");
+        reverse_string_tag_in_place(&mut rec, offset, SamTag::RX);
     }
 
     // ========================================================================
@@ -3193,8 +3194,8 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
-        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACGT".as_ref()));
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"ACGT".as_ref()));
     }
 
     #[test]
@@ -3203,9 +3204,9 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
         // lowercase a->T, c->G, g->C, t->A, reversed: ACGT
-        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACGT".as_ref()));
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"ACGT".as_ref()));
     }
 
     #[test]
@@ -3214,9 +3215,9 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, aux);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
         // ANGT -> reverse TGNA -> complement ACNT
-        assert_eq!(find_string_tag(&rec[aux_offset..], b"RX"), Some(b"ACNT".as_ref()));
+        assert_eq!(find_string_tag(&rec[aux_offset..], SamTag::RX), Some(b"ACNT".as_ref()));
     }
 
     #[test]
@@ -3224,14 +3225,14 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let aux_offset = aux_data_offset_from_record(&rec)
             .expect("record should have valid header for aux offset");
-        reverse_complement_string_tag_in_place(&mut rec, aux_offset, b"RX");
+        reverse_complement_string_tag_in_place(&mut rec, aux_offset, SamTag::RX);
     }
 
     #[test]
     fn test_reverse_complement_string_tag_in_place_offset_past_end() {
         let mut rec = make_bam_bytes(0, 0, 0, b"rea", &[], 0, -1, -1, &[]);
         let offset = rec.len() + 10;
-        reverse_complement_string_tag_in_place(&mut rec, offset, b"RX");
+        reverse_complement_string_tag_in_place(&mut rec, offset, SamTag::RX);
     }
 
     // ========================================================================
@@ -3248,7 +3249,7 @@ mod tests {
         aux.extend_from_slice(b"MCZ10M5S\x00");
         let rec = make_bam_bytes(0, 100, 0, b"read1", &[], 4, -1, -1, &aux);
 
-        let result = extract_template_aux_tags(&rec, Some(b"CB"));
+        let result = extract_template_aux_tags(&rec, Some(SamTag::CB.as_tag_bytes()));
         assert_eq!(result.mi, (42, true));
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell99".as_ref()));
@@ -3289,7 +3290,7 @@ mod tests {
         let aux = b"RGZsample\x00";
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, aux);
 
-        let result = extract_template_aux_tags(&rec, Some(b"CB"));
+        let result = extract_template_aux_tags(&rec, Some(SamTag::CB.as_tag_bytes()));
         assert_eq!(result.mi, (0, true)); // default
         assert_eq!(result.rg, Some(b"sample".as_ref()));
         assert!(result.cell.is_none());
@@ -3300,7 +3301,7 @@ mod tests {
     fn test_extract_template_aux_tags_empty_aux() {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
 
-        let result = extract_template_aux_tags(&rec, Some(b"CB"));
+        let result = extract_template_aux_tags(&rec, Some(SamTag::CB.as_tag_bytes()));
         assert_eq!(result.mi, (0, true));
         assert!(result.rg.is_none());
         assert!(result.cell.is_none());
@@ -3387,12 +3388,12 @@ mod tests {
         aux.extend_from_slice(&77i32.to_le_bytes());
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
 
-        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+        normalize_int_tag_to_smallest_signed(&mut rec, SamTag::AS);
 
         let aux_data = aux_data_slice(&rec);
-        let (_, val_type) = find_tag_position(aux_data, *b"AS").unwrap();
+        let (_, val_type) = find_tag_position(aux_data, SamTag::AS.into()).unwrap();
         assert_eq!(val_type, b'c', "77 should fit in i8 (type 'c')");
-        assert_eq!(find_int_tag(aux_data, b"AS"), Some(77));
+        assert_eq!(find_int_tag(aux_data, SamTag::AS), Some(77));
     }
 
     #[test]
@@ -3403,12 +3404,12 @@ mod tests {
         aux.extend_from_slice(&200i32.to_le_bytes());
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
 
-        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+        normalize_int_tag_to_smallest_signed(&mut rec, SamTag::AS);
 
         let aux_data = aux_data_slice(&rec);
-        let (_, val_type) = find_tag_position(aux_data, *b"AS").unwrap();
+        let (_, val_type) = find_tag_position(aux_data, SamTag::AS.into()).unwrap();
         assert_eq!(val_type, b's', "200 should be i16 (type 's') with signed-only encoding");
-        assert_eq!(find_int_tag(aux_data, b"AS"), Some(200));
+        assert_eq!(find_int_tag(aux_data, SamTag::AS), Some(200));
     }
 
     #[test]
@@ -3419,19 +3420,19 @@ mod tests {
         aux.extend_from_slice(&100_000i32.to_le_bytes());
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &aux);
 
-        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+        normalize_int_tag_to_smallest_signed(&mut rec, SamTag::AS);
 
         let aux_data = aux_data_slice(&rec);
-        let (_, val_type) = find_tag_position(aux_data, *b"AS").unwrap();
+        let (_, val_type) = find_tag_position(aux_data, SamTag::AS.into()).unwrap();
         assert_eq!(val_type, b'i', "100000 requires i32 (type 'i')");
-        assert_eq!(find_int_tag(aux_data, b"AS"), Some(100_000));
+        assert_eq!(find_int_tag(aux_data, SamTag::AS), Some(100_000));
     }
 
     #[test]
     fn test_normalize_int_tag_missing_is_noop() {
         let mut rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
         let original = rec.clone();
-        normalize_int_tag_to_smallest_signed(&mut rec, b"AS");
+        normalize_int_tag_to_smallest_signed(&mut rec, SamTag::AS);
         assert_eq!(rec, original);
     }
 
@@ -3460,7 +3461,7 @@ mod tests {
         src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
 
         let mut dest = Vec::new();
-        copy_aux_tags(&src_aux, &mut dest, &[b"NM"]);
+        copy_aux_tags(&src_aux, &mut dest, &[SamTag::NM.as_tag_bytes()]);
 
         // Only RX should be copied
         assert_eq!(dest, b"RXZ\x41\x43\x47\x54\x00");
@@ -3473,7 +3474,7 @@ mod tests {
         src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]);
 
         let mut dest = Vec::new();
-        copy_aux_tags(&src_aux, &mut dest, &[b"RX", b"NM"]);
+        copy_aux_tags(&src_aux, &mut dest, &[SamTag::RX.as_tag_bytes(), SamTag::NM.as_tag_bytes()]);
 
         assert!(dest.is_empty(), "All tags skipped should produce empty dest");
     }
@@ -3490,7 +3491,7 @@ mod tests {
     #[case::single(&[42u8])]
     #[case::multiple(&[0u8, 128, 255])]
     fn test_append_u8_array_tag_round_trip(#[case] values: &[u8]) {
-        let tag = b"ML";
+        let tag = SamTag::ML;
         let mut record = Vec::new();
         append_u8_array_tag(&mut record, tag, values);
 
@@ -3517,10 +3518,10 @@ mod tests {
         let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         let v = RawRecordView::new(&rec);
         let tags = v.tags();
-        assert_eq!(tags.find_string(b"RG"), Some(b"mysample".as_slice()));
+        assert_eq!(tags.find_string(SamTag::RG), Some(b"mysample".as_slice()));
         assert!(!tags.is_empty());
-        assert!(tags.contains(b"RG"));
-        assert!(!tags.contains(b"NM"));
+        assert!(tags.contains(SamTag::RG));
+        assert!(!tags.contains(SamTag::NM));
     }
 
     #[test]
@@ -3555,7 +3556,7 @@ mod tests {
         use crate::fields::RawRecordView;
         let aux = b"RGZmygrp\0BCZACGT\0MCZ50M\0";
         let rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
-        let s = RawRecordView::new(&rec).tags().extract_string_batch(b"BC");
+        let s = RawRecordView::new(&rec).tags().extract_string_batch(SamTag::BC);
         assert_eq!(s.rg, Some(b"mygrp".as_slice()));
         assert_eq!(s.cell, Some(b"ACGT".as_slice()));
         assert_eq!(s.mc, Some("50M"));
@@ -3576,10 +3577,10 @@ mod tests {
         {
             let mut m = RawRecordMut::new(&mut rec);
             let mut tm = m.tags_mut();
-            tm.set_array_element_u16(b"bq", 2, 99);
+            tm.set_array_element_u16(SamTag::BQ, 2, 99);
         }
         let v = RawRecordView::new(&rec);
-        let arr = v.tags().find_array(b"bq").expect("array tag");
+        let arr = v.tags().find_array(SamTag::BQ).expect("array tag");
         assert_eq!(arr.count, 4);
         assert_eq!(array_tag_element_u16(&arr, 2), 99);
     }
@@ -3595,9 +3596,12 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().reverse_string(b"BC");
+            m.tags_mut().reverse_string(SamTag::BC);
         }
-        assert_eq!(RawRecordView::new(&rec).tags().find_string(b"BC"), Some(b"TGCA".as_slice()));
+        assert_eq!(
+            RawRecordView::new(&rec).tags().find_string(SamTag::BC),
+            Some(b"TGCA".as_slice())
+        );
     }
 
     #[test]
@@ -3607,10 +3611,13 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_string_in_place(b"BC", b"TTTT")
+            m.tags_mut().set_string_in_place(SamTag::BC, b"TTTT")
         };
         assert!(ok);
-        assert_eq!(RawRecordView::new(&rec).tags().find_string(b"BC"), Some(b"TTTT".as_slice()));
+        assert_eq!(
+            RawRecordView::new(&rec).tags().find_string(SamTag::BC),
+            Some(b"TTTT".as_slice())
+        );
     }
 
     #[test]
@@ -3620,7 +3627,7 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_string_in_place(b"BC", b"AC")
+            m.tags_mut().set_string_in_place(SamTag::BC, b"AC")
         };
         assert!(!ok);
     }
@@ -3634,10 +3641,10 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_int_in_place(b"NM", 100_000)
+            m.tags_mut().set_int_in_place(SamTag::NM, 100_000)
         };
         assert!(ok);
-        assert_eq!(RawRecordView::new(&rec).tags().find_int(b"NM"), Some(100_000));
+        assert_eq!(RawRecordView::new(&rec).tags().find_int(SamTag::NM), Some(100_000));
     }
 
     #[test]
@@ -3648,7 +3655,7 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_int_in_place(b"NM", 100_000)
+            m.tags_mut().set_int_in_place(SamTag::NM, 100_000)
         };
         assert!(!ok);
     }
@@ -3663,7 +3670,7 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_int_in_place(b"NM", 7)
+            m.tags_mut().set_int_in_place(SamTag::NM, 7)
         };
         assert!(!ok, "truncated int tag must return false");
     }
@@ -3676,7 +3683,7 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_float_in_place(b"AS", 1.0)
+            m.tags_mut().set_float_in_place(SamTag::AS, 1.0)
         };
         assert!(!ok, "truncated float tag must return false");
     }
@@ -3689,10 +3696,10 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &aux);
         let ok = {
             let mut m = RawRecordMut::new(&mut rec);
-            m.tags_mut().set_float_in_place(b"AS", 99.25)
+            m.tags_mut().set_float_in_place(SamTag::AS, 99.25)
         };
         assert!(ok);
-        let got = RawRecordView::new(&rec).tags().find_float(b"AS").unwrap();
+        let got = RawRecordView::new(&rec).tags().find_float(SamTag::AS).unwrap();
         assert!((got - 99.25).abs() < 1e-6);
     }
 
@@ -3707,7 +3714,7 @@ mod tests {
         let expected_off = aux_data_offset_from_record(&rec).unwrap();
         let editor = RawTagsEditor::from_vec(&mut rec);
         assert_eq!(editor.aux_offset(), expected_off);
-        assert_eq!(editor.view().find_string(b"RG"), Some(b"mygrp".as_slice()));
+        assert_eq!(editor.view().find_string(SamTag::RG), Some(b"mygrp".as_slice()));
     }
 
     #[test]
@@ -3716,20 +3723,20 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.append_string(b"RG", b"mygrp");
-            ed.append_int(b"NM", 5);
-            ed.update_int(b"NM", 7);
-            ed.update_string(b"RG", b"newgrp");
+            ed.append_string(SamTag::RG, b"mygrp");
+            ed.append_int(SamTag::NM, 5);
+            ed.update_int(SamTag::NM, 7);
+            ed.update_string(SamTag::RG, b"newgrp");
         }
         let v = RawRecordView::new(&rec);
-        assert_eq!(v.tags().find_string(b"RG"), Some(b"newgrp".as_slice()));
-        assert_eq!(v.tags().find_int(b"NM"), Some(7));
+        assert_eq!(v.tags().find_string(SamTag::RG), Some(b"newgrp".as_slice()));
+        assert_eq!(v.tags().find_int(SamTag::NM), Some(7));
 
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.remove(b"NM");
+            ed.remove(SamTag::NM);
         }
-        assert_eq!(RawRecordView::new(&rec).tags().find_int(b"NM"), None);
+        assert_eq!(RawRecordView::new(&rec).tags().find_int(SamTag::NM), None);
     }
 
     #[test]
@@ -3737,11 +3744,11 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.append_int(b"NM", 100_000); // Will encode as 'i' (i32) — fits 100,000
-            ed.normalize_int_to_smallest_signed(b"NM");
+            ed.append_int(SamTag::NM, 100_000); // Will encode as 'i' (i32) — fits 100,000
+            ed.normalize_int_to_smallest_signed(SamTag::NM);
         }
         let aux = aux_data_slice(&rec);
-        let (p, t) = find_tag_position(aux, *b"NM").unwrap();
+        let (p, t) = find_tag_position(aux, SamTag::NM.into()).unwrap();
         assert_eq!(t, b'i');
         assert_eq!(i32::from_le_bytes([aux[p + 3], aux[p + 4], aux[p + 5], aux[p + 6]]), 100_000);
     }
@@ -3752,10 +3759,13 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.append_phred33_string(b"OQ", &[30, 31, 32, 33]);
+            ed.append_phred33_string(SamTag::OQ, &[30, 31, 32, 33]);
         }
         // Phred+33: 30 -> '?', 31 -> '@', 32 -> 'A', 33 -> 'B'
-        assert_eq!(RawRecordView::new(&rec).tags().find_string(b"OQ"), Some(b"?@AB".as_slice()));
+        assert_eq!(
+            RawRecordView::new(&rec).tags().find_string(SamTag::OQ),
+            Some(b"?@AB".as_slice())
+        );
     }
 
     #[test]
@@ -3780,12 +3790,12 @@ mod tests {
         {
             let src_view = RawRecordView::new(&src_rec);
             let mut ed = RawTagsEditor::from_vec(&mut dst_rec);
-            ed.copy_from(src_view.tags(), &[b"NM"]);
+            ed.copy_from(src_view.tags(), &[SamTag::NM.as_tag_bytes()]);
         }
         let dst = RawRecordView::new(&dst_rec);
-        assert_eq!(dst.tags().find_string(b"RG"), Some(b"mygrp".as_slice()));
-        assert_eq!(dst.tags().find_int(b"NM"), None); // skipped
-        assert_eq!(dst.tags().find_int(b"AS"), Some(10));
+        assert_eq!(dst.tags().find_string(SamTag::RG), Some(b"mygrp".as_slice()));
+        assert_eq!(dst.tags().find_int(SamTag::NM), None); // skipped
+        assert_eq!(dst.tags().find_int(SamTag::AS), Some(10));
     }
 
     // ========================================================================
@@ -3798,10 +3808,12 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.append_float(b"AS", 12.5);
-            ed.update_float(b"AS", 99.25);
+            ed.append_float(SamTag::AS, 12.5);
+            ed.update_float(SamTag::AS, 99.25);
         }
-        assert!((RawRecordView::new(&rec).tags().find_float(b"AS").unwrap() - 99.25).abs() < 1e-6);
+        assert!(
+            (RawRecordView::new(&rec).tags().find_float(SamTag::AS).unwrap() - 99.25).abs() < 1e-6
+        );
 
         // Updating a non-existent float tag inserts it
         let mut rec2 = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
@@ -3818,10 +3830,10 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.update_array_u16(b"bq", &[0u16, 1, 2, 3]); // not present -> append
-            ed.update_array_u16(b"bq", &[10, 20, 30, 40]); // same length -> in-place
+            ed.update_array_u16(SamTag::BQ, &[0u16, 1, 2, 3]); // not present -> append
+            ed.update_array_u16(SamTag::BQ, &[10, 20, 30, 40]); // same length -> in-place
         }
-        let arr = RawRecordView::new(&rec).tags().find_array(b"bq").expect("present");
+        let arr = RawRecordView::new(&rec).tags().find_array(SamTag::BQ).expect("present");
         let vals = array_tag_to_vec_u16(&arr);
         assert_eq!(vals, vec![10, 20, 30, 40]);
     }
@@ -3832,10 +3844,10 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.update_array_u16(b"bq", &[1u16, 2, 3]); // not present -> append
-            ed.update_array_u16(b"bq", &[7u16, 8, 9, 10, 11]); // grows
+            ed.update_array_u16(SamTag::BQ, &[1u16, 2, 3]); // not present -> append
+            ed.update_array_u16(SamTag::BQ, &[7u16, 8, 9, 10, 11]); // grows
         }
-        let arr = RawRecordView::new(&rec).tags().find_array(b"bq").expect("present");
+        let arr = RawRecordView::new(&rec).tags().find_array(SamTag::BQ).expect("present");
         let vals = array_tag_to_vec_u16(&arr);
         assert_eq!(vals, vec![7, 8, 9, 10, 11]);
     }
@@ -3874,10 +3886,10 @@ mod tests {
         let mut rec = make_bam_bytes(0, 0, 0, b"r", &[], 0, -1, -1, &[]);
         {
             let mut ed = RawTagsEditor::from_vec(&mut rec);
-            ed.update_array_u8(b"ML", &[10u8, 20, 30]); // not present -> append
-            ed.update_array_u8(b"ML", &[40u8, 50, 60]); // same length -> in-place
+            ed.update_array_u8(SamTag::ML, &[10u8, 20, 30]); // not present -> append
+            ed.update_array_u8(SamTag::ML, &[40u8, 50, 60]); // same length -> in-place
         }
-        let arr = RawRecordView::new(&rec).tags().find_array(b"ML").expect("present");
+        let arr = RawRecordView::new(&rec).tags().find_array(SamTag::ML).expect("present");
         assert_eq!(arr.elem_type, b'C');
         assert_eq!(arr.count, 3);
         assert_eq!(arr.data, &[40u8, 50, 60]);
@@ -3973,7 +3985,7 @@ mod tests {
         let mut aux = vec![b'A', b'S', b'f'];
         aux.extend_from_slice(&value.to_le_bytes());
         let view = RawTagsView::new(&aux);
-        match view.get(b"AS") {
+        match view.get(SamTag::AS) {
             Some(TagValue::Float(got)) => assert_eq!(got.to_bits(), value.to_bits()),
             other => panic!("expected TagValue::Float, got {other:?}"),
         }
@@ -3984,7 +3996,7 @@ mod tests {
         // RX:Z:hello\0 — get should return TagValue::String without NUL
         let aux = b"RXZhello\x00";
         let view = RawTagsView::new(aux.as_ref());
-        assert_eq!(view.get(b"RX"), Some(TagValue::String(b"hello")));
+        assert_eq!(view.get(SamTag::RX), Some(TagValue::String(b"hello")));
     }
 
     #[test]
@@ -4070,10 +4082,10 @@ mod tests {
         let pairs: Vec<([u8; 2], TagValue<'_>)> = view.iter_typed().collect();
 
         assert_eq!(pairs.len(), 3);
-        assert_eq!(pairs[0], (*b"NM", TagValue::Int(5)));
-        assert_eq!(pairs[1], (*b"RG", TagValue::String(b"lib1")));
+        assert_eq!(pairs[0], (<[u8; 2]>::from(SamTag::NM), TagValue::Int(5)));
+        assert_eq!(pairs[1], (<[u8; 2]>::from(SamTag::RG), TagValue::String(b"lib1")));
         let (tag2, val2) = pairs[2];
-        assert_eq!(tag2, *b"AS");
+        assert_eq!(tag2, <[u8; 2]>::from(SamTag::AS));
         match val2 {
             TagValue::Float(f) => assert_eq!(f.to_bits(), 1.5f32.to_bits()),
             other => panic!("expected TagValue::Float(1.5), got {other:?}"),
@@ -4086,7 +4098,6 @@ mod tests {
 
     #[test]
     fn test_find_string_tag_accepts_sam_tag() {
-        use fgumi_tag::SamTag;
         // Build a tiny aux block: RX:Z:ACGT\0
         let mut aux = Vec::new();
         aux.extend_from_slice(b"RXZACGT\0");
