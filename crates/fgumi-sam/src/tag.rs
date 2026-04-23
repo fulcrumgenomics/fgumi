@@ -206,6 +206,56 @@ impl SamTag {
     pub const BU: SamTag = SamTag::new(b'b', b'u');
     /// Per-base converted-cytosine count for the BA single-strand consensus (`bt`, `B,s`).
     pub const BT: SamTag = SamTag::new(b'b', b't');
+
+    // ── Slice helpers ──────────────────────────────────────────────────────
+
+    /// All per-read consensus tags (combined, AB strand, BA strand).
+    pub const PER_READ_CONSENSUS_TAGS: &'static [SamTag] =
+        &[Self::CD, Self::CM, Self::CE, Self::AD, Self::AM, Self::AE, Self::BD, Self::BM, Self::BE];
+
+    /// All per-base consensus tags, including methylation conversion counts.
+    pub const PER_BASE_CONSENSUS_TAGS: &'static [SamTag] = &[
+        Self::CD_BASES,
+        Self::CE_BASES,
+        Self::AD_BASES,
+        Self::AE_BASES,
+        Self::BD_BASES,
+        Self::BE_BASES,
+        Self::AC,
+        Self::BC_BASES,
+        Self::AQ,
+        Self::BQ,
+        Self::CU,
+        Self::CT,
+        Self::AU,
+        Self::AT,
+        Self::BU,
+        Self::BT,
+    ];
+
+    /// Per-base tags that must be **reversed** (not reverse-complemented) when
+    /// the read is on the negative strand. These are scalar/quality arrays
+    /// keyed by read position.
+    pub const PER_BASE_TAGS_TO_REVERSE: &'static [SamTag] = &[
+        Self::CD_BASES,
+        Self::CE_BASES,
+        Self::AD_BASES,
+        Self::AE_BASES,
+        Self::BD_BASES,
+        Self::BE_BASES,
+        Self::AQ,
+        Self::BQ,
+        Self::CU,
+        Self::CT,
+        Self::AU,
+        Self::AT,
+        Self::BU,
+        Self::BT,
+    ];
+
+    /// Per-base tags that must be **reverse-complemented** when the read is on
+    /// the negative strand. These are base-sequence strings.
+    pub const PER_BASE_TAGS_TO_REVCOMP: &'static [SamTag] = &[Self::AC, Self::BC_BASES];
 }
 
 impl Deref for SamTag {
@@ -408,5 +458,69 @@ mod tests {
         assert_ne!(SamTag::BE, SamTag::BE_BASES);
         // BC_BASES collides with the SAM-spec sample-barcode BC tag.
         assert_ne!(SamTag::BC, SamTag::BC_BASES);
+    }
+
+    #[test]
+    fn test_per_base_consensus_tag_set() {
+        let tags = SamTag::PER_BASE_CONSENSUS_TAGS;
+        // exact set & length — guards against accidental drift
+        let expected = [
+            SamTag::CD_BASES,
+            SamTag::CE_BASES,
+            SamTag::AD_BASES,
+            SamTag::AE_BASES,
+            SamTag::BD_BASES,
+            SamTag::BE_BASES,
+            SamTag::AC,
+            SamTag::BC_BASES,
+            SamTag::AQ,
+            SamTag::BQ,
+            SamTag::CU,
+            SamTag::CT,
+            SamTag::AU,
+            SamTag::AT,
+            SamTag::BU,
+            SamTag::BT,
+        ];
+        assert_eq!(tags.len(), expected.len());
+        for t in &expected {
+            assert!(tags.contains(t), "missing {t} from PER_BASE_CONSENSUS_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_per_read_consensus_tag_set() {
+        let tags = SamTag::PER_READ_CONSENSUS_TAGS;
+        let expected = [
+            SamTag::CD,
+            SamTag::CM,
+            SamTag::CE,
+            SamTag::AD,
+            SamTag::AM,
+            SamTag::AE,
+            SamTag::BD,
+            SamTag::BM,
+            SamTag::BE,
+        ];
+        assert_eq!(tags.len(), expected.len());
+        for t in &expected {
+            assert!(tags.contains(t), "missing {t} from PER_READ_CONSENSUS_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_per_base_tags_to_reverse_set() {
+        let tags = SamTag::PER_BASE_TAGS_TO_REVERSE;
+        for t in tags {
+            assert!(SamTag::PER_BASE_CONSENSUS_TAGS.contains(t));
+        }
+        // Bases tags are reverse-COMPLEMENTED, not just reversed; they must NOT appear here.
+        assert!(!tags.contains(&SamTag::AC));
+        assert!(!tags.contains(&SamTag::BC_BASES));
+    }
+
+    #[test]
+    fn test_per_base_tags_to_revcomp_set() {
+        assert_eq!(SamTag::PER_BASE_TAGS_TO_REVCOMP, &[SamTag::AC, SamTag::BC_BASES]);
     }
 }
