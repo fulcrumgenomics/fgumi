@@ -19,6 +19,7 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
 use crate::ReferenceProvider;
+use crate::SamTag;
 
 /// Tags used for alignment information
 #[must_use]
@@ -265,9 +266,9 @@ pub fn regenerate_alignment_tags_raw(
     // For unmapped reads, remove alignment tags
     if RawRecordView::new(record).is_unmapped() {
         let mut editor = RawTagsEditor::from_vec(record);
-        editor.remove(b"NM");
-        editor.remove(b"UQ");
-        editor.remove(b"MD");
+        editor.remove(SamTag::NM);
+        editor.remove(SamTag::UQ);
+        editor.remove(SamTag::MD);
         return Ok(false);
     }
 
@@ -299,9 +300,9 @@ pub fn regenerate_alignment_tags_raw(
     // Handle edge case: CIGAR with no reference-consuming operations
     if ref_span == 0 {
         let mut editor = RawTagsEditor::from_vec(record);
-        editor.update_int(b"NM", 0);
-        editor.update_int(b"UQ", 0);
-        editor.update_string(b"MD", b"0");
+        editor.update_int(SamTag::NM, 0);
+        editor.update_int(SamTag::UQ, 0);
+        editor.update_string(SamTag::MD, b"0");
         return Ok(true);
     }
 
@@ -411,9 +412,9 @@ pub fn regenerate_alignment_tags_raw(
 
     // Update tags
     let mut editor = RawTagsEditor::from_vec(record);
-    editor.update_int(b"NM", nm);
-    editor.update_int(b"UQ", uq.min(i32::MAX as u32) as i32);
-    editor.update_string(b"MD", md_string.as_bytes());
+    editor.update_int(SamTag::NM, nm);
+    editor.update_int(SamTag::UQ, uq.min(i32::MAX as u32) as i32);
+    editor.update_string(SamTag::MD, md_string.as_bytes());
 
     Ok(true)
 }
@@ -957,9 +958,9 @@ mod tests {
         let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
-        let nm = fgumi_raw_bam::find_int_tag(aux, b"NM");
-        let uq = fgumi_raw_bam::find_int_tag(aux, b"UQ");
-        let md = fgumi_raw_bam::find_string_tag(aux, b"MD");
+        let nm = fgumi_raw_bam::find_int_tag(aux, SamTag::NM);
+        let uq = fgumi_raw_bam::find_int_tag(aux, SamTag::UQ);
+        let md = fgumi_raw_bam::find_string_tag(aux, SamTag::MD);
 
         // Verify raw path produces same results as RecordBuf path
         assert_eq!(nm, Some(1i64), "NM should be 1 (one mismatch)");
@@ -989,9 +990,9 @@ mod tests {
         let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
 
-        let nm = fgumi_raw_bam::find_int_tag(aux, b"NM");
-        let uq = fgumi_raw_bam::find_int_tag(aux, b"UQ");
-        let md = fgumi_raw_bam::find_string_tag(aux, b"MD");
+        let nm = fgumi_raw_bam::find_int_tag(aux, SamTag::NM);
+        let uq = fgumi_raw_bam::find_int_tag(aux, SamTag::UQ);
+        let md = fgumi_raw_bam::find_string_tag(aux, SamTag::MD);
 
         assert_eq!(nm, Some(1i64), "NM should be 1 (masked base = mismatch)");
         assert_eq!(uq, Some(0i64), "UQ should be 0 (masked base quality is 0)");
@@ -1035,10 +1036,10 @@ mod tests {
         assert!(regenerated, "tags were written for zero-ref-span raw record; return must be true");
         let aux_off = fgumi_raw_bam::aux_data_offset_from_record(&raw).unwrap_or(raw.len());
         let aux = &raw[aux_off..];
-        assert_eq!(fgumi_raw_bam::find_int_tag(aux, b"NM"), Some(0i64));
-        assert_eq!(fgumi_raw_bam::find_int_tag(aux, b"UQ"), Some(0i64));
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::NM), Some(0i64));
+        assert_eq!(fgumi_raw_bam::find_int_tag(aux, SamTag::UQ), Some(0i64));
         assert_eq!(
-            fgumi_raw_bam::find_string_tag(aux, b"MD")
+            fgumi_raw_bam::find_string_tag(aux, SamTag::MD)
                 .map(|s| std::str::from_utf8(s).expect("MD tag should be valid UTF-8")),
             Some("0")
         );
