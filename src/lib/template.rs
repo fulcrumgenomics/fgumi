@@ -35,6 +35,7 @@
 //! }
 //! ```
 
+use crate::sam::SamTag;
 use crate::unified_pipeline::MemoryEstimate;
 use anyhow::{Result, bail};
 use fgumi_raw_bam::{RawRecord, RawRecordView};
@@ -424,8 +425,8 @@ impl Template {
                 (RawRecordView::new(&rr[r2_i]).flags() & bam_fields::flags::UNMAPPED) != 0;
 
             // Get alignment scores for mate score tags
-            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), b"AS");
-            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), b"AS");
+            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), SamTag::AS);
+            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
             if !r1_is_unmapped && !r2_is_unmapped {
                 // Case 1: Both mapped
@@ -442,14 +443,14 @@ impl Template {
             let rr = &mut self.records;
             if let Some(as_value) = r2_as {
                 if let Ok(v) = i32::try_from(as_value) {
-                    bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"ms");
-                    bam_fields::append_signed_int_tag(rr[r1_i].as_mut_vec(), b"ms", v);
+                    bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MS);
+                    bam_fields::append_signed_int_tag(rr[r1_i].as_mut_vec(), SamTag::MS, v);
                 }
             }
             if let Some(as_value) = r1_as {
                 if let Ok(v) = i32::try_from(as_value) {
-                    bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"ms");
-                    bam_fields::append_signed_int_tag(rr[r2_i].as_mut_vec(), b"ms", v);
+                    bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MS);
+                    bam_fields::append_signed_int_tag(rr[r2_i].as_mut_vec(), SamTag::MS, v);
                 }
             }
         }
@@ -465,7 +466,7 @@ impl Template {
             let r2_tlen = bam_fields::template_length(&rr[r2_i]);
             let r2_mapq = bam_fields::mapq(&rr[r2_i]);
             let r2_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r2_i]);
-            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), b"AS");
+            let r2_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r2_i]), SamTag::AS);
 
             if let Some((start, end)) = self.r1_supplementals {
                 let rr = &mut self.records;
@@ -476,22 +477,22 @@ impl Template {
                     bam_fields::set_template_length(rec, -r2_tlen);
 
                     let mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-                    bam_fields::update_int_tag(rec.as_mut_vec(), b"MQ", mq_val);
+                    bam_fields::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
 
                     if !r2_cigar_str.is_empty() && r2_cigar_str != "*" && !r2_is_unmapped {
                         bam_fields::update_string_tag(
                             rec.as_mut_vec(),
-                            b"MC",
+                            SamTag::MC,
                             r2_cigar_str.as_bytes(),
                         );
                     } else {
-                        bam_fields::remove_tag(rec.as_mut_vec(), b"MC");
+                        bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
 
                     if let Some(as_value) = r2_as {
                         if let Ok(v) = i32::try_from(as_value) {
-                            bam_fields::remove_tag(rec.as_mut_vec(), b"ms");
-                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), b"ms", v);
+                            bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
                         }
                     }
                 }
@@ -509,7 +510,7 @@ impl Template {
             let r1_tlen = bam_fields::template_length(&rr[r1_i]);
             let r1_mapq = bam_fields::mapq(&rr[r1_i]);
             let r1_cigar_str = bam_fields::cigar_to_string_from_raw(&rr[r1_i]);
-            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), b"AS");
+            let r1_as = bam_fields::find_int_tag(bam_fields::aux_data_slice(&rr[r1_i]), SamTag::AS);
 
             if let Some((start, end)) = self.r2_supplementals {
                 let rr = &mut self.records;
@@ -520,22 +521,22 @@ impl Template {
                     bam_fields::set_template_length(rec, -r1_tlen);
 
                     let mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-                    bam_fields::update_int_tag(rec.as_mut_vec(), b"MQ", mq_val);
+                    bam_fields::update_int_tag(rec.as_mut_vec(), SamTag::MQ, mq_val);
 
                     if !r1_cigar_str.is_empty() && r1_cigar_str != "*" && !r1_is_unmapped {
                         bam_fields::update_string_tag(
                             rec.as_mut_vec(),
-                            b"MC",
+                            SamTag::MC,
                             r1_cigar_str.as_bytes(),
                         );
                     } else {
-                        bam_fields::remove_tag(rec.as_mut_vec(), b"MC");
+                        bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MC);
                     }
 
                     if let Some(as_value) = r1_as {
                         if let Ok(v) = i32::try_from(as_value) {
-                            bam_fields::remove_tag(rec.as_mut_vec(), b"ms");
-                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), b"ms", v);
+                            bam_fields::remove_tag(rec.as_mut_vec(), SamTag::MS);
+                            bam_fields::append_signed_int_tag(rec.as_mut_vec(), SamTag::MS, v);
                         }
                     }
                 }
@@ -577,11 +578,15 @@ impl Template {
         bam_fields::set_mate_pos(&mut rr[r1_i], r2_pos);
         set_mate_flags(&mut rr[r1_i], r2_is_reverse, false);
         let r2_mq_val = if r2_mapq == 255 { 255 } else { i32::from(r2_mapq) };
-        bam_fields::update_int_tag(rr[r1_i].as_mut_vec(), b"MQ", r2_mq_val);
+        bam_fields::update_int_tag(rr[r1_i].as_mut_vec(), SamTag::MQ, r2_mq_val);
         if !r2_cigar_str.is_empty() && r2_cigar_str != "*" {
-            bam_fields::update_string_tag(rr[r1_i].as_mut_vec(), b"MC", r2_cigar_str.as_bytes());
+            bam_fields::update_string_tag(
+                rr[r1_i].as_mut_vec(),
+                SamTag::MC,
+                r2_cigar_str.as_bytes(),
+            );
         } else {
-            bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"MC");
+            bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
         }
 
         // Set mate info on R2 from R1
@@ -589,11 +594,15 @@ impl Template {
         bam_fields::set_mate_pos(&mut rr[r2_i], r1_pos);
         set_mate_flags(&mut rr[r2_i], r1_is_reverse, false);
         let r1_mq_val = if r1_mapq == 255 { 255 } else { i32::from(r1_mapq) };
-        bam_fields::update_int_tag(rr[r2_i].as_mut_vec(), b"MQ", r1_mq_val);
+        bam_fields::update_int_tag(rr[r2_i].as_mut_vec(), SamTag::MQ, r1_mq_val);
         if !r1_cigar_str.is_empty() && r1_cigar_str != "*" {
-            bam_fields::update_string_tag(rr[r2_i].as_mut_vec(), b"MC", r1_cigar_str.as_bytes());
+            bam_fields::update_string_tag(
+                rr[r2_i].as_mut_vec(),
+                SamTag::MC,
+                r1_cigar_str.as_bytes(),
+            );
         } else {
-            bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"MC");
+            bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
         }
 
         // Set insert size
@@ -619,8 +628,8 @@ impl Template {
         bam_fields::set_mate_ref_id(&mut rr[r1_i], -1);
         bam_fields::set_mate_pos(&mut rr[r1_i], -1);
         set_mate_flags(&mut rr[r1_i], r2_is_reverse, true);
-        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"MQ");
-        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), b"MC");
+        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MQ);
+        bam_fields::remove_tag(rr[r1_i].as_mut_vec(), SamTag::MC);
         bam_fields::set_template_length(&mut rr[r1_i], 0);
 
         // R2: set to unmapped coordinates
@@ -629,8 +638,8 @@ impl Template {
         bam_fields::set_mate_ref_id(&mut rr[r2_i], -1);
         bam_fields::set_mate_pos(&mut rr[r2_i], -1);
         set_mate_flags(&mut rr[r2_i], r1_is_reverse, true);
-        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"MQ");
-        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), b"MC");
+        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MQ);
+        bam_fields::remove_tag(rr[r2_i].as_mut_vec(), SamTag::MC);
         bam_fields::set_template_length(&mut rr[r2_i], 0);
     }
 
@@ -661,8 +670,8 @@ impl Template {
         bam_fields::set_mate_ref_id(&mut rr[mapped_i], mapped_ref_id);
         bam_fields::set_mate_pos(&mut rr[mapped_i], mapped_pos);
         set_mate_flags(&mut rr[mapped_i], unmapped_is_reverse, true);
-        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), b"MQ");
-        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), b"MC");
+        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), SamTag::MQ);
+        bam_fields::remove_tag(rr[mapped_i].as_mut_vec(), SamTag::MC);
         bam_fields::set_template_length(&mut rr[mapped_i], 0);
 
         // Set mate info on unmapped read (mate is mapped)
@@ -670,15 +679,15 @@ impl Template {
         bam_fields::set_mate_pos(&mut rr[unmapped_i], mapped_pos);
         set_mate_flags(&mut rr[unmapped_i], mapped_is_reverse, false);
         let mq_val = if mapped_mapq == 255 { 255 } else { i32::from(mapped_mapq) };
-        bam_fields::update_int_tag(rr[unmapped_i].as_mut_vec(), b"MQ", mq_val);
+        bam_fields::update_int_tag(rr[unmapped_i].as_mut_vec(), SamTag::MQ, mq_val);
         if !mapped_cigar_str.is_empty() && mapped_cigar_str != "*" {
             bam_fields::update_string_tag(
                 rr[unmapped_i].as_mut_vec(),
-                b"MC",
+                SamTag::MC,
                 mapped_cigar_str.as_bytes(),
             );
         } else {
-            bam_fields::remove_tag(rr[unmapped_i].as_mut_vec(), b"MC");
+            bam_fields::remove_tag(rr[unmapped_i].as_mut_vec(), SamTag::MC);
         }
         bam_fields::set_template_length(&mut rr[unmapped_i], 0);
     }
@@ -1163,7 +1172,7 @@ mod tests {
             .pos(99)
             .mapq(30)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 55);
+            .add_int_tag(SamTag::AS, 55);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1175,16 +1184,24 @@ mod tests {
             .pos(199)
             .mapq(40)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 44);
+            .add_int_tag(SamTag::AS, 44);
         let r2 = b.build();
 
         let mut template = Template::from_records(vec![r1, r2])?;
         template.fix_mate_info()?;
 
         // R1 should have ms tag with R2's AS value (44)
-        assert_eq!(template.records()[0].tags().find_int(b"ms"), Some(44), "R1 ms should be 44");
+        assert_eq!(
+            template.records()[0].tags().find_int(SamTag::MS),
+            Some(44),
+            "R1 ms should be 44"
+        );
         // R2 should have ms tag with R1's AS value (55)
-        assert_eq!(template.records()[1].tags().find_int(b"ms"), Some(55), "R2 ms should be 55");
+        assert_eq!(
+            template.records()[1].tags().find_int(SamTag::MS),
+            Some(55),
+            "R2 ms should be 55"
+        );
 
         Ok(())
     }
@@ -1201,7 +1218,7 @@ mod tests {
             .pos(99)
             .mapq(30)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 77);
+            .add_int_tag(SamTag::AS, 77);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1213,14 +1230,22 @@ mod tests {
             .pos(199)
             .mapq(40)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 88);
+            .add_int_tag(SamTag::AS, 88);
         let r2 = b.build();
 
         let mut template = Template::from_records(vec![r1, r2])?;
         template.fix_mate_info()?;
 
-        assert_eq!(template.records()[0].tags().find_int(b"ms"), Some(88), "R1 ms should be 88");
-        assert_eq!(template.records()[1].tags().find_int(b"ms"), Some(77), "R2 ms should be 77");
+        assert_eq!(
+            template.records()[0].tags().find_int(SamTag::MS),
+            Some(88),
+            "R1 ms should be 88"
+        );
+        assert_eq!(
+            template.records()[1].tags().find_int(SamTag::MS),
+            Some(77),
+            "R2 ms should be 77"
+        );
 
         Ok(())
     }
@@ -1237,7 +1262,7 @@ mod tests {
             .pos(99)
             .mapq(30)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 1000);
+            .add_int_tag(SamTag::AS, 1000);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1249,19 +1274,19 @@ mod tests {
             .pos(199)
             .mapq(40)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 2000);
+            .add_int_tag(SamTag::AS, 2000);
         let r2 = b.build();
 
         let mut template = Template::from_records(vec![r1, r2])?;
         template.fix_mate_info()?;
 
         assert_eq!(
-            template.records()[0].tags().find_int(b"ms"),
+            template.records()[0].tags().find_int(SamTag::MS),
             Some(2000),
             "R1 ms should be 2000"
         );
         assert_eq!(
-            template.records()[1].tags().find_int(b"ms"),
+            template.records()[1].tags().find_int(SamTag::MS),
             Some(1000),
             "R2 ms should be 1000"
         );
@@ -1281,7 +1306,7 @@ mod tests {
             .pos(99)
             .mapq(30)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 100_000);
+            .add_int_tag(SamTag::AS, 100_000);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1293,19 +1318,19 @@ mod tests {
             .pos(199)
             .mapq(40)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 200_000);
+            .add_int_tag(SamTag::AS, 200_000);
         let r2 = b.build();
 
         let mut template = Template::from_records(vec![r1, r2])?;
         template.fix_mate_info()?;
 
         assert_eq!(
-            template.records()[0].tags().find_int(b"ms"),
+            template.records()[0].tags().find_int(SamTag::MS),
             Some(200_000),
             "R1 ms should be 200_000"
         );
         assert_eq!(
-            template.records()[1].tags().find_int(b"ms"),
+            template.records()[1].tags().find_int(SamTag::MS),
             Some(100_000),
             "R2 ms should be 100_000"
         );
@@ -1324,11 +1349,11 @@ mod tests {
 
         // Neither record should have ms tag since AS is missing
         assert!(
-            template.records()[0].tags().find_int(b"ms").is_none(),
+            template.records()[0].tags().find_int(SamTag::MS).is_none(),
             "R1 should not have ms tag"
         );
         assert!(
-            template.records()[1].tags().find_int(b"ms").is_none(),
+            template.records()[1].tags().find_int(SamTag::MS).is_none(),
             "R2 should not have ms tag"
         );
 
@@ -1347,7 +1372,7 @@ mod tests {
             .pos(99)
             .mapq(30)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 55);
+            .add_int_tag(SamTag::AS, 55);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1359,7 +1384,7 @@ mod tests {
             .pos(199)
             .mapq(40)
             .cigar_ops(&[fgumi_raw_bam::testutil::encode_op(0, 100)])
-            .add_int_tag(b"AS", 44);
+            .add_int_tag(SamTag::AS, 44);
         let r2 = b.build();
 
         let r1_supp =
@@ -1370,7 +1395,7 @@ mod tests {
 
         // After from_records: R1[0], R2[1], R1_supp[2]
         assert_eq!(
-            template.records()[2].tags().find_int(b"ms"),
+            template.records()[2].tags().find_int(SamTag::MS),
             Some(44),
             "R1 supplementary ms should be R2's AS value (44)"
         );
@@ -1658,7 +1683,7 @@ mod tests {
             .template_length(200)
             .mate_ref_id(0)
             .mate_pos(199)
-            .add_int_tag(b"AS", 100);
+            .add_int_tag(SamTag::AS, 100);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1673,7 +1698,7 @@ mod tests {
             .template_length(-200)
             .mate_ref_id(0)
             .mate_pos(99)
-            .add_int_tag(b"AS", 150);
+            .add_int_tag(SamTag::AS, 150);
         let r2 = b.build();
 
         // R1 supp has wrong mate info (will be corrected by fix_mate_info)
@@ -1703,11 +1728,11 @@ mod tests {
         // TLEN should be -(-200) = 200
         assert_eq!(supp.template_length(), 200, "R1 supp TLEN should be -(-200) = 200");
         // MQ tag should be R2's mapq (40)
-        assert_eq!(supp.tags().find_int(b"MQ"), Some(40), "R1 supp MQ should be R2's mapq");
+        assert_eq!(supp.tags().find_int(SamTag::MQ), Some(40), "R1 supp MQ should be R2's mapq");
         // MC tag should be present
-        assert!(supp.tags().find_string(b"MC").is_some(), "R1 supp should have MC tag");
+        assert!(supp.tags().find_string(SamTag::MC).is_some(), "R1 supp should have MC tag");
         // ms tag should be R2's AS value (150)
-        assert_eq!(supp.tags().find_int(b"ms"), Some(150), "R1 supp ms should be R2's AS");
+        assert_eq!(supp.tags().find_int(SamTag::MS), Some(150), "R1 supp ms should be R2's AS");
 
         Ok(())
     }
@@ -1728,7 +1753,7 @@ mod tests {
             .template_length(300)
             .mate_ref_id(0)
             .mate_pos(199)
-            .add_int_tag(b"AS", 120);
+            .add_int_tag(SamTag::AS, 120);
         let r1 = b.build();
 
         let mut b = RawSamBuilder::new();
@@ -1743,7 +1768,7 @@ mod tests {
             .template_length(-300)
             .mate_ref_id(0)
             .mate_pos(99)
-            .add_int_tag(b"AS", 180);
+            .add_int_tag(SamTag::AS, 180);
         let r2 = b.build();
 
         let r2_supp = create_mapped_record_with_flags(
@@ -1772,11 +1797,11 @@ mod tests {
         // R1(pos=100,forward) and R2(pos=200,forward) → insert_size = 101
         assert_eq!(supp.template_length(), -101, "R2 supp TLEN should be -101");
         // MQ tag should be R1's mapq (35)
-        assert_eq!(supp.tags().find_int(b"MQ"), Some(35), "R2 supp MQ should be R1's mapq");
+        assert_eq!(supp.tags().find_int(SamTag::MQ), Some(35), "R2 supp MQ should be R1's mapq");
         // MC tag should be present
-        assert!(supp.tags().find_string(b"MC").is_some(), "R2 supp should have MC tag");
+        assert!(supp.tags().find_string(SamTag::MC).is_some(), "R2 supp should have MC tag");
         // ms tag should be R1's AS value (120)
-        assert_eq!(supp.tags().find_int(b"ms"), Some(120), "R2 supp ms should be R1's AS");
+        assert_eq!(supp.tags().find_int(SamTag::MS), Some(120), "R2 supp ms should be R1's AS");
 
         Ok(())
     }
@@ -1831,7 +1856,7 @@ mod tests {
             !supp.is_mate_reverse(),
             "R1 supp should NOT have mate_reverse when R2 is unmapped"
         );
-        assert!(supp.tags().find_string(b"MC").is_none(), "R1 supp should NOT have MC tag");
+        assert!(supp.tags().find_string(SamTag::MC).is_none(), "R1 supp should NOT have MC tag");
         assert_eq!(supp.template_length(), 0, "TLEN should be 0 when mate is unmapped");
 
         Ok(())
@@ -1913,7 +1938,7 @@ mod tests {
             .template_length(-400)
             .mate_ref_id(0)
             .mate_pos(99)
-            .add_int_tag(b"AS", 200);
+            .add_int_tag(SamTag::AS, 200);
         let r2 = b.build();
 
         let r1_supp1 = create_mapped_record_with_flags(
@@ -2021,12 +2046,12 @@ mod tests {
         template.fix_mate_info()?;
 
         // R1's MC should be R2's CIGAR (25M5I20M)
-        let r1_mc = template.records()[0].tags().find_string(b"MC");
+        let r1_mc = template.records()[0].tags().find_string(SamTag::MC);
         assert!(r1_mc.is_some(), "R1 should have MC tag");
         assert_eq!(r1_mc.unwrap(), b"25M5I20M", "R1 MC should be R2's CIGAR");
 
         // R2's MC should be R1's CIGAR (50M)
-        let r2_mc = template.records()[1].tags().find_string(b"MC");
+        let r2_mc = template.records()[1].tags().find_string(SamTag::MC);
         assert!(r2_mc.is_some(), "R2 should have MC tag");
         assert_eq!(r2_mc.unwrap(), b"50M", "R2 MC should be R1's CIGAR");
 
@@ -2045,7 +2070,7 @@ mod tests {
             .ref_id(0)
             .pos(0)
             .mapq(0)
-            .add_int_tag(b"MQ", 30);
+            .add_int_tag(SamTag::MQ, 30);
         let r1 = b.build();
 
         // R2: unmapped, placed at ref 0, has MC tag
@@ -2057,7 +2082,7 @@ mod tests {
             .ref_id(0)
             .pos(0)
             .mapq(0)
-            .add_string_tag(b"MC", b"100M");
+            .add_string_tag(SamTag::MC, b"100M");
         let r2 = b.build();
 
         let mut template = Template::from_records(vec![r1, r2])?;
@@ -2072,9 +2097,12 @@ mod tests {
         assert!(template.records()[1].is_mate_unmapped(), "R2 mate_unmapped");
 
         // MQ and MC tags should be removed
-        assert!(template.records()[0].tags().find_int(b"MQ").is_none(), "R1 MQ should be removed");
         assert!(
-            template.records()[1].tags().find_string(b"MC").is_none(),
+            template.records()[0].tags().find_int(SamTag::MQ).is_none(),
+            "R1 MQ should be removed"
+        );
+        assert!(
+            template.records()[1].tags().find_string(SamTag::MC).is_none(),
             "R2 MC should be removed"
         );
 
@@ -2108,10 +2136,13 @@ mod tests {
         assert_eq!(template.records()[1].pos() + 1, 100, "R2 should be placed at R1's position");
 
         // R1 (mapped) should NOT have MQ tag (mate is unmapped)
-        assert!(template.records()[0].tags().find_int(b"MQ").is_none(), "R1 should NOT have MQ");
+        assert!(
+            template.records()[0].tags().find_int(SamTag::MQ).is_none(),
+            "R1 should NOT have MQ"
+        );
 
         // R2 (unmapped) SHOULD have MQ tag (mate is mapped)
-        assert!(template.records()[1].tags().find_int(b"MQ").is_some(), "R2 should have MQ");
+        assert!(template.records()[1].tags().find_int(SamTag::MQ).is_some(), "R2 should have MQ");
 
         // R1 should have mate_unmapped flag set
         assert!(template.records()[0].is_mate_unmapped(), "R1 mate_unmapped should be set");
@@ -2124,8 +2155,11 @@ mod tests {
         assert_eq!(template.records()[1].template_length(), 0, "R2 TLEN");
 
         // MC tag: R1 should not have it (mate unmapped), R2 should have it (mate mapped)
-        assert!(template.records()[0].tags().find_string(b"MC").is_none(), "R1 NOT have MC");
-        assert!(template.records()[1].tags().find_string(b"MC").is_some(), "R2 should have MC");
+        assert!(template.records()[0].tags().find_string(SamTag::MC).is_none(), "R1 NOT have MC");
+        assert!(
+            template.records()[1].tags().find_string(SamTag::MC).is_some(),
+            "R2 should have MC"
+        );
 
         Ok(())
     }
