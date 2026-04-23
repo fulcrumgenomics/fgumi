@@ -120,6 +120,14 @@ impl SamTag {
     /// forward/top strand, `Z:r` for the reverse/bottom strand. Used by `fgumi
     /// zipper --restore-unconverted-bases` to decide which bases to restore.
     pub const YD: SamTag = SamTag::new(b'Y', b'D');
+    /// Base modification calls, e.g. `MM:Z:C+m,5,12,0;` (SAM spec, "Base modifications").
+    pub const MM: SamTag = SamTag::new(b'M', b'M');
+    /// Per-base modification probabilities, paired with `MM` (SAM spec).
+    pub const ML: SamTag = SamTag::new(b'M', b'L');
+    /// Phred-likelihood that the segment is incorrect (SAM spec).
+    pub const UQ: SamTag = SamTag::new(b'U', b'Q');
+    /// Original base quality scores, before recalibration (SAM spec).
+    pub const OQ: SamTag = SamTag::new(b'O', b'Q');
 
     // ── fgumi-internal tags ─────────────────────────────────────────────────
 
@@ -275,5 +283,13 @@ mod tests {
         let tag = SamTag::CB;
         let bytes: &[u8; 2] = &tag;
         assert_eq!(bytes, b"CB");
+    }
+
+    #[test]
+    fn test_sam_spec_extension_constants() {
+        assert_eq!(*SamTag::MM, [b'M', b'M']);
+        assert_eq!(*SamTag::ML, [b'M', b'L']);
+        assert_eq!(*SamTag::UQ, [b'U', b'Q']);
+        assert_eq!(*SamTag::OQ, [b'O', b'Q']);
     }
 }
