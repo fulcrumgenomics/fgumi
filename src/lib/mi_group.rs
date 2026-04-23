@@ -1161,7 +1161,7 @@ mod tests {
             for raw in &group.records {
                 use crate::sort::bam_fields;
                 // MI tag still holds the original value, not the composite key
-                let mi_val = bam_fields::find_string_tag_in_record(raw, b"MI");
+                let mi_val = bam_fields::find_string_tag_in_record(raw, SamTag::MI);
                 assert_eq!(mi_val, Some(b"1".as_ref()), "MI tag must retain original value");
             }
         }

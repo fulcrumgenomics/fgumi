@@ -19,7 +19,6 @@
 
 use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
-#[cfg(test)]
 use crate::sam::SamTag;
 use crate::sort::inline_buffer::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
@@ -1167,9 +1166,9 @@ pub struct RawExternalSorter {
     pg_info: Option<(String, String)>,
     /// Maximum temp files before consolidation (0 = unlimited).
     max_temp_files: usize,
-    /// Cell barcode tag for template-coordinate sort (e.g., `[b'C', b'B']`).
+    /// Cell barcode tag for template-coordinate sort (e.g., `SamTag::CB`).
     /// When `Some`, CB hash is included in sort key for single-cell data.
-    cell_tag: Option<[u8; 2]>,
+    cell_tag: Option<SamTag>,
     /// Initial buffer capacity hint (bytes) for pre-allocation.
     ///
     /// Decoupled from `memory_limit` so that auto-detected limits can start with
@@ -1319,7 +1318,7 @@ impl RawExternalSorter {
     /// When set, the CB hash is included in the sort key so that templates
     /// from different cells at the same locus are not interleaved.
     #[must_use]
-    pub fn cell_tag(mut self, tag: [u8; 2]) -> Self {
+    pub fn cell_tag(mut self, tag: SamTag) -> Self {
         self.cell_tag = Some(tag);
         self
     }
@@ -1578,7 +1577,7 @@ impl RawExternalSorter {
                 let cell_tag = self.cell_tag;
                 let hasher = cb_hasher();
                 self.run_merge_loop(&mut readers, &output_header, output, |bam| {
-                    extract_template_key_inline(bam, &lib_lookup, cell_tag.as_ref(), &hasher)
+                    extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher)
                 })
             }
             SortOrder::Coordinate => {
@@ -2370,12 +2369,8 @@ impl RawExternalSorter {
 
             // Extract template key and push to buffer
             let bam_bytes = record.as_ref();
-            let key = extract_template_key_inline(
-                bam_bytes,
-                &lib_lookup,
-                self.cell_tag.as_ref(),
-                &cb_hasher,
-            );
+            let key =
+                extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag, &cb_hasher);
             buffer.push(bam_bytes, key)?;
 
             if probe.should_sample_read(stats.total_records) {
@@ -2922,7 +2917,7 @@ impl RawExternalSorter {
 pub fn extract_template_key_inline(
     bam_bytes: &[u8],
     lib_lookup: &LibraryLookup,
-    cell_tag: Option<&[u8; 2]>,
+    cell_tag: Option<SamTag>,
     cb_hasher: &ahash::RandomState,
 ) -> TemplateKey {
     use crate::sort::bam_fields;
@@ -3265,8 +3260,8 @@ mod tests {
 
     #[test]
     fn test_raw_sorter_cell_tag_builder() {
-        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(*SamTag::CB);
-        assert_eq!(sorter.cell_tag, Some(*SamTag::CB));
+        let sorter = RawExternalSorter::new(SortOrder::TemplateCoordinate).cell_tag(SamTag::CB);
+        assert_eq!(sorter.cell_tag, Some(SamTag::CB));
     }
 
     // ========================================================================
@@ -3320,7 +3315,8 @@ mod tests {
         let aux = cb_aux(b"ACGTACGT");
         let bam = build_mapped_bam(0, 100, b"read1", &aux);
 
-        let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"), &test_cb_hasher());
+        let key =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
         assert_ne!(key.cb_hash, 0, "CB present should produce non-zero cb_hash");
     }
 
@@ -3331,7 +3327,8 @@ mod tests {
         // No CB tag in aux data
         let bam = build_mapped_bam(0, 100, b"read1", &[]);
 
-        let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"), &test_cb_hasher());
+        let key =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
         assert_eq!(key.cb_hash, 0, "missing CB tag should produce cb_hash=0");
     }
 
@@ -3353,11 +3350,13 @@ mod tests {
 
         let aux1 = cb_aux(b"ACGTACGT");
         let bam1 = build_mapped_bam(0, 100, b"read1", &aux1);
-        let key1 = extract_template_key_inline(&bam1, &lib_lookup, Some(b"CB"), &test_cb_hasher());
+        let key1 =
+            extract_template_key_inline(&bam1, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
 
         let aux2 = cb_aux(b"TGCATGCA");
         let bam2 = build_mapped_bam(0, 100, b"read1", &aux2);
-        let key2 = extract_template_key_inline(&bam2, &lib_lookup, Some(b"CB"), &test_cb_hasher());
+        let key2 =
+            extract_template_key_inline(&bam2, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
 
         assert_ne!(
             key1.cb_hash, key2.cb_hash,
@@ -3372,8 +3371,10 @@ mod tests {
         let aux = cb_aux(b"ACGTACGT");
         let bam = build_mapped_bam(0, 100, b"read1", &aux);
 
-        let key1 = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"), &test_cb_hasher());
-        let key2 = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"), &test_cb_hasher());
+        let key1 =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
+        let key2 =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
         assert_eq!(key1.cb_hash, key2.cb_hash, "same input should produce same cb_hash");
     }
 
@@ -3395,7 +3396,8 @@ mod tests {
         bam.extend_from_slice(b"read1\0");
         bam.extend_from_slice(&aux);
 
-        let key = extract_template_key_inline(&bam, &lib_lookup, Some(b"CB"), &test_cb_hasher());
+        let key =
+            extract_template_key_inline(&bam, &lib_lookup, Some(SamTag::CB), &test_cb_hasher());
         assert_ne!(key.cb_hash, 0, "unmapped read with CB should have non-zero cb_hash");
         assert_eq!(key.primary, u64::MAX, "unmapped both-mates should have MAX primary");
     }

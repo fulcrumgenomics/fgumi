@@ -362,8 +362,8 @@ pub(crate) fn parse_memory_reserve(s: &str) -> Result<MemoryReserve, String> {
 
 /// Parse the cell tag for template-coordinate sort/verify, returning `None`
 /// for other sort orders.
-pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<[u8; 2]>> {
-    if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(*SamTag::CB)) } else { Ok(None) }
+pub(crate) fn parse_cell_tag(order: SortOrderArg) -> Result<Option<SamTag>> {
+    if matches!(order, SortOrderArg::TemplateCoordinate) { Ok(Some(SamTag::CB)) } else { Ok(None) }
 }
 
 /// Summary of sort-order verification: `(total_records, violations, first_violation)`.
@@ -544,7 +544,7 @@ fn resolve_memory_limit(
 impl Sort {
     /// Parse the cell tag for template-coordinate sort/verify, returning `None`
     /// for other sort orders.
-    fn parse_cell_tag(&self) -> Result<Option<[u8; 2]>> {
+    fn parse_cell_tag(&self) -> Result<Option<SamTag>> {
         parse_cell_tag(self.order)
     }
 
@@ -574,7 +574,8 @@ impl Sort {
         info!("Output: {}", output.display());
         info!("Sort order: {:?}", self.order);
         if let Some(ct) = cell_tag {
-            info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
+            let ct_bytes = *ct;
+            info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
         }
         if let MemoryLimit::Fixed(per_thread) = self.max_memory {
             if self.memory_per_thread {
@@ -668,7 +669,8 @@ impl Sort {
         info!("Input: {}", self.input.display());
         info!("Expected order: {:?}", self.order);
         if let Some(ct) = cell_tag {
-            info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
+            let ct_bytes = *ct;
+            info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
         }
 
         // Get header via the raw-byte reader, then re-open for raw record iteration.
@@ -708,7 +710,7 @@ impl Sort {
                 let hasher = cb_hasher();
                 verify_sort_order(
                     raw_reader,
-                    |bam| extract_template_key_inline(bam, &lib_lookup, cell_tag.as_ref(), &hasher),
+                    |bam| extract_template_key_inline(bam, &lib_lookup, cell_tag, &hasher),
                     // Use core_cmp to ignore name_hash tie-breaker differences
                     // This allows both fgumi and samtools sorted files to pass
                     |key, prev| key.core_cmp(prev) == Ordering::Less,
@@ -840,10 +842,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case(SortOrderArg::TemplateCoordinate, Some(*SamTag::CB))]
+    #[case(SortOrderArg::TemplateCoordinate, Some(SamTag::CB))]
     #[case(SortOrderArg::Coordinate, None)]
     #[case(SortOrderArg::Queryname, None)]
-    fn test_parse_cell_tag(#[case] order: SortOrderArg, #[case] expected: Option<[u8; 2]>) {
+    fn test_parse_cell_tag(#[case] order: SortOrderArg, #[case] expected: Option<SamTag>) {
         let sort = make_sort(order);
         assert_eq!(sort.parse_cell_tag().expect("parse_cell_tag should succeed"), expected);
     }
