@@ -181,7 +181,7 @@ fn filter_template_raw(
                 continue;
             }
 
-            if check_mq && t == *b"MQ" {
+            if check_mq && t == *SamTag::MQ {
                 // Extract MQ value (common types: C/c/S/s/I/i)
                 found_mq = match val_type {
                     b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
@@ -817,10 +817,10 @@ impl Command for GroupReadsByUmi {
         // Add @PG record with PP chaining to input's last program
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
-        // Tag constants per SAM specification
+        // Tag constants per SAM specification — all derived from SamTag to ensure type safety.
         let raw_tag: [u8; 2] = *SamTag::RX;
-        let cell_tag = Tag::from(SamTag::CB);
         let assign_tag_bytes: [u8; 2] = *SamTag::MI;
+        let cell_tag = Tag::from(SamTag::CB);
 
         // Create filter configuration
         let filter_config = GroupFilterConfig {
@@ -1793,8 +1793,11 @@ mod tests {
     }
 
     /// Append a string (Z-type) tag to a raw BAM record.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    fn append_str_tag(rec: &mut fgumi_raw_bam::RawRecord, tag: &[u8; 2], value: &[u8]) {
+    fn append_str_tag(
+        rec: &mut fgumi_raw_bam::RawRecord,
+        tag: impl fgumi_raw_bam::AsTagBytes,
+        value: &[u8],
+    ) {
         fgumi_raw_bam::RawTagsEditor::from_vec(rec.as_mut_vec()).append_string(tag, value);
     }
 
@@ -1821,7 +1824,7 @@ mod tests {
             .cigar_ops(&[cigar])
             .sequence(seq)
             .qualities(&quals);
-        b.add_string_tag(b"RX", umi.as_bytes());
+        b.add_string_tag(SamTag::RX, umi.as_bytes());
         b.build()
     }
 
@@ -1851,8 +1854,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos2 - 1);
-        b1.add_string_tag(b"RX", umi.as_bytes());
-        b1.add_string_tag(b"MC", b"100M");
+        b1.add_string_tag(SamTag::RX, umi.as_bytes());
+        b1.add_string_tag(SamTag::MC, b"100M");
         let r1 = b1.build();
 
         let mut b2 = RawSamBuilder::new();
@@ -1866,8 +1869,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos1 - 1);
-        b2.add_string_tag(b"RX", umi.as_bytes());
-        b2.add_string_tag(b"MC", b"100M");
+        b2.add_string_tag(SamTag::RX, umi.as_bytes());
+        b2.add_string_tag(SamTag::MC, b"100M");
         let r2 = b2.build();
 
         (r1, r2)
@@ -1897,8 +1900,8 @@ mod tests {
             .cigar_ops(&[cigar])
             .sequence(&seq)
             .qualities(&quals);
-        b1.add_string_tag(b"RX", umi.as_bytes());
-        b1.add_int_tag(b"MQ", 0i32); // R1's mate (R2) is unmapped, so MQ=0
+        b1.add_string_tag(SamTag::RX, umi.as_bytes());
+        b1.add_int_tag(SamTag::MQ, 0i32); // R1's mate (R2) is unmapped, so MQ=0
         let r1 = b1.build();
 
         // R2: unmapped
@@ -1910,8 +1913,8 @@ mod tests {
             .mapq(0)
             .sequence(&seq)
             .qualities(&quals);
-        b2.add_string_tag(b"RX", umi.as_bytes());
-        b2.add_int_tag(b"MQ", i32::from(mapq)); // R2's mate (R1) has the specified MAPQ
+        b2.add_string_tag(SamTag::RX, umi.as_bytes());
+        b2.add_int_tag(SamTag::MQ, i32::from(mapq)); // R2's mate (R1) has the specified MAPQ
         let r2 = b2.build();
 
         (r1, r2)
@@ -2890,8 +2893,8 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(1) // R2 on chr2
                 .mate_pos(299); // 1-based 300 -> 0-based 299
-            b1.add_string_tag(b"RX", b"ACT-ACT");
-            b1.add_string_tag(b"MC", b"100M");
+            b1.add_string_tag(SamTag::RX, b"ACT-ACT");
+            b1.add_string_tag(SamTag::MC, b"100M");
             let r1 = b1.build();
 
             let mut b2 = RawSamBuilder::new();
@@ -2905,8 +2908,8 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(0) // R1 on chr1
                 .mate_pos(99); // 1-based 100 -> 0-based 99
-            b2.add_string_tag(b"RX", b"ACT-ACT");
-            b2.add_string_tag(b"MC", b"100M");
+            b2.add_string_tag(SamTag::RX, b"ACT-ACT");
+            b2.add_string_tag(SamTag::MC, b"100M");
             let r2 = b2.build();
 
             records.push(r1);
@@ -2930,8 +2933,8 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(0) // R2 on chr1
                 .mate_pos(99); // 1-based 100 -> 0-based 99
-            b1.add_string_tag(b"RX", b"ACT-ACT");
-            b1.add_string_tag(b"MC", b"100M");
+            b1.add_string_tag(SamTag::RX, b"ACT-ACT");
+            b1.add_string_tag(SamTag::MC, b"100M");
             let r1 = b1.build();
 
             let mut b2 = RawSamBuilder::new();
@@ -2945,8 +2948,8 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(1) // R1 on chr2
                 .mate_pos(299); // 1-based 300 -> 0-based 299
-            b2.add_string_tag(b"RX", b"ACT-ACT");
-            b2.add_string_tag(b"MC", b"100M");
+            b2.add_string_tag(SamTag::RX, b"ACT-ACT");
+            b2.add_string_tag(SamTag::MC, b"100M");
             let r2 = b2.build();
 
             records.push(r1);
@@ -3098,7 +3101,7 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(0)
             .mate_pos(299);
-        b1.add_string_tag(b"MC", b"100M");
+        b1.add_string_tag(SamTag::MC, b"100M");
         let r1 = b1.build();
 
         let mut b2 = RawSamBuilder::new();
@@ -3112,7 +3115,7 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(0)
             .mate_pos(99);
-        b2.add_string_tag(b"MC", b"100M");
+        b2.add_string_tag(SamTag::MC, b"100M");
         let r2 = b2.build();
 
         records.push(r1);
@@ -3163,7 +3166,7 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(0)
             .mate_pos(299);
-        b1.add_string_tag(b"MC", b"100M");
+        b1.add_string_tag(SamTag::MC, b"100M");
         let r1 = b1.build();
 
         let mut b2 = RawSamBuilder::new();
@@ -3177,7 +3180,7 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(0)
             .mate_pos(99);
-        b2.add_string_tag(b"MC", b"100M");
+        b2.add_string_tag(SamTag::MC, b"100M");
         let r2 = b2.build();
 
         records.push(r1);
@@ -3301,30 +3304,30 @@ mod tests {
 
         // Two reads with same UMI and position but same cell barcode
         let mut r1 = build_test_read("a01", 0, 100, 60, 0, "AAAAAAAA");
-        append_str_tag(&mut r1, b"CB", b"AA");
+        append_str_tag(&mut r1, SamTag::CB, b"AA");
         records.push(r1);
 
         let mut r2 = build_test_read("a02", 0, 100, 60, 0, "AAAAAAAA");
-        append_str_tag(&mut r2, b"CB", b"AA");
+        append_str_tag(&mut r2, SamTag::CB, b"AA");
         records.push(r2);
 
         // One read with similar UMI but different cell barcode
         let mut r3 = build_test_read("a03", 0, 100, 60, 0, "CACACACA");
-        append_str_tag(&mut r3, b"CB", b"CA");
+        append_str_tag(&mut r3, SamTag::CB, b"CA");
         records.push(r3);
 
         // One read with close UMI but different cell barcode
         let mut r4 = build_test_read("a04", 0, 100, 60, 0, "CACACACC");
-        append_str_tag(&mut r4, b"CB", b"NN");
+        append_str_tag(&mut r4, SamTag::CB, b"NN");
         records.push(r4);
 
         // Two reads at different position with same UMI and cell barcode
         let mut r5 = build_test_read("a05", 0, 105, 60, 0, "GTAGTAGG");
-        append_str_tag(&mut r5, b"CB", b"GT");
+        append_str_tag(&mut r5, SamTag::CB, b"GT");
         records.push(r5);
 
         let mut r6 = build_test_read("a06", 0, 105, 60, 0, "GTAGTAGG");
-        append_str_tag(&mut r6, b"CB", b"GT");
+        append_str_tag(&mut r6, SamTag::CB, b"GT");
         records.push(r6);
 
         let input = create_test_bam(records)?;
@@ -3530,7 +3533,7 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(0)
                 .mate_pos(299);
-            b1.add_string_tag(b"RX", b"AAAAAAAA");
+            b1.add_string_tag(SamTag::RX, b"AAAAAAAA");
             let r1 = b1.build();
             let mut b2 = RawSamBuilder::new();
             b2.read_name(b"a01_sec")
@@ -3543,7 +3546,7 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(0)
                 .mate_pos(99);
-            b2.add_string_tag(b"RX", b"AAAAAAAA");
+            b2.add_string_tag(SamTag::RX, b"AAAAAAAA");
             let r2 = b2.build();
             records.push(r1);
             records.push(r2);
@@ -3570,7 +3573,7 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(0)
                 .mate_pos(299);
-            b1.add_string_tag(b"RX", b"AAAAAAAA");
+            b1.add_string_tag(SamTag::RX, b"AAAAAAAA");
             let r1 = b1.build();
             let mut b2 = RawSamBuilder::new();
             b2.read_name(b"a01_sup")
@@ -3583,7 +3586,7 @@ mod tests {
                 .qualities(&quals)
                 .mate_ref_id(0)
                 .mate_pos(99);
-            b2.add_string_tag(b"RX", b"AAAAAAAA");
+            b2.add_string_tag(SamTag::RX, b"AAAAAAAA");
             let r2 = b2.build();
             records.push(r1);
             records.push(r2);
@@ -4722,8 +4725,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos2 - 1);
-        b1.add_string_tag(b"RX", umi.as_bytes());
-        b1.add_string_tag(b"MC", b"100M");
+        b1.add_string_tag(SamTag::RX, umi.as_bytes());
+        b1.add_string_tag(SamTag::MC, b"100M");
         let r1 = b1.build();
 
         let mut b2 = RawSamBuilder::new();
@@ -4737,8 +4740,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos1 - 1);
-        b2.add_string_tag(b"RX", umi.as_bytes());
-        b2.add_string_tag(b"MC", b"100M");
+        b2.add_string_tag(SamTag::RX, umi.as_bytes());
+        b2.add_string_tag(SamTag::MC, b"100M");
         let r2 = b2.build();
 
         (r1, r2)
@@ -5428,13 +5431,13 @@ mod tests {
             flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED;
         let mut b1 = UnmappedSamBuilder::new();
         b1.build_record(name.as_bytes(), r1_flags, &seq, &quals);
-        b1.append_string_tag(b"RX", umi.as_bytes());
+        b1.append_string_tag(SamTag::RX, umi.as_bytes());
         let r1 = b1.build();
 
         let r2_flags = flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED | flags::MATE_UNMAPPED;
         let mut b2 = UnmappedSamBuilder::new();
         b2.build_record(name.as_bytes(), r2_flags, &seq, &quals);
-        b2.append_string_tag(b"RX", umi.as_bytes());
+        b2.append_string_tag(SamTag::RX, umi.as_bytes());
         let r2 = b2.build();
 
         (r1, r2)

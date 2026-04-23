@@ -317,7 +317,7 @@ fn filter_template(
                 continue;
             }
 
-            if check_mq && t == *b"MQ" {
+            if check_mq && t == *SamTag::MQ {
                 found_mq = match val_type {
                     b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),
                     b'c' if p + 3 < aux.len() => Some(i64::from(aux[p + 3] as i8)),
@@ -480,7 +480,7 @@ fn assign_umi_groups_for_indices(
     templates: &mut [Template],
     indices: &[usize],
     assigner: &dyn UmiAssigner,
-    raw_tag: [u8; 2],
+    raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
@@ -536,7 +536,7 @@ fn assign_umi_groups_for_indices(
 fn assign_umi_groups(
     templates: &mut [Template],
     assigner: &dyn UmiAssigner,
-    raw_tag: [u8; 2],
+    raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> Result<()> {
@@ -660,7 +660,7 @@ fn process_position_group(
     group: RawPositionGroup,
     filter_config: &DedupFilterConfig,
     assigner: &dyn UmiAssigner,
-    raw_tag: [u8; 2],
+    raw_tag: SamTag,
     min_umi_length: Option<usize>,
     no_umi: bool,
 ) -> io::Result<ProcessedDedupGroup> {
@@ -953,12 +953,12 @@ impl Command for MarkDuplicates {
         let header = crate::commands::common::add_pg_record(header, command_line)?;
 
         // Tag constants per SAM specification
-        let raw_tag: [u8; 2] = *SamTag::RX;
+        let raw_tag = SamTag::RX;
         let cell_tag = Tag::from(SamTag::CB);
         let assign_tag_bytes: [u8; 2] = *SamTag::MI;
 
         let filter_config = DedupFilterConfig {
-            umi_tag: raw_tag,
+            umi_tag: *raw_tag,
             min_mapq,
             include_non_pf: self.include_non_pf_reads,
             min_umi_length: self.min_umi_length,
@@ -1536,7 +1536,7 @@ mod tests {
             .cigar_ops(&[encode_op(0, 4)])
             .mapq(mapq)
             .flags(flags::PAIRED | flags::FIRST_SEGMENT);
-        b.add_string_tag(b"RX", umi.as_bytes());
+        b.add_string_tag(SamTag::RX, umi.as_bytes());
         let record = b.build();
         Template::from_records(vec![record]).expect("test template construction should not fail")
     }
@@ -1622,7 +1622,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::QC_FAIL);
-            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.add_string_tag(SamTag::RX, b"ACGTACGT");
             b.build()
         };
         let template = Template::from_records(vec![record])
@@ -1648,7 +1648,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::QC_FAIL);
-            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.add_string_tag(SamTag::RX, b"ACGTACGT");
             b.build()
         };
         let template = Template::from_records(vec![record])
@@ -1669,7 +1669,7 @@ mod tests {
                 .sequence(b"ACGT")
                 .qualities(&[30, 30, 30, 30])
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
-            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.add_string_tag(SamTag::RX, b"ACGTACGT");
             b.build()
         };
         let template = Template::from_records(vec![record])
@@ -1761,7 +1761,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT);
-            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
             b.build()
         };
         let r2 = {
@@ -1774,7 +1774,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::LAST_SEGMENT);
-            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
             b.build()
         };
         let template = Template::from_records(vec![r1, r2])
@@ -1797,7 +1797,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE);
-            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
             b.build()
         };
         let r2 = {
@@ -1810,7 +1810,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::LAST_SEGMENT);
-            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
             b.build()
         };
         let template = Template::from_records(vec![r1, r2])
@@ -1833,7 +1833,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::REVERSE);
-            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
             b.build()
         };
         let r2 = {
@@ -1846,7 +1846,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::REVERSE);
-            b.add_string_tag(b"RX", b"ACGT-TGCA");
+            b.add_string_tag(SamTag::RX, b"ACGT-TGCA");
             b.build()
         };
         let template = Template::from_records(vec![r1, r2])
@@ -1999,7 +1999,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(r1_mapq)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT);
-            b.add_string_tag(b"RX", umi.as_bytes());
+            b.add_string_tag(SamTag::RX, umi.as_bytes());
             b.build()
         };
         let r2 = {
@@ -2012,7 +2012,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(r2_mapq)
                 .flags(flags::PAIRED | flags::LAST_SEGMENT);
-            b.add_string_tag(b"RX", umi.as_bytes());
+            b.add_string_tag(SamTag::RX, umi.as_bytes());
             b.build()
         };
         Template::from_records(vec![r1, r2]).expect("test template construction should not fail")
@@ -2053,7 +2053,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT);
-            b.add_string_tag(b"RX", b"ACGTACGT");
+            b.add_string_tag(SamTag::RX, b"ACGTACGT");
             b.build()
         };
         let r2 = {
@@ -2066,7 +2066,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 4)])
                 .mapq(30)
                 .flags(flags::PAIRED | flags::LAST_SEGMENT);
-            b.add_string_tag(b"RX", b"ACNTACGT");
+            b.add_string_tag(SamTag::RX, b"ACNTACGT");
             b.build()
         };
         let template = Template::from_records(vec![r1, r2])
