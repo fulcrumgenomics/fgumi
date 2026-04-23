@@ -1180,7 +1180,7 @@ impl CorrectUmis {
         let mut mismatched = 0u64;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        let umi_tag_bytes: [u8; 2] = *b"RX";
+        let umi_tag_bytes: [u8; 2] = SamTag::RX.into();
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
         let revcomp = self.revcomp;
@@ -1789,7 +1789,7 @@ mod tests {
                 .sequence(b"AAAAAAAAAA")
                 .qualities(&[40u8; 10]);
             if let Some(umi_seq) = umi {
-                b.add_string_tag(b"RX", umi_seq.as_bytes());
+                b.add_string_tag(SamTag::RX, umi_seq.as_bytes());
             }
             let raw = b.build();
             let record = raw_record_to_record_buf(&raw, &sam::Header::default())
@@ -3369,7 +3369,7 @@ mod tests {
                     .qualities(&quals)
                     .mate_ref_id(0)
                     .mate_pos(pos2);
-                b1.add_string_tag(b"RX", umi.as_bytes());
+                b1.add_string_tag(SamTag::RX, umi.as_bytes());
                 let r1 = raw_record_to_record_buf(&b1.build(), &header)?;
                 writer.write_alignment_record(&header, &r1)?;
 
@@ -3384,7 +3384,7 @@ mod tests {
                     .qualities(&quals)
                     .mate_ref_id(0)
                     .mate_pos(pos1);
-                b2.add_string_tag(b"RX", umi.as_bytes());
+                b2.add_string_tag(SamTag::RX, umi.as_bytes());
                 let r2 = raw_record_to_record_buf(&b2.build(), &header)?;
                 writer.write_alignment_record(&header, &r2)?;
             }
