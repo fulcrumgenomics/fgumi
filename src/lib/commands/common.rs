@@ -4,15 +4,19 @@
 //! command structs using `#[command(flatten)]`.
 
 use std::path::PathBuf;
+#[cfg(feature = "simplex")]
 use std::sync::Arc;
 
 use crate::bam_io::is_stdin_path;
+#[cfg(feature = "simplex")]
 use crate::logging::OperationTimer;
 use crate::unified_pipeline::{BamPipelineConfig, SchedulerStrategy};
 use crate::validation::validate_file_exists;
 use bytesize::ByteSize;
 use clap::Args;
+#[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
+#[cfg(feature = "simplex")]
 use log::info;
 use noodles::sam::Header;
 
@@ -53,6 +57,7 @@ pub fn resolve_methylation_mode(
 }
 
 /// Methylation reference pair: reference base provider + contig name mapping.
+#[cfg(feature = "simplex")]
 pub type MethylationRef = Option<(
     Arc<dyn fgumi_consensus::methylation::RefBaseProvider + Send + Sync>,
     Arc<Vec<String>>,
@@ -61,6 +66,7 @@ pub type MethylationRef = Option<(
 /// Loads the reference FASTA and builds contig name mapping for methylation-aware modes.
 ///
 /// Returns `None` if methylation mode is disabled. Errors if enabled but `reference` is `None`.
+#[cfg(feature = "simplex")]
 pub fn load_methylation_reference(
     methylation_mode: fgumi_consensus::MethylationMode,
     reference: &Option<PathBuf>,

@@ -10,13 +10,14 @@
 
 use crate::alignment_tags::regenerate_alignment_tags_raw;
 use crate::bam_io::create_bam_reader_for_pipeline_with_opts;
+#[cfg(feature = "simplex")]
+use crate::consensus_filter::resolve_ref_bases_for_record;
 use crate::consensus_filter::{
     FilterConfig, FilterResult, MethylationDepthThresholds, MethylationTags,
     check_conversion_fraction_raw_with_ref_bases_and_tags, compute_read_stats, filter_duplex_read,
     filter_read, is_duplex_consensus, mask_bases, mask_duplex_bases,
     mask_methylation_depth_duplex_raw_with_tags, mask_methylation_depth_simplex_raw_with_tags,
-    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, resolve_ref_bases_for_record,
-    template_passes,
+    mask_strand_methylation_agreement_raw_with_ref_bases_and_tags, template_passes,
 };
 use crate::grouper::{SingleRawRecordGrouper, TemplateGrouper};
 use crate::logging::OperationTimer;
@@ -750,6 +751,10 @@ impl Filter {
         methylation_mode: fgumi_consensus::MethylationMode,
         ref_names: &[String],
     ) -> Result<(u64, bool)> {
+        // `ref_names` is only consumed by the `simplex`-gated ref-base resolver below.
+        #[cfg(not(feature = "simplex"))]
+        let _ = ref_names;
+
         // Fail fast if we encounter a mapped read without a reference, since masking
         // can invalidate NM/UQ/MD tags and we have no way to regenerate them.
         if reference.is_none() {
@@ -808,12 +813,29 @@ impl Filter {
             };
         }
 
-        // Resolve reference bases once for all reference-dependent filters
-        let needs_ref_bases = (require_strand_methylation_agreement && is_duplex)
-            || min_conversion_fraction.is_some();
-        let ref_base_map = if needs_ref_bases {
-            reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
-        } else {
+        // Resolve reference bases once for all reference-dependent filters.
+        // The resolver lives in the `simplex`-gated `methylation` module, so the
+        // reference-dependent methylation filters below are only available when
+        // `simplex` is enabled. Without `simplex` we skip the lookup entirely.
+        #[cfg(feature = "simplex")]
+        let ref_base_map = {
+            let needs_ref_bases = (require_strand_methylation_agreement && is_duplex)
+                || min_conversion_fraction.is_some();
+            if needs_ref_bases {
+                reference.and_then(|r| resolve_ref_bases_for_record(record, r, ref_names))
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "simplex"))]
+        let ref_base_map: Option<Vec<Option<u8>>> = {
+            if (require_strand_methylation_agreement && is_duplex)
+                || min_conversion_fraction.is_some()
+            {
+                bail!(
+                    "reference-dependent methylation filters require building fgumi with the `simplex` feature"
+                );
+            }
             None
         };
 

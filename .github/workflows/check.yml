@@ -128,3 +128,27 @@ jobs:
         # dep. Current members:
         #   - fgumi-raw-bam: default = [], `noodles`/`anyhow` behind feature
         run: cargo check -p fgumi-raw-bam --no-default-features --all-targets
+
+  no-default-features-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: cargo check --workspace --no-default-features --all-targets
+        # The regular test/lint jobs run with default features enabled, which
+        # pulls in every optional dependency transitively. That hides two
+        # classes of bug from CI:
+        #   1. Optional deps used unconditionally (library behind a feature
+        #      gate referenced from non-gated code).
+        #   2. Modules behind a non-default feature referenced from
+        #      always-compiled code.
+        # Both manifest as compile failures only under
+        # `default-features = false`, which is exactly what downstream
+        # consumers can opt into. This job compiles every workspace crate
+        # (lib + tests + benches) with no default features to surface
+        # regressions at PR time.
+        run: cargo check --workspace --no-default-features --all-targets

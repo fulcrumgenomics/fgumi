@@ -12,6 +12,7 @@ const STYLES: Styles = Styles::styled()
     .placeholder(AnsiColor::Cyan.on_default());
 use env_logger::Env;
 use fgumi_lib::commands::clip::Clip;
+#[cfg(feature = "codec")]
 use fgumi_lib::commands::codec::Codec;
 use fgumi_lib::commands::command::Command;
 #[cfg(feature = "compare")]
@@ -19,7 +20,9 @@ use fgumi_lib::commands::compare::Compare;
 use fgumi_lib::commands::correct::CorrectUmis;
 use fgumi_lib::commands::dedup::MarkDuplicates;
 use fgumi_lib::commands::downsample::Downsample;
+#[cfg(feature = "duplex")]
 use fgumi_lib::commands::duplex::Duplex;
+#[cfg(feature = "duplex")]
 use fgumi_lib::commands::duplex_metrics::DuplexMetrics;
 use fgumi_lib::commands::extract::Extract;
 use fgumi_lib::commands::fastq::Fastq;
@@ -27,7 +30,9 @@ use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::merge::Merge;
 use fgumi_lib::commands::review::Review;
+#[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex::Simplex;
+#[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
 #[cfg(feature = "simulate")]
 use fgumi_lib::commands::simulate::Simulate;
@@ -38,6 +43,16 @@ use log::info;
 /// Commands that require feature flags to be enabled.
 /// Format: (`command_name`, `feature_name`)
 const FEATURE_GATED_COMMANDS: &[(&str, &str)] = &[
+    #[cfg(not(feature = "simplex"))]
+    ("simplex", "simplex"),
+    #[cfg(not(feature = "simplex"))]
+    ("simplex-metrics", "simplex"),
+    #[cfg(not(feature = "duplex"))]
+    ("duplex", "duplex"),
+    #[cfg(not(feature = "duplex"))]
+    ("duplex-metrics", "duplex"),
+    #[cfg(not(feature = "codec"))]
+    ("codec", "codec"),
     #[cfg(not(feature = "compare"))]
     ("compare", "compare"),
     #[cfg(not(feature = "simulate"))]
@@ -91,10 +106,13 @@ enum Subcommand {
     Dedup(MarkDuplicates),
 
     // Consensus Calling
+    #[cfg(feature = "simplex")]
     #[command(display_order = 9)]
     Simplex(Simplex),
+    #[cfg(feature = "duplex")]
     #[command(display_order = 10)]
     Duplex(Duplex),
+    #[cfg(feature = "codec")]
     #[command(display_order = 11)]
     Codec(Codec),
 
@@ -103,8 +121,10 @@ enum Subcommand {
     Filter(Filter),
     #[command(display_order = 13)]
     Clip(Clip),
+    #[cfg(feature = "duplex")]
     #[command(display_order = 14)]
     DuplexMetrics(DuplexMetrics),
+    #[cfg(feature = "simplex")]
     #[command(display_order = 15)]
     SimplexMetrics(SimplexMetrics),
     #[command(display_order = 16)]
@@ -132,12 +152,17 @@ impl Subcommand {
             Self::Merge(cmd) => cmd.execute(command_line),
             Self::Group(cmd) => cmd.execute(command_line),
             Self::Dedup(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "simplex")]
             Self::Simplex(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "duplex")]
             Self::Duplex(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "codec")]
             Self::Codec(cmd) => cmd.execute(command_line),
             Self::Filter(cmd) => cmd.execute(command_line),
             Self::Clip(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "duplex")]
             Self::DuplexMetrics(cmd) => cmd.execute(command_line),
+            #[cfg(feature = "simplex")]
             Self::SimplexMetrics(cmd) => cmd.execute(command_line),
             Self::Review(cmd) => cmd.execute(command_line),
             Self::Downsample(cmd) => cmd.execute(command_line),

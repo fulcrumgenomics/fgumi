@@ -10,14 +10,18 @@ mod test_async_reader;
 mod test_bam_pipeline;
 mod test_bgzf_eof;
 mod test_clip_command;
+#[cfg(feature = "codec")]
 mod test_codec_command;
+#[cfg(feature = "codec")]
 mod test_codec_pipeline;
 #[cfg(feature = "compare")]
 mod test_compare_bams;
 mod test_correct_command;
 mod test_dedup_command;
 mod test_downsample_command;
+#[cfg(feature = "duplex")]
 mod test_duplex_command;
+#[cfg(feature = "duplex")]
 mod test_duplex_metrics_command;
 #[cfg(all(feature = "compare", feature = "simulate"))]
 mod test_e2e_regression;
@@ -28,8 +32,11 @@ mod test_filter_command;
 mod test_group_command;
 mod test_pipeline_concurrency;
 mod test_review_command;
+#[cfg(feature = "simplex")]
 mod test_simplex_command;
+#[cfg(feature = "simplex")]
 mod test_simplex_metrics_command;
+#[cfg(feature = "simplex")]
 mod test_simplex_pipeline;
 mod test_simulate_sort;
 mod test_sort_correctness;
