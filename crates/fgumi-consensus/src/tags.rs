@@ -60,20 +60,20 @@ pub fn qualities_to_tag_value(quals: &[u8]) -> Value {
     Value::from(ascii_quals)
 }
 
-/// Default field in which to look for UMI sequences
-pub const UMI_BASES: &str = "RX";
+/// Default field in which to look for UMI sequences (`RX`).
+pub const UMI_BASES: fgumi_sam::SamTag = fgumi_sam::SamTag::RX;
 
-/// Default field in which to look for UMI qualities
-pub const UMI_QUALS: &str = "QX";
+/// Default field in which to look for UMI qualities (`QX`).
+pub const UMI_QUALS: fgumi_sam::SamTag = fgumi_sam::SamTag::QX;
 
-/// Field in which the original UMI bases are stored post-correction
-pub const ORIGINAL_UMI_BASES: &str = "OX";
+/// Field in which the original UMI bases are stored post-correction (`OX`).
+pub const ORIGINAL_UMI_BASES: fgumi_sam::SamTag = fgumi_sam::SamTag::OX;
 
-/// Field in which the original UMI qualities are stored post-correction
-pub const ORIGINAL_UMI_QUALS: &str = "BZ";
+/// Field in which the original UMI qualities are stored post-correction (`BZ`).
+pub const ORIGINAL_UMI_QUALS: fgumi_sam::SamTag = fgumi_sam::SamTag::BZ;
 
-/// Post-grouping ID that is file-wide unique per source molecule
-pub const MOLECULAR_ID: &str = "MI";
+/// Post-grouping ID that is file-wide unique per source molecule (`MI`).
+pub const MOLECULAR_ID: fgumi_sam::SamTag = fgumi_sam::SamTag::MI;
 
 /// Per-base consensus tags
 pub mod per_base {
@@ -314,8 +314,9 @@ mod tests {
 
     #[test]
     fn test_tag_constants() {
-        assert_eq!(UMI_BASES, "RX");
-        assert_eq!(MOLECULAR_ID, "MI");
+        assert_eq!(UMI_BASES, fgumi_sam::SamTag::RX);
+        assert_eq!(MOLECULAR_ID, fgumi_sam::SamTag::MI);
+        // per_base / per_read subset converted in Task 2.2 — leave string compares for now.
         assert_eq!(per_base::RAW_READ_COUNT, "cd");
         assert_eq!(per_read::RAW_READ_COUNT, "cD");
     }
@@ -507,12 +508,12 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn test_umi_tag_constants() {
-        assert_eq!(UMI_BASES, "RX");
-        assert_eq!(UMI_QUALS, "QX");
-        assert_eq!(ORIGINAL_UMI_BASES, "OX");
-        assert_eq!(ORIGINAL_UMI_QUALS, "BZ");
-        assert_eq!(MOLECULAR_ID, "MI");
+    fn test_umi_tag_constants_match_sam_tag() {
+        assert_eq!(UMI_BASES, fgumi_sam::SamTag::RX);
+        assert_eq!(UMI_QUALS, fgumi_sam::SamTag::QX);
+        assert_eq!(ORIGINAL_UMI_BASES, fgumi_sam::SamTag::OX);
+        assert_eq!(ORIGINAL_UMI_QUALS, fgumi_sam::SamTag::BZ);
+        assert_eq!(MOLECULAR_ID, fgumi_sam::SamTag::MI);
     }
 
     // =====================================================================
