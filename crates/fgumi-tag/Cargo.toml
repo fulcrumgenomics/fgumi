@@ -1,0 +1,15 @@
+[package]
+name = "fgumi-tag"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Validated SAM/BAM aux tag identifier (SamTag) for fgumi"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+noodles = { version = "0.106.0", features = ["sam"] }
+anyhow = "1.0"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

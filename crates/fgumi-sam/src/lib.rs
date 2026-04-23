@@ -36,7 +36,6 @@ pub mod alignment_tags;
 pub mod builder;
 pub mod clipper;
 pub mod record_utils;
-pub mod tag;
 pub mod template_coordinate;
 
 /// Abstraction over reference genome access for alignment tag calculation.
@@ -86,6 +85,7 @@ pub use builder::{
     degrading_qualities, parse_cigar, repeat_n, uniform_qualities,
 };
 pub use clipper::{ClippingMode, RawRecordClipper, SamRecordClipper};
+pub use fgumi_tag::SamTag;
 pub use record_utils::{
     PairOrientation, alignment_end, cigar_reference_length, get_pair_orientation, is_fr_pair,
     is_fr_pair_from_tags, leading_clipping, leading_soft_clipping, mate_unclipped_end,
@@ -93,7 +93,6 @@ pub use record_utils::{
     reference_length, trailing_clipping, trailing_soft_clipping, unclipped_end,
     unclipped_five_prime_position, unclipped_start,
 };
-pub use tag::SamTag;
 pub use template_coordinate::{TC_TAG, TemplateCoordinateInfo};
 
 use bstr::ByteSlice;

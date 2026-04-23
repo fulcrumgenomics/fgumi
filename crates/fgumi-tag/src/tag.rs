@@ -11,7 +11,7 @@
 //! Standard SAM-spec and fgumi-internal tags are available as associated constants:
 //!
 //! ```
-//! use fgumi_sam::SamTag;
+//! use fgumi_tag::SamTag;
 //!
 //! assert_eq!(SamTag::RX.to_string(), "RX");
 //! assert_eq!(SamTag::MI.to_string(), "MI");
@@ -24,7 +24,7 @@
 //! tag arguments automatically:
 //!
 //! ```
-//! use fgumi_sam::SamTag;
+//! use fgumi_tag::SamTag;
 //!
 //! let tag: SamTag = "XT".parse().expect("valid tag");
 //! assert_eq!(*tag, [b'X', b'T']);
@@ -522,5 +522,27 @@ mod tests {
     #[test]
     fn test_per_base_tags_to_revcomp_set() {
         assert_eq!(SamTag::PER_BASE_TAGS_TO_REVCOMP, &[SamTag::AC, SamTag::BC_BASES]);
+    }
+
+    #[test]
+    fn test_per_base_partitions_are_exhaustive() {
+        // REVERSE and REVCOMP must together cover every tag in PER_BASE_CONSENSUS_TAGS.
+        assert_eq!(
+            SamTag::PER_BASE_TAGS_TO_REVERSE.len() + SamTag::PER_BASE_TAGS_TO_REVCOMP.len(),
+            SamTag::PER_BASE_CONSENSUS_TAGS.len(),
+            "REVERSE + REVCOMP must partition PER_BASE_CONSENSUS_TAGS exactly",
+        );
+        for t in SamTag::PER_BASE_TAGS_TO_REVCOMP {
+            assert!(
+                SamTag::PER_BASE_CONSENSUS_TAGS.contains(t),
+                "REVCOMP tag {t} missing from PER_BASE_CONSENSUS_TAGS",
+            );
+        }
+        for t in SamTag::PER_BASE_TAGS_TO_REVERSE {
+            assert!(
+                SamTag::PER_BASE_CONSENSUS_TAGS.contains(t),
+                "REVERSE tag {t} missing from PER_BASE_CONSENSUS_TAGS",
+            );
+        }
     }
 }
