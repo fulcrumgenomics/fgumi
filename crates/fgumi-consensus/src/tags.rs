@@ -218,24 +218,22 @@ mod tests {
 
     /// Build a minimal `RawRecord` with the given integer tags, then decode to
     /// `RecordBuf` so that `is_*_consensus` (which takes `&impl Record`) can be tested.
-    fn make_record_with_int_tags(tags: &[(&[u8; 2], i32)]) -> impl noodles::sam::alignment::Record {
+    fn make_record_with_int_tags(tags: &[(SamTag, i32)]) -> impl noodles::sam::alignment::Record {
         let mut b = SamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30u8; 4]);
         for (tag, value) in tags {
-            b.add_int_tag(tag, *value);
+            b.add_int_tag(*tag, *value);
         }
         let raw: RawRecord = b.build();
         raw_record_to_record_buf(&raw, &noodles::sam::Header::default()).expect("decode failed")
     }
 
     /// Build a minimal `RawRecord` with the given string tags, then decode to `RecordBuf`.
-    fn make_record_with_str_tags(
-        tags: &[(&[u8; 2], &[u8])],
-    ) -> impl noodles::sam::alignment::Record {
+    fn make_record_with_str_tags(tags: &[(SamTag, &[u8])]) -> impl noodles::sam::alignment::Record {
         let mut b = SamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30u8; 4]);
         for (tag, value) in tags {
-            b.add_string_tag(tag, value);
+            b.add_string_tag(*tag, value);
         }
         let raw: RawRecord = b.build();
         raw_record_to_record_buf(&raw, &noodles::sam::Header::default()).expect("decode failed")
@@ -273,7 +271,7 @@ mod tests {
     #[test]
     fn test_is_simplex_consensus() {
         // Create a record with cD tag (simplex consensus)
-        let rec = make_record_with_int_tags(&[(b"cD", 10)]);
+        let rec = make_record_with_int_tags(&[(SamTag::CD, 10)]);
 
         assert!(is_simplex_consensus(&rec));
         assert!(!is_duplex_consensus(&rec));
@@ -283,7 +281,7 @@ mod tests {
     #[test]
     fn test_is_duplex_consensus() {
         // Create a record with aD and bD tags (duplex consensus)
-        let rec = make_record_with_int_tags(&[(b"aD", 10), (b"bD", 5)]);
+        let rec = make_record_with_int_tags(&[(SamTag::AD, 10), (SamTag::BD, 5)]);
 
         assert!(!is_simplex_consensus(&rec));
         assert!(is_duplex_consensus(&rec));
@@ -293,7 +291,7 @@ mod tests {
     #[test]
     fn test_is_not_consensus() {
         // Create a record without consensus tags (raw read)
-        let rec = make_record_with_str_tags(&[(b"RX", b"ACGT")]);
+        let rec = make_record_with_str_tags(&[(SamTag::RX, b"ACGT")]);
 
         assert!(!is_simplex_consensus(&rec));
         assert!(!is_duplex_consensus(&rec));
@@ -431,7 +429,7 @@ mod tests {
     #[test]
     fn test_is_consensus_with_all_tags() {
         // Record with cD, aD, and bD is duplex, not simplex
-        let rec = make_record_with_int_tags(&[(b"cD", 10), (b"aD", 5), (b"bD", 3)]);
+        let rec = make_record_with_int_tags(&[(SamTag::CD, 10), (SamTag::AD, 5), (SamTag::BD, 3)]);
 
         assert!(!is_simplex_consensus(&rec));
         assert!(is_duplex_consensus(&rec));
@@ -441,7 +439,7 @@ mod tests {
     #[test]
     fn test_is_not_duplex_with_only_one_strand() {
         // Record with only aD (no bD) is not duplex
-        let rec = make_record_with_int_tags(&[(b"aD", 5)]);
+        let rec = make_record_with_int_tags(&[(SamTag::AD, 5)]);
 
         assert!(!is_simplex_consensus(&rec));
         assert!(!is_duplex_consensus(&rec));

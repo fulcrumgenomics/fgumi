@@ -11,7 +11,7 @@ use noodles::sam::alignment::record::cigar::op::Kind;
 use crate::phred::{MIN_PHRED, NO_CALL_BASE};
 use fgumi_metrics::rejection::RejectionReason;
 use fgumi_raw_bam as bam_fields;
-use fgumi_raw_bam::{RawRecord, RawRecordView};
+use fgumi_raw_bam::{AsTagBytes, RawRecord, RawRecordView, SamTag};
 
 /// Expands a 1-3 element slice to a 3-element array, filling missing values from the last.
 ///
@@ -431,7 +431,7 @@ impl MethylationTags {
     }
 
     /// Looks up a 2-character tag in the aux data and returns its values as `Vec<u16>`.
-    fn find_tag(aux: &[u8], tag: fgumi_sam::SamTag) -> Option<Vec<u16>> {
+    fn find_tag(aux: &[u8], tag: SamTag) -> Option<Vec<u16>> {
         bam_fields::find_array_tag(aux, tag).map(|r| bam_fields::array_tag_to_vec_u16(&r))
     }
 }
@@ -441,8 +441,8 @@ impl MethylationTags {
 /// Checks for presence of `aD` or `bD` tags in the aux data.
 #[must_use]
 pub fn is_duplex_consensus(aux_data: &[u8]) -> bool {
-    bam_fields::find_tag_type(aux_data, b"aD").is_some()
-        || bam_fields::find_tag_type(aux_data, b"bD").is_some()
+    bam_fields::find_tag_type(aux_data, SamTag::AD).is_some()
+        || bam_fields::find_tag_type(aux_data, SamTag::BD).is_some()
 }
 
 /// Filters a raw consensus read based on per-read tags (cD depth, cE error rate).
@@ -452,7 +452,7 @@ pub fn is_duplex_consensus(aux_data: &[u8]) -> bool {
 /// Returns an error if the aux data cannot be parsed.
 pub fn filter_read(aux_data: &[u8], thresholds: &FilterThresholds) -> Result<FilterResult> {
     // Check minimum reads (cD tag — any integer type)
-    if let Some(depth) = bam_fields::find_int_tag(aux_data, b"cD") {
+    if let Some(depth) = bam_fields::find_int_tag(aux_data, SamTag::CD) {
         let min_reads = i64::try_from(thresholds.min_reads).unwrap_or(i64::MAX);
         if depth < min_reads {
             return Ok(FilterResult::InsufficientReads);
@@ -460,7 +460,7 @@ pub fn filter_read(aux_data: &[u8], thresholds: &FilterThresholds) -> Result<Fil
     }
 
     // Check maximum error rate (cE tag — Float)
-    if let Some(error_rate) = bam_fields::find_float_tag(aux_data, b"cE") {
+    if let Some(error_rate) = bam_fields::find_float_tag(aux_data, SamTag::CE) {
         if f64::from(error_rate) > thresholds.max_read_error_rate {
             return Ok(FilterResult::ExcessiveErrorRate);
         }
@@ -487,12 +487,12 @@ pub fn filter_duplex_read(
     }
 
     // Extract AB and BA depths and error rates
-    let ab_depth = bam_fields::find_int_tag(aux_data, b"aD")
-        .or_else(|| bam_fields::find_int_tag(aux_data, b"aM"));
-    let ba_depth = bam_fields::find_int_tag(aux_data, b"bD")
-        .or_else(|| bam_fields::find_int_tag(aux_data, b"bM"));
-    let ab_error = bam_fields::find_float_tag(aux_data, b"aE");
-    let ba_error = bam_fields::find_float_tag(aux_data, b"bE");
+    let ab_depth = bam_fields::find_int_tag(aux_data, SamTag::AD)
+        .or_else(|| bam_fields::find_int_tag(aux_data, SamTag::AM));
+    let ba_depth = bam_fields::find_int_tag(aux_data, SamTag::BD)
+        .or_else(|| bam_fields::find_int_tag(aux_data, SamTag::BM));
+    let ab_error = bam_fields::find_float_tag(aux_data, SamTag::AE);
+    let ba_error = bam_fields::find_float_tag(aux_data, SamTag::BE);
 
     // Pick the "best" and "worst" value per metric, independently. `best`/
     // `worst` are per-metric extremes across the two strands — NOT the
@@ -618,11 +618,11 @@ pub fn mean_base_quality(bam: &[u8]) -> f64 {
 /// Reads a tag value as either a Z-type string or a B-type `UInt8` array.
 ///
 /// Returns `Some(Vec<u8>)` if found as either type, `None` otherwise.
-fn find_string_or_uint8_array(aux_data: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    if let Some(s) = bam_fields::find_string_tag(aux_data, tag) {
+fn find_string_or_uint8_array(aux_data: &[u8], tag: impl AsTagBytes) -> Option<Vec<u8>> {
+    if let Some(s) = bam_fields::find_string_tag(aux_data, &tag) {
         Some(s.to_vec())
     } else {
-        let arr = bam_fields::find_array_tag(aux_data, tag)?;
+        let arr = bam_fields::find_array_tag(aux_data, &tag)?;
         if matches!(arr.elem_type, b'C' | b'c') {
             #[expect(
                 clippy::cast_possible_truncation,
@@ -659,9 +659,9 @@ pub fn mask_bases(
     let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
 
     // Pre-read per-base arrays into owned Vecs to release the immutable borrow on record
-    let cd_vals = bam_fields::find_array_tag(&record[aux_off..], b"cd")
+    let cd_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::CD_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
-    let ce_vals = bam_fields::find_array_tag(&record[aux_off..], b"ce")
+    let ce_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::CE_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
 
     let mut masked_count = 0;
@@ -714,24 +714,25 @@ pub fn mask_duplex_bases(
     let aux_off = bam_fields::aux_data_offset_from_record(record).unwrap_or(record.len());
 
     // Pre-read per-base arrays and strings into owned data to release the immutable borrow
-    let ad_vals = bam_fields::find_array_tag(&record[aux_off..], b"ad")
+    let ad_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::AD_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
-    let ae_vals = bam_fields::find_array_tag(&record[aux_off..], b"ae")
+    let ae_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::AE_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
-    let bd_vals = bam_fields::find_array_tag(&record[aux_off..], b"bd")
+    let bd_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::BD_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
-    let be_vals = bam_fields::find_array_tag(&record[aux_off..], b"be")
+    let be_vals = bam_fields::find_array_tag(&record[aux_off..], SamTag::BE_BASES)
         .map(|r| bam_fields::array_tag_to_vec_u16(&r));
 
     // For single-strand agreement checking, get ac/bc tags (copy to owned).
     // These may be Z-type strings or B-type UInt8 arrays.
+    // AC has no SAM-spec clash; BC does, hence BC_BASES for the per-base tag.
     let ac_owned: Option<Vec<u8>> = if require_ss_agreement {
-        find_string_or_uint8_array(&record[aux_off..], *b"ac")
+        find_string_or_uint8_array(&record[aux_off..], SamTag::AC)
     } else {
         None
     };
     let bc_owned: Option<Vec<u8>> = if require_ss_agreement {
-        find_string_or_uint8_array(&record[aux_off..], *b"bc")
+        find_string_or_uint8_array(&record[aux_off..], SamTag::BC_BASES)
     } else {
         None
     };
@@ -1448,7 +1449,7 @@ mod tests {
         aux.push(b'Z'); // type
         aux.extend_from_slice(b"ACGT\0"); // value + NUL
 
-        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        let result = super::find_string_or_uint8_array(&aux, SamTag::AC);
         assert_eq!(result, Some(b"ACGT".to_vec()));
     }
 
@@ -1462,14 +1463,14 @@ mod tests {
         aux.extend_from_slice(&4u32.to_le_bytes()); // count = 4
         aux.extend_from_slice(&[65u8, 67, 71, 84]); // A, C, G, T
 
-        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        let result = super::find_string_or_uint8_array(&aux, SamTag::AC);
         assert_eq!(result, Some(vec![65u8, 67, 71, 84]));
     }
 
     #[test]
     fn test_find_string_or_uint8_array_missing_tag() {
         let aux: Vec<u8> = Vec::new();
-        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        let result = super::find_string_or_uint8_array(&aux, SamTag::AC);
         assert!(result.is_none());
     }
 
@@ -1484,7 +1485,7 @@ mod tests {
         aux.extend_from_slice(&1i16.to_le_bytes());
         aux.extend_from_slice(&2i16.to_le_bytes());
 
-        let result = super::find_string_or_uint8_array(&aux, *b"ac");
+        let result = super::find_string_or_uint8_array(&aux, SamTag::AC);
         assert!(result.is_none());
     }
 
@@ -1526,7 +1527,7 @@ mod tests {
         let mut raw = {
             let mut b = RawSamBuilder::new();
             b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
-            b.add_array_i16(b"cu", &[5, 5, 5, 5]).add_array_i16(b"ct", &[3, 3, 3, 3]);
+            b.add_array_i16(SamTag::CU, &[5, 5, 5, 5]).add_array_i16(SamTag::CT, &[3, 3, 3, 3]);
             b.build()
         };
         let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
@@ -1542,7 +1543,7 @@ mod tests {
         let mut raw = {
             let mut b = RawSamBuilder::new();
             b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
-            b.add_array_i16(b"cu", &[5, 1, 0, 10]).add_array_i16(b"ct", &[3, 1, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[5, 1, 0, 10]).add_array_i16(SamTag::CT, &[3, 1, 0, 0]);
             b.build()
         };
         let masked = mask_methylation_depth_simplex_raw(&mut raw, 5).unwrap();
@@ -1568,12 +1569,12 @@ mod tests {
         let mut raw = {
             let mut b = RawSamBuilder::new();
             b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
-            b.add_array_i16(b"cu", &[10, 10, 10, 10])
-                .add_array_i16(b"ct", &[2, 2, 2, 2])
-                .add_array_i16(b"au", &[5, 5, 5, 5])
-                .add_array_i16(b"at", &[1, 1, 1, 1])
-                .add_array_i16(b"bu", &[5, 5, 5, 5])
-                .add_array_i16(b"bt", &[1, 1, 1, 1]);
+            b.add_array_i16(SamTag::CU, &[10, 10, 10, 10])
+                .add_array_i16(SamTag::CT, &[2, 2, 2, 2])
+                .add_array_i16(SamTag::AU, &[5, 5, 5, 5])
+                .add_array_i16(SamTag::AT, &[1, 1, 1, 1])
+                .add_array_i16(SamTag::BU, &[5, 5, 5, 5])
+                .add_array_i16(SamTag::BT, &[1, 1, 1, 1]);
             b.build()
         };
         let thresholds = MethylationDepthThresholds { duplex: 5, ab: 3, ba: 3 };
@@ -1587,12 +1588,12 @@ mod tests {
         let mut raw = {
             let mut b = RawSamBuilder::new();
             b.ref_id(0).pos(0).mapq(60).cigar_ops(&[4 << 4]).sequence(b"ACGT").qualities(&[30; 4]);
-            b.add_array_i16(b"cu", &[10, 10, 10, 10])
-                .add_array_i16(b"ct", &[2, 2, 2, 2])
-                .add_array_i16(b"au", &[5, 0, 5, 5])
-                .add_array_i16(b"at", &[1, 1, 1, 1])
-                .add_array_i16(b"bu", &[5, 5, 5, 5])
-                .add_array_i16(b"bt", &[1, 1, 1, 1]);
+            b.add_array_i16(SamTag::CU, &[10, 10, 10, 10])
+                .add_array_i16(SamTag::CT, &[2, 2, 2, 2])
+                .add_array_i16(SamTag::AU, &[5, 0, 5, 5])
+                .add_array_i16(SamTag::AT, &[1, 1, 1, 1])
+                .add_array_i16(SamTag::BU, &[5, 5, 5, 5])
+                .add_array_i16(SamTag::BT, &[1, 1, 1, 1]);
             b.build()
         };
         let thresholds = MethylationDepthThresholds { duplex: 5, ab: 3, ba: 3 };
@@ -1622,10 +1623,10 @@ mod tests {
                 .cigar_ops(&[11 << 4])
                 .sequence(b"AAAAACGAAAA")
                 .qualities(&[30; 11]);
-            b.add_array_i16(b"au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0])
-                .add_array_i16(b"at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
-                .add_array_i16(b"bu", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0])
-                .add_array_i16(b"bt", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+            b.add_array_i16(SamTag::AU, &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0])
+                .add_array_i16(SamTag::AT, &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+                .add_array_i16(SamTag::BU, &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0])
+                .add_array_i16(SamTag::BT, &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
             b.build()
         };
         let masked =
@@ -1653,10 +1654,10 @@ mod tests {
                 .cigar_ops(&[11 << 4])
                 .sequence(b"AAAAACGAAAA")
                 .qualities(&[30; 11]);
-            b.add_array_i16(b"au", &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0])
-                .add_array_i16(b"at", &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
-                .add_array_i16(b"bu", &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
-                .add_array_i16(b"bt", &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
+            b.add_array_i16(SamTag::AU, &[0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0])
+                .add_array_i16(SamTag::AT, &[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+                .add_array_i16(SamTag::BU, &[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+                .add_array_i16(SamTag::BT, &[0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0]);
             b.build()
         };
         let masked =
@@ -1681,10 +1682,10 @@ mod tests {
                 .cigar_ops(&[11 << 4])
                 .sequence(b"ACAGTGCATGA")
                 .qualities(&[30; 11]);
-            b.add_array_i16(b"au", &[0; 11])
-                .add_array_i16(b"at", &[0; 11])
-                .add_array_i16(b"bu", &[0; 11])
-                .add_array_i16(b"bt", &[0; 11]);
+            b.add_array_i16(SamTag::AU, &[0; 11])
+                .add_array_i16(SamTag::AT, &[0; 11])
+                .add_array_i16(SamTag::BU, &[0; 11])
+                .add_array_i16(SamTag::BT, &[0; 11]);
             b.build()
         };
         let masked =
@@ -1714,8 +1715,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"ACATACATA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 1, 0, 0, 0, 1, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
             b.build()
         };
         // 18 converted out of 20 = 90% conversion (positions 1 and 5)
@@ -1748,8 +1749,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"ACATACATA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
             b.build()
         };
         // 2 converted out of 20 = 10% conversion (positions 1 and 5)
@@ -1784,8 +1785,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"AAAACGAAA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 0, 0, 0, 10, 0, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 0, 0, 0, 10, 0, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 0, 0, 0, 0, 0, 0, 0, 0]);
             b.build()
         };
         assert!(
@@ -1876,8 +1877,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"ACATACATA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
             b.build()
         };
         // TAPs numerator = cu: 18 out of 20 = 90%
@@ -1910,8 +1911,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"ACATACATA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 1, 0, 0, 0, 1, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 1, 0, 0, 0, 1, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 9, 0, 0, 0, 9, 0, 0, 0]);
             b.build()
         };
         // TAPs numerator = cu: 2 out of 20 = 10%
@@ -1945,8 +1946,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"ACATACATA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
             b.build()
         };
         // EM-Seq should fail (10% < 80%), TAPs should pass (90% >= 80%)
@@ -1991,8 +1992,8 @@ mod tests {
                 .cigar_ops(&[9 << 4])
                 .sequence(b"ACATACATA")
                 .qualities(&[30; 9]);
-            b.add_array_i16(b"cu", &[0, 9, 0, 0, 0, 9, 0, 0, 0])
-                .add_array_i16(b"ct", &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
+            b.add_array_i16(SamTag::CU, &[0, 9, 0, 0, 0, 9, 0, 0, 0])
+                .add_array_i16(SamTag::CT, &[0, 1, 0, 0, 0, 1, 0, 0, 0]);
             b.build()
         };
         // Disabled mode should always pass regardless of data
