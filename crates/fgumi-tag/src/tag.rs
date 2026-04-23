@@ -213,6 +213,20 @@ impl SamTag {
     /// Per-base converted-cytosine count for the BA single-strand consensus (`bt`, `B,s`).
     pub const BT: SamTag = SamTag::new(b'b', b't');
 
+    /// Per-base methylation-modification string for the AB single-strand consensus (`am`, `Z`).
+    ///
+    /// Stores an MM-format annotation (e.g. `C+m,5,12,0;`) for the top strand.
+    /// Uses the `_BASES` suffix to disambiguate from per-read [`SamTag::AM`]
+    /// (bytes `aM`, min depth scalar), which shares the Rust identifier stem.
+    pub const AM_BASES: SamTag = SamTag::new(b'a', b'm');
+
+    /// Per-base methylation-modification string for the BA single-strand consensus (`bm`, `Z`).
+    ///
+    /// Stores an MM-format annotation (e.g. `G-m,...`) for the bottom strand.
+    /// Uses the `_BASES` suffix to disambiguate from per-read [`SamTag::BM`]
+    /// (bytes `bM`, min depth scalar), which shares the Rust identifier stem.
+    pub const BM_BASES: SamTag = SamTag::new(b'b', b'm');
+
     // ── Slice helpers ──────────────────────────────────────────────────────
 
     /// All per-read consensus tags (combined, AB strand, BA strand).
@@ -464,6 +478,15 @@ mod tests {
         assert_ne!(SamTag::BE, SamTag::BE_BASES);
         // BC_BASES collides with the SAM-spec sample-barcode BC tag.
         assert_ne!(SamTag::BC, SamTag::BC_BASES);
+    }
+
+    #[test]
+    fn test_per_base_methylation_annotation_constants() {
+        assert_eq!(*SamTag::AM_BASES, [b'a', b'm']);
+        assert_eq!(*SamTag::BM_BASES, [b'b', b'm']);
+        // These must NOT collide with the per-read AM/BM (which have uppercase M).
+        assert_ne!(SamTag::AM, SamTag::AM_BASES);
+        assert_ne!(SamTag::BM, SamTag::BM_BASES);
     }
 
     #[test]

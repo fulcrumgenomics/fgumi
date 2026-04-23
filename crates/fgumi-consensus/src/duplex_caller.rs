@@ -211,6 +211,7 @@ use crate::vanilla_caller::{
 };
 use crate::{ReadType, SourceRead};
 use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_sam::SamTag;
 
 /// Duplex consensus read - matches fgbio's `DuplexConsensusRead`
 ///
@@ -541,7 +542,7 @@ impl DuplexConsensusCaller {
         let mut has_b = false;
 
         for read in reads {
-            if let Some(mi_bytes) = RawRecordView::new(read).tags().find_string(b"MI") {
+            if let Some(mi_bytes) = RawRecordView::new(read).tags().find_string(SamTag::MI) {
                 match Self::extract_strand_from_mi_bytes(mi_bytes) {
                     Some('A') => {
                         has_a = true;
@@ -589,7 +590,8 @@ impl DuplexConsensusCaller {
         for record in records {
             // Extract strand info before moving the record (drop borrow before push)
             let is_a_strand = {
-                let Some(mi_bytes) = RawRecordView::new(&record).tags().find_string(b"MI") else {
+                let Some(mi_bytes) = RawRecordView::new(&record).tags().find_string(SamTag::MI)
+                else {
                     let read_name =
                         String::from_utf8_lossy(RawRecordView::new(&record).read_name());
                     bail!(
@@ -650,7 +652,7 @@ impl DuplexConsensusCaller {
             // fatal error: the input must be grouped with `fgumi group --strategy paired`.
             let mi = {
                 let view = RawRecordView::new(&read);
-                let Some(mi_bytes) = view.tags().find_string(b"MI") else {
+                let Some(mi_bytes) = view.tags().find_string(SamTag::MI) else {
                     let read_name = String::from_utf8_lossy(view.read_name());
                     bail!("Read '{read_name}' is missing MI tag");
                 };
@@ -1078,7 +1080,7 @@ impl DuplexConsensusCaller {
         builder.build_record(read_name.as_bytes(), flag, &consensus.bases, &consensus.quals);
 
         // 1. MI tag (string)
-        builder.append_string_tag(b"MI", umi.as_bytes());
+        builder.append_string_tag(SamTag::MI, umi.as_bytes());
 
         // 2. Cell barcode tag if present
         if let (Some(tag), Some(barcode)) = (cell_tag, cell_barcode) {
@@ -1087,7 +1089,7 @@ impl DuplexConsensusCaller {
         }
 
         // 3. RG tag (string)
-        builder.append_string_tag(b"RG", read_group_id.as_bytes());
+        builder.append_string_tag(SamTag::RG, read_group_id.as_bytes());
 
         // Calculate AB strand metrics
         let ab = &consensus.ab_consensus;
@@ -1101,23 +1103,23 @@ impl DuplexConsensusCaller {
             if ab_total_depth > 0 { ab_total_errors as f32 / ab_total_depth as f32 } else { 0.0 };
 
         // 4. AB strand tags: aD (int, max depth), aE (float, error rate), aM (int, min depth)
-        builder.append_int_tag(b"aD", ab_depth_max);
-        builder.append_float_tag(b"aE", ab_error_rate);
-        builder.append_int_tag(b"aM", ab_depth_min);
+        builder.append_int_tag(SamTag::AD, ab_depth_max);
+        builder.append_float_tag(SamTag::AE, ab_error_rate);
+        builder.append_int_tag(SamTag::AM, ab_depth_min);
 
         // 5. Per-base AB tags if requested
         if produce_per_base_tags {
-            builder.append_string_tag(b"ac", &ab.bases);
+            builder.append_string_tag(SamTag::AC, &ab.bases);
 
             let ab_depths_i16: Vec<i16> =
                 ab.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
-            builder.append_i16_array_tag(b"ad", &ab_depths_i16);
+            builder.append_i16_array_tag(SamTag::AD_BASES, &ab_depths_i16);
 
             let ab_errors_i16: Vec<i16> =
                 ab.errors.iter().map(|&e| i16::try_from(e).unwrap_or(i16::MAX)).collect();
-            builder.append_i16_array_tag(b"ae", &ab_errors_i16);
+            builder.append_i16_array_tag(SamTag::AE_BASES, &ab_errors_i16);
 
-            builder.append_phred33_string_tag(b"aq", &ab.quals);
+            builder.append_phred33_string_tag(SamTag::AQ, &ab.quals);
         }
 
         // Calculate BA strand metrics
@@ -1137,24 +1139,24 @@ impl DuplexConsensusCaller {
         };
 
         // 6. BA strand tags: bD (int), bE (float), bM (int)
-        builder.append_int_tag(b"bD", ba_depth_max);
-        builder.append_float_tag(b"bE", ba_error_rate);
-        builder.append_int_tag(b"bM", ba_depth_min);
+        builder.append_int_tag(SamTag::BD, ba_depth_max);
+        builder.append_float_tag(SamTag::BE, ba_error_rate);
+        builder.append_int_tag(SamTag::BM, ba_depth_min);
 
         // 7. Per-base BA tags if requested and BA strand exists
         if produce_per_base_tags {
             if let Some(ba) = ba_opt {
-                builder.append_string_tag(b"bc", &ba.bases);
+                builder.append_string_tag(SamTag::BC_BASES, &ba.bases);
 
                 let ba_depths_i16: Vec<i16> =
                     ba.depths.iter().map(|&d| i16::try_from(d).unwrap_or(i16::MAX)).collect();
-                builder.append_i16_array_tag(b"bd", &ba_depths_i16);
+                builder.append_i16_array_tag(SamTag::BD_BASES, &ba_depths_i16);
 
                 let ba_errors_i16: Vec<i16> =
                     ba.errors.iter().map(|&e| i16::try_from(e).unwrap_or(i16::MAX)).collect();
-                builder.append_i16_array_tag(b"be", &ba_errors_i16);
+                builder.append_i16_array_tag(SamTag::BE_BASES, &ba_errors_i16);
 
-                builder.append_phred33_string_tag(b"bq", &ba.quals);
+                builder.append_phred33_string_tag(SamTag::BQ, &ba.quals);
             }
         }
 
@@ -1175,15 +1177,15 @@ impl DuplexConsensusCaller {
         let duplex_error_rate =
             if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
 
-        builder.append_int_tag(b"cD", duplex_depth_max);
-        builder.append_float_tag(b"cE", duplex_error_rate);
-        builder.append_int_tag(b"cM", duplex_depth_min);
+        builder.append_int_tag(SamTag::CD, duplex_depth_max);
+        builder.append_float_tag(SamTag::CE, duplex_error_rate);
+        builder.append_int_tag(SamTag::CM, duplex_depth_min);
 
         // 9. Build RX consensus from source reads
         let mut all_umis = Vec::new();
 
         for raw in source_reads_a {
-            if let Some(rx_bytes) = raw.tags().find_string(b"RX") {
+            if let Some(rx_bytes) = raw.tags().find_string(SamTag::RX) {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
                 let is_first = raw.flags() & flags::FIRST_SEGMENT != 0;
                 if is_first == first_of_pair {
@@ -1196,7 +1198,7 @@ impl DuplexConsensusCaller {
         }
 
         for raw in source_reads_b {
-            if let Some(rx_bytes) = raw.tags().find_string(b"RX") {
+            if let Some(rx_bytes) = raw.tags().find_string(SamTag::RX) {
                 let rx = String::from_utf8_lossy(rx_bytes).to_string();
                 let is_first = raw.flags() & flags::FIRST_SEGMENT != 0;
                 if is_first == first_of_pair {
@@ -1210,7 +1212,7 @@ impl DuplexConsensusCaller {
 
         if !all_umis.is_empty() {
             let consensus_umi = consensus_umis(&all_umis);
-            builder.append_string_tag(b"RX", consensus_umi.as_bytes());
+            builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
         }
 
         // 9b. Methylation tags (EM-Seq/TAPs)
@@ -1222,8 +1224,11 @@ impl DuplexConsensusCaller {
             // Per-strand methylation tags
             if let Some(ab_annot) = &consensus.ab_consensus.methylation {
                 // Use correct strand tags: am/au/at for top strand, bm/bu/bt for bottom strand
-                let (mm_tag, u_tag, t_tag): (&[u8; 2], &[u8; 2], &[u8; 2]) =
-                    if is_top_strand { (b"am", b"au", b"at") } else { (b"bm", b"bu", b"bt") };
+                let (mm_tag, u_tag, t_tag): (SamTag, SamTag, SamTag) = if is_top_strand {
+                    (SamTag::AM_BASES, SamTag::AU, SamTag::AT)
+                } else {
+                    (SamTag::BM_BASES, SamTag::BU, SamTag::BT)
+                };
                 if let Some(mm_val) = crate::methylation::build_mm_tag_no_ml(
                     &consensus.ab_consensus.bases,
                     ab_annot,
@@ -1246,12 +1251,12 @@ impl DuplexConsensusCaller {
                         false,
                         methylation_mode,
                     ) {
-                        builder.append_string_tag(b"bm", bm.as_bytes());
+                        builder.append_string_tag(SamTag::BM_BASES, bm.as_bytes());
                     }
                     let bu = ba_annot.unconverted_counts();
                     let bt = ba_annot.converted_counts();
-                    builder.append_i16_array_tag(b"bu", &bu);
-                    builder.append_i16_array_tag(b"bt", &bt);
+                    builder.append_i16_array_tag(SamTag::BU, &bu);
+                    builder.append_i16_array_tag(SamTag::BT, &bt);
                 }
             }
 
@@ -1263,13 +1268,13 @@ impl DuplexConsensusCaller {
                 is_top_strand,
                 methylation_mode,
             ) {
-                builder.append_string_tag(b"MM", mm.as_bytes());
-                builder.append_u8_array_tag(b"ML", &ml);
+                builder.append_string_tag(SamTag::MM, mm.as_bytes());
+                builder.append_u8_array_tag(SamTag::ML, &ml);
             }
             let cu = combined_annot.unconverted_counts();
             let ct = combined_annot.converted_counts();
-            builder.append_i16_array_tag(b"cu", &cu);
-            builder.append_i16_array_tag(b"ct", &ct);
+            builder.append_i16_array_tag(SamTag::CU, &cu);
+            builder.append_i16_array_tag(SamTag::CT, &ct);
         }
 
         // 10. Write to output
@@ -2309,7 +2314,7 @@ mod tests {
     fn raw_with_mi(name: &[u8], mi: &[u8]) -> RawRecord {
         let mut b = SamBuilder::new();
         b.read_name(name).sequence(b"ACGT").qualities(&[30u8; 4]);
-        b.add_string_tag(b"MI", mi);
+        b.add_string_tag(SamTag::MI, mi);
         b.build()
     }
 
@@ -2477,9 +2482,9 @@ mod tests {
     ) -> RecordBuf {
         let mut b = SamBuilder::new();
         b.sequence(seq).qualities(qual);
-        b.add_int_tag(b"cD", depth_max);
-        b.add_int_tag(b"cM", depth_min);
-        b.add_float_tag(b"cE", error_rate);
+        b.add_int_tag(SamTag::CD, depth_max);
+        b.add_int_tag(SamTag::CM, depth_min);
+        b.add_float_tag(SamTag::CE, error_rate);
         let raw = b.build();
         fgumi_raw_bam::raw_record_to_record_buf(&raw, &noodles::sam::Header::default())
             .expect("raw_record_to_record_buf should succeed")
@@ -3185,7 +3190,7 @@ mod tests {
         qual: &[u8],
         cigar: &[u32],
         mi: &[u8],
-        extra_tags: &[(&[u8; 2], &[u8])],
+        extra_tags: &[(SamTag, &[u8])],
     ) -> RawRecord {
         b.clear();
         b.ref_id(0)
@@ -3198,8 +3203,8 @@ mod tests {
             .cigar_ops(cigar)
             .sequence(seq)
             .qualities(qual);
-        b.add_string_tag(b"MI", mi);
-        b.add_string_tag(b"RG", b"A");
+        b.add_string_tag(SamTag::MI, mi);
+        b.add_string_tag(SamTag::RG, b"A");
         for (tag, val) in extra_tags {
             b.add_string_tag(tag, val);
         }
@@ -3215,7 +3220,7 @@ mod tests {
         qual: &[u8],
         cigar: &[u32],
         mi: &[u8],
-        extra_tags: &[(&[u8; 2], &[u8])],
+        extra_tags: &[(SamTag, &[u8])],
     ) -> RawRecord {
         b.clear();
         b.ref_id(0)
@@ -3228,8 +3233,8 @@ mod tests {
             .cigar_ops(cigar)
             .sequence(seq)
             .qualities(qual);
-        b.add_string_tag(b"MI", mi);
-        b.add_string_tag(b"RG", b"A");
+        b.add_string_tag(SamTag::MI, mi);
+        b.add_string_tag(SamTag::RG, b"A");
         for (tag, val) in extra_tags {
             b.add_string_tag(tag, val);
         }
@@ -3245,7 +3250,7 @@ mod tests {
         qual: &[u8],
         cigar: &[u32],
         mi: &[u8],
-        extra_tags: &[(&[u8; 2], &[u8])],
+        extra_tags: &[(SamTag, &[u8])],
     ) -> RawRecord {
         b.clear();
         b.ref_id(0)
@@ -3258,8 +3263,8 @@ mod tests {
             .cigar_ops(cigar)
             .sequence(seq)
             .qualities(qual);
-        b.add_string_tag(b"MI", mi);
-        b.add_string_tag(b"RG", b"A");
+        b.add_string_tag(SamTag::MI, mi);
+        b.add_string_tag(SamTag::RG, b"A");
         for (tag, val) in extra_tags {
             b.add_string_tag(tag, val);
         }
@@ -3275,7 +3280,7 @@ mod tests {
         qual: &[u8],
         cigar: &[u32],
         mi: &[u8],
-        extra_tags: &[(&[u8; 2], &[u8])],
+        extra_tags: &[(SamTag, &[u8])],
     ) -> RawRecord {
         b.clear();
         b.ref_id(0)
@@ -3288,8 +3293,8 @@ mod tests {
             .cigar_ops(cigar)
             .sequence(seq)
             .qualities(qual);
-        b.add_string_tag(b"MI", mi);
-        b.add_string_tag(b"RG", b"A");
+        b.add_string_tag(SamTag::MI, mi);
+        b.add_string_tag(SamTag::RG, b"A");
         for (tag, val) in extra_tags {
             b.add_string_tag(tag, val);
         }
@@ -3328,7 +3333,7 @@ mod tests {
                 .cigar_ops(cigar_10m)
                 .sequence(b"AAAAAAAAAA")
                 .qualities(&[30u8; 10]);
-            b.add_string_tag(b"MI", b"foo/A");
+            b.add_string_tag(SamTag::MI, b"foo/A");
             b.build()
         };
         let frag_b = {
@@ -3341,7 +3346,7 @@ mod tests {
                 .cigar_ops(cigar_10m)
                 .sequence(b"AAAAAAAAAA")
                 .qualities(&[30u8; 10]);
-            b.add_string_tag(b"MI", b"foo/B");
+            b.add_string_tag(SamTag::MI, b"foo/B");
             b.build()
         };
 
@@ -3422,7 +3427,7 @@ mod tests {
         let cigar_10m = &[encode_op(0, 10)];
         let quals = &[20u8; 10];
         let mut b = SamBuilder::new();
-        let cb_extra: &[(&[u8; 2], &[u8])] = &[(b"CB", b"ACGT")];
+        let cb_extra: &[(SamTag, &[u8])] = &[(SamTag::CB, b"ACGT")];
 
         let reads = vec![
             ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", cb_extra),
@@ -3439,7 +3444,8 @@ mod tests {
         // Check that CB tag is preserved on consensus reads
         let records = ParsedBamRecord::parse_all(&result.data);
         for rec in &records {
-            let cb = rec.get_string_tag(b"CB").expect("CB tag should be present on consensus read");
+            let cb =
+                rec.get_string_tag(SamTag::CB).expect("CB tag should be present on consensus read");
             assert_eq!(cb, b"ACGT", "CB tag should be preserved");
         }
 
@@ -3468,8 +3474,8 @@ mod tests {
         let cigar_10m = &[encode_op(0, 10)];
         let quals = &[20u8; 10];
         let mut b = SamBuilder::new();
-        let rx_a: &[(&[u8; 2], &[u8])] = &[(b"RX", b"ACT-")];
-        let rx_b: &[(&[u8; 2], &[u8])] = &[(b"RX", b"-ACT")];
+        let rx_a: &[(SamTag, &[u8])] = &[(SamTag::RX, b"ACT-")];
+        let rx_b: &[(SamTag, &[u8])] = &[(SamTag::RX, b"-ACT")];
 
         let reads = vec![
             ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", rx_a),
@@ -3486,7 +3492,8 @@ mod tests {
         // Check RX tag is inherited from the A family (leftUmi pattern "ACT-")
         let records = ParsedBamRecord::parse_all(&result.data);
         for rec in &records {
-            let rx = rec.get_string_tag(b"RX").expect("RX tag should be present on consensus read");
+            let rx =
+                rec.get_string_tag(SamTag::RX).expect("RX tag should be present on consensus read");
             assert_eq!(rx, b"ACT-", "RX tag should be inherited from A family");
         }
 
@@ -3514,8 +3521,8 @@ mod tests {
         let cigar_10m = &[encode_op(0, 10)];
         let quals = &[20u8; 10];
         let mut b = SamBuilder::new();
-        let rx_a: &[(&[u8; 2], &[u8])] = &[(b"RX", b"-ACT")];
-        let rx_b: &[(&[u8; 2], &[u8])] = &[(b"RX", b"ACT-")];
+        let rx_a: &[(SamTag, &[u8])] = &[(SamTag::RX, b"-ACT")];
+        let rx_b: &[(SamTag, &[u8])] = &[(SamTag::RX, b"ACT-")];
 
         let reads = vec![
             ab_r1(&mut b, b"q1", b"AAAAAAAAAA", quals, cigar_10m, b"foo/A", rx_a),
@@ -3532,7 +3539,8 @@ mod tests {
         // Check RX tag is inherited from the A family (leftUmi pattern "-ACT")
         let records = ParsedBamRecord::parse_all(&result.data);
         for rec in &records {
-            let rx = rec.get_string_tag(b"RX").expect("RX tag should be present on consensus read");
+            let rx =
+                rec.get_string_tag(SamTag::RX).expect("RX tag should be present on consensus read");
             assert_eq!(rx, b"-ACT", "RX tag should be inherited from A family");
         }
 
@@ -3583,11 +3591,11 @@ mod tests {
         let records = ParsedBamRecord::parse_all(&result.data);
 
         for rec in &records {
-            let ab_depth = rec.get_int_tag(b"aD").expect("Missing aD tag");
+            let ab_depth = rec.get_int_tag(SamTag::AD).expect("Missing aD tag");
             assert_eq!(ab_depth, 3, "AB depth should be 3");
 
             // BA depth should be 0 or tag should not exist
-            if let Some(ba_depth) = rec.get_int_tag(b"bD") {
+            if let Some(ba_depth) = rec.get_int_tag(SamTag::BD) {
                 assert_eq!(ba_depth, 0, "BA depth should be 0");
             }
             // If tag doesn't exist, that's also correct for single-strand
@@ -3640,7 +3648,7 @@ mod tests {
 
         for rec in &records {
             // After swap, AB should have the depth
-            if let Some(ab_depth) = rec.get_int_tag(b"aD") {
+            if let Some(ab_depth) = rec.get_int_tag(SamTag::AD) {
                 assert_eq!(ab_depth, 3, "AB depth should be 3 after swap");
             }
         }
@@ -3973,8 +3981,8 @@ mod tests {
                 .cigar_ops(cigar)
                 .sequence(bases1)
                 .qualities(quals);
-            b.add_string_tag(b"RG", b"A");
-            b.add_string_tag(b"MI", b"test/B");
+            b.add_string_tag(SamTag::RG, b"A");
+            b.add_string_tag(SamTag::MI, b"test/B");
             out.push(b.build());
 
             // R2: reverse at pos 199, mate at pos 99
@@ -3989,8 +3997,8 @@ mod tests {
                 .cigar_ops(cigar)
                 .sequence(bases2)
                 .qualities(quals);
-            b.add_string_tag(b"RG", b"A");
-            b.add_string_tag(b"MI", b"test/B");
+            b.add_string_tag(SamTag::RG, b"A");
+            b.add_string_tag(SamTag::MI, b"test/B");
             out.push(b.build());
         }
 
@@ -4018,8 +4026,8 @@ mod tests {
             .cigar_ops(cigar_10m)
             .sequence(b"TTTTTTTTTT")
             .qualities(&quals);
-        b.add_string_tag(b"RG", b"A");
-        b.add_string_tag(b"MI", b"test/A");
+        b.add_string_tag(SamTag::RG, b"A");
+        b.add_string_tag(SamTag::MI, b"test/A");
         raw_records.push(b.build());
 
         b.clear();
@@ -4033,8 +4041,8 @@ mod tests {
             .cigar_ops(cigar_10m)
             .sequence(b"AAAAAAAAAA")
             .qualities(&quals);
-        b.add_string_tag(b"RG", b"A");
-        b.add_string_tag(b"MI", b"test/A");
+        b.add_string_tag(SamTag::RG, b"A");
+        b.add_string_tag(SamTag::MI, b"test/A");
         raw_records.push(b.build());
 
         // Create a duplex consensus caller with minimum thresholds
@@ -4067,7 +4075,7 @@ mod tests {
             .expect("Should have R1 consensus");
 
         // Get the bc tag (BA simplex consensus)
-        let bc_bases = r1.get_string_tag(b"bc").expect("Should have bc tag");
+        let bc_bases = r1.get_string_tag(SamTag::BC_BASES).expect("Should have bc tag");
 
         // Check base at position 5
         // With 4 'A' and 4 'C', this appears to be a tie. However, the order of
@@ -4407,7 +4415,7 @@ mod tests {
                 let mut b = SamBuilder::new();
                 b.sequence(b"ACGT")
                     .flags(flags::PAIRED | flags::FIRST_SEGMENT)
-                    .add_string_tag(b"MI", b"test/A");
+                    .add_string_tag(SamTag::MI, b"test/A");
                 b.build()
             })
             .collect();
@@ -4418,7 +4426,7 @@ mod tests {
                 let mut b = SamBuilder::new();
                 b.sequence(b"ACGT")
                     .flags(flags::PAIRED | flags::FIRST_SEGMENT)
-                    .add_string_tag(b"MI", b"test/B");
+                    .add_string_tag(SamTag::MI, b"test/B");
                 b.build()
             })
             .collect();
@@ -4446,7 +4454,7 @@ mod tests {
                 let mut b = SamBuilder::new();
                 b.sequence(b"ACGT")
                     .flags(flags::PAIRED | flags::FIRST_SEGMENT)
-                    .add_string_tag(b"MI", b"test/A");
+                    .add_string_tag(SamTag::MI, b"test/A");
                 b.build()
             })
             .collect();
@@ -4456,7 +4464,7 @@ mod tests {
             let mut b = SamBuilder::new();
             b.sequence(b"ACGT")
                 .flags(flags::PAIRED | flags::FIRST_SEGMENT)
-                .add_string_tag(b"MI", b"test/B");
+                .add_string_tag(SamTag::MI, b"test/B");
             vec![b.build()]
         };
 
@@ -4636,7 +4644,7 @@ mod tests {
         // Check cell barcode tag is present
         let records = ParsedBamRecord::parse_all(&output.data);
         assert_eq!(records.len(), 1);
-        let cb = records[0].get_string_tag(b"CB").expect("CB tag should be present");
+        let cb = records[0].get_string_tag(SamTag::CB).expect("CB tag should be present");
         assert_eq!(String::from_utf8(cb).expect("from_utf8 should succeed"), cell_barcode);
     }
 
@@ -4687,7 +4695,7 @@ mod tests {
         // Check CB tag is not present
         let records = ParsedBamRecord::parse_all(&output.data);
         assert_eq!(records.len(), 1);
-        assert!(records[0].get_string_tag(b"CB").is_none());
+        assert!(records[0].get_string_tag(SamTag::CB).is_none());
     }
 
     #[test]
@@ -4820,15 +4828,15 @@ mod tests {
         let rec = &records[0];
 
         // Check BA tags are set to zero
-        assert_eq!(rec.get_int_tag(b"bD"), Some(0));
-        assert_eq!(rec.get_int_tag(b"bM"), Some(0));
+        assert_eq!(rec.get_int_tag(SamTag::BD), Some(0));
+        assert_eq!(rec.get_int_tag(SamTag::BM), Some(0));
 
-        let be_val = rec.get_float_tag(b"bE").expect("bE tag should be present");
+        let be_val = rec.get_float_tag(SamTag::BE).expect("bE tag should be present");
         assert!((be_val - 0.0).abs() < 0.001);
 
         // Verify AB tags are set correctly
-        assert_eq!(rec.get_int_tag(b"aD"), Some(5)); // max depth from AB
-        assert_eq!(rec.get_int_tag(b"aM"), Some(5)); // min depth from AB
+        assert_eq!(rec.get_int_tag(SamTag::AD), Some(5)); // max depth from AB
+        assert_eq!(rec.get_int_tag(SamTag::AM), Some(5)); // min depth from AB
     }
 
     #[test]
@@ -4921,14 +4929,14 @@ mod tests {
         let rec = &records[0];
 
         // Check per-base AB tags
-        assert!(rec.get_i16_array_tag(b"ad").is_some(), "ad tag should be present");
-        assert!(rec.get_i16_array_tag(b"ae").is_some(), "ae tag should be present");
-        assert!(rec.get_string_tag(b"ac").is_some(), "ac tag should be present");
+        assert!(rec.get_i16_array_tag(SamTag::AD_BASES).is_some(), "ad tag should be present");
+        assert!(rec.get_i16_array_tag(SamTag::AE_BASES).is_some(), "ae tag should be present");
+        assert!(rec.get_string_tag(SamTag::AC).is_some(), "ac tag should be present");
 
         // Check per-base BA tags
-        assert!(rec.get_i16_array_tag(b"bd").is_some(), "bd tag should be present");
-        assert!(rec.get_i16_array_tag(b"be").is_some(), "be tag should be present");
-        assert!(rec.get_string_tag(b"bc").is_some(), "bc tag should be present");
+        assert!(rec.get_i16_array_tag(SamTag::BD_BASES).is_some(), "bd tag should be present");
+        assert!(rec.get_i16_array_tag(SamTag::BE_BASES).is_some(), "be tag should be present");
+        assert!(rec.get_string_tag(SamTag::BC_BASES).is_some(), "bc tag should be present");
     }
 
     #[test]
@@ -5426,7 +5434,7 @@ mod tests {
             b.read_name(b"r1")
                 .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .add_string_tag(b"MI", b"UMI1/A");
+                .add_string_tag(SamTag::MI, b"UMI1/A");
             b.build()
         };
         let a2 = {
@@ -5434,7 +5442,7 @@ mod tests {
             b.read_name(b"r2")
                 .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .add_string_tag(b"MI", b"UMI1/A");
+                .add_string_tag(SamTag::MI, b"UMI1/A");
             b.build()
         };
         let b1 = {
@@ -5442,7 +5450,7 @@ mod tests {
             b.read_name(b"r3")
                 .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .add_string_tag(b"MI", b"UMI1/B");
+                .add_string_tag(SamTag::MI, b"UMI1/B");
             b.build()
         };
 
@@ -5471,7 +5479,10 @@ mod tests {
     fn test_partition_records_by_strand_missing_suffix() {
         let rec = {
             let mut b = SamBuilder::new();
-            b.read_name(b"r1").sequence(b"ACGT").qualities(&[30; 4]).add_string_tag(b"MI", b"UMI1"); // No /A or /B suffix
+            b.read_name(b"r1")
+                .sequence(b"ACGT")
+                .qualities(&[30; 4])
+                .add_string_tag(SamTag::MI, b"UMI1"); // No /A or /B suffix
             b.build()
         };
 
@@ -5486,7 +5497,7 @@ mod tests {
             b.read_name(b"r1")
                 .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .add_string_tag(b"MI", b"UMI1/A");
+                .add_string_tag(SamTag::MI, b"UMI1/A");
             b.build()
         };
 
@@ -5811,16 +5822,16 @@ mod tests {
         let rec = &records[0];
 
         // Combined MM tag (C+m format, tracks C bases in duplex: pos 0 and 3)
-        let mm = rec.get_string_tag(b"MM").expect("Should have MM tag");
+        let mm = rec.get_string_tag(SamTag::MM).expect("Should have MM tag");
         assert!(mm.starts_with(b"C+m"), "MM should start with C+m");
 
         // ML tag: probabilities for 2 ref-C positions (0 and 3)
-        let ml = rec.get_u8_array_tag(b"ML").expect("Should have ML tag");
+        let ml = rec.get_u8_array_tag(SamTag::ML).expect("Should have ML tag");
         assert_eq!(ml.len(), 2);
 
         // Combined cu/ct tags (length = 4)
-        let cu = rec.get_i16_array_tag(b"cu").expect("Should have cu tag");
-        let ct = rec.get_i16_array_tag(b"ct").expect("Should have ct tag");
+        let cu = rec.get_i16_array_tag(SamTag::CU).expect("Should have cu tag");
+        let ct = rec.get_i16_array_tag(SamTag::CT).expect("Should have ct tag");
         assert_eq!(cu.len(), 4);
         assert_eq!(ct.len(), 4);
         // Pos 0: AB(5,0) + BA(0,0) = (5, 0)
@@ -5837,23 +5848,23 @@ mod tests {
         assert_eq!(ct[3], 4);
 
         // Per-strand AB tags
-        let au = rec.get_i16_array_tag(b"au").expect("Should have au tag");
-        let at_tag = rec.get_i16_array_tag(b"at").expect("Should have at tag");
+        let au = rec.get_i16_array_tag(SamTag::AU).expect("Should have au tag");
+        let at_tag = rec.get_i16_array_tag(SamTag::AT).expect("Should have at tag");
         assert_eq!(au[0], 5); // pos 0 unconverted
         assert_eq!(at_tag[0], 0); // pos 0 converted
 
         // Per-strand BA tags
-        let bu = rec.get_i16_array_tag(b"bu").expect("Should have bu tag");
-        let bt = rec.get_i16_array_tag(b"bt").expect("Should have bt tag");
+        let bu = rec.get_i16_array_tag(SamTag::BU).expect("Should have bu tag");
+        let bt = rec.get_i16_array_tag(SamTag::BT).expect("Should have bt tag");
         assert_eq!(bu[1], 3); // pos 1 unconverted (ref-G for bottom strand)
         assert_eq!(bt[1], 0);
 
         // am tag (C+m format for AB top strand)
-        let am = rec.get_string_tag(b"am").expect("Should have am tag");
+        let am = rec.get_string_tag(SamTag::AM_BASES).expect("Should have am tag");
         assert!(am.starts_with(b"C+m"), "am should start with C+m");
 
         // bm tag (G-m format for BA bottom strand, minus = opposite strand per SAM spec)
-        let bm = rec.get_string_tag(b"bm").expect("Should have bm tag");
+        let bm = rec.get_string_tag(SamTag::BM_BASES).expect("Should have bm tag");
         assert!(bm.starts_with(b"G-m"), "bm should start with G-m");
     }
 
@@ -5916,8 +5927,8 @@ mod tests {
                         .cigar_ops(cigar_10m)
                         .sequence(b"GGGGGGGGGG")
                         .qualities(quals);
-                    b.add_string_tag(b"MI", b"foo/B");
-                    b.add_string_tag(b"RG", b"A");
+                    b.add_string_tag(SamTag::MI, b"foo/B");
+                    b.add_string_tag(SamTag::RG, b"A");
                     b.build()
                 };
                 let ba_r2 = {
@@ -5931,8 +5942,8 @@ mod tests {
                         .cigar_ops(cigar_10m)
                         .sequence(b"CCCCCCCCCC")
                         .qualities(quals);
-                    b.add_string_tag(b"MI", b"foo/B");
-                    b.add_string_tag(b"RG", b"A");
+                    b.add_string_tag(SamTag::MI, b"foo/B");
+                    b.add_string_tag(SamTag::RG, b"A");
                     b.build()
                 };
                 vec![ba_r1, ba_r2]
@@ -5949,19 +5960,19 @@ mod tests {
         // au/at because it incorrectly sets is_ba_only=false.
         for rec in &records {
             assert!(
-                rec.get_i16_array_tag(b"bu").is_some(),
+                rec.get_i16_array_tag(SamTag::BU).is_some(),
                 "BA-only consensus must have bu tag (bottom-strand unconverted counts)"
             );
             assert!(
-                rec.get_i16_array_tag(b"bt").is_some(),
+                rec.get_i16_array_tag(SamTag::BT).is_some(),
                 "BA-only consensus must have bt tag (bottom-strand converted counts)"
             );
             assert!(
-                rec.get_i16_array_tag(b"au").is_none(),
+                rec.get_i16_array_tag(SamTag::AU).is_none(),
                 "BA-only consensus must NOT have au tag (no top-strand data)"
             );
             assert!(
-                rec.get_i16_array_tag(b"at").is_none(),
+                rec.get_i16_array_tag(SamTag::AT).is_none(),
                 "BA-only consensus must NOT have at tag (no top-strand data)"
             );
         }
@@ -6011,8 +6022,8 @@ mod tests {
                         .cigar_ops(cigar_10m)
                         .sequence(b"GGGGGGGGGG")
                         .qualities(quals);
-                    b.add_string_tag(b"MI", b"foo/B");
-                    b.add_string_tag(b"RG", b"A");
+                    b.add_string_tag(SamTag::MI, b"foo/B");
+                    b.add_string_tag(SamTag::RG, b"A");
                     b.build()
                 };
                 let ba_r2 = {
@@ -6026,8 +6037,8 @@ mod tests {
                         .cigar_ops(cigar_10m)
                         .sequence(b"AAAAAAAAAA")
                         .qualities(quals);
-                    b.add_string_tag(b"MI", b"foo/B");
-                    b.add_string_tag(b"RG", b"A");
+                    b.add_string_tag(SamTag::MI, b"foo/B");
+                    b.add_string_tag(SamTag::RG, b"A");
                     b.build()
                 };
                 vec![ba_r1, ba_r2]
