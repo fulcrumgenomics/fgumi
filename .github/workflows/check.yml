@@ -96,3 +96,35 @@ jobs:
           tool: cargo-audit
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit
+
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Package every workspace crate (dry-run)
+        # Validates manifest health for every publishable crate: declared
+        # dependency versions on path deps, include = [...] paths, features
+        # referring to real deps/features, no-publish flags, etc. Uses
+        # --no-verify because cargo's workspace dry-run with --verify hits
+        # an internal "no hash listed" error (cargo 1.93) when a later
+        # crate transitively depends on an earlier crate's freshly packaged
+        # tarball. Real-CI publish doesn't hit this -- each predecessor
+        # resolves from crates.io with a real hash before the next verify.
+        run: cargo publish --workspace --dry-run --allow-dirty --no-verify
+      - name: Simulate publish-verify for crates with default-off optional deps
+        # `cargo publish --verify` compiles the packaged tarball with DEFAULT
+        # features only. For crates whose default feature set does NOT enable
+        # every optional dependency, that build path is not exercised by the
+        # regular workspace build (other crates often enable the optional
+        # feature transitively), so "optional dep used unconditionally" bugs
+        # can ship unnoticed and break publish mid-release.
+        #
+        # Add a crate to this list whenever it gains a default-off optional
+        # dep. Current members:
+        #   - fgumi-raw-bam: default = [], `noodles`/`anyhow` behind feature
+        run: cargo check -p fgumi-raw-bam --no-default-features --all-targets
