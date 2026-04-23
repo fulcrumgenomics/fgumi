@@ -1,3 +1,5 @@
+use fgumi_tag::AsTagBytes;
+
 use crate::fields::{
     RawRecordMut, RawRecordView, TAG_FIXED_SIZES, aux_data_offset_from_record, aux_data_slice,
     tag_value_size,
@@ -33,7 +35,8 @@ fn find_tag_position(aux_data: &[u8], tag: [u8; 2]) -> Option<(usize, u8)> {
 
 /// Find a string (Z-type) tag in auxiliary data, returning value bytes without null terminator.
 #[must_use]
-pub fn find_string_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<&'a [u8]> {
+pub fn find_string_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<&[u8]> {
+    let tag = tag.as_tag_bytes();
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     if val_type != b'Z' {
         return None;
@@ -48,13 +51,15 @@ pub fn find_string_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<&'a [u8]
 /// Returns `Some(type_byte)` (e.g. `b'Z'`, `b'C'`, `b'i'`) if the tag is present,
 /// `None` if the tag is absent.
 #[must_use]
-pub fn find_tag_type(aux_data: &[u8], tag: &[u8; 2]) -> Option<u8> {
+pub fn find_tag_type(aux_data: &[u8], tag: impl AsTagBytes) -> Option<u8> {
+    let tag = tag.as_tag_bytes();
     find_tag_position(aux_data, *tag).map(|(_, val_type)| val_type)
 }
 
 /// Find a string tag in a complete BAM record.
 #[must_use]
-pub fn find_string_tag_in_record<'a>(bam: &'a [u8], tag: &[u8; 2]) -> Option<&'a [u8]> {
+pub fn find_string_tag_in_record(bam: &[u8], tag: impl AsTagBytes) -> Option<&[u8]> {
+    let tag = tag.as_tag_bytes();
     let aux = aux_data_slice(bam);
     if aux.is_empty() {
         return None;
@@ -67,8 +72,8 @@ pub fn find_string_tag_in_record<'a>(bam: &'a [u8], tag: &[u8; 2]) -> Option<&'a
 /// Returns offsets relative to the start of `aux_data`.
 /// Returns `None` if the tag is not found.
 #[must_use]
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn find_tag_bounds(aux_data: &[u8], tag: &[u8; 2]) -> Option<(usize, usize)> {
+pub(crate) fn find_tag_bounds(aux_data: &[u8], tag: impl AsTagBytes) -> Option<(usize, usize)> {
+    let tag = tag.as_tag_bytes();
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     let size = tag_value_size(val_type, &aux_data[p + 3..])?;
     Some((p, p + 3 + size))
@@ -76,14 +81,16 @@ pub(crate) fn find_tag_bounds(aux_data: &[u8], tag: &[u8; 2]) -> Option<(usize, 
 
 /// Find a uint8 (C-type) tag value in auxiliary data.
 #[must_use]
-pub fn find_uint8_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<u8> {
+pub fn find_uint8_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<u8> {
+    let tag = tag.as_tag_bytes();
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     if val_type == b'C' && p + 4 <= aux_data.len() { Some(aux_data[p + 3]) } else { None }
 }
 
 /// Find a float (f-type) tag value in auxiliary data.
 #[must_use]
-pub fn find_float_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<f32> {
+pub fn find_float_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<f32> {
+    let tag = tag.as_tag_bytes();
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     if val_type == b'f' && p + 7 <= aux_data.len() {
         Some(f32::from_le_bytes([
@@ -101,7 +108,8 @@ pub fn find_float_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<f32> {
 ///
 /// Supports signed/unsigned byte, short, and int types (c/C/s/S/i/I).
 #[must_use]
-pub fn find_int_tag(aux_data: &[u8], tag: &[u8; 2]) -> Option<i64> {
+pub fn find_int_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<i64> {
+    let tag = tag.as_tag_bytes();
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     extract_int_value(aux_data, p, val_type)
 }
@@ -220,7 +228,8 @@ pub struct AuxStringTags<'a> {
 
 /// Extract RG, cell barcode, and MC tags in a single pass over the aux data.
 #[must_use]
-pub fn extract_aux_string_tags<'a>(aux_data: &'a [u8], cell_tag: &[u8; 2]) -> AuxStringTags<'a> {
+pub fn extract_aux_string_tags(aux_data: &[u8], cell_tag: impl AsTagBytes) -> AuxStringTags<'_> {
+    let cell_tag = cell_tag.as_tag_bytes();
     let mut result = AuxStringTags { rg: None, cell: None, mc: None };
     let mut found = 0u8; // bit 0=RG, bit 1=cell, bit 2=MC
     let mut p = 0;
@@ -379,7 +388,8 @@ pub struct ArrayTagRef<'a> {
 ///
 /// Returns `None` if the tag is absent or is not of type `B`.
 #[must_use]
-pub fn find_array_tag<'a>(aux_data: &'a [u8], tag: &[u8; 2]) -> Option<ArrayTagRef<'a>> {
+pub fn find_array_tag(aux_data: &[u8], tag: impl AsTagBytes) -> Option<ArrayTagRef<'_>> {
+    let tag = tag.as_tag_bytes();
     let (p, val_type) = find_tag_position(aux_data, *tag)?;
     if val_type != b'B' {
         return None;
@@ -492,8 +502,8 @@ pub fn array_tag_to_vec_u16(tag_ref: &ArrayTagRef) -> Vec<u16> {
 /// Append a string (Z-type) tag to a BAM record.
 ///
 /// The tag is appended at the end of the record: `[tag_byte_1, tag_byte_2, 'Z', value..., NUL]`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8]) {
+pub(crate) fn append_string_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: &[u8]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'Z');
@@ -512,8 +522,8 @@ pub(crate) fn append_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: &[u8
 /// - `i16` (type `'s'`): if value in `[-32768, -129]`
 /// - `u16` (type `'S'`): if value in `[256, 65535]`
 /// - `i32` (type `'i'`): otherwise
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+pub(crate) fn append_int_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: i32) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     if let Ok(v) = i8::try_from(value) {
@@ -535,8 +545,8 @@ pub(crate) fn append_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
 }
 
 /// Append a float (`f`-type) tag to a BAM record.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_float_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: f32) {
+pub(crate) fn append_float_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: f32) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'f');
@@ -550,8 +560,8 @@ pub(crate) fn append_float_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: f32) 
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i16]) {
+pub(crate) fn append_i16_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[i16]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -571,8 +581,8 @@ pub(crate) fn append_i16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: 
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u8]) {
+pub(crate) fn append_u8_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[u8]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -590,8 +600,8 @@ pub(crate) fn append_u8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_i8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i8]) {
+pub(crate) fn append_i8_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[i8]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -611,8 +621,8 @@ pub(crate) fn append_i8_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_u32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u32]) {
+pub(crate) fn append_u32_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[u32]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -629,8 +639,8 @@ pub(crate) fn append_u32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: 
 ///
 /// Converts raw Phred scores (0-93) to ASCII (Phred+33) and writes
 /// directly as a null-terminated string tag. Avoids intermediate String allocation.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_phred33_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], quals: &[u8]) {
+pub(crate) fn append_phred33_string_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, quals: &[u8]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'Z');
@@ -642,7 +652,8 @@ pub(crate) fn append_phred33_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], qua
 }
 
 /// Remove a tag from a BAM record. No-op if the tag is not found.
-pub fn remove_tag(record: &mut Vec<u8>, tag: &[u8; 2]) {
+pub fn remove_tag(record: &mut Vec<u8>, tag: impl AsTagBytes) {
+    let tag = tag.as_tag_bytes();
     let Some(aux_start) = aux_data_offset_from_record(record) else {
         return;
     };
@@ -664,7 +675,8 @@ pub fn remove_tag(record: &mut Vec<u8>, tag: &[u8; 2]) {
 /// **Note:** `find_tag_bounds` is type-agnostic, so if the tag exists with a
 /// non-Z type (e.g., integer), this will replace it with a Z-type string tag.
 /// This is intentional for MI/OX tags which should always be strings.
-pub fn update_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], new_value: &[u8]) {
+pub fn update_string_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, new_value: &[u8]) {
+    let tag = tag.as_tag_bytes();
     let aux_start = aux_data_offset_from_record(record).unwrap_or(record.len());
     if aux_start < record.len() {
         if let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag) {
@@ -697,7 +709,8 @@ pub fn update_string_tag(record: &mut Vec<u8>, tag: &[u8; 2], new_value: &[u8]) 
 /// If the existing tag is a 4-byte `i`/`I` type, the value is overwritten in-place.
 /// Otherwise the tag is removed and re-appended using `append_int_tag`
 /// (smallest type that fits).
-pub fn update_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+pub fn update_int_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: i32) {
+    let tag = tag.as_tag_bytes();
     let aux_start = aux_data_offset_from_record(record).unwrap_or(record.len());
     if aux_start < record.len() {
         if let Some((start, end)) = find_tag_bounds(&record[aux_start..], tag) {
@@ -720,7 +733,8 @@ pub fn update_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
 }
 
 /// Reverse elements of a B-type array tag in place. No-op if tag not found.
-pub fn reverse_array_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
+pub fn reverse_array_tag_in_place(record: &mut [u8], aux_offset: usize, tag: impl AsTagBytes) {
+    let tag = tag.as_tag_bytes();
     if aux_offset >= record.len() {
         return;
     }
@@ -773,14 +787,20 @@ fn find_string_tag_range(record: &[u8], aux_offset: usize, tag: [u8; 2]) -> Opti
 }
 
 /// Reverse bytes of a Z-type string tag value in place. No-op if tag not found.
-pub fn reverse_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
+pub fn reverse_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: impl AsTagBytes) {
+    let tag = tag.as_tag_bytes();
     if let Some((start, end)) = find_string_tag_range(record, aux_offset, *tag) {
         record[start..end].reverse();
     }
 }
 
 /// Reverse-complement a Z-type string tag value in place (A<->T, C<->G).
-pub fn reverse_complement_string_tag_in_place(record: &mut [u8], aux_offset: usize, tag: &[u8; 2]) {
+pub fn reverse_complement_string_tag_in_place(
+    record: &mut [u8],
+    aux_offset: usize,
+    tag: impl AsTagBytes,
+) {
+    let tag = tag.as_tag_bytes();
     if let Some((start, end)) = find_string_tag_range(record, aux_offset, *tag) {
         record[start..end].reverse();
         for b in &mut record[start..end] {
@@ -802,7 +822,8 @@ pub fn reverse_complement_string_tag_in_place(record: &mut [u8], aux_offset: usi
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-pub fn append_i32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i32]) {
+pub fn append_i32_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[i32]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -822,8 +843,8 @@ pub fn append_i32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[i32])
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_u16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[u16]) {
+pub(crate) fn append_u16_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[u16]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -843,8 +864,8 @@ pub(crate) fn append_u16_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: 
 /// # Panics
 ///
 /// Panics if `values.len()` exceeds `u32::MAX`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn append_f32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: &[f32]) {
+pub(crate) fn append_f32_array_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, values: &[f32]) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     record.push(b'B');
@@ -862,7 +883,8 @@ pub(crate) fn append_f32_array_tag(record: &mut Vec<u8>, tag: &[u8; 2], values: 
 /// If the tag exists and is an integer type, it is re-encoded using
 /// [`append_signed_int_tag`] semantics (signed types only: i8 → i16 → i32).
 /// No-op if the tag is not found or is not an integer type.
-pub fn normalize_int_tag_to_smallest_signed(record: &mut Vec<u8>, tag: &[u8; 2]) {
+pub fn normalize_int_tag_to_smallest_signed(record: &mut Vec<u8>, tag: impl AsTagBytes) {
+    let tag = tag.as_tag_bytes();
     let Some(aux_start) = aux_data_offset_from_record(record) else {
         return;
     };
@@ -887,7 +909,8 @@ pub fn normalize_int_tag_to_smallest_signed(record: &mut Vec<u8>, tag: &[u8; 2])
 /// Unlike [`append_int_tag`] (which prefers unsigned types), this uses only
 /// signed types: `i8` (type `'c'`) -> `i16` (type `'s'`) -> `i32` (type `'i'`).
 /// This matches fgbio's `to_smallest_signed_int` encoding.
-pub fn append_signed_int_tag(record: &mut Vec<u8>, tag: &[u8; 2], value: i32) {
+pub fn append_signed_int_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: i32) {
+    let tag = tag.as_tag_bytes();
     record.push(tag[0]);
     record.push(tag[1]);
     if let Ok(v) = i8::try_from(value) {
@@ -974,7 +997,7 @@ impl<'a> RawTagsView<'a> {
     /// Returns `true` if the named tag is present in the aux section.
     #[inline]
     #[must_use]
-    pub fn contains(&self, tag: &[u8; 2]) -> bool {
+    pub fn contains(&self, tag: impl AsTagBytes) -> bool {
         find_tag_type(self.0, tag).is_some()
     }
 
@@ -983,7 +1006,7 @@ impl<'a> RawTagsView<'a> {
     /// Returns `None` if the tag is absent or is not `Z`-typed.
     #[inline]
     #[must_use]
-    pub fn find_string(&self, tag: &[u8; 2]) -> Option<&'a [u8]> {
+    pub fn find_string(&self, tag: impl AsTagBytes) -> Option<&'a [u8]> {
         find_string_tag(self.0, tag)
     }
 
@@ -992,7 +1015,7 @@ impl<'a> RawTagsView<'a> {
     /// Returns `None` if the tag is absent or is not an integer type.
     #[inline]
     #[must_use]
-    pub fn find_int(&self, tag: &[u8; 2]) -> Option<i64> {
+    pub fn find_int(&self, tag: impl AsTagBytes) -> Option<i64> {
         find_int_tag(self.0, tag)
     }
 
@@ -1001,7 +1024,7 @@ impl<'a> RawTagsView<'a> {
     /// Returns `None` if the tag is absent or is not `C`-typed.
     #[inline]
     #[must_use]
-    pub fn find_uint8(&self, tag: &[u8; 2]) -> Option<u8> {
+    pub fn find_uint8(&self, tag: impl AsTagBytes) -> Option<u8> {
         find_uint8_tag(self.0, tag)
     }
 
@@ -1010,7 +1033,7 @@ impl<'a> RawTagsView<'a> {
     /// Returns `None` if the tag is absent or is not `f`-typed.
     #[inline]
     #[must_use]
-    pub fn find_float(&self, tag: &[u8; 2]) -> Option<f32> {
+    pub fn find_float(&self, tag: impl AsTagBytes) -> Option<f32> {
         find_float_tag(self.0, tag)
     }
 
@@ -1019,7 +1042,7 @@ impl<'a> RawTagsView<'a> {
     /// Returns `None` if the tag is absent or is not `B`-typed.
     #[inline]
     #[must_use]
-    pub fn find_array(&self, tag: &[u8; 2]) -> Option<ArrayTagRef<'a>> {
+    pub fn find_array(&self, tag: impl AsTagBytes) -> Option<ArrayTagRef<'a>> {
         find_array_tag(self.0, tag)
     }
 
@@ -1047,7 +1070,8 @@ impl<'a> RawTagsView<'a> {
     /// Integer types are widened to `i64`. Returns `None` if the tag is absent or malformed.
     #[inline]
     #[must_use]
-    pub fn get(&self, tag: &[u8; 2]) -> Option<TagValue<'a>> {
+    pub fn get(&self, tag: impl AsTagBytes) -> Option<TagValue<'a>> {
+        let tag = tag.as_tag_bytes();
         let (p, val_type) = find_tag_position(self.0, *tag)?;
         let start = p + 3;
         let aux = self.0;
@@ -1182,7 +1206,7 @@ impl<'a> RawTagsView<'a> {
     /// Single-pass extraction of (RG, cell, MC) string tags from this aux section.
     #[inline]
     #[must_use]
-    pub fn extract_string_batch(&self, cell_tag: &[u8; 2]) -> AuxStringTags<'a> {
+    pub fn extract_string_batch(&self, cell_tag: impl AsTagBytes) -> AuxStringTags<'a> {
         extract_aux_string_tags(self.0, cell_tag)
     }
 }
@@ -1228,40 +1252,68 @@ impl<'a> RawTagsMut<'a> {
     ///
     /// No-op on tag absence, type mismatch (must be `B` with sub-type `C`), or out-of-range index.
     #[inline]
-    pub fn set_array_element_u8(&mut self, tag: &[u8; 2], index: usize, value: u8) {
-        Self::set_array_element_le(self.0, *tag, b'C', 1, index, &[value]);
+    pub fn set_array_element_u8(&mut self, tag: impl AsTagBytes, index: usize, value: u8) {
+        Self::set_array_element_le(self.0, *tag.as_tag_bytes(), b'C', 1, index, &[value]);
     }
 
     /// Overwrite a single u16 element of a B:S array tag in place.
     ///
     /// No-op on tag absence, type mismatch (must be `B` with sub-type `S`), or out-of-range index.
     #[inline]
-    pub fn set_array_element_u16(&mut self, tag: &[u8; 2], index: usize, value: u16) {
-        Self::set_array_element_le(self.0, *tag, b'S', 2, index, &value.to_le_bytes());
+    pub fn set_array_element_u16(&mut self, tag: impl AsTagBytes, index: usize, value: u16) {
+        Self::set_array_element_le(
+            self.0,
+            *tag.as_tag_bytes(),
+            b'S',
+            2,
+            index,
+            &value.to_le_bytes(),
+        );
     }
 
     /// Overwrite a single i16 element of a B:s array tag in place.
     ///
     /// No-op on tag absence, type mismatch (must be `B` with sub-type `s`), or out-of-range index.
     #[inline]
-    pub fn set_array_element_i16(&mut self, tag: &[u8; 2], index: usize, value: i16) {
-        Self::set_array_element_le(self.0, *tag, b's', 2, index, &value.to_le_bytes());
+    pub fn set_array_element_i16(&mut self, tag: impl AsTagBytes, index: usize, value: i16) {
+        Self::set_array_element_le(
+            self.0,
+            *tag.as_tag_bytes(),
+            b's',
+            2,
+            index,
+            &value.to_le_bytes(),
+        );
     }
 
     /// Overwrite a single i32 element of a B:i array tag in place.
     ///
     /// No-op on tag absence, type mismatch (must be `B` with sub-type `i`), or out-of-range index.
     #[inline]
-    pub fn set_array_element_i32(&mut self, tag: &[u8; 2], index: usize, value: i32) {
-        Self::set_array_element_le(self.0, *tag, b'i', 4, index, &value.to_le_bytes());
+    pub fn set_array_element_i32(&mut self, tag: impl AsTagBytes, index: usize, value: i32) {
+        Self::set_array_element_le(
+            self.0,
+            *tag.as_tag_bytes(),
+            b'i',
+            4,
+            index,
+            &value.to_le_bytes(),
+        );
     }
 
     /// Overwrite a single f32 element of a B:f array tag in place.
     ///
     /// No-op on tag absence, type mismatch (must be `B` with sub-type `f`), or out-of-range index.
     #[inline]
-    pub fn set_array_element_f32(&mut self, tag: &[u8; 2], index: usize, value: f32) {
-        Self::set_array_element_le(self.0, *tag, b'f', 4, index, &value.to_le_bytes());
+    pub fn set_array_element_f32(&mut self, tag: impl AsTagBytes, index: usize, value: f32) {
+        Self::set_array_element_le(
+            self.0,
+            *tag.as_tag_bytes(),
+            b'f',
+            4,
+            index,
+            &value.to_le_bytes(),
+        );
     }
 
     /// Internal helper: locate a B-type array of the expected sub-type and overwrite
@@ -1297,26 +1349,27 @@ impl<'a> RawTagsMut<'a> {
 
     /// Reverse element bytes of a B-type array tag in place.
     #[inline]
-    pub fn reverse_array(&mut self, tag: &[u8; 2]) {
+    pub fn reverse_array(&mut self, tag: impl AsTagBytes) {
         reverse_array_tag_in_place(self.0, 0, tag);
     }
 
     /// Reverse the bytes of a Z-type string tag value in place.
     #[inline]
-    pub fn reverse_string(&mut self, tag: &[u8; 2]) {
+    pub fn reverse_string(&mut self, tag: impl AsTagBytes) {
         reverse_string_tag_in_place(self.0, 0, tag);
     }
 
     /// Reverse-complement a Z-type string tag value (A<->T, C<->G).
     #[inline]
-    pub fn reverse_complement_string(&mut self, tag: &[u8; 2]) {
+    pub fn reverse_complement_string(&mut self, tag: impl AsTagBytes) {
         reverse_complement_string_tag_in_place(self.0, 0, tag);
     }
 
     /// Overwrite an existing Z-type tag if the new value matches its current length.
     ///
     /// Returns `false` (no-op) if absent, wrong type, or different length.
-    pub fn set_string_in_place(&mut self, tag: &[u8; 2], value: &[u8]) -> bool {
+    pub fn set_string_in_place(&mut self, tag: impl AsTagBytes, value: &[u8]) -> bool {
+        let tag = tag.as_tag_bytes();
         let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
             return false;
         };
@@ -1337,7 +1390,8 @@ impl<'a> RawTagsMut<'a> {
     /// Overwrite an existing integer tag if the new value fits its current type byte.
     ///
     /// Returns `false` if absent or value doesn't fit the existing type.
-    pub fn set_int_in_place(&mut self, tag: &[u8; 2], value: i64) -> bool {
+    pub fn set_int_in_place(&mut self, tag: impl AsTagBytes, value: i64) -> bool {
+        let tag = tag.as_tag_bytes();
         let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
             return false;
         };
@@ -1410,7 +1464,8 @@ impl<'a> RawTagsMut<'a> {
     ///
     /// Returns `false` if absent, wrong type, or the payload is truncated.
     #[inline]
-    pub fn set_float_in_place(&mut self, tag: &[u8; 2], value: f32) -> bool {
+    pub fn set_float_in_place(&mut self, tag: impl AsTagBytes, value: f32) -> bool {
+        let tag = tag.as_tag_bytes();
         let Some((p, val_type)) = find_tag_position(self.0, *tag) else {
             return false;
         };
@@ -1480,25 +1535,25 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Append a string (Z-type) tag to the record.
     #[inline]
-    pub fn append_string(&mut self, tag: &[u8; 2], value: &[u8]) {
+    pub fn append_string(&mut self, tag: impl AsTagBytes, value: &[u8]) {
         append_string_tag(self.record, tag, value);
     }
 
     /// Append an integer tag, choosing the smallest fitting unsigned/signed type.
     #[inline]
-    pub fn append_int(&mut self, tag: &[u8; 2], value: i32) {
+    pub fn append_int(&mut self, tag: impl AsTagBytes, value: i32) {
         append_int_tag(self.record, tag, value);
     }
 
     /// Append a signed integer tag, choosing the smallest fitting signed type.
     #[inline]
-    pub fn append_signed_int(&mut self, tag: &[u8; 2], value: i32) {
+    pub fn append_signed_int(&mut self, tag: impl AsTagBytes, value: i32) {
         append_signed_int_tag(self.record, tag, value);
     }
 
     /// Append a float (`f`-type) tag to the record.
     #[inline]
-    pub fn append_float(&mut self, tag: &[u8; 2], value: f32) {
+    pub fn append_float(&mut self, tag: impl AsTagBytes, value: f32) {
         append_float_tag(self.record, tag, value);
     }
 
@@ -1506,37 +1561,37 @@ impl<'a> RawTagsEditor<'a> {
     ///
     /// Converts raw Phred scores (0–93) to ASCII (Phred+33) and writes as a Z-type tag.
     #[inline]
-    pub fn append_phred33_string(&mut self, tag: &[u8; 2], quals: &[u8]) {
+    pub fn append_phred33_string(&mut self, tag: impl AsTagBytes, quals: &[u8]) {
         append_phred33_string_tag(self.record, tag, quals);
     }
 
     /// Append a `B:C` (u8 array) tag to the record.
     #[inline]
-    pub fn append_array_u8(&mut self, tag: &[u8; 2], values: &[u8]) {
+    pub fn append_array_u8(&mut self, tag: impl AsTagBytes, values: &[u8]) {
         append_u8_array_tag(self.record, tag, values);
     }
 
     /// Append a `B:s` (i16 array) tag to the record.
     #[inline]
-    pub fn append_array_i16(&mut self, tag: &[u8; 2], values: &[i16]) {
+    pub fn append_array_i16(&mut self, tag: impl AsTagBytes, values: &[i16]) {
         append_i16_array_tag(self.record, tag, values);
     }
 
     /// Append a `B:i` (i32 array) tag to the record.
     #[inline]
-    pub fn append_array_i32(&mut self, tag: &[u8; 2], values: &[i32]) {
+    pub fn append_array_i32(&mut self, tag: impl AsTagBytes, values: &[i32]) {
         append_i32_array_tag(self.record, tag, values);
     }
 
     /// Append a `B:c` (i8 array) tag to the record.
     #[inline]
-    pub fn append_array_i8(&mut self, tag: &[u8; 2], values: &[i8]) {
+    pub fn append_array_i8(&mut self, tag: impl AsTagBytes, values: &[i8]) {
         append_i8_array_tag(self.record, tag, values);
     }
 
     /// Append a `B:I` (u32 array) tag to the record.
     #[inline]
-    pub fn append_array_u32(&mut self, tag: &[u8; 2], values: &[u32]) {
+    pub fn append_array_u32(&mut self, tag: impl AsTagBytes, values: &[u32]) {
         append_u32_array_tag(self.record, tag, values);
     }
 
@@ -1544,19 +1599,20 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing integer tag in place, or append it if absent.
     #[inline]
-    pub fn update_int(&mut self, tag: &[u8; 2], value: i32) {
+    pub fn update_int(&mut self, tag: impl AsTagBytes, value: i32) {
         update_int_tag(self.record, tag, value);
     }
 
     /// Update an existing string tag in place, or append it if absent.
     #[inline]
-    pub fn update_string(&mut self, tag: &[u8; 2], value: &[u8]) {
+    pub fn update_string(&mut self, tag: impl AsTagBytes, value: &[u8]) {
         update_string_tag(self.record, tag, value);
     }
 
     /// Update an existing `f`-type tag in place, or remove + append if the existing tag has a
     /// different type or is absent.
-    pub fn update_float(&mut self, tag: &[u8; 2], value: f32) {
+    pub fn update_float(&mut self, tag: impl AsTagBytes, value: f32) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1573,7 +1629,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:C` (u8 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_u8(&mut self, tag: &[u8; 2], values: &[u8]) {
+    pub fn update_array_u8(&mut self, tag: impl AsTagBytes, values: &[u8]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1599,7 +1656,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:S` (u16 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_u16(&mut self, tag: &[u8; 2], values: &[u16]) {
+    pub fn update_array_u16(&mut self, tag: impl AsTagBytes, values: &[u16]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1628,7 +1686,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:s` (i16 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_i16(&mut self, tag: &[u8; 2], values: &[i16]) {
+    pub fn update_array_i16(&mut self, tag: impl AsTagBytes, values: &[i16]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1657,7 +1716,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:i` (i32 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_i32(&mut self, tag: &[u8; 2], values: &[i32]) {
+    pub fn update_array_i32(&mut self, tag: impl AsTagBytes, values: &[i32]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1686,7 +1746,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:c` (i8 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_i8(&mut self, tag: &[u8; 2], values: &[i8]) {
+    pub fn update_array_i8(&mut self, tag: impl AsTagBytes, values: &[i8]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1714,7 +1775,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:I` (u32 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_u32(&mut self, tag: &[u8; 2], values: &[u32]) {
+    pub fn update_array_u32(&mut self, tag: impl AsTagBytes, values: &[u32]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1743,7 +1805,8 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Update an existing `B:f` (f32 array) tag in place if the length matches, else remove and
     /// append.
-    pub fn update_array_f32(&mut self, tag: &[u8; 2], values: &[f32]) {
+    pub fn update_array_f32(&mut self, tag: impl AsTagBytes, values: &[f32]) {
+        let tag = tag.as_tag_bytes();
         let off = self.aux_offset.min(self.record.len());
         if let Some((p, val_type)) = find_tag_position(&self.record[off..], *tag) {
             let abs = off + p;
@@ -1772,7 +1835,7 @@ impl<'a> RawTagsEditor<'a> {
 
     /// Remove a tag from the record. No-op if the tag is not found.
     #[inline]
-    pub fn remove(&mut self, tag: &[u8; 2]) {
+    pub fn remove(&mut self, tag: impl AsTagBytes) {
         remove_tag(self.record, tag);
     }
 
@@ -1780,7 +1843,7 @@ impl<'a> RawTagsEditor<'a> {
     ///
     /// No-op if the tag is not found or is not an integer type.
     #[inline]
-    pub fn normalize_int_to_smallest_signed(&mut self, tag: &[u8; 2]) {
+    pub fn normalize_int_to_smallest_signed(&mut self, tag: impl AsTagBytes) {
         normalize_int_tag_to_smallest_signed(self.record, tag);
     }
 
@@ -3272,14 +3335,14 @@ mod tests {
         let pa_tag_bytes: [u8; 2] = *b"pa";
 
         // This is the exact check from dedup.rs:932-934
-        let found_by_dedup = find_string_tag(&aux, &pa_tag_bytes).is_some()
-            || find_int_tag(&aux, &pa_tag_bytes).is_some();
+        let found_by_dedup = find_string_tag(&aux, pa_tag_bytes).is_some()
+            || find_int_tag(&aux, pa_tag_bytes).is_some();
 
         // BUG: dedup thinks the pa tag is missing even though it's present
         assert!(!found_by_dedup, "dedup check should fail to find B:i pa tag");
 
         // But find_tag_type correctly finds it
-        assert!(find_tag_type(&aux, &pa_tag_bytes).is_some());
+        assert!(find_tag_type(&aux, pa_tag_bytes).is_some());
     }
 
     // ========================================================================
@@ -4015,5 +4078,23 @@ mod tests {
             TagValue::Float(f) => assert_eq!(f.to_bits(), 1.5f32.to_bits()),
             other => panic!("expected TagValue::Float(1.5), got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // AsTagBytes smoke test — SamTag and &[u8; 2] both accepted
+    // ========================================================================
+
+    #[test]
+    fn test_find_string_tag_accepts_sam_tag() {
+        use fgumi_tag::SamTag;
+        // Build a tiny aux block: RX:Z:ACGT\0
+        let mut aux = Vec::new();
+        aux.extend_from_slice(b"RXZACGT\0");
+        // Accept SamTag.
+        let v = find_string_tag(&aux, SamTag::RX);
+        assert_eq!(v, Some(b"ACGT".as_ref()));
+        // And still accept &[u8; 2] for backward compat.
+        let v2 = find_string_tag(&aux, b"RX");
+        assert_eq!(v2, Some(b"ACGT".as_ref()));
     }
 }

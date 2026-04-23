@@ -2298,39 +2298,39 @@ fn raw_clip_update_array_tag(
     match elem_type {
         b'c' => {
             let vals: Vec<i8> = raw_bytes.iter().map(|&b| b.cast_signed()).collect();
-            editor.update_array_i8(&tag, &vals);
+            editor.update_array_i8(tag, &vals);
         }
-        b'C' => editor.update_array_u8(&tag, raw_bytes),
+        b'C' => editor.update_array_u8(tag, raw_bytes),
         b's' => {
             let vals: Vec<i16> =
                 raw_bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-            editor.update_array_i16(&tag, &vals);
+            editor.update_array_i16(tag, &vals);
         }
         b'S' => {
             let vals: Vec<u16> =
                 raw_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            editor.update_array_u16(&tag, &vals);
+            editor.update_array_u16(tag, &vals);
         }
         b'i' => {
             let vals: Vec<i32> = raw_bytes
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            editor.update_array_i32(&tag, &vals);
+            editor.update_array_i32(tag, &vals);
         }
         b'I' => {
             let vals: Vec<u32> = raw_bytes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            editor.update_array_u32(&tag, &vals);
+            editor.update_array_u32(tag, &vals);
         }
         b'f' => {
             let vals: Vec<f32> = raw_bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            editor.update_array_f32(&tag, &vals);
+            editor.update_array_f32(tag, &vals);
         }
         _ => {} // Unknown BAM array subtype — leave untouched
     }

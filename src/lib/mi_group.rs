@@ -203,7 +203,7 @@ impl MiGrouper {
     /// When `cell_tag` is set, returns a composite key of `"MI\tCELL"`.
     fn get_mi_tag(&self, bam: &[u8]) -> Option<String> {
         use crate::sort::bam_fields;
-        let value = bam_fields::find_string_tag_in_record(bam, &self.tag)?;
+        let value = bam_fields::find_string_tag_in_record(bam, self.tag)?;
         let mut key = if let Some(ref transform) = self.mi_transform {
             transform(value)
         } else {
@@ -390,7 +390,7 @@ where
     /// Otherwise returns just the MI tag value.
     fn get_mi(&self, bam: &[u8]) -> Option<String> {
         use crate::sort::bam_fields;
-        let value = bam_fields::find_string_tag_in_record(bam, &self.tag)?;
+        let value = bam_fields::find_string_tag_in_record(bam, self.tag)?;
         let mut key = if let Some(ref transform) = self.mi_transform {
             transform(value)
         } else {

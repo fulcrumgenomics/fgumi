@@ -527,10 +527,10 @@ struct MiExtractResult {
 /// yields `None`, matching the "missing MI" treatment used by the caller.
 fn get_mi_tag_raw(raw: &RawRecord) -> Option<MiKey> {
     let aux = raw_fields::aux_data_slice(raw.as_ref());
-    if let Some(v) = find_int_tag(aux, &SamTag::MI) {
+    if let Some(v) = find_int_tag(aux, SamTag::MI) {
         return Some(MiKey::Int(v));
     }
-    let bytes = find_string_tag(aux, &SamTag::MI)?;
+    let bytes = find_string_tag(aux, SamTag::MI)?;
     let s = std::str::from_utf8(bytes).ok()?;
     if let Some((base_str, strand_str)) = s.rsplit_once('/') {
         let base = base_str.parse::<i64>().ok()?;

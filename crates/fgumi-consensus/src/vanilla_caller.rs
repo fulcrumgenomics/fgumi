@@ -1420,7 +1420,7 @@ impl VanillaUmiConsensusCaller {
         if let Some(cell_tag) = self.options.cell_tag {
             if let Some(first_raw) = original_raws.first() {
                 let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
-                if let Some(value) = RawRecordView::new(first_raw).tags().find_string(&tag_bytes) {
+                if let Some(value) = RawRecordView::new(first_raw).tags().find_string(tag_bytes) {
                     self.bam_builder.append_string_tag(&tag_bytes, value);
                 }
             }
@@ -1490,7 +1490,7 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         let read_name = String::from_utf8_lossy(read_name_bytes);
 
         let tag_value =
-            RawRecordView::new(first_raw.as_ref()).tags().find_string(&tag_key).ok_or_else(
+            RawRecordView::new(first_raw.as_ref()).tags().find_string(tag_key).ok_or_else(
                 || anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name),
             )?;
 

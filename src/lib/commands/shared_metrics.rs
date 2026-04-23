@@ -607,7 +607,7 @@ where
 /// points at `read_name` when the tag is absent or not UTF-8.
 fn required_z_tag(record: &RawRecord, tag: [u8; 2], read_name: &str) -> Result<String> {
     let tag_name = std::str::from_utf8(&tag).unwrap_or("??");
-    let bytes = find_string_tag_in_record(record.as_ref(), &tag).ok_or_else(|| {
+    let bytes = find_string_tag_in_record(record.as_ref(), tag).ok_or_else(|| {
         anyhow::anyhow!(
             "Read '{read_name}' is missing the required {tag_name} tag. \
              Metrics commands require standard MI/RX tags."

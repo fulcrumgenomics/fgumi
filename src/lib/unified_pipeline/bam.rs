@@ -445,7 +445,7 @@ pub fn compute_group_key_from_raw(
     // Single-pass aux tag extraction (RG, cell barcode, MC)
     let aux_data = bam_fields::aux_data_slice(raw);
     let cell_tag_bytes = cell_tag.map_or([0u8; 2], |t| [t.as_ref()[0], t.as_ref()[1]]);
-    let aux_tags = bam_fields::extract_aux_string_tags(aux_data, &cell_tag_bytes);
+    let aux_tags = bam_fields::extract_aux_string_tags(aux_data, cell_tag_bytes);
 
     let library_idx = if let Some(rg) = aux_tags.rg {
         let rg_hash = LibraryIndex::hash_rg(rg);

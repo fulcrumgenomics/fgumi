@@ -643,7 +643,7 @@ impl Review {
                 // Check if this read has a non-reference base at the variant position
                 if self.has_non_reference_base(&record, variant)? {
                     // Extract MI tag
-                    if let Some(mi_bytes) = find_string_tag_in_record(&record, &SamTag::MI) {
+                    if let Some(mi_bytes) = find_string_tag_in_record(&record, SamTag::MI) {
                         let mi = std::str::from_utf8(mi_bytes)?;
                         let mi_base = extract_mi_base(mi).to_string();
                         mi_set.insert(mi_base);
@@ -706,7 +706,7 @@ impl Review {
             progress.log_if_needed(1);
 
             // Extract MI tag directly from raw bytes; no RecordBuf decode needed.
-            if let Some(mi_bytes) = find_string_tag_in_record(&raw_rec, &SamTag::MI) {
+            if let Some(mi_bytes) = find_string_tag_in_record(&raw_rec, SamTag::MI) {
                 let mi = std::str::from_utf8(mi_bytes)?;
                 let mi_base = extract_mi_base(mi);
 
@@ -807,7 +807,7 @@ impl Review {
                 let read_qual = self.get_quality_at_position(&record, variant.pos)?.unwrap_or(0);
 
                 // Extract MI tag from raw bytes
-                let mi_str = match find_string_tag_in_record(&record, &SamTag::MI) {
+                let mi_str = match find_string_tag_in_record(&record, SamTag::MI) {
                     Some(mi_bytes) => std::str::from_utf8(mi_bytes)?.to_string(),
                     None => continue,
                 };
@@ -837,7 +837,7 @@ impl Review {
                         let rec = result?;
 
                         // Extract MI tag from raw bytes
-                        let grp_mi_str = match find_string_tag_in_record(&rec, &SamTag::MI) {
+                        let grp_mi_str = match find_string_tag_in_record(&rec, SamTag::MI) {
                             Some(mi_bytes) => std::str::from_utf8(mi_bytes)?.to_string(),
                             None => continue,
                         };

@@ -432,7 +432,7 @@ impl MethylationTags {
 
     /// Looks up a 2-character tag in the aux data and returns its values as `Vec<u16>`.
     fn find_tag(aux: &[u8], tag: fgumi_sam::SamTag) -> Option<Vec<u16>> {
-        bam_fields::find_array_tag(aux, &tag).map(|r| bam_fields::array_tag_to_vec_u16(&r))
+        bam_fields::find_array_tag(aux, tag).map(|r| bam_fields::array_tag_to_vec_u16(&r))
     }
 }
 
@@ -619,10 +619,10 @@ pub fn mean_base_quality(bam: &[u8]) -> f64 {
 ///
 /// Returns `Some(Vec<u8>)` if found as either type, `None` otherwise.
 fn find_string_or_uint8_array(aux_data: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    if let Some(s) = bam_fields::find_string_tag(aux_data, &tag) {
+    if let Some(s) = bam_fields::find_string_tag(aux_data, tag) {
         Some(s.to_vec())
     } else {
-        let arr = bam_fields::find_array_tag(aux_data, &tag)?;
+        let arr = bam_fields::find_array_tag(aux_data, tag)?;
         if matches!(arr.elem_type, b'C' | b'c') {
             #[expect(
                 clippy::cast_possible_truncation,

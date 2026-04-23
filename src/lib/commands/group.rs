@@ -442,11 +442,11 @@ fn assign_umi_groups_for_indices_impl(
 
             let umi_bytes = if let Some(r1_raw) = template.r1() {
                 let aux = bam_fields::aux_data_slice(r1_raw);
-                bam_fields::find_string_tag(aux, &raw_tag)
+                bam_fields::find_string_tag(aux, raw_tag)
                     .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else if let Some(r2_raw) = template.r2() {
                 let aux = bam_fields::aux_data_slice(r2_raw);
-                bam_fields::find_string_tag(aux, &raw_tag)
+                bam_fields::find_string_tag(aux, raw_tag)
                     .ok_or_else(|| anyhow::anyhow!("Missing UMI tag"))?
             } else {
                 bail!("Template has no reads");
@@ -1629,7 +1629,7 @@ fn emit_templates_raw_with_mi(
             if has_mi {
                 scratch.clear();
                 scratch.extend_from_slice(raw);
-                bam_fields::update_string_tag(scratch, &assign_tag_bytes, mi_buf.as_bytes());
+                bam_fields::update_string_tag(scratch, assign_tag_bytes, mi_buf.as_bytes());
                 let block_size = scratch.len() as u32;
                 emit(&block_size.to_le_bytes())?;
                 emit(scratch)?;

@@ -384,7 +384,7 @@ pub fn merge_raw(
         for tag_str in &tag_info.remove {
             if tag_str.len() == 2 {
                 let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
-                bam_fields::remove_tag(record.as_mut_vec(), &tag_bytes);
+                bam_fields::remove_tag(record.as_mut_vec(), tag_bytes);
             }
         }
     }
@@ -431,7 +431,7 @@ pub fn merge_raw(
                     continue;
                 }
                 let aux = bam_fields::aux_data_slice(&rr[i]);
-                let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
+                let has_pg = bam_fields::find_tag_type(aux, pg_tag).is_some();
 
                 for entry in &u_tags {
                     if entry.tag == pg_tag && has_pg {
@@ -442,7 +442,7 @@ pub fn merge_raw(
                     if tag_info.remove.contains(tag_str) {
                         continue;
                     }
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), &entry.tag);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
                 }
             }
@@ -456,7 +456,7 @@ pub fn merge_raw(
                     continue;
                 }
                 let aux = bam_fields::aux_data_slice(&rr[i]);
-                let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
+                let has_pg = bam_fields::find_tag_type(aux, pg_tag).is_some();
 
                 // Aux offset is safe to cache here: `remove_tag` and `append_raw_tag_entry`
                 // only modify bytes within/after the aux region, so this offset stays valid.
@@ -472,7 +472,7 @@ pub fn merge_raw(
                         continue;
                     }
 
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), &entry.tag);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
 
                     if has_transforms && tag_info.reverse.contains(tag_str) {
@@ -547,10 +547,10 @@ fn reverse_tag_in_place_raw_by_type(
 ) {
     match type_byte {
         b'Z' => {
-            bam_fields::reverse_string_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_string_tag_in_place(record, aux_offset, tag);
         }
         b'B' => {
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, tag);
         }
         _ => {}
     }
@@ -570,13 +570,13 @@ fn revcomp_tag_in_place_raw_by_type(
 ) {
     match type_byte {
         b'Z' => {
-            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, tag);
         }
         b'B' => {
             // For array tags, revcomp is the same as reverse (no base complement for
             // numeric arrays; arrays that hold base-encoded ints are rare and numeric
             // reversal matches the existing BufValue::Array branch behavior).
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, tag);
         }
         _ => {}
     }
@@ -3689,8 +3689,8 @@ mod tests {
 
     /// Helper: check that a tag is absent in a `RawRecord`'s aux data.
     fn raw_tag_absent(rec: &RawRecord, tag: [u8; 2]) -> bool {
-        fgumi_raw_bam::find_string_tag_in_record(rec.as_ref(), &tag).is_none()
-            && fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), &tag)
+        fgumi_raw_bam::find_string_tag_in_record(rec.as_ref(), tag).is_none()
+            && fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), tag)
                 .is_none()
     }
 

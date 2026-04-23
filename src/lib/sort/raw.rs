@@ -299,7 +299,7 @@ impl LibraryLookup {
     pub fn get_ordinal(&self, bam: &[u8]) -> u32 {
         fgumi_raw_bam::RawRecordView::new(bam)
             .tags()
-            .find_string(&SamTag::RG)
+            .find_string(SamTag::RG)
             .and_then(|rg| self.rg_to_ordinal.get(rg))
             .copied()
             .unwrap_or(0)
@@ -3234,7 +3234,7 @@ mod tests {
     fn test_find_rg_tag(#[case] aux_data: &[u8], #[case] expected: Option<&[u8]>) {
         let bam = build_bam_with_aux(aux_data);
         assert_eq!(
-            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(&SamTag::RG),
+            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(SamTag::RG),
             expected
         );
     }
@@ -3248,7 +3248,7 @@ mod tests {
         aux.extend_from_slice(b"RGZmygroup\0");
         let bam = build_bam_with_aux(&aux);
         assert_eq!(
-            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(&SamTag::RG),
+            fgumi_raw_bam::RawRecordView::new(&bam).tags().find_string(SamTag::RG),
             Some(b"mygroup".as_slice())
         );
     }

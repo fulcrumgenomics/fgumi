@@ -754,6 +754,7 @@ dependencies = [
  "anyhow",
  "bstr 1.12.1",
  "bytemuck",
+ "fgumi-tag",
  "noodles",
  "proptest",
  "rstest",

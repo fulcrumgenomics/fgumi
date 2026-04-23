@@ -103,6 +103,9 @@ pub use sequence::{
 // -- sort --
 pub use sort::{compare_coordinate_raw, compare_names_raw, compare_queryname_raw, natural_compare};
 
+// Re-export SamTag and AsTagBytes so callers can reach them through the raw-bam crate boundary.
+pub use fgumi_tag::{AsTagBytes, SamTag};
+
 // -- tags --
 pub use tags::{
     ArrayTagRef, AuxStringTags, AuxTagsIter, RawTagsEditor, RawTagsMut, RawTagsView, TagEntry,

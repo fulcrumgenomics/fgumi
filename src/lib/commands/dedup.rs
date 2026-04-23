@@ -499,10 +499,10 @@ fn assign_umi_groups_for_indices(
         } else {
             let umi_bytes = if let Some(r1_raw) = template.r1() {
                 let aux = bam_fields::aux_data_slice(r1_raw);
-                bam_fields::find_string_tag(aux, &raw_tag)
+                bam_fields::find_string_tag(aux, raw_tag)
             } else if let Some(r2_raw) = template.r2() {
                 let aux = bam_fields::aux_data_slice(r2_raw);
-                bam_fields::find_string_tag(aux, &raw_tag)
+                bam_fields::find_string_tag(aux, raw_tag)
             } else {
                 None
             };
@@ -764,7 +764,7 @@ fn process_position_group(
             }
             if is_secondary || is_supplementary {
                 let aux = bam_fields::aux_data_slice(raw);
-                if bam_fields::find_tag_type(aux, &tc_tag_bytes).is_none() {
+                if bam_fields::find_tag_type(aux, tc_tag_bytes).is_none() {
                     dedup_metrics.missing_tc_tag += 1;
                 }
             }
@@ -1064,7 +1064,7 @@ impl Command for MarkDuplicates {
                             scratch.extend_from_slice(raw);
                             bam_fields::update_string_tag(
                                 &mut scratch,
-                                &assign_tag_bytes,
+                                assign_tag_bytes,
                                 mi_buf.as_bytes(),
                             );
                             let block_size = scratch.len() as u32;

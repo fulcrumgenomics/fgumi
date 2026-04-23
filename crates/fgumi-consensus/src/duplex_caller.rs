@@ -1772,7 +1772,7 @@ impl DuplexConsensusCaller {
             a_records.first().or_else(|| b_records.first()).and_then(|r| {
                 RawRecordView::new(r)
                     .tags()
-                    .find_string(&tag_bytes)
+                    .find_string(tag_bytes)
                     .map(|v| String::from_utf8_lossy(v).into_owned())
             })
         });

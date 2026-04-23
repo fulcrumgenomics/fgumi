@@ -101,20 +101,20 @@ fn unpack_sequence_for_test(packed: &[u8], l_seq: usize) -> Vec<u8> {
 }
 
 fn find_z_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    crate::tags::find_string_tag(aux, &tag).map(<[u8]>::to_vec)
+    crate::tags::find_string_tag(aux, tag).map(<[u8]>::to_vec)
 }
 
 #[expect(clippy::cast_possible_truncation, reason = "test values always fit in i32")]
 fn find_int_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<i32> {
-    crate::tags::find_int_tag(aux, &tag).map(|v| v as i32)
+    crate::tags::find_int_tag(aux, tag).map(|v| v as i32)
 }
 
 fn find_float_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<f32> {
-    crate::tags::find_float_tag(aux, &tag)
+    crate::tags::find_float_tag(aux, tag)
 }
 
 fn find_u8_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    let arr = crate::tags::find_array_tag(aux, &tag)?;
+    let arr = crate::tags::find_array_tag(aux, tag)?;
     (arr.elem_type == b'C').then(|| arr.data.to_vec())
 }
 
