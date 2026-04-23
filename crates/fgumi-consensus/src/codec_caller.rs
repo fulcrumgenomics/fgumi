@@ -1330,7 +1330,7 @@ impl CodecConsensusCaller {
             for raw in source_raws {
                 if let Some(cell_bc) = RawRecordView::new(raw).tags().find_string(cell_tag_bytes) {
                     if !cell_bc.is_empty() {
-                        self.bam_builder.append_string_tag(&cell_tag_bytes, cell_bc);
+                        self.bam_builder.append_string_tag(cell_tag_bytes, cell_bc);
                         break;
                     }
                 }

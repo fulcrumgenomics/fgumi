@@ -60,31 +60,36 @@ impl ParsedBamRecord {
 
     /// Find a Z-type string tag value by tag name.
     #[must_use]
-    pub fn get_string_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+    pub fn get_string_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<Vec<u8>> {
+        let tag = tag.as_tag_bytes();
         find_z_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find an integer tag value (c/s/i type) by tag name.
     #[must_use]
-    pub fn get_int_tag(&self, tag: &[u8; 2]) -> Option<i32> {
+    pub fn get_int_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<i32> {
+        let tag = tag.as_tag_bytes();
         find_int_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find a float tag value by tag name.
     #[must_use]
-    pub fn get_float_tag(&self, tag: &[u8; 2]) -> Option<f32> {
+    pub fn get_float_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<f32> {
+        let tag = tag.as_tag_bytes();
         find_float_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find a B:s (i16 array) tag value by tag name.
     #[must_use]
-    pub fn get_i16_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<i16>> {
+    pub fn get_i16_array_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<Vec<i16>> {
+        let tag = tag.as_tag_bytes();
         find_i16_array_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find a B:C (u8 array) tag value by tag name.
     #[must_use]
-    pub fn get_u8_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+    pub fn get_u8_array_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<Vec<u8>> {
+        let tag = tag.as_tag_bytes();
         find_u8_array_tag_in_aux(&self.aux_data, *tag)
     }
 }

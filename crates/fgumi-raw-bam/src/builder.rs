@@ -142,42 +142,48 @@ impl UnmappedSamBuilder {
 
     /// Append a string (`Z`-type) tag.
     #[inline]
-    pub fn append_string_tag(&mut self, tag: &[u8; 2], value: &[u8]) {
+    pub fn append_string_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, value: &[u8]) {
+        let tag = tag.as_tag_bytes();
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_string_tag(&mut self.buf, tag, value);
     }
 
     /// Append an integer tag using the smallest type that fits the value.
     #[inline]
-    pub fn append_int_tag(&mut self, tag: &[u8; 2], value: i32) {
+    pub fn append_int_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, value: i32) {
+        let tag = tag.as_tag_bytes();
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_int_tag(&mut self.buf, tag, value);
     }
 
     /// Append a float (`f`-type) tag.
     #[inline]
-    pub fn append_float_tag(&mut self, tag: &[u8; 2], value: f32) {
+    pub fn append_float_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, value: f32) {
+        let tag = tag.as_tag_bytes();
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_float_tag(&mut self.buf, tag, value);
     }
 
     /// Append an `i16` array (`B:s`-type) tag.
     #[inline]
-    pub fn append_i16_array_tag(&mut self, tag: &[u8; 2], values: &[i16]) {
+    pub fn append_i16_array_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[i16]) {
+        let tag = tag.as_tag_bytes();
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_i16_array_tag(&mut self.buf, tag, values);
     }
 
     /// Append a `u8` array (`B:C`-type) tag.
     #[inline]
-    pub fn append_u8_array_tag(&mut self, tag: &[u8; 2], values: &[u8]) {
+    pub fn append_u8_array_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[u8]) {
+        let tag = tag.as_tag_bytes();
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_u8_array_tag(&mut self.buf, tag, values);
     }
 
     /// Append a Phred+33 encoded quality string (`Z`-type) tag.
     #[inline]
-    pub fn append_phred33_string_tag(&mut self, tag: &[u8; 2], quals: &[u8]) {
+    pub fn append_phred33_string_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, quals: &[u8]) {
+        let tag = tag.as_tag_bytes();
         debug_assert!(self.sealed, "must call build_record before appending tags");
         append_phred33_string_tag(&mut self.buf, tag, quals);
     }
@@ -421,49 +427,57 @@ impl SamBuilder {
     // -------------------------------------------------------------------------
 
     /// Append a string (`Z`-type) aux tag.
-    pub fn add_string_tag(&mut self, tag: &[u8; 2], value: &[u8]) -> &mut Self {
+    pub fn add_string_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, value: &[u8]) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_string_tag(&mut self.aux, tag, value);
         self
     }
 
     /// Append an integer aux tag (smallest type that fits).
-    pub fn add_int_tag(&mut self, tag: &[u8; 2], value: i32) -> &mut Self {
+    pub fn add_int_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, value: i32) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_int_tag(&mut self.aux, tag, value);
         self
     }
 
     /// Append a float (`f`-type) aux tag.
-    pub fn add_float_tag(&mut self, tag: &[u8; 2], value: f32) -> &mut Self {
+    pub fn add_float_tag(&mut self, tag: impl fgumi_tag::AsTagBytes, value: f32) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_float_tag(&mut self.aux, tag, value);
         self
     }
 
     /// Append a `u8` array (`B:C`-type) aux tag.
-    pub fn add_array_u8(&mut self, tag: &[u8; 2], values: &[u8]) -> &mut Self {
+    pub fn add_array_u8(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[u8]) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_u8_array_tag(&mut self.aux, tag, values);
         self
     }
 
     /// Append a `u16` array (`B:S`-type) aux tag.
-    pub fn add_array_u16(&mut self, tag: &[u8; 2], values: &[u16]) -> &mut Self {
+    pub fn add_array_u16(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[u16]) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_u16_array_tag(&mut self.aux, tag, values);
         self
     }
 
     /// Append an `i16` array (`B:s`-type) aux tag.
-    pub fn add_array_i16(&mut self, tag: &[u8; 2], values: &[i16]) -> &mut Self {
+    pub fn add_array_i16(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[i16]) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_i16_array_tag(&mut self.aux, tag, values);
         self
     }
 
     /// Append an `i32` array (`B:i`-type) aux tag.
-    pub fn add_array_i32(&mut self, tag: &[u8; 2], values: &[i32]) -> &mut Self {
+    pub fn add_array_i32(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[i32]) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_i32_array_tag(&mut self.aux, tag, values);
         self
     }
 
     /// Append an `f32` array (`B:f`-type) aux tag.
-    pub fn add_array_f32(&mut self, tag: &[u8; 2], values: &[f32]) -> &mut Self {
+    pub fn add_array_f32(&mut self, tag: impl fgumi_tag::AsTagBytes, values: &[f32]) -> &mut Self {
+        let tag = tag.as_tag_bytes();
         append_f32_array_tag(&mut self.aux, tag, values);
         self
     }
@@ -1164,6 +1178,31 @@ mod tests {
         assert_eq!(b.ref_id, -1);
         assert_eq!(b.pos, -1);
         assert_eq!(b.read_name, b"*");
+    }
+
+    #[test]
+    fn test_unmapped_builder_tag_methods_accept_sam_tag() {
+        use fgumi_tag::SamTag;
+        let mut b = UnmappedSamBuilder::new();
+        b.build_record(b"r1", flags::UNMAPPED, b"ACGT", &[30, 30, 30, 30]);
+        // Accepts SamTag directly
+        b.append_int_tag(SamTag::CD, 7);
+        // Also accepts a byte literal reference
+        b.append_int_tag(b"cd", 3);
+        // Verify the record can be built without panic
+        let _rec = b.build();
+    }
+
+    #[test]
+    fn test_sam_builder_tag_methods_accept_sam_tag() {
+        use fgumi_tag::SamTag;
+        let mut b = SamBuilder::new();
+        b.sequence(b"ACGT").qualities(&[30u8; 4]);
+        b.add_int_tag(SamTag::CD, 7);
+        b.add_int_tag(b"cd", 3);
+        b.add_string_tag(SamTag::RX, b"AAA");
+        b.add_string_tag(b"RX", b"AAA");
+        let _raw = b.build();
     }
 
     #[cfg(feature = "noodles")]

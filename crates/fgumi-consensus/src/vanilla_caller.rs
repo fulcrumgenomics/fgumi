@@ -1421,7 +1421,7 @@ impl VanillaUmiConsensusCaller {
             if let Some(first_raw) = original_raws.first() {
                 let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
                 if let Some(value) = RawRecordView::new(first_raw).tags().find_string(tag_bytes) {
-                    self.bam_builder.append_string_tag(&tag_bytes, value);
+                    self.bam_builder.append_string_tag(tag_bytes, value);
                 }
             }
         }

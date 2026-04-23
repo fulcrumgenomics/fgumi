@@ -1083,7 +1083,7 @@ impl DuplexConsensusCaller {
         // 2. Cell barcode tag if present
         if let (Some(tag), Some(barcode)) = (cell_tag, cell_barcode) {
             let tag_bytes: [u8; 2] = <[u8; 2]>::from(tag);
-            builder.append_string_tag(&tag_bytes, barcode.as_bytes());
+            builder.append_string_tag(tag_bytes, barcode.as_bytes());
         }
 
         // 3. RG tag (string)

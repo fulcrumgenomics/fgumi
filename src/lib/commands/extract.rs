@@ -827,8 +827,6 @@ impl Extract {
         };
 
         let num_templates = templates.len();
-        let umi_tag: &[u8; 2] = &SamTag::RX;
-        let cell_tag: &[u8; 2] = &SamTag::CB;
 
         for (index, template) in templates.iter().enumerate() {
             // Compute flags for unmapped reads
@@ -866,38 +864,38 @@ impl Extract {
 
             // Append tags
             // Read group
-            builder.append_string_tag(&SamTag::RG, self.read_group_id.as_bytes());
+            builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
 
             // Cell barcode
             if !cell_barcode_bs.is_empty() {
-                builder.append_string_tag(cell_tag, cell_barcode_bs.as_bytes());
+                builder.append_string_tag(SamTag::CB, cell_barcode_bs.as_bytes());
             }
 
             if !cell_quals_bs.is_empty() && self.store_cell_quals {
-                builder.append_string_tag(&SamTag::CY, cell_quals_bs.as_bytes());
+                builder.append_string_tag(SamTag::CY, cell_quals_bs.as_bytes());
             }
 
             // Sample barcode
             if !sample_barcode_bs.is_empty() {
-                builder.append_string_tag(&SamTag::BC, sample_barcode_bs.as_bytes());
+                builder.append_string_tag(SamTag::BC, sample_barcode_bs.as_bytes());
             }
 
             if self.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-                builder.append_string_tag(&SamTag::QT, sample_quals_bs.as_bytes());
+                builder.append_string_tag(SamTag::QT, sample_quals_bs.as_bytes());
             }
 
             // UMI
             if !final_umi_bs.is_empty() {
-                builder.append_string_tag(umi_tag, final_umi_bs.as_bytes());
+                builder.append_string_tag(SamTag::RX, final_umi_bs.as_bytes());
 
                 // Single tag for all concatenated UMIs (if specified)
                 if let Some(single_tag) = self.single_tag {
-                    builder.append_string_tag(&single_tag, final_umi_bs.as_bytes());
+                    builder.append_string_tag(single_tag, final_umi_bs.as_bytes());
                 }
 
                 // Only add UMI qualities if not extracted from read names
                 if umi_from_name.is_none() && !umi_qual_bs.is_empty() && self.store_umi_quals {
-                    builder.append_string_tag(&SamTag::QX, umi_qual_bs.as_bytes());
+                    builder.append_string_tag(SamTag::QX, umi_qual_bs.as_bytes());
                 }
             }
 
@@ -1204,38 +1202,38 @@ fn make_raw_records_static(
 
         // Append tags
         // Read group
-        builder.append_string_tag(&SamTag::RG, cfg.read_group_id.as_bytes());
+        builder.append_string_tag(SamTag::RG, cfg.read_group_id.as_bytes());
 
         // Cell barcode
         if !cell_barcode_bs.is_empty() {
-            builder.append_string_tag(&SamTag::CB, cell_barcode_bs.as_bytes());
+            builder.append_string_tag(SamTag::CB, cell_barcode_bs.as_bytes());
         }
 
         if !cell_quals_bs.is_empty() && cfg.store_cell_quals {
-            builder.append_string_tag(&SamTag::CY, cell_quals_bs.as_bytes());
+            builder.append_string_tag(SamTag::CY, cell_quals_bs.as_bytes());
         }
 
         // Sample barcode
         if !sample_barcode_bs.is_empty() {
-            builder.append_string_tag(&SamTag::BC, sample_barcode_bs.as_bytes());
+            builder.append_string_tag(SamTag::BC, sample_barcode_bs.as_bytes());
         }
 
         if cfg.store_sample_barcode_qualities && !sample_quals_bs.is_empty() {
-            builder.append_string_tag(&SamTag::QT, sample_quals_bs.as_bytes());
+            builder.append_string_tag(SamTag::QT, sample_quals_bs.as_bytes());
         }
 
         // UMI
         if !final_umi_bs.is_empty() {
-            builder.append_string_tag(&SamTag::RX, final_umi_bs.as_bytes());
+            builder.append_string_tag(SamTag::RX, final_umi_bs.as_bytes());
 
             // Single tag for all concatenated UMIs (if specified)
             if let Some(st) = cfg.single_tag {
-                builder.append_string_tag(&st, final_umi_bs.as_bytes());
+                builder.append_string_tag(st, final_umi_bs.as_bytes());
             }
 
             // Only add UMI qualities if not extracted from read names
             if umi_from_name.is_none() && !umi_qual_bs.is_empty() && cfg.store_umi_quals {
-                builder.append_string_tag(&SamTag::QX, umi_qual_bs.as_bytes());
+                builder.append_string_tag(SamTag::QX, umi_qual_bs.as_bytes());
             }
         }
 
