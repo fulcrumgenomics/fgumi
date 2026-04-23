@@ -5,6 +5,7 @@
 //! verifying outputs with `compare`.  No golden files are checked in — expected
 //! output is generated fresh each run.
 
+use fgumi_lib::sam::SamTag;
 use noodles::bam;
 use std::ffi::OsString;
 use std::fs::File;
@@ -455,10 +456,10 @@ fn assert_simplex_has_methylation_tags(bam_path: &Path) {
     let mut reader = bam::io::Reader::new(file);
     let _header = reader.read_header().expect("failed to read BAM header");
 
-    let mm_tag = [b'M', b'M'];
-    let ml_tag = [b'M', b'L'];
-    let cu_tag = [b'c', b'u'];
-    let ct_tag = [b'c', b't'];
+    let mm_tag = SamTag::MM.to_noodles_tag();
+    let ml_tag = SamTag::ML.to_noodles_tag();
+    let cu_tag = SamTag::CU.to_noodles_tag();
+    let ct_tag = SamTag::CT.to_noodles_tag();
 
     let mut total = 0usize;
     let mut with_mm = 0usize;

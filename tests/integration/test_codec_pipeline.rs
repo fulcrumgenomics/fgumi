@@ -15,6 +15,7 @@
 
 use fgumi_lib::consensus::caller::ConsensusCaller;
 use fgumi_lib::consensus::codec_caller::{CodecConsensusCaller, CodecConsensusOptions};
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::RawRecord;
 use noodles::sam::alignment::record::cigar::op::Kind;
 
@@ -103,7 +104,7 @@ fn create_codec_read(
         .mate_ref_id(0)
         .mate_pos(i32::try_from(mate_start).expect("mate_start fits i32") - 1) // 0-based
         .template_length(insert_size)
-        .add_string_tag(b"MI", umi.as_bytes());
+        .add_string_tag(SamTag::MI, umi.as_bytes());
     b.build()
 }
 
@@ -280,7 +281,7 @@ fn test_codec_fragment_reads_rejection() {
             .pos(99) // 0-based (alignment_start 100)
             .mapq(60)
             .cigar_ops(&[8u32 << 4]) // 8M
-            .add_string_tag(b"MI", b"UMI004");
+            .add_string_tag(SamTag::MI, b"UMI004");
         b.build()
     };
 

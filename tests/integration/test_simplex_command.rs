@@ -6,6 +6,7 @@
 //! 3. Rejected reads output
 
 use bstr::BString;
+use fgumi_lib::sam::SamTag;
 use noodles::bam;
 use noodles::sam::Header;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -78,7 +79,7 @@ fn test_simplex_command_basic_consensus() {
     for result in reader.records() {
         let record = result.expect("Failed to read record");
         // Verify consensus tags exist
-        let cd_tag = [b'c', b'D'];
+        let cd_tag = SamTag::CD.to_noodles_tag();
         assert!(record.data().get(&cd_tag).is_some(), "Consensus should have cD tag");
         count += 1;
     }

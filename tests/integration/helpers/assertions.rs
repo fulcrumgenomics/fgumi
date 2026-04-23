@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 #![allow(clippy::cast_precision_loss)]
 
+use fgumi_lib::sam::SamTag;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
@@ -68,7 +69,7 @@ pub fn assert_header_unsorted(path: &std::path::Path) {
 ///
 /// Panics if the MI tag is missing or has unexpected value.
 pub fn assert_mi_tag(record: &RecordBuf, expected: &str) {
-    let mi_tag = Tag::from([b'M', b'I']);
+    let mi_tag = Tag::from(SamTag::MI);
     let mi_value = record.data().get(&mi_tag).expect("Record should have MI tag");
 
     match mi_value {
@@ -91,7 +92,7 @@ pub fn assert_mi_tag(record: &RecordBuf, expected: &str) {
 ///
 /// Panics if the RX tag is missing or has unexpected value.
 pub fn assert_rx_tag(record: &RecordBuf, expected: &str) {
-    let rx_tag = Tag::from([b'R', b'X']);
+    let rx_tag = Tag::from(SamTag::RX);
     let rx_value = record.data().get(&rx_tag).expect("Record should have RX tag");
 
     match rx_value {
@@ -147,7 +148,7 @@ pub fn assert_same_molecule_id(records: &[RecordBuf]) {
         return;
     }
 
-    let mi_tag = Tag::from([b'M', b'I']);
+    let mi_tag = Tag::from(SamTag::MI);
     let first_mi = records[0].data().get(&mi_tag).expect("First record should have MI tag");
 
     for record in records.iter().skip(1) {
@@ -182,7 +183,7 @@ pub fn assert_different_molecule_ids(family1: &[RecordBuf], family2: &[RecordBuf
         return;
     }
 
-    let mi_tag = Tag::from([b'M', b'I']);
+    let mi_tag = Tag::from(SamTag::MI);
 
     let mi1 = family1[0].data().get(&mi_tag).expect("Family 1 should have MI tag");
     let mi2 = family2[0].data().get(&mi_tag).expect("Family 2 should have MI tag");
@@ -203,7 +204,7 @@ mod tests {
             b.read_name(b"test")
                 .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .add_string_tag(b"MI", b"molecule_123");
+                .add_string_tag(SamTag::MI, b"molecule_123");
             b.build()
         };
         let record = to_record_buf(&raw);
@@ -218,7 +219,7 @@ mod tests {
             b.read_name(b"test")
                 .sequence(b"ACGT")
                 .qualities(&[30; 4])
-                .add_string_tag(b"MI", b"molecule_123");
+                .add_string_tag(SamTag::MI, b"molecule_123");
             b.build()
         };
         let record = to_record_buf(&raw);

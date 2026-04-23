@@ -5,6 +5,7 @@
 //! 2. Rejected reads output
 //! 3. Statistics output
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder as RawSamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -61,7 +62,7 @@ fn test_filter_command_basic() {
             .cigar_ops(&[8 << 4]) // 8M
             .sequence(b"ACGTACGT")
             .qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -74,7 +75,7 @@ fn test_filter_command_basic() {
             .cigar_ops(&[8 << 4]) // 8M
             .sequence(b"ACGTACGT")
             .qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[5; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[5; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -132,7 +133,7 @@ fn test_filter_command_rejects_low_depth() {
             .cigar_ops(&[8 << 4]) // 8M
             .sequence(b"ACGTACGT")
             .qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -146,7 +147,7 @@ fn test_filter_command_rejects_low_depth() {
             .cigar_ops(&[8 << 4]) // 8M
             .sequence(b"ACGTACGT")
             .qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[1; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[1; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -205,7 +206,9 @@ fn test_filter_command_with_stats() {
             .cigar_ops(&[8 << 4]) // 8M
             .sequence(b"ACGTACGT")
             .qualities(&[35; 8]);
-        b.add_int_tag(b"cD", 10).add_int_tag(b"cM", 8).add_float_tag(b"cE", 0.005_f32);
+        b.add_int_tag(SamTag::CD, 10)
+            .add_int_tag(SamTag::CM, 8)
+            .add_float_tag(SamTag::CE, 0.005_f32);
         b.build()
     };
 
@@ -251,14 +254,14 @@ fn test_filter_command_no_ref_unmapped_reads() {
     let r1 = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"cons1").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
     let r2 = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"cons2").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[5; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[5; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -306,7 +309,7 @@ fn test_filter_command_no_ref_with_rejects() {
     let good = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"good").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -314,7 +317,7 @@ fn test_filter_command_no_ref_with_rejects() {
     let low_depth = {
         let mut b = RawSamBuilder::new();
         b.read_name(b"low_depth").flags(flags::UNMAPPED).sequence(b"ACGTACGT").qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[1; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[1; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 
@@ -375,7 +378,7 @@ fn test_filter_command_no_ref_mapped_reads_fails() {
             .cigar_ops(&[8 << 4]) // 8M
             .sequence(b"ACGTACGT")
             .qualities(&[35; 8]);
-        b.add_array_u16(b"cd", &[10; 8]).add_array_u16(b"ce", &[0; 8]);
+        b.add_array_u16(SamTag::CD_BASES, &[10; 8]).add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 

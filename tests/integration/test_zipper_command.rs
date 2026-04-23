@@ -76,8 +76,8 @@ fn test_zipper_basic_merge() {
                 .sequence(b"ACGTACGT")
                 .qualities(&[30; 8])
                 .flags(flags::UNMAPPED)
-                .add_string_tag(b"RX", b"AACCGGTT")
-                .add_string_tag(b"QX", b"IIIIIIII");
+                .add_string_tag(SamTag::RX, b"AACCGGTT")
+                .add_string_tag(SamTag::QX, b"IIIIIIII");
             b.build()
         },
         {
@@ -86,8 +86,8 @@ fn test_zipper_basic_merge() {
                 .sequence(b"TGCATGCA")
                 .qualities(&[30; 8])
                 .flags(flags::UNMAPPED)
-                .add_string_tag(b"RX", b"GGTTCCAA")
-                .add_string_tag(b"QX", b"IIIIIIII");
+                .add_string_tag(SamTag::RX, b"GGTTCCAA")
+                .add_string_tag(SamTag::QX, b"IIIIIIII");
             b.build()
         },
     ];
@@ -169,7 +169,7 @@ fn test_zipper_tag_removal() {
             .sequence(b"ACGTACGT")
             .qualities(&[30; 8])
             .flags(flags::UNMAPPED)
-            .add_string_tag(b"RX", b"AACCGGTT")
+            .add_string_tag(SamTag::RX, b"AACCGGTT")
             .add_string_tag(b"XY", b"REMOVE_ME");
         b.build()
     }];
@@ -266,8 +266,8 @@ fn test_zipper_bam_mapped_input() {
                 .sequence(b"ACGTACGT")
                 .qualities(&[30; 8])
                 .flags(flags::UNMAPPED)
-                .add_string_tag(b"RX", b"AACCGGTT")
-                .add_string_tag(b"QX", b"IIIIIIII");
+                .add_string_tag(SamTag::RX, b"AACCGGTT")
+                .add_string_tag(SamTag::QX, b"IIIIIIII");
             b.build()
         },
         {
@@ -276,8 +276,8 @@ fn test_zipper_bam_mapped_input() {
                 .sequence(b"TGCATGCA")
                 .qualities(&[30; 8])
                 .flags(flags::UNMAPPED)
-                .add_string_tag(b"RX", b"GGTTCCAA")
-                .add_string_tag(b"QX", b"IIIIIIII");
+                .add_string_tag(SamTag::RX, b"GGTTCCAA")
+                .add_string_tag(SamTag::QX, b"IIIIIIII");
             b.build()
         },
     ];
@@ -372,8 +372,8 @@ fn test_zipper_bam_stdin_input() {
                 .sequence(b"ACGTACGT")
                 .qualities(&[30; 8])
                 .flags(flags::UNMAPPED)
-                .add_string_tag(b"RX", b"AACCGGTT")
-                .add_string_tag(b"QX", b"IIIIIIII");
+                .add_string_tag(SamTag::RX, b"AACCGGTT")
+                .add_string_tag(SamTag::QX, b"IIIIIIII");
             b.build()
         },
         {
@@ -382,8 +382,8 @@ fn test_zipper_bam_stdin_input() {
                 .sequence(b"TGCATGCA")
                 .qualities(&[30; 8])
                 .flags(flags::UNMAPPED)
-                .add_string_tag(b"RX", b"GGTTCCAA")
-                .add_string_tag(b"QX", b"IIIIIIII");
+                .add_string_tag(SamTag::RX, b"GGTTCCAA")
+                .add_string_tag(SamTag::QX, b"IIIIIIII");
             b.build()
         },
     ];

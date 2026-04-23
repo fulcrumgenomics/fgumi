@@ -4,6 +4,7 @@
 //! 1. Missing required arguments produce a clear error
 //! 2. Basic execution with minimal valid inputs
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -120,7 +121,7 @@ fn test_review_basic_execution() {
             .pos(96) // 0-based for 1-based pos 97
             .mapq(60)
             .cigar_ops(&[8 << 4]) // 8M
-            .add_string_tag(b"MI", b"1");
+            .add_string_tag(SamTag::MI, b"1");
         b.build()
     }];
     create_indexed_bam(&consensus_bam, &consensus_records);
@@ -136,7 +137,7 @@ fn test_review_basic_execution() {
                 .pos(96)
                 .mapq(60)
                 .cigar_ops(&[8 << 4]) // 8M
-                .add_string_tag(b"MI", b"1");
+                .add_string_tag(SamTag::MI, b"1");
             b.build()
         },
         {
@@ -148,7 +149,7 @@ fn test_review_basic_execution() {
                 .pos(96)
                 .mapq(60)
                 .cigar_ops(&[8 << 4]) // 8M
-                .add_string_tag(b"MI", b"1");
+                .add_string_tag(SamTag::MI, b"1");
             b.build()
         },
     ];

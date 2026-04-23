@@ -9,6 +9,7 @@
 //! 6. BAM output with consensus tags
 
 use crate::helpers::*;
+use fgumi_lib::sam::SamTag;
 use fgumi_lib::umi::assigner::{AdjacencyUmiAssigner, IdentityUmiAssigner, UmiAssigner};
 use std::collections::HashSet;
 
@@ -28,7 +29,7 @@ fn test_identity_assigner_basic_workflow() {
 
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.tags().get(b"RX").expect("RX tag should exist") {
+        .map(|record| match record.tags().get(SamTag::RX).expect("RX tag should exist") {
             fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
@@ -77,7 +78,7 @@ fn test_adjacency_assigner_with_error_correction() {
 
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.tags().get(b"RX").expect("RX tag") {
+        .map(|record| match record.tags().get(SamTag::RX).expect("RX tag") {
             fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
@@ -128,7 +129,7 @@ fn test_adjacency_respects_count_gradient() {
 
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.tags().get(b"RX").expect("RX tag") {
+        .map(|record| match record.tags().get(SamTag::RX).expect("RX tag") {
             fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })
@@ -193,7 +194,7 @@ fn test_paired_end_umi_workflow() {
 
     let umis: Vec<String> = all_reads
         .iter()
-        .map(|record| match record.tags().get(b"RX").expect("RX tag") {
+        .map(|record| match record.tags().get(SamTag::RX).expect("RX tag") {
             fgumi_raw_bam::TagValue::String(s) => String::from_utf8_lossy(s).to_string(),
             _ => panic!("RX should be string"),
         })

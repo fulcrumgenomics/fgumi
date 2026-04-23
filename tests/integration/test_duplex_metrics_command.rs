@@ -3,6 +3,7 @@
 use fgoxide::io::DelimFile;
 use fgumi_lib::metrics::duplex::{DuplexFamilySizeMetric, FamilySizeMetric};
 use fgumi_lib::metrics::shared::UmiMetric;
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::Header;
@@ -65,8 +66,8 @@ fn create_duplex_pair(
             .mate_ref_id(ref_id)
             .mate_pos(pos2 - 1)
             .template_length(tlen)
-            .add_string_tag(b"RX", rx_umi.as_bytes())
-            .add_string_tag(b"MI", mi_tag.as_bytes());
+            .add_string_tag(SamTag::RX, rx_umi.as_bytes())
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
         b.build()
     };
 
@@ -83,8 +84,8 @@ fn create_duplex_pair(
             .mate_ref_id(ref_id)
             .mate_pos(pos1 - 1)
             .template_length(-tlen)
-            .add_string_tag(b"RX", rx_umi.as_bytes())
-            .add_string_tag(b"MI", mi_tag.as_bytes());
+            .add_string_tag(SamTag::RX, rx_umi.as_bytes())
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
         b.build()
     };
 

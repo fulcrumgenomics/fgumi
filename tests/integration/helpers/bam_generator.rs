@@ -1,5 +1,6 @@
 //! Utilities for generating test BAM data programmatically.
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::sam::Header;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -51,7 +52,7 @@ pub fn create_umi_family(
                 .cigar_ops(&[cigar_op])
                 .sequence(seq)
                 .qualities(&vec![quality; seq.len()])
-                .add_string_tag(b"RX", umi.as_bytes());
+                .add_string_tag(SamTag::RX, umi.as_bytes());
             b.build()
         })
         .collect()
@@ -109,7 +110,7 @@ pub fn create_paired_umi_family(
             .cigar_ops(&[r1_cigar])
             .sequence(r1_seq)
             .qualities(&vec![quality; r1_seq.len()])
-            .add_string_tag(b"RX", umi.as_bytes());
+            .add_string_tag(SamTag::RX, umi.as_bytes());
         records.push(b1.build());
 
         // R2: paired + last segment
@@ -125,7 +126,7 @@ pub fn create_paired_umi_family(
             .cigar_ops(&[r2_cigar])
             .sequence(r2_seq)
             .qualities(&vec![quality; r2_seq.len()])
-            .add_string_tag(b"RX", umi.as_bytes());
+            .add_string_tag(SamTag::RX, umi.as_bytes());
         records.push(b2.build());
     }
 
@@ -159,9 +160,9 @@ pub fn create_consensus_read(
     b.read_name(name.as_bytes())
         .sequence(seq)
         .qualities(&vec![mean_quality; seq.len()])
-        .add_int_tag(b"cD", depth_max)
-        .add_int_tag(b"cM", depth_min)
-        .add_float_tag(b"cE", error_rate);
+        .add_int_tag(SamTag::CD, depth_max)
+        .add_int_tag(SamTag::CM, depth_min)
+        .add_float_tag(SamTag::CE, error_rate);
     b.build()
 }
 

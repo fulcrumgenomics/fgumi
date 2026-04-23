@@ -335,6 +335,7 @@ fn test_extract_bgzf_threads_mode() {
 
 #[test]
 fn test_extract_gzip_verifies_umi_extraction() {
+    use fgumi_lib::sam::SamTag;
     use noodles::sam::alignment::record::data::field::Tag;
 
     let tmp = TempDir::new().unwrap();
@@ -385,7 +386,7 @@ fn test_extract_gzip_verifies_umi_extraction() {
 
     // Verify UMI was extracted and stored in RX tag
     for record in &records {
-        let rx_tag = record.data().get(&Tag::from(*b"RX"));
+        let rx_tag = record.data().get(&Tag::from(SamTag::RX));
         assert!(rx_tag.is_some(), "RX tag should be present");
     }
 
@@ -901,6 +902,7 @@ fn test_variable_length_reads_bgzf() {
 /// --annotate-read-names) are correctly propagated in multi-threaded mode.
 #[test]
 fn test_extract_multithreaded_custom_options() {
+    use fgumi_lib::sam::SamTag;
     use noodles::sam::alignment::record::data::field::Tag;
     use noodles::sam::alignment::record_buf::data::field::Value;
 
@@ -942,7 +944,7 @@ fn test_extract_multithreaded_custom_options() {
 
     for record in &records {
         // Verify custom read group ID
-        let rg = record.data().get(&Tag::from(*b"RG")).expect("RG tag should be present");
+        let rg = record.data().get(&Tag::from(SamTag::RG)).expect("RG tag should be present");
         match rg {
             Value::String(s) => {
                 let rg_str = String::from_utf8_lossy(s);
@@ -952,7 +954,7 @@ fn test_extract_multithreaded_custom_options() {
         }
 
         // Verify UMI stored under standard RX tag
-        assert!(record.data().get(&Tag::from(*b"RX")).is_some(), "UMI should be under RX tag");
+        assert!(record.data().get(&Tag::from(SamTag::RX)).is_some(), "UMI should be under RX tag");
 
         // Verify read name annotation (should contain '+' with UMI appended)
         let name = std::str::from_utf8(record.name().unwrap().as_ref()).unwrap();
@@ -1125,6 +1127,7 @@ fn test_bgzf_block_merge_single_stream_thread_counts() {
 /// BAM records).
 #[test]
 fn test_bgzf_block_merge_content_verification() {
+    use fgumi_lib::sam::SamTag;
     use noodles::sam::alignment::record::data::field::Tag;
 
     let tmp = TempDir::new().unwrap();
@@ -1153,7 +1156,7 @@ fn test_bgzf_block_merge_content_verification() {
     // Verify UMI tag is present.
     for rec in &records {
         assert!(
-            rec.data().get(&Tag::from(*b"RX")).is_some(),
+            rec.data().get(&Tag::from(SamTag::RX)).is_some(),
             "RX tag must be present on every record"
         );
     }

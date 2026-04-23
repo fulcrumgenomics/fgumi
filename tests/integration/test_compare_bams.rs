@@ -3,6 +3,7 @@
 //! These tests exercise all three compare modes (content, full, grouping)
 //! using the raw byte comparison path.
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::Header;
@@ -63,7 +64,7 @@ fn mapped_record_with_mi(name: &[u8], pos: i32, mi: &str) -> RawRecord {
         .ref_id(0)
         .pos(pos - 1) // pos is 1-based in tests, BAM uses 0-based
         .mapq(60)
-        .add_string_tag(b"MI", mi.as_bytes());
+        .add_string_tag(SamTag::MI, mi.as_bytes());
     b.build()
 }
 
@@ -204,8 +205,8 @@ fn test_grouping_mode_identical_bams() {
                 .ref_id(0)
                 .pos(99)
                 .mapq(60)
-                .add_string_tag(b"MI", b"1")
-                .add_string_tag(b"RX", b"AAAA");
+                .add_string_tag(SamTag::MI, b"1")
+                .add_string_tag(SamTag::RX, b"AAAA");
             b.build()
         },
         {
@@ -217,8 +218,8 @@ fn test_grouping_mode_identical_bams() {
                 .ref_id(0)
                 .pos(199)
                 .mapq(60)
-                .add_string_tag(b"MI", b"1")
-                .add_string_tag(b"RX", b"AAAA");
+                .add_string_tag(SamTag::MI, b"1")
+                .add_string_tag(SamTag::RX, b"AAAA");
             b.build()
         },
     ];
@@ -250,7 +251,7 @@ fn test_grouping_mode_flag_mismatch_reported_separately() {
             .ref_id(0)
             .pos(pos - 1)
             .mapq(60)
-            .add_string_tag(b"MI", mi.as_bytes());
+            .add_string_tag(SamTag::MI, mi.as_bytes());
         b.build()
     };
 
@@ -299,8 +300,8 @@ fn test_content_mode_reordered_tags_equivalent() {
             .ref_id(0)
             .pos(99)
             .mapq(60)
-            .add_string_tag(b"MI", b"1")
-            .add_string_tag(b"RX", b"AAAA");
+            .add_string_tag(SamTag::MI, b"1")
+            .add_string_tag(SamTag::RX, b"AAAA");
         b.build()
     }];
     let records2 = vec![{
@@ -311,8 +312,8 @@ fn test_content_mode_reordered_tags_equivalent() {
             .ref_id(0)
             .pos(99)
             .mapq(60)
-            .add_string_tag(b"RX", b"AAAA")
-            .add_string_tag(b"MI", b"1");
+            .add_string_tag(SamTag::RX, b"AAAA")
+            .add_string_tag(SamTag::MI, b"1");
         b.build()
     }];
 
@@ -343,8 +344,8 @@ fn test_full_mode_reordered_tags_equivalent() {
             .ref_id(0)
             .pos(99)
             .mapq(60)
-            .add_string_tag(b"MI", b"1")
-            .add_string_tag(b"RX", b"AAAA");
+            .add_string_tag(SamTag::MI, b"1")
+            .add_string_tag(SamTag::RX, b"AAAA");
         b.build()
     }];
     let records2 = vec![{
@@ -355,8 +356,8 @@ fn test_full_mode_reordered_tags_equivalent() {
             .ref_id(0)
             .pos(99)
             .mapq(60)
-            .add_string_tag(b"RX", b"AAAA")
-            .add_string_tag(b"MI", b"1");
+            .add_string_tag(SamTag::RX, b"AAAA")
+            .add_string_tag(SamTag::MI, b"1");
         b.build()
     }];
 
@@ -394,7 +395,7 @@ fn test_grouping_mode_ignore_order() {
                 .ref_id(0)
                 .pos(99)
                 .mapq(60)
-                .add_string_tag(b"MI", b"1");
+                .add_string_tag(SamTag::MI, b"1");
             b.build()
         },
         {
@@ -406,7 +407,7 @@ fn test_grouping_mode_ignore_order() {
                 .ref_id(0)
                 .pos(199)
                 .mapq(60)
-                .add_string_tag(b"MI", b"1");
+                .add_string_tag(SamTag::MI, b"1");
             b.build()
         },
     ];
@@ -422,7 +423,7 @@ fn test_grouping_mode_ignore_order() {
                 .ref_id(0)
                 .pos(199)
                 .mapq(60)
-                .add_string_tag(b"MI", b"5");
+                .add_string_tag(SamTag::MI, b"5");
             b.build()
         },
         {
@@ -434,7 +435,7 @@ fn test_grouping_mode_ignore_order() {
                 .ref_id(0)
                 .pos(99)
                 .mapq(60)
-                .add_string_tag(b"MI", b"5");
+                .add_string_tag(SamTag::MI, b"5");
             b.build()
         },
     ];
@@ -560,8 +561,8 @@ fn paired_record_pair(name: &[u8], mi: &str) -> [RawRecord; 2] {
             .ref_id(0)
             .pos(99)
             .mapq(60)
-            .add_string_tag(b"MI", mi.as_bytes())
-            .add_string_tag(b"RX", b"AAAA");
+            .add_string_tag(SamTag::MI, mi.as_bytes())
+            .add_string_tag(SamTag::RX, b"AAAA");
         b.build()
     };
     let r2 = {
@@ -573,8 +574,8 @@ fn paired_record_pair(name: &[u8], mi: &str) -> [RawRecord; 2] {
             .ref_id(0)
             .pos(199)
             .mapq(60)
-            .add_string_tag(b"MI", mi.as_bytes())
-            .add_string_tag(b"RX", b"AAAA");
+            .add_string_tag(SamTag::MI, mi.as_bytes())
+            .add_string_tag(SamTag::RX, b"AAAA");
         b.build()
     };
     [r1, r2]

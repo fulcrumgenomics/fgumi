@@ -7,6 +7,7 @@
 //! 4. Quality filtering options
 
 use fgumi_lib::bam_io::create_raw_bam_writer;
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
 use noodles::bam;
 use std::fs;
@@ -53,10 +54,10 @@ fn create_codec_read_pair(
         .mate_ref_id(0)
         .mate_pos(pos)
         .template_length(r1_len as i32)
-        .add_string_tag(b"MI", umi.as_bytes())
-        .add_string_tag(b"MC", r2_mc_tag.as_bytes());
+        .add_string_tag(SamTag::MI, umi.as_bytes())
+        .add_string_tag(SamTag::MC, r2_mc_tag.as_bytes());
     if let Some(cb) = cell_barcode {
-        b1.add_string_tag(b"CB", cb.as_bytes());
+        b1.add_string_tag(SamTag::CB, cb.as_bytes());
     }
 
     let mut b2 = SamBuilder::new();
@@ -71,10 +72,10 @@ fn create_codec_read_pair(
         .mate_ref_id(0)
         .mate_pos(pos)
         .template_length(-(r2_len as i32))
-        .add_string_tag(b"MI", umi.as_bytes())
-        .add_string_tag(b"MC", r1_mc_tag.as_bytes());
+        .add_string_tag(SamTag::MI, umi.as_bytes())
+        .add_string_tag(SamTag::MC, r1_mc_tag.as_bytes());
     if let Some(cb) = cell_barcode {
-        b2.add_string_tag(b"CB", cb.as_bytes());
+        b2.add_string_tag(SamTag::CB, cb.as_bytes());
     }
 
     (b1.build(), b2.build())
@@ -147,7 +148,7 @@ fn test_codec_command_basic_consensus() {
         consensus_count += 1;
 
         // Verify consensus tags exist by checking the raw tag bytes
-        let cd_tag = [b'c', b'D'];
+        let cd_tag = SamTag::CD.to_noodles_tag();
         assert!(record.data().get(&cd_tag).is_some(), "Consensus should have cD tag");
     }
 
@@ -403,8 +404,8 @@ fn test_codec_command_per_base_tags() {
         let record = result.expect("Failed to read record");
 
         // Check for per-base depth tags (ad, bd)
-        let ad_tag = [b'a', b'd'];
-        let bd_tag = [b'b', b'd'];
+        let ad_tag = SamTag::AD_BASES.to_noodles_tag();
+        let bd_tag = SamTag::BD_BASES.to_noodles_tag();
 
         assert!(record.data().get(&ad_tag).is_some(), "Should have per-base depth tag 'ad'");
         assert!(record.data().get(&bd_tag).is_some(), "Should have per-base depth tag 'bd'");
@@ -466,7 +467,7 @@ fn test_codec_command_cell_barcode_preservation() {
         consensus_count += 1;
 
         // Verify cell barcode tag is preserved
-        let cb_tag = [b'C', b'B'];
+        let cb_tag = SamTag::CB.to_noodles_tag();
         assert!(
             record.data().get(&cb_tag).is_some(),
             "Consensus should have CB (cell barcode) tag"
