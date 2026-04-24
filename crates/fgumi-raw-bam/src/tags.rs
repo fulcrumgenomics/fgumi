@@ -296,10 +296,7 @@ pub struct TemplateAuxTags<'a> {
 /// This replaces 4 separate linear scans with one, reducing the cost of aux tag
 /// extraction from O(4n) to O(n) where n is the aux data length.
 #[must_use]
-pub fn extract_template_aux_tags<'a>(
-    bam: &'a [u8],
-    cell_tag: Option<&[u8; 2]>,
-) -> TemplateAuxTags<'a> {
+pub fn extract_template_aux_tags(bam: &[u8], cell_tag: Option<SamTag>) -> TemplateAuxTags<'_> {
     let aux_data = aux_data_slice(bam);
     let mut result = TemplateAuxTags { mi: (0, true), rg: None, cell: None, mc: None };
     // Bits: 0=MI, 1=RG, 2=cell, 3=MC
@@ -957,7 +954,7 @@ pub fn append_signed_int_tag(record: &mut Vec<u8>, tag: impl AsTagBytes, value: 
 ///
 /// Iterates all tags in `src_aux` and appends each tag entry (tag + type + value bytes)
 /// to `dest`, unless the tag's two-byte key is in `skip_tags`.
-pub(crate) fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[&[u8; 2]]) {
+pub(crate) fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[SamTag]) {
     let mut offset = 0;
     while offset + 3 <= src_aux.len() {
         let tag_key = [src_aux[offset], src_aux[offset + 1]];
@@ -973,7 +970,7 @@ pub(crate) fn copy_aux_tags(src_aux: &[u8], dest: &mut Vec<u8>, skip_tags: &[&[u
         }
 
         // Copy unless this tag should be skipped
-        if !skip_tags.iter().any(|t| **t == tag_key) {
+        if !skip_tags.iter().any(|t| *t == tag_key) {
             dest.extend_from_slice(&src_aux[offset..entry_end]);
         }
 
@@ -1250,7 +1247,7 @@ impl<'a> RawRecordView<'a> {
     /// Single-pass extraction of (MI, RG, cell, MC) from this record's aux data.
     #[inline]
     #[must_use]
-    pub fn template_aux_tags(&self, cell_tag: Option<&[u8; 2]>) -> TemplateAuxTags<'a> {
+    pub fn template_aux_tags(&self, cell_tag: Option<SamTag>) -> TemplateAuxTags<'a> {
         extract_template_aux_tags(self.as_bytes(), cell_tag)
     }
 }
@@ -1879,7 +1876,7 @@ impl<'a> RawTagsEditor<'a> {
     ///
     /// All tags in `src` are appended to the record unless their two-byte key appears in `skip`.
     #[inline]
-    pub fn copy_from(&mut self, src: RawTagsView<'_>, skip: &[&[u8; 2]]) {
+    pub fn copy_from(&mut self, src: RawTagsView<'_>, skip: &[SamTag]) {
         copy_aux_tags(src.as_bytes(), self.record, skip);
     }
 }
@@ -3277,7 +3274,7 @@ mod tests {
         aux.extend_from_slice(b"MCZ10M5S\x00");
         let rec = make_bam_bytes(0, 100, 0, b"read1", &[], 4, -1, -1, &aux);
 
-        let result = extract_template_aux_tags(&rec, Some(SamTag::CB.as_tag_bytes()));
+        let result = extract_template_aux_tags(&rec, Some(SamTag::CB));
         assert_eq!(result.mi, (42, true));
         assert_eq!(result.rg, Some(b"sample1".as_ref()));
         assert_eq!(result.cell, Some(b"cell99".as_ref()));
@@ -3318,7 +3315,7 @@ mod tests {
         let aux = b"RGZsample\x00";
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, aux);
 
-        let result = extract_template_aux_tags(&rec, Some(SamTag::CB.as_tag_bytes()));
+        let result = extract_template_aux_tags(&rec, Some(SamTag::CB));
         assert_eq!(result.mi, (0, true)); // default
         assert_eq!(result.rg, Some(b"sample".as_ref()));
         assert!(result.cell.is_none());
@@ -3329,7 +3326,7 @@ mod tests {
     fn test_extract_template_aux_tags_empty_aux() {
         let rec = make_bam_bytes(0, 0, 0, b"r1", &[], 4, -1, -1, &[]);
 
-        let result = extract_template_aux_tags(&rec, Some(SamTag::CB.as_tag_bytes()));
+        let result = extract_template_aux_tags(&rec, Some(SamTag::CB));
         assert_eq!(result.mi, (0, true));
         assert!(result.rg.is_none());
         assert!(result.cell.is_none());
@@ -3489,7 +3486,7 @@ mod tests {
         src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]); // NM:C:5
 
         let mut dest = Vec::new();
-        copy_aux_tags(&src_aux, &mut dest, &[SamTag::NM.as_tag_bytes()]);
+        copy_aux_tags(&src_aux, &mut dest, &[SamTag::NM]);
 
         // Only RX should be copied
         assert_eq!(dest, b"RXZ\x41\x43\x47\x54\x00");
@@ -3502,7 +3499,7 @@ mod tests {
         src_aux.extend_from_slice(&[b'N', b'M', b'C', 5]);
 
         let mut dest = Vec::new();
-        copy_aux_tags(&src_aux, &mut dest, &[SamTag::RX.as_tag_bytes(), SamTag::NM.as_tag_bytes()]);
+        copy_aux_tags(&src_aux, &mut dest, &[SamTag::RX, SamTag::NM]);
 
         assert!(dest.is_empty(), "All tags skipped should produce empty dest");
     }
@@ -3818,7 +3815,7 @@ mod tests {
         {
             let src_view = RawRecordView::new(&src_rec);
             let mut ed = RawTagsEditor::from_vec(&mut dst_rec);
-            ed.copy_from(src_view.tags(), &[SamTag::NM.as_tag_bytes()]);
+            ed.copy_from(src_view.tags(), &[SamTag::NM]);
         }
         let dst = RawRecordView::new(&dst_rec);
         assert_eq!(dst.tags().find_string(SamTag::RG), Some(b"mygrp".as_slice()));
