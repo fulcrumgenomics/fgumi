@@ -14,6 +14,7 @@ use crate::simple_umi::consensus_umis;
 use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_sam::SamTag;
 use fgumi_sam::clipper::cigar_utils::{self, SimplifiedCigar};
 use noodles::sam::alignment::record::cigar::op::Kind;
 use rand::SeedableRng;
@@ -1389,7 +1390,7 @@ impl VanillaUmiConsensusCaller {
         self.bam_builder.build_record(read_name.as_bytes(), flag, bases, quals);
 
         // RG tag
-        self.bam_builder.append_string_tag(b"RG", self.read_group_id.as_bytes());
+        self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
 
         // Consensus summary tags: cD, cM, cE
         let max_depth = i32::from(*depths.iter().max().unwrap_or(&0));
@@ -1399,9 +1400,9 @@ impl VanillaUmiConsensusCaller {
         let error_rate =
             if total_depth > 0 { total_errors as f32 / total_depth as f32 } else { 0.0 };
 
-        self.bam_builder.append_int_tag(b"cD", max_depth);
-        self.bam_builder.append_int_tag(b"cM", min_depth);
-        self.bam_builder.append_float_tag(b"cE", error_rate);
+        self.bam_builder.append_int_tag(SamTag::CD, max_depth);
+        self.bam_builder.append_int_tag(SamTag::CM, min_depth);
+        self.bam_builder.append_float_tag(SamTag::CE, error_rate);
 
         // Per-base tags if requested: cd, ce
         if self.options.produce_per_base_tags {
@@ -1409,19 +1410,19 @@ impl VanillaUmiConsensusCaller {
                 depths.iter().map(|&d| d.min(i16::MAX as u16) as i16).collect();
             let error_i16: Vec<i16> =
                 errors.iter().map(|&e| e.min(i16::MAX as u16) as i16).collect();
-            self.bam_builder.append_i16_array_tag(b"cd", &depth_i16);
-            self.bam_builder.append_i16_array_tag(b"ce", &error_i16);
+            self.bam_builder.append_i16_array_tag(SamTag::CD_BASES, &depth_i16);
+            self.bam_builder.append_i16_array_tag(SamTag::CE_BASES, &error_i16);
         }
 
         // MI tag
-        self.bam_builder.append_string_tag(b"MI", umi.as_bytes());
+        self.bam_builder.append_string_tag(SamTag::MI, umi.as_bytes());
 
         // Cell barcode tag (if configured and present in original reads)
         if let Some(cell_tag) = self.options.cell_tag {
             if let Some(first_raw) = original_raws.first() {
                 let tag_bytes = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
-                if let Some(value) = RawRecordView::new(first_raw).tags().find_string(&tag_bytes) {
-                    self.bam_builder.append_string_tag(&tag_bytes, value);
+                if let Some(value) = RawRecordView::new(first_raw).tags().find_string(tag_bytes) {
+                    self.bam_builder.append_string_tag(tag_bytes, value);
                 }
             }
         }
@@ -1432,14 +1433,14 @@ impl VanillaUmiConsensusCaller {
             .filter_map(|raw| {
                 RawRecordView::new(raw)
                     .tags()
-                    .find_string(b"RX")
+                    .find_string(SamTag::RX)
                     .map(|v| String::from_utf8_lossy(v).into_owned())
             })
             .collect();
 
         if !umis.is_empty() {
             let consensus_umi = consensus_umis(&umis);
-            self.bam_builder.append_string_tag(b"RX", consensus_umi.as_bytes());
+            self.bam_builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
         }
 
         // Methylation tags (EM-Seq/TAPs)
@@ -1455,15 +1456,15 @@ impl VanillaUmiConsensusCaller {
                 is_top,
                 self.options.methylation_mode,
             ) {
-                self.bam_builder.append_string_tag(b"MM", mm.as_bytes());
-                self.bam_builder.append_u8_array_tag(b"ML", &ml);
+                self.bam_builder.append_string_tag(SamTag::MM, mm.as_bytes());
+                self.bam_builder.append_u8_array_tag(SamTag::ML, &ml);
             }
 
             // Dense count tags
             let cu = annot.unconverted_counts();
             let ct = annot.converted_counts();
-            self.bam_builder.append_i16_array_tag(b"cu", &cu);
-            self.bam_builder.append_i16_array_tag(b"ct", &ct);
+            self.bam_builder.append_i16_array_tag(SamTag::CU, &cu);
+            self.bam_builder.append_i16_array_tag(SamTag::CT, &ct);
         }
 
         // Write record with block_size prefix
@@ -1490,7 +1491,7 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         let read_name = String::from_utf8_lossy(read_name_bytes);
 
         let tag_value =
-            RawRecordView::new(first_raw.as_ref()).tags().find_string(&tag_key).ok_or_else(
+            RawRecordView::new(first_raw.as_ref()).tags().find_string(tag_key).ok_or_else(
                 || anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name),
             )?;
 
@@ -1582,7 +1583,7 @@ mod tests {
             .sequence(seq)
             .qualities(qual)
             .cigar_ops(&[encode_op(0, n)])
-            .add_string_tag(b"MI", b"UMI123");
+            .add_string_tag(SamTag::MI, b"UMI123");
         b.build()
     }
 
@@ -1721,7 +1722,7 @@ mod tests {
                 .sequence(b"ACGT")
                 .qualities(b"####")
                 .cigar_ops(&[encode_op(0, 4)])
-                .add_string_tag(b"MI", b"UMI123");
+                .add_string_tag(SamTag::MI, b"UMI123");
             b.build()
         };
 
@@ -1769,7 +1770,7 @@ mod tests {
         assert_eq!(consensus.bases, b"ACGT");
 
         // Check tags
-        assert_eq!(consensus.get_int_tag(b"cD").expect("get_int_tag should succeed"), 3);
+        assert_eq!(consensus.get_int_tag(SamTag::CD).expect("get_int_tag should succeed"), 3);
     }
 
     #[test]
@@ -2072,7 +2073,7 @@ mod tests {
             .sequence(bases)
             .qualities(quals)
             .cigar_ops(&[encode_op(0, n)])
-            .add_string_tag(b"MI", umi.as_bytes());
+            .add_string_tag(SamTag::MI, umi.as_bytes());
         b.build()
     }
 
@@ -2425,31 +2426,33 @@ mod tests {
 
         // cD (max depth) should be 4
         assert_eq!(
-            consensus.get_int_tag(b"cD").expect("get_int_tag should succeed"),
+            consensus.get_int_tag(SamTag::CD).expect("get_int_tag should succeed"),
             4,
             "cD should be 4"
         );
 
         // cM (min depth) should be 4
         assert_eq!(
-            consensus.get_int_tag(b"cM").expect("get_int_tag should succeed"),
+            consensus.get_int_tag(SamTag::CM).expect("get_int_tag should succeed"),
             4,
             "cM should be 4"
         );
 
         // cE (error rate) should be 1/40 = 0.025 (1 error in 40 bases)
-        let error_rate = consensus.get_float_tag(b"cE").expect("get_float_tag should succeed");
+        let error_rate = consensus.get_float_tag(SamTag::CE).expect("get_float_tag should succeed");
         assert!((error_rate - 0.025).abs() < 0.01, "cE should be ~0.025, got {error_rate}");
 
         // Check per-base depth tag (cd)
-        let depths = consensus.get_i16_array_tag(b"cd").expect("cd tag should be present");
+        let depths =
+            consensus.get_i16_array_tag(SamTag::CD_BASES).expect("cd tag should be present");
         // All depths should be 4
         for (i, &d) in depths.iter().enumerate() {
             assert_eq!(d, 4, "Position {i} depth should be 4");
         }
 
         // Check per-base error tag (ce)
-        let errors = consensus.get_i16_array_tag(b"ce").expect("ce tag should be present");
+        let errors =
+            consensus.get_i16_array_tag(SamTag::CE_BASES).expect("ce tag should be present");
         // Position 5 should have 1 error, others should have 0
         for (i, &e) in errors.iter().enumerate() {
             if i == 5 {
@@ -2500,12 +2503,14 @@ mod tests {
         assert_eq!(consensus.bases[3], b'G', "Position 3 consensus should be G");
 
         // Check per-base depth tag (cd) - position 3 should have depth 3 (N ignored)
-        let depths = consensus.get_i16_array_tag(b"cd").expect("cd tag should be present");
+        let depths =
+            consensus.get_i16_array_tag(SamTag::CD_BASES).expect("cd tag should be present");
         assert_eq!(depths.len(), 8, "Should have 8 depth values, got {}", depths.len());
         assert_eq!(depths[3], 3, "Position 3 depth should be 3 (N ignored)");
 
         // Check per-base error tag (ce) - position 3 should have 1 error (T vs G consensus)
-        let errors = consensus.get_i16_array_tag(b"ce").expect("ce tag should be present");
+        let errors =
+            consensus.get_i16_array_tag(SamTag::CE_BASES).expect("ce tag should be present");
         assert_eq!(errors[3], 1, "Position 3 should have 1 error (T vs G consensus)");
     }
 
@@ -2556,7 +2561,8 @@ mod tests {
         }
 
         // Check per-base depth tag - all should be 1 (only one read contributed)
-        let depths = consensus.get_i16_array_tag(b"cd").expect("cd tag should be present");
+        let depths =
+            consensus.get_i16_array_tag(SamTag::CD_BASES).expect("cd tag should be present");
         for (i, &d) in depths.iter().enumerate() {
             assert_eq!(d, 1, "Position {i} depth should be 1");
         }
@@ -2586,23 +2592,26 @@ mod tests {
         let consensus = &records[0];
 
         // Per-read tags should still be present
-        assert!(consensus.get_int_tag(b"cD").is_some(), "cD (per-read depth) should be present");
         assert!(
-            consensus.get_int_tag(b"cM").is_some(),
+            consensus.get_int_tag(SamTag::CD).is_some(),
+            "cD (per-read depth) should be present"
+        );
+        assert!(
+            consensus.get_int_tag(SamTag::CM).is_some(),
             "cM (per-read min depth) should be present"
         );
         assert!(
-            consensus.get_float_tag(b"cE").is_some(),
+            consensus.get_float_tag(SamTag::CE).is_some(),
             "cE (per-read error rate) should be present"
         );
 
         // Per-base tags should NOT be present
         assert!(
-            consensus.get_i16_array_tag(b"cd").is_none(),
+            consensus.get_i16_array_tag(SamTag::CD_BASES).is_none(),
             "cd (per-base depth) should NOT be present"
         );
         assert!(
-            consensus.get_i16_array_tag(b"ce").is_none(),
+            consensus.get_i16_array_tag(SamTag::CE_BASES).is_none(),
             "ce (per-base error) should NOT be present"
         );
     }
@@ -3030,7 +3039,7 @@ mod tests {
                 .sequence(&[b'A'; 50])
                 .qualities(&[30; 50])
                 .cigar_ops(&[encode_op(0, 50)])
-                .add_string_tag(b"MC", b"50M");
+                .add_string_tag(SamTag::MC, b"50M");
             b.build()
         };
 
@@ -3070,7 +3079,7 @@ mod tests {
                 .sequence(&[b'A'; 100])
                 .qualities(&[30; 100])
                 .cigar_ops(&[encode_op(0, 40), encode_op(1, 20), encode_op(0, 40)])
-                .add_string_tag(b"MC", b"40M20I40M");
+                .add_string_tag(SamTag::MC, b"40M20I40M");
             b.build()
         };
 
@@ -3107,7 +3116,7 @@ mod tests {
                 .sequence(&[b'A'; 50])
                 .qualities(&[30; 50])
                 .cigar_ops(&[encode_op(0, 50)])
-                .add_string_tag(b"MC", b"50M");
+                .add_string_tag(SamTag::MC, b"50M");
             b.build()
         };
 
@@ -3143,7 +3152,7 @@ mod tests {
                 .sequence(&[b'A'; 50])
                 .qualities(&[30; 50])
                 .cigar_ops(&[encode_op(0, 50)])
-                .add_string_tag(b"MC", b"30M");
+                .add_string_tag(SamTag::MC, b"30M");
             b.build()
         };
 
@@ -3257,7 +3266,7 @@ mod tests {
                 .sequence(&seq_r1)
                 .qualities(&[30; 50])
                 .cigar_ops(&[encode_op(0, 50)])
-                .add_string_tag(b"MC", b"50M");
+                .add_string_tag(SamTag::MC, b"50M");
             b.build()
         };
 
@@ -3293,7 +3302,7 @@ mod tests {
                 .sequence(&seq_r2)
                 .qualities(&[30; 50])
                 .cigar_ops(&[encode_op(0, 50)])
-                .add_string_tag(b"MC", b"50M");
+                .add_string_tag(SamTag::MC, b"50M");
             b.build()
         };
 
@@ -3339,7 +3348,7 @@ mod tests {
                 .sequence(&[b'A'; 142])
                 .qualities(&[30; 142])
                 .cigar_ops(&[encode_op(4, 47), encode_op(0, 72), encode_op(4, 23)])
-                .add_string_tag(b"MC", b"46S96M");
+                .add_string_tag(SamTag::MC, b"46S96M");
             b.build()
         };
 
@@ -3380,7 +3389,7 @@ mod tests {
                 .sequence(&[b'A'; 142])
                 .qualities(&[30; 142])
                 .cigar_ops(&[encode_op(4, 46), encode_op(0, 96)])
-                .add_string_tag(b"MC", b"47S72M23S");
+                .add_string_tag(SamTag::MC, b"47S72M23S");
             b.build()
         };
 
@@ -3425,7 +3434,7 @@ mod tests {
                 .sequence(&seq_r1_sc)
                 .qualities(&[30; 50])
                 .cigar_ops(&[encode_op(4, 10), encode_op(0, 35), encode_op(4, 5)])
-                .add_string_tag(b"MC", b"12S30M8S");
+                .add_string_tag(SamTag::MC, b"12S30M8S");
             b.build()
         };
 
@@ -3540,7 +3549,8 @@ mod tests {
         assert_eq!(consensus.bases, b"GATTACA", "Consensus should follow majority");
 
         // Check per-base errors - position 4 should have 1 error
-        let errors = consensus.get_i16_array_tag(b"ce").expect("ce tag should be present");
+        let errors =
+            consensus.get_i16_array_tag(SamTag::CE_BASES).expect("ce tag should be present");
         assert_eq!(errors[4], 1, "Position 4 should have 1 error (T vs A consensus)");
         // Other positions should have 0 errors
         for (i, &e) in errors.iter().enumerate() {
@@ -3706,7 +3716,7 @@ mod tests {
             .sequence(bases)
             .qualities(quals)
             .cigar_ops(&[encode_op(0, len)])
-            .add_string_tag(b"MI", umi);
+            .add_string_tag(SamTag::MI, umi);
         b.build()
     }
 
@@ -3738,7 +3748,7 @@ mod tests {
             .cigar_ops(&cigar)
             .mate_ref_id(0)
             .mate_pos(pos2)
-            .add_string_tag(b"MI", umi);
+            .add_string_tag(SamTag::MI, umi);
         let r1 = b1.build();
 
         let mut b2 = SamBuilder::new();
@@ -3751,7 +3761,7 @@ mod tests {
             .cigar_ops(&cigar)
             .mate_ref_id(0)
             .mate_pos(pos1)
-            .add_string_tag(b"MI", umi);
+            .add_string_tag(SamTag::MI, umi);
         let r2 = b2.build();
 
         (r1, r2)
@@ -3922,7 +3932,7 @@ mod tests {
                 .sequence(b"AGCACGACGT")
                 .qualities(&[30, 30, 30, 2, 5, 2, 3, 20, 2, 6])
                 .cigar_ops(&[encode_op(0, 10)])
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -3964,7 +3974,7 @@ mod tests {
                 .sequence(b"AAAAAAAAAA")
                 // Not setting qualities → SamBuilder encodes 0xFF (absent) per BAM spec
                 .cigar_ops(&[encode_op(0, 10)])
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4002,7 +4012,7 @@ mod tests {
                 .qualities(&[30; 10])
                 .cigar_ops(&[encode_op(0, len)])
                 // No MC tag intentionally
-                .add_string_tag(b"MI", b"GATTACA");
+                .add_string_tag(SamTag::MI, b"GATTACA");
             b.build()
         };
         let r2 = {
@@ -4018,7 +4028,7 @@ mod tests {
                 .qualities(&[30; 10])
                 .cigar_ops(&[encode_op(0, len)])
                 // No MC tag intentionally
-                .add_string_tag(b"MI", b"GATTACA");
+                .add_string_tag(SamTag::MI, b"GATTACA");
             b.build()
         };
 
@@ -4067,8 +4077,8 @@ mod tests {
                 .sequence(&bases)
                 .qualities(&quals)
                 .cigar_ops(&[encode_op(0, 10)])
-                .add_string_tag(b"MI", b"AAA")
-                .add_string_tag(b"RX", b"TTT");
+                .add_string_tag(SamTag::MI, b"AAA")
+                .add_string_tag(SamTag::RX, b"TTT");
             b.build()
         };
 
@@ -4081,8 +4091,8 @@ mod tests {
                 .sequence(&bases)
                 .qualities(&quals)
                 .cigar_ops(&[encode_op(0, 5), encode_op(2, 5), encode_op(0, 5)])
-                .add_string_tag(b"MI", b"AAA")
-                .add_string_tag(b"RX", b"ATT");
+                .add_string_tag(SamTag::MI, b"AAA")
+                .add_string_tag(SamTag::RX, b"ATT");
             b.build()
         };
 
@@ -4095,8 +4105,8 @@ mod tests {
                 .sequence(&bases)
                 .qualities(&quals)
                 .cigar_ops(&[encode_op(0, 10)])
-                .add_string_tag(b"MI", b"AAA")
-                .add_string_tag(b"RX", b"TAT");
+                .add_string_tag(SamTag::MI, b"AAA")
+                .add_string_tag(SamTag::RX, b"TAT");
             b.build()
         };
 
@@ -4109,8 +4119,8 @@ mod tests {
                 .sequence(&bases)
                 .qualities(&quals)
                 .cigar_ops(&[encode_op(0, 4), encode_op(1, 2), encode_op(0, 4)])
-                .add_string_tag(b"MI", b"AAA")
-                .add_string_tag(b"RX", b"TTA");
+                .add_string_tag(SamTag::MI, b"AAA")
+                .add_string_tag(SamTag::RX, b"TTA");
             b.build()
         };
 
@@ -4131,7 +4141,7 @@ mod tests {
         let consensus = &records[0];
 
         // Check the RX tag - should be consensus of TTT and TAT = TNT
-        let consensus_rx = consensus.get_string_tag(b"RX");
+        let consensus_rx = consensus.get_string_tag(SamTag::RX);
 
         assert_eq!(
             consensus_rx,
@@ -4270,7 +4280,7 @@ mod tests {
                 .sequence(b"ACGT")
                 .qualities(&[30, 30, 30, 30])
                 .cigar_ops(&[encode_op(0, 4)])
-                .add_string_tag(b"MI", umi);
+                .add_string_tag(SamTag::MI, umi);
             b.build()
         }
 
@@ -4346,7 +4356,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(999)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4361,7 +4371,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(999)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4376,7 +4386,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 25), encode_op(1, 25)])
                 .mate_ref_id(0)
                 .mate_pos(999)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4392,7 +4402,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(99)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4407,7 +4417,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(99)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4422,7 +4432,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(99)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4506,7 +4516,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(999)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4521,7 +4531,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(999)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4536,7 +4546,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(999)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4552,7 +4562,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(99)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4567,7 +4577,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .mate_ref_id(0)
                 .mate_pos(99)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4582,7 +4592,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 25), encode_op(1, 25)])
                 .mate_ref_id(0)
                 .mate_pos(99)
-                .add_string_tag(b"MI", b"UMI1");
+                .add_string_tag(SamTag::MI, b"UMI1");
             b.build()
         };
 
@@ -4685,22 +4695,22 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'C'; 10]);
 
         // MM tag should be present (all positions are methylated C)
-        let mm = consensus.get_string_tag(b"MM").expect("MM tag should be present");
+        let mm = consensus.get_string_tag(SamTag::MM).expect("MM tag should be present");
         assert!(mm.starts_with(b"C+m"), "MM should start with C+m");
 
         // ML tag should be present
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         // All positions methylated → all probabilities should be 255 (3/3 unconverted)
         for &p in &ml {
             assert_eq!(p, 255, "Expected methylation probability 255 for fully methylated");
         }
 
         // cu (unconverted counts) should all be 3
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![3i16; 10]);
 
         // ct (converted counts) should all be 0
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![0i16; 10]);
     }
 
@@ -4728,18 +4738,18 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'C'; 10]);
 
         // MM/ML tags present — consensus is C at ref-C, prob = unconverted/total = 0/3 = 0
-        let mm = consensus.get_string_tag(b"MM").expect("MM tag should be present");
+        let mm = consensus.get_string_tag(SamTag::MM).expect("MM tag should be present");
         assert_eq!(mm, b"C+m,0,0,0,0,0,0,0,0,0,0;");
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         assert_eq!(ml.len(), 10);
         assert!(ml.iter().all(|&p| p == 0), "all probs should be 0, got {ml:?}");
 
         // cu should all be 0 (no reads showed C)
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![0i16; 10]);
 
         // ct should all be 3 (all reads showed T)
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![3i16; 10]);
     }
 
@@ -4765,15 +4775,15 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'C'; 10]);
 
         // ML probabilities should be ~170 (2/3 ≈ 0.667 * 255 = 170)
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         for &p in &ml {
             assert_eq!(p, 170, "Expected ~170 for 2/3 methylation ratio");
         }
 
         // cu should be 2, ct should be 1
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![2i16; 10]);
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![1i16; 10]);
     }
 
@@ -4798,12 +4808,12 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'A'; 10]);
 
         // MM tag should not be present (no ref-C positions)
-        assert!(consensus.get_string_tag(b"MM").is_none(), "MM tag should be absent");
+        assert!(consensus.get_string_tag(SamTag::MM).is_none(), "MM tag should be absent");
 
         // cu/ct should still be present but all zeros
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![0i16; 10]);
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![0i16; 10]);
     }
 
@@ -4832,10 +4842,10 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'T'; 10]);
 
         // No methylation tags
-        assert!(consensus.get_string_tag(b"MM").is_none());
-        assert!(consensus.get_u8_array_tag(b"ML").is_none());
-        assert!(consensus.get_i16_array_tag(b"cu").is_none());
-        assert!(consensus.get_i16_array_tag(b"ct").is_none());
+        assert!(consensus.get_string_tag(SamTag::MM).is_none());
+        assert!(consensus.get_u8_array_tag(SamTag::ML).is_none());
+        assert!(consensus.get_i16_array_tag(SamTag::CU).is_none());
+        assert!(consensus.get_i16_array_tag(SamTag::CT).is_none());
     }
 
     /// Test: The longest source read is used as the mapping template, not the first.
@@ -4862,7 +4872,7 @@ mod tests {
         assert_eq!(consensus.bases.len(), 10);
 
         // cu tag should have 10 entries: 3 for positions 0-4 (all reads), 2 for 5-9 (long reads)
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu.len(), 10, "cu tag should cover all 10 consensus positions");
         for &c in &cu[0..5] {
             assert_eq!(c, 3, "positions 0-4 covered by all 3 reads");
@@ -4872,15 +4882,15 @@ mod tests {
         }
 
         // ct (converted counts) should all be 0
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![0i16; 10]);
 
         // MM tag should cover all 10 positions
-        let mm = consensus.get_string_tag(b"MM").expect("MM tag should be present");
+        let mm = consensus.get_string_tag(SamTag::MM).expect("MM tag should be present");
         assert!(mm.starts_with(b"C+m"), "MM should start with C+m");
 
         // ML tag should have 10 entries (one per C position)
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         assert_eq!(ml.len(), 10, "ML tag should cover all 10 consensus positions");
     }
 
@@ -4913,19 +4923,19 @@ mod tests {
         // Consensus bases should be C (unmethylated in TAPs = unconverted)
         assert_eq!(consensus.bases, vec![b'C'; 10]);
 
-        let mm = consensus.get_string_tag(b"MM").expect("MM tag should be present");
+        let mm = consensus.get_string_tag(SamTag::MM).expect("MM tag should be present");
         assert!(mm.starts_with(b"C+m"), "MM should start with C+m");
 
         // In TAPs: all C (unconverted) means 0 converted → methylation prob = 0/3 = 0
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         for &p in &ml {
             assert_eq!(p, 0, "Expected methylation probability 0 for fully unmethylated TAPs");
         }
 
         // cu (unconverted) = 3, ct (converted) = 0
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![3i16; 10]);
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![0i16; 10]);
     }
 
@@ -4952,17 +4962,17 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'C'; 10]);
 
         // MM/ML tags should be present — consensus is C at ref-C positions
-        let mm = consensus.get_string_tag(b"MM").expect("MM tag should be present");
+        let mm = consensus.get_string_tag(SamTag::MM).expect("MM tag should be present");
         assert_eq!(mm, b"C+m,0,0,0,0,0,0,0,0,0,0;");
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         // TAPs prob = converted/total = 3/3 → 255
         assert_eq!(ml.len(), 10);
         assert!(ml.iter().all(|&p| p == 255), "all probs should be 255, got {ml:?}");
 
         // cu/ct tags should still be present with correct counts
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![0i16; 10]);
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![3i16; 10]);
     }
 
@@ -4988,14 +4998,14 @@ mod tests {
         assert_eq!(consensus.bases, vec![b'C'; 10]);
 
         // TAPs: prob = converted/total = 1/3 * 255 = 85
-        let ml = consensus.get_u8_array_tag(b"ML").expect("ML tag should be present");
+        let ml = consensus.get_u8_array_tag(SamTag::ML).expect("ML tag should be present");
         for &p in &ml {
             assert_eq!(p, 85, "Expected ~85 for 1/3 methylation ratio in TAPs");
         }
 
-        let cu = consensus.get_i16_array_tag(b"cu").expect("cu tag should be present");
+        let cu = consensus.get_i16_array_tag(SamTag::CU).expect("cu tag should be present");
         assert_eq!(cu, vec![2i16; 10]);
-        let ct = consensus.get_i16_array_tag(b"ct").expect("ct tag should be present");
+        let ct = consensus.get_i16_array_tag(SamTag::CT).expect("ct tag should be present");
         assert_eq!(ct, vec![1i16; 10]);
     }
 
@@ -5014,7 +5024,7 @@ mod tests {
         let r3 = create_consensus_test_read("r3", &[b'T'; 10], &quals, "UMI1");
         let em_output = consensus_reads_from_raw(&mut em_caller, vec![r1, r2, r3]).unwrap();
         let em_records = ParsedBamRecord::parse_all(&em_output.data);
-        let em_ml = em_records[0].get_u8_array_tag(b"ML").unwrap();
+        let em_ml = em_records[0].get_u8_array_tag(SamTag::ML).unwrap();
 
         // TAPs: 2C + 1T → prob = converted/total = 1/3*255 = 85
         let mut taps_caller = create_taps_caller(&ref_seq);
@@ -5023,7 +5033,7 @@ mod tests {
         let r3 = create_consensus_test_read("r3", &[b'T'; 10], &quals, "UMI1");
         let taps_output = consensus_reads_from_raw(&mut taps_caller, vec![r1, r2, r3]).unwrap();
         let taps_records = ParsedBamRecord::parse_all(&taps_output.data);
-        let taps_ml = taps_records[0].get_u8_array_tag(b"ML").unwrap();
+        let taps_ml = taps_records[0].get_u8_array_tag(SamTag::ML).unwrap();
 
         // EM-seq: 170, TAPs: 85 — they sum to 255
         for (&em_p, &taps_p) in em_ml.iter().zip(taps_ml.iter()) {

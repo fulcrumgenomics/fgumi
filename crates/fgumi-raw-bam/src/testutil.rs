@@ -60,31 +60,36 @@ impl ParsedBamRecord {
 
     /// Find a Z-type string tag value by tag name.
     #[must_use]
-    pub fn get_string_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+    pub fn get_string_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<Vec<u8>> {
+        let tag = tag.as_tag_bytes();
         find_z_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find an integer tag value (c/s/i type) by tag name.
     #[must_use]
-    pub fn get_int_tag(&self, tag: &[u8; 2]) -> Option<i32> {
+    pub fn get_int_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<i32> {
+        let tag = tag.as_tag_bytes();
         find_int_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find a float tag value by tag name.
     #[must_use]
-    pub fn get_float_tag(&self, tag: &[u8; 2]) -> Option<f32> {
+    pub fn get_float_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<f32> {
+        let tag = tag.as_tag_bytes();
         find_float_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find a B:s (i16 array) tag value by tag name.
     #[must_use]
-    pub fn get_i16_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<i16>> {
+    pub fn get_i16_array_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<Vec<i16>> {
+        let tag = tag.as_tag_bytes();
         find_i16_array_tag_in_aux(&self.aux_data, *tag)
     }
 
     /// Find a B:C (u8 array) tag value by tag name.
     #[must_use]
-    pub fn get_u8_array_tag(&self, tag: &[u8; 2]) -> Option<Vec<u8>> {
+    pub fn get_u8_array_tag(&self, tag: impl fgumi_tag::AsTagBytes) -> Option<Vec<u8>> {
+        let tag = tag.as_tag_bytes();
         find_u8_array_tag_in_aux(&self.aux_data, *tag)
     }
 }
@@ -101,20 +106,20 @@ fn unpack_sequence_for_test(packed: &[u8], l_seq: usize) -> Vec<u8> {
 }
 
 fn find_z_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    crate::tags::find_string_tag(aux, &tag).map(<[u8]>::to_vec)
+    crate::tags::find_string_tag(aux, tag).map(<[u8]>::to_vec)
 }
 
 #[expect(clippy::cast_possible_truncation, reason = "test values always fit in i32")]
 fn find_int_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<i32> {
-    crate::tags::find_int_tag(aux, &tag).map(|v| v as i32)
+    crate::tags::find_int_tag(aux, tag).map(|v| v as i32)
 }
 
 fn find_float_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<f32> {
-    crate::tags::find_float_tag(aux, &tag)
+    crate::tags::find_float_tag(aux, tag)
 }
 
 fn find_u8_array_tag_in_aux(aux: &[u8], tag: [u8; 2]) -> Option<Vec<u8>> {
-    let arr = crate::tags::find_array_tag(aux, &tag)?;
+    let arr = crate::tags::find_array_tag(aux, tag)?;
     (arr.elem_type == b'C').then(|| arr.data.to_vec())
 }
 

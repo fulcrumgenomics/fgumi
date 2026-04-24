@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/xtask"]
+members = [".", "crates/fgumi-raw-bam", "crates/fgumi-dna", "crates/fgumi-bgzf", "crates/fgumi-metrics", "crates/fgumi-sam", "crates/fgumi-simd-fastq", "crates/fgumi-tag", "crates/fgumi-umi", "crates/fgumi-consensus", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,7 @@ fgumi-metrics = { version = "0.2.0", path = "crates/fgumi-metrics" }
 fgumi-raw-bam = { version = "0.2.0", path = "crates/fgumi-raw-bam" }
 fgumi-sam = { version = "0.2.0", path = "crates/fgumi-sam" }
 fgumi-simd-fastq = { version = "0.2.0", path = "crates/fgumi-simd-fastq" }
+fgumi-tag = { version = "0.2.0", path = "crates/fgumi-tag" }
 fgumi-umi = { version = "0.2.0", path = "crates/fgumi-umi" }
 bytemuck = { version = "1.14", features = ["derive"] }
 wide = "1.3"

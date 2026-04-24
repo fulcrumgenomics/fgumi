@@ -16,6 +16,7 @@ use crate::commands::simulate::common::{
 use crate::commands::simulate::region_to_bin;
 use crate::dna::reverse_complement;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::simulate::{
     FamilySizeDistribution, InsertSizeModel, PositionQualityModel, ReadPairQualityBias,
     StrandBiasModel, create_rng,
@@ -667,10 +668,10 @@ fn build_record(
         .cigar_ops(&[cigar_op])
         .sequence(seq)
         .qualities(quals)
-        .add_string_tag(b"RX", umi.as_bytes())
-        .add_string_tag(b"MI", mi_tag.as_bytes())
-        .add_string_tag(b"MC", mate_cigar.as_bytes())
-        .add_int_tag(b"MQ", i32::from(mate_mapq));
+        .add_string_tag(SamTag::RX, umi.as_bytes())
+        .add_string_tag(SamTag::MI, mi_tag.as_bytes())
+        .add_string_tag(SamTag::MC, mate_cigar.as_bytes())
+        .add_int_tag(SamTag::MQ, i32::from(mate_mapq));
     b.build()
 }
 

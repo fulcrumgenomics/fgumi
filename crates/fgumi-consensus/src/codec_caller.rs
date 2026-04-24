@@ -84,7 +84,9 @@ use crate::vanilla_caller::{
 use crate::{IndexedSourceRead, SourceRead, select_most_common_alignment_group};
 use anyhow::Result;
 use fgumi_dna::dna::reverse_complement;
-use fgumi_raw_bam::{self as bam_fields, RawRecord, RawRecordView, UnmappedSamBuilder, flags};
+use fgumi_raw_bam::{
+    self as bam_fields, RawRecord, RawRecordView, SamTag, UnmappedSamBuilder, flags,
+};
 use noodles::sam::alignment::record::data::field::Tag;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -536,7 +538,7 @@ impl CodecConsensusCaller {
         // Extract MI tag from first record for naming
         let umi: Option<String> = RawRecordView::new(&records[0])
             .tags()
-            .find_string(b"MI")
+            .find_string(SamTag::MI)
             .map(|b| String::from_utf8_lossy(b).to_string());
 
         // Phase 1: Filter on raw bytes — keep paired, primary, mapped, FR-pair reads
@@ -1250,11 +1252,11 @@ impl CodecConsensusCaller {
         );
 
         // RG tag
-        self.bam_builder.append_string_tag(b"RG", self.read_group_id.as_bytes());
+        self.bam_builder.append_string_tag(SamTag::RG, self.read_group_id.as_bytes());
 
         // MI tag
         if let Some(umi_str) = umi {
-            self.bam_builder.append_string_tag(b"MI", umi_str.as_bytes());
+            self.bam_builder.append_string_tag(SamTag::MI, umi_str.as_bytes());
         }
 
         // Duplex consensus tags (cD, cM, cE)
@@ -1273,9 +1275,9 @@ impl CodecConsensusCaller {
         let error_rate =
             if total_bases > 0 { total_errors as f32 / total_bases as f32 } else { 0.0 };
 
-        self.bam_builder.append_int_tag(b"cD", total_depth);
-        self.bam_builder.append_int_tag(b"cM", min_depth);
-        self.bam_builder.append_float_tag(b"cE", error_rate);
+        self.bam_builder.append_int_tag(SamTag::CD, total_depth);
+        self.bam_builder.append_int_tag(SamTag::CM, min_depth);
+        self.bam_builder.append_float_tag(SamTag::CE, error_rate);
 
         // AB strand tags (aD, aM, aE)
         let a_max_depth = ss_a.depths.iter().map(|&d| i32::from(d)).max().unwrap_or(0);
@@ -1285,9 +1287,9 @@ impl CodecConsensusCaller {
         let a_error_rate =
             if a_total_bases > 0 { a_total_errors as f32 / a_total_bases as f32 } else { 0.0 };
 
-        self.bam_builder.append_int_tag(b"aD", a_max_depth);
-        self.bam_builder.append_int_tag(b"aM", a_min_depth);
-        self.bam_builder.append_float_tag(b"aE", a_error_rate);
+        self.bam_builder.append_int_tag(SamTag::AD, a_max_depth);
+        self.bam_builder.append_int_tag(SamTag::AM, a_min_depth);
+        self.bam_builder.append_float_tag(SamTag::AE, a_error_rate);
 
         // BA strand tags (bD, bM, bE)
         let b_max_depth = ss_b.depths.iter().map(|&d| i32::from(d)).max().unwrap_or(0);
@@ -1297,40 +1299,40 @@ impl CodecConsensusCaller {
         let b_error_rate =
             if b_total_bases > 0 { b_total_errors as f32 / b_total_bases as f32 } else { 0.0 };
 
-        self.bam_builder.append_int_tag(b"bD", b_max_depth);
-        self.bam_builder.append_int_tag(b"bM", b_min_depth);
-        self.bam_builder.append_float_tag(b"bE", b_error_rate);
+        self.bam_builder.append_int_tag(SamTag::BD, b_max_depth);
+        self.bam_builder.append_int_tag(SamTag::BM, b_min_depth);
+        self.bam_builder.append_float_tag(SamTag::BE, b_error_rate);
 
         // Per-base tags if enabled
         if self.options.produce_per_base_tags {
             // Per-base depth arrays - convert to signed integers to match fgbio/simplex/duplex
             let ad_array: Vec<i16> = ss_a.depths.iter().map(|&d| d as i16).collect();
             let bd_array: Vec<i16> = ss_b.depths.iter().map(|&d| d as i16).collect();
-            self.bam_builder.append_i16_array_tag(b"ad", &ad_array);
-            self.bam_builder.append_i16_array_tag(b"bd", &bd_array);
+            self.bam_builder.append_i16_array_tag(SamTag::AD_BASES, &ad_array);
+            self.bam_builder.append_i16_array_tag(SamTag::BD_BASES, &bd_array);
 
             // Per-base error arrays - convert to signed integers to match fgbio/simplex/duplex
             let ae_array: Vec<i16> = ss_a.errors.iter().map(|&e| e as i16).collect();
             let be_array: Vec<i16> = ss_b.errors.iter().map(|&e| e as i16).collect();
-            self.bam_builder.append_i16_array_tag(b"ae", &ae_array);
-            self.bam_builder.append_i16_array_tag(b"be", &be_array);
+            self.bam_builder.append_i16_array_tag(SamTag::AE_BASES, &ae_array);
+            self.bam_builder.append_i16_array_tag(SamTag::BE_BASES, &be_array);
 
             // Single-strand consensus sequences
-            self.bam_builder.append_string_tag(b"ac", &ss_a.bases);
-            self.bam_builder.append_string_tag(b"bc", &ss_b.bases);
+            self.bam_builder.append_string_tag(SamTag::AC, &ss_a.bases);
+            self.bam_builder.append_string_tag(SamTag::BC_BASES, &ss_b.bases);
 
             // Single-strand consensus qualities - Phred+33 encoded
-            self.bam_builder.append_phred33_string_tag(b"aq", &ss_a.quals);
-            self.bam_builder.append_phred33_string_tag(b"bq", &ss_b.quals);
+            self.bam_builder.append_phred33_string_tag(SamTag::AQ, &ss_a.quals);
+            self.bam_builder.append_phred33_string_tag(SamTag::BQ, &ss_b.quals);
         }
 
         // Cell barcode tag - extract from first source read if configured
         if let Some(cell_tag) = &self.options.cell_tag {
             let cell_tag_bytes: [u8; 2] = [cell_tag.as_ref()[0], cell_tag.as_ref()[1]];
             for raw in source_raws {
-                if let Some(cell_bc) = RawRecordView::new(raw).tags().find_string(&cell_tag_bytes) {
+                if let Some(cell_bc) = RawRecordView::new(raw).tags().find_string(cell_tag_bytes) {
                     if !cell_bc.is_empty() {
-                        self.bam_builder.append_string_tag(&cell_tag_bytes, cell_bc);
+                        self.bam_builder.append_string_tag(cell_tag_bytes, cell_bc);
                         break;
                     }
                 }
@@ -1346,7 +1348,7 @@ impl CodecConsensusCaller {
             .filter_map(|raw| {
                 RawRecordView::new(raw)
                     .tags()
-                    .find_string(b"RX")
+                    .find_string(SamTag::RX)
                     .and_then(|b| String::from_utf8(b.to_vec()).ok())
             })
             .collect();
@@ -1354,7 +1356,7 @@ impl CodecConsensusCaller {
         if !umis.is_empty() {
             let consensus_umi = consensus_umis(&umis);
             if !consensus_umi.is_empty() {
-                self.bam_builder.append_string_tag(b"RX", consensus_umi.as_bytes());
+                self.bam_builder.append_string_tag(SamTag::RX, consensus_umi.as_bytes());
             }
         }
 
@@ -1697,7 +1699,7 @@ mod tests {
             .mate_ref_id(0)
             .mate_pos(mate_pos_0based)
             .template_length(tlen);
-        b.add_string_tag(b"MI", b"UMI123");
+        b.add_string_tag(SamTag::MI, b"UMI123");
         b.build()
     }
 
@@ -2144,9 +2146,9 @@ mod tests {
             .mate_ref_id(0)
             .mate_pos((start2 - 1) as i32)
             .template_length(template_len);
-        b1.add_string_tag(b"MI", mi_tag.as_bytes());
+        b1.add_string_tag(SamTag::MI, mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            b1.add_string_tag(b"RX", rx.as_bytes());
+            b1.add_string_tag(SamTag::RX, rx.as_bytes());
         }
         let r1 = b1.build();
 
@@ -2170,9 +2172,9 @@ mod tests {
             .mate_ref_id(0)
             .mate_pos((start1 - 1) as i32)
             .template_length(-template_len);
-        b2.add_string_tag(b"MI", mi_tag.as_bytes());
+        b2.add_string_tag(SamTag::MI, mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            b2.add_string_tag(b"RX", rx.as_bytes());
+            b2.add_string_tag(SamTag::RX, rx.as_bytes());
         }
         let r2 = b2.build();
 
@@ -2224,7 +2226,7 @@ mod tests {
         assert_eq!(consensus.bases.len(), 40, "Consensus should be 40bp");
 
         // Check RX tag is preserved (UmiBases consensus)
-        let rx = consensus.get_string_tag(b"RX").expect("RX tag not found in consensus");
+        let rx = consensus.get_string_tag(SamTag::RX).expect("RX tag not found in consensus");
         assert_eq!(&rx[..], b"ACC-TGA", "RX tag should be preserved");
     }
 

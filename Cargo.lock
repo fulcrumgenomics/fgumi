@@ -754,6 +754,7 @@ dependencies = [
  "anyhow",
  "bstr 1.12.1",
  "bytemuck",
+ "fgumi-tag",
  "noodles",
  "proptest",
  "rstest",
@@ -770,6 +771,7 @@ dependencies = [
  "clap",
  "fgumi-dna",
  "fgumi-raw-bam",
+ "fgumi-tag",
  "log",
  "noodles",
  "tempfile",
@@ -784,6 +786,14 @@ dependencies = [
  "proptest",
  "rstest",
  "seq_io",
+]
+
+[[package]]
+name = "fgumi-tag"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "noodles",
 ]
 
 [[package]]

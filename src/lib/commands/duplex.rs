@@ -866,7 +866,7 @@ fn has_both_strands_raw(records: &[RawRecord]) -> bool {
     let mut has_b = false;
 
     for raw in records {
-        if let Some(mi_bytes) = bam_fields::find_string_tag_in_record(raw, b"MI") {
+        if let Some(mi_bytes) = bam_fields::find_string_tag_in_record(raw, SamTag::MI) {
             // Strip trailing NUL if present (raw BAM Z-tags may be NUL-terminated)
             let mi_bytes = mi_bytes.strip_suffix(&[0]).unwrap_or(mi_bytes);
             if mi_bytes.len() >= 2 {
@@ -1038,12 +1038,12 @@ mod tests {
             .qualities(&qual)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos2 - 1);
-        b1.add_string_tag(b"MI", mi_tag.as_bytes());
+        b1.add_string_tag(SamTag::MI, mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            b1.add_string_tag(b"RX", rx.as_bytes());
+            b1.add_string_tag(SamTag::RX, rx.as_bytes());
         }
         if let Some(cell) = cell_tag {
-            b1.add_string_tag(b"CB", cell.as_bytes());
+            b1.add_string_tag(SamTag::CB, cell.as_bytes());
         }
         let r1 = to_record_buf(b1.build());
 
@@ -1058,12 +1058,12 @@ mod tests {
             .qualities(&qual)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos1 - 1);
-        b2.add_string_tag(b"MI", mi_tag.as_bytes());
+        b2.add_string_tag(SamTag::MI, mi_tag.as_bytes());
         if let Some(rx) = rx_tag {
-            b2.add_string_tag(b"RX", rx.as_bytes());
+            b2.add_string_tag(SamTag::RX, rx.as_bytes());
         }
         if let Some(cell) = cell_tag {
-            b2.add_string_tag(b"CB", cell.as_bytes());
+            b2.add_string_tag(SamTag::CB, cell.as_bytes());
         }
         let r2 = to_record_buf(b2.build());
 

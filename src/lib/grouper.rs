@@ -1033,7 +1033,7 @@ mod tests {
     // RecordPositionGrouper tests
     // ========================================================================
 
-    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags as raw_flags};
+    use fgumi_raw_bam::{SamBuilder as RawSamBuilder, SamTag, flags as raw_flags};
 
     /// Helper: create a `DecodedRecord` with the given `GroupKey` and flags/tags.
     fn make_decoded(
@@ -1059,7 +1059,7 @@ mod tests {
             .pos(99) // alignment_start=100 in 1-based => 0-based pos=99
             .cigar_ops(&[encode_op(0, 4)]);
         if let Some(mc_val) = mc {
-            b.add_string_tag(b"MC", mc_val.as_bytes());
+            b.add_string_tag(SamTag::MC, mc_val.as_bytes());
         }
         DecodedRecord::from_raw_bytes(b.build(), key)
     }

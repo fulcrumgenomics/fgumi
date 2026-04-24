@@ -5,6 +5,7 @@
 //! 2. Statistics output
 //! 3. Rejected reads output
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -70,7 +71,7 @@ fn create_duplex_read_pair(
             .mate_ref_id(0)
             .mate_pos(r2_start - 1)
             .template_length(tlen)
-            .add_string_tag(b"MI", mi_tag.as_bytes());
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
         b.build()
     };
 
@@ -87,7 +88,7 @@ fn create_duplex_read_pair(
             .mate_ref_id(0)
             .mate_pos(r1_start - 1)
             .template_length(-tlen)
-            .add_string_tag(b"MI", mi_tag.as_bytes());
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
         b.build()
     };
 
@@ -182,7 +183,7 @@ fn test_duplex_command_basic() {
     let mut count = 0;
     for result in reader.records() {
         let record = result.expect("Failed to read record");
-        let cd_tag = [b'c', b'D'];
+        let cd_tag = SamTag::CD.to_noodles_tag();
         assert!(record.data().get(&cd_tag).is_some(), "Duplex consensus should have cD tag");
         count += 1;
     }

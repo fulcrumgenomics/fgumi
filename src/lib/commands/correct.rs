@@ -656,11 +656,11 @@ impl CorrectUmis {
 
         let first_aux = bam_fields::aux_data_slice(&raw_records[0]);
         // Work with &[u8] slices to avoid per-record String allocation
-        let first_umi_bytes = bam_fields::find_string_tag(first_aux, &umi_tag);
+        let first_umi_bytes = bam_fields::find_string_tag(first_aux, umi_tag);
 
         // If tag exists but is not a Z-type string, return an error
         if first_umi_bytes.is_none() {
-            if let Some(tag_type) = bam_fields::find_tag_type(first_aux, &umi_tag) {
+            if let Some(tag_type) = bam_fields::find_tag_type(first_aux, umi_tag) {
                 anyhow::bail!(
                     "UMI tag {:?} exists but has non-string type '{}', expected 'Z'",
                     std::str::from_utf8(&umi_tag).unwrap_or("??"),
@@ -671,7 +671,7 @@ impl CorrectUmis {
 
         for raw in &raw_records[1..] {
             let aux = bam_fields::aux_data_slice(raw);
-            let current_umi_bytes = bam_fields::find_string_tag(aux, &umi_tag);
+            let current_umi_bytes = bam_fields::find_string_tag(aux, umi_tag);
 
             match (first_umi_bytes, current_umi_bytes) {
                 (Some(first), Some(current)) if first != current => {
@@ -704,7 +704,7 @@ impl CorrectUmis {
         if correction.needs_correction {
             // Write corrected UMI first (in-place update avoids scanning past OX)
             if let Some(ref corrected) = correction.corrected_umi {
-                bam_fields::update_string_tag(record.as_mut_vec(), &umi_tag, corrected.as_bytes());
+                bam_fields::update_string_tag(record.as_mut_vec(), umi_tag, corrected.as_bytes());
             }
 
             // Store original UMI if there were actual mismatches
@@ -712,7 +712,7 @@ impl CorrectUmis {
             if !dont_store_original_umis && correction.has_mismatches {
                 bam_fields::update_string_tag(
                     record.as_mut_vec(),
-                    &SamTag::OX,
+                    SamTag::OX,
                     correction.original_umi.as_bytes(),
                 );
             }
@@ -1180,7 +1180,7 @@ impl CorrectUmis {
         let mut mismatched = 0u64;
         let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
-        let umi_tag_bytes: [u8; 2] = *b"RX";
+        let umi_tag_bytes: [u8; 2] = SamTag::RX.into();
         let max_mismatches = self.max_mismatches;
         let min_distance_diff = self.min_distance_diff;
         let revcomp = self.revcomp;
@@ -1789,7 +1789,7 @@ mod tests {
                 .sequence(b"AAAAAAAAAA")
                 .qualities(&[40u8; 10]);
             if let Some(umi_seq) = umi {
-                b.add_string_tag(b"RX", umi_seq.as_bytes());
+                b.add_string_tag(SamTag::RX, umi_seq.as_bytes());
             }
             let raw = b.build();
             let record = raw_record_to_record_buf(&raw, &sam::Header::default())
@@ -3286,11 +3286,11 @@ mod tests {
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, false);
 
         // Verify corrected UMI
-        let umi = bam_fields::find_string_tag_in_record(&raw, &SamTag::RX);
+        let umi = bam_fields::find_string_tag_in_record(&raw, SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
 
         // Verify OX tag with original UMI
-        let ox = bam_fields::find_string_tag_in_record(&raw, &SamTag::OX);
+        let ox = bam_fields::find_string_tag_in_record(&raw, SamTag::OX);
         assert_eq!(ox, Some(b"AAAAAG".as_ref()));
     }
 
@@ -3319,7 +3319,7 @@ mod tests {
 
         // Record should be unchanged
         assert_eq!(raw.len(), orig_len);
-        let umi = bam_fields::find_string_tag_in_record(&raw, &SamTag::RX);
+        let umi = bam_fields::find_string_tag_in_record(&raw, SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
     }
 
@@ -3369,7 +3369,7 @@ mod tests {
                     .qualities(&quals)
                     .mate_ref_id(0)
                     .mate_pos(pos2);
-                b1.add_string_tag(b"RX", umi.as_bytes());
+                b1.add_string_tag(SamTag::RX, umi.as_bytes());
                 let r1 = raw_record_to_record_buf(&b1.build(), &header)?;
                 writer.write_alignment_record(&header, &r1)?;
 
@@ -3384,7 +3384,7 @@ mod tests {
                     .qualities(&quals)
                     .mate_ref_id(0)
                     .mate_pos(pos1);
-                b2.add_string_tag(b"RX", umi.as_bytes());
+                b2.add_string_tag(SamTag::RX, umi.as_bytes());
                 let r2 = raw_record_to_record_buf(&b2.build(), &header)?;
                 writer.write_alignment_record(&header, &r2)?;
             }
@@ -3527,11 +3527,11 @@ mod tests {
         CorrectUmis::apply_correction_to_raw(&mut raw, &correction, *SamTag::RX, true);
 
         // Corrected UMI should be present
-        let umi = bam_fields::find_string_tag_in_record(&raw, &SamTag::RX);
+        let umi = bam_fields::find_string_tag_in_record(&raw, SamTag::RX);
         assert_eq!(umi, Some(b"AAAAAA".as_ref()));
 
         // OX tag should NOT be present (dont_store_original_umis = true)
-        let ox = bam_fields::find_string_tag_in_record(&raw, &SamTag::OX);
+        let ox = bam_fields::find_string_tag_in_record(&raw, SamTag::OX);
         assert!(ox.is_none());
     }
 }

@@ -355,8 +355,8 @@ mod tests {
     #[test]
     fn test_tags_byte_not_equal_different_order() {
         let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
-        let mut aux2 = make_i_tag(*b"NM", 5);
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
+        let mut aux2 = make_i_tag(*SamTag::NM, 5);
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn test_order_independent_same_order() {
         let mut aux = make_z_tag(*SamTag::RG, b"s1");
-        aux.extend_from_slice(&make_i_tag(*b"NM", 5));
+        aux.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
         let r1 = base_record(&aux);
         let r2 = base_record(&aux);
         assert!(raw_tags_equal_order_independent(&r1, &r2));
@@ -379,8 +379,8 @@ mod tests {
     #[test]
     fn test_order_independent_different_order() {
         let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
-        let mut aux2 = make_i_tag(*b"NM", 5);
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
+        let mut aux2 = make_i_tag(*SamTag::NM, 5);
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
@@ -389,15 +389,15 @@ mod tests {
 
     #[test]
     fn test_order_independent_different_values() {
-        let r1 = base_record(&make_i_tag(*b"NM", 5));
-        let r2 = base_record(&make_i_tag(*b"NM", 10));
+        let r1 = base_record(&make_i_tag(*SamTag::NM, 5));
+        let r2 = base_record(&make_i_tag(*SamTag::NM, 10));
         assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_missing_tag() {
         let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
         let aux2 = make_z_tag(*SamTag::RG, b"s1");
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
@@ -406,8 +406,8 @@ mod tests {
 
     #[test]
     fn test_order_independent_extra_tag() {
-        let aux1 = make_i_tag(*b"NM", 5);
-        let mut aux2 = make_i_tag(*b"NM", 5);
+        let aux1 = make_i_tag(*SamTag::NM, 5);
+        let mut aux2 = make_i_tag(*SamTag::NM, 5);
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
@@ -425,14 +425,14 @@ mod tests {
     fn test_order_independent_multiple_types() {
         // Mix of Z, i, C, and f tags in different orders
         let mut aux1 = make_z_tag(*SamTag::RG, b"grp");
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 3));
-        aux1.extend_from_slice(&make_c_tag(*b"MQ", 42));
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 3));
+        aux1.extend_from_slice(&make_c_tag(*SamTag::MQ, 42));
         aux1.extend_from_slice(&make_f_tag(*b"GC", 0.75));
 
         let mut aux2 = make_f_tag(*b"GC", 0.75);
-        aux2.extend_from_slice(&make_c_tag(*b"MQ", 42));
+        aux2.extend_from_slice(&make_c_tag(*SamTag::MQ, 42));
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"grp"));
-        aux2.extend_from_slice(&make_i_tag(*b"NM", 3));
+        aux2.extend_from_slice(&make_i_tag(*SamTag::NM, 3));
 
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_order_independent_short_record() {
         let short = vec![0u8; 10];
-        let rec = base_record(&make_i_tag(*b"NM", 5));
+        let rec = base_record(&make_i_tag(*SamTag::NM, 5));
         // Both have empty aux slices due to short record, but the short record
         // returns empty aux, so it won't match a record with tags.
         assert!(!raw_tags_equal_order_independent(&short, &rec));
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_structured_identical() {
-        let aux = make_i_tag(*b"NM", 5);
+        let aux = make_i_tag(*SamTag::NM, 5);
         let rec = base_record(&aux);
         let result = raw_compare_structured(&rec, &rec);
         assert_eq!(
@@ -475,8 +475,8 @@ mod tests {
     #[test]
     fn test_structured_same_core_different_tag_order() {
         let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
-        let mut aux2 = make_i_tag(*b"NM", 5);
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
+        let mut aux2 = make_i_tag(*SamTag::NM, 5);
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let r1 = base_record(&aux1);
         let r2 = base_record(&aux2);
@@ -488,8 +488,8 @@ mod tests {
 
     #[test]
     fn test_structured_different_tags() {
-        let r1 = base_record(&make_i_tag(*b"NM", 5));
-        let r2 = base_record(&make_i_tag(*b"NM", 10));
+        let r1 = base_record(&make_i_tag(*SamTag::NM, 5));
+        let r2 = base_record(&make_i_tag(*SamTag::NM, 10));
         let result = raw_compare_structured(&r1, &r2);
         assert!(result.core_match);
         assert!(!result.tags_match);
@@ -510,8 +510,8 @@ mod tests {
         // core_match=true (bin is not semantically meaningful),
         // tags_match=false (byte order differs), tag_order_match=true (values match)
         let mut aux1 = make_z_tag(*SamTag::RG, b"s1");
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
-        let mut aux2 = make_i_tag(*b"NM", 5);
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
+        let mut aux2 = make_i_tag(*SamTag::NM, 5);
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"s1"));
         let mut r1 = base_record(&aux1);
         let mut r2 = base_record(&aux2);
@@ -537,22 +537,22 @@ mod tests {
 
     #[test]
     fn test_collect_entries_single_int() {
-        let aux = make_i_tag(*b"NM", 42);
+        let aux = make_i_tag(*SamTag::NM, 42);
         let entries = collect_tag_entries(&aux)
             .expect("collect_tag_entries should succeed for single int tag");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, *b"NM");
+        assert_eq!(entries[0].0, *SamTag::NM);
     }
 
     #[test]
     fn test_collect_entries_multiple() {
         let mut aux = make_z_tag(*SamTag::RG, b"grp");
-        aux.extend_from_slice(&make_i_tag(*b"NM", 5));
+        aux.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
         let entries = collect_tag_entries(&aux)
             .expect("collect_tag_entries should succeed for multiple tags");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, *SamTag::RG);
-        assert_eq!(entries[1].0, *b"NM");
+        assert_eq!(entries[1].0, *SamTag::NM);
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
         // Regression: `raw_tags_equal_order_independent` used to panic when aux data was
         // truncated for a fixed-size type because `collect_tag_entries` produced entries
         // whose `val_end` exceeded `aux_data.len()`. It must return `false` instead.
-        let aux_good = make_i_tag(*b"NM", 42);
+        let aux_good = make_i_tag(*SamTag::NM, 42);
         let aux_bad = [b'N', b'M', b'i', 0x00, 0x01]; // truncated i32 (only 2 bytes)
         let r1 = base_record(&aux_good);
         let r2 = base_record(&aux_bad);
@@ -614,50 +614,50 @@ mod tests {
 
     #[test]
     fn test_order_independent_same_value_different_int_types_u8_vs_i16() {
-        // cD tag: u8 (C) value 158 vs i16 (s) value 158
+        // CD tag: u8 (C) value 158 vs i16 (s) value 158
         // These are semantically equal but have different byte encodings.
-        let r1 = base_record(&make_c_tag(*b"cD", 158));
-        let r2 = base_record(&make_s_tag(*b"cD", 158));
+        let r1 = base_record(&make_c_tag(*SamTag::CD, 158));
+        let r2 = base_record(&make_s_tag(*SamTag::CD, 158));
         assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_same_value_different_int_types_u8_vs_i32() {
         // NM tag: u8 (C) value 42 vs i32 (i) value 42
-        let r1 = base_record(&make_c_tag(*b"NM", 42));
-        let r2 = base_record(&make_i_tag(*b"NM", 42));
+        let r1 = base_record(&make_c_tag(*SamTag::NM, 42));
+        let r2 = base_record(&make_i_tag(*SamTag::NM, 42));
         assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_same_value_different_int_types_i16_vs_i32() {
         // MQ tag: i16 (s) value 300 vs i32 (i) value 300
-        let r1 = base_record(&make_s_tag(*b"MQ", 300));
-        let r2 = base_record(&make_i_tag(*b"MQ", 300));
+        let r1 = base_record(&make_s_tag(*SamTag::MQ, 300));
+        let r2 = base_record(&make_i_tag(*SamTag::MQ, 300));
         assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_same_value_different_int_types_u32_vs_i32() {
         // NM tag: u32 (I) value 1000 vs i32 (i) value 1000
-        let r1 = base_record(&make_upper_i_tag(*b"NM", 1000));
-        let r2 = base_record(&make_i_tag(*b"NM", 1000));
+        let r1 = base_record(&make_upper_i_tag(*SamTag::NM, 1000));
+        let r2 = base_record(&make_i_tag(*SamTag::NM, 1000));
         assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_same_value_different_int_types_u32_vs_u8() {
         // NM tag: u32 (I) value 42 vs u8 (C) value 42
-        let r1 = base_record(&make_upper_i_tag(*b"NM", 42));
-        let r2 = base_record(&make_c_tag(*b"NM", 42));
+        let r1 = base_record(&make_upper_i_tag(*SamTag::NM, 42));
+        let r2 = base_record(&make_c_tag(*SamTag::NM, 42));
         assert!(raw_tags_equal_order_independent(&r1, &r2));
     }
 
     #[test]
     fn test_order_independent_different_values_different_int_types() {
         // Same tag name, different int types, different values => should NOT match
-        let r1 = base_record(&make_c_tag(*b"NM", 5));
-        let r2 = base_record(&make_i_tag(*b"NM", 10));
+        let r1 = base_record(&make_c_tag(*SamTag::NM, 5));
+        let r2 = base_record(&make_i_tag(*SamTag::NM, 10));
         assert!(!raw_tags_equal_order_independent(&r1, &r2));
     }
 
@@ -673,8 +673,8 @@ mod tests {
     fn test_structured_semantic_int_tags_match() {
         // Same value with different int encodings: structured comparison should
         // report tags_match=false (bytes differ) but tag_order_match=true (semantically equal)
-        let r1 = base_record(&make_c_tag(*b"cD", 158));
-        let r2 = base_record(&make_s_tag(*b"cD", 158));
+        let r1 = base_record(&make_c_tag(*SamTag::CD, 158));
+        let r2 = base_record(&make_s_tag(*SamTag::CD, 158));
         let result = raw_compare_structured(&r1, &r2);
         assert!(result.core_match);
         assert!(!result.tags_match); // raw bytes differ
@@ -685,11 +685,11 @@ mod tests {
     fn test_order_independent_semantic_int_with_reordered_tags() {
         // Multiple tags, different order, AND different integer encodings
         let mut aux1 = make_z_tag(*SamTag::RG, b"grp");
-        aux1.extend_from_slice(&make_c_tag(*b"cD", 200));
-        aux1.extend_from_slice(&make_i_tag(*b"NM", 5));
+        aux1.extend_from_slice(&make_c_tag(*SamTag::CD, 200));
+        aux1.extend_from_slice(&make_i_tag(*SamTag::NM, 5));
 
-        let mut aux2 = make_i_tag(*b"NM", 5);
-        aux2.extend_from_slice(&make_upper_s_tag(*b"cD", 200));
+        let mut aux2 = make_i_tag(*SamTag::NM, 5);
+        aux2.extend_from_slice(&make_upper_s_tag(*SamTag::CD, 200));
         aux2.extend_from_slice(&make_z_tag(*SamTag::RG, b"grp"));
 
         let r1 = base_record(&aux1);

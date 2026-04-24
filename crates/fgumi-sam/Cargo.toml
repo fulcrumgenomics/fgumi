@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 noodles = { version = "0.106.0", features = ["bam", "sam", "core"] }
 fgumi-raw-bam = { workspace = true, features = ["noodles"] }
+fgumi-tag = { workspace = true }
 bstr = "1.12.1"
 clap = { version = "4", features = ["derive"] }
 log = "0"

@@ -1,5 +1,6 @@
 //! Integration tests for the downsample command.
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::SamBuilder;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -13,7 +14,7 @@ use tempfile::TempDir;
 use crate::helpers::bam_generator::create_minimal_header;
 
 /// MI tag constant
-const MI_TAG: Tag = fgumi_lib::sam::SamTag::MI.to_noodles_tag();
+const MI_TAG: Tag = SamTag::MI.to_noodles_tag();
 
 /// Create a grouped BAM file with MI tags (simulating output from group).
 fn create_grouped_bam(path: &PathBuf, families: Vec<(&str, usize)>) {
@@ -37,7 +38,7 @@ fn create_grouped_bam(path: &PathBuf, families: Vec<(&str, usize)>) {
                     .pos(99) // 0-based (alignment_start 100)
                     .mapq(60)
                     .cigar_ops(&[4u32 << 4]) // 4M
-                    .add_string_tag(b"MI", mi.as_bytes());
+                    .add_string_tag(SamTag::MI, mi.as_bytes());
                 b.build()
             };
             let record =

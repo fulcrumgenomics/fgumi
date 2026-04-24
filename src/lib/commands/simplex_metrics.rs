@@ -344,6 +344,7 @@ impl SimplexMetrics {
 mod tests {
     use super::*;
     use crate::metrics::simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector};
+    use crate::sam::SamTag;
     use anyhow::Result;
     use fgoxide::io::DelimFile;
     use fgumi_raw_bam::{
@@ -404,8 +405,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos2 - 1);
-        b1.add_string_tag(b"RX", rx_umi.as_bytes());
-        b1.add_string_tag(b"MI", mi_tag.as_bytes());
+        b1.add_string_tag(SamTag::RX, rx_umi.as_bytes());
+        b1.add_string_tag(SamTag::MI, mi_tag.as_bytes());
         let r1 = to_record_buf(b1.build());
 
         let mut b2 = RawSamBuilder::new();
@@ -419,8 +420,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(ref_id as i32)
             .mate_pos(pos1 - 1);
-        b2.add_string_tag(b"RX", rx_umi.as_bytes());
-        b2.add_string_tag(b"MI", mi_tag.as_bytes());
+        b2.add_string_tag(SamTag::RX, rx_umi.as_bytes());
+        b2.add_string_tag(SamTag::MI, mi_tag.as_bytes());
         let r2 = to_record_buf(b2.build());
 
         (r1, r2)
@@ -615,7 +616,7 @@ mod tests {
             .cigar_ops(&[encode_op(0, 100)])
             .sequence(&[b'A'; 100])
             .qualities(&[30u8; 100]);
-        b.add_int_tag(b"cD", 5);
+        b.add_int_tag(SamTag::CD, 5);
         let record = to_record_buf(b.build());
         writer.write_alignment_record(&header, &record)?;
         drop(writer);

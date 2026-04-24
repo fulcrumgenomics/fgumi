@@ -901,6 +901,7 @@ impl<W: Write> RawBamWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fgumi_tag::SamTag;
 
     #[test]
     fn test_raw_record_inherent_delegators() {
@@ -913,7 +914,7 @@ mod tests {
         assert_eq!(rec.ref_id(), 3);
         assert_eq!(rec.pos(), 200);
         assert!(rec.is_paired());
-        assert_eq!(rec.tags().find_int(b"NM"), Some(5));
+        assert_eq!(rec.tags().find_int(SamTag::NM), Some(5));
 
         // Fixed-length writes via inherent delegators
         rec.set_pos(999);
@@ -924,9 +925,9 @@ mod tests {
         // Length-changing edits via tags_editor
         {
             let mut ed = rec.tags_editor();
-            ed.update_int(b"NM", 8);
+            ed.update_int(SamTag::NM, 8);
         }
-        assert_eq!(rec.tags().find_int(b"NM"), Some(8));
+        assert_eq!(rec.tags().find_int(SamTag::NM), Some(8));
     }
 
     #[test]
@@ -1006,7 +1007,7 @@ mod tests {
         let pre_cigar = rec.cigar_ops_vec();
         let pre_seq = rec.sequence_vec();
         let pre_qual = rec.quality_scores().to_vec();
-        let pre_nm = rec.tags().find_int(b"NM");
+        let pre_nm = rec.tags().find_int(SamTag::NM);
 
         rec.set_read_name(b"new");
         assert_eq!(rec.read_name(), b"new");
@@ -1015,7 +1016,7 @@ mod tests {
         assert_eq!(rec.cigar_ops_vec(), pre_cigar);
         assert_eq!(rec.sequence_vec(), pre_seq);
         assert_eq!(rec.quality_scores(), pre_qual.as_slice());
-        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+        assert_eq!(rec.tags().find_int(SamTag::NM), pre_nm);
 
         // Empty name (still NUL-terminated)
         rec.set_read_name(b"");
@@ -1031,7 +1032,7 @@ mod tests {
         let pre_name = rec.read_name().to_vec();
         let pre_seq = rec.sequence_vec();
         let pre_qual = rec.quality_scores().to_vec();
-        let pre_nm = rec.tags().find_int(b"NM");
+        let pre_nm = rec.tags().find_int(SamTag::NM);
 
         let new_ops = vec![encode_op(0, 4), encode_op(2, 1), encode_op(0, 6)];
         rec.set_cigar_ops(&new_ops);
@@ -1041,7 +1042,7 @@ mod tests {
         assert_eq!(rec.read_name(), pre_name.as_slice());
         assert_eq!(rec.sequence_vec(), pre_seq);
         assert_eq!(rec.quality_scores(), pre_qual.as_slice());
-        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+        assert_eq!(rec.tags().find_int(SamTag::NM), pre_nm);
     }
 
     #[test]
@@ -1051,7 +1052,7 @@ mod tests {
         let mut rec = RawRecord::from(bytes);
         let pre_name = rec.read_name().to_vec();
         let pre_cigar = rec.cigar_ops_vec();
-        let pre_nm = rec.tags().find_int(b"NM");
+        let pre_nm = rec.tags().find_int(SamTag::NM);
 
         let new_seq = b"ACGTACGTACGT";
         let new_qual = vec![30u8; 12];
@@ -1062,7 +1063,7 @@ mod tests {
         assert_eq!(rec.quality_scores(), new_qual.as_slice());
         assert_eq!(rec.read_name(), pre_name.as_slice());
         assert_eq!(rec.cigar_ops_vec(), pre_cigar);
-        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+        assert_eq!(rec.tags().find_int(SamTag::NM), pre_nm);
     }
 
     #[test]
@@ -1195,14 +1196,14 @@ mod tests {
             b"NMc\x05",
         );
         let mut rec = RawRecord::from(bytes);
-        let pre_nm = rec.tags().find_int(b"NM");
+        let pre_nm = rec.tags().find_int(SamTag::NM);
 
         rec.set_cigar_ops(&[]);
 
         assert_eq!(rec.n_cigar_op(), 0);
         assert_eq!(rec.cigar_ops_vec(), Vec::<u32>::new());
         // Aux tags survive the clear.
-        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+        assert_eq!(rec.tags().find_int(SamTag::NM), pre_nm);
     }
 
     /// `set_sequence_and_qualities(b"", &[])` is legal: `l_seq` becomes 0, the
@@ -1212,7 +1213,7 @@ mod tests {
         use crate::testutil::*;
         let bytes = make_bam_bytes(0, 0, 0, b"r", &[encode_op(0, 4)], 4, -1, -1, b"NMc\x05");
         let mut rec = RawRecord::from(bytes);
-        let pre_nm = rec.tags().find_int(b"NM");
+        let pre_nm = rec.tags().find_int(SamTag::NM);
 
         rec.set_sequence_and_qualities(b"", &[]);
 
@@ -1220,7 +1221,7 @@ mod tests {
         assert_eq!(rec.sequence_vec(), Vec::<u8>::new());
         assert_eq!(rec.quality_scores(), &[] as &[u8]);
         // Aux tags survive the removal of all seq+qual bytes.
-        assert_eq!(rec.tags().find_int(b"NM"), pre_nm);
+        assert_eq!(rec.tags().find_int(SamTag::NM), pre_nm);
     }
 
     /// A `B:S` (u16) array tag followed by an int tag must be byte-for-byte
@@ -1245,14 +1246,15 @@ mod tests {
         rec.set_sequence_and_qualities(b"ACGTACGTACGTACGT", &[30u8; 16]);
 
         // Array tag must decode identically.
-        let post_arr = rec.tags().find_array(b"bq").expect("B:S array tag should be preserved");
+        let post_arr =
+            rec.tags().find_array(SamTag::BQ).expect("B:S array tag should be preserved");
         assert_eq!(post_arr.count, 4);
         let decoded: Vec<u16> = (0..4)
             .map(|i| u16::from_le_bytes([post_arr.data[i * 2], post_arr.data[i * 2 + 1]]))
             .collect();
         assert_eq!(decoded, vec![100u16, 200, 300, 400]);
 
-        assert_eq!(rec.tags().find_int(b"NM"), Some(7));
+        assert_eq!(rec.tags().find_int(SamTag::NM), Some(7));
         // Byte-for-byte preservation of the entire aux section.
         assert_eq!(rec.tags().as_bytes(), pre_aux.as_slice());
     }

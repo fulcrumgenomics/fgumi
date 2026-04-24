@@ -5,6 +5,7 @@
 //! 2. Metrics output
 //! 3. Remove duplicates mode
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -53,8 +54,8 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
                 .mate_ref_id(0)
                 .mate_pos(start + 99)
                 .template_length(108)
-                .add_string_tag(b"RX", umi.as_bytes())
-                .add_string_tag(b"MC", b"8M");
+                .add_string_tag(SamTag::RX, umi.as_bytes())
+                .add_string_tag(SamTag::MC, b"8M");
             b.build()
         };
 
@@ -71,8 +72,8 @@ fn create_duplicate_group(base_name: &str, umi: &str, count: usize, start: i32) 
                 .mate_ref_id(0)
                 .mate_pos(start - 1)
                 .template_length(-108)
-                .add_string_tag(b"RX", umi.as_bytes())
-                .add_string_tag(b"MC", b"8M");
+                .add_string_tag(SamTag::RX, umi.as_bytes())
+                .add_string_tag(SamTag::MC, b"8M");
             b.build()
         };
 
@@ -202,7 +203,6 @@ fn test_dedup_no_umi_large_position_group() {
     use clap::Parser;
     use fgumi_lib::commands::command::Command as FgumiCommand;
     use fgumi_lib::commands::dedup::MarkDuplicates;
-    use fgumi_lib::sam::SamTag;
     use fgumi_raw_bam::raw_record_to_record_buf;
     use fgumi_raw_bam::{SamBuilder as RawSamBuilder, flags, testutil::encode_op};
     use noodles::sam::Header;
@@ -270,7 +270,7 @@ fn test_dedup_no_umi_large_position_group() {
                     .mate_ref_id(0)
                     .mate_pos(199)
                     .template_length(108);
-                b.add_string_tag(b"MC", b"8M");
+                b.add_string_tag(SamTag::MC, b"8M");
                 b.build()
             };
 
@@ -287,7 +287,7 @@ fn test_dedup_no_umi_large_position_group() {
                     .mate_ref_id(0)
                     .mate_pos(99)
                     .template_length(-108);
-                b.add_string_tag(b"MC", b"8M");
+                b.add_string_tag(SamTag::MC, b"8M");
                 b.build()
             };
 

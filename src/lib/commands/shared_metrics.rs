@@ -7,11 +7,12 @@
 
 use crate::bam_io::create_raw_bam_reader;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::template::TemplateIterator;
 use anyhow::{Context, Result};
 use fgumi_raw_bam::{
-    RawRecord, alignment_end_from_raw, aux_data_slice, find_string_tag_in_record, find_tag_type,
-    flags as raw_flags, unclipped_5prime_from_raw_bam,
+    AsTagBytes, RawRecord, alignment_end_from_raw, aux_data_slice, find_string_tag_in_record,
+    find_tag_type, flags as raw_flags, unclipped_5prime_from_raw_bam,
 };
 
 use log::info;
@@ -324,9 +325,9 @@ pub fn validate_not_consensus_bam(input: &Path) -> Result<()> {
         // fgumi_consensus::tags::is_consensus: simplex = cD without aD+bD;
         // duplex = aD and bD). Avoids decoding the record to RecordBuf.
         let aux = aux_data_slice(raw.as_ref());
-        let has_ad = find_tag_type(aux, b"aD").is_some();
-        let has_bd = find_tag_type(aux, b"bD").is_some();
-        let has_cd = find_tag_type(aux, b"cD").is_some();
+        let has_ad = find_tag_type(aux, SamTag::AD).is_some();
+        let has_bd = find_tag_type(aux, SamTag::BD).is_some();
+        let has_cd = find_tag_type(aux, SamTag::CD).is_some();
         let is_duplex_consensus = has_ad && has_bd;
         let is_simplex_consensus = has_cd && !is_duplex_consensus;
         if is_simplex_consensus || is_duplex_consensus {
@@ -499,8 +500,8 @@ where
         };
 
         let read_name = String::from_utf8_lossy(fgumi_raw_bam::read_name(r1.as_ref())).into_owned();
-        let mi = required_z_tag(r1, *b"MI", &read_name)?;
-        let rx = required_z_tag(r1, *b"RX", &read_name)?;
+        let mi = required_z_tag(r1, SamTag::MI, &read_name)?;
+        let rx = required_z_tag(r1, SamTag::RX, &read_name)?;
 
         // Filter already excluded unmapped reads, so tid >= 0 here; skip defensively.
         let r1_tid = r1.ref_id();
@@ -605,9 +606,10 @@ where
 
 /// Extracts a required Z-typed aux tag from `record`, returning an error that
 /// points at `read_name` when the tag is absent or not UTF-8.
-fn required_z_tag(record: &RawRecord, tag: [u8; 2], read_name: &str) -> Result<String> {
-    let tag_name = std::str::from_utf8(&tag).unwrap_or("??");
-    let bytes = find_string_tag_in_record(record.as_ref(), &tag).ok_or_else(|| {
+fn required_z_tag(record: &RawRecord, tag: impl AsTagBytes, read_name: &str) -> Result<String> {
+    let tag_bytes = *tag.as_tag_bytes();
+    let tag_name = std::str::from_utf8(&tag_bytes).unwrap_or("??");
+    let bytes = find_string_tag_in_record(record.as_ref(), tag).ok_or_else(|| {
         anyhow::anyhow!(
             "Read '{read_name}' is missing the required {tag_name} tag. \
              Metrics commands require standard MI/RX tags."
@@ -668,8 +670,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(r2_ref)
             .mate_pos(r2_pos - 1);
-        b1.add_string_tag(b"RX", b"ACGT-TGCA");
-        b1.add_string_tag(b"MI", mi.as_bytes());
+        b1.add_string_tag(SamTag::RX, b"ACGT-TGCA");
+        b1.add_string_tag(SamTag::MI, mi.as_bytes());
         let r1 = fgumi_raw_bam::raw_record_to_record_buf(&b1.build(), &sam::Header::default())
             .expect("decode r1");
 
@@ -684,8 +686,8 @@ mod tests {
             .qualities(&quals)
             .mate_ref_id(r1_ref)
             .mate_pos(r1_pos - 1);
-        b2.add_string_tag(b"RX", b"ACGT-TGCA");
-        b2.add_string_tag(b"MI", mi.as_bytes());
+        b2.add_string_tag(SamTag::RX, b"ACGT-TGCA");
+        b2.add_string_tag(SamTag::MI, mi.as_bytes());
         let r2 = fgumi_raw_bam::raw_record_to_record_buf(&b2.build(), &sam::Header::default())
             .expect("decode r2");
 

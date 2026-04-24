@@ -89,6 +89,7 @@ jobs:
             fgumi-dna
             fgumi-bgzf
             fgumi-simd-fastq
+            fgumi-tag
             fgumi-raw-bam
             fgumi-umi
             fgumi-sam

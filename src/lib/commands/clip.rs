@@ -16,6 +16,7 @@ use crate::metrics::writer::write_metrics as write_metrics_tsv;
 use crate::per_thread_accumulator::PerThreadAccumulator;
 use crate::progress::ProgressTracker;
 use crate::reference::ReferenceReader;
+use crate::sam::SamTag;
 use crate::template::{TemplateBatch, TemplateIterator};
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
@@ -862,11 +863,11 @@ fn update_mate_info_raw(record: &mut RawRecord, mate: &RawRecord) {
     // Update MC tag: build CIGAR string from raw bytes
     let cigar_str = mate.cigar_to_string();
     let mut editor = record.tags_editor();
-    editor.update_string(b"MC", cigar_str.as_bytes());
+    editor.update_string(SamTag::MC, cigar_str.as_bytes());
 
     // Update MQ tag: mate mapping quality
     let mapq = mate.mapq();
-    editor.update_int(b"MQ", i32::from(mapq));
+    editor.update_int(SamTag::MQ, i32::from(mapq));
 }
 
 /// Returns the number of clipped bases (soft + hard) in a raw record's CIGAR.

@@ -1,3 +1,4 @@
+use crate::SamTag;
 use crate::cigar::{
     consumes_query, get_cigar_ops, reference_length_from_cigar, reference_length_from_raw_bam,
     unclipped_other_end, unclipped_other_start,
@@ -73,7 +74,7 @@ pub fn num_bases_extending_past_mate_raw(bam: &[u8]) -> usize {
 
     // Need MC tag for mate CIGAR information
     let aux = aux_data_slice(bam);
-    let Some(mc_bytes) = RawTagsView::new(aux).find_string(b"MC") else {
+    let Some(mc_bytes) = RawTagsView::new(aux).find_string(SamTag::MC) else {
         return 0;
     };
     let Ok(mc_cigar) = std::str::from_utf8(mc_bytes) else {

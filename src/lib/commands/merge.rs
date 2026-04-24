@@ -141,7 +141,8 @@ impl Command for Merge {
         info!("Output: {}", self.output.display());
         info!("Sort order: {:?}", self.order);
         if let Some(ct) = cell_tag {
-            info!("Cell tag: {}{}", ct[0] as char, ct[1] as char);
+            let ct_bytes = *ct;
+            info!("Cell tag: {}{}", ct_bytes[0] as char, ct_bytes[1] as char);
         }
         info!("Threads: {}", self.threads);
 

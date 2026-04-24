@@ -55,7 +55,7 @@ use crate::commands::common::{CompressionOptions, parse_bool};
 use crate::logging::OperationTimer;
 use crate::progress::ProgressTracker;
 use crate::reference::{ReferenceReader, find_dict_path};
-use crate::sam::{TemplateCoordinateInfo, check_sort};
+use crate::sam::{SamTag, TemplateCoordinateInfo, check_sort};
 use crate::sort::bam_fields;
 use crate::template::{Template, TemplateIterator};
 use crate::umi::TagInfo;
@@ -312,7 +312,7 @@ fn add_template_coordinate_tags_raw(mapped: &mut Template) {
         return;
     };
 
-    let tc_tag = b"tc";
+    let tc_tag = SamTag::TC;
     let tc_values = [
         tc_info.tid1,
         tc_info.pos1,
@@ -384,15 +384,13 @@ pub fn merge_raw(
         for tag_str in &tag_info.remove {
             if tag_str.len() == 2 {
                 let tag_bytes: [u8; 2] = [tag_str.as_bytes()[0], tag_str.as_bytes()[1]];
-                bam_fields::remove_tag(record.as_mut_vec(), &tag_bytes);
+                bam_fields::remove_tag(record.as_mut_vec(), tag_bytes);
             }
         }
     }
 
     // Steps 3–4: Copy tags from unmapped to mapped, transfer QC flags
     let has_transforms = tag_info.has_revs_or_revcomps();
-    let pg_tag: [u8; 2] = [b'P', b'G'];
-
     for u in unmapped.primary_reads() {
         let u_flags = RawRecordView::new(u).flags();
         let is_unpaired = (u_flags & bam_fields::flags::PAIRED) == 0;
@@ -431,10 +429,10 @@ pub fn merge_raw(
                     continue;
                 }
                 let aux = bam_fields::aux_data_slice(&rr[i]);
-                let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
+                let has_pg = bam_fields::find_tag_type(aux, SamTag::PG).is_some();
 
                 for entry in &u_tags {
-                    if entry.tag == pg_tag && has_pg {
+                    if entry.tag == *SamTag::PG && has_pg {
                         continue;
                     }
                     // Tag bytes are always valid ASCII
@@ -442,7 +440,7 @@ pub fn merge_raw(
                     if tag_info.remove.contains(tag_str) {
                         continue;
                     }
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), &entry.tag);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
                 }
             }
@@ -456,7 +454,7 @@ pub fn merge_raw(
                     continue;
                 }
                 let aux = bam_fields::aux_data_slice(&rr[i]);
-                let has_pg = bam_fields::find_tag_type(aux, &pg_tag).is_some();
+                let has_pg = bam_fields::find_tag_type(aux, SamTag::PG).is_some();
 
                 // Aux offset is safe to cache here: `remove_tag` and `append_raw_tag_entry`
                 // only modify bytes within/after the aux region, so this offset stays valid.
@@ -464,7 +462,7 @@ pub fn merge_raw(
                     bam_fields::aux_data_offset_from_record(&rr[i]).unwrap_or(rr[i].len());
 
                 for entry in &u_tags {
-                    if entry.tag == pg_tag && has_pg {
+                    if entry.tag == *SamTag::PG && has_pg {
                         continue;
                     }
                     let tag_str = std::str::from_utf8(&entry.tag).unwrap_or("");
@@ -472,7 +470,7 @@ pub fn merge_raw(
                         continue;
                     }
 
-                    bam_fields::remove_tag(rr[i].as_mut_vec(), &entry.tag);
+                    bam_fields::remove_tag(rr[i].as_mut_vec(), entry.tag);
                     append_raw_tag_entry(rr[i].as_mut_vec(), entry);
 
                     if has_transforms && tag_info.reverse.contains(tag_str) {
@@ -510,8 +508,8 @@ pub fn merge_raw(
 
     // Step 5: Normalize AS/XS tags
     for record in mapped.records_mut().iter_mut() {
-        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), b"AS");
-        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), b"XS");
+        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::AS);
+        bam_fields::normalize_int_tag_to_smallest_signed(record.as_mut_vec(), SamTag::XS);
     }
 
     // Step 6: Add PA tags
@@ -547,10 +545,10 @@ fn reverse_tag_in_place_raw_by_type(
 ) {
     match type_byte {
         b'Z' => {
-            bam_fields::reverse_string_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_string_tag_in_place(record, aux_offset, tag);
         }
         b'B' => {
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, tag);
         }
         _ => {}
     }
@@ -570,13 +568,13 @@ fn revcomp_tag_in_place_raw_by_type(
 ) {
     match type_byte {
         b'Z' => {
-            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_complement_string_tag_in_place(record, aux_offset, tag);
         }
         b'B' => {
             // For array tags, revcomp is the same as reverse (no base complement for
             // numeric arrays; arrays that hold base-encoded ints are rare and numeric
             // reversal matches the existing BufValue::Array branch behavior).
-            bam_fields::reverse_array_tag_in_place(record, aux_offset, &tag);
+            bam_fields::reverse_array_tag_in_place(record, aux_offset, tag);
         }
         _ => {}
     }
@@ -631,7 +629,7 @@ fn restore_unconverted_bases_in_raw_record(
     }
 
     // Get the bisulfite strand from the bwameth YD tag
-    let yd_bytes = rec.tags().find_string(b"YD").map(|s| s.to_vec());
+    let yd_bytes = rec.tags().find_string(SamTag::YD).map(|s| s.to_vec());
     let is_top = match yd_bytes.as_deref() {
         Some(s) if s == YD_FORWARD => true,
         Some(s) if s == YD_REVERSE => false,
@@ -744,8 +742,8 @@ fn restore_unconverted_bases_in_raw_record(
         // NM/MD tags are now stale since SEQ changed; remove them so downstream
         // tools don't trust incorrect mismatch counts.
         let mut ed = rec.tags_editor();
-        ed.remove(b"NM");
-        ed.remove(b"MD");
+        ed.remove(SamTag::NM);
+        ed.remove(SamTag::MD);
     }
 
     Ok(())
@@ -1224,7 +1222,7 @@ mod tests {
     ///
     /// Returns `None` if the `pa` tag is absent or malformed.
     fn tc_info_from_raw(rec: &RawRecord) -> Option<TemplateCoordinateInfo> {
-        let arr = rec.tags().find_array(b"tc")?;
+        let arr = rec.tags().find_array(SamTag::TC)?;
         // pa tag is B:i with 6 int32 elements
         if arr.elem_type != b'i' || arr.count != 6 {
             return None;
@@ -1607,8 +1605,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 100)])
                 .sequence(&b"A".repeat(100))
                 .qualities(&[30u8; 100]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 77);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 77);
             to_record_buf(b.build())
         };
         mapped.push_record(supp_rec);
@@ -1807,7 +1805,7 @@ mod tests {
         let r1_unmapped = {
             let mut b = RawSamBuilder::new();
             b.read_name(b"q1").flags(flags::PAIRED | flags::FIRST_SEGMENT | flags::UNMAPPED);
-            b.add_string_tag(b"RX", b"ACGT");
+            b.add_string_tag(SamTag::RX, b"ACGT");
             to_record_buf(b.build())
         };
 
@@ -1816,7 +1814,7 @@ mod tests {
             let mut b = RawSamBuilder::new();
             b.read_name(b"q1")
                 .flags(flags::PAIRED | flags::LAST_SEGMENT | flags::UNMAPPED | flags::QC_FAIL);
-            b.add_string_tag(b"RX", b"ACGT");
+            b.add_string_tag(SamTag::RX, b"ACGT");
             to_record_buf(b.build())
         };
 
@@ -1935,8 +1933,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 100)])
                 .sequence(&b"A".repeat(100))
                 .qualities(&[30u8; 100]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 77);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 77);
             to_record_buf(b.build())
         };
         mapped.push_record(secondary_rec);
@@ -1952,8 +1950,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 100)])
                 .sequence(&b"A".repeat(100))
                 .qualities(&[30u8; 100]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 77);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 77);
             to_record_buf(b.build())
         };
         mapped.push_record(supp_rec);
@@ -2245,7 +2243,7 @@ mod tests {
                     .cigar_ops(&[encode_op(0, 100)])
                     .sequence(&b"A".repeat(100))
                     .qualities(&[30u8; 100]);
-                b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+                b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
                 to_record_buf(b.build())
             };
             mapped.push_record(secondary_rec);
@@ -2286,7 +2284,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 100)])
                 .sequence(&b"A".repeat(100))
                 .qualities(&[30u8; 100]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
             to_record_buf(b.build())
         };
         mapped.push_record(r2_mapped);
@@ -2869,7 +2867,7 @@ mod tests {
         let unmapped_record = {
             let mut b = RawSamBuilder::new();
             b.read_name(b"q1").flags(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED);
-            b.add_string_tag(b"RX", b"AAAA");
+            b.add_string_tag(SamTag::RX, b"AAAA");
             b.sequence(b"ACGT").qualities(&[30u8; 4]);
             b.build()
         };
@@ -2930,7 +2928,7 @@ mod tests {
         let unmapped_record = {
             let mut b = RawSamBuilder::new();
             b.read_name(b"q1").flags(FLAG_PAIRED | FLAG_READ1 | FLAG_UNMAPPED);
-            b.add_string_tag(b"RX", b"AAAA");
+            b.add_string_tag(SamTag::RX, b"AAAA");
             b.sequence(b"ACGT").qualities(&[30u8; 4]);
             b.build()
         };
@@ -2979,9 +2977,9 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 100)])
                 .sequence(&b"A".repeat(100))
                 .qualities(&[30u8; 100]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 77);
-            b.add_int_tag(b"XS", 50);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 77);
+            b.add_int_tag(SamTag::XS, 50);
             to_record_buf(b.build())
         };
         mapped.push_record(mapped_rec);
@@ -3023,9 +3021,9 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 100)])
                 .sequence(&b"A".repeat(100))
                 .qualities(&[30u8; 100]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 200);
-            b.add_int_tag(b"XS", -200);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 200);
+            b.add_int_tag(SamTag::XS, -200);
             to_record_buf(b.build())
         };
         mapped.push_record(mapped_rec);
@@ -3179,7 +3177,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .sequence(&b"A".repeat(50))
                 .qualities(&[30u8; 50]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
             to_record_buf(b.build())
         };
         let r2_mapped = {
@@ -3193,7 +3191,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 75)])
                 .sequence(&b"A".repeat(75))
                 .qualities(&[30u8; 75]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
             to_record_buf(b.build())
         };
         mapped.push_record(r1_mapped);
@@ -3291,8 +3289,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .sequence(&b"A".repeat(50))
                 .qualities(&[30u8; 50]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 77);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 77);
             to_record_buf(b.build())
         };
         let r2_mapped = {
@@ -3306,8 +3304,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 75)])
                 .sequence(&b"A".repeat(75))
                 .qualities(&[30u8; 75]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 55);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 55);
             to_record_buf(b.build())
         };
         mapped.push_record(r1_mapped);
@@ -3324,8 +3322,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 60)])
                 .sequence(&b"A".repeat(60))
                 .qualities(&[30u8; 60]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 33);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 33);
             to_record_buf(b.build())
         };
         mapped.push_record(supp_rec);
@@ -3461,8 +3459,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 50)])
                 .sequence(&b"A".repeat(50))
                 .qualities(&[30u8; 50]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 77);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 77);
             to_record_buf(b.build())
         };
         let r2_mapped = {
@@ -3476,8 +3474,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 75)])
                 .sequence(&b"A".repeat(75))
                 .qualities(&[30u8; 75]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 55);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 55);
             to_record_buf(b.build())
         };
         mapped.push_record(r1_mapped);
@@ -3494,8 +3492,8 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 60)])
                 .sequence(&b"A".repeat(60))
                 .qualities(&[30u8; 60]);
-            b.add_string_tag(b"PG", MAPPED_PG_ID.as_bytes());
-            b.add_int_tag(b"AS", 33);
+            b.add_string_tag(SamTag::PG, MAPPED_PG_ID.as_bytes());
+            b.add_int_tag(SamTag::AS, 33);
             to_record_buf(b.build())
         };
         mapped.push_record(supp_rec);
@@ -3689,8 +3687,8 @@ mod tests {
 
     /// Helper: check that a tag is absent in a `RawRecord`'s aux data.
     fn raw_tag_absent(rec: &RawRecord, tag: [u8; 2]) -> bool {
-        fgumi_raw_bam::find_string_tag_in_record(rec.as_ref(), &tag).is_none()
-            && fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), &tag)
+        fgumi_raw_bam::find_string_tag_in_record(rec.as_ref(), tag).is_none()
+            && fgumi_raw_bam::find_tag_type(fgumi_raw_bam::aux_data_slice(rec.as_ref()), tag)
                 .is_none()
     }
 
@@ -3713,7 +3711,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"ATGTATGT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
+            b.add_string_tag(SamTag::YD, b"f");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3740,7 +3738,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"ACATACAT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"r");
+            b.add_string_tag(SamTag::YD, b"r");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3773,7 +3771,7 @@ mod tests {
                 ])
                 .sequence(b"TTNATTGT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
+            b.add_string_tag(SamTag::YD, b"f");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3793,7 +3791,7 @@ mod tests {
         let mut raw = {
             let mut b = RawSamBuilder::new();
             b.read_name(b"q1").flags(flags::UNMAPPED).sequence(b"TTTTTTTT").qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
+            b.add_string_tag(SamTag::YD, b"f");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3846,7 +3844,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"CTCACTGC")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
+            b.add_string_tag(SamTag::YD, b"f");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3874,16 +3872,16 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"ATGTATGT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
-            b.add_int_tag(b"NM", 0);
-            b.add_string_tag(b"MD", b"8");
+            b.add_string_tag(SamTag::YD, b"f");
+            b.add_int_tag(SamTag::NM, 0);
+            b.add_string_tag(SamTag::MD, b"8");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
         assert_eq!(raw_sequence(&raw), b"ATGTATGT");
         // No SEQ change => NM/MD must remain present.
-        assert!(!raw_tag_absent(&raw, *b"NM"), "NM should remain when no bases were changed");
-        assert!(!raw_tag_absent(&raw, *b"MD"), "MD should remain when no bases were changed");
+        assert!(!raw_tag_absent(&raw, *SamTag::NM), "NM should remain when no bases were changed");
+        assert!(!raw_tag_absent(&raw, *SamTag::MD), "MD should remain when no bases were changed");
         Ok(())
     }
 
@@ -3906,7 +3904,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"ACATACGT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
+            b.add_string_tag(SamTag::YD, b"f");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3933,7 +3931,7 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"ATGTACGT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"r");
+            b.add_string_tag(SamTag::YD, b"r");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
@@ -3960,16 +3958,16 @@ mod tests {
                 .cigar_ops(&[encode_op(0, 8)])
                 .sequence(b"ATGTATGT")
                 .qualities(&[30u8; 8]);
-            b.add_string_tag(b"YD", b"f");
-            b.add_int_tag(b"NM", 2);
-            b.add_string_tag(b"MD", b"1T3T2");
+            b.add_string_tag(SamTag::YD, b"f");
+            b.add_int_tag(SamTag::NM, 2);
+            b.add_string_tag(SamTag::MD, b"1T3T2");
             b.build()
         };
         restore_unconverted_bases_in_raw_record(&mut raw, &reference, &header)?;
         // SEQ changed (T→C at ref-C positions) so NM/MD must be gone.
         assert_eq!(raw_sequence(&raw), b"ACGTACGT");
-        assert!(raw_tag_absent(&raw, *b"NM"), "NM should be removed when bases were changed");
-        assert!(raw_tag_absent(&raw, *b"MD"), "MD should be removed when bases were changed");
+        assert!(raw_tag_absent(&raw, *SamTag::NM), "NM should be removed when bases were changed");
+        assert!(raw_tag_absent(&raw, *SamTag::MD), "MD should be removed when bases were changed");
         Ok(())
     }
 }

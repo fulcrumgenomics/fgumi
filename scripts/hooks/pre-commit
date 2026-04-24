@@ -37,6 +37,16 @@ if ! cargo ci-lint; then
     exit 1
 fi
 
+# Check for bare SAM-tag byte literals
+echo "==> cargo ci-tag-literals"
+if ! cargo ci-tag-literals; then
+    echo ""
+    echo "Bare SAM-tag byte literal check failed!"
+    echo "Replace the flagged literals with SamTag::XX constants, or add them to the"
+    echo "PAYLOAD_ALLOWLIST in crates/xtask/src/check_tag_literals.rs with a justification."
+    exit 1
+fi
+
 # Optionally run tests
 if [[ "${FGUMI_PRECOMMIT_TEST:-0}" == "1" ]]; then
     echo "==> cargo ci-test"

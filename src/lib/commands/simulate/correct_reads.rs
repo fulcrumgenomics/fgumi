@@ -5,6 +5,7 @@ use crate::commands::command::Command;
 use crate::commands::common::CompressionOptions;
 use crate::commands::simulate::common::generate_random_sequence;
 use crate::progress::ProgressTracker;
+use crate::sam::SamTag;
 use crate::simulate::create_rng;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -381,7 +382,7 @@ fn generate_correct_read_pair(
         )
         .sequence(&template_r1)
         .qualities(&vec![params.quality; template_r1.len()])
-        .add_string_tag(b"RX", observed_umi.as_bytes());
+        .add_string_tag(SamTag::RX, observed_umi.as_bytes());
     let r1_record = r1_builder.build();
 
     // Build R2 (flag 141: UNMAPPED | SEGMENTED | LAST_SEGMENT | MATE_UNMAPPED)
@@ -396,7 +397,7 @@ fn generate_correct_read_pair(
         )
         .sequence(&template_r2)
         .qualities(&vec![params.quality; template_r2.len()])
-        .add_string_tag(b"RX", observed_umi.as_bytes());
+        .add_string_tag(SamTag::RX, observed_umi.as_bytes());
     let r2_record = r2_builder.build();
 
     CorrectReadPair {
@@ -440,7 +441,6 @@ fn introduce_n_errors(umi: &str, n: usize, rng: &mut impl Rng) -> String {
 #[allow(clippy::naive_bytecount)]
 mod tests {
     use super::*;
-    use crate::sam::SamTag;
     use crate::simulate::create_rng;
     use noodles::sam::alignment::record::data::field::Tag;
 
@@ -648,7 +648,7 @@ mod tests {
                     | raw_flags::MATE_UNMAPPED,
             )
             .sequence(b"ACGT");
-        b.add_string_tag(b"RX", b"AAAAAAAA");
+        b.add_string_tag(SamTag::RX, b"AAAAAAAA");
         let r1 = to_record_buf(b.build());
 
         assert!(r1.flags().is_unmapped());
@@ -676,7 +676,7 @@ mod tests {
                     | raw_flags::MATE_UNMAPPED,
             )
             .sequence(b"ACGT");
-        b.add_string_tag(b"RX", b"AAAAAAAA");
+        b.add_string_tag(SamTag::RX, b"AAAAAAAA");
         let r2 = to_record_buf(b.build());
 
         assert!(r2.flags().is_unmapped());
@@ -706,7 +706,7 @@ mod tests {
                     | raw_flags::MATE_UNMAPPED,
             )
             .sequence(b"AAAA");
-        b1.add_string_tag(b"RX", umi.as_bytes());
+        b1.add_string_tag(SamTag::RX, umi.as_bytes());
         let r1 = to_record_buf(b1.build());
 
         let mut b2 = RawSamBuilder::new();
@@ -718,7 +718,7 @@ mod tests {
                     | raw_flags::MATE_UNMAPPED,
             )
             .sequence(b"CCCC");
-        b2.add_string_tag(b"RX", umi.as_bytes());
+        b2.add_string_tag(SamTag::RX, umi.as_bytes());
         let r2 = to_record_buf(b2.build());
 
         // Both should have the same read name

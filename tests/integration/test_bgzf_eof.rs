@@ -4,6 +4,7 @@
 //! GitHub issue #125: BAM files written by pipeline-based commands were missing
 //! the BGZF EOF block, causing `samtools quickcheck` to fail.
 
+use fgumi_lib::sam::SamTag;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags};
 use noodles::bam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
@@ -40,7 +41,7 @@ fn write_grouped_bam(path: &Path, families: &[(&str, &[RawRecord])]) {
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));
     writer.write_header(&header).expect("Failed to write header");
 
-    let mi_tag = Tag::from(fgumi_lib::sam::SamTag::MI);
+    let mi_tag = Tag::from(SamTag::MI);
     for &(mi, records) in families {
         for record in records {
             let mut buf = to_record_buf(record);
@@ -66,8 +67,8 @@ fn create_dedup_reads(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> {
             .mate_ref_id(0)
             .mate_pos(start + 99)
             .template_length(108)
-            .add_string_tag(b"RX", umi.as_bytes())
-            .add_string_tag(b"MC", b"8M");
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
         b.build()
     };
 
@@ -84,8 +85,8 @@ fn create_dedup_reads(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> {
             .mate_ref_id(0)
             .mate_pos(start - 1)
             .template_length(-108)
-            .add_string_tag(b"RX", umi.as_bytes())
-            .add_string_tag(b"MC", b"8M");
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
         b.build()
     };
 
@@ -138,7 +139,7 @@ fn create_duplex_pair(
             .mate_ref_id(0)
             .mate_pos(r2_start - 1)
             .template_length(tlen)
-            .add_string_tag(b"MI", mi_tag.as_bytes());
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
         b.build()
     };
 
@@ -155,7 +156,7 @@ fn create_duplex_pair(
             .mate_ref_id(0)
             .mate_pos(r1_start - 1)
             .template_length(-tlen)
-            .add_string_tag(b"MI", mi_tag.as_bytes());
+            .add_string_tag(SamTag::MI, mi_tag.as_bytes());
         b.build()
     };
 
@@ -177,8 +178,8 @@ fn create_rejected_family(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> 
             .mate_ref_id(0)
             .mate_pos(start + 99)
             .template_length(108)
-            .add_string_tag(b"RX", umi.as_bytes())
-            .add_string_tag(b"MC", b"8M");
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
         b.build()
     };
 
@@ -195,8 +196,8 @@ fn create_rejected_family(name: &[u8], umi: &str, start: i32) -> Vec<RawRecord> 
             .mate_ref_id(0)
             .mate_pos(start - 1)
             .template_length(-108)
-            .add_string_tag(b"RX", umi.as_bytes())
-            .add_string_tag(b"MC", b"8M");
+            .add_string_tag(SamTag::RX, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
         b.build()
     };
 
@@ -218,8 +219,8 @@ fn create_codec_pair(name: &[u8], umi: &str, ref_start: i32) -> (RawRecord, RawR
             .mate_ref_id(0)
             .mate_pos(ref_start - 1)
             .template_length(8)
-            .add_string_tag(b"MI", umi.as_bytes())
-            .add_string_tag(b"MC", b"8M");
+            .add_string_tag(SamTag::MI, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
         b.build()
     };
 
@@ -236,8 +237,8 @@ fn create_codec_pair(name: &[u8], umi: &str, ref_start: i32) -> (RawRecord, RawR
             .mate_ref_id(0)
             .mate_pos(ref_start - 1)
             .template_length(-8)
-            .add_string_tag(b"MI", umi.as_bytes())
-            .add_string_tag(b"MC", b"8M");
+            .add_string_tag(SamTag::MI, umi.as_bytes())
+            .add_string_tag(SamTag::MC, b"8M");
         b.build()
     };
 
@@ -433,8 +434,8 @@ fn test_filter_output_has_bgzf_eof() {
             .pos(99)
             .mapq(60)
             .cigar_ops(&[8 << 4]) // 8M
-            .add_array_u16(b"cd", &[10; 8])
-            .add_array_u16(b"ce", &[0; 8]);
+            .add_array_u16(SamTag::CD_BASES, &[10; 8])
+            .add_array_u16(SamTag::CE_BASES, &[0; 8]);
         b.build()
     };
 

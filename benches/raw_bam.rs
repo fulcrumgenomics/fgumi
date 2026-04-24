@@ -20,7 +20,7 @@ use noodles::sam::alignment::record_buf::Cigar as CigarBuf;
 
 use fgumi_raw_bam::raw_records_to_record_bufs;
 use fgumi_raw_bam::testutil::{encode_op, make_bam_bytes};
-use fgumi_raw_bam::{RawRecord, RawRecordView};
+use fgumi_raw_bam::{RawRecord, RawRecordView, SamTag};
 
 // ============================================================================
 // Shared helpers
@@ -334,7 +334,7 @@ fn bench_tags_editor_variable(c: &mut Criterion) {
                 RawRecord::from(bytes)
             },
             |rec| {
-                rec.tags_editor().copy_from(src_tags, black_box(&[b"NM"]));
+                rec.tags_editor().copy_from(src_tags, black_box(&[SamTag::NM]));
             },
             BatchSize::SmallInput,
         );
