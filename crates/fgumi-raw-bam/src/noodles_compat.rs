@@ -282,6 +282,7 @@ pub fn raw_records_to_record_bufs_with_header(
 #[allow(clippy::identity_op)]
 mod tests {
     use super::*;
+    use crate::SamTag;
     use crate::builder::*;
     use crate::testutil::*;
 
@@ -395,7 +396,7 @@ mod tests {
     fn test_raw_records_to_record_bufs_single() {
         let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"read1", 0, b"ACGT", &[30, 25, 20, 15]);
-        builder.append_string_tag(b"MI", b"1");
+        builder.append_string_tag(SamTag::MI, b"1");
         let raw = builder.as_bytes().to_vec();
 
         let bufs = raw_records_to_record_bufs(&[raw])
@@ -438,7 +439,7 @@ mod tests {
     fn test_encode_record_buf_to_raw_single() {
         let mut builder = UnmappedSamBuilder::new();
         builder.build_record(b"read1", 0, b"ACGT", &[30, 25, 20, 15]);
-        builder.append_string_tag(b"MI", b"1");
+        builder.append_string_tag(SamTag::MI, b"1");
         let original_raw = crate::RawRecord::from(builder.as_bytes().to_vec());
 
         // Decode to RecordBuf then re-encode and compare field-by-field.
