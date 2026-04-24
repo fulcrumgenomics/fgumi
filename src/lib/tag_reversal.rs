@@ -70,7 +70,7 @@ pub fn reverse_per_base_tags_raw(record: &mut [u8]) -> Result<bool> {
 mod tests {
     use super::*;
     use fgumi_raw_bam::{
-        SamBuilder as RawSamBuilder, flags as raw_flags, raw_record_to_record_buf,
+        SamBuilder as RawSamBuilder, SamTag, flags as raw_flags, raw_record_to_record_buf,
     };
     use noodles::sam::Header;
     use noodles::sam::alignment::record::data::field::Tag;
@@ -109,7 +109,7 @@ mod tests {
 
         let mut b = RawSamBuilder::new();
         b.sequence(b"ACGT").qualities(&[30; 4]).flags(raw_flags::REVERSE);
-        b.add_string_tag(b"aq", b"IIHG");
+        b.add_string_tag(SamTag::AQ, b"IIHG");
         let record_buf = to_record_buf(&b.build());
 
         let header = Header::default();
@@ -122,14 +122,14 @@ mod tests {
         assert!(result);
 
         let aux = bam_fields::aux_data_slice(&raw);
-        let s = bam_fields::find_string_tag(aux, b"aq").expect("aq tag should exist");
+        let s = bam_fields::find_string_tag(aux, SamTag::AQ).expect("aq tag should exist");
         assert_eq!(s, b"GHII");
     }
 
     #[rstest]
-    #[case(b"ac")]
-    #[case(b"bc")]
-    fn test_reverse_per_base_tags_raw_revcomp_string_tags(#[case] tag: &'static [u8; 2]) {
+    #[case(SamTag::AC)]
+    #[case(SamTag::BC_BASES)]
+    fn test_reverse_per_base_tags_raw_revcomp_string_tags(#[case] tag: SamTag) {
         // Verify ac/bc Z-type tags are reverse-complemented on the raw path.
         use crate::sort::bam_fields;
 
@@ -199,7 +199,7 @@ mod tests {
 
         // Verify the cd tag was reversed: find it in the raw record's aux data
         let aux = bam_fields::aux_data_slice(&raw);
-        let arr = bam_fields::find_array_tag(aux, b"cd").expect("cd tag should exist");
+        let arr = bam_fields::find_array_tag(aux, SamTag::CD_BASES).expect("cd tag should exist");
         let values = bam_fields::array_tag_to_vec_u16(&arr);
         assert_eq!(values, vec![4, 3, 2, 1]);
     }

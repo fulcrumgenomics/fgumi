@@ -1445,7 +1445,7 @@ mod tests {
     fn test_find_string_or_uint8_array_z_tag() {
         // Build aux data with a Z-type string tag: ac:Z:ACGT
         let mut aux = Vec::new();
-        aux.extend_from_slice(b"ac"); // tag
+        aux.extend_from_slice(SamTag::AC.as_ref()); // tag
         aux.push(b'Z'); // type
         aux.extend_from_slice(b"ACGT\0"); // value + NUL
 
@@ -1457,7 +1457,7 @@ mod tests {
     fn test_find_string_or_uint8_array_b_uint8_tag() {
         // Build aux data with a B-type UInt8 array tag: ac:B:C,65,67,71,84
         let mut aux = Vec::new();
-        aux.extend_from_slice(b"ac"); // tag
+        aux.extend_from_slice(SamTag::AC.as_ref()); // tag
         aux.push(b'B'); // type = array
         aux.push(b'C'); // sub-type = UInt8
         aux.extend_from_slice(&4u32.to_le_bytes()); // count = 4
@@ -1478,7 +1478,7 @@ mod tests {
     fn test_find_string_or_uint8_array_wrong_array_type() {
         // Build aux data with a B-type Int16 array — should return None since not UInt8
         let mut aux = Vec::new();
-        aux.extend_from_slice(b"ac"); // tag
+        aux.extend_from_slice(SamTag::AC.as_ref()); // tag
         aux.push(b'B'); // type = array
         aux.push(b's'); // sub-type = Int16
         aux.extend_from_slice(&2u32.to_le_bytes()); // count = 2
