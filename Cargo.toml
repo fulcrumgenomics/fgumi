@@ -127,6 +127,18 @@ profile-adjacency = []
 # Enable long-running concurrency stress tests (behind a feature gate so normal
 # `cargo test` doesn't run them — use `cargo nextest run --features stress-tests`).
 stress-tests = []
+# `runall` only: have AlignAndMerge reorder its input into canonical
+# ordinal order before feeding the aligner. The default code path forwards
+# batches in upstream worker-scheduling order, which is fine for real
+# aligners that preserve input order in their output (e.g. bwa mem). This
+# feature exists for benchmark harnesses (e.g. fgumi-benchmarks's
+# replay-aligner.sh) whose SAM output is sourced independently of stdin —
+# those harnesses need the FASTQ written to the aligner in canonical order
+# so both sides of the zipper merge are in the same order. Off by default
+# because the reorder buffer holds up to `in-flight-batches` of unmapped
+# bytes on top of the upstream `StageQueue`'s accounting, which is a
+# memory cost most workloads don't need.
+runall-reorder-aligner-input = []
 
 [dev-dependencies]
 rstest = "0"

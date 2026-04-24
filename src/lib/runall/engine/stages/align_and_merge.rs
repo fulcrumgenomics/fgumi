@@ -16,15 +16,25 @@
 //! ## Ordering guarantees
 //!
 //! Best-effort: thread A forwards the unmapped bytes of each input batch
-//! to the merge thread in input-ordinal order, and the aligner emits
-//! SAM in the order it consumed FASTQ. However, `bwa mem -t N` with
-//! `N > 1` reorders its output when worker threads finish alignments
-//! out of submission order, so the merged output is **not**
-//! deterministically ordered for `-t > 1`. Downstream stages that need
+//! to the merge thread in upstream worker-scheduling order, and the
+//! aligner is expected to preserve input order in its SAM output
+//! (`bwa mem` and `bwa-mem2` both do). Downstream stages that need
 //! canonical order must call a reorder/sort stage. The emitted
 //! `ordinal` is a fresh monotonic counter stamped at merge time and is
 //! therefore meaningful only for in-run batch identity, not for
 //! reconstructing input order.
+//!
+//! When built with `--features runall-reorder-aligner-input`, thread A instead
+//! buffers input in a [`ReorderBuffer`] keyed by `batch.ordinal` and
+//! writes to the aligner / forwards to the merge thread in canonical
+//! 0..N order. This makes the pipeline compatible with replay-style
+//! aligner harnesses whose SAM output stream has a fixed order
+//! independent of stdin (e.g. streaming from a pre-aligned BAM), at the
+//! cost of holding in-flight batches in memory until earlier ordinals
+//! arrive. Off by default because it adds memory footprint for no
+//! real-world benefit — real aligners don't need it.
+//!
+//! [`ReorderBuffer`]: crate::runall::engine::reorder::ReorderBuffer
 //!
 //! ## Memory model
 //!
@@ -191,6 +201,47 @@ impl SpecialStage for AlignAndMerge {
             move || -> Result<()> {
                 let mut fastq_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
 
+                // Per-batch: convert to FASTQ, forward unmapped to merge,
+                // then write FASTQ to stdin. Forwarding before writing
+                // keeps the merge input consistent even if stdin writes
+                // EPIPE mid-batch (partial write + aligner died) — see
+                // the module-level note on the "mapped reads remain"
+                // tail check.
+                //
+                // Returns `Ok(false)` when we should stop the loop
+                // (merge thread dropped the unmapped channel, or the
+                // aligner's stdin has broken).
+                let mut process_batch = |batch: SerializedBatch| -> Result<bool> {
+                    fastq_buf.clear();
+                    bam_records_to_fastq(
+                        &batch.primary.data,
+                        &mut fastq_buf,
+                        no_read_suffix,
+                        DEFAULT_EXCLUDE_FLAGS,
+                        0,
+                    )?;
+
+                    if unmapped_tx.send(batch.primary.data).is_err() {
+                        return Ok(false); // thread C dropped
+                    }
+
+                    if !fastq_buf.is_empty()
+                        && let Err(e) = stdin.write_all(&fastq_buf)
+                    {
+                        // Broken pipe = aligner died; the real error
+                        // surfaces via `wait()`.
+                        tracing::debug!("stdin write failed (aligner likely exited): {e}");
+                        return Ok(false);
+                    }
+
+                    Ok(true)
+                };
+
+                // Default: feed batches to the aligner in upstream
+                // worker-scheduling order. Real aligners preserve that
+                // order in their output, so the zipper merge sees both
+                // streams in matching (if arbitrary) order.
+                #[cfg(not(feature = "runall-reorder-aligner-input"))]
                 loop {
                     if cancel_a.is_cancelled() {
                         break;
@@ -202,39 +253,71 @@ impl SpecialStage for AlignAndMerge {
                         thread::yield_now();
                         continue;
                     };
-
-                    let batch = item.item;
-
-                    // Convert to FASTQ (borrows the batch bytes), then forward
-                    // the unmapped bytes to thread C *before* writing to the
-                    // aligner. Forwarding first makes the merge input resilient
-                    // to a broken-pipe write: if the aligner dies mid-batch
-                    // (partial write + EPIPE), thread C still receives this
-                    // batch's unmapped records, so any alignments the aligner
-                    // emitted for the portion it consumed have matching
-                    // unmapped counterparts and the zipper's tail-check stays
-                    // consistent. Swapping the order to write-then-send would
-                    // silently drop the current batch from the merge input on
-                    // EPIPE, producing a spurious "mapped reads remain" error.
-                    fastq_buf.clear();
-                    bam_records_to_fastq(
-                        &batch.primary.data,
-                        &mut fastq_buf,
-                        no_read_suffix,
-                        DEFAULT_EXCLUDE_FLAGS,
-                        0,
-                    )?;
-
-                    if unmapped_tx.send(batch.primary.data).is_err() {
-                        break; // thread C dropped
-                    }
-
-                    if !fastq_buf.is_empty()
-                        && let Err(e) = stdin.write_all(&fastq_buf)
-                    {
-                        // Broken pipe = aligner died; the real error surfaces via wait().
-                        tracing::debug!("stdin write failed (aligner likely exited): {e}");
+                    if !process_batch(item.item)? {
                         break;
+                    }
+                }
+
+                // `runall-reorder-aligner-input`: feed batches in canonical
+                // 0..N ordinal order, buffering out-of-order arrivals
+                // in a ReorderBuffer until earlier ordinals arrive.
+                // Needed for aligner harnesses whose SAM output order
+                // is externally fixed (e.g. streaming a pre-aligned
+                // BAM), which must see the FASTQ in canonical order to
+                // line up with the saved mapped stream.
+                #[cfg(feature = "runall-reorder-aligner-input")]
+                {
+                    use crate::runall::engine::reorder::ReorderBuffer;
+                    let mut reorder: ReorderBuffer<SerializedBatch> = ReorderBuffer::new();
+                    let mut input_drained = false;
+
+                    'outer: loop {
+                        if cancel_a.is_cancelled() {
+                            break;
+                        }
+
+                        if let Some(batch) = reorder.pop_ready() {
+                            if !process_batch(batch)? {
+                                break 'outer;
+                            }
+                            continue;
+                        }
+
+                        if input_drained {
+                            if !reorder.is_empty() {
+                                // Upstream pipelines that feed AlignAndMerge
+                                // emit contiguous 0..N ordinals today, so a
+                                // non-empty reorder buffer at drain would
+                                // indicate a new gap-producing stage —
+                                // log so a future regression is visible.
+                                tracing::debug!(
+                                    "AlignAndMerge: {} batch(es) stranded in reorder \
+                                     buffer after input drain (ordinal gap upstream)",
+                                    reorder.len(),
+                                );
+                            }
+                            break;
+                        }
+
+                        match input.pop() {
+                            Some(item) => {
+                                // Use `batch.ordinal` (contiguous 0..N from
+                                // the upstream batcher) rather than
+                                // `SequencedItem::seq`, which earlier
+                                // stream-merging stages (e.g. `FastqPair`)
+                                // can duplicate or leave gappy. `Coalesce`
+                                // makes the same choice.
+                                let ordinal = item.item.ordinal;
+                                reorder.push(ordinal, item.item);
+                            }
+                            None => {
+                                if input.is_drained() {
+                                    input_drained = true;
+                                } else {
+                                    thread::yield_now();
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -975,6 +1058,132 @@ mod tests {
         assert!(
             err.contains("--aligner::threads 1") || err.contains("--threads 1"),
             "error should point at an actionable knob; got:\n{err}",
+        );
+    }
+
+    /// Regression test for the `runall-reorder-aligner-input` feature: Thread
+    /// A reorders its input into canonical ordinal order so a mock
+    /// aligner that emits a fixed-order SAM stream (like
+    /// fgumi-benchmarks's `samtools view -h saved.bam & cat >/dev/null`
+    /// replay script) can zip cleanly even when upstream delivers
+    /// batches in arbitrary worker-scheduling order.
+    ///
+    /// Without the feature the default path feeds the aligner in
+    /// upstream arrival order, which is fine for aligners whose output
+    /// is a function of their input (`bwa mem`) but not for replays
+    /// whose output is fixed externally. The test is gated on the
+    /// feature so we don't build the reorder code into default
+    /// binaries.
+    #[cfg(all(unix, feature = "runall-reorder-aligner-input"))]
+    #[test]
+    fn test_thread_a_reorders_shuffled_input_against_canonical_mapped() {
+        use std::fmt::Write as _;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+
+        const NUM_BATCHES: usize = 32;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dict_path = tmp.path().join("ref.dict");
+        fs::write(&dict_path, "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:100000\n")
+            .expect("write dict");
+
+        let mut names: Vec<String> = Vec::with_capacity(NUM_BATCHES);
+        let mut batches: Vec<SerializedBatch> = Vec::with_capacity(NUM_BATCHES);
+        for i in 0..NUM_BATCHES {
+            let name = format!("read_{i:02}");
+            let rec = make_bam_bytes(
+                -1,
+                -1,
+                fgumi_raw_bam::flags::UNMAPPED,
+                name.as_bytes(),
+                &[],
+                10,
+                -1,
+                -1,
+                &[],
+            );
+            let size = u32::try_from(rec.len()).expect("record size fits u32");
+            let mut data: Vec<u8> = Vec::with_capacity(4 + rec.len());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&rec);
+            batches.push(SerializedBatch {
+                primary: RawBytes { data, record_count: 1 },
+                secondary: None,
+                ordinal: i as u64,
+            });
+            names.push(name);
+        }
+
+        // Replay-style aligner: background `cat >/dev/null` drains
+        // stdin, foreground emits canonical SAM. Output order is
+        // independent of stdin — this is exactly the pattern that
+        // drove the replay-compat feature.
+        let aligner_path = tmp.path().join("replay_aligner.sh");
+        let mut script = String::from("#!/bin/bash\nset -e\ncat >/dev/null &\n");
+        script.push_str("drain=$!\n");
+        script.push_str("printf '@HD\\tVN:1.6\\tSO:unsorted\\n'\n");
+        script.push_str("printf '@SQ\\tSN:chr1\\tLN:100000\\n'\n");
+        for name in &names {
+            writeln!(script, "printf '{name}\\t0\\tchr1\\t1\\t60\\t10M\\t*\\t0\\t0\\t*\\t*\\n'",)
+                .expect("format into String is infallible");
+        }
+        script.push_str("wait $drain\nexit 0\n");
+        fs::write(&aligner_path, &script).expect("write aligner script");
+        let mut perms = fs::metadata(&aligner_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&aligner_path, perms).expect("chmod aligner");
+
+        let stage = AlignAndMerge::new(
+            format!("/bin/bash {}", aligner_path.display()),
+            PathBuf::from("/unused.fa"),
+            dict_path,
+            Header::default(),
+            TagInfo::new(vec![], vec![], vec![]),
+            true,
+            true,
+        );
+
+        let tracker = Arc::new(MemoryTracker::new(100_000_000));
+        let input_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_in", NUM_BATCHES + 8, 50_000_000, tracker.clone()));
+        let output_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_out", 64, 50_000_000, tracker));
+
+        // Worst-case shuffle: push in reverse ordinal order.
+        for batch in batches.into_iter().rev() {
+            let batch_mem = batch.primary.data.len();
+            input_q.push(SequencedItem::new(batch.ordinal, batch, batch_mem)).expect("push batch");
+        }
+        input_q.close();
+
+        let drain_handle = std::thread::spawn({
+            let output_q = output_q.clone();
+            move || -> u64 {
+                let mut total: u64 = 0;
+                loop {
+                    if let Some(item) = output_q.pop() {
+                        total += item.item.primary.record_count;
+                    } else if output_q.is_drained() {
+                        break;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                total
+            }
+        });
+
+        let result = Box::new(stage).run(Box::new(input_q), Box::new(output_q), CancelToken::new());
+        let total_records = drain_handle.join().expect("drain thread join");
+
+        assert!(result.is_ok(), "AlignAndMerge unexpectedly failed: {result:?}");
+        assert_eq!(
+            total_records, NUM_BATCHES as u64,
+            "every shuffled-input record must zip cleanly against the canonical \
+             replay SAM stream",
         );
     }
 }

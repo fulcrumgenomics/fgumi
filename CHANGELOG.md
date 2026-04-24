@@ -26,6 +26,17 @@ All notable changes to this project will be documented in this file.
   `--threads 1` for custom/replay aligners whose output is
   independent of stdin).
 
+### Features
+
+- `runall`: add an off-by-default `runall-reorder-aligner-input` Cargo
+  feature that reorders `AlignAndMerge`'s input into canonical
+  ordinal order before feeding the aligner. Built for benchmark
+  harnesses (e.g. fgumi-benchmarks's `replay-aligner.sh`, which
+  streams a pre-aligned BAM whose SAM order is fixed independent of
+  stdin) — the default binary stays on the fast path that assumes
+  the aligner preserves input order, because real aligners
+  (`bwa mem`, `bwa-mem2`) do.
+
 ## [0.2.0] - 2026-04-22
 
 ### Bug Fixes
