@@ -18,6 +18,13 @@ All notable changes to this project will be documented in this file.
   forwarding channel is now unbounded, so thread A can finish writing
   and close stdin instead of stalling on a full channel while thread
   C waits on mapped records and the aligner waits on stdin EOF.
+- `runall`: replace the terse `AlignAndMerge` tail-check error with
+  an actionable diagnostic that names the offending template, points
+  at the real cause (aligner SAM output must be in the same order
+  as the FASTQ records written to its stdin), and lists concrete
+  next steps (`--aligner::threads 1` for thread-reordering aligners;
+  `--threads 1` for custom/replay aligners whose output is
+  independent of stdin).
 
 ## [0.2.0] - 2026-04-22
 

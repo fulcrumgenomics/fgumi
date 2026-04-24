@@ -453,13 +453,35 @@ fn run_merge(
         mapped_peek = None;
     }
 
-    // Sanity check: any leftover mapped templates indicate a name mismatch.
+    // Sanity check: any leftover mapped templates mean the aligner emitted
+    // a record whose QNAME wasn't found in the unmapped stream by the time
+    // we exhausted it. The zipper merge is a linear scan — it advances
+    // through unmapped and mapped in lockstep, treating un-matched
+    // unmapped records as orphans — so any mapped record that is either
+    // (a) not present in unmapped at all, or (b) present but positioned
+    // earlier in the mapped stream than it is in the unmapped stream,
+    // ends up stranded here. Report both the template and the actionable
+    // causes so the user doesn't have to reverse-engineer the scan.
     let leftover = mapped_peek.map(Ok).or_else(|| mapped_rx.recv().ok()).transpose()?;
     if let Some(remaining) = leftover {
         return Err(anyhow!(
-            "AlignAndMerge: processed all unmapped reads but mapped reads remain. \
-             Found template '{}'. Ensure unmapped and mapped inputs have matching read names.",
-            String::from_utf8_lossy(&remaining.name)
+            "AlignAndMerge: aligner emitted mapped record '{name}' with no matching \
+             unmapped record. fgumi's zipper merge is a linear scan — the aligner's \
+             SAM output must be in the same order as the FASTQ records written to its \
+             stdin, and every output read name must also appear in the input.\n\n\
+             Common causes:\n  \
+             - The aligner reorders SAM output across threads. \
+             Most (`bwa mem`, `bwa-mem2`) preserve input order; if yours does not, \
+             run it with a single aligner thread (`--aligner::threads 1`).\n  \
+             - `--aligner::command` is a custom script whose SAM stream is \
+             independent of its stdin (e.g. a replay of a pre-aligned BAM). \
+             fgumi cannot recover from this at `--threads > 1` because upstream \
+             stages emit batches in worker-scheduling order; run the pipeline \
+             with `--threads 1` so the FASTQ is written in canonical order \
+             matching the pre-aligned source.\n  \
+             - The aligner emits SAM records for reads that were not in the \
+             FASTQ input (rare — usually a replay-harness bug).",
+            name = String::from_utf8_lossy(&remaining.name),
         ));
     }
 
@@ -845,6 +867,114 @@ mod tests {
         assert_eq!(
             total_records, NUM_BATCHES as u64,
             "every unmapped record should be merged with its alignment",
+        );
+    }
+
+    /// Guards the actionable tail-check error message emitted when the
+    /// aligner's SAM output contains a record whose name does not appear
+    /// in the unmapped stream at all (or is positioned out-of-order
+    /// relative to it). The previous "Ensure unmapped and mapped inputs
+    /// have matching read names" wording was misleading under the common
+    /// real cause (names *do* match; the *order* differs). This test
+    /// locks in the key pieces a user should be able to learn from the
+    /// message so a future refactor doesn't quietly regress it back.
+    #[cfg(unix)]
+    #[test]
+    fn test_tail_check_error_message_is_actionable() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dict_path = tmp.path().join("ref.dict");
+        fs::write(&dict_path, "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:100000\n")
+            .expect("write dict");
+
+        // One unmapped record named `only_known` and a mock aligner that
+        // emits a mapped record for a *different* name (`ghost`) so the
+        // zipper's tail check trips on a name with no unmapped sibling.
+        let rec = make_bam_bytes(
+            -1,
+            -1,
+            fgumi_raw_bam::flags::UNMAPPED,
+            b"only_known",
+            &[],
+            10,
+            -1,
+            -1,
+            &[],
+        );
+        let size = u32::try_from(rec.len()).expect("record size fits u32");
+        let mut data: Vec<u8> = Vec::with_capacity(4 + rec.len());
+        data.extend_from_slice(&size.to_le_bytes());
+        data.extend_from_slice(&rec);
+        let batch = SerializedBatch {
+            primary: RawBytes { data, record_count: 1 },
+            secondary: None,
+            ordinal: 0,
+        };
+
+        let aligner_path = tmp.path().join("ghost_aligner.sh");
+        let script = "#!/bin/bash\nset -e\ncat >/dev/null &\n\
+                      drain=$!\n\
+                      printf '@HD\\tVN:1.6\\tSO:unsorted\\n'\n\
+                      printf '@SQ\\tSN:chr1\\tLN:100000\\n'\n\
+                      printf 'ghost\\t0\\tchr1\\t1\\t60\\t10M\\t*\\t0\\t0\\t*\\t*\\n'\n\
+                      wait $drain\nexit 0\n";
+        fs::write(&aligner_path, script).expect("write aligner script");
+        let mut perms = fs::metadata(&aligner_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&aligner_path, perms).expect("chmod aligner");
+
+        let stage = AlignAndMerge::new(
+            format!("/bin/bash {}", aligner_path.display()),
+            PathBuf::from("/unused.fa"),
+            dict_path,
+            Header::default(),
+            TagInfo::new(vec![], vec![], vec![]),
+            true,
+            true,
+        );
+
+        let tracker = Arc::new(MemoryTracker::new(10_000_000));
+        let input_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_in", 8, 1_000_000, tracker.clone()));
+        let output_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_out", 8, 1_000_000, tracker));
+
+        let batch_mem = batch.primary.data.len();
+        input_q.push(SequencedItem::new(0, batch, batch_mem)).expect("push batch");
+        input_q.close();
+
+        let drain_handle = std::thread::spawn({
+            let output_q = output_q.clone();
+            move || loop {
+                if output_q.pop().is_some() {
+                    continue;
+                }
+                if output_q.is_drained() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let result = Box::new(stage).run(Box::new(input_q), Box::new(output_q), CancelToken::new());
+        drain_handle.join().expect("drain thread join");
+
+        let err = result.expect_err("tail check should fail").to_string();
+
+        // Name of the offending template must appear so the user can
+        // trace it back to their aligner input.
+        assert!(err.contains("ghost"), "error should name the stranded template; got:\n{err}");
+        // Root-cause framing: it's an order/presence mismatch, not a
+        // "check your read names" problem.
+        assert!(err.contains("order"), "error should mention order-sensitivity; got:\n{err}");
+        // At least one concrete, user-actionable pointer.
+        assert!(
+            err.contains("--aligner::threads 1") || err.contains("--threads 1"),
+            "error should point at an actionable knob; got:\n{err}",
         );
     }
 }
