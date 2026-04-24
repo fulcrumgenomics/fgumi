@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- `runall`: fix `AlignAndMerge` thread-A race that could surface as a
+  spurious "processed all unmapped reads but mapped reads remain" error
+  at higher thread counts: the stdin-writer thread now forwards each
+  batch's unmapped bytes to the merge thread **before** writing FASTQ
+  to the aligner, so a partial-write + EPIPE never silently drops the
+  in-flight batch from the merge input.
+- `runall`: fix `AlignAndMerge` deadlock at non-trivial input sizes
+  when the aligner buffers its whole input chunk before emitting
+  (e.g. `bwa mem -K` larger than the total input): the unmapped
+  forwarding channel is now unbounded, so thread A can finish writing
+  and close stdin instead of stalling on a full channel while thread
+  C waits on mapped records and the aligner waits on stdin EOF.
+
 ## [0.2.0] - 2026-04-22
 
 ### Bug Fixes

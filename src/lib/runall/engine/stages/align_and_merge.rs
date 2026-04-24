@@ -28,12 +28,20 @@
 //!
 //! ## Memory model
 //!
-//! Three cooperating threads share bounded crossbeam channels
-//! (`unmapped_tx` capped at 50 000 batches of raw unmapped bytes,
-//! `mapped_tx` capped at 10 000 mapped templates). Each input batch's
-//! primary bytes are cloned once for the merge thread; FASTQ is
-//! rebuilt per batch into a reusable buffer. Peak memory is dominated
-//! by the in-flight aligner pipe + these two channels.
+//! Three cooperating threads share crossbeam channels. `mapped_tx` is
+//! bounded (1 024 mapped templates). `unmapped_tx` is **unbounded**:
+//! Thread A forwards unmapped bytes into it at stdin-write cadence,
+//! while Thread C only drains them in lockstep with aligner-emitted
+//! mapped templates. A bounded `unmapped_tx` plus an aligner that
+//! buffers its whole input chunk before emitting (e.g. `bwa mem -K`
+//! set larger than the input size) produces a circular wait — Thread
+//! A blocks on a full `unmapped_tx`, Thread C blocks on an empty
+//! `mapped_rx`, and the aligner is still waiting on stdin EOF that
+//! Thread A will never reach. Unbounded forwarding breaks that cycle;
+//! the upstream `StageQueue` still caps memory via the global
+//! `MemoryTracker`, and in the pathological "aligner buffers
+//! everything" case the forwarded-unmapped footprint is already
+//! mirrored by the aligner's own in-memory chunk.
 //!
 //! ## Determinism
 //!
@@ -155,11 +163,19 @@ impl SpecialStage for AlignAndMerge {
         // 2. Channel for the mapped header: thread B -> thread C (single-shot).
         let (header_tx, header_rx) = std::sync::mpsc::sync_channel::<Header>(1);
 
-        // 3. Thread A -> Thread C: unmapped BAM record bytes, one chunk per input batch.
-        //    Capped at 256 in-flight chunks (~10 MB at typical batch sizes);
-        //    backpressure flows into the upstream `StageQueue` which is itself
-        //    `MemoryTracker`-bounded, so this channel doesn't need to be.
-        let (unmapped_tx, unmapped_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
+        // 3. Thread A -> Thread C: unmapped BAM record bytes, one chunk per
+        //    input batch. Intentionally **unbounded**: a bounded channel here
+        //    deadlocks when the aligner buffers its whole input chunk before
+        //    emitting anything (e.g. `bwa mem -K` larger than the actual
+        //    input). In that case the merge thread cannot drain until the
+        //    aligner emits, the aligner cannot emit until it sees stdin EOF,
+        //    and Thread A cannot close stdin because it is blocked forwarding
+        //    the current batch into a full channel. The stage-level memory
+        //    bound still comes from the upstream `StageQueue` (tracked by the
+        //    global `MemoryTracker`); in the pathological buffer-everything
+        //    case the aligner's internal chunk already mirrors this
+        //    allocation.
+        let (unmapped_tx, unmapped_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         // 4. Thread B -> Thread C: mapped templates from aligner stdout.
         let (mapped_tx, mapped_rx) =
             crossbeam_channel::bounded::<Result<crate::template::Template>>(1024);
@@ -189,9 +205,17 @@ impl SpecialStage for AlignAndMerge {
 
                     let batch = item.item;
 
-                    // Convert to FASTQ and write to aligner stdin (borrows the
-                    // batch bytes). Then move those bytes to thread C for merge
-                    // — no clone, one allocation, one memcpy-equivalent pass.
+                    // Convert to FASTQ (borrows the batch bytes), then forward
+                    // the unmapped bytes to thread C *before* writing to the
+                    // aligner. Forwarding first makes the merge input resilient
+                    // to a broken-pipe write: if the aligner dies mid-batch
+                    // (partial write + EPIPE), thread C still receives this
+                    // batch's unmapped records, so any alignments the aligner
+                    // emitted for the portion it consumed have matching
+                    // unmapped counterparts and the zipper's tail-check stays
+                    // consistent. Swapping the order to write-then-send would
+                    // silently drop the current batch from the merge input on
+                    // EPIPE, producing a spurious "mapped reads remain" error.
                     fastq_buf.clear();
                     bam_records_to_fastq(
                         &batch.primary.data,
@@ -200,16 +224,17 @@ impl SpecialStage for AlignAndMerge {
                         DEFAULT_EXCLUDE_FLAGS,
                         0,
                     )?;
+
+                    if unmapped_tx.send(batch.primary.data).is_err() {
+                        break; // thread C dropped
+                    }
+
                     if !fastq_buf.is_empty()
                         && let Err(e) = stdin.write_all(&fastq_buf)
                     {
                         // Broken pipe = aligner died; the real error surfaces via wait().
                         tracing::debug!("stdin write failed (aligner likely exited): {e}");
                         break;
-                    }
-
-                    if unmapped_tx.send(batch.primary.data).is_err() {
-                        break; // thread C dropped
                     }
                 }
 
@@ -505,7 +530,12 @@ impl Iterator for RawBamChunkIterator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    use crate::runall::engine::memory::MemoryTracker;
+    use crate::runall::engine::queue::StageQueue;
 
     #[test]
     fn test_align_and_merge_name() {
@@ -519,5 +549,302 @@ mod tests {
             false,
         );
         assert_eq!(stage.name(), "AlignAndMerge");
+    }
+
+    /// Regression test for the Thread A "forward-before-write" ordering fix.
+    ///
+    /// Wires [`AlignAndMerge`] against a bash mock aligner that emits one
+    /// matching SAM alignment per unmapped input record and then exits
+    /// **without reading stdin**. The input batch is deliberately sized so
+    /// its FASTQ payload greatly exceeds any plausible pipe buffer
+    /// (macOS 16 KiB, Linux 64 KiB), so Thread A's `stdin.write_all`
+    /// cannot complete before the mock aligner exits and closes the pipe
+    /// read end, which forces an `EPIPE` mid-write.
+    ///
+    /// Before the fix, Thread A broke out of the loop on `EPIPE` *before*
+    /// forwarding the current batch's unmapped bytes to the merge thread,
+    /// so the mapped stream contained matching alignments with no
+    /// corresponding unmapped records and the zipper's tail check raised
+    /// `"AlignAndMerge: processed all unmapped reads but mapped reads
+    /// remain. Found template '...'"`. With the reorder, Thread A
+    /// forwards the batch to the merge thread *before* the stdin write,
+    /// so the merge input is complete regardless of write failure and
+    /// the tail check stays consistent.
+    #[cfg(unix)]
+    #[test]
+    fn test_thread_a_forwards_unmapped_on_stdin_write_failure() {
+        use std::fmt::Write as _;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+
+        // Enough records at a large enough sequence length that the
+        // interleaved FASTQ comfortably exceeds the largest pipe buffer we
+        // expect to see on any supported platform. 256 records × ~400 B
+        // FASTQ/record ≈ 100 KiB, well past macOS's 16 KiB and Linux's
+        // 64 KiB pipe buffers, so Thread A's `write_all` must block until
+        // the aligner exits — at which point the pipe is broken and
+        // `write_all` returns `EPIPE` with only a partial write landed.
+        const NUM_RECORDS: usize = 256;
+        const SEQ_LEN: usize = 200;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Reference dict with a single contig covering the mock alignment's
+        // reported POS. `build_output_header` reads this to seed the merged
+        // header's @SQ lines.
+        let dict_path = tmp.path().join("ref.dict");
+        fs::write(&dict_path, "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:100000\n")
+            .expect("write dict");
+
+        let mut record_bytes: Vec<u8> = Vec::new();
+        let mut names: Vec<String> = Vec::with_capacity(NUM_RECORDS);
+        for i in 0..NUM_RECORDS {
+            let name = format!("read_{i:06}");
+            // Unmapped single-end record: UNMAPPED flag, no CIGAR, no
+            // mate. `make_bam_bytes` zero-fills seq and qual bytes, which
+            // is fine — we only care about names matching the mapped side.
+            let rec = make_bam_bytes(
+                -1,
+                -1,
+                fgumi_raw_bam::flags::UNMAPPED,
+                name.as_bytes(),
+                &[],
+                SEQ_LEN,
+                -1,
+                -1,
+                &[],
+            );
+            let size = u32::try_from(rec.len()).expect("record size fits u32");
+            record_bytes.extend_from_slice(&size.to_le_bytes());
+            record_bytes.extend_from_slice(&rec);
+            names.push(name);
+        }
+
+        let batch = SerializedBatch {
+            primary: RawBytes { data: record_bytes, record_count: NUM_RECORDS as u64 },
+            secondary: None,
+            ordinal: 0,
+        };
+
+        // Build the mock aligner: emit `@HD`/`@SQ` + N matching SAM lines,
+        // then exit 0. The script deliberately never reads stdin — by the
+        // time Thread A tries to push its FASTQ through, the aligner has
+        // already exited, the pipe reader is gone, and `write_all`
+        // returns EPIPE after the kernel-buffered prefix has been
+        // accepted.
+        let aligner_path = tmp.path().join("mock_aligner.sh");
+        let mut script = String::from("#!/bin/bash\nset -e\n");
+        script.push_str("printf '@HD\\tVN:1.6\\tSO:unsorted\\n'\n");
+        script.push_str("printf '@SQ\\tSN:chr1\\tLN:100000\\n'\n");
+        for name in &names {
+            // POS=1, MAPQ=60, CIGAR=<SEQ_LEN>M, SEQ=*, QUAL=*. The actual
+            // bases don't matter for the zipper — what matters is that
+            // QNAME matches the unmapped side.
+            writeln!(
+                script,
+                "printf '{name}\\t0\\tchr1\\t1\\t60\\t{SEQ_LEN}M\\t*\\t0\\t0\\t*\\t*\\n'",
+            )
+            .expect("format into String is infallible");
+        }
+        script.push_str("exit 0\n");
+        fs::write(&aligner_path, &script).expect("write aligner script");
+        let mut perms = fs::metadata(&aligner_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&aligner_path, perms).expect("chmod aligner");
+
+        let stage = AlignAndMerge::new(
+            format!("/bin/bash {}", aligner_path.display()),
+            PathBuf::from("/unused.fa"),
+            dict_path,
+            Header::default(),
+            TagInfo::new(vec![], vec![], vec![]),
+            true, // skip_pa_tags
+            true, // no_read_suffix
+        );
+
+        // Typed queues — Arc<StageQueue<T>> implements InputQueue<T> /
+        // OutputQueue<T> directly, so we skip the multi-stage driver's
+        // type-erased plumbing.
+        let tracker = Arc::new(MemoryTracker::new(100_000_000));
+        let input_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_in", 16, 50_000_000, tracker.clone()));
+        let output_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_out", 16, 50_000_000, tracker));
+
+        let batch_mem = batch.primary.data.len();
+        input_q.push(SequencedItem::new(0, batch, batch_mem)).expect("push batch");
+        input_q.close();
+
+        // Drain the output queue concurrently with the stage so the merge
+        // thread's `push_until_cancelled` doesn't stall on a full
+        // downstream slot.
+        let drain_handle = std::thread::spawn({
+            let output_q = output_q.clone();
+            move || -> u64 {
+                let mut total: u64 = 0;
+                loop {
+                    if let Some(item) = output_q.pop() {
+                        total += item.item.primary.record_count;
+                    } else if output_q.is_drained() {
+                        break;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                total
+            }
+        });
+
+        let result = Box::new(stage).run(Box::new(input_q), Box::new(output_q), CancelToken::new());
+        let total_records = drain_handle.join().expect("drain thread join");
+
+        assert!(result.is_ok(), "AlignAndMerge unexpectedly failed: {result:?}");
+
+        // All N mapped records had matching unmapped counterparts, so the
+        // merge should have emitted N records (possibly split across
+        // batches). Before the fix, Thread A would silently drop the
+        // batch on EPIPE — the merge would then see 0 unmapped vs. N
+        // mapped and fail with "mapped reads remain".
+        assert_eq!(
+            total_records, NUM_RECORDS as u64,
+            "expected every unmapped record to be paired with a mapped alignment; \
+             a smaller count indicates Thread A dropped the batch on stdin-write failure",
+        );
+    }
+
+    /// Regression test for the `unmapped_tx` unbounded fix.
+    ///
+    /// Drives [`AlignAndMerge`] with many input batches behind a mock
+    /// aligner that drains its entire stdin before emitting any
+    /// alignments (the defining pattern of `bwa mem -K` set larger than
+    /// the actual input). The batch count is intentionally chosen to
+    /// exceed the channel's old 256-slot cap several times over so that
+    /// the previous bounded design could not avoid the stall under any
+    /// scheduling. With a bounded `unmapped_tx`, Thread A stalls on
+    /// `send` once the channel fills, never closes stdin, the aligner
+    /// never emits, and Thread C blocks forever on an empty mapped
+    /// channel — a textbook circular wait that surfaces as the
+    /// watchdog's "pipeline deadlock detected: no progress for 120s".
+    /// With the unbounded channel, Thread A drains its input queue,
+    /// closes stdin, the aligner emits, and the merge completes
+    /// normally.
+    #[cfg(unix)]
+    #[test]
+    fn test_thread_a_does_not_deadlock_when_aligner_buffers_stdin() {
+        use std::fmt::Write as _;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use fgumi_raw_bam::testutil::make_bam_bytes;
+
+        // Well over the channel's former 256-slot cap so the old bounded
+        // design had no room to avoid the stall. One record per batch
+        // keeps each batch small; the point of the test is the *number*
+        // of in-flight batches, not the per-batch byte size.
+        const NUM_BATCHES: usize = 1000;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dict_path = tmp.path().join("ref.dict");
+        fs::write(&dict_path, "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:100000\n")
+            .expect("write dict");
+
+        let mut names: Vec<String> = Vec::with_capacity(NUM_BATCHES);
+        let mut batches: Vec<SerializedBatch> = Vec::with_capacity(NUM_BATCHES);
+        for i in 0..NUM_BATCHES {
+            let name = format!("bread_{i:06}");
+            let rec = make_bam_bytes(
+                -1,
+                -1,
+                fgumi_raw_bam::flags::UNMAPPED,
+                name.as_bytes(),
+                &[],
+                10,
+                -1,
+                -1,
+                &[],
+            );
+            let size = u32::try_from(rec.len()).expect("record size fits u32");
+            let mut data: Vec<u8> = Vec::with_capacity(4 + rec.len());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&rec);
+            batches.push(SerializedBatch {
+                primary: RawBytes { data, record_count: 1 },
+                secondary: None,
+                ordinal: i as u64,
+            });
+            names.push(name);
+        }
+
+        // Mock aligner: read ALL of stdin first (via `cat`), discarding
+        // it, then emit the full SAM header + matching alignments. This
+        // guarantees no mapped output lands on stdout until Thread A
+        // has closed stdin — the exact ordering that deadlocks a bounded
+        // `unmapped_tx`.
+        let aligner_path = tmp.path().join("buffer_then_emit.sh");
+        let mut script = String::from("#!/bin/bash\nset -e\ncat >/dev/null\n");
+        script.push_str("printf '@HD\\tVN:1.6\\tSO:unsorted\\n'\n");
+        script.push_str("printf '@SQ\\tSN:chr1\\tLN:100000\\n'\n");
+        for name in &names {
+            writeln!(script, "printf '{name}\\t0\\tchr1\\t1\\t60\\t10M\\t*\\t0\\t0\\t*\\t*\\n'",)
+                .expect("format into String is infallible");
+        }
+        script.push_str("exit 0\n");
+        fs::write(&aligner_path, &script).expect("write aligner script");
+        let mut perms = fs::metadata(&aligner_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&aligner_path, perms).expect("chmod aligner");
+
+        let stage = AlignAndMerge::new(
+            format!("/bin/bash {}", aligner_path.display()),
+            PathBuf::from("/unused.fa"),
+            dict_path,
+            Header::default(),
+            TagInfo::new(vec![], vec![], vec![]),
+            true,
+            true,
+        );
+
+        let tracker = Arc::new(MemoryTracker::new(100_000_000));
+        // Input queue sized to hold the whole workload at once so the
+        // upstream pool isn't a confounding factor for the deadlock we're
+        // testing.
+        let input_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_in", NUM_BATCHES + 8, 50_000_000, tracker.clone()));
+        let output_q: Arc<StageQueue<SerializedBatch>> =
+            Arc::new(StageQueue::new("align_out", 64, 50_000_000, tracker));
+
+        for batch in batches {
+            let batch_mem = batch.primary.data.len();
+            input_q.push(SequencedItem::new(batch.ordinal, batch, batch_mem)).expect("push batch");
+        }
+        input_q.close();
+
+        let drain_handle = std::thread::spawn({
+            let output_q = output_q.clone();
+            move || -> u64 {
+                let mut total: u64 = 0;
+                loop {
+                    if let Some(item) = output_q.pop() {
+                        total += item.item.primary.record_count;
+                    } else if output_q.is_drained() {
+                        break;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                total
+            }
+        });
+
+        let result = Box::new(stage).run(Box::new(input_q), Box::new(output_q), CancelToken::new());
+        let total_records = drain_handle.join().expect("drain thread join");
+
+        assert!(result.is_ok(), "AlignAndMerge unexpectedly failed: {result:?}");
+        assert_eq!(
+            total_records, NUM_BATCHES as u64,
+            "every unmapped record should be merged with its alignment",
+        );
     }
 }
