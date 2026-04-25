@@ -1702,6 +1702,19 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     /// Current heap bytes in processed queue.
     pub processed_heap_bytes: AtomicU64,
 
+    /// Serial-keyed reorder buffer used by the optional MI Assign hook
+    /// (see [`crate::unified_pipeline::PipelineFunctions::mi_assign_fn`]).
+    ///
+    /// When `mi_assign_fn` is installed, serialize workers drain `processed`
+    /// (Q5) into this buffer and then pop in pipeline-serial order before
+    /// invoking the hook. The mutex serializes the hook invocation across
+    /// workers so `mi_assign_fn` always observes
+    /// `(batch_serial, idx_in_batch)` pairs in monotonic order.
+    ///
+    /// When `mi_assign_fn` is `None`, this buffer is never touched —
+    /// serialize pops directly from `processed` exactly as before.
+    pub mi_assign_reorder: Mutex<ReorderBuffer<Vec<P>>>,
+
     // ========== Queue: Serialize → Compress ==========
     /// Serialized bytes waiting for compression.
     pub serialized: ArrayQueue<(u64, SerializedBatch)>,
@@ -1768,6 +1781,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
             groups_heap_bytes: AtomicU64::new(0),
             processed: ArrayQueue::new(queue_capacity),
             processed_heap_bytes: AtomicU64::new(0),
+            mi_assign_reorder: Mutex::new(ReorderBuffer::new()),
             serialized: ArrayQueue::new(queue_capacity),
             serialized_heap_bytes: AtomicU64::new(0),
             compressed: ArrayQueue::new(queue_capacity),
@@ -1861,6 +1875,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     pub fn are_queues_empty(&self) -> bool {
         self.groups.is_empty()
             && self.processed.is_empty()
+            && self.mi_assign_reorder.lock().is_empty()
             && self.serialized.is_empty()
             && self.compressed.is_empty()
             && self.write_reorder.lock().is_empty()
@@ -5934,6 +5949,25 @@ mod tests {
         let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
         let queues: OutputPipelineQueues<(), TestProcessed> =
             OutputPipelineQueues::new(16, output, None, "test", 0);
+        assert!(queues.are_queues_empty());
+    }
+
+    /// `are_queues_empty()` must report not-empty when work is parked in
+    /// `mi_assign_reorder`, even when every other queue is empty. Regression
+    /// guard: the MI Assign zone holds batches between Process and Serialize,
+    /// and missing this check meant the pipeline could declare completion
+    /// while serialized work was still pending.
+    #[test]
+    fn test_output_queues_are_queues_empty_includes_mi_assign_reorder() {
+        let output: Box<dyn std::io::Write + Send> = Box::new(Vec::<u8>::new());
+        let queues: OutputPipelineQueues<(), TestProcessed> =
+            OutputPipelineQueues::new(16, output, None, "test", 0);
+        assert!(queues.are_queues_empty());
+
+        queues.mi_assign_reorder.lock().insert(0, vec![TestProcessed { size: 0 }]);
+        assert!(!queues.are_queues_empty());
+
+        let _ = queues.mi_assign_reorder.lock().try_pop_next();
         assert!(queues.are_queues_empty());
     }
 

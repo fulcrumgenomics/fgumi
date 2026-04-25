@@ -67,19 +67,31 @@ impl MoleculeId {
     /// Write string representation into a reusable buffer, returning the bytes.
     ///
     /// Avoids per-call String allocation by reusing the caller's buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics consistently in both debug and release builds if `base + id`
+    /// would overflow `u64`. With `id` and `base` both bounded by the number
+    /// of molecules in the input (which fits comfortably under `u64::MAX` for
+    /// every realistic sequencing run), this is unreachable in practice; the
+    /// explicit `checked_add` keeps debug and release behavior identical
+    /// rather than wrapping silently in release.
     pub fn write_with_offset<'a>(&self, base: u64, buf: &'a mut String) -> &'a [u8] {
         use std::fmt::Write;
         buf.clear();
         match self {
             MoleculeId::None => {}
             MoleculeId::Single(id) => {
-                write!(buf, "{}", base + id).expect("write to String is infallible");
+                let total = id.checked_add(base).expect("MoleculeId offset overflow");
+                write!(buf, "{total}").expect("write to String is infallible");
             }
             MoleculeId::PairedA(id) => {
-                write!(buf, "{}/A", base + id).expect("write to String is infallible");
+                let total = id.checked_add(base).expect("MoleculeId offset overflow");
+                write!(buf, "{total}/A").expect("write to String is infallible");
             }
             MoleculeId::PairedB(id) => {
-                write!(buf, "{}/B", base + id).expect("write to String is infallible");
+                let total = id.checked_add(base).expect("MoleculeId offset overflow");
+                write!(buf, "{total}/B").expect("write to String is infallible");
             }
         }
         buf.as_bytes()
@@ -124,6 +136,40 @@ impl MoleculeId {
             MoleculeId::None => String::new(),
             MoleculeId::Single(id) | MoleculeId::PairedA(id) | MoleculeId::PairedB(id) => {
                 id.to_string()
+            }
+        }
+    }
+
+    /// Return a new `MoleculeId` whose numeric `id` is shifted by `offset`,
+    /// preserving the variant tag.
+    ///
+    /// `MoleculeId::None` is returned unchanged. `Single`, `PairedA`, and
+    /// `PairedB` each have `offset` added to their inner `id`. Used by the
+    /// MI Assign pipeline stage to convert the per-position-group local IDs
+    /// produced by `assigner.assign(...)` into globally unique IDs by
+    /// folding in a serial-ordered cumulative offset.
+    ///
+    /// # Panics
+    ///
+    /// Panics consistently in both debug and release builds if `id + offset`
+    /// would overflow `u64`. The cumulative MI counter is bounded by the
+    /// number of molecules in the input, which fits comfortably under
+    /// `u64::MAX` for every realistic sequencing run — `checked_add` is used
+    /// only to keep debug and release behavior identical rather than
+    /// wrapping silently in release.
+    #[inline]
+    #[must_use]
+    pub fn with_offset(self, offset: u64) -> Self {
+        match self {
+            MoleculeId::None => MoleculeId::None,
+            MoleculeId::Single(id) => {
+                MoleculeId::Single(id.checked_add(offset).expect("MoleculeId offset overflow"))
+            }
+            MoleculeId::PairedA(id) => {
+                MoleculeId::PairedA(id.checked_add(offset).expect("MoleculeId offset overflow"))
+            }
+            MoleculeId::PairedB(id) => {
+                MoleculeId::PairedB(id.checked_add(offset).expect("MoleculeId offset overflow"))
             }
         }
     }
@@ -324,6 +370,90 @@ mod tests {
     fn test_consensus_reverse_returns_correct_tags() {
         assert_eq!(TagSets::CONSENSUS_REVERSE.len(), 5);
         assert_eq!(TagSets::CONSENSUS_REVERSE, &["ad", "ae", "bd", "be", "cd"]);
+    }
+
+    // ========================================================================
+    // MoleculeId::with_offset
+    //
+    // The deterministic-MI design's MI Assign stage rewrites local per-batch
+    // ids into global ids by calling `with_offset(cumulative_offset)` on
+    // every template's MoleculeId. The contract these tests pin down:
+    //   * `None` is preserved (an unassigned slot stays unassigned).
+    //   * Each `Some` variant adds the offset to its `id`, leaving the
+    //     variant tag (Single / PairedA / PairedB) untouched.
+    //   * `with_offset(0)` is the identity function.
+    //   * Offsets compose by addition: applying `a` then `b` is identical
+    //     to applying `a + b` in one step.
+    // ========================================================================
+
+    #[test]
+    fn molecule_id_with_offset_preserves_none() {
+        assert_eq!(MoleculeId::None.with_offset(0), MoleculeId::None);
+        assert_eq!(MoleculeId::None.with_offset(42), MoleculeId::None);
+        assert_eq!(MoleculeId::None.with_offset(u64::MAX), MoleculeId::None);
+    }
+
+    #[test]
+    fn molecule_id_with_offset_shifts_single() {
+        assert_eq!(MoleculeId::Single(0).with_offset(7), MoleculeId::Single(7));
+        assert_eq!(MoleculeId::Single(5).with_offset(100), MoleculeId::Single(105));
+    }
+
+    #[test]
+    fn molecule_id_with_offset_shifts_paired_a() {
+        assert_eq!(MoleculeId::PairedA(0).with_offset(7), MoleculeId::PairedA(7));
+        assert_eq!(MoleculeId::PairedA(5).with_offset(100), MoleculeId::PairedA(105));
+    }
+
+    #[test]
+    fn molecule_id_with_offset_shifts_paired_b() {
+        assert_eq!(MoleculeId::PairedB(0).with_offset(7), MoleculeId::PairedB(7));
+        assert_eq!(MoleculeId::PairedB(5).with_offset(100), MoleculeId::PairedB(105));
+    }
+
+    #[test]
+    fn molecule_id_with_offset_zero_is_identity() {
+        for mi in [
+            MoleculeId::None,
+            MoleculeId::Single(0),
+            MoleculeId::Single(42),
+            MoleculeId::PairedA(7),
+            MoleculeId::PairedB(7),
+        ] {
+            assert_eq!(mi.with_offset(0), mi, "with_offset(0) must be identity for {mi:?}");
+        }
+    }
+
+    #[test]
+    fn molecule_id_with_offset_composes_by_addition() {
+        for mi in [MoleculeId::Single(3), MoleculeId::PairedA(11), MoleculeId::PairedB(11)] {
+            let a: u64 = 5;
+            let b: u64 = 17;
+            assert_eq!(
+                mi.with_offset(a).with_offset(b),
+                mi.with_offset(a + b),
+                "composition of with_offset must be additive for {mi:?}",
+            );
+        }
+    }
+
+    /// `with_offset` must panic on `u64` overflow in both debug and release
+    /// builds — `checked_add` keeps the failure mode consistent across
+    /// profiles instead of wrapping silently in release (which would let
+    /// distinct molecules collide on the same MI).
+    #[test]
+    #[should_panic(expected = "MoleculeId offset overflow")]
+    fn molecule_id_with_offset_panics_on_overflow() {
+        let _ = MoleculeId::Single(u64::MAX).with_offset(1);
+    }
+
+    /// Same overflow guard for `write_with_offset`, the codepath that
+    /// actually emits the MI:Z tag bytes during BAM serialization.
+    #[test]
+    #[should_panic(expected = "MoleculeId offset overflow")]
+    fn molecule_id_write_with_offset_panics_on_overflow() {
+        let mut buf = String::new();
+        let _ = MoleculeId::PairedA(u64::MAX).write_with_offset(1, &mut buf);
     }
 
     #[test]

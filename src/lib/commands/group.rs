@@ -25,7 +25,9 @@ use crate::umi::parallel_assigner::{
 use crate::umi::{UmiValidation, validate_umi};
 use crate::unified_pipeline::DecodedRecord;
 use crate::unified_pipeline::compute_group_key_from_raw;
-use crate::unified_pipeline::{GroupKeyConfig, Grouper, run_bam_pipeline_from_reader};
+use crate::unified_pipeline::{
+    GroupKeyConfig, Grouper, run_bam_pipeline_from_reader_with_mi_assign,
+};
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -385,8 +387,15 @@ fn assign_umi_groups_impl(
             subgroups.entry(orientation).or_default().push(idx);
         }
 
-        // Process each subgroup separately
-        for indices in subgroups.values() {
+        // Process each subgroup separately, in deterministic orientation
+        // order. `subgroups` is an `AHashMap` whose iteration order varies
+        // per process; without sorting, two runs would walk FR/RF (etc.)
+        // subgroups in different orders and assign different local
+        // `MoleculeId`s to the same templates.
+        let mut ordered_subgroups: Vec<((bool, bool), Vec<usize>)> =
+            subgroups.into_iter().collect();
+        ordered_subgroups.sort_by_key(|(orientation, _)| *orientation);
+        for (_orientation, indices) in &ordered_subgroups {
             assign_umi_groups_for_indices_impl(
                 templates,
                 indices,
@@ -945,13 +954,19 @@ impl Command for GroupReadsByUmi {
         #[cfg(feature = "memory-debug")]
         let short_circuit_compress = short_circuit == "compress";
 
-        // Counter for contiguous MI assignment (incremented in the serial serialize step).
-        // AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering is fine because
-        // the serialize step is serial and ordered.
-        let next_mi_base = std::sync::atomic::AtomicU64::new(0);
+        // Cumulative MoleculeId counter, advanced **only** by the
+        // serial-ordered MI Assign hook installed below. The hook is
+        // invoked in pipeline-input order (`(batch_serial, idx_in_batch)`)
+        // by the unified pipeline's MI Assign zone, so two runs of
+        // `fgumi group` on the same input observe the same `fetch_add`
+        // sequence and produce byte-identical `MI:Z` integers — see
+        // `docs/design/deterministic-mi-numbering.md`. The `Arc` is owned
+        // by the hook closure; nothing outside the closure needs to read
+        // its final value.
+        let next_mi_base_for_hook = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
-        let records_processed = run_bam_pipeline_from_reader(
+        let records_processed = run_bam_pipeline_from_reader_with_mi_assign(
             pipeline_config,
             reader,
             header,
@@ -1193,17 +1208,6 @@ impl Command for GroupReadsByUmi {
                 // Save input record count for progress tracking
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from the global counter. Advance by the
-                // number of distinct numeric MoleculeId IDs actually assigned in this
-                // group (not the template count), because multiple templates can share
-                // the same MoleculeId and because PairedA/PairedB share a numeric id.
-                // This ensures emitted MI integers are consecutive 0..N-1, matching
-                // fgbio's `GroupReadsByUmi` (see issue #269).
-                let base_mi = next_mi_base.fetch_add(
-                    processed.distinct_mi_count,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-
                 // Track template memory deallocation (templates are consumed here)
                 #[cfg(feature = "memory-debug")]
                 if debug_memory_flag {
@@ -1213,15 +1217,20 @@ impl Command for GroupReadsByUmi {
                     }
                 }
 
-                // Serialize primary reads directly from templates — no intermediate Vec<RecordBuf>.
-                // Each record is serialized and dropped immediately, reducing per-thread peak memory.
-                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
+                // Serialize primary reads directly from templates — no
+                // intermediate `Vec<RecordBuf>`. Templates already carry
+                // their final global `MoleculeId`s because the MI Assign
+                // hook (installed below) ran in serial order before this
+                // closure was called, so we pass `base_mi = 0` to the
+                // emitter. Each record is serialized and dropped
+                // immediately, keeping per-thread peak memory low.
+                // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record.
                 output.reserve(processed.templates.len() * 2 * 400);
                 let mut scratch = Vec::with_capacity(512);
                 let mut mi_buf = String::with_capacity(16);
                 emit_templates_raw_with_mi(
                     &processed.templates,
-                    base_mi,
+                    0,
                     assign_tag_bytes,
                     &mut scratch,
                     &mut mi_buf,
@@ -1237,6 +1246,32 @@ impl Command for GroupReadsByUmi {
                 }
                 // Return INPUT record count for progress tracking (not output count)
                 Ok(input_record_count)
+            },
+            // mi_assign_fn: called in serial order by the MI Assign zone
+            // before each item's `serialize_fn`. Folds a cumulative offset
+            // into every template's local `MoleculeId`, turning per-position-
+            // group local IDs (0..N-1) into globally contiguous IDs that
+            // `serialize_fn` can emit verbatim.
+            move |_ord, processed: &mut ProcessedPositionGroup| {
+                // `fetch_update` + `checked_add` so wraparound is detected and surfaced
+                // rather than silently reusing MI integers (which would defeat
+                // `MoleculeId::with_offset`'s own overflow check on the per-template add).
+                let base = next_mi_base_for_hook
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |current| current.checked_add(processed.distinct_mi_count),
+                    )
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX",
+                        )
+                    })?;
+                for template in &mut processed.templates {
+                    template.mi = template.mi.with_offset(base);
+                }
+                Ok(())
             },
         )
         .context("Pipeline execution failed")?;
@@ -1534,7 +1569,10 @@ impl GroupReadsByUmi {
         let distinct_mi_count: u64 =
             templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
         let base_mi = *next_mi_base;
-        *next_mi_base += distinct_mi_count;
+        // `checked_add` so wraparound is reported instead of silently reusing MI integers.
+        *next_mi_base = next_mi_base.checked_add(distinct_mi_count).ok_or_else(|| {
+            anyhow::anyhow!("MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX")
+        })?;
 
         // Raw-byte output: inject MI tag directly into raw bytes, write without noodles.
         use std::io::Write as _;
