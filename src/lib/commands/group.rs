@@ -378,8 +378,16 @@ fn assign_umi_groups_impl(
     // All templates are in raw-byte mode (Template always uses RawRecord)
 
     if assigner.split_templates_by_pair_orientation() {
-        // Group by pair orientation
-        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
+        // Group by pair orientation. Use BTreeMap (not AHashMap) so subgroup
+        // iteration order is deterministic across processes — `AHashMap`'s
+        // per-process random hasher seed would otherwise make
+        // `assigner.assign()` see orientation subgroups in different orders
+        // between two runs of `fgumi group` on the same input, which produces
+        // identical molecule groupings but different `MoleculeId` numbering
+        // (and therefore different `MI:Z` tags and downstream consensus
+        // QNAMEs). See `tests/integration/test_group_determinism.rs`.
+        let mut subgroups: std::collections::BTreeMap<(bool, bool), Vec<usize>> =
+            std::collections::BTreeMap::new();
         for (idx, template) in templates.iter().enumerate() {
             let orientation = get_pair_orientation_raw(template);
             subgroups.entry(orientation).or_default().push(idx);
@@ -945,10 +953,28 @@ impl Command for GroupReadsByUmi {
         #[cfg(feature = "memory-debug")]
         let short_circuit_compress = short_circuit == "compress";
 
-        // Counter for contiguous MI assignment (incremented in the serial serialize step).
-        // AtomicU64 satisfies the Fn + Sync bound; Relaxed ordering is fine because
-        // the serialize step is serial and ordered.
-        let next_mi_base = std::sync::atomic::AtomicU64::new(0);
+        // Serial-ordered counter for contiguous MI assignment. Two
+        // pieces are needed for cross-run determinism:
+        //
+        // 1. `SerialOrderedArrayQueue` (the `processed` queue) makes the
+        //    serialize step pop batches in pipeline serial order rather
+        //    than completion order.
+        //
+        // 2. `OrderedMiAllocator` serializes the cumulative-offset advance
+        //    on the batch's pipeline serial. This is necessary because
+        //    serialize workers can still run concurrently — one worker can
+        //    pop serial S+1 and start `serialize_fn` while another worker
+        //    is still inside `serialize_fn` for serial S — and the
+        //    `MoleculeId` numbering must reflect serial order, not
+        //    completion order.
+        //
+        // Together these guarantee identical `MI:Z` numbering across runs of
+        // `fgumi group` on the same input. See
+        // `src/lib/unified_pipeline/serial_ordered_array_queue.rs`,
+        // `src/lib/ordered_mi_allocator.rs`, and
+        // `tests/integration/test_group_determinism.rs`.
+        let next_mi_base =
+            std::sync::Arc::new(crate::ordered_mi_allocator::OrderedMiAllocator::new());
 
         // Run the 7-step unified pipeline with the already-opened reader (supports streaming)
         let records_processed = run_bam_pipeline_from_reader(
@@ -1193,16 +1219,17 @@ impl Command for GroupReadsByUmi {
                 // Save input record count for progress tracking
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from the global counter. Advance by the
-                // number of distinct numeric MoleculeId IDs actually assigned in this
-                // group (not the template count), because multiple templates can share
-                // the same MoleculeId and because PairedA/PairedB share a numeric id.
-                // This ensures emitted MI integers are consecutive 0..N-1, matching
-                // fgbio's `GroupReadsByUmi` (see issue #269).
-                let base_mi = next_mi_base.fetch_add(
-                    processed.distinct_mi_count,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                // Assign contiguous base_mi from the serial-ordered allocator.
+                // Advance by the number of distinct numeric MoleculeId IDs
+                // actually assigned in this group (not the template count),
+                // because multiple templates can share the same MoleculeId and
+                // because PairedA/PairedB share a numeric id. This keeps
+                // emitted MI integers consecutive `0..N-1`, matching fgbio's
+                // `GroupReadsByUmi` (see issue #269).
+                let serialize_ctx = crate::unified_pipeline::serialize_context::current()
+                    .expect("serialize_fn called outside of pipeline serialize step");
+                let base_mi =
+                    next_mi_base.allocate(serialize_ctx.serial, processed.distinct_mi_count);
 
                 // Track template memory deallocation (templates are consumed here)
                 #[cfg(feature = "memory-debug")]
@@ -1234,6 +1261,14 @@ impl Command for GroupReadsByUmi {
                 #[cfg(feature = "memory-debug")]
                 if short_circuit_compress {
                     output.clear();
+                }
+                // Finalize the per-batch MoleculeId allocation on the last
+                // item so the cumulative cursor advances and waiters on later
+                // serials wake up. The pipeline guarantees we see every item
+                // in a batch before the batch is dropped, so this fires
+                // exactly once per serial.
+                if serialize_ctx.is_last() {
+                    next_mi_base.finalize(serialize_ctx.serial);
                 }
                 // Return INPUT record count for progress tracking (not output count)
                 Ok(input_record_count)

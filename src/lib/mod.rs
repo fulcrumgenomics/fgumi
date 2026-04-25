@@ -144,6 +144,7 @@ pub mod header;
 pub mod logging;
 pub mod metrics;
 pub mod mi_group;
+pub mod ordered_mi_allocator;
 pub mod os_hints;
 pub mod per_thread_accumulator;
 pub mod prefetch_reader;

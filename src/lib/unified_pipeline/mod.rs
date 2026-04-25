@@ -111,6 +111,8 @@ mod fastq;
 pub mod queue;
 pub mod rebalancer;
 pub mod scheduler;
+pub mod serial_ordered_array_queue;
+pub mod serialize_context;
 
 // Re-export everything from base
 pub use base::*;

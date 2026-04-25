@@ -1698,7 +1698,13 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
 
     // ========== Queue: Process → Serialize ==========
     /// Batches of processed data waiting for serialization.
-    pub processed: ArrayQueue<(u64, Vec<P>)>,
+    ///
+    /// Uses [`SerialOrderedArrayQueue`] (rather than `ArrayQueue`) so the
+    /// serialize step pops batches in pipeline-serial order, not in completion
+    /// order. This is required for any global counter advanced inside
+    /// `serialize_fn` to be deterministic across runs — most notably the
+    /// per-batch `MoleculeId` base in `fgumi group` and `fgumi dedup`.
+    pub processed: super::serial_ordered_array_queue::SerialOrderedArrayQueue<Vec<P>>,
     /// Current heap bytes in processed queue.
     pub processed_heap_bytes: AtomicU64,
 
@@ -1766,7 +1772,9 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
         Self {
             groups: ArrayQueue::new(queue_capacity),
             groups_heap_bytes: AtomicU64::new(0),
-            processed: ArrayQueue::new(queue_capacity),
+            processed: super::serial_ordered_array_queue::SerialOrderedArrayQueue::new(
+                queue_capacity,
+            ),
             processed_heap_bytes: AtomicU64::new(0),
             serialized: ArrayQueue::new(queue_capacity),
             serialized_heap_bytes: AtomicU64::new(0),

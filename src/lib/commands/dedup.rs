@@ -541,7 +541,16 @@ fn assign_umi_groups(
     no_umi: bool,
 ) -> Result<()> {
     if assigner.split_templates_by_pair_orientation() {
-        let mut subgroups: AHashMap<(bool, bool), Vec<usize>> = AHashMap::new();
+        // Group by pair orientation. Use BTreeMap (not AHashMap) so subgroup
+        // iteration order is deterministic across processes — `AHashMap`'s
+        // per-process random hasher seed would otherwise make
+        // `assigner.assign()` see orientation subgroups in different orders
+        // between two runs of `fgumi dedup` on the same input, which produces
+        // identical molecule groupings but different `MoleculeId` numbering
+        // (and therefore different `MI:Z` tags). Mirrors the same fix in
+        // `src/lib/commands/group.rs`.
+        let mut subgroups: std::collections::BTreeMap<(bool, bool), Vec<usize>> =
+            std::collections::BTreeMap::new();
         for (idx, template) in templates.iter().enumerate() {
             let orientation = get_pair_orientation(template);
             subgroups.entry(orientation).or_default().push(idx);
@@ -991,8 +1000,16 @@ impl Command for MarkDuplicates {
         let library_index = LibraryIndex::from_header(&header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
-        // Counter for contiguous MI assignment (incremented in the serial serialize step).
-        let next_mi_base = std::sync::atomic::AtomicU64::new(0);
+        // Serial-ordered counter for contiguous MI assignment. See the
+        // matching comment in `src/lib/commands/group.rs` for the full
+        // rationale; in short, `SerialOrderedArrayQueue` makes the serialize
+        // step pop batches in pipeline serial order, and
+        // `OrderedMiAllocator` serializes the cumulative-offset advance on
+        // that serial so that two runs of `fgumi dedup` on the same input
+        // assign identical `MI:Z` numbering even though serialize workers
+        // can run concurrently across batches.
+        let next_mi_base =
+            std::sync::Arc::new(crate::ordered_mi_allocator::OrderedMiAllocator::new());
 
         // Run the pipeline
         let _records_processed = run_bam_pipeline_from_reader(
@@ -1034,13 +1051,15 @@ impl Command for MarkDuplicates {
 
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from serial counter. Use the distinct MI
-                // count (number of families) so base_mi advances once per emitted MI,
-                // not once per template — families with multiple templates would
-                // otherwise create gaps in MI IDs.
+                // Assign contiguous base_mi from the serial-ordered allocator.
+                // Use the distinct MI count (number of families) so base_mi
+                // advances once per emitted MI, not once per template —
+                // families with multiple templates would otherwise create
+                // gaps in MI IDs.
+                let serialize_ctx = crate::unified_pipeline::serialize_context::current()
+                    .expect("serialize_fn called outside of pipeline serialize step");
                 let distinct_mi_count: u64 = processed.family_sizes.values().copied().sum();
-                let base_mi =
-                    next_mi_base.fetch_add(distinct_mi_count, std::sync::atomic::Ordering::Relaxed);
+                let base_mi = next_mi_base.allocate(serialize_ctx.serial, distinct_mi_count);
                 // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
                 output.reserve(processed.templates.len() * 2 * 400);
                 // Serialize templates
@@ -1076,6 +1095,15 @@ impl Command for MarkDuplicates {
                             output.extend_from_slice(raw);
                         }
                     }
+                }
+
+                // Finalize the per-batch MoleculeId allocation on the last
+                // item so the cumulative cursor advances and waiters on later
+                // serials wake up. The pipeline guarantees we see every item
+                // in a batch before the batch is dropped, so this fires
+                // exactly once per serial.
+                if serialize_ctx.is_last() {
+                    next_mi_base.finalize(serialize_ctx.serial);
                 }
 
                 Ok(input_record_count)

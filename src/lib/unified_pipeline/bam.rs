@@ -2668,12 +2668,28 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     worker.core.serialization_buffer.clear();
     worker.core.secondary_serialization_buffer.clear();
 
-    // Serialize all items into worker's buffer
+    // Serialize all items into worker's buffer.
+    //
+    // Publish a per-thread `SerializeContext` for each item so closures
+    // needing serial-ordered global state (notably `fgumi group` /
+    // `fgumi dedup`'s `MoleculeId` numbering via `OrderedMiAllocator`) can
+    // read the batch's pipeline serial and detect the last item via
+    // `SerializeContext::is_last()`. Combined with `SerialOrderedArrayQueue`
+    // ensuring pops happen in serial order, this gives the closure a stable
+    // serial to anchor its global counter advance against, even though
+    // `serialize_fn` itself runs in parallel across worker threads.
     let mut total_record_count: u64 = 0;
-    for item in batch {
+    let batch_len = batch.len();
+    for (item_idx, item) in batch.into_iter().enumerate() {
+        super::serialize_context::set(super::serialize_context::SerializeContext {
+            serial,
+            item_idx,
+            batch_len,
+        });
         // Secondary serialize (borrows item) — must run before primary consumes it
         if let Some(ref secondary_fn) = fns.secondary_serialize_fn {
             if let Err(e) = (secondary_fn)(&item, &mut worker.core.secondary_serialization_buffer) {
+                super::serialize_context::clear();
                 state.set_error(e);
                 return false;
             }
@@ -2684,11 +2700,13 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
                 total_record_count += record_count;
             }
             Err(e) => {
+                super::serialize_context::clear();
                 state.set_error(e);
                 return false;
             }
         }
     }
+    super::serialize_context::clear();
 
     // Swap buffer into batch, replace with fresh pre-allocated buffer
     let combined_data = std::mem::replace(
@@ -3014,7 +3032,7 @@ impl SingleThreadedBuffers {
 /// This avoids the overhead of thread spawning, queues, and atomic
 /// operations when only one thread is requested. Significantly faster
 /// for small inputs or when parallelization overhead exceeds the benefit.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn run_bam_pipeline_single_threaded<G, P>(
     config: &PipelineConfig,
     mut input: Box<dyn Read + Send>,
@@ -3046,6 +3064,12 @@ where
 
     // Progress tracking
     let progress = ProgressTracker::new("Processed records").with_interval(PROGRESS_LOG_INTERVAL);
+
+    // Serial counter for the SerializeContext so single-threaded callers see
+    // the same serial-ordered API as the parallel pipeline. Each call to
+    // (fns.serialize_fn) is a one-batch-per-serial step and we increment the
+    // serial after every call.
+    let mut next_serial: u64 = 0;
 
     // Main loop: read -> decompress -> find_boundaries -> decode -> group -> process -> serialize -> compress -> write
     loop {
@@ -3090,7 +3114,15 @@ where
 
                 // Step 7b: Primary serialize (consumes processed, reuse buffer)
                 buffers.serialized.clear();
-                let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
+                super::serialize_context::set(super::serialize_context::SerializeContext {
+                    serial: next_serial,
+                    item_idx: 0,
+                    batch_len: 1,
+                });
+                let serialize_result = (fns.serialize_fn)(processed, &mut buffers.serialized);
+                super::serialize_context::clear();
+                next_serial += 1;
+                let record_count = serialize_result?;
 
                 // Step 8: Compress (only when buffer reaches 64KB)
                 compressor.write_all(&buffers.serialized)?;
@@ -3126,7 +3158,15 @@ where
                 }
 
                 buffers.serialized.clear();
-                let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
+                super::serialize_context::set(super::serialize_context::SerializeContext {
+                    serial: next_serial,
+                    item_idx: 0,
+                    batch_len: 1,
+                });
+                let serialize_result = (fns.serialize_fn)(processed, &mut buffers.serialized);
+                super::serialize_context::clear();
+                next_serial += 1;
+                let record_count = serialize_result?;
                 compressor.write_all(&buffers.serialized)?;
                 compressor.maybe_compress()?;
                 compressor.write_blocks_to(output.as_mut())?;
@@ -3155,7 +3195,17 @@ where
 
         // Step 7b: Primary serialize (consumes processed, reuse buffer)
         buffers.serialized.clear();
-        let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
+        super::serialize_context::set(super::serialize_context::SerializeContext {
+            serial: next_serial,
+            item_idx: 0,
+            batch_len: 1,
+        });
+        let serialize_result = (fns.serialize_fn)(processed, &mut buffers.serialized);
+        super::serialize_context::clear();
+        // No further iterations after the final-group block; this assignment
+        // is purely for symmetry with the in-loop case.
+        let _ = next_serial + 1;
+        let record_count = serialize_result?;
 
         // Step 8: Compress (only when buffer reaches 64KB)
         compressor.write_all(&buffers.serialized)?;
