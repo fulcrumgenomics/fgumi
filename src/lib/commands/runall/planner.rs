@@ -605,7 +605,8 @@ impl Runall {
     }
 
     // -----------------------------------------------------------------------
-    // start-from: sort — runs through consensus + filter to BamSink
+    // start-from: sort — runs through consensus + filter to BamSink, or
+    //             stops early at sort or after group-assign when --stop-after requests it.
     // -----------------------------------------------------------------------
 
     fn plan_from_sort(
@@ -623,12 +624,61 @@ impl Runall {
             let (_reader, h) = crate::bam_io::create_raw_bam_reader(input, 1)?;
             h
         };
+        let threads = self.threads.max(1);
+        let source = SourceSpec::BamBatchedSource { path: input.clone(), threads };
+
+        // Shared builder for the two early-exit arms below: wraps the given
+        // stages and output header into a BamFileWrite sink and returns the
+        // corresponding no-finalization PlanWithFinalize.
+        let make_plan = |source: SourceSpec, stages: Vec<StageSpec>, sink_header: Header| {
+            let sink = SinkSpec::BamFileWrite {
+                path: tmp_output.to_path_buf(),
+                header: sink_header,
+                secondary_path: None,
+                secondary_header: None,
+                queue_capacity: 64,
+            };
+            PlanWithFinalize {
+                plan: Plan {
+                    source,
+                    stages,
+                    sink,
+                    config: self.default_config(),
+                    metrics_tsv: self.metrics.clone(),
+                },
+                correction_state: None,
+                filter_stats_state: None,
+            }
+        };
+
+        // Early-exit: --stop-after sort — write the sorted BAM and stop.
+        if self.stop_after == StopAfter::Sort {
+            let stages = vec![self.sort_spec(header.clone())];
+            return Ok(make_plan(source, stages, header));
+        }
+
+        // Early-exit: --stop-after group — sort, group-assign, write grouped BAM.
+        // Uses CoalesceMiGroup + BgzfCompress (not append_coalesce_bgzf) because
+        // the output of GroupAssignStage is MI-grouped batches, not serialized
+        // batches; CoalesceSerialized would be wrong here. This matches the
+        // established StopAfter::Group arm in append_tail_from_unmapped_bam
+        // (see lines 424-446).
+        if self.stop_after == StopAfter::Group {
+            let stages = vec![
+                self.sort_spec(header.clone()),
+                StageSpec::PositionBatch { header: header.clone() },
+                self.group_assign_spec(),
+                StageSpec::CoalesceMiGroup { target_chunk_size: default_coalesce_chunk_size() },
+                StageSpec::BgzfCompress { level: self.compression_level },
+            ];
+            return Ok(make_plan(source, stages, header));
+        }
+
+        // Default: run all the way through consensus + filter.
         let output_header =
             self.consensus_output_header(&header, "Pipeline consensus (from sort)", command_line)?;
         let consensus_factory = self.build_consensus_factory(&header)?;
-        let threads = self.threads.max(1);
 
-        let source = SourceSpec::BamBatchedSource { path: input.clone(), threads };
         let (filter_spec, filter_stats_state) = self.filter_stage_spec_with_stats(explain)?;
         let stages = vec![
             self.sort_spec(header.clone()),

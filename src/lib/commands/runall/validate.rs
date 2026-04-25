@@ -103,8 +103,15 @@ impl Runall {
                 let input = self.single_input()?;
                 validate_file_exists(input, "Input BAM")?;
 
-                // Reference is needed for the dict used in output header
-                self.require_reference()?;
+                // Reference is needed for the dict used in output header when the
+                // pipeline runs through the alignment/consensus stages. Plans that
+                // stop at sort or group write the input header unchanged and don't
+                // need the reference dict.
+                let stops_before_consensus =
+                    matches!(self.stop_after, StopAfter::Sort | StopAfter::Group);
+                if !stops_before_consensus {
+                    self.require_reference()?;
+                }
             }
             StartFrom::Correct | StartFrom::Fastq => {
                 // Requires exactly one unmapped BAM input
