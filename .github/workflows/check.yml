@@ -23,7 +23,7 @@ jobs:
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Install nextest
-        uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2.75.22
         with:
           tool: nextest
       - name: Unit tests
@@ -55,11 +55,11 @@ jobs:
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2.75.22
         with:
           tool: cargo-llvm-cov
       - name: Install nextest
-        uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2.75.22
         with:
           tool: nextest
       - name: Generate coverage
@@ -91,7 +91,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install cargo-audit
-        uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2.75.22
         with:
           tool: cargo-audit
       - name: Audit dependencies for known vulnerabilities
@@ -133,11 +133,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: cargo check --workspace --no-default-features --all-targets
         # The regular test/lint jobs run with default features enabled, which
         # pulls in every optional dependency transitively. That hides two
