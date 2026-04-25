@@ -4,7 +4,13 @@
 //! queryname into [`Template`]s, runs UMI assignment to stamp molecule
 //! IDs via a freshly constructed [`fgumi_umi::UmiAssigner`], then
 //! regroups records by molecule ID into [`MiGroup`]s ready for
-//! consensus calling.
+//! downstream MI tag injection and consensus calling.
+//!
+//! **MI tag injection is deferred.** This stage does NOT write the MI tag
+//! into raw BAM record bytes. Instead, it carries the local
+//! [`fgumi_umi::MoleculeId`] on each [`MiGroup`] so a downstream
+//! serial-ordered stage can apply the cumulative cross-batch offset and
+//! write the final MI tag bytes.
 //!
 //! ## Input
 //!
@@ -53,8 +59,7 @@ use anyhow::Result;
 use fgumi_metrics::downsampling::compute_hash_fraction;
 use fgumi_metrics::inline_collector::InlineCollector;
 use fgumi_metrics::template_info::{ReadInfoKey, TemplateInfo};
-use fgumi_raw_bam::update_string_tag;
-use fgumi_umi::Strategy;
+use fgumi_umi::{MoleculeId, Strategy};
 use noodles::sam::Header;
 
 use crate::grouper::{
@@ -271,6 +276,7 @@ impl GroupAssignStage {
             groups: Vec::new(),
             ordinal: input.ordinal,
             position_key: input.position_key,
+            assign_tag: self.assign_tag,
         };
 
         // 2. Group records by queryname (consecutive runs with same name).
@@ -333,38 +339,38 @@ impl GroupAssignStage {
             a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
         });
 
-        // 7. Inject MI tags into raw records and regroup by molecule ID. Use
+        // 7. Regroup records by molecule ID without injecting the MI tag. Use
         //    `BTreeMap` so downstream consumers see MI groups in stable
         //    ascending MI order — required by `Coalesce<MiGroupBatch>` and the
-        //    byte-compare gate. MI values are written with offset 0 (local IDs);
-        //    `MiAssignStage` rewrites them with the global cumulative offset.
-        let mut mi_map: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
-        let mut mi_buf = String::new();
+        //    byte-compare gate. A downstream serial-ordered MI assign stage
+        //    will apply the cumulative offset and write the final MI tag bytes.
+        //    The map value is `(MoleculeId, records)` so we can carry the local
+        //    MoleculeId variant through to `MiGroup.local_mi`.
+        let mut mi_map: BTreeMap<u64, (MoleculeId, Vec<Vec<u8>>)> = BTreeMap::new();
 
         for template in templates {
             let mi = template.mi;
             if !mi.is_assigned() {
                 continue;
             }
-            let mi_value = mi.write_with_offset(0, &mut mi_buf);
             let global_id = mi.id().unwrap_or(0);
-            let mut raw_records = template.into_records();
-            for record in &mut raw_records {
-                update_string_tag(record.as_mut_vec(), self.assign_tag, mi_value);
-            }
-            mi_map
-                .entry(global_id)
-                .or_default()
-                .extend(raw_records.into_iter().map(fgumi_raw_bam::RawRecord::into_inner));
+            let raw_records = template.into_records();
+            let entry = mi_map.entry(global_id).or_insert_with(|| (mi, Vec::new()));
+            entry.1.extend(raw_records.into_iter().map(fgumi_raw_bam::RawRecord::into_inner));
         }
 
         // 8. Serialize each MI group into concat-byte `MiGroup`.
         let mi_groups: Vec<MiGroup> = mi_map
             .into_iter()
-            .map(|(mi, records)| {
+            .map(|(mi, (molecule_id, records))| {
                 let (data, record_count) =
                     crate::runall::engine::grouping_types::serialize_records(&records)?;
-                Ok::<_, anyhow::Error>(MiGroup { data, record_count, mi })
+                Ok::<_, anyhow::Error>(MiGroup {
+                    data,
+                    record_count,
+                    mi,
+                    local_mi: Some(molecule_id),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -372,6 +378,7 @@ impl GroupAssignStage {
             groups: mi_groups,
             ordinal: input.ordinal,
             position_key: input.position_key,
+            assign_tag: self.assign_tag,
         })
     }
 }
@@ -569,11 +576,12 @@ mod tests {
 
         let mi_batch = MiGroupBatch {
             groups: vec![
-                MiGroup { data: g0_data, record_count: g0_count, mi: 0 },
-                MiGroup { data: g1_data, record_count: g1_count, mi: 1 },
+                MiGroup { data: g0_data, record_count: g0_count, mi: 0, local_mi: None },
+                MiGroup { data: g1_data, record_count: g1_count, mi: 1, local_mi: None },
             ],
             ordinal: 0,
             position_key: (0, 0),
+            assign_tag: *b"MI",
         };
 
         // Expected: each record gets +4 bytes for the block_size prefix.

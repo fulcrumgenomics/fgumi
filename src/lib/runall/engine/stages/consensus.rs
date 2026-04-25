@@ -196,9 +196,17 @@ mod tests {
         let mut stage = ConsensusStage::new(&factory);
         let mut captured = None;
         stage
-            .process(MiGroupBatch { groups: vec![], ordinal: 0, position_key: (0, 0) }, &mut |v| {
-                captured = Some(v);
-            })
+            .process(
+                MiGroupBatch {
+                    groups: vec![],
+                    ordinal: 0,
+                    position_key: (0, 0),
+                    assign_tag: *b"MI",
+                },
+                &mut |v| {
+                    captured = Some(v);
+                },
+            )
             .unwrap();
         let out = captured.expect("stage must emit");
         assert_eq!(out.count, 0);

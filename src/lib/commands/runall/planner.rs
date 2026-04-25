@@ -428,6 +428,7 @@ impl Runall {
                 stages.push(self.sort_spec(sink_header.clone()));
                 stages.push(StageSpec::PositionBatch { header: sink_header.clone() });
                 stages.push(self.group_assign_spec());
+                stages.push(StageSpec::MiAssign);
                 stages.push(StageSpec::CoalesceMiGroup {
                     target_chunk_size: default_coalesce_chunk_size(),
                 });
@@ -455,6 +456,7 @@ impl Runall {
                 stages.push(self.sort_spec(zipper_header.clone()));
                 stages.push(StageSpec::PositionBatch { header: zipper_header.clone() });
                 stages.push(self.group_assign_spec());
+                stages.push(StageSpec::MiAssign);
                 stages.push(StageSpec::Consensus {
                     factory: consensus_factory,
                     call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
@@ -668,6 +670,7 @@ impl Runall {
                 self.sort_spec(header.clone()),
                 StageSpec::PositionBatch { header: header.clone() },
                 self.group_assign_spec(),
+                StageSpec::MiAssign,
                 StageSpec::CoalesceMiGroup { target_chunk_size: default_coalesce_chunk_size() },
                 StageSpec::BgzfCompress { level: self.compression_level },
             ];
@@ -684,6 +687,7 @@ impl Runall {
             self.sort_spec(header.clone()),
             StageSpec::PositionBatch { header: header.clone() },
             self.group_assign_spec(),
+            StageSpec::MiAssign,
             StageSpec::Consensus {
                 factory: consensus_factory,
                 call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
@@ -740,6 +744,7 @@ impl Runall {
         let stages = vec![
             StageSpec::PositionBatch { header: header.clone() },
             self.group_assign_spec(),
+            StageSpec::MiAssign,
             StageSpec::Consensus {
                 factory: consensus_factory,
                 call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,

@@ -36,6 +36,7 @@ use crate::runall::engine::stage_source::{ErasedStageSource, StageSource};
 use crate::runall::engine::stages::align_and_merge::AlignAndMerge;
 use crate::runall::engine::stages::coalesce::Coalesce;
 use crate::runall::engine::stages::group_assign::GroupAssignStage;
+use crate::runall::engine::stages::mi_assign::MiAssignStage;
 use crate::runall::engine::stages::position_batch::PositionBatchStage;
 use crate::runall::engine::stages::sort::SortStage;
 use crate::runall::engine::stages::{
@@ -246,6 +247,9 @@ fn spec_to_entry(spec: StageSpec) -> StageEntry {
                 assign_tag,
                 filter_config,
             ))
+        }
+        StageSpec::MiAssign => {
+            StageEntry::Special(Box::new(TypedSpecialStage::new(MiAssignStage::new())))
         }
         StageSpec::Consensus { factory, call_overlapping_bases } => {
             pool_factory(move || ConsensusStage::with_overlapping(&factory, call_overlapping_bases))

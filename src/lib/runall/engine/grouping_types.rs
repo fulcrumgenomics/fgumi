@@ -15,6 +15,15 @@
 //! that the same reorder-and-concatenate engine handles both byte-level
 //! batches (`SerializedBatch`, emitted by Extract/Correct/AlignAndMerge/Sort)
 //! and structured batches (`MiGroupBatch`, emitted by `GroupAssignStage`).
+//!
+//! ## MI tag injection
+//!
+//! `GroupAssignStage` does **not** inject the MI tag into the raw BAM record
+//! bytes. It carries the local [`MoleculeId`] on each [`MiGroup`] instead.
+//! A downstream serial-ordered stage applies the cumulative cross-batch
+//! offset and writes the final MI tag bytes into the records.
+
+use fgumi_umi::MoleculeId;
 
 use crate::runall::engine::output_types::{RawBytes, SerializedBatch};
 
@@ -43,30 +52,47 @@ pub struct PositionGroupBatch {
 /// holding the records for a single MI.
 #[derive(Debug, Clone)]
 pub struct MiGroup {
-    /// Length-prefixed concat records (MI tag applied).
+    /// Length-prefixed concat records. **The MI tag is NOT yet injected**
+    /// when emitted by `GroupAssignStage` — a downstream serial-ordered
+    /// stage writes it after applying the cumulative cross-batch offset.
+    /// Records flowing through the runall pipeline downstream of that stage
+    /// carry the MI tag.
     pub data: Vec<u8>,
     /// Number of records encoded in [`data`](Self::data).
     pub record_count: u64,
-    /// Assigned molecule ID.
+    /// Numeric MI for ordering. Local (`0..N-1` per batch) when emitted by
+    /// `GroupAssignStage`; replaced by the global value by the downstream
+    /// serial-ordered MI assign stage.
     pub mi: u64,
+    /// Local `MoleculeId` (variant tag preserved). The downstream MI assign
+    /// stage calls `with_offset(base)` to convert to a global ID before
+    /// writing the MI tag bytes. `None` after that stage runs (the offset
+    /// has been applied and the value lives in `mi` and in the record bytes).
+    pub local_mi: Option<MoleculeId>,
 }
 
 /// A batch of MI groups coming from one position group.
 ///
-/// Emitted by `GroupAssignStage`; consumed by `ConsensusStage` (future) or
-/// flattened through `Coalesce<MiGroupBatch>` on the `--stop-after group`
-/// path. The MI groups are ordered by MI (via `BTreeMap` iteration) so
-/// downstream consumers can assume a stable within-batch ordering for
-/// byte-compare determinism.
+/// Emitted by `GroupAssignStage` carrying *local* MI integers; rewritten in
+/// place by a downstream serial-ordered MI assign stage with global integers
+/// and BAM-record MI tag bytes; consumed by `ConsensusStage` or
+/// `Coalesce<MiGroupBatch>` on the `--stop-after group` path. The MI groups
+/// are ordered by MI ascending so downstream consumers can assume a stable
+/// within-batch ordering for byte-compare determinism.
 #[derive(Debug, Clone)]
 pub struct MiGroupBatch {
     /// The MI groups for this position, ordered by MI ascending.
     pub groups: Vec<MiGroup>,
     /// Monotonic batch ordinal, inherited from the incoming
-    /// `PositionGroupBatch.ordinal` so downstream `Coalesce` can reorder.
+    /// `PositionGroupBatch.ordinal` so downstream stages can reorder by
+    /// pipeline-serial order.
     pub ordinal: u64,
     /// Template-coordinate position key: `(primary, secondary)`.
     pub position_key: (u64, u64),
+    /// Two-byte BAM tag for the assigned molecule ID (e.g., `b"MI"`).
+    /// Threaded from `GroupAssignStage` to the downstream MI assign stage
+    /// so the latter knows which tag to write into each record.
+    pub assign_tag: [u8; 2],
 }
 
 /// A typed pipeline batch that can be coalesced into bytes for BGZF

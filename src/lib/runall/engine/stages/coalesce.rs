@@ -446,12 +446,18 @@ mod tests {
     fn test_coalesce_migroup_flattens_and_coalesces() {
         let (input, output) = make_migroup_queues();
 
-        let g0 = MiGroup { data: b"\x01A".to_vec(), record_count: 1, mi: 0 };
-        let g1 = MiGroup { data: b"\x01B".to_vec(), record_count: 1, mi: 1 };
-        let mg0 = MiGroupBatch { groups: vec![g0, g1], ordinal: 0, position_key: (0, 0) };
+        let g0 = MiGroup { data: b"\x01A".to_vec(), record_count: 1, mi: 0, local_mi: None };
+        let g1 = MiGroup { data: b"\x01B".to_vec(), record_count: 1, mi: 1, local_mi: None };
+        let mg0 = MiGroupBatch {
+            groups: vec![g0, g1],
+            ordinal: 0,
+            position_key: (0, 0),
+            assign_tag: *b"MI",
+        };
 
-        let g2 = MiGroup { data: b"\x01C".to_vec(), record_count: 1, mi: 2 };
-        let mg1 = MiGroupBatch { groups: vec![g2], ordinal: 1, position_key: (1, 0) };
+        let g2 = MiGroup { data: b"\x01C".to_vec(), record_count: 1, mi: 2, local_mi: None };
+        let mg1 =
+            MiGroupBatch { groups: vec![g2], ordinal: 1, position_key: (1, 0), assign_tag: *b"MI" };
 
         input.push(seq(1, mg1, 2)).unwrap();
         input.push(seq(0, mg0, 4)).unwrap();

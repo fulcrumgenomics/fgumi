@@ -150,7 +150,8 @@ pub enum StageSpec {
         header: Header,
     },
 
-    // Group-assign: PositionGroupBatch → MiGroupBatch (MI-tag applied)
+    // Group-assign: PositionGroupBatch → MiGroupBatch (local MoleculeIds,
+    // MI tag NOT yet injected — MiAssignStage does that downstream)
     GroupAssign {
         umi_tag: [u8; 2],
         assign_tag: [u8; 2],
@@ -158,6 +159,12 @@ pub enum StageSpec {
         max_edits: u32,
         filter_config: GroupFilterConfig,
     },
+
+    // MI-assign: serial-ordered cumulative offset on local MoleculeIds.
+    // Rewrites every MiGroup's local id into a global id and injects the
+    // final MI tag bytes into each record. Mirrors the `mi_assign_fn` zone
+    // PR #319 added to the unified BAM pipeline.
+    MiAssign,
 
     // Consensus calling: MiGroupBatch → ConsensusOutput
     Consensus {
@@ -212,6 +219,7 @@ impl StageSpec {
             StageSpec::Sort { .. } => "Sort",
             StageSpec::PositionBatch { .. } => "PositionBatch",
             StageSpec::GroupAssign { .. } => "GroupAssign",
+            StageSpec::MiAssign => "MiAssign",
             StageSpec::Consensus { .. } => "Consensus",
             StageSpec::Filter { .. } => "Filter",
             StageSpec::CoalesceSerialized { .. } => "CoalesceSerialized",
@@ -438,6 +446,9 @@ impl Plan {
                     } else {
                         let _ = writeln!(out, "      min umi length: (not set)");
                     }
+                }
+                StageSpec::MiAssign => {
+                    let _ = writeln!(out, "  {n:>2}. {name}");
                 }
                 StageSpec::Consensus { factory: _, call_overlapping_bases } => {
                     let _ = writeln!(out, "  {n:>2}. {name}");
