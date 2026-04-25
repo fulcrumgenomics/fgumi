@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-noodles = { version = "0.106.0", features = ["sam"] }
+noodles = { version = "0.109.0", features = ["sam"] }
 anyhow = "1.0"
 
 [lints.clippy]
