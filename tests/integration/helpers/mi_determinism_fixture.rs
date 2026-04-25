@@ -5,6 +5,8 @@
 //! test suites exercise the same input data and that any future changes to the
 //! fixture automatically apply to all callers.
 
+use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 use fgumi_lib::sam::SamTag;
@@ -83,9 +85,92 @@ pub fn build_paired_template(
     (r1, r2)
 }
 
+/// Read all `(QNAME, flags, MI:Z)` tuples from a BAM in input order.
+///
+/// Returning the tuple lets callers compare both per-output-position (which
+/// catches sort-order differences induced by re-numbered MIs) and
+/// per-(QNAME, flags) (which catches MI re-numbering on the same record).
+pub fn read_qname_mi(path: &Path) -> Vec<(String, u16, String)> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).expect("open output BAM"));
+    let _header = reader.read_header().expect("read header");
+    let mi = SamTag::MI.to_noodles_tag();
+    reader
+        .records()
+        .map(|r| {
+            let r = r.expect("read record");
+            let qname = r.name().expect("missing name").to_string();
+            let flags = u16::from(r.flags());
+            let mi_val = r.data().get(&mi).map(|v| format!("{v:?}")).unwrap_or_default();
+            (qname, flags, mi_val)
+        })
+        .collect()
+}
+
+/// Assert that per-record `MI:Z` tags are identical across all provided runs.
+///
+/// `all_runs` is a slice of per-run record vectors, where each inner `Vec` was
+/// produced by [`read_qname_mi`]. `total_runs` is the total number of runs
+/// (used in assertion messages). `label` is interpolated into failure messages
+/// to identify the command variant being tested (e.g. `"group --threads 4"` or
+/// `"runall group --threads 4"`).
+///
+/// Performs two checks per run:
+/// 1. **Keyed**: per-(QNAME, flags) MI tag equality — catches MI re-numbering
+///    on the same logical record even if the output is re-sorted by MI.
+/// 2. **Positional**: per-position equality — catches reordering induced by
+///    different MI numbering across runs.
+pub fn assert_mi_deterministic_across_runs(
+    all_runs: &[Vec<(String, u16, String)>],
+    total_runs: usize,
+    label: &str,
+) {
+    let baseline = &all_runs[0];
+    let baseline_by_key: HashMap<(String, u16), &str> =
+        baseline.iter().map(|(q, f, m)| ((q.clone(), *f), m.as_str())).collect();
+
+    for (run, run_records) in all_runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            baseline.len(),
+            run_records.len(),
+            "{label}: produced different record counts across runs ({total_runs} total)",
+        );
+
+        // Per-(QNAME, flags) comparison: catches MI tag re-numbering on the
+        // same logical record, even if the output is re-sorted by MI.
+        let mut keyed_mismatches = 0usize;
+        let mut sample_diffs: Vec<String> = Vec::new();
+        for (qname, flags, mi_run) in run_records {
+            let mi_base = baseline_by_key.get(&(qname.clone(), *flags));
+            let Some(mi_base) = mi_base else {
+                continue;
+            };
+            if *mi_base != mi_run.as_str() {
+                keyed_mismatches += 1;
+                if sample_diffs.len() < 5 {
+                    sample_diffs
+                        .push(format!("{qname} flags={flags}: run0={mi_base} run{run}={mi_run}",));
+                }
+            }
+        }
+
+        // Positional comparison: catches re-sorting that occurs because
+        // templates are sorted by MI on the way out.
+        let pos_mismatches =
+            baseline.iter().zip(run_records.iter()).filter(|(x, y)| x != y).count();
+
+        assert_eq!(
+            keyed_mismatches,
+            0,
+            "{label}: per-(QNAME,flags) MI tags differ between run 0 and run {run} \
+             ({keyed_mismatches}/{} records). Positional mismatches: {pos_mismatches}. \
+             Examples: {sample_diffs:?}",
+            baseline.len(),
+        );
+    }
+}
+
 /// Write a BAM containing the given templates against a minimal `chr1` header.
 pub fn write_bam(path: &Path, templates: &[(RawRecord, RawRecord)]) {
-    use std::fs;
     let header = create_minimal_header("chr1", 100_000);
     let mut writer =
         bam::io::Writer::new(fs::File::create(path).expect("Failed to create BAM file"));

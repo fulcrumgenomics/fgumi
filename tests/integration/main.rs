@@ -46,6 +46,7 @@ mod test_progress_bars;
 mod test_review_command;
 mod test_runall_cancel;
 mod test_runall_explain;
+mod test_runall_mi_determinism;
 mod test_runall_regression;
 mod test_runall_validate;
 #[cfg(feature = "simplex")]
