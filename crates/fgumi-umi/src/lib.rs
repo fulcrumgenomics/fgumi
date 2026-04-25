@@ -45,8 +45,8 @@ pub mod error;
 
 // Re-export commonly used items
 pub use assigner::{
-    AdjacencyUmiAssigner, IdentityUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner, Strategy,
-    Umi, UmiAssigner,
+    AdjacencyUmiAssigner, DEFAULT_INDEX_THRESHOLD, IdentityUmiAssigner, PairedUmiAssigner,
+    SimpleErrorUmiAssigner, Strategy, Umi, UmiAssigner,
 };
 pub use error::{Error, Result};
 

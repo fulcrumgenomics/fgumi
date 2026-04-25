@@ -13,11 +13,9 @@
 //! [`Sink`]: crate::runall::engine::sink::Sink
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use fgumi_consensus::caller::ConsensusOutput;
-use fgumi_umi::UmiAssigner;
 
 use super::plan::{Plan, SinkSpec, SourceSpec, StageSpec};
 use crate::runall::engine::cancel::CancelToken;
@@ -241,8 +239,13 @@ fn spec_to_entry(spec: StageSpec) -> StageEntry {
             StageEntry::Special(Box::new(TypedSpecialStage::new(PositionBatchStage::new(header))))
         }
         StageSpec::GroupAssign { umi_tag, assign_tag, strategy, max_edits, filter_config } => {
-            let assigner: Arc<dyn UmiAssigner> = Arc::from(strategy.new_assigner(max_edits));
-            pool_clone(GroupAssignStage::new(assigner, umi_tag, assign_tag, filter_config))
+            pool_clone(GroupAssignStage::new(
+                strategy,
+                max_edits,
+                umi_tag,
+                assign_tag,
+                filter_config,
+            ))
         }
         StageSpec::Consensus { factory, call_overlapping_bases } => {
             pool_factory(move || ConsensusStage::with_overlapping(&factory, call_overlapping_bases))

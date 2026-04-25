@@ -2,8 +2,9 @@
 //!
 //! Parallel pool stage. Groups records of one position bucket by
 //! queryname into [`Template`]s, runs UMI assignment to stamp molecule
-//! IDs via a shared [`UmiAssigner`], then regroups records by molecule
-//! ID into [`MiGroup`]s ready for consensus calling.
+//! IDs via a freshly constructed [`fgumi_umi::UmiAssigner`], then
+//! regroups records by molecule ID into [`MiGroup`]s ready for
+//! consensus calling.
 //!
 //! ## Input
 //!
@@ -35,13 +36,15 @@
 //!
 //! ## Determinism
 //!
-//! Deterministic per batch. The shared [`UmiAssigner`] behind an
-//! `Arc<dyn UmiAssigner>` uses an internal atomic counter to mint
-//! globally-unique MI values; the counter increments in the order
-//! pool workers call `assign()`, so cross-run MI *values* can differ
-//! — but the grouping itself (which reads cluster into which MI) is
-//! stable. Metrics collection lives in a [`PerThreadAccumulator`], so
-//! each worker merges into its own slot without cross-worker contention.
+//! Locally deterministic per batch. Each `step()` call builds a fresh
+//! per-batch `UmiAssigner` whose internal counter starts at 0, so the
+//! `MoleculeId`s it produces are local IDs `0..N-1` for that batch
+//! alone. Cross-run MI integers become globally deterministic only
+//! after the downstream `MiAssignStage` applies a serial-ordered
+//! cumulative offset (mirrors PR #319's design for standalone
+//! `group`/`dedup`). Metrics collection lives in a
+//! [`PerThreadAccumulator`], so each worker merges into its own slot
+//! without cross-worker contention.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,7 +54,7 @@ use fgumi_metrics::downsampling::compute_hash_fraction;
 use fgumi_metrics::inline_collector::InlineCollector;
 use fgumi_metrics::template_info::{ReadInfoKey, TemplateInfo};
 use fgumi_raw_bam::update_string_tag;
-use fgumi_umi::UmiAssigner;
+use fgumi_umi::Strategy;
 use noodles::sam::Header;
 
 use crate::grouper::{
@@ -67,14 +70,14 @@ use crate::template::Template;
 
 /// Pipeline group-assign stage.
 ///
-/// `Clone` via shared state: `assigner`, `next_mi`, and `metrics_collector`
-/// all live behind `Arc` so cloned instances share them. The work-stealing
-/// pool instantiates a per-worker stage while preserving global MI
-/// uniqueness — all workers increment the same `AtomicU64` counter through
-/// their shared `Arc`.
+/// `Clone` is cheap: `strategy` and `max_edits` are `Copy`; `metrics_collector`
+/// and `header` are `Option<Arc<...>>`. Each `step()` call builds a fresh
+/// per-batch `UmiAssigner` (counter starts at 0), so cloned worker instances
+/// produce local IDs independently without sharing any mutable state.
 #[derive(Clone)]
 pub struct GroupAssignStage {
-    assigner: Arc<dyn UmiAssigner>,
+    strategy: Strategy,
+    max_edits: u32,
     umi_tag: [u8; 2],
     /// Two-byte BAM tag for the assigned molecule ID (e.g., `b"MI"`).
     assign_tag: [u8; 2],
@@ -86,15 +89,21 @@ pub struct GroupAssignStage {
 
 impl GroupAssignStage {
     /// Create a new `GroupAssignStage`.
+    ///
+    /// A fresh [`fgumi_umi::UmiAssigner`] is constructed on each `step()` call
+    /// from `strategy` and `max_edits`, so local per-batch molecule IDs start
+    /// from 0 every time — no shared mutable counter between workers.
     #[must_use]
     pub fn new(
-        assigner: Arc<dyn UmiAssigner>,
+        strategy: Strategy,
+        max_edits: u32,
         umi_tag: [u8; 2],
         assign_tag: [u8; 2],
         group_filter_config: GroupFilterConfig,
     ) -> Self {
         Self {
-            assigner,
+            strategy,
+            max_edits,
             umi_tag,
             assign_tag,
             group_filter_config,
@@ -290,12 +299,15 @@ impl GroupAssignStage {
 
         // 4. UMI assignment via the shared library orchestration (pair-
         //    orientation split, UMI canonicalization, truncation, and
-        //    `assigner.assign()`). The assigner returns globally-unique IDs
-        //    directly via its internal atomic counter, so no `base_mi` offset
-        //    is applied here.
+        //    `assigner.assign()`). A fresh assigner is constructed per batch
+        //    so its internal counter starts at 0 — IDs are local 0..N-1 for
+        //    this batch alone. The downstream `MiAssignStage` applies a
+        //    serial-ordered cumulative offset to make IDs globally unique.
+        let assigner =
+            self.strategy.new_assigner_full(self.max_edits, 1, fgumi_umi::DEFAULT_INDEX_THRESHOLD);
         assign_umi_groups_impl(
             &mut templates,
-            self.assigner.as_ref(),
+            assigner.as_ref(),
             self.umi_tag,
             self.group_filter_config.min_umi_length,
             self.group_filter_config.no_umi,
@@ -324,9 +336,8 @@ impl GroupAssignStage {
         // 7. Inject MI tags into raw records and regroup by molecule ID. Use
         //    `BTreeMap` so downstream consumers see MI groups in stable
         //    ascending MI order — required by `Coalesce<MiGroupBatch>` and the
-        //    byte-compare gate. MI values come straight from
-        //    `MoleculeId::write_with_offset(0, _)` since assigner IDs are
-        //    already globally unique.
+        //    byte-compare gate. MI values are written with offset 0 (local IDs);
+        //    `MiAssignStage` rewrites them with the global cumulative offset.
         let mut mi_map: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
         let mut mi_buf = String::new();
 
@@ -394,7 +405,6 @@ mod tests {
     use super::*;
     use crate::runall::engine::grouping_types::{iter_length_prefixed, serialize_records};
     use fgumi_raw_bam::fields::read_name;
-    use fgumi_umi::IdentityUmiAssigner;
 
     /// Minimal raw BAM record with the given name, flag, and UMI.
     #[allow(clippy::cast_possible_truncation)]
@@ -477,9 +487,9 @@ mod tests {
 
     #[test]
     fn test_process_two_templates_same_umi() {
-        let assigner = Arc::new(IdentityUmiAssigner::new());
         let stage = GroupAssignStage::new(
-            assigner,
+            Strategy::Identity,
+            0,
             *b"RX",
             *b"MI",
             GroupFilterConfig::with_defaults(*b"RX"),
@@ -503,9 +513,9 @@ mod tests {
 
     #[test]
     fn test_process_two_templates_different_umis() {
-        let assigner = Arc::new(IdentityUmiAssigner::new());
         let stage = GroupAssignStage::new(
-            assigner,
+            Strategy::Identity,
+            0,
             *b"RX",
             *b"MI",
             GroupFilterConfig::with_defaults(*b"RX"),
@@ -527,9 +537,9 @@ mod tests {
 
     #[test]
     fn test_process_empty_batch() {
-        let assigner = Arc::new(IdentityUmiAssigner::new());
         let stage = GroupAssignStage::new(
-            assigner,
+            Strategy::Identity,
+            0,
             *b"RX",
             *b"MI",
             GroupFilterConfig::with_defaults(*b"RX"),
@@ -543,9 +553,9 @@ mod tests {
 
     #[test]
     fn test_output_memory_estimate() {
-        let assigner = Arc::new(IdentityUmiAssigner::new());
         let stage = GroupAssignStage::new(
-            assigner,
+            Strategy::Identity,
+            0,
             *b"RX",
             *b"MI",
             GroupFilterConfig::with_defaults(*b"RX"),
