@@ -281,9 +281,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.2.60"
+version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20"
+checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-bgzf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bgzf",
  "crc32fast",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-consensus"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -729,14 +729,14 @@ dependencies = [
 
 [[package]]
 name = "fgumi-dna"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
 name = "fgumi-metrics"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "fgoxide",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-raw-bam"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bstr 1.12.1",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-sam"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bstr 1.12.1",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-simd-fastq"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "memchr",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-tag"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "noodles",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "fgumi-umi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1205,9 +1205,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiff"
-version = "0.2.23"
+version = "0.2.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a3546dc96b6d42c5f24902af9e2538e82e39ad350b0c766eb3fbf2d8f3d8359"
+checksum = "f00b5dbd620d61dfdcb6007c9c1f6054ebd75319f163d886a9055cec1155073d"
 dependencies = [
  "jiff-static",
  "log",
@@ -1218,9 +1218,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.23"
+version = "0.2.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a8c8b344124222efd714b73bb41f8b5120b27a7cc1c75593a6ff768d9d05aa4"
+checksum = "e000de030ff8022ea1da3f466fbb0f3a809f5e51ed31f6dd931c35181ad8e6d7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1318,9 +1318,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.185"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libdeflate-sys"
@@ -1360,9 +1360,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libmimalloc-sys"
-version = "0.1.46"
+version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc89deee4af0429081d2a518c0431ae068222a5a262a3bc6ff4d8535ec2e02fe"
+checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
 dependencies = [
  "cc",
  "cty",
@@ -1440,9 +1440,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mimalloc"
-version = "0.1.49"
+version = "0.1.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aca3c01a711f395b4257b81674c0e90e8dd1f1e62c4b7db45f684cc7a4fcb18a"
+checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -3113,7 +3113,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
