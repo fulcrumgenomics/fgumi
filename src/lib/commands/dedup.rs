@@ -20,6 +20,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::assigner::{PairedUmiAssigner, Strategy, UmiAssigner};
 use crate::bam_io::{create_bam_reader_for_pipeline_with_opts, is_stdin_path};
@@ -34,7 +35,8 @@ use crate::sam::is_template_coordinate_sorted;
 use crate::template::Template;
 use crate::umi::{UmiValidation, validate_umi};
 use crate::unified_pipeline::{
-    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
+    BatchWeight, GroupKeyConfig, Grouper, MemoryEstimate,
+    run_bam_pipeline_from_reader_with_mi_assign,
 };
 use crate::validation::validate_file_exists;
 use ahash::AHashMap;
@@ -174,6 +176,11 @@ pub struct ProcessedDedupGroup {
     pub dedup_metrics: DedupMetrics,
     /// Total input records processed (for progress tracking).
     pub input_record_count: u64,
+    /// Number of distinct numeric `MoleculeId`s assigned in this group.
+    /// Derived directly from the templates the MI Assign hook will mutate, so
+    /// the cumulative MI counter stays in lockstep with what `serialize_fn`
+    /// emits even if the family-size histogram semantics change.
+    pub distinct_mi_count: u64,
 }
 
 impl BatchWeight for ProcessedDedupGroup {
@@ -547,7 +554,14 @@ fn assign_umi_groups(
             subgroups.entry(orientation).or_default().push(idx);
         }
 
-        for indices in subgroups.values() {
+        // Iterate orientation subgroups in a deterministic order.
+        // `AHashMap`'s per-process random hasher would otherwise walk
+        // FR/RF subgroups in different orders across runs and assign
+        // different local `MoleculeId`s to the same templates.
+        let mut ordered_subgroups: Vec<((bool, bool), Vec<usize>)> =
+            subgroups.into_iter().collect();
+        ordered_subgroups.sort_by_key(|(orientation, _)| *orientation);
+        for (_orientation, indices) in &ordered_subgroups {
             assign_umi_groups_for_indices(
                 templates,
                 indices,
@@ -685,6 +699,7 @@ fn process_position_group(
             family_sizes: AHashMap::new(),
             dedup_metrics,
             input_record_count,
+            distinct_mi_count: 0,
         });
     }
 
@@ -773,7 +788,21 @@ fn process_position_group(
 
     dedup_metrics.unique_reads = dedup_metrics.total_reads - dedup_metrics.duplicate_reads;
 
-    Ok(ProcessedDedupGroup { templates, family_sizes, dedup_metrics, input_record_count })
+    // Compute the number of distinct numeric molecule IDs assigned in this group.
+    // Mirrors `fgumi group`: assigners hand out numeric IDs 0, 1, 2, ... contiguously,
+    // so `max(id) + 1` equals the count of distinct IDs used. Derived from the
+    // templates the MI Assign hook will mutate, which decouples the cumulative MI
+    // counter from how `family_sizes` is populated.
+    let distinct_mi_count: u64 =
+        templates.iter().filter_map(|t| t.mi.id()).max().map(|max_id| max_id + 1).unwrap_or(0);
+
+    Ok(ProcessedDedupGroup {
+        templates,
+        family_sizes,
+        dedup_metrics,
+        input_record_count,
+        distinct_mi_count,
+    })
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -991,11 +1020,17 @@ impl Command for MarkDuplicates {
         let library_index = LibraryIndex::from_header(&header);
         pipeline_config.group_key_config = Some(GroupKeyConfig::new(library_index, cell_tag));
 
-        // Counter for contiguous MI assignment (incremented in the serial serialize step).
-        let next_mi_base = std::sync::atomic::AtomicU64::new(0);
+        // Cumulative MoleculeId counter, advanced **only** by the
+        // serial-ordered MI Assign hook installed below. Mirrors the
+        // pattern used by `fgumi group`; see
+        // `docs/design/deterministic-mi-numbering.md` for why this lives
+        // in the hook rather than in `serialize_fn`. The `Arc` is owned
+        // by the hook closure; nothing outside the closure needs to read
+        // its final value.
+        let next_mi_base_for_hook = Arc::new(AtomicU64::new(0));
 
         // Run the pipeline
-        let _records_processed = run_bam_pipeline_from_reader(
+        let _records_processed = run_bam_pipeline_from_reader_with_mi_assign(
             pipeline_config,
             reader,
             header,
@@ -1034,23 +1069,19 @@ impl Command for MarkDuplicates {
 
                 let input_record_count = processed.input_record_count;
 
-                // Assign contiguous base_mi from serial counter. Use the distinct MI
-                // count (number of families) so base_mi advances once per emitted MI,
-                // not once per template — families with multiple templates would
-                // otherwise create gaps in MI IDs.
-                let distinct_mi_count: u64 = processed.family_sizes.values().copied().sum();
-                let base_mi =
-                    next_mi_base.fetch_add(distinct_mi_count, std::sync::atomic::Ordering::Relaxed);
+                // Templates already carry their final global `MoleculeId`s
+                // because the MI Assign hook (installed below) ran in
+                // serial order before this closure was called, so we pass
+                // `base_mi = 0` to `write_with_offset`.
                 // Pre-allocate output buffer: ~2 records/template × ~400 bytes/record
                 output.reserve(processed.templates.len() * 2 * 400);
-                // Serialize templates
                 let mut scratch = Vec::with_capacity(512);
                 let mut mi_buf = String::with_capacity(16);
                 for template in &processed.templates {
                     let mi = template.mi;
                     let has_mi = mi.is_assigned();
                     if has_mi {
-                        mi.write_with_offset(base_mi, &mut mi_buf);
+                        mi.write_with_offset(0, &mut mi_buf);
                     }
                     for raw in template.records() {
                         // Skip duplicates if remove mode
@@ -1079,6 +1110,31 @@ impl Command for MarkDuplicates {
                 }
 
                 Ok(input_record_count)
+            },
+            // mi_assign_fn: called in serial order by the MI Assign zone
+            // before each item's `serialize_fn`. Folds a cumulative offset
+            // into every template's local `MoleculeId`. Advances the counter
+            // by `distinct_mi_count` so the offset matches what `serialize_fn`
+            // emits even when families contain multiple templates.
+            //
+            // `fetch_update` + `checked_add` so wraparound is detected and surfaced
+            // rather than silently reusing MI integers (which would defeat
+            // `MoleculeId::with_offset`'s own overflow check on the per-template add).
+            move |_ord, processed: &mut ProcessedDedupGroup| {
+                let base = next_mi_base_for_hook
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current.checked_add(processed.distinct_mi_count)
+                    })
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "MoleculeId offset overflow: cumulative MI counter exceeded u64::MAX",
+                        )
+                    })?;
+                for template in &mut processed.templates {
+                    template.mi = template.mi.with_offset(base);
+                }
+                Ok(())
             },
         )?;
 
@@ -2529,6 +2585,7 @@ mod tests {
             family_sizes: AHashMap::new(),
             dedup_metrics: DedupMetrics::default(),
             input_record_count: 1,
+            distinct_mi_count: 0,
         };
 
         let estimate = batch.estimate_heap_size();

@@ -903,6 +903,12 @@ impl<G: Send, P: Send + MemoryEstimate> BamPipelineState<G, P> {
             }
         }
         {
+            let mi_assign_reorder = self.output.mi_assign_reorder.lock();
+            if !mi_assign_reorder.is_empty() {
+                non_empty_queues.push(format!("mi_assign_reorder ({})", mi_assign_reorder.len()));
+            }
+        }
+        {
             let write_reorder = self.output.write_reorder.lock();
             if !write_reorder.is_empty() {
                 non_empty_queues.push(format!("write_reorder ({})", write_reorder.len()));
@@ -1032,6 +1038,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> MonitorableState
             let reorder = self.q3_reorder.lock();
             reorder.total_heap_size() as u64
         };
+        let mi_assign_reorder_len = self.output.mi_assign_reorder.lock().len();
 
         QueueSnapshot {
             q1_len: self.q1_raw_blocks.len(),
@@ -1044,6 +1051,7 @@ impl<G: Send + 'static, P: Send + MemoryEstimate + 'static> MonitorableState
             q7_len: self.output.compressed.len(),
             q2_reorder_mem,
             q3_reorder_mem,
+            mi_assign_reorder_len,
             memory_limit: self.deadlock_state.get_memory_limit(),
             read_done: self.read_done.load(Ordering::Relaxed),
             group_done: self.group_done.load(Ordering::Relaxed),
@@ -1429,6 +1437,44 @@ impl<G: Send> GroupState<G> {
 // Step Functions Trait (for BAM pipeline)
 // ============================================================================
 
+/// Position of a single processed item within its pipeline batch, published
+/// by the BAM pipeline harness when invoking [`PipelineFunctions::mi_assign_fn`].
+///
+/// `batch_serial` is the monotonically-increasing serial assigned by the
+/// Group step (one per `(serial, Vec<P>)` push to Q5), and `idx_in_batch`
+/// identifies one item within that batch. Together `(batch_serial,
+/// idx_in_batch)` uniquely names every `ProcessedPositionGroup` produced by
+/// a run of the pipeline, independent of completion timing.
+///
+/// `batch_len` is the total number of items in the enclosing batch; the
+/// hook can compare `idx_in_batch + 1 == batch_len` to detect the final
+/// item if it needs to finalize per-batch state before returning.
+///
+/// See `docs/design/deterministic-mi-numbering.md` for the design that
+/// motivates this struct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchOrdinal {
+    /// Group-step serial of the enclosing batch.
+    pub batch_serial: u64,
+    /// Zero-based index of this item within the batch.
+    pub idx_in_batch: usize,
+    /// Total number of items in the batch.
+    pub batch_len: usize,
+}
+
+impl BatchOrdinal {
+    /// True when this is the final item in the batch.
+    ///
+    /// Convenient shorthand for `self.idx_in_batch + 1 == self.batch_len`,
+    /// used by `mi_assign_fn` callers that need to run per-batch
+    /// finalization on the last item only.
+    #[inline]
+    #[must_use]
+    pub fn is_last(&self) -> bool {
+        self.idx_in_batch + 1 == self.batch_len
+    }
+}
+
 /// Functions provided by the command for each pipeline step.
 ///
 /// Generic parameters:
@@ -1449,6 +1495,24 @@ pub struct PipelineFunctions<G: Send, P: Send> {
     /// Called with a borrow of P BEFORE the primary `serialize_fn` consumes it.
     pub secondary_serialize_fn:
         Option<Box<dyn Fn(&P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync>>,
+
+    /// Optional serial-ordered hook that runs after `process_fn` and before
+    /// `serialize_fn`, with mutable access to each batched item.
+    ///
+    /// When set, the BAM pipeline routes batches through a single-threaded
+    /// "MI Assign" stage that pops in pipeline-serial order and invokes
+    /// this closure once per item, in `(batch_serial, idx_in_batch)`
+    /// order, before the batch is handed to `serialize_fn`. The hook is
+    /// permitted to mutate the item — `fgumi group` and `fgumi dedup` use
+    /// it to rewrite each template's local `MoleculeId` into a global one
+    /// via `MoleculeId::with_offset`, so that `serialize_fn` itself stays
+    /// synchronization-free.
+    ///
+    /// When `None` (the default), the pipeline behaves exactly as before:
+    /// Process pushes onto Q5 and Serialize pops from Q5 in completion
+    /// order. Commands that do not need cumulative ordering should leave
+    /// this field unset.
+    pub mi_assign_fn: Option<Box<dyn Fn(BatchOrdinal, &mut P) -> io::Result<()> + Send + Sync>>,
 }
 
 impl<G: Send, P: Send> PipelineFunctions<G, P> {
@@ -1462,6 +1526,7 @@ impl<G: Send, P: Send> PipelineFunctions<G, P> {
             process_fn: Box::new(process_fn),
             serialize_fn: Box::new(serialize_fn),
             secondary_serialize_fn: None,
+            mi_assign_fn: None,
         }
     }
 
@@ -1472,6 +1537,17 @@ impl<G: Send, P: Send> PipelineFunctions<G, P> {
         F: Fn(&P, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
     {
         self.secondary_serialize_fn = Some(Box::new(f));
+        self
+    }
+
+    /// Install a serial-ordered MI-assign hook. See
+    /// [`PipelineFunctions::mi_assign_fn`] for the contract.
+    #[must_use]
+    pub fn with_mi_assign<F>(mut self, f: F) -> Self
+    where
+        F: Fn(BatchOrdinal, &mut P) -> io::Result<()> + Send + Sync + 'static,
+    {
+        self.mi_assign_fn = Some(Box::new(f));
         self
     }
 }
@@ -2606,6 +2682,87 @@ fn try_step_process<G: Send + MemoryEstimate + 'static, P: Send + MemoryEstimate
     did_work
 }
 
+/// Outcome of an attempt to pop a serial-ordered batch out of the MI Assign
+/// reorder zone. Distinguishing `Stalled` from `Empty` lets the caller
+/// avoid polluting the queue-emptiness stat with reorder-buffer waits;
+/// distinguishing `Errored` from both lets the call site treat hook
+/// failures as the terminal abort they actually are.
+enum MiAssignPopOutcome<P> {
+    /// A batch is ready to serialize, already mutated by the hook.
+    Ready { serial: u64, batch: Vec<P> },
+    /// Q5 was drained into the reorder buffer, but the next-expected
+    /// pipeline-serial-order batch hasn't arrived yet — there is in-flight
+    /// work parked in the reorder buffer, so this is *not* a Q5-empty
+    /// stall.
+    Stalled,
+    /// Q5 was empty and the reorder buffer was empty — nothing to do.
+    Empty,
+    /// The hook returned an error; `state.set_error` has already been
+    /// invoked and the worker loop will short-circuit on the next
+    /// iteration. Functionally equivalent to `Stalled` at the call
+    /// site, but named distinctly so the contract is self-documenting.
+    Errored,
+}
+
+/// Drain `processed` (Q5) into the per-pipeline MI-assign reorder buffer
+/// and try to pop the next-in-pipeline-serial-order batch.
+///
+/// Called only when `mi_assign_fn` is installed. Holds the
+/// `mi_assign_reorder` mutex for the duration of (drain + pop + hook
+/// invocation), so the hook always sees `(batch_serial, idx_in_batch)`
+/// pairs in monotonic order even though parallel workers race to pop
+/// from `processed`.
+fn try_pop_mi_assigned<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
+    state: &BamPipelineState<G, P>,
+    hook: &(dyn Fn(BatchOrdinal, &mut P) -> io::Result<()> + Send + Sync),
+) -> MiAssignPopOutcome<P> {
+    let mut reorder = state.output.mi_assign_reorder.lock();
+
+    // Drain whatever is currently in Q5 into the reorder buffer. This keeps
+    // Q5 drainable (so producers don't get stuck on slot backpressure) and
+    // gives the reorder buffer a chance to receive the next-expected serial.
+    //
+    // Memory accounting: heap bytes stay charged to `processed_heap_bytes`
+    // while the batch is parked in the reorder buffer (carried in via
+    // `insert_with_size`, refunded on `try_pop_next_with_size`). This keeps
+    // `is_q5_memory_high()` honest so producers stay backpressured if many
+    // batches stack up waiting for an out-of-order serial.
+    while let Some((serial, batch)) = state.output.processed.pop() {
+        let heap_size: usize = batch.iter().map(MemoryEstimate::estimate_heap_size).sum();
+        state.deadlock_state.record_q5_pop();
+        reorder.insert_with_size(serial, batch, heap_size);
+    }
+
+    // Pop the next batch in pipeline-serial order if it's available.
+    let serial = reorder.next_seq();
+    let Some((mut batch, heap_size)) = reorder.try_pop_next_with_size() else {
+        // No in-order batch — distinguish a true Q5-empty stall (reorder
+        // buffer also empty after the drain) from a reorder-stalled wait
+        // (reorder buffer non-empty, just missing an earlier serial).
+        return if reorder.is_empty() {
+            MiAssignPopOutcome::Empty
+        } else {
+            MiAssignPopOutcome::Stalled
+        };
+    };
+    state.output.processed_heap_bytes.fetch_sub(heap_size as u64, Ordering::AcqRel);
+
+    // Run the hook on every item in the popped batch, in order. We hold the
+    // reorder mutex for the whole loop so that two workers cannot interleave
+    // hook invocations across batches and race on whatever shared state the
+    // hook is advancing (e.g. `group`/`dedup`'s cumulative MI counter).
+    let batch_len = batch.len();
+    for (idx_in_batch, item) in batch.iter_mut().enumerate() {
+        let ordinal = BatchOrdinal { batch_serial: serial, idx_in_batch, batch_len };
+        if let Err(e) = (hook)(ordinal, item) {
+            state.set_error(e);
+            return MiAssignPopOutcome::Errored;
+        }
+    }
+
+    MiAssignPopOutcome::Ready { serial, batch }
+}
+
 /// Try to execute Step 7: Serialize records.
 ///
 /// This step is parallel - multiple threads can serialize concurrently.
@@ -2647,19 +2804,54 @@ fn try_step_serialize<G: Send + 'static, P: Send + MemoryEstimate + 'static>(
     }
 
     // =========================================================================
-    // Priority 3: Pop input
+    // Priority 3: Pop input.
+    //
+    // When `mi_assign_fn` is installed, route the batch through a serial-
+    // ordered "MI Assign" zone so the hook always observes batches (and
+    // items within them) in monotonic `(batch_serial, idx_in_batch)` order
+    // even though `try_step_serialize` itself runs on parallel workers.
+    // The hook may mutate items in place (e.g. fold a cumulative offset
+    // into per-template `MoleculeId`s); the subsequent serialize work then
+    // proceeds on the mutated batch outside the reorder lock.
+    //
+    // When `mi_assign_fn` is `None`, the existing fast path applies:
+    // pop directly from `processed` (Q5) in completion order. No mutex,
+    // no reorder buffer, no behavior change for any other command.
     // =========================================================================
-    let Some((serial, batch)) = state.output.processed.pop() else {
-        if let Some(stats) = state.stats() {
-            stats.record_queue_empty(5);
+    let (serial, batch) = if let Some(ref hook) = fns.mi_assign_fn {
+        match try_pop_mi_assigned(state, hook.as_ref()) {
+            MiAssignPopOutcome::Ready { serial, batch } => (serial, batch),
+            // Stalled: reorder buffer has batches parked but the
+            // next-expected serial isn't here yet — Q5 is *not* empty
+            // in any pipeline-meaningful sense, so counting this as
+            // Q5-empty would skew the queue-emptiness stat.
+            // Errored: hook returned an error and `set_error` is already
+            // recorded; the worker loop's `state.has_error()` check tears
+            // the pipeline down on the next iteration. Both cases yield
+            // here without recording a Q5-empty stat.
+            MiAssignPopOutcome::Stalled | MiAssignPopOutcome::Errored => return false,
+            MiAssignPopOutcome::Empty => {
+                if let Some(stats) = state.stats() {
+                    stats.record_queue_empty(5);
+                }
+                return false;
+            }
         }
-        return false;
+    } else {
+        let Some(item) = state.output.processed.pop() else {
+            if let Some(stats) = state.stats() {
+                stats.record_queue_empty(5);
+            }
+            return false;
+        };
+        state.deadlock_state.record_q5_pop();
+        // Track memory being removed from Q5 (only when we go straight from
+        // Q5 to Serialize; the MI Assign path subtracts after the reorder
+        // buffer hands the batch off to serialize).
+        let q5_heap_size: usize = item.1.iter().map(MemoryEstimate::estimate_heap_size).sum();
+        state.output.processed_heap_bytes.fetch_sub(q5_heap_size as u64, Ordering::AcqRel);
+        item
     };
-    state.deadlock_state.record_q5_pop();
-
-    // Track memory being removed from Q5
-    let q5_heap_size: usize = batch.iter().map(MemoryEstimate::estimate_heap_size).sum();
-    state.output.processed_heap_bytes.fetch_sub(q5_heap_size as u64, Ordering::AcqRel);
 
     // =========================================================================
     // Priority 4: Serialize all items
@@ -3009,12 +3201,41 @@ impl SingleThreadedBuffers {
     }
 }
 
+/// Type alias for an `mi_assign_fn` reference, used by
+/// [`run_mi_assign_single_threaded`] to keep the parameter list readable
+/// for clippy's `type_complexity` lint.
+type MiAssignFnRef<'a, P> =
+    Option<&'a (dyn Fn(BatchOrdinal, &mut P) -> io::Result<()> + Send + Sync)>;
+
+/// Optionally invoke the MI Assign hook on a processed group before it is
+/// serialized.
+///
+/// The single-threaded BAM pipeline path is intrinsically in serial order,
+/// so the hook receives a strictly increasing `batch_serial` (one per
+/// processed group, treated as a one-item batch) with no synchronization
+/// needed. Returns the consumed `processed` (the hook may have mutated it
+/// in place) so the caller can pass it on to `serialize_fn`.
+fn run_mi_assign_single_threaded<P>(
+    mi_assign_fn: MiAssignFnRef<'_, P>,
+    next_serial: &mut u64,
+    mut processed: P,
+) -> io::Result<P> {
+    if let Some(hook) = mi_assign_fn {
+        (hook)(
+            BatchOrdinal { batch_serial: *next_serial, idx_in_batch: 0, batch_len: 1 },
+            &mut processed,
+        )?;
+        *next_serial += 1;
+    }
+    Ok(processed)
+}
+
 /// Run the BAM pipeline in single-threaded mode.
 ///
 /// This avoids the overhead of thread spawning, queues, and atomic
 /// operations when only one thread is requested. Significantly faster
 /// for small inputs or when parallelization overhead exceeds the benefit.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn run_bam_pipeline_single_threaded<G, P>(
     config: &PipelineConfig,
     mut input: Box<dyn Read + Send>,
@@ -3046,6 +3267,14 @@ where
 
     // Progress tracking
     let progress = ProgressTracker::new("Processed records").with_interval(PROGRESS_LOG_INTERVAL);
+
+    // Per-position-group serial counter, incremented every time a processed
+    // group is handed off to `serialize_fn`. Only meaningful when
+    // `fns.mi_assign_fn` is set; otherwise the harness never reads it. The
+    // single-threaded path treats each processed group as a single-item
+    // batch (`idx_in_batch=0, batch_len=1`), which is the natural mapping
+    // since serialization here is synchronous and one-at-a-time.
+    let mut next_serial: u64 = 0;
 
     // Main loop: read -> decompress -> find_boundaries -> decode -> group -> process -> serialize -> compress -> write
     loop {
@@ -3088,8 +3317,16 @@ where
                     (secondary_fn)(&processed, &mut buffers.secondary)?;
                 }
 
-                // Step 7b: Primary serialize (consumes processed, reuse buffer)
+                // Step 7b: Primary serialize (consumes processed, reuse buffer).
+                // Run the optional MI Assign hook first so any per-template
+                // rewriting it does is reflected in the bytes serialize
+                // emits.
                 buffers.serialized.clear();
+                let processed = run_mi_assign_single_threaded(
+                    fns.mi_assign_fn.as_deref(),
+                    &mut next_serial,
+                    processed,
+                )?;
                 let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
 
                 // Step 8: Compress (only when buffer reaches 64KB)
@@ -3126,6 +3363,11 @@ where
                 }
 
                 buffers.serialized.clear();
+                let processed = run_mi_assign_single_threaded(
+                    fns.mi_assign_fn.as_deref(),
+                    &mut next_serial,
+                    processed,
+                )?;
                 let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
                 compressor.write_all(&buffers.serialized)?;
                 compressor.maybe_compress()?;
@@ -3153,8 +3395,15 @@ where
             (secondary_fn)(&processed, &mut buffers.secondary)?;
         }
 
-        // Step 7b: Primary serialize (consumes processed, reuse buffer)
+        // Step 7b: Primary serialize (consumes processed, reuse buffer).
+        // Run the MI Assign hook first so the bytes reflect any per-template
+        // rewriting it performs.
         buffers.serialized.clear();
+        let processed = run_mi_assign_single_threaded(
+            fns.mi_assign_fn.as_deref(),
+            &mut next_serial,
+            processed,
+        )?;
         let record_count = (fns.serialize_fn)(processed, &mut buffers.serialized)?;
 
         // Step 8: Compress (only when buffer reaches 64KB)
@@ -3777,6 +4026,82 @@ where
 // Reader-based Pipeline Functions (for streaming support)
 // ============================================================================
 
+/// Shared driver behind [`run_bam_pipeline_from_reader`] and
+/// [`run_bam_pipeline_from_reader_with_mi_assign`].
+///
+/// Resolves the output header, opens the output writer, writes the BAM
+/// header, builds the `GroupKeyConfig` and grouper, then defers to the
+/// caller-supplied `build_fns` to construct the `PipelineFunctions`
+/// (with or without an `mi_assign_fn` installed) before delegating to
+/// [`run_bam_pipeline`].
+///
+/// `input_header` is taken by value so it can be cloned into the output
+/// header when the caller passes `output_header: None`; both public
+/// wrappers do the same.
+#[allow(clippy::needless_pass_by_value)]
+fn run_bam_pipeline_from_reader_inner<G, P, R, GrouperFn, BuildFns>(
+    config: BamPipelineConfig,
+    input: R,
+    input_header: Header,
+    output_path: &Path,
+    output_header: Option<Header>,
+    grouper_fn: GrouperFn,
+    build_fns: BuildFns,
+) -> io::Result<u64>
+where
+    G: Send + BatchWeight + MemoryEstimate + 'static,
+    P: Send + MemoryEstimate + 'static,
+    R: Read + Send + 'static,
+    GrouperFn: FnOnce(&Header) -> Box<dyn Grouper<Group = G> + Send>,
+    BuildFns: FnOnce(Header) -> PipelineFunctions<G, P>,
+{
+    // Use output_header if provided, otherwise clone input_header
+    let output_header = output_header.unwrap_or_else(|| input_header.clone());
+
+    // Create output writer (supports stdout via "-" or "/dev/stdout")
+    let output_writer = open_pipeline_output(output_path)?;
+
+    // Write BAM header using BGZF compression
+    let mut header_writer = bam::io::Writer::new(output_writer);
+    header_writer
+        .write_header(&output_header)
+        .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
+
+    // Finish the BGZF writer and get the underlying writer for the pipeline.
+    let mut bgzf_writer = header_writer.into_inner();
+    bgzf_writer
+        .try_finish()
+        .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
+    let output = bgzf_writer.into_inner();
+
+    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
+
+    // Build GroupKeyConfig from input header if not provided
+    let group_key_config = config.group_key_config.unwrap_or_else(|| {
+        let library_index = LibraryIndex::from_header(&input_header);
+        let cell_tag = Tag::from(SamTag::CB);
+        GroupKeyConfig::new(library_index, cell_tag)
+    });
+
+    // Create the grouper using INPUT header
+    let grouper = grouper_fn(&input_header);
+
+    // Hand the resolved OUTPUT header to the caller so its serialize closure
+    // can capture it. This is the only piece that must stay caller-side
+    // because the closure type is otherwise unnameable.
+    let fns = build_fns(output_header);
+
+    run_bam_pipeline(
+        config.pipeline,
+        Box::new(input),
+        Box::new(output),
+        grouper,
+        fns,
+        group_key_config,
+        None,
+    )
+}
+
 /// Run a BAM pipeline from an already-opened reader.
 ///
 /// This variant accepts a pre-opened reader and header, enabling streaming from
@@ -3826,50 +4151,79 @@ where
     ProcessFn: Fn(G) -> io::Result<P> + Send + Sync + 'static,
     SerializeFn: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
 {
-    // Use output_header if provided, otherwise clone input_header
-    let output_header = output_header.unwrap_or_else(|| input_header.clone());
+    run_bam_pipeline_from_reader_inner(
+        config,
+        input,
+        input_header,
+        output_path,
+        output_header,
+        grouper_fn,
+        |output_header| {
+            PipelineFunctions::new(process_fn, move |p: P, buf: &mut Vec<u8>| {
+                serialize_fn(p, &output_header, buf)
+            })
+        },
+    )
+}
 
-    // Create output writer (supports stdout via "-" or "/dev/stdout")
-    let output_writer = open_pipeline_output(output_path)?;
-
-    // Write BAM header using BGZF compression
-    let mut header_writer = bam::io::Writer::new(output_writer);
-    header_writer
-        .write_header(&output_header)
-        .map_err(|e| io::Error::other(format!("Failed to write BAM header: {e}")))?;
-
-    // Finish the BGZF writer and get the underlying writer for the pipeline.
-    let mut bgzf_writer = header_writer.into_inner();
-    bgzf_writer
-        .try_finish()
-        .map_err(|e| io::Error::other(format!("Failed to finish BGZF header: {e}")))?;
-    let output = bgzf_writer.into_inner();
-
-    let output = BufWriter::with_capacity(IO_BUFFER_SIZE, output);
-
-    // Build GroupKeyConfig from input header if not provided
-    let group_key_config = config.group_key_config.unwrap_or_else(|| {
-        let library_index = LibraryIndex::from_header(&input_header);
-        let cell_tag = Tag::from(SamTag::CB);
-        GroupKeyConfig::new(library_index, cell_tag)
-    });
-
-    // Create the grouper using INPUT header
-    let grouper = grouper_fn(&input_header);
-
-    // Create step functions with OUTPUT header captured (for serialization)
-    let fns = PipelineFunctions::new(process_fn, move |p: P, buf: &mut Vec<u8>| {
-        serialize_fn(p, &output_header, buf)
-    });
-
-    run_bam_pipeline(
-        config.pipeline,
-        Box::new(input),
-        Box::new(output),
-        grouper,
-        fns,
-        group_key_config,
-        None,
+/// Run a BAM pipeline from an already-opened reader, with an additional
+/// serial-ordered MI-assign hook.
+///
+/// Same as [`run_bam_pipeline_from_reader`] but installs an `mi_assign_fn`
+/// on the underlying [`PipelineFunctions`]. The hook is invoked once per
+/// processed item, in pipeline-serial order
+/// (`(batch_serial, idx_in_batch)`), before that item is handed to
+/// `serialize_fn` — see
+/// [`PipelineFunctions::mi_assign_fn`] for the contract. Used by
+/// `fgumi group` and `fgumi dedup` to rewrite per-template `MoleculeId`s
+/// from local to global so that `serialize_fn` itself stays
+/// synchronization-free.
+///
+/// # Errors
+///
+/// Returns an I/O error if any pipeline step or file I/O fails.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+pub fn run_bam_pipeline_from_reader_with_mi_assign<
+    G,
+    P,
+    R,
+    GrouperFn,
+    ProcessFn,
+    SerializeFn,
+    MiAssignFn,
+>(
+    config: BamPipelineConfig,
+    input: R,
+    input_header: Header,
+    output_path: &Path,
+    output_header: Option<Header>,
+    grouper_fn: GrouperFn,
+    process_fn: ProcessFn,
+    serialize_fn: SerializeFn,
+    mi_assign_fn: MiAssignFn,
+) -> io::Result<u64>
+where
+    G: Send + BatchWeight + MemoryEstimate + 'static,
+    P: Send + MemoryEstimate + 'static,
+    R: Read + Send + 'static,
+    GrouperFn: FnOnce(&Header) -> Box<dyn Grouper<Group = G> + Send>,
+    ProcessFn: Fn(G) -> io::Result<P> + Send + Sync + 'static,
+    SerializeFn: Fn(P, &Header, &mut Vec<u8>) -> io::Result<u64> + Send + Sync + 'static,
+    MiAssignFn: Fn(BatchOrdinal, &mut P) -> io::Result<()> + Send + Sync + 'static,
+{
+    run_bam_pipeline_from_reader_inner(
+        config,
+        input,
+        input_header,
+        output_path,
+        output_header,
+        grouper_fn,
+        |output_header| {
+            PipelineFunctions::new(process_fn, move |p: P, buf: &mut Vec<u8>| {
+                serialize_fn(p, &output_header, buf)
+            })
+            .with_mi_assign(mi_assign_fn)
+        },
     )
 }
 
@@ -3973,6 +4327,47 @@ where
 mod tests {
     use super::*;
     use crate::read_info::LibraryIndex;
+    use rstest::rstest;
+
+    // ========================================================================
+    // BatchOrdinal
+    // ========================================================================
+
+    #[rstest]
+    // Final-item cases: idx_in_batch == batch_len - 1.
+    #[case(0, 0, 1, true)]
+    #[case(7, 4, 5, true)]
+    // Non-final-item cases: idx_in_batch < batch_len - 1.
+    #[case(0, 0, 4, false)]
+    #[case(9, 2, 4, false)]
+    fn batch_ordinal_is_last(
+        #[case] batch_serial: u64,
+        #[case] idx_in_batch: usize,
+        #[case] batch_len: usize,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(BatchOrdinal { batch_serial, idx_in_batch, batch_len }.is_last(), expected);
+    }
+
+    #[test]
+    fn pipeline_functions_default_has_no_optional_hooks() {
+        // Sanity guard: adding `mi_assign_fn` (or any future optional field)
+        // must not change defaults — every existing command relies on
+        // `secondary_serialize_fn` and `mi_assign_fn` being `None` unless
+        // explicitly installed.
+        let fns: PipelineFunctions<(), ()> = PipelineFunctions::new(|_g| Ok(()), |_p, _buf| Ok(0));
+        assert!(fns.secondary_serialize_fn.is_none());
+        assert!(fns.mi_assign_fn.is_none());
+    }
+
+    #[test]
+    fn pipeline_functions_with_mi_assign_installs_hook() {
+        let fns: PipelineFunctions<(), ()> =
+            PipelineFunctions::new(|_g| Ok(()), |_p, _buf| Ok(0)).with_mi_assign(|_ord, _p| Ok(()));
+        assert!(fns.mi_assign_fn.is_some());
+        // Other optional hooks remain unset.
+        assert!(fns.secondary_serialize_fn.is_none());
+    }
 
     /// Create a minimal `BamPipelineState` for testing memory backpressure.
     fn create_test_state(memory_limit: u64) -> BamPipelineState<(), ()> {

@@ -30,6 +30,7 @@ mod test_extract_command;
 mod test_fastq_command;
 mod test_filter_command;
 mod test_group_command;
+mod test_group_determinism;
 mod test_pipeline_concurrency;
 mod test_review_command;
 #[cfg(feature = "simplex")]

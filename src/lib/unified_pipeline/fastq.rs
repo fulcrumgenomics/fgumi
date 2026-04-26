@@ -1821,6 +1821,7 @@ impl<R: BufRead + Send + 'static, P: Send + MemoryEstimate + 'static> Monitorabl
             q7_len: 0,         // Not used in FASTQ (q6_compressed is the write input)
             q2_reorder_mem: 0, // No reorder buffer in new per-stream pipeline
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: self.deadlock_state.get_memory_limit(),
             read_done: self.read_done.load(Ordering::Relaxed),
             group_done: self.group_done.load(Ordering::Relaxed),

@@ -383,6 +383,12 @@ pub struct QueueSnapshot {
     pub q7_len: usize,
     pub q2_reorder_mem: u64,
     pub q3_reorder_mem: u64,
+    /// Number of serial-keyed batches currently parked in the MI Assign
+    /// reorder buffer (only non-zero for `fgumi group`/`dedup`, which are
+    /// the only commands that install an `mi_assign_fn` hook). Heap bytes
+    /// for these batches stay charged to `processed_heap_bytes` while
+    /// parked, so we report a count rather than duplicating bytes.
+    pub mi_assign_reorder_len: usize,
     pub memory_limit: u64,
     pub read_done: bool,
     pub group_done: bool,
@@ -447,7 +453,8 @@ pub fn check_deadlock_and_restore(
             || snapshot.q6_len > 0
             || snapshot.q7_len > 0
             || snapshot.q2_reorder_mem > 0
-            || snapshot.q3_reorder_mem > 0;
+            || snapshot.q3_reorder_mem > 0
+            || snapshot.mi_assign_reorder_len > 0;
         if !has_in_flight_work {
             log::debug!(
                 "Deadlock detector: no queue activity for {}s but all queues \
@@ -647,9 +654,10 @@ fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
 
     // Memory state
     log::warn!(
-        "  Memory: Q2 reorder={:.1}MB, Q3 reorder={:.1}MB, limit={:.1}MB",
+        "  Memory: Q2 reorder={:.1}MB, Q3 reorder={:.1}MB, MI Assign reorder={} batches, limit={:.1}MB",
         snapshot.q2_reorder_mem as f64 / 1_000_000.0,
         snapshot.q3_reorder_mem as f64 / 1_000_000.0,
+        snapshot.mi_assign_reorder_len,
         snapshot.memory_limit as f64 / 1_000_000.0,
     );
 
@@ -757,6 +765,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 100_000_000,
             q3_reorder_mem: 200_000_000,
+            mi_assign_reorder_len: 0,
             memory_limit: 512_000_000,
             read_done: false,
             group_done: false,
@@ -766,6 +775,41 @@ mod tests {
 
         let action = check_deadlock_and_restore(&state, &snapshot);
         assert_eq!(action, DeadlockAction::Detected);
+    }
+
+    #[test]
+    fn test_mi_assign_reorder_counts_as_in_flight() {
+        // Regression guard: batches parked in the MI Assign reorder buffer
+        // are real in-flight work, even when every other queue length and
+        // reorder-memory counter is zero. Without this branch the detector
+        // would mis-classify the wait as upstream starvation and return
+        // `None`, masking a real deadlock in `fgumi group`/`dedup`.
+        let config = DeadlockConfig::new(1, false);
+        let state = DeadlockState::new(&config, 512 * 1024 * 1024);
+
+        let now = now_secs();
+        state.last_progress_time.store(now.saturating_sub(5), Ordering::Relaxed);
+
+        let snapshot = QueueSnapshot {
+            q1_len: 0,
+            q2_len: 0,
+            q2b_len: 0,
+            q3_len: 0,
+            q4_len: 0,
+            q5_len: 0,
+            q6_len: 0,
+            q7_len: 0,
+            q2_reorder_mem: 0,
+            q3_reorder_mem: 0,
+            mi_assign_reorder_len: 3,
+            memory_limit: 512_000_000,
+            read_done: false,
+            group_done: false,
+            draining: false,
+            extra_state: None,
+        };
+
+        assert_eq!(check_deadlock_and_restore(&state, &snapshot), DeadlockAction::Detected);
     }
 
     #[test]
@@ -785,6 +829,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: 0,
             read_done: false,
             group_done: false,
@@ -815,6 +860,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: 0,
             read_done: false,
             group_done: false,
@@ -849,6 +895,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 400_000_000,
             q3_reorder_mem: 500_000_000,
+            mi_assign_reorder_len: 0,
             memory_limit: original_limit,
             read_done: false,
             group_done: false,
@@ -888,6 +935,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: original_limit * 8,
             read_done: false,
             group_done: false,
@@ -930,6 +978,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: original_limit,
             read_done: false,
             group_done: false,
@@ -967,6 +1016,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: original_limit,
             read_done: false,
             group_done: false,
@@ -1104,6 +1154,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: 256 * 1024 * 1024,
             read_done: false,
             group_done: false,
@@ -1177,6 +1228,7 @@ mod tests {
             q7_len: 0,
             q2_reorder_mem: 0,
             q3_reorder_mem: 0,
+            mi_assign_reorder_len: 0,
             memory_limit: 0,
             read_done: false,
             group_done: false,
