@@ -12,7 +12,9 @@ use fgumi_umi::Strategy;
 /// Pipeline entry point: which stage to start from.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum StartFrom {
-    /// Start from grouped BAM (MI tags present). Runs: consensus -> filter -> write.
+    /// Start from a template-coordinate-sorted BAM with UMIs in `RX`.
+    /// Runs: group (`PositionBatch` + `GroupAssign` + `MiAssign`) -> consensus -> filter -> write.
+    /// Any pre-existing `MI` tags on the input are overwritten by the group stage.
     Group,
     /// Start from coordinate-sorted BAM. Runs: sort -> group -> consensus -> filter -> write.
     Sort,

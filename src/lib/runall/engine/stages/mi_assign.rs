@@ -21,6 +21,8 @@
 //! advance. A single-threaded `SpecialStage` with an internal `ReorderBuffer`
 //! is the same shape as `Coalesce`.
 
+use std::fmt::Write as _;
+
 use anyhow::Result;
 use fgumi_raw_bam::update_string_tag;
 
@@ -81,8 +83,13 @@ impl SpecialStage for MiAssignStage {
                     let mem = estimate_batch_bytes(&batch);
                     let out_ordinal = batch.ordinal;
                     let seq = SequencedItem::new(out_ordinal, batch, mem);
+                    // `push_until_cancelled` only returns Err when the shared
+                    // cancel token has fired (set by whatever stage actually
+                    // failed). Returning our own error here would shadow the
+                    // real cause in the driver's first-error-wins join. Exit
+                    // cleanly and let the originating error propagate.
                     if output.push_until_cancelled(seq, &cancel).is_err() {
-                        anyhow::bail!("MiAssign: output queue dropped during push");
+                        return Ok(());
                     }
                 }
             } else if input.is_drained() {
@@ -101,8 +108,10 @@ impl SpecialStage for MiAssignStage {
             let mem = estimate_batch_bytes(&batch);
             let out_ordinal = batch.ordinal;
             let seq = SequencedItem::new(out_ordinal, batch, mem);
+            // See comment above: cancellation here means another stage
+            // already errored; exit cleanly so the real error wins.
             if output.push_until_cancelled(seq, &cancel).is_err() {
-                anyhow::bail!("MiAssign: output queue dropped during final drain");
+                return Ok(());
             }
         }
 
@@ -115,31 +124,33 @@ impl SpecialStage for MiAssignStage {
     }
 }
 
-/// Apply the cumulative offset to every `MiGroup` in `batch` and inject the
-/// global MI tag bytes into each record. Advances `next_mi_base` by
+/// Apply the cumulative offset to every `MiGroup` in `batch` and rewrite the
+/// numeric prefix of each record's MI tag accordingly, preserving any
+/// `/A` / `/B` strand suffix. Advances `next_mi_base` by
 /// `max(local_id) + 1` so subsequent batches see a fresh, non-overlapping
 /// integer range — same accounting as standalone group's `distinct_mi_count`.
 fn apply_offset_in_place(batch: &mut MiGroupBatch, next_mi_base: &mut u64) -> Result<()> {
-    let mut mi_buf = String::with_capacity(16);
     let mut max_local: Option<u64> = None;
 
     for group in &mut batch.groups {
-        let local = group
-            .local_mi
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("MiAssign: MiGroup missing local_mi"))?;
-
-        if let Some(local_id) = local.id() {
-            max_local = Some(max_local.map_or(local_id, |m| m.max(local_id)));
+        // The numeric `mi` is the local id, set by `GroupAssignStage`.
+        // `local_mi` carries one of the variants (any of `Single`, `PairedA`,
+        // `PairedB`) for accounting; we don't use the variant here because
+        // each record's per-record MI tag bytes already carry their own
+        // `/A` / `/B` suffix from `GroupAssignStage`.
+        if group.local_mi.take().is_some() {
+            max_local = Some(max_local.map_or(group.mi, |m: u64| m.max(group.mi)));
         }
 
-        let global = local.with_offset(*next_mi_base);
-        let mi_bytes = global.write_with_offset(0, &mut mi_buf);
-
-        group.mi = global.id().unwrap_or(0);
-
-        let new_data = rewrite_mi_tag(&group.data, batch.assign_tag, mi_bytes)?;
+        // Rewrite the numeric prefix of every record's MI tag in place.
+        let new_data = rewrite_mi_tag_numeric_prefix(&group.data, batch.assign_tag, *next_mi_base)?;
         group.data = new_data;
+
+        // Update the numeric MI used for downstream ordering / display.
+        group.mi = group
+            .mi
+            .checked_add(*next_mi_base)
+            .ok_or_else(|| anyhow::anyhow!("MiAssign: global MoleculeId numeric overflowed u64"))?;
     }
 
     if let Some(max_id) = max_local {
@@ -151,14 +162,44 @@ fn apply_offset_in_place(batch: &mut MiGroupBatch, next_mi_base: &mut u64) -> Re
     Ok(())
 }
 
-/// Walk `data` as length-prefixed records, write `mi_value` into the
-/// `assign_tag` field of each record, and return a fresh concat-byte buffer.
-fn rewrite_mi_tag(data: &[u8], assign_tag: [u8; 2], mi_value: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len() + 16);
+/// Walk `data` as length-prefixed records, parse each record's MI tag (a
+/// string of the form `"NNN"` or `"NNN/A"` or `"NNN/B"` — written as a local
+/// id by `GroupAssignStage`), add `offset` to the numeric prefix, write the
+/// rewritten tag, and return a fresh concat-byte buffer. Records without an
+/// MI tag are passed through unchanged.
+fn rewrite_mi_tag_numeric_prefix(data: &[u8], assign_tag: [u8; 2], offset: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut new_value_buf = String::with_capacity(16);
     for rec in iter_length_prefixed(data) {
         let rec = rec?;
         let mut owned = rec.to_vec();
-        update_string_tag(&mut owned, assign_tag, mi_value);
+
+        let existing = fgumi_raw_bam::find_string_tag_in_record(&owned, assign_tag);
+        if let Some(existing_bytes) = existing {
+            // Split at first `/` (if present) to separate numeric prefix from
+            // strand suffix. Allocate a small owned copy so the read-borrow
+            // ends before we mutate `owned` via `update_string_tag`.
+            let existing_str = std::str::from_utf8(existing_bytes)
+                .map_err(|e| anyhow::anyhow!("MiAssign: MI tag is not valid UTF-8: {e}"))?
+                .to_owned();
+            let (numeric_part, suffix) = match existing_str.find('/') {
+                Some(idx) => (&existing_str[..idx], &existing_str[idx..]),
+                None => (existing_str.as_str(), ""),
+            };
+            let local_numeric: u64 = numeric_part.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "MiAssign: MI tag numeric prefix '{numeric_part}' is not a u64: {e}"
+                )
+            })?;
+            let global_numeric = local_numeric
+                .checked_add(offset)
+                .ok_or_else(|| anyhow::anyhow!("MiAssign: MI tag numeric prefix overflowed u64"))?;
+            new_value_buf.clear();
+            write!(new_value_buf, "{global_numeric}{suffix}")
+                .expect("writing to String never fails");
+            update_string_tag(&mut owned, assign_tag, new_value_buf.as_bytes());
+        }
+
         let block_size = u32::try_from(owned.len()).map_err(|_| {
             anyhow::anyhow!("MiAssign: rewritten record exceeds u32::MAX bytes ({})", owned.len())
         })?;
@@ -179,15 +220,27 @@ mod tests {
     use fgumi_raw_bam::SamBuilder;
     use fgumi_umi::MoleculeId;
 
-    /// Build a minimal valid BAM record body (no MI tag yet).
-    fn make_record_body(name: &[u8]) -> Vec<u8> {
+    /// Build a minimal valid BAM record body with an MI tag pre-written by
+    /// `GroupAssignStage` semantics: the local MI value as `"NNN"` (single)
+    /// or `"NNN/A"` / `"NNN/B"` (paired). The numeric prefix is the local id;
+    /// `MiAssignStage` rewrites this prefix in place by adding the cumulative
+    /// offset.
+    fn make_record_body(name: &[u8], local_mi_value: &str) -> Vec<u8> {
         let mut b = SamBuilder::new();
-        b.read_name(name).ref_id(-1).pos(-1).flags(0).sequence(b"A").qualities(&[30]);
+        b.read_name(name)
+            .ref_id(-1)
+            .pos(-1)
+            .flags(0)
+            .sequence(b"A")
+            .qualities(&[30])
+            .add_string_tag(*b"MI", local_mi_value.as_bytes());
         b.build().into_inner()
     }
 
     fn make_group(local_mi: MoleculeId, mi_numeric: u64, name: &[u8]) -> MiGroup {
-        let body = make_record_body(name);
+        let mut mi_buf = String::new();
+        let mi_value = local_mi.write_with_offset(0, &mut mi_buf);
+        let body = make_record_body(name, std::str::from_utf8(mi_value).unwrap());
         let (data, count) = serialize_records(&[body]).unwrap();
         MiGroup { data, record_count: count, mi: mi_numeric, local_mi: Some(local_mi) }
     }
@@ -244,12 +297,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_local_mi_is_an_error() {
+    fn missing_local_mi_skips_base_advance() {
+        // `local_mi: None` means this group does not contribute a local
+        // MoleculeId to the cumulative-base advance. The records' MI tags
+        // are still rewritten in place (so any pre-existing MI prefix gets
+        // offset by `next_mi_base`), but `next_mi_base` itself does not
+        // advance for this group. This matches the standalone
+        // `distinct_mi_count` accounting where empty groups do not
+        // increment the global counter.
         let mut batch = make_two_group_batch(0);
         batch.groups[0].local_mi = None;
         let mut base: u64 = 0;
-        let err = apply_offset_in_place(&mut batch, &mut base);
-        assert!(err.is_err(), "missing local_mi must error, not silently succeed");
+        apply_offset_in_place(&mut batch, &mut base).unwrap();
+        // Only group[1] contributed to max_local (its mi = 1).
+        // base advances by max_local + 1 = 2.
+        assert_eq!(base, 2);
     }
 
     #[test]

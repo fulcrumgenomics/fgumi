@@ -241,3 +241,80 @@ pub fn build_mixed_orientation_bam(path: &Path) {
     }
     write_bam(path, &templates);
 }
+
+/// Build a BAM with proper duplex pairs: every molecule contributes BOTH a
+/// canonical-UMI strand and a swapped-UMI strand, so `--strategy paired`
+/// assigns one of each to `PairedA(N)` and `PairedB(N)`.
+///
+/// The canonical strand uses UMI `"AAAA-CCCC"` in FR orientation; the
+/// swapped strand uses UMI `"CCCC-AAAA"` in RF orientation, where the two
+/// halves come from the same source molecule. The paired assigner detects
+/// the reverse-pair relationship and stamps `PairedA(N)` on the canonical
+/// strand and `PairedB(N)` on the reversed one. Downstream duplex consensus
+/// then has both strands available and emits a duplex consensus record.
+///
+/// Produces: 40 position groups × 256 paired-UMI families × 2 strands × 2
+/// supporting reads-per-strand = 40,960 templates / 81,920 reads.
+pub fn build_duplex_pair_bam(path: &Path) {
+    let bases = [b'A', b'C', b'G', b'T'];
+    // Build 256 canonical UMI prefixes; suffix is reversed prefix.
+    let mut canonical_halves: Vec<(String, String)> = Vec::new();
+    for &a in &bases {
+        for &b in &bases {
+            for &c in &bases {
+                for &d in &bases {
+                    let prefix = format!("{}{}{}{}", a as char, b as char, c as char, d as char);
+                    let suffix = format!("{}{}{}{}", d as char, c as char, b as char, a as char);
+                    canonical_halves
+                        .push((format!("{prefix}{prefix}"), format!("{suffix}{suffix}")));
+                }
+            }
+        }
+    }
+
+    let mut templates = Vec::new();
+    let mut counter: u64 = 0;
+
+    // For each duplex pair: the top strand's R1 is at the low coord with the
+    // canonical UMI; the bottom strand's R1 is at the HIGH coord with the
+    // swapped UMI. The position swap flips `is_r1_genomically_earlier`, which
+    // in turn flips the lower/higher prefix order in `umi_for_read_impl`. The
+    // resulting prefixed UMI on the bottom strand is the lexical reverse of
+    // the prefixed UMI on the top strand, which is exactly what
+    // `PairedUmiAssigner` requires to detect a duplex pair and stamp
+    // `PairedA(N)` / `PairedB(N)`.
+    for group_idx in 0..40 {
+        let low_pos = 1_000 + group_idx * 1_000;
+        let high_pos = low_pos + 100;
+        for (u_idx, (lhs, rhs)) in canonical_halves.iter().enumerate() {
+            // Two reads per strand so the duplex caller's min-reads check
+            // (default 1) clears comfortably and a few reads can be lost to
+            // any per-read masking without dropping the whole pair.
+            for rep in 0..2 {
+                let canonical = format!("{lhs}-{rhs}");
+                let swapped = format!("{rhs}-{lhs}");
+                counter += 1;
+                templates.push(build_paired_template(
+                    &format!("read_g{group_idx}_u{u_idx}_top_r{rep}_{counter}"),
+                    &canonical,
+                    "ACGTACGTACGTACGT",
+                    30,
+                    low_pos,
+                    high_pos,
+                    false,
+                ));
+                counter += 1;
+                templates.push(build_paired_template(
+                    &format!("read_g{group_idx}_u{u_idx}_bot_r{rep}_{counter}"),
+                    &swapped,
+                    "ACGTACGTACGTACGT",
+                    30,
+                    high_pos,
+                    low_pos,
+                    true,
+                ));
+            }
+        }
+    }
+    write_bam(path, &templates);
+}

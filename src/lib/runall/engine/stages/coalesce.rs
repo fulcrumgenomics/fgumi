@@ -193,8 +193,12 @@ impl<T: CoalesceInput> SpecialStage for Coalesce<T> {
             let mem =
                 batch.primary.data.len() + batch.secondary.as_ref().map_or(0, |s| s.data.len());
             let item = SequencedItem::new(*out_ordinal, batch, mem);
+            // Cancellation here means another stage already errored; exit
+            // cleanly (via the early return inside the inner loop) so the
+            // real error wins in the driver's first-error-in-join-order
+            // selection. Bailing with our own message would shadow it.
             if output.push_until_cancelled(item, &cancel).is_err() {
-                anyhow::bail!("Coalesce: output queue dropped during push");
+                return Ok(false);
             }
             *out_ordinal += 1;
             *chunk_primary_records = 0;

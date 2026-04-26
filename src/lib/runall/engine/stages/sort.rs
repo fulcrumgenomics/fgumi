@@ -110,6 +110,12 @@ impl<'a> BatchingQueueSink<'a> {
         Self { output, cancel, data: Vec::with_capacity(256 * 1024), record_count: 0, ordinal: 0 }
     }
 
+    // `flush` keeps the `Result` return type to match the
+    // `SortedRecordSink::finish` contract (which calls `flush` directly) and
+    // to leave room for future flush-time errors; today the only failure
+    // path was a "cancelled during merge" bail that was shadowing the real
+    // upstream error, so it now exits cleanly.
+    #[allow(clippy::unnecessary_wraps)]
     fn flush(&mut self) -> anyhow::Result<()> {
         if self.record_count == 0 {
             return Ok(());
@@ -124,8 +130,12 @@ impl<'a> BatchingQueueSink<'a> {
         };
         let mem = batch.primary.data.len();
         let item = SequencedItem::new(self.ordinal, batch, mem);
+        // Cancellation here means another stage already errored; exit
+        // cleanly so the real error wins in the driver's first-error-in-
+        // join-order selection rather than shadowing it with our own
+        // generic "sort cancelled" message.
         if self.output.push_until_cancelled(item, self.cancel).is_err() {
-            anyhow::bail!("sort cancelled during merge");
+            return Ok(());
         }
         self.ordinal += 1;
         self.record_count = 0;

@@ -227,3 +227,95 @@ fn runall_explain_covers_all_valid_start_stop_combos() {
         assert_no_output_files(&output_path);
     }
 }
+
+/// Regression: `--stop-after consensus` must not include the Filter stage
+/// in the plan for `--start-from group` or `--start-from sort`.
+///
+/// Pre-fix: `plan_from_group` and `plan_from_sort` always pushed the
+/// `filter_spec` regardless of `--stop-after`, so plans that requested
+/// `--stop-after consensus` silently ran the filter logic and (because
+/// `FilterStage` zeros the per-batch record `count`) the user-facing
+/// "records written" counter reported `0` even when records reached the
+/// output BAM. The fix wires `--stop-after consensus` to drop the Filter
+/// stage from the plan, matching the behaviour of the
+/// `append_tail_from_unmapped_bam` arm used by `plan_from_extract` /
+/// `plan_from_fastq` / `plan_from_correct`.
+#[test]
+fn runall_explain_stop_after_consensus_omits_filter() {
+    for start_from in ["group", "sort"] {
+        let output_path = scratch_output(&format!("stop_after_consensus_{start_from}"));
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(output_path.with_extension("bam.tmp"));
+
+        let mut cmd = Command::new(fgumi_bin());
+        cmd.args(["runall", "--explain", "--start-from", start_from])
+            .args(["--stop-after", "consensus"])
+            .args(["--filter::min-reads", "1"])
+            .args(["--input", "ignored.bam"])
+            .arg("--output")
+            .arg(&output_path);
+        if start_from == "sort" {
+            cmd.args(["--reference", "ignored.fa"]);
+        }
+
+        let output = cmd.output().expect("spawn");
+        assert!(
+            output.status.success(),
+            "--explain failed for --start-from {start_from} --stop-after consensus: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        assert!(
+            stdout.contains("Consensus"),
+            "missing Consensus stage for --start-from {start_from}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Filter"),
+            "--stop-after consensus must omit the Filter stage from the plan \
+             (--start-from {start_from}); got:\n{stdout}"
+        );
+
+        assert_no_output_files(&output_path);
+    }
+}
+
+/// Regression: `--start-from group --stop-after group` must produce a plan
+/// that writes the grouped BAM via `BgzfCompress` and stops, without
+/// reaching `Consensus` or `Filter`. Mirrors the analogous early-exit arm
+/// in `plan_from_sort`.
+#[test]
+fn runall_explain_start_from_group_stop_after_group_omits_consensus() {
+    let output_path = scratch_output("start_group_stop_group");
+    let _ = std::fs::remove_file(&output_path);
+    let _ = std::fs::remove_file(output_path.with_extension("bam.tmp"));
+
+    let output = Command::new(fgumi_bin())
+        .args(["runall", "--explain", "--start-from", "group", "--stop-after", "group"])
+        .args(["--input", "ignored.bam"])
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .expect("spawn");
+    assert!(
+        output.status.success(),
+        "--explain failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("Pipeline plan"), "missing header: {stdout}");
+    assert!(stdout.contains("PositionBatch"), "missing PositionBatch stage: {stdout}");
+    assert!(stdout.contains("GroupAssign"), "missing GroupAssign stage: {stdout}");
+    assert!(stdout.contains("BgzfCompress"), "missing BgzfCompress stage: {stdout}");
+    assert!(
+        !stdout.contains("Consensus"),
+        "--stop-after group must omit Consensus from the plan; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Filter"),
+        "--stop-after group must omit Filter from the plan; got:\n{stdout}"
+    );
+
+    assert_no_output_files(&output_path);
+}

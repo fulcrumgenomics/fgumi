@@ -677,13 +677,16 @@ impl Runall {
             return Ok(make_plan(source, stages, header));
         }
 
-        // Default: run all the way through consensus + filter.
+        // Default: run through consensus, with filter only when explicitly
+        // requested (`--stop-after filter`). `--stop-after consensus` drops
+        // the filter stage so a stop-after-consensus plan does not silently
+        // run filter logic — matches the StopAfter::Consensus | StopAfter::Filter
+        // arm in `append_tail_from_unmapped_bam`.
         let output_header =
             self.consensus_output_header(&header, "Pipeline consensus (from sort)", command_line)?;
         let consensus_factory = self.build_consensus_factory(&header)?;
 
-        let (filter_spec, filter_stats_state) = self.filter_stage_spec_with_stats(explain)?;
-        let stages = vec![
+        let mut stages: Vec<StageSpec> = vec![
             self.sort_spec(header.clone()),
             StageSpec::PositionBatch { header: header.clone() },
             self.group_assign_spec(),
@@ -692,8 +695,14 @@ impl Runall {
                 factory: consensus_factory,
                 call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
             },
-            filter_spec,
         ];
+        let filter_stats_state = if self.stop_after == StopAfter::Filter {
+            let (filter_spec, state) = self.filter_stage_spec_with_stats(explain)?;
+            stages.push(filter_spec);
+            state
+        } else {
+            None
+        };
         let sink = SinkSpec::BamSink {
             path: tmp_output.to_path_buf(),
             header: output_header,
@@ -716,7 +725,9 @@ impl Runall {
     }
 
     // -----------------------------------------------------------------------
-    // start-from: group — same as sort but skips Sort stage
+    // start-from: group — same as sort but skips Sort stage. Honors
+    //   `--stop-after group` (early-exit, write the grouped BAM) and
+    //   `--stop-after consensus` (run consensus but skip the filter stage).
     // -----------------------------------------------------------------------
 
     fn plan_from_group(
@@ -734,14 +745,52 @@ impl Runall {
             let (_reader, h) = crate::bam_io::create_raw_bam_reader(input, 1)?;
             h
         };
+        let threads = self.threads.max(1);
+        let source = SourceSpec::BamBatchedSource { path: input.clone(), threads };
+
+        // Early-exit: --stop-after group — group-assign, write grouped BAM.
+        // Mirrors the StopAfter::Group arm in `plan_from_sort` (and in
+        // `append_tail_from_unmapped_bam`), minus the leading Sort stage:
+        // the input is already template-coordinate sorted by definition of
+        // `--start-from group`.
+        if self.stop_after == StopAfter::Group {
+            let stages = vec![
+                StageSpec::PositionBatch { header: header.clone() },
+                self.group_assign_spec(),
+                StageSpec::MiAssign,
+                StageSpec::CoalesceMiGroup { target_chunk_size: default_coalesce_chunk_size() },
+                StageSpec::BgzfCompress { level: self.compression_level },
+            ];
+            let sink = SinkSpec::BamFileWrite {
+                path: tmp_output.to_path_buf(),
+                header: header.clone(),
+                secondary_path: None,
+                secondary_header: None,
+                queue_capacity: 64,
+            };
+            return Ok(PlanWithFinalize {
+                plan: Plan {
+                    source,
+                    stages,
+                    sink,
+                    config: self.default_config(),
+                    metrics_tsv: self.metrics.clone(),
+                },
+                correction_state: None,
+                filter_stats_state: None,
+            });
+        }
+
+        // Default: run through consensus, with filter only when explicitly
+        // requested (`--stop-after filter`). `--stop-after consensus` drops
+        // the filter stage so a stop-after-consensus plan does not silently
+        // run filter logic — matches the StopAfter::Consensus | StopAfter::Filter
+        // arm in `append_tail_from_unmapped_bam`.
         let output_header =
             self.consensus_output_header(&header, "Pipeline consensus (from group)", command_line)?;
         let consensus_factory = self.build_consensus_factory(&header)?;
-        let threads = self.threads.max(1);
 
-        let source = SourceSpec::BamBatchedSource { path: input.clone(), threads };
-        let (filter_spec, filter_stats_state) = self.filter_stage_spec_with_stats(explain)?;
-        let stages = vec![
+        let mut stages: Vec<StageSpec> = vec![
             StageSpec::PositionBatch { header: header.clone() },
             self.group_assign_spec(),
             StageSpec::MiAssign,
@@ -749,8 +798,15 @@ impl Runall {
                 factory: consensus_factory,
                 call_overlapping_bases: self.consensus_opts.consensus_call_overlapping_bases,
             },
-            filter_spec,
         ];
+        let filter_stats_state = if self.stop_after == StopAfter::Filter {
+            let (filter_spec, state) = self.filter_stage_spec_with_stats(explain)?;
+            stages.push(filter_spec);
+            state
+        } else {
+            None
+        };
+
         let sink = SinkSpec::BamSink {
             path: tmp_output.to_path_buf(),
             header: output_header,

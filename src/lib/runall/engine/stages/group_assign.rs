@@ -59,6 +59,7 @@ use anyhow::Result;
 use fgumi_metrics::downsampling::compute_hash_fraction;
 use fgumi_metrics::inline_collector::InlineCollector;
 use fgumi_metrics::template_info::{ReadInfoKey, TemplateInfo};
+use fgumi_raw_bam::update_string_tag;
 use fgumi_umi::{MoleculeId, Strategy};
 use noodles::sam::Header;
 
@@ -339,13 +340,20 @@ impl GroupAssignStage {
             a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name))
         });
 
-        // 7. Regroup records by molecule ID without injecting the MI tag. Use
-        //    `BTreeMap` so downstream consumers see MI groups in stable
-        //    ascending MI order — required by `Coalesce<MiGroupBatch>` and the
-        //    byte-compare gate. A downstream serial-ordered MI assign stage
-        //    will apply the cumulative offset and write the final MI tag bytes.
-        //    The map value is `(MoleculeId, records)` so we can carry the local
-        //    MoleculeId variant through to `MiGroup.local_mi`.
+        // 7. Inject the LOCAL MI tag per-template, then regroup records by
+        //    numeric MoleculeId. The MI tag has to be written per-template
+        //    (not per group) because PairedA and PairedB variants share a
+        //    numeric id but require distinct `/A` / `/B` suffixes — and both
+        //    end up in the same numeric-keyed MiGroup so duplex consensus can
+        //    later pair them. The downstream serial-ordered `MiAssignStage`
+        //    rewrites only the numeric prefix of each tag (e.g. `7/A` ->
+        //    `137/A` if the cumulative offset is 130), preserving each
+        //    record's `/A` / `/B` suffix.
+        //
+        //    Use `BTreeMap` so downstream consumers see MI groups in stable
+        //    ascending MI order — required by `Coalesce<MiGroupBatch>` and
+        //    the byte-compare gate.
+        let mut mi_buf = String::with_capacity(16);
         let mut mi_map: BTreeMap<u64, (MoleculeId, Vec<Vec<u8>>)> = BTreeMap::new();
 
         for template in templates {
@@ -353,8 +361,12 @@ impl GroupAssignStage {
             if !mi.is_assigned() {
                 continue;
             }
+            let mi_value = mi.write_with_offset(0, &mut mi_buf);
             let global_id = mi.id().unwrap_or(0);
-            let raw_records = template.into_records();
+            let mut raw_records = template.into_records();
+            for record in &mut raw_records {
+                update_string_tag(record.as_mut_vec(), self.assign_tag, mi_value);
+            }
             let entry = mi_map.entry(global_id).or_insert_with(|| (mi, Vec::new()));
             entry.1.extend(raw_records.into_iter().map(fgumi_raw_bam::RawRecord::into_inner));
         }
@@ -362,13 +374,13 @@ impl GroupAssignStage {
         // 8. Serialize each MI group into concat-byte `MiGroup`.
         let mi_groups: Vec<MiGroup> = mi_map
             .into_iter()
-            .map(|(mi, (molecule_id, records))| {
+            .map(|(numeric_id, (molecule_id, records))| {
                 let (data, record_count) =
                     crate::runall::engine::grouping_types::serialize_records(&records)?;
                 Ok::<_, anyhow::Error>(MiGroup {
                     data,
                     record_count,
-                    mi,
+                    mi: numeric_id,
                     local_mi: Some(molecule_id),
                 })
             })

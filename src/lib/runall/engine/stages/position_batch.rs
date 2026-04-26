@@ -112,8 +112,15 @@ impl SpecialStage for PositionBatchStage {
             };
             let mem = batch.data.len();
             let item = SequencedItem::new(*out_ordinal, batch, mem);
+            // `push_until_cancelled` only returns Err when the shared cancel
+            // token has fired. The token is set by whatever stage actually
+            // failed (a panicking pool worker, an upstream/downstream error,
+            // or the watchdog); surfacing our own "cancelled during push"
+            // error here would shadow that real cause when the driver picks
+            // the first error in join order. Treat cancellation as a clean
+            // early exit and let the originating error propagate.
             if output.push_until_cancelled(item, &cancel).is_err() {
-                anyhow::bail!("PositionBatchStage: cancelled during push");
+                return Ok(());
             }
             *out_ordinal += 1;
             *current_count = 0;
