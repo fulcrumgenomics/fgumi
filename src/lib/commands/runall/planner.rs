@@ -654,8 +654,12 @@ impl Runall {
         };
 
         // Early-exit: --stop-after sort — write the sorted BAM and stop.
+        // SortStage emits SerializedBatch but BamFileWrite consumes
+        // CompressedBatch, so we must coalesce + BGZF-compress before the sink
+        // (mirrors the from-extract `--stop-after sort` path at line 411).
         if self.stop_after == StopAfter::Sort {
-            let stages = vec![self.sort_spec(header.clone())];
+            let mut stages = vec![self.sort_spec(header.clone())];
+            append_coalesce_bgzf(&mut stages, self.compression_level);
             return Ok(make_plan(source, stages, header));
         }
 
