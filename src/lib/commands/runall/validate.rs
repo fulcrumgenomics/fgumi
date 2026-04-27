@@ -7,7 +7,8 @@ use crate::validation::validate_file_exists;
 use anyhow::{Context, Result, anyhow};
 
 use super::Runall;
-use super::options::{StartFrom, StopAfter};
+use super::options::{ConsensusMode, StartFrom, StopAfter};
+use fgumi_umi::Strategy;
 
 impl Runall {
     /// Get the single input file path, or error if multiple inputs were provided.
@@ -244,6 +245,41 @@ impl Runall {
                     "--filter::min-reads must have 1-3 values (total, [AB, [BA]]), got {}",
                     min_reads.len()
                 );
+            }
+
+            // The group stage runs whenever the plan reaches consensus, and the
+            // strategy GroupAssign uses must produce MI tags compatible with the
+            // consensus caller — runall overwrites pre-existing MI tags under
+            // --start-from group, so the input's tags are always replaced.
+            //
+            //   - duplex: requires `paired` (produces /A and /B-suffixed MIs)
+            //   - simplex / codec: must NOT use `paired` (the /A /B suffix
+            //     splits each molecule into two MI groups, which neither
+            //     simplex nor codec consensus understand; codec.rs explicitly
+            //     calls out `must use adjacency or identity (NOT paired)`)
+            //
+            // Without this check, mismatched plans only fail deep inside the
+            // consensus stage's tag-validation step ("MI tag '1' without /A or
+            // /B suffix" / "unexpected /A suffix on MI tag"), after the entire
+            // group + MI-assign work has already run.
+            match (self.consensus_mode, self.group_opts.group_strategy) {
+                (ConsensusMode::Duplex, Strategy::Paired) => {}
+                (ConsensusMode::Duplex, other) => anyhow::bail!(
+                    "--consensus duplex requires --group::strategy paired \
+                     (so re-grouping produces /A and /B-suffixed MI tags that \
+                     duplex consensus calling expects). Got --group::strategy {:?}.",
+                    other
+                ),
+                (ConsensusMode::Simplex | ConsensusMode::Codec, Strategy::Paired) => {
+                    anyhow::bail!(
+                        "--consensus {:?} is incompatible with --group::strategy paired \
+                         (paired strategy emits /A and /B-suffixed MI tags that only \
+                         duplex consensus understands). Use --group::strategy adjacency \
+                         or identity.",
+                        self.consensus_mode
+                    )
+                }
+                _ => {}
             }
         }
 
