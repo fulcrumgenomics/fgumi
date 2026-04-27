@@ -47,6 +47,7 @@ pub mod raw;
 pub mod raw_bam_reader;
 pub mod read_ahead;
 pub(crate) mod segmented_buf;
+pub mod sink;
 pub mod tmp_dir_alloc;
 pub mod worker_pool;
 
@@ -145,7 +146,10 @@ pub use keys::{
     SortContext, SortOrder, natural_compare, normalize_natural_key,
 };
 pub use pipeline::{ParallelMergeConfig, parallel_merge, parallel_merge_buffered};
-pub use raw::{LibraryLookup, RawExternalSorter, cb_hasher, extract_template_key_inline};
+pub use raw::{
+    LibraryLookup, RawExternalSorter, SortedChunks, cb_hasher, extract_template_key_inline,
+    merge_sorted_chunks_to_sink,
+};
 
 #[cfg(test)]
 mod tests {

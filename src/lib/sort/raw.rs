@@ -18,7 +18,6 @@
 //! 4. Write raw record bytes to output
 
 use crate::bam_io::create_raw_bam_reader;
-use crate::progress::ProgressTracker;
 use crate::sam::SamTag;
 use crate::sort::inline_buffer::{
     ProbeableBuffer, RecordBuffer, TemplateKey, TemplateRecordBuffer,
@@ -29,11 +28,10 @@ use crate::sort::memory_probe::{
 };
 use crate::sort::pooled_chunk_writer::PooledChunkWriter;
 use crate::sort::read_ahead::{RawReadAheadReader, RecordSource};
-use crate::sort::tmp_dir_alloc::TmpDirAllocator;
 use crate::sort::worker_pool::SortWorkerPool;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use log::{debug, info};
+use fgumi_raw_bam::RawRecordView;
 use noodles::sam::Header;
 use noodles::sam::header::record::value::map::read_group::tag as rg_tag;
 use noodles_bgzf::io::{
@@ -48,6 +46,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tracing::{debug, info};
 
 // ============================================================================
 // Per-Phase Timing for Sort Pipeline
@@ -319,6 +318,15 @@ const MERGE_PREFETCH_SIZE: usize = 1024;
 /// Maximum number of temp files before consolidation (like samtools).
 /// When this limit is reached, oldest files are merged to reduce file count.
 const DEFAULT_MAX_TEMP_FILES: usize = 64;
+
+/// Estimated bytes per record for template-coordinate sorted BAM records.
+/// Used for initial capacity estimation: 48 bytes inline header + ~250 bytes BAM data
+/// + 56 bytes TemplateKey/offset/len ≈ 354 bytes total.
+const TEMPLATE_RECORD_BYTES_ESTIMATE: usize = 354;
+
+/// Fraction of memory budget (as a percentage) allocated to record data storage.
+/// The remainder (~14%) covers sort key refs (`TemplateKey` + offset + length).
+const TEMPLATE_DATA_FRACTION_PERCENT: usize = 86;
 
 /// Counting semaphore for limiting concurrent chunk reader I/O.
 /// Pre-filled with N tokens; readers acquire before decompressing, release after.
@@ -1085,34 +1093,29 @@ impl<K: RawSortKey + 'static> Read for SourceReadAdapter<'_, K> {
 /// Maintains monotonic counters for both chunk files (`chunk_0000.keyed`, ...)
 /// and merged files (`merged_0000.keyed`, ...) to prevent naming collisions
 /// after consolidation drains entries from the chunk file list.
-///
-/// When multiple temp directories are supplied via [`TmpDirAllocator`], chunk
-/// and merged files are distributed across them in round-robin order.
 struct ChunkNamer<'a> {
-    alloc: &'a mut TmpDirAllocator,
+    temp_path: &'a Path,
     chunk_count: usize,
     merge_count: usize,
 }
 
 impl<'a> ChunkNamer<'a> {
-    fn new(alloc: &'a mut TmpDirAllocator) -> Self {
-        Self { alloc, chunk_count: 0, merge_count: 0 }
+    fn new(temp_path: &'a Path) -> Self {
+        Self { temp_path, chunk_count: 0, merge_count: 0 }
     }
 
-    /// Returns the next unique chunk file path, drawing from the allocator.
-    fn next_chunk_path(&mut self) -> Result<PathBuf> {
-        let base = self.alloc.next()?;
-        let path = base.join(format!("chunk_{:04}.keyed", self.chunk_count));
+    /// Returns the next unique chunk file path.
+    fn next_chunk_path(&mut self) -> PathBuf {
+        let path = self.temp_path.join(format!("chunk_{:04}.keyed", self.chunk_count));
         self.chunk_count += 1;
-        Ok(path)
+        path
     }
 
-    /// Returns the next unique merged file path, drawing from the allocator.
-    fn next_merged_path(&mut self) -> Result<PathBuf> {
-        let base = self.alloc.next()?;
-        let path = base.join(format!("merged_{:04}.keyed", self.merge_count));
+    /// Returns the next unique merged file path.
+    fn next_merged_path(&mut self) -> PathBuf {
+        let path = self.temp_path.join(format!("merged_{:04}.keyed", self.merge_count));
         self.merge_count += 1;
-        Ok(path)
+        path
     }
 }
 
@@ -1143,17 +1146,13 @@ fn probe_stats(buf: &impl ProbeableBuffer) -> BufferProbeStats {
 /// re-encoding overhead. It's significantly faster than the RecordBuf-based
 /// sorter for large files.
 pub struct RawExternalSorter {
+    async_reader: bool,
     /// Sort order to use.
     sort_order: SortOrder,
     /// Maximum memory to use for in-memory sorting.
     memory_limit: usize,
-    /// Temporary directories for spill files.
-    ///
-    /// When empty, a single directory is created under the system default
-    /// temp location. When one or more paths are given, spill files are
-    /// distributed across them in free-space-aware round-robin order via
-    /// [`TmpDirAllocator`].
-    temp_dirs: Vec<PathBuf>,
+    /// Temporary directory for spill files.
+    temp_dir: Option<PathBuf>,
     /// Number of threads for parallel operations.
     threads: usize,
     /// Compression level for output.
@@ -1175,8 +1174,6 @@ pub struct RawExternalSorter {
     /// a modest allocation and let `Vec` grow on demand, while explicit limits
     /// pre-allocate the full budget upfront (preserving prior behavior).
     initial_capacity: Option<usize>,
-    /// When true, wrap input in a `PrefetchReader` for async I/O.
-    async_reader: bool,
 }
 
 /// RAII guard that ensures Phase 2 teardown runs on every exit path between
@@ -1217,9 +1214,10 @@ impl RawExternalSorter {
     #[must_use]
     pub fn new(sort_order: SortOrder) -> Self {
         Self {
+            async_reader: false,
             sort_order,
             memory_limit: 512 * 1024 * 1024, // 512 MB default
-            temp_dirs: Vec::new(),
+            temp_dir: None,
             threads: 1,
             output_compression: 6,
             temp_compression: 1, // Default: fast compression
@@ -1228,7 +1226,6 @@ impl RawExternalSorter {
             max_temp_files: DEFAULT_MAX_TEMP_FILES,
             cell_tag: None,
             initial_capacity: None,
-            async_reader: false,
         }
     }
 
@@ -1239,23 +1236,20 @@ impl RawExternalSorter {
         self
     }
 
-    /// Set a single temporary directory for spill files.
-    ///
-    /// Equivalent to calling [`Self::temp_dirs`] with a single-element vector.
+    /// Set the temporary directory for spill files.
     #[must_use]
     pub fn temp_dir(mut self, path: PathBuf) -> Self {
-        self.temp_dirs = vec![path];
+        self.temp_dir = Some(path);
         self
     }
 
-    /// Set multiple temporary directories for spill files.
-    ///
-    /// Spill files are distributed across the supplied directories in
-    /// free-space-aware round-robin order. Passing an empty vector falls
-    /// back to a single directory under the system temp location.
+    /// Set multiple temporary directories for spill files (distributes across them).
     #[must_use]
     pub fn temp_dirs(mut self, paths: Vec<PathBuf>) -> Self {
-        self.temp_dirs = paths;
+        // If any paths provided, use the first as temp_dir (keep it simple).
+        if let Some(first) = paths.into_iter().next() {
+            self.temp_dir = Some(first);
+        }
         self
     }
 
@@ -1295,6 +1289,13 @@ impl RawExternalSorter {
         self
     }
 
+    /// Enable async reader (`POSIX_FADV_SEQUENTIAL` + prefetch thread) for BAM input.
+    #[must_use]
+    pub fn async_reader(mut self, enabled: bool) -> Self {
+        self.async_reader = enabled;
+        self
+    }
+
     /// Set program record info for @PG header entry.
     #[must_use]
     pub fn pg_info(mut self, version: String, command_line: String) -> Self {
@@ -1331,16 +1332,6 @@ impl RawExternalSorter {
     #[must_use]
     pub fn initial_capacity(mut self, bytes: usize) -> Self {
         self.initial_capacity = Some(bytes);
-        self
-    }
-
-    /// Enable/disable the async prefetch reader on input.
-    ///
-    /// When enabled, the input BAM is wrapped in a `PrefetchReader` before the
-    /// BGZF layer, which overlaps block I/O with decompression.
-    #[must_use]
-    pub fn async_reader(mut self, enabled: bool) -> Self {
-        self.async_reader = enabled;
         self
     }
 
@@ -1430,7 +1421,7 @@ impl RawExternalSorter {
         );
 
         // Create merged output file
-        let merged_path = namer.next_merged_path()?;
+        let merged_path = namer.next_merged_path();
 
         // Open readers with semaphore to cap concurrent I/O.
         let sem = make_reader_semaphore(self.threads);
@@ -1519,11 +1510,8 @@ impl RawExternalSorter {
         // main thread reads records directly from PooledInputStream.
         info!("Phase 1: Pool-integrated input reading ({} workers, N+2 model)", pool.num_workers());
         let (record_source, header) = {
-            let (reader, header) = crate::bam_io::create_raw_bam_reader_pool_integrated(
-                input,
-                &pool,
-                self.async_reader,
-            )?;
+            let (reader, header) =
+                crate::bam_io::create_raw_bam_reader_pool_integrated(input, &pool, false)?;
             (RecordSource::direct(reader), header)
         };
 
@@ -1534,19 +1522,20 @@ impl RawExternalSorter {
             header
         };
 
-        // _temp_dirs: RAII handles; kept alive until sort returns.
-        let (_temp_dirs, mut alloc) = self.create_temp_dirs()?;
+        // Create temp directory
+        let temp_dir = self.create_temp_dir()?;
+        let temp_path = temp_dir.path();
 
         // Sort based on order
         match self.sort_order {
             SortOrder::Coordinate => {
-                self.sort_coordinate(record_source, pool, &header, output, &mut alloc)
+                self.sort_coordinate(record_source, pool, &header, output, temp_path)
             }
             SortOrder::Queryname(comparator) => {
-                self.sort_queryname(record_source, pool, &header, output, &mut alloc, comparator)
+                self.sort_queryname(record_source, pool, &header, output, temp_path, comparator)
             }
             SortOrder::TemplateCoordinate => {
-                self.sort_template_coordinate(record_source, pool, &header, output, &mut alloc)
+                self.sort_template_coordinate(record_source, pool, &header, output, temp_path)
             }
         }
     }
@@ -1664,14 +1653,13 @@ impl RawExternalSorter {
         )?;
 
         let mut records_merged = 0u64;
-        let merge_progress = ProgressTracker::new("Merged records").with_interval(1_000_000);
 
         while tree.winner_is_active() {
             let winner = tree.winner();
 
             writer.write_raw_record(&records[winner])?;
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            crate::progress::records_out("sort_merge", 1);
 
             let reader_idx = source_map[winner];
             if let Some(raw_record) = readers[reader_idx].next() {
@@ -1686,7 +1674,6 @@ impl RawExternalSorter {
         }
 
         writer.finish()?;
-        merge_progress.log_final();
 
         Ok(records_merged)
     }
@@ -1698,12 +1685,12 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        alloc: &mut TmpDirAllocator,
+        temp_path: &Path,
     ) -> Result<RawSortStats> {
         if self.write_index {
-            self.sort_coordinate_with_index(record_source, pool, header, output, alloc)
+            self.sort_coordinate_with_index(record_source, pool, header, output, temp_path)
         } else {
-            self.sort_coordinate_optimized(record_source, pool, header, output, alloc)
+            self.sort_coordinate_optimized(record_source, pool, header, output, temp_path)
         }
     }
 
@@ -1718,7 +1705,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        alloc: &mut TmpDirAllocator,
+        temp_path: &Path,
     ) -> Result<RawSortStats> {
         use crate::sort::keys::RawCoordinateKey;
 
@@ -1738,17 +1725,16 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
-        let mut namer = ChunkNamer::new(alloc);
+        let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
-        let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer, keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            crate::progress::records_out("sort_read", 1);
 
             // Push directly to buffer - key extracted inline from raw bytes
             buffer.push_coordinate(record.as_ref())?;
@@ -1775,7 +1761,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
+                let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -1805,7 +1791,6 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
-        progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
         }
@@ -1906,7 +1891,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        alloc: &mut TmpDirAllocator,
+        temp_path: &Path,
     ) -> Result<RawSortStats> {
         use crate::bam_io::{create_indexing_bam_writer, write_bai_index};
         use crate::sort::keys::RawCoordinateKey;
@@ -1924,7 +1909,7 @@ impl RawExternalSorter {
 
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer = RecordBuffer::with_capacity(estimated_records, estimated_data_bytes, nref);
-        let mut namer = ChunkNamer::new(alloc);
+        let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
@@ -1956,7 +1941,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
+                let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -2095,7 +2080,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        alloc: &mut TmpDirAllocator,
+        temp_path: &Path,
         comparator: QuerynameComparator,
     ) -> Result<RawSortStats> {
         use crate::sort::keys::{RawQuerynameKey, RawQuerynameLexKey};
@@ -2106,14 +2091,14 @@ impl RawExternalSorter {
                 pool,
                 header,
                 output,
-                alloc,
+                temp_path,
             ),
             QuerynameComparator::Natural => self.sort_queryname_keyed::<RawQuerynameKey>(
                 record_source,
                 pool,
                 header,
                 output,
-                alloc,
+                temp_path,
             ),
         }
     }
@@ -2126,7 +2111,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        alloc: &mut TmpDirAllocator,
+        temp_path: &Path,
     ) -> Result<RawSortStats> {
         use crate::sort::keys::SortContext;
 
@@ -2142,17 +2127,16 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut entries: Vec<(K, fgumi_raw_bam::RawRecord)> = Vec::with_capacity(estimated_records);
         let mut memory_used = 0usize;
-        let mut namer = ChunkNamer::new(alloc);
+        let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
-        let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (keyed output)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            crate::progress::records_out("sort_read", 1);
 
             // Extract key from raw bytes
             let key = K::extract(record.as_ref(), &ctx);
@@ -2186,7 +2170,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(bstats, Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
+                let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
                     use rayon::prelude::*;
@@ -2212,7 +2196,6 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
-        progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
         }
@@ -2332,7 +2315,7 @@ impl RawExternalSorter {
         pool: Arc<SortWorkerPool>,
         header: &Header,
         output: &Path,
-        alloc: &mut TmpDirAllocator,
+        temp_path: &Path,
     ) -> Result<RawSortStats> {
         let mut stats = RawSortStats::default();
         let mut timer = SortPhaseTimer::new();
@@ -2355,17 +2338,16 @@ impl RawExternalSorter {
         let mut chunk_files: Vec<PathBuf> = Vec::new();
         let mut buffer =
             TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
-        let mut namer = ChunkNamer::new(alloc);
+        let mut namer = ChunkNamer::new(temp_path);
         let mut pending_spill: Option<PendingSpill> = None;
         let rayon_pool = self.build_sort_rayon_pool()?;
 
-        let progress = ProgressTracker::new("Read records").with_interval(1_000_000);
         info!("Phase 1: Reading and sorting chunks (inline buffer)...");
         let mut probe = SpillProbe::new("phase1");
 
         for record in record_source.by_ref() {
             stats.total_records += 1;
-            progress.log_if_needed(1);
+            crate::progress::records_out("sort_read", 1);
 
             // Extract template key and push to buffer
             let bam_bytes = record.as_ref();
@@ -2395,7 +2377,7 @@ impl RawExternalSorter {
                 )?;
                 probe.post_drain(probe_stats(&buffer), Some(pool.phase1_queue_depths()));
 
-                let chunk_path = namer.next_chunk_path()?;
+                let chunk_path = namer.next_chunk_path();
 
                 timer.time_sort(|| {
                     rayon_pool.install(|| buffer.par_sort());
@@ -2421,7 +2403,6 @@ impl RawExternalSorter {
         }
 
         timer.end_read_span();
-        progress.log_final();
         if let Some(err) = record_source.take_error() {
             return Err(anyhow::Error::from(err));
         }
@@ -2663,14 +2644,11 @@ impl RawExternalSorter {
         let mut writer = PooledBamWriter::new(Arc::clone(pool), output, &output_header)?;
 
         let mut records_merged = 0u64;
-        let merge_progress = ProgressTracker::new("Merged records")
-            .with_interval(1_000_000)
-            .with_total(total_records);
-
+        let _ = total_records; // reserved for future absolute-progress rendering
         let mut merge_probe = MergeProbe::new();
 
         // Sub-phase timing: only paid when debug logging is enabled.
-        let debug_timing = log::log_enabled!(log::Level::Debug);
+        let debug_timing = tracing::enabled!(tracing::Level::DEBUG);
         let merge_sample_interval: u64 = 1024;
         let mut merge_write_secs = 0.0f64;
         let mut merge_read_secs = 0.0f64;
@@ -2691,7 +2669,7 @@ impl RawExternalSorter {
             }
 
             records_merged += 1;
-            merge_progress.log_if_needed(1);
+            crate::progress::records_out("sort_merge", 1);
 
             if merge_probe.should_sample(records_merged) {
                 let depths = pool.phase1_queue_depths();
@@ -2745,7 +2723,6 @@ impl RawExternalSorter {
         }
 
         writer.finish()?;
-        merge_progress.log_final();
         log_snapshot("phase2.end", 0);
 
         Ok(records_merged)
@@ -2848,14 +2825,12 @@ impl RawExternalSorter {
             self.output_compression,
             writer_threads,
         )?;
-        let merge_progress = ProgressTracker::new("Merged records")
-            .with_interval(1_000_000)
-            .with_total(total_records);
+        let _ = total_records; // reserved for future absolute-progress rendering
 
         while tree.winner_is_active() {
             let winner = tree.winner();
             writer.write_raw_record(&records[winner])?;
-            merge_progress.log_if_needed(1);
+            crate::progress::records_out("sort_merge", 1);
 
             let src_idx = source_map[winner];
             if let Some(key) = sources[src_idx].next_record(&mut records[winner], None)? {
@@ -2866,7 +2841,6 @@ impl RawExternalSorter {
         }
 
         let index = writer.finish()?;
-        merge_progress.log_final();
         Ok(index)
     }
 
@@ -2875,35 +2849,270 @@ impl RawExternalSorter {
         super::create_output_header(self.sort_order, header)
     }
 
-    /// Create per-base temp directories and an allocator over their subdirs.
-    ///
-    /// For each user-supplied base directory, a fresh sort-run subdirectory is
-    /// created (via `tempfile::TempDir`). The returned [`Vec<TempDir>`] owns
-    /// those handles so subdirs are removed on drop; the allocator hands out
-    /// the corresponding subdir paths for chunk/merged file placement.
-    ///
-    /// When `temp_dirs` is empty, a single subdirectory is created under the
-    /// system default temp location.
-    fn create_temp_dirs(&self) -> Result<(Vec<TempDir>, TmpDirAllocator)> {
-        use super::create_temp_dir;
-
-        if self.temp_dirs.is_empty() {
-            let td = create_temp_dir(None)?;
-            let base = td.path().to_path_buf();
-            let alloc = TmpDirAllocator::new(vec![base])?;
-            return Ok((vec![td], alloc));
-        }
-
-        let mut handles = Vec::with_capacity(self.temp_dirs.len());
-        let mut subdirs = Vec::with_capacity(self.temp_dirs.len());
-        for base in &self.temp_dirs {
-            let td = create_temp_dir(Some(base))?;
-            subdirs.push(td.path().to_path_buf());
-            handles.push(td);
-        }
-        let alloc = TmpDirAllocator::new(subdirs)?;
-        Ok((handles, alloc))
+    /// Create temporary directory for spill files.
+    fn create_temp_dir(&self) -> Result<TempDir> {
+        super::create_temp_dir(self.temp_dir.as_deref())
     }
+
+    /// Sort-accumulate phase: read a BAM file, sort into chunks, and return
+    /// [`SortedChunks`] without performing the K-way merge.
+    ///
+    /// This is the first half of a two-phase sort. Call
+    /// [`merge_sorted_chunks_to_sink`] to merge the chunks into a
+    /// [`SortedRecordSink`](super::sink::SortedRecordSink).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or sorting records fails.
+    pub fn sort_accumulate_template(&self, input: &Path, header: &Header) -> Result<SortedChunks> {
+        let (reader, _input_header) = crate::bam_io::create_raw_bam_reader(input, self.threads)?;
+        let read_ahead = super::read_ahead::RawReadAheadReader::new(reader);
+        self.sort_accumulate_inner(read_ahead, header)
+    }
+
+    /// Sort-accumulate phase from an iterator of raw BAM record bytes.
+    ///
+    /// Like [`sort_accumulate_template`](Self::sort_accumulate_template) but takes records
+    /// from an iterator instead of reading from a BAM file. Returns sorted chunks for
+    /// later merging via [`merge_sorted_chunks_to_sink`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sorting records fails.
+    pub fn sort_accumulate_from_iter(
+        &self,
+        records: impl Iterator<Item = impl AsRef<[u8]>>,
+        header: &Header,
+    ) -> Result<SortedChunks> {
+        self.sort_accumulate_inner(records, header)
+    }
+
+    /// Shared accumulate logic for both file-based and iterator-based sort-accumulate.
+    ///
+    /// Reads records from the iterator, sorts them into chunks on disk/memory, and
+    /// returns `SortedChunks` without performing the K-way merge phase.
+    fn sort_accumulate_inner(
+        &self,
+        records: impl Iterator<Item = impl AsRef<[u8]>>,
+        header: &Header,
+    ) -> Result<SortedChunks> {
+        let temp_dir = self.create_temp_dir()?;
+        let temp_path = temp_dir.path();
+
+        let lib_lookup = LibraryLookup::from_header(header);
+        let hasher = cb_hasher();
+        let estimated_records = self.memory_limit / TEMPLATE_RECORD_BYTES_ESTIMATE;
+        let estimated_data_bytes = self.memory_limit * TEMPLATE_DATA_FRACTION_PERCENT / 100;
+
+        let mut chunk_files: Vec<PathBuf> = Vec::new();
+        let mut buffer =
+            TemplateRecordBuffer::with_capacity(estimated_records, estimated_data_bytes);
+        let mut namer = ChunkNamer::new(temp_path);
+        let mut stats = RawSortStats::default();
+
+        info!("Phase 1 (accumulate): Reading and sorting chunks (inline buffer)...");
+
+        for record in records {
+            stats.total_records += 1;
+
+            let bam_bytes = record.as_ref();
+            let key = extract_template_key_inline(bam_bytes, &lib_lookup, self.cell_tag, &hasher);
+            buffer.push(bam_bytes, key)?;
+
+            if buffer.memory_usage() >= self.memory_limit {
+                let chunk_path = namer.next_chunk_path();
+
+                if self.threads > 1 {
+                    buffer.par_sort();
+                } else {
+                    buffer.sort();
+                }
+
+                let mut keyed_writer = GenericKeyedChunkWriter::<TemplateKey>::create(
+                    &chunk_path,
+                    self.temp_compression,
+                    self.threads,
+                )?;
+                for (key, record) in buffer.iter_sorted_keyed() {
+                    keyed_writer.write_record(&key, record)?;
+                }
+                keyed_writer.finish()?;
+
+                stats.chunks_written += 1;
+                chunk_files.push(chunk_path);
+
+                // Note: temp-file consolidation is skipped here because this
+                // simplified accumulate path does not create a SortWorkerPool.
+                // The pipeline orchestrator sorts relatively small batches, so
+                // exceeding the max temp-file count is unlikely.
+                buffer.clear();
+            }
+        }
+
+        info!("Accumulate phase read {} records total", stats.total_records);
+
+        // Sort the remaining in-memory buffer into memory chunks.
+        let memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>> = if buffer.is_empty() {
+            Vec::new()
+        } else if chunk_files.is_empty() {
+            // All records fit in memory — produce a single memory chunk.
+            if self.threads > 1 {
+                buffer.par_sort();
+            } else {
+                buffer.sort();
+            }
+            let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
+            vec![chunk]
+        } else {
+            // Spill happened — split remaining buffer into sub-array chunks.
+            if self.threads > 1 {
+                buffer
+                    .par_sort_into_chunks(self.threads)
+                    .into_iter()
+                    .map(|chunk| chunk.into_iter().map(|(k, r)| (k, r.into_inner())).collect())
+                    .collect()
+            } else {
+                buffer.sort();
+                let chunk = buffer.iter_sorted_keyed().map(|(k, r)| (k, r.to_vec())).collect();
+                vec![chunk]
+            }
+        };
+
+        stats.output_records = stats.total_records;
+
+        Ok(SortedChunks { chunk_files, memory_chunks, stats, _temp_dir: temp_dir })
+    }
+}
+
+/// Pre-sorted chunks from the accumulate phase, ready for K-way merge.
+///
+/// **Important:** The [`TempDir`] is owned here.  Dropping a `SortedChunks` removes
+/// the temporary directory and all spill files.  Keep this value alive until the merge
+/// is complete.
+pub struct SortedChunks {
+    /// Paths to sorted keyed chunk files on disk.
+    pub chunk_files: Vec<PathBuf>,
+    /// Sorted in-memory chunks (from the last partial buffer that didn't spill).
+    /// Each inner `Vec` is independently sorted; the merge treats them as separate sources.
+    pub memory_chunks: Vec<Vec<(TemplateKey, Vec<u8>)>>,
+    /// Accumulation-phase statistics (total records read, chunks written to disk).
+    pub stats: RawSortStats,
+    /// Temporary directory owning the spill files.  Must outlive the merge phase.
+    _temp_dir: TempDir,
+}
+
+/// Merge pre-sorted chunks into a [`SortedRecordSink`](super::sink::SortedRecordSink)
+/// using K-way merge.
+///
+/// This is a public wrapper around the internal LoserTree-based merge.  It consumes
+/// both disk chunks and in-memory chunks from a [`SortedChunks`], emitting records
+/// in template-coordinate order.
+///
+/// **Note:** This does NOT call [`SortedRecordSink::finish`](super::sink::SortedRecordSink::finish)
+/// on the sink — the caller is responsible for calling `finish()` after the merge returns.
+///
+/// # Errors
+///
+/// Returns an error if reading chunks or emitting records to the sink fails.
+pub fn merge_sorted_chunks_to_sink(
+    chunks: SortedChunks,
+    sink: &mut dyn super::sink::SortedRecordSink,
+) -> Result<u64> {
+    use crate::sort::loser_tree::LoserTree;
+
+    /// Source for keyed chunks during merge.
+    enum KeyedChunkSource {
+        /// Disk-based chunk with prefetching reader.
+        Disk(GenericKeyedChunkReader<TemplateKey>),
+        /// In-memory sorted records.
+        Memory { records: Vec<(TemplateKey, Vec<u8>)>, idx: usize },
+    }
+
+    impl KeyedChunkSource {
+        fn next_record(&mut self) -> Result<Option<(TemplateKey, Vec<u8>)>> {
+            match self {
+                KeyedChunkSource::Disk(reader) => {
+                    let mut buf = Vec::new();
+                    match reader.next_record(&mut buf)? {
+                        Some(key) => Ok(Some((key, buf))),
+                        None => Ok(None),
+                    }
+                }
+                KeyedChunkSource::Memory { records, idx } => {
+                    if *idx < records.len() {
+                        let dummy = (TemplateKey::zeroed(), Vec::new());
+                        let entry = std::mem::replace(&mut records[*idx], dummy);
+                        *idx += 1;
+                        Ok(Some(entry))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    if chunks.chunk_files.is_empty() && chunks.memory_chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let num_disk = chunks.chunk_files.len();
+    let num_memory = chunks.memory_chunks.iter().filter(|c| !c.is_empty()).count();
+    info!("Merging from {num_disk} files and {num_memory} in-memory blocks...");
+
+    let mut sources: Vec<KeyedChunkSource> = Vec::with_capacity(num_disk + num_memory);
+    for path in &chunks.chunk_files {
+        sources.push(KeyedChunkSource::Disk(GenericKeyedChunkReader::<TemplateKey>::open(
+            path, None,
+        )?));
+    }
+    for chunk in chunks.memory_chunks {
+        if !chunk.is_empty() {
+            sources.push(KeyedChunkSource::Memory { records: chunk, idx: 0 });
+        }
+    }
+
+    // Initialize LoserTree with first key from each source
+    let mut initial_keys: Vec<TemplateKey> = Vec::with_capacity(sources.len());
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+    let mut source_map: Vec<usize> = Vec::with_capacity(sources.len());
+
+    for (idx, source) in sources.iter_mut().enumerate() {
+        if let Some((key, record)) = source.next_record()? {
+            initial_keys.push(key);
+            records.push(record);
+            source_map.push(idx);
+        }
+    }
+
+    if initial_keys.is_empty() {
+        info!("Merge complete: 0 records merged");
+        return Ok(0);
+    }
+
+    let mut tree = LoserTree::new(initial_keys);
+    let mut records_merged = 0u64;
+
+    while tree.winner_is_active() {
+        let winner = tree.winner();
+        let key = tree.winner_key();
+        let record_bytes = std::mem::take(&mut records[winner]);
+
+        sink.emit(key, record_bytes)?;
+        records_merged += 1;
+
+        // Fetch next record from the same source
+        let source_idx = source_map[winner];
+        if let Some((next_key, next_record)) = sources[source_idx].next_record()? {
+            records[winner] = next_record;
+            tree.replace_winner(next_key);
+        } else {
+            tree.remove_winner();
+        }
+    }
+
+    info!("Merge complete: {records_merged} records merged");
+    Ok(records_merged)
 }
 
 /// Extract a packed `TemplateKey` directly from BAM record bytes.
@@ -2930,13 +3139,12 @@ pub fn extract_template_key_inline(
     let cb_hash = aux.cell.map_or(0u64, |cb_bytes| cb_hasher.hash_one(cb_bytes));
 
     // Extract fields from raw bytes
-    let v = bam_fields::RawRecordView::new(bam_bytes);
-    let tid = v.ref_id();
-    let pos = v.pos();
-    let l_read_name = v.l_read_name() as usize;
-    let flag = v.flags();
-    let mate_tid = v.mate_ref_id();
-    let mate_pos = v.mate_pos();
+    let tid = bam_fields::ref_id(bam_bytes);
+    let pos = bam_fields::pos(bam_bytes);
+    let l_read_name = RawRecordView::new(bam_bytes).l_read_name() as usize;
+    let flag = RawRecordView::new(bam_bytes).flags();
+    let mate_tid = bam_fields::mate_ref_id(bam_bytes);
+    let mate_pos = bam_fields::mate_pos(bam_bytes);
 
     // Extract flags
     let is_unmapped = (flag & flags::UNMAPPED) != 0;
@@ -3109,7 +3317,7 @@ mod tests {
     fn test_raw_sorter_defaults() {
         let sorter = RawExternalSorter::new(SortOrder::Coordinate);
         assert_eq!(sorter.memory_limit, 512 * 1024 * 1024);
-        assert!(sorter.temp_dirs.is_empty());
+        assert!(sorter.temp_dir.is_none());
         assert_eq!(sorter.threads, 1);
         assert_eq!(sorter.output_compression, 6);
         assert_eq!(sorter.temp_compression, 1);
@@ -3131,7 +3339,7 @@ mod tests {
             .max_temp_files(128);
 
         assert_eq!(sorter.memory_limit, 1024);
-        assert_eq!(sorter.temp_dirs, vec![PathBuf::from("/tmp/test")]);
+        assert_eq!(sorter.temp_dir, Some(PathBuf::from("/tmp/test")));
         assert_eq!(sorter.threads, 8);
         assert_eq!(sorter.output_compression, 9);
         assert_eq!(sorter.temp_compression, 3);
@@ -3660,7 +3868,7 @@ mod tests {
         let (reader, _) = create_raw_bam_reader(path, 1).expect("failed to create raw BAM reader");
         RawReadAheadReader::new(reader)
             .map(|rec| {
-                let name_bytes = fgumi_raw_bam::RawRecordView::new(rec.as_ref()).read_name();
+                let name_bytes = fgumi_raw_bam::fields::read_name(rec.as_ref());
                 String::from_utf8(name_bytes.to_vec()).expect("read name should be valid UTF-8")
             })
             .collect()
@@ -3673,10 +3881,7 @@ mod tests {
         RawReadAheadReader::new(reader)
             .map(|rec| {
                 let bytes = rec.as_ref();
-                {
-                    let v = fgumi_raw_bam::RawRecordView::new(bytes);
-                    (v.ref_id(), v.pos())
-                }
+                (fgumi_raw_bam::fields::ref_id(bytes), fgumi_raw_bam::fields::pos(bytes))
             })
             .collect()
     }
@@ -4008,64 +4213,5 @@ mod tests {
             let total: usize = chunks.iter().map(Vec::len).sum();
             assert_eq!(total, n, "n={n} threads={threads}: total mismatch");
         }
-    }
-
-    /// End-to-end sort across two temp directories. Forces multiple spill
-    /// chunks and verifies the output is still correct. The round-robin
-    /// distribution itself is covered by `TmpDirAllocator`'s unit tests; this
-    /// test proves the plumbing from `temp_dirs(...)` through to the sort
-    /// fns works and that multi-dir mode produces byte-identical output to
-    /// single-dir mode.
-    #[test]
-    fn test_sort_with_two_temp_dirs_matches_single_dir() {
-        use crate::sam::builder::SamBuilder;
-
-        let num_pairs = 200;
-        let mut builder = SamBuilder::new();
-        for i in 0..num_pairs {
-            let _ = builder
-                .add_pair()
-                .name(&format!("read{i:05}"))
-                .start1(i * 200 + 1)
-                .start2(i * 200 + 101)
-                .build();
-        }
-
-        let workdir = tempfile::tempdir().expect("workdir");
-        let input = workdir.path().join("input.bam");
-        let output_multi = workdir.path().join("output_multi.bam");
-        let output_single = workdir.path().join("output_single.bam");
-        builder.write_bam(&input).expect("write bam");
-
-        let tmp_a = tempfile::tempdir().expect("tmp a");
-        let tmp_b = tempfile::tempdir().expect("tmp b");
-
-        // 8 KiB memory limit forces several spills across the dir rotation.
-        let stats_multi = RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(8 * 1024)
-            .threads(1)
-            .temp_compression(0)
-            .output_compression(0)
-            .temp_dirs(vec![tmp_a.path().to_path_buf(), tmp_b.path().to_path_buf()])
-            .sort(&input, &output_multi)
-            .expect("multi-dir sort should succeed");
-
-        assert!(stats_multi.chunks_written >= 2, "expected multiple spill chunks");
-
-        RawExternalSorter::new(SortOrder::Coordinate)
-            .memory_limit(8 * 1024)
-            .threads(1)
-            .temp_compression(0)
-            .output_compression(0)
-            .sort(&input, &output_single)
-            .expect("single-dir sort should succeed");
-
-        let names_multi = collect_read_names(&output_multi);
-        let names_single = collect_read_names(&output_single);
-        assert_eq!(names_multi.len(), num_pairs * 2, "record count mismatch");
-        assert_eq!(
-            names_multi, names_single,
-            "multi-dir and single-dir sort produced different record orders"
-        );
     }
 }

@@ -61,7 +61,6 @@ use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fgumi_raw_bam::RawRecord;
-use log::{info, warn};
 use lru::LruCache;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
@@ -71,6 +70,7 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{info, warn};
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -147,12 +147,32 @@ pub struct UmiMatch {
 /// corrector.execute("test")?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+const CORRECT_EXAMPLES: &str = r"EXAMPLES:
+    # Correct UMIs against an inline list
+    fgumi correct -i grouped.bam -o corrected.bam \
+        --umis AAAAAA CCCCCC GGGGGG TTTTTT \
+        --max-mismatches 1 --min-distance 2
+
+    # Correct UMIs using a file of expected UMI sequences
+    fgumi correct -i grouped.bam -o corrected.bam \
+        --umi-files expected_umis.txt \
+        --max-mismatches 2 --min-distance 1 \
+        --metrics correct.metrics.tsv
+
+    # Write rejected reads (UMIs that couldn't be corrected) to a separate BAM
+    fgumi correct -i input.bam -o corrected.bam \
+        --umi-files expected_umis.txt \
+        --rejects rejected.bam \
+        --max-mismatches 2 --min-distance 1
+";
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "correct",
     author,
     version,
     about = "\x1b[38;5;30m[UMI EXTRACTION]\x1b[0m \x1b[36mCorrect UMIs in a BAM file to a fixed set of UMIs\x1b[0m",
+    after_help = CORRECT_EXAMPLES,
     long_about = r#"
 Corrects UMIs stored in BAM files when a set of fixed UMIs is in use.
 

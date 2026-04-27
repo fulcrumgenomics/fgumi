@@ -6,6 +6,9 @@
 //! ensuring that module interactions work correctly.
 
 mod helpers;
+mod pipeline;
+mod proptest;
+mod runall;
 mod test_async_reader;
 mod test_bam_pipeline;
 mod test_bgzf_eof;
@@ -18,6 +21,8 @@ mod test_codec_pipeline;
 mod test_compare_bams;
 mod test_correct_command;
 mod test_dedup_command;
+mod test_defaults_parity;
+mod test_determinism;
 mod test_downsample_command;
 #[cfg(feature = "duplex")]
 mod test_duplex_command;
@@ -31,8 +36,20 @@ mod test_fastq_command;
 mod test_filter_command;
 mod test_group_command;
 mod test_group_determinism;
+mod test_help_examples;
+mod test_metrics_output;
+mod test_metrics_snapshots;
+mod test_pipeline_command;
 mod test_pipeline_concurrency;
+mod test_pipeline_equivalence;
+mod test_progress_bars;
 mod test_review_command;
+mod test_runall_cancel;
+mod test_runall_explain;
+mod test_runall_group_output_records;
+mod test_runall_mi_determinism;
+mod test_runall_regression;
+mod test_runall_validate;
 #[cfg(feature = "simplex")]
 mod test_simplex_command;
 #[cfg(feature = "simplex")]
@@ -43,4 +60,6 @@ mod test_simulate_sort;
 mod test_sort_correctness;
 mod test_sort_write_index;
 mod test_streaming_input;
+mod test_unclipped_5prime_parity;
+mod test_version_info;
 mod test_zipper_command;

@@ -118,7 +118,6 @@ impl ClippingMetrics {
     /// # Arguments
     /// * `record` - The raw BAM record after clipping
     /// * `counts` - The clip counts for this operation
-    #[cfg(feature = "clip")]
     pub fn update_raw(&mut self, record: &fgumi_raw_bam::RawRecord, counts: ClipCounts) {
         use fgumi_raw_bam::get_cigar_ops;
 

@@ -25,7 +25,6 @@ use crossbeam_channel::{Receiver, bounded};
 use fgumi_raw_bam::fields as raw_fields;
 use fgumi_raw_bam::{RawRecord, find_int_tag, find_string_tag};
 use itertools::Itertools;
-use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::RecordBuf;
@@ -35,6 +34,7 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::thread;
+use tracing::info;
 
 use crate::commands::command::Command;
 use crate::commands::common::parse_bool;

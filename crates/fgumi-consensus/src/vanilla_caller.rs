@@ -6,12 +6,12 @@
 
 use crate::base_builder::ConsensusBaseBuilder;
 use crate::caller::{ConsensusCaller, ConsensusCallingStats, ConsensusOutput, RejectionReason};
+use crate::error::{Error, Result};
 use crate::phred::{
     MIN_PHRED, NO_CALL_BASE, NO_CALL_BASE_LOWER, PhredScore, ln_error_prob_two_trials,
     ln_prob_to_phred, phred_to_ln_error_prob,
 };
 use crate::simple_umi::consensus_umis;
-use anyhow::{Result, anyhow, bail};
 use fgumi_dna::dna::reverse_complement;
 use fgumi_raw_bam::{RawRecord, RawRecordView, UnmappedSamBuilder, flags};
 use fgumi_sam::SamTag;
@@ -520,13 +520,22 @@ impl VanillaUmiConsensusCaller {
         self.rejected_reads.clear();
     }
 
-    /// Clears all per-group state to prepare for reuse
+    /// Clears all per-group state to prepare for reuse.
     ///
-    /// This resets statistics and rejected reads while preserving the caller's
-    /// configuration and reusable components (consensus builder, lookup tables, etc.).
+    /// Resets statistics, rejected reads, and re-seeds the RNG so a fresh
+    /// sequence of draws is used for the next group. Preserves the caller's
+    /// configuration and reusable components (consensus builder, lookup
+    /// tables). If no explicit seed was configured on the options this
+    /// reseeds from OS entropy — downsampling is then non-deterministic
+    /// across runs by design.
     pub fn clear(&mut self) {
         self.stats = ConsensusCallingStats::default();
         self.rejected_reads.clear();
+        self.rng = if let Some(seed) = self.options.seed {
+            StdRng::seed_from_u64(seed)
+        } else {
+            rand::make_rng()
+        };
     }
 
     /// Temporary bridge: converts a `RecordBuf` to a `SourceRead`.
@@ -1191,7 +1200,9 @@ impl VanillaUmiConsensusCaller {
             self.filter_source_reads_by_alignment(source_reads);
 
         if self.track_rejects {
-            for idx in rejected_indices {
+            let mut sorted: Vec<usize> = rejected_indices.into_iter().collect();
+            sorted.sort_unstable(); // deterministic rejects order (HashSet is random)
+            for idx in sorted {
                 self.rejected_reads.push(group_reads[idx].to_vec());
             }
         }
@@ -1262,7 +1273,7 @@ impl VanillaUmiConsensusCaller {
         source_reads: &[SourceRead],
     ) -> Result<ConsensusResult> {
         if source_reads.is_empty() {
-            bail!("Cannot create consensus from empty source reads");
+            return Err(Error::EmptySourceReads);
         }
 
         // Calculate consensus length (min_reads-th longest read)
@@ -1482,7 +1493,10 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         // Extract UMI from first record
         let tag_bytes = self.options.tag.as_bytes();
         if tag_bytes.len() != 2 {
-            bail!("Tag '{}' must be exactly 2 characters", self.options.tag);
+            return Err(Error::InvalidConfig(format!(
+                "Tag '{}' must be exactly 2 characters",
+                self.options.tag
+            )));
         }
         let tag_key = [tag_bytes[0], tag_bytes[1]];
 
@@ -1490,10 +1504,13 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
         let read_name_bytes = RawRecordView::new(first_raw.as_ref()).read_name();
         let read_name = String::from_utf8_lossy(read_name_bytes);
 
-        let tag_value =
-            RawRecordView::new(first_raw.as_ref()).tags().find_string(tag_key).ok_or_else(
-                || anyhow!("Missing UMI tag '{}' for read '{}'", self.options.tag, read_name),
-            )?;
+        let tag_value = RawRecordView::new(first_raw.as_ref())
+            .tags()
+            .find_string(tag_key)
+            .ok_or_else(|| Error::MissingTag {
+                tag: self.options.tag.clone(),
+                read_name: read_name.clone().into_owned(),
+            })?;
 
         let umi = String::from_utf8_lossy(tag_value).into_owned();
 
@@ -1517,17 +1534,21 @@ impl ConsensusCaller for VanillaUmiConsensusCaller {
     }
 
     fn log_statistics(&self) {
-        log::info!("Consensus Calling Statistics:");
-        log::info!("  Total input reads: {}", self.stats.total_reads);
-        log::info!("  Consensus reads generated: {}", self.stats.consensus_reads);
-        log::info!("  Reads filtered: {}", self.stats.filtered_reads);
+        tracing::info!("Consensus Calling Statistics:");
+        tracing::info!("  Total input reads: {}", self.stats.total_reads);
+        tracing::info!("  Consensus reads generated: {}", self.stats.consensus_reads);
+        tracing::info!("  Reads filtered: {}", self.stats.filtered_reads);
 
         if !self.stats.rejection_reasons.is_empty() {
-            log::info!("  Rejection reasons:");
+            tracing::info!("  Rejection reasons:");
             for (reason, count) in &self.stats.rejection_reasons {
-                log::info!("    {reason:?}: {count}");
+                tracing::info!("    {reason:?}: {count}");
             }
         }
+    }
+
+    fn clear(&mut self) {
+        VanillaUmiConsensusCaller::clear(self);
     }
 }
 
@@ -1556,7 +1577,7 @@ mod tests {
     fn consensus_reads_from_raw(
         caller: &mut VanillaUmiConsensusCaller,
         records: Vec<RawRecord>,
-    ) -> anyhow::Result<ConsensusOutput> {
+    ) -> Result<ConsensusOutput> {
         caller.consensus_reads(records)
     }
 

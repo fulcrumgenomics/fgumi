@@ -186,20 +186,18 @@
 //! - `caller`: Base consensus calling infrastructure and trait definitions
 //! - `base_builder`: Likelihood-based consensus algorithm for individual bases
 
+use crate::error::{Error, Result};
 #[cfg(test)]
 use ahash::AHashMap;
-#[cfg(test)]
-use anyhow::Context;
-use anyhow::{Result, bail};
 #[cfg(test)]
 use bstr::BString;
 #[cfg(test)]
 use bstr::ByteSlice;
-use log::{debug, info};
 use noodles::sam::alignment::record::data::field::Tag;
 // Used by call_duplex_from_ss_pair and extract_int_tag (both #[cfg(test)])
 #[cfg(test)]
 use noodles::sam::alignment::record_buf::RecordBuf;
+use tracing::{debug, info};
 
 use crate::caller::ConsensusOutput;
 use crate::caller::{ConsensusCaller, ConsensusCallingStats, RejectionReason};
@@ -371,13 +369,15 @@ impl DuplexConsensusCaller {
         // Parse min_reads vector like fgbio: padTo(3, last)
         // [total, XY, YX] where XY >= YX (larger strand, smaller strand)
         if min_reads.is_empty() {
-            anyhow::bail!("min_reads parameter must have at least 1 value");
+            return Err(Error::InvalidConfig(
+                "min_reads parameter must have at least 1 value".into(),
+            ));
         }
         if min_reads.len() > 3 {
-            anyhow::bail!(
+            return Err(Error::InvalidConfig(format!(
                 "min_reads parameter must have 1-3 values (total, [XY, [YX]]), got {} values",
                 min_reads.len()
-            );
+            )));
         }
 
         let last = *min_reads.last().expect("expected a last item");
@@ -388,10 +388,14 @@ impl DuplexConsensusCaller {
         // Validate min_reads ordering: yx <= xy <= total (matching fgbio)
         // For depth thresholds it's required that yx <= xy <= total
         if min_xy_reads > min_total_reads {
-            anyhow::bail!("min-reads values must be specified high to low (total >= XY)");
+            return Err(Error::InvalidConfig(
+                "min-reads values must be specified high to low (total >= XY)".into(),
+            ));
         }
         if min_yx_reads > min_xy_reads {
-            anyhow::bail!("min-reads values must be specified high to low (XY >= YX)");
+            return Err(Error::InvalidConfig(
+                "min-reads values must be specified high to low (XY >= YX)".into(),
+            ));
         }
 
         // Create single-strand consensus caller with min_reads=1 (matching fgbio)
@@ -594,11 +598,10 @@ impl DuplexConsensusCaller {
                 else {
                     let read_name =
                         String::from_utf8_lossy(RawRecordView::new(&record).read_name());
-                    bail!(
-                        "Read '{read_name}' is missing MI tag. \
-                        The duplex command requires all reads to have MI tags. \
-                        Please run 'fgumi group' on your input BAM first."
-                    );
+                    return Err(Error::MissingTag {
+                        tag: "MI".into(),
+                        read_name: read_name.into_owned(),
+                    });
                 };
                 if base_mi.is_none() {
                     base_mi = Some(Self::base_mi_from_bytes(mi_bytes));
@@ -608,13 +611,13 @@ impl DuplexConsensusCaller {
                     Some('B') => false,
                     _ => {
                         let mi_str = String::from_utf8_lossy(mi_bytes).into_owned();
-                        bail!(
+                        return Err(Error::InvalidTag(format!(
                             "Read has MI tag '{mi_str}' without /A or /B suffix. \
                             The duplex command requires reads to be grouped using the 'paired' strategy, \
                             which adds /A and /B suffixes to MI tags to indicate the strand of the source \
                             duplex molecule. Please run 'fgumi group --strategy paired' on your input BAM \
                             before running duplex consensus calling."
-                        );
+                        )));
                     }
                 }
             };
@@ -654,9 +657,13 @@ impl DuplexConsensusCaller {
                 let view = RawRecordView::new(&read);
                 let Some(mi_bytes) = view.tags().find_string(SamTag::MI) else {
                     let read_name = String::from_utf8_lossy(view.read_name());
-                    bail!("Read '{read_name}' is missing MI tag");
+                    return Err(Error::MissingTag {
+                        tag: "MI".into(),
+                        read_name: read_name.into_owned(),
+                    });
                 };
-                String::from_utf8(mi_bytes.to_vec()).context("MI tag is not valid UTF-8")?
+                String::from_utf8(mi_bytes.to_vec())
+                    .map_err(|_| Error::InvalidTag("MI tag is not valid UTF-8".into()))?
             };
             let (base_mi, strand) = Self::parse_mi_tag(&mi);
 
@@ -667,20 +674,20 @@ impl DuplexConsensusCaller {
                 Some('B') => entry.1.push(read),
                 None => {
                     // No strand suffix - this is an error!
-                    bail!(
+                    return Err(Error::InvalidTag(format!(
                         "Read has MI tag '{mi}' without /A or /B suffix. \
                         The duplex command requires reads to be grouped using the 'paired' strategy, \
                         which adds /A and /B suffixes to MI tags to indicate the strand of the source \
                         duplex molecule. Please run 'fgumi group --strategy paired' on your input BAM \
                         before running duplex consensus calling."
-                    );
+                    )));
                 }
                 Some(c) => {
                     // Invalid strand suffix character
-                    bail!(
+                    return Err(Error::InvalidTag(format!(
                         "Read has MI tag '{mi}' with invalid strand suffix '{c}'. \
                         Expected /A or /B suffix only."
-                    );
+                    )));
                 }
             }
         }
@@ -1390,12 +1397,30 @@ impl DuplexConsensusCaller {
 
         // For each position, compare bases and call consensus
         for i in 0..len {
-            let base_a = seq_a.as_ref().get(i).copied().context("Index out of bounds")?;
-            let qual_a_i =
-                i32::from(qual_a.as_ref().get(i).copied().context("Index out of bounds")?);
-            let base_b = seq_b.as_ref().get(i).copied().context("Index out of bounds")?;
-            let qual_b_i =
-                i32::from(qual_b.as_ref().get(i).copied().context("Index out of bounds")?);
+            let base_a = seq_a
+                .as_ref()
+                .get(i)
+                .copied()
+                .ok_or_else(|| Error::InvalidRecord(format!("Index {i} out of bounds")))?;
+            let qual_a_i = i32::from(
+                qual_a
+                    .as_ref()
+                    .get(i)
+                    .copied()
+                    .ok_or_else(|| Error::InvalidRecord(format!("Index {i} out of bounds")))?,
+            );
+            let base_b = seq_b
+                .as_ref()
+                .get(i)
+                .copied()
+                .ok_or_else(|| Error::InvalidRecord(format!("Index {i} out of bounds")))?;
+            let qual_b_i = i32::from(
+                qual_b
+                    .as_ref()
+                    .get(i)
+                    .copied()
+                    .ok_or_else(|| Error::InvalidRecord(format!("Index {i} out of bounds")))?,
+            );
 
             // Calculate raw consensus base and quality using Scala's algorithm
             // This matches the Bayesian approach in DuplexConsensusCaller.scala lines 423-428
@@ -1477,7 +1502,7 @@ impl DuplexConsensusCaller {
         let mi_tag = Tag::from([b'M', b'I']);
         if let Some(Value::String(mi_bytes)) = duplex.data().get(&mi_tag) {
             let mi_str = String::from_utf8(mi_bytes.iter().copied().collect::<Vec<u8>>())
-                .context("MI tag is not valid UTF-8")?;
+                .map_err(|_| Error::InvalidTag("MI tag is not valid UTF-8".into()))?;
             let (base_mi, _suffix) = Self::parse_mi_tag(&mi_str);
             duplex.data_mut().insert(mi_tag, Value::String(base_mi.as_bytes().into()));
         }
@@ -2279,6 +2304,10 @@ impl ConsensusCaller for DuplexConsensusCaller {
         // Log single-strand caller statistics
         info!("Single-strand caller:");
         self.ss_caller.log_statistics();
+    }
+
+    fn clear(&mut self) {
+        DuplexConsensusCaller::clear(self);
     }
 }
 

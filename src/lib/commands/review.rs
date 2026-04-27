@@ -20,11 +20,30 @@ use fgumi_raw_bam::{
     BAM_BASE_TO_ASCII, CigarKind, IndexedRawBamReader, RawBamReader, RawRecord,
     find_string_tag_in_record, write_raw_record,
 };
-use log::info;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 use super::command::Command;
+
+const REVIEW_EXAMPLES: &str = r"EXAMPLES:
+    # Review consensus variant calls against a VCF
+    fgumi review -i variants.vcf \
+        -c consensus.bam -g grouped.bam \
+        -r ref.fa -o review
+
+    # Review from an interval list, ignoring N consensus bases
+    fgumi review -i targets.interval_list \
+        -c consensus.bam -g grouped.bam \
+        -r ref.fa -o review \
+        --ignore-ns
+
+    # Limit detail to rare variants (MAF <= 0.01) from a multi-sample VCF
+    fgumi review -i variants.vcf \
+        -c consensus.bam -g grouped.bam \
+        -r ref.fa -o review \
+        --sample SAMPLE1 --maf 0.01
+";
 
 /// Reviews consensus variant calls by extracting relevant reads.
 ///
@@ -36,6 +55,7 @@ use super::command::Command;
     author,
     version,
     about = "\x1b[38;5;173m[POST-CONSENSUS]\x1b[0m \x1b[36mExtract data to review variant calls from consensus reads\x1b[0m",
+    after_help = REVIEW_EXAMPLES,
     long_about = r#"
 Extracts data to make reviewing of variant calls from consensus reads easier.
 

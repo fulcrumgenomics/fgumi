@@ -456,7 +456,7 @@ pub fn check_deadlock_and_restore(
             || snapshot.q3_reorder_mem > 0
             || snapshot.mi_assign_reorder_len > 0;
         if !has_in_flight_work {
-            log::debug!(
+            tracing::debug!(
                 "Deadlock detector: no queue activity for {}s but all queues \
                  are empty (read_done={}); treating as upstream starvation, \
                  not deadlock",
@@ -497,7 +497,7 @@ fn handle_deadlock(
     let current = deadlock_state.current_memory_limit.load(Ordering::Relaxed);
 
     // Log diagnostics
-    log::warn!("DEADLOCK DETECTED: No progress for {}s", deadlock_state.timeout_secs);
+    tracing::warn!("DEADLOCK DETECTED: No progress for {}s", deadlock_state.timeout_secs);
     log_queue_state(deadlock_state, snapshot);
 
     let action = if deadlock_state.recover_enabled {
@@ -510,7 +510,7 @@ fn handle_deadlock(
             let old_stable = deadlock_state.stable_memory_limit.load(Ordering::Relaxed);
             if new_stable > old_stable {
                 deadlock_state.stable_memory_limit.store(new_stable, Ordering::Relaxed);
-                log::warn!("  Stable limit updated: {old_stable} -> {new_stable} bytes");
+                tracing::warn!("  Stable limit updated: {old_stable} -> {new_stable} bytes");
             }
         }
 
@@ -525,10 +525,10 @@ fn handle_deadlock(
             || new_limit > 8u64.saturating_mul(deadlock_state.original_memory_limit)
         {
             // Cap at 8x or unbind
-            log::warn!("  Recovery: Unbinding limits (unlimited)");
+            tracing::warn!("  Recovery: Unbinding limits (unlimited)");
             0
         } else {
-            log::warn!("  Recovery: {current} -> {new_limit} bytes (2x)");
+            tracing::warn!("  Recovery: {current} -> {new_limit} bytes (2x)");
             new_limit
         };
 
@@ -537,7 +537,7 @@ fn handle_deadlock(
 
         DeadlockAction::Recovered(final_limit)
     } else {
-        log::warn!("  Recovery disabled - use --deadlock-recover to enable automatic recovery");
+        tracing::warn!("  Recovery disabled - use --deadlock-recover to enable automatic recovery");
         DeadlockAction::Detected
     };
 
@@ -564,7 +564,7 @@ fn try_restore_limits(deadlock_state: &DeadlockState, now: u64) {
         // Unbounded - try to restore to 8x original or stable, whichever is higher
         let target = (original.saturating_mul(8)).max(stable);
         if target > 0 {
-            log::info!("  Restoring: unlimited -> {target} bytes");
+            tracing::info!("  Restoring: unlimited -> {target} bytes");
             deadlock_state.current_memory_limit.store(target, Ordering::SeqCst);
             deadlock_state.last_recovery_time.store(now, Ordering::Relaxed);
             deadlock_state.deadlock_at_current_limit.store(false, Ordering::Relaxed);
@@ -580,7 +580,7 @@ fn try_restore_limits(deadlock_state: &DeadlockState, now: u64) {
     // Halve the limit (but not below original or stable)
     let new_limit = (current / 2).max(original).max(stable);
     if new_limit < current {
-        log::info!("  Restoring: {current} -> {new_limit} bytes (halving)");
+        tracing::info!("  Restoring: {current} -> {new_limit} bytes (halving)");
         deadlock_state.current_memory_limit.store(new_limit, Ordering::SeqCst);
         deadlock_state.last_recovery_time.store(now, Ordering::Relaxed);
         deadlock_state.deadlock_at_current_limit.store(false, Ordering::Relaxed);
@@ -593,7 +593,7 @@ fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
     let now = now_secs();
 
     // Queue depths
-    log::warn!(
+    tracing::warn!(
         "  Queue depths: Q1={} Q2={} Q2b={} Q3={} Q4={} Q5={} Q6={} Q7={}",
         snapshot.q1_len,
         snapshot.q2_len,
@@ -606,54 +606,54 @@ fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
     );
 
     // Per-queue stall detection (seconds since last activity)
-    log::warn!(
+    tracing::warn!(
         "  Q1: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q1_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q1_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q2: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q2_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q2_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q2b: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q2b_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q2b_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q2.5: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q2_5_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q2_5_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q3: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q3_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q3_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q4: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q4_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q4_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q5: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q5_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q5_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q6: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q6_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q6_last_pop.load(Ordering::Relaxed))
     );
-    log::warn!(
+    tracing::warn!(
         "  Q7: push={}s ago, pop={}s ago",
         now.saturating_sub(deadlock_state.q7_last_push.load(Ordering::Relaxed)),
         now.saturating_sub(deadlock_state.q7_last_pop.load(Ordering::Relaxed))
     );
 
     // Memory state
-    log::warn!(
+    tracing::warn!(
         "  Memory: Q2 reorder={:.1}MB, Q3 reorder={:.1}MB, MI Assign reorder={} batches, limit={:.1}MB",
         snapshot.q2_reorder_mem as f64 / 1_000_000.0,
         snapshot.q3_reorder_mem as f64 / 1_000_000.0,
@@ -662,14 +662,14 @@ fn log_queue_state(deadlock_state: &DeadlockState, snapshot: &QueueSnapshot) {
     );
 
     // Pipeline state flags
-    log::warn!(
+    tracing::warn!(
         "  State: read_done={}, group_done={}, draining={}",
         snapshot.read_done,
         snapshot.group_done,
         snapshot.draining,
     );
     if let Some(ref extra) = snapshot.extra_state {
-        log::warn!("  Extra: {extra}");
+        tracing::warn!("  Extra: {extra}");
     }
 }
 

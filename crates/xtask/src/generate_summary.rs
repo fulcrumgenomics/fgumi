@@ -59,6 +59,18 @@ pub fn generate(
         }
     }
 
+    // Pipeline sub-group
+    let pipeline_guides = [("Runall Pipeline", "guide/runall.md")];
+    let pipeline_exists = pipeline_guides.iter().any(|(_, p)| docs_src.join(p).exists());
+    if pipeline_exists {
+        md.push_str("- [Pipeline]()\n");
+        for (title, path) in &pipeline_guides {
+            if docs_src.join(path).exists() {
+                let _ = writeln!(md, "  - [{title}]({path})");
+            }
+        }
+    }
+
     // Methylation sub-group
     let methylation = [("Pipeline Guide", "guide/methylation.md")];
     let methylation_exists = methylation.iter().any(|(_, p)| docs_src.join(p).exists());

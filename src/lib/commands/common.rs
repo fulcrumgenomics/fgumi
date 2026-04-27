@@ -16,9 +16,8 @@ use bytesize::ByteSize;
 use clap::Args;
 #[cfg(feature = "simplex")]
 use fgumi_consensus::methylation::RefBaseProvider;
-#[cfg(feature = "simplex")]
-use log::info;
 use noodles::sam::Header;
+use tracing::info;
 
 /// CLI argument value for `--methylation-mode`.
 ///
@@ -224,15 +223,15 @@ impl StatsOptions {
 #[derive(Debug, Clone, Args)]
 pub struct ConsensusCallingOptions {
     /// Phred-scaled error rate prior to UMI integration
-    #[arg(short = '1', long = "error-rate-pre-umi", default_value = "45")]
+    #[arg(short = '1', long = "error-rate-pre-umi", default_value_t = crate::defaults::CONSENSUS_ERROR_RATE_PRE_UMI)]
     pub error_rate_pre_umi: u8,
 
     /// Phred-scaled error rate post UMI integration
-    #[arg(short = '2', long = "error-rate-post-umi", default_value = "40")]
+    #[arg(short = '2', long = "error-rate-post-umi", default_value_t = crate::defaults::CONSENSUS_ERROR_RATE_POST_UMI)]
     pub error_rate_post_umi: u8,
 
     /// Minimum base quality in raw reads to use for consensus
-    #[arg(short = 'm', long = "min-input-base-quality", default_value = "10")]
+    #[arg(short = 'm', long = "min-input-base-quality", default_value_t = crate::defaults::CONSENSUS_MIN_INPUT_BASE_QUALITY)]
     pub min_input_base_quality: u8,
 
     /// Produce per-base tags (cd, ce) in addition to per-read tags
@@ -244,19 +243,19 @@ pub struct ConsensusCallingOptions {
     pub trim: bool,
 
     /// Minimum consensus base quality (output consensus bases below this are masked to N)
-    #[arg(long = "min-consensus-base-quality", default_value = "2")]
+    #[arg(long = "min-consensus-base-quality", default_value_t = crate::defaults::CONSENSUS_MIN_BASE_QUALITY)]
     pub min_consensus_base_quality: u8,
 }
 
 impl Default for ConsensusCallingOptions {
     fn default() -> Self {
         Self {
-            error_rate_pre_umi: 45,
-            error_rate_post_umi: 40,
-            min_input_base_quality: 10,
-            output_per_base_tags: true,
-            trim: false,
-            min_consensus_base_quality: 2,
+            error_rate_pre_umi: crate::defaults::CONSENSUS_ERROR_RATE_PRE_UMI,
+            error_rate_post_umi: crate::defaults::CONSENSUS_ERROR_RATE_POST_UMI,
+            min_input_base_quality: crate::defaults::CONSENSUS_MIN_INPUT_BASE_QUALITY,
+            output_per_base_tags: crate::defaults::CONSENSUS_OUTPUT_PER_BASE_TAGS,
+            trim: crate::defaults::CONSENSUS_TRIM,
+            min_consensus_base_quality: crate::defaults::CONSENSUS_MIN_BASE_QUALITY,
         }
     }
 }
@@ -322,7 +321,7 @@ pub struct ReadGroupOptions {
     pub read_name_prefix: Option<String>,
 
     /// Read group ID for consensus reads
-    #[arg(short = 'R', long = "read-group-id", default_value = "A")]
+    #[arg(short = 'R', long = "read-group-id", default_value = crate::defaults::READ_GROUP_ID)]
     pub read_group_id: String,
 }
 
@@ -639,10 +638,10 @@ impl QueueMemoryOptions {
 
         // Handle migration from old parameter
         let (base_memory_bytes, is_legacy) = if let Some(legacy_mb) = self.queue_memory_limit_mb {
-            log::warn!(
+            tracing::warn!(
                 "DEPRECATED: --queue-memory-limit-mb is deprecated. Use --queue-memory instead."
             );
-            log::warn!(
+            tracing::warn!(
                 "Migration: --queue-memory-limit-mb {legacy_mb} → --queue-memory {legacy_mb} --queue-memory-per-thread false"
             );
             (
@@ -716,7 +715,7 @@ impl QueueMemoryOptions {
         // Calculate 90% limit using integer arithmetic to avoid precision loss
         let memory_limit = total_memory_bytes - (total_memory_bytes / 10); // 90% = total - 10%
         if requested_bytes > memory_limit {
-            log::warn!(
+            tracing::warn!(
                 "Requested memory {} exceeds 90% of system memory ({}). System has {} total, {} available. This may cause OOM conditions.",
                 ByteSize(requested_bytes),
                 ByteSize(memory_limit),
@@ -727,7 +726,7 @@ impl QueueMemoryOptions {
 
         // Warn if requesting more than currently available memory
         if requested_bytes > available_memory_bytes {
-            log::warn!(
+            tracing::warn!(
                 "Requested memory {} exceeds currently available memory {}. This may cause swapping.",
                 ByteSize(requested_bytes),
                 ByteSize(available_memory_bytes)
@@ -742,19 +741,19 @@ impl QueueMemoryOptions {
     /// * `total_memory` - Pre-computed total memory limit in bytes from `calculate_memory_limit`
     pub fn log_memory_config(&self, num_threads: usize, total_memory: u64) {
         if let Some(legacy_mb) = self.queue_memory_limit_mb {
-            log::info!(
+            tracing::info!(
                 "Queue memory limit: {} (LEGACY: {legacy_mb} MB total, per-thread scaling disabled)",
                 ByteSize(total_memory)
             );
         } else if self.queue_memory_per_thread && num_threads > 1 {
-            log::info!(
+            tracing::info!(
                 "Queue memory limit: {} total ({} MB/thread × {} threads)",
                 ByteSize(total_memory),
                 self.queue_memory,
                 num_threads
             );
         } else {
-            log::info!("Queue memory limit: {} total (fixed)", ByteSize(total_memory));
+            tracing::info!("Queue memory limit: {} total (fixed)", ByteSize(total_memory));
         }
     }
 }

@@ -123,7 +123,7 @@
 //! ### Basic Usage - Identity Strategy
 //!
 //! ```
-//! use fgumi_lib::umi::assigner::{Strategy, UmiAssigner};
+//! use fgumi_umi::assigner::{Strategy, UmiAssigner};
 //!
 //! let strategy = Strategy::Identity;
 //! let assigner = strategy.new_assigner(0); // No mismatches allowed
@@ -145,7 +145,7 @@
 //! ### Error-Tolerant Assignment - Adjacency Strategy
 //!
 //! ```
-//! use fgumi_lib::umi::assigner::{Strategy, UmiAssigner};
+//! use fgumi_umi::assigner::{Strategy, UmiAssigner};
 //!
 //! let strategy = Strategy::Adjacency;
 //! let assigner = strategy.new_assigner(1); // Allow 1 mismatch
@@ -166,7 +166,7 @@
 //! ### Paired UMI Assignment - Duplex Sequencing
 //!
 //! ```
-//! use fgumi_lib::umi::assigner::{Strategy, UmiAssigner, TOP_STRAND_DUPLEX, BOTTOM_STRAND_DUPLEX};
+//! use fgumi_umi::assigner::{Strategy, UmiAssigner, TOP_STRAND_DUPLEX, BOTTOM_STRAND_DUPLEX};
 //!
 //! let strategy = Strategy::Paired;
 //! let assigner = strategy.new_assigner(1); // Allow 1 mismatch per UMI half
@@ -214,7 +214,6 @@
 //!   are tagged with dual UMIs and you need strand-aware consensus calling.
 
 use ahash::AHashMap;
-use anyhow::Result;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::any::Any;
@@ -222,6 +221,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::MoleculeId;
+use crate::error::{Error, Result};
 use fgumi_dna::BitEnc;
 
 /// Default minimum number of unique UMIs to use N-gram/BK-tree index for candidate search.
@@ -509,8 +509,7 @@ pub const BOTTOM_STRAND_DUPLEX: &str = "/B";
 ///
 /// Determines how reads are grouped based on their UMI sequences. Each strategy makes
 /// different tradeoffs between speed, error tolerance, and grouping behavior.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Strategy {
     /// Only reads with identical UMI sequences are grouped together
     ///
@@ -633,7 +632,7 @@ impl Strategy {
 /// # Examples
 ///
 /// ```
-/// use fgumi_lib::umi::assigner::count_mismatches;
+/// use fgumi_umi::assigner::count_mismatches;
 ///
 /// assert_eq!(count_mismatches("ACGT", "ACGT"), 0);
 /// assert_eq!(count_mismatches("ACGT", "ACTT"), 1);
@@ -668,7 +667,7 @@ pub fn count_mismatches(a: &str, b: &str) -> usize {
 /// # Examples
 ///
 /// ```
-/// use fgumi_lib::umi::assigner::matches_within_threshold;
+/// use fgumi_umi::assigner::matches_within_threshold;
 ///
 /// assert!(matches_within_threshold("ACGT", "ACGT", 1));
 /// assert!(matches_within_threshold("ACGT", "ACTT", 1));
@@ -1437,10 +1436,6 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             return Vec::new();
         }
 
-        // Profiling: track time spent in each phase
-        #[cfg(feature = "profile-adjacency")]
-        let t_start = std::time::Instant::now();
-
         // Count UMIs using compact BitEnc representation (saves ~60-70% memory)
         // We store index into raw_umis to avoid cloning strings
         // Also build a map from BitEnc -> unique_index for result lookup
@@ -1472,18 +1467,12 @@ impl UmiAssigner for AdjacencyUmiAssigner {
             return vec![MoleculeId::None; raw_umis.len()];
         }
 
-        #[cfg(feature = "profile-adjacency")]
-        let t_after_count = std::time::Instant::now();
-
         // Sort by descending count, then by original string for determinism
         umi_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| raw_umis[a.2].cmp(&raw_umis[b.2])));
 
         // Build lookup from BitEnc to sorted index (after sorting)
         let bitenc_to_unique_idx: AHashMap<BitEnc, usize> =
             umi_counts.iter().enumerate().map(|(idx, (enc, _, _))| (*enc, idx)).collect();
-
-        #[cfg(feature = "profile-adjacency")]
-        let t_after_sort = std::time::Instant::now();
 
         if umi_counts.len() == 1 {
             let id = MoleculeId::Single(self.next_id());
@@ -1504,14 +1493,11 @@ impl UmiAssigner for AdjacencyUmiAssigner {
         // Build adjacency graph using BitEnc-based matching
         let (nodes, roots) = self.build_adjacency_graph_bitenc(&umi_counts, raw_umis);
 
-        #[cfg(feature = "profile-adjacency")]
-        let t_after_graph = std::time::Instant::now();
-
         // Assign IDs to nodes and build result Vec
         let unique_assignments = self.assign_ids_to_nodes_bitenc(&nodes, &roots, &umi_counts);
 
         // Map each input UMI to its MoleculeId using BitEnc lookup
-        let result: Vec<MoleculeId> = raw_umis
+        raw_umis
             .iter()
             .map(|umi| {
                 if let Some(enc) = BitEnc::from_umi_str(umi) {
@@ -1521,39 +1507,7 @@ impl UmiAssigner for AdjacencyUmiAssigner {
                 }
                 MoleculeId::None // Invalid UMI
             })
-            .collect();
-
-        #[cfg(feature = "profile-adjacency")]
-        {
-            let t_end = std::time::Instant::now();
-            let num_unique = umi_counts.len();
-            let num_reads = raw_umis.len();
-
-            // Bucket by unique UMI count
-            let bucket = match num_unique {
-                0..=10 => "1-10",
-                11..=50 => "11-50",
-                51..=100 => "51-100",
-                101..=500 => "101-500",
-                501..=1000 => "501-1000",
-                _ => "1000+",
-            };
-
-            eprintln!(
-                "PROFILE bucket={} unique={} reads={} L={} count={:?} sort={:?} graph={:?} assign={:?} total={:?}",
-                bucket,
-                num_unique,
-                num_reads,
-                umi_base_length,
-                t_after_count.duration_since(t_start),
-                t_after_sort.duration_since(t_after_count),
-                t_after_graph.duration_since(t_after_sort),
-                t_end.duration_since(t_after_graph),
-                t_end.duration_since(t_start),
-            );
-        }
-
-        result
+            .collect()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1666,14 +1620,15 @@ impl PairedUmiAssigner {
         if let Some(pos) = bytes.iter().position(|&b| b == b'-') {
             // Check for additional dashes after first
             if bytes[pos + 1..].contains(&b'-') {
-                return Err(anyhow::anyhow!(
-                    "UMI '{umi}' is not a valid paired UMI (expected format: 'A-B', found multiple '-')"
-                ));
+                return Err(Error::InvalidPairedUmi {
+                    umi: umi.to_string(),
+                    multiple_separators: true,
+                });
             }
             // SAFETY: '-' is a single byte ASCII, so splitting at its position is valid UTF-8
             Ok((&umi[..pos], &umi[pos + 1..]))
         } else {
-            Err(anyhow::anyhow!("UMI '{umi}' is not a valid paired UMI (expected format: 'A-B')"))
+            Err(Error::InvalidPairedUmi { umi: umi.to_string(), multiple_separators: false })
         }
     }
 

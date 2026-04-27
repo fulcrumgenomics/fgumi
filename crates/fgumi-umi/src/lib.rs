@@ -1,19 +1,54 @@
 #![deny(unsafe_code)]
+#![deny(missing_docs)]
 
-//! UMI (Unique Molecular Identifier) utilities
+//! UMI (Unique Molecular Identifier) utilities for fgumi.
 //!
-//! This crate provides functionality for working with UMIs including:
-//! - UMI assignment strategies (identity, edit-distance, adjacency, paired)
-//! - Tag set management for consensus calling
-//! - UMI grouping and family analysis
+//! This crate provides the building blocks for UMI-based read grouping and
+//! molecule identity tracking. It is consumed by the fgumi CLI and may also be
+//! used directly as a library.
+//!
+//! # Overview
+//!
+//! The crate is organized around two concepts:
+//!
+//! - **UMI assignment** ([`assigner`]): strategies that take a stream of UMI
+//!   observations and assign each to a canonical UMI, grouping reads that likely
+//!   originated from the same source molecule. Available strategies include
+//!   [`IdentityUmiAssigner`], [`SimpleErrorUmiAssigner`],
+//!   [`AdjacencyUmiAssigner`], and [`PairedUmiAssigner`].
+//! - **Molecule identity** ([`MoleculeId`]): a compact enum used to label reads
+//!   with a numeric molecule id, optionally with a duplex `/A` or `/B` suffix.
+//!
+//! Utility functions ([`validate_umi`], [`extract_mi_base`]) and a tag-set
+//! helper ([`TagInfo`]) round out the public API.
+//!
+//! # Example
+//!
+//! ```
+//! use fgumi_umi::{validate_umi, UmiValidation, extract_mi_base};
+//!
+//! // Validate a UMI string, matching fgbio's base-counting rules.
+//! assert_eq!(validate_umi(b"ACGT-TGCA"), UmiValidation::Valid(8));
+//! assert_eq!(validate_umi(b"ACNT"), UmiValidation::ContainsN);
+//!
+//! // Strip the duplex strand suffix from a molecule identifier.
+//! assert_eq!(extract_mi_base("42/A"), "42");
+//! ```
+//!
+//! # Errors
+//!
+//! All fallible public functions return [`enum@Error`] via [`Result`]. See
+//! [`enum@Error`] for the variants consumers may pattern-match on.
 
 pub mod assigner;
+pub mod error;
 
 // Re-export commonly used items
 pub use assigner::{
-    AdjacencyUmiAssigner, IdentityUmiAssigner, PairedUmiAssigner, SimpleErrorUmiAssigner, Strategy,
-    Umi, UmiAssigner,
+    AdjacencyUmiAssigner, DEFAULT_INDEX_THRESHOLD, IdentityUmiAssigner, PairedUmiAssigner,
+    SimpleErrorUmiAssigner, Strategy, Umi, UmiAssigner,
 };
+pub use error::{Error, Result};
 
 use std::collections::HashSet;
 

@@ -1,0 +1,45 @@
+# cargo-deny configuration.
+# See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "warn"
+ignore = [
+    # `paste` is a compile-time proc-macro crate whose author archived the repo.
+    # It is pulled in transitively via statrs -> nalgebra -> simba. There is no
+    # fix available and no drop-in replacement has been adopted upstream. Since
+    # `paste` only runs at build time to generate code, the unmaintained status
+    # is low risk for a runtime binary. Revisit when simba/nalgebra migrate.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

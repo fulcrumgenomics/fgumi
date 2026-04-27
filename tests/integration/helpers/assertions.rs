@@ -68,6 +68,7 @@ pub fn assert_header_unsorted(path: &std::path::Path) {
 /// # Panics
 ///
 /// Panics if the MI tag is missing or has unexpected value.
+#[allow(dead_code)]
 pub fn assert_mi_tag(record: &RecordBuf, expected: &str) {
     let mi_tag = Tag::from(SamTag::MI);
     let mi_value = record.data().get(&mi_tag).expect("Record should have MI tag");
@@ -91,6 +92,7 @@ pub fn assert_mi_tag(record: &RecordBuf, expected: &str) {
 /// # Panics
 ///
 /// Panics if the RX tag is missing or has unexpected value.
+#[allow(dead_code)]
 pub fn assert_rx_tag(record: &RecordBuf, expected: &str) {
     let rx_tag = Tag::from(SamTag::RX);
     let rx_value = record.data().get(&rx_tag).expect("Record should have RX tag");
@@ -118,6 +120,7 @@ pub fn assert_rx_tag(record: &RecordBuf, expected: &str) {
 /// # Panics
 ///
 /// Panics if consensus quality is not improved.
+#[allow(dead_code, clippy::cast_precision_loss)]
 pub fn assert_consensus_quality_improved(input_reads: &[RecordBuf], consensus: &RecordBuf) {
     // Calculate mean quality of input reads
     let input_mean_quality: f64 = input_reads
@@ -143,6 +146,7 @@ pub fn assert_consensus_quality_improved(input_reads: &[RecordBuf], consensus: &
 /// # Panics
 ///
 /// Panics if records have different MI tags or any record is missing MI tag.
+#[allow(dead_code)]
 pub fn assert_same_molecule_id(records: &[RecordBuf]) {
     if records.is_empty() {
         return;
@@ -178,6 +182,7 @@ pub fn assert_proper_pairing(r1: &RecordBuf, r2: &RecordBuf) {
 /// # Panics
 ///
 /// Panics if the families have the same molecule ID.
+#[allow(dead_code)]
 pub fn assert_different_molecule_ids(family1: &[RecordBuf], family2: &[RecordBuf]) {
     if family1.is_empty() || family2.is_empty() {
         return;
@@ -189,6 +194,95 @@ pub fn assert_different_molecule_ids(family1: &[RecordBuf], family2: &[RecordBuf
     let mi2 = family2[0].data().get(&mi_tag).expect("Family 2 should have MI tag");
 
     assert_ne!(mi1, mi2, "Different UMI families should have different molecule IDs");
+}
+
+/// Extract MI tag string values from a slice of records.
+///
+/// Records without an MI tag are skipped. Returns a `Vec<String>` with one entry
+/// per record that carries the tag.
+pub fn extract_mi_tags(records: &[RecordBuf]) -> Vec<String> {
+    let mi_tag = Tag::from([b'M', b'I']);
+    records
+        .iter()
+        .filter_map(|r| match r.data().get(&mi_tag)? {
+            Value::String(s) => Some(String::from_utf8_lossy(s.as_ref()).into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Compute the family-size distribution from a list of MI tag values.
+///
+/// Returns a sorted `Vec<usize>` where each element is the number of reads
+/// assigned to one MI group. The returned vec is sorted so that two equivalent
+/// distributions compare equal regardless of the order in which families appear
+/// or how MI numbers are assigned.
+pub fn count_mi_families(mi_tags: &[String]) -> Vec<usize> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for tag in mi_tags {
+        *counts.entry(tag.as_str()).or_insert(0) += 1;
+    }
+    let mut sizes: Vec<usize> = counts.into_values().collect();
+    sizes.sort_unstable();
+    sizes
+}
+
+/// Assert that two BAM files are record-level equivalent.
+///
+/// Checks:
+/// 1. Both files contain the same number of records (and at least one).
+/// 2. The multisets of sequences are identical (compared sorted).
+/// 3. If both files carry MI tags, the family-size distributions are identical.
+///    The exact MI values are not compared because the numbering scheme may differ
+///    between a sequential run and a runall pipeline run.
+///
+/// # Panics
+///
+/// Panics on any mismatch.
+pub fn assert_bam_equivalent(path_a: &std::path::Path, path_b: &std::path::Path) {
+    use crate::helpers::bam_generator::{count_bam_records, read_bam_records, read_bam_sequences};
+
+    let count_a = count_bam_records(path_a);
+    let count_b = count_bam_records(path_b);
+    assert_eq!(
+        count_a,
+        count_b,
+        "Record count mismatch: {} has {count_a}, {} has {count_b}",
+        path_a.display(),
+        path_b.display()
+    );
+    assert!(count_a > 0, "Both files should have at least one record");
+
+    // Compare sorted sequence multisets.
+    let mut seqs_a = read_bam_sequences(path_a);
+    let mut seqs_b = read_bam_sequences(path_b);
+    seqs_a.sort();
+    seqs_b.sort();
+    assert_eq!(
+        seqs_a,
+        seqs_b,
+        "Sequences differ between {} and {}",
+        path_a.display(),
+        path_b.display()
+    );
+
+    // Compare MI tag family-size distributions when tags are present.
+    let records_a = read_bam_records(path_a);
+    let records_b = read_bam_records(path_b);
+    let mi_a = extract_mi_tags(&records_a);
+    let mi_b = extract_mi_tags(&records_b);
+    if !mi_a.is_empty() && !mi_b.is_empty() {
+        let dist_a = count_mi_families(&mi_a);
+        let dist_b = count_mi_families(&mi_b);
+        assert_eq!(
+            dist_a,
+            dist_b,
+            "MI family size distributions differ between {} and {}",
+            path_a.display(),
+            path_b.display()
+        );
+    }
 }
 
 #[cfg(test)]

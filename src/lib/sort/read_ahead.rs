@@ -147,7 +147,7 @@ impl RawReadAheadReader {
                     }
                 }
                 Err(e) => {
-                    log::error!("Error reading raw BAM record: {e}");
+                    tracing::error!("Error reading raw BAM record: {e}");
                     // Store error so the foreground thread can retrieve it via take_error()
                     if let Ok(mut slot) = error_slot.lock() {
                         *slot = Some(e);
@@ -451,7 +451,7 @@ impl Iterator for RecordSource {
                     Ok(0) => None, // EOF
                     Ok(_) => Some(record),
                     Err(e) => {
-                        log::error!("Error reading raw BAM record: {e}");
+                        tracing::error!("Error reading raw BAM record: {e}");
                         // Preserve the first error; don't overwrite with later ones.
                         if error_slot.is_none() {
                             *error_slot = Some(e);

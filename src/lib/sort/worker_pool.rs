@@ -35,7 +35,6 @@ use crossbeam_queue::ArrayQueue;
 use fgumi_bgzf::reader::read_raw_blocks;
 use fgumi_bgzf::writer::InlineBgzfCompressor;
 use fgumi_bgzf::{RawBgzfBlock, decompress_block};
-use log::info;
 use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, Read};
@@ -43,6 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+use tracing::info;
 
 use crate::reorder_buffer::ReorderBuffer;
 
@@ -1221,7 +1221,7 @@ impl SortWorkerPool {
         let blocks = match read_raw_blocks(reader.as_mut(), INPUT_READ_BATCH_SIZE) {
             Ok(b) => b,
             Err(e) => {
-                log::error!("I/O error reading input BAM: {e}");
+                tracing::error!("I/O error reading input BAM: {e}");
                 shared.input_read_error.store(true, Ordering::Release);
                 shared.input_eof.store(true, Ordering::Release);
                 shared.main_thread_handle.unpark();
@@ -1291,7 +1291,7 @@ impl SortWorkerPool {
         let data = match decompress_block(&block, &mut worker.decompressor) {
             Ok(d) => d,
             Err(e) => {
-                log::error!("BGZF decompression error (input block serial {serial}): {e}");
+                tracing::error!("BGZF decompression error (input block serial {serial}): {e}");
                 shared.decompression_error.store(true, Ordering::Release);
                 shared.main_thread_handle.unpark();
                 return StepResult::InputEmpty;
@@ -1388,7 +1388,7 @@ impl SortWorkerPool {
                 let data = match decompress_block(&raw_block, &mut worker.decompressor) {
                     Ok(d) => d,
                     Err(e) => {
-                        log::error!(
+                        tracing::error!(
                             "BGZF decompression error (chunk source {i} serial {serial}): {e}"
                         );
                         shared.decompression_error.store(true, Ordering::Release);
@@ -1443,7 +1443,7 @@ impl SortWorkerPool {
             let blocks = match read_raw_blocks(&mut reader_guard.inner, PHASE2_READ_BATCH) {
                 Ok(b) => b,
                 Err(e) => {
-                    log::error!("I/O error reading chunk file (source {i}): {e}");
+                    tracing::error!("I/O error reading chunk file (source {i}): {e}");
                     shared.chunk_read_error.store(true, Ordering::Release);
                     file.mark_reader_eof(&mut reader_guard);
                     drop(reader_guard);
@@ -1717,7 +1717,7 @@ impl SortWorkerPool {
     /// stopped. It is also safe to simply drop the pool — `Drop` performs the same cleanup
     /// (minus the debug logging) if `shutdown` was not called explicitly.
     pub fn shutdown(mut self) {
-        if log::log_enabled!(log::Level::Debug) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             self.stats.log_summary();
             self.pipeline_stats.log_summary();
         }
@@ -1781,7 +1781,7 @@ impl SortWorkerPool {
             match job.result_tx.try_send(result) {
                 Ok(()) => return,
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    log::warn!(
+                    tracing::warn!(
                         "compress result discarded (serial {serial}): I/O writer thread disconnected"
                     );
                     return;

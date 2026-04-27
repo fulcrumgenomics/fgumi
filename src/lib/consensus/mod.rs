@@ -2,13 +2,13 @@
 //!
 //! This module re-exports from the `fgumi-consensus` crate for backward compatibility.
 
-pub use fgumi_consensus::{base_builder, caller, filter, overlapping, sequence, simple_umi, tags};
+pub use fgumi_consensus::{
+    MethylationMode, base_builder, caller, filter, methylation, overlapping, sequence, simple_umi,
+    tags,
+};
 
-#[cfg(feature = "codec")]
 pub use fgumi_consensus::codec_caller;
-#[cfg(feature = "duplex")]
 pub use fgumi_consensus::duplex_caller;
-#[cfg(feature = "simplex")]
 pub use fgumi_consensus::vanilla_caller;
 
 // Re-export commonly used items
@@ -20,13 +20,10 @@ pub use fgumi_consensus::{
     log_consensus_statistics, mask_bases, mask_duplex_bases, mean_base_quality, template_passes,
 };
 
-#[cfg(feature = "simplex")]
 pub use fgumi_consensus::{
     VanillaConsensusRead, VanillaUmiConsensusCaller, VanillaUmiConsensusOptions,
 };
 
-#[cfg(feature = "duplex")]
 pub use fgumi_consensus::{DuplexConsensusCaller, DuplexConsensusRead};
 
-#[cfg(feature = "codec")]
 pub use fgumi_consensus::{CodecConsensusCaller, CodecConsensusOptions, CodecConsensusStats};

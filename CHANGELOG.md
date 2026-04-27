@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- `runall`: fix `AlignAndMerge` thread-A race that could surface as a
+  spurious "processed all unmapped reads but mapped reads remain" error
+  at higher thread counts: the stdin-writer thread now forwards each
+  batch's unmapped bytes to the merge thread **before** writing FASTQ
+  to the aligner, so a partial-write + EPIPE never silently drops the
+  in-flight batch from the merge input.
+- `runall`: fix `AlignAndMerge` deadlock at non-trivial input sizes
+  when the aligner buffers its whole input chunk before emitting
+  (e.g. `bwa mem -K` larger than the total input): the unmapped
+  forwarding channel is now unbounded, so thread A can finish writing
+  and close stdin instead of stalling on a full channel while thread
+  C waits on mapped records and the aligner waits on stdin EOF.
+- `runall`: replace the terse `AlignAndMerge` tail-check error with
+  an actionable diagnostic that names the offending template, points
+  at the real cause (aligner SAM output must be in the same order
+  as the FASTQ records written to its stdin), and lists concrete
+  next steps (`--aligner::threads 1` for thread-reordering aligners;
+  `--threads 1` for custom/replay aligners whose output is
+  independent of stdin).
+
+### Features
+
+- `runall`: add an off-by-default `runall-reorder-aligner-input` Cargo
+  feature that reorders `AlignAndMerge`'s input into canonical
+  ordinal order before feeding the aligner. Built for benchmark
+  harnesses (e.g. fgumi-benchmarks's `replay-aligner.sh`, which
+  streams a pre-aligned BAM whose SAM order is fixed independent of
+  stdin) — the default binary stays on the fast path that assumes
+  the aligner preserves input order, because real aligners
+  (`bwa mem`, `bwa-mem2`) do.
+
 ## [0.2.0] - 2026-04-22
 
 ### Bug Fixes
@@ -75,6 +108,16 @@ All notable changes to this project will be documented in this file.
 ### Breaking Changes
 
 - Rename the template-coordinate sort-key tag written by `fgumi zipper` from `pa` to `tc` to avoid collision with bwa-mem's `pa:f` (primary-alignment score fraction) ([#268](https://github.com/fulcrumgenomics/fgumi/issues/268)). The `--skip-pa-tags` flag on `fgumi zipper` is renamed to `--skip-tc-tags`, and the `missing_pa_tag` dedup metric field is renamed to `missing_tc_tag`. Existing fgumi-zippered BAMs must be re-zippered (or the tag must be manually renamed) before `fgumi dedup` will accept them.
+
+### Changed
+
+- Unified progress tracking: new `--progress {auto,dashboard,heartbeat,none}`
+  flag on runall. Interactive runs get a multi-stage dashboard; batch runs
+  get periodic logfmt heartbeat lines and an end-of-run summary table with
+  read/written totals and consensus ratio. Standalone commands (extract,
+  sort, group, filter, etc.) now use the same tracker. ETA is shown as
+  `???` until the source reader finishes, then computed from the bottleneck
+  stage rate.
 
 ## [0.1.3] - 2026-04-11
 

@@ -163,8 +163,10 @@ impl<K: RawSortKey> Drop for PooledChunkWriter<K> {
             if let Some(handle) = self.io_handle.take() {
                 match handle.join() {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::error!("PooledChunkWriter: I/O writer thread error: {e}"),
-                    Err(_) => log::error!("PooledChunkWriter: I/O writer thread panicked"),
+                    Ok(Err(e)) => {
+                        tracing::error!("PooledChunkWriter: I/O writer thread error: {e}");
+                    }
+                    Err(_) => tracing::error!("PooledChunkWriter: I/O writer thread panicked"),
                 }
             }
         }
@@ -208,8 +210,8 @@ impl Drop for SpillWriteHandle {
         if let Some(handle) = self.io_handle.take() {
             match handle.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => log::error!("SpillWriteHandle: I/O writer thread error: {e}"),
-                Err(_) => log::error!("SpillWriteHandle: I/O writer thread panicked"),
+                Ok(Err(e)) => tracing::error!("SpillWriteHandle: I/O writer thread error: {e}"),
+                Err(_) => tracing::error!("SpillWriteHandle: I/O writer thread panicked"),
             }
         }
     }

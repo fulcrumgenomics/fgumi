@@ -4,6 +4,7 @@
 //! by verifying that noodles can read back what we write, field by field.
 //!
 //! Each test section is labelled with what it exercises:
+#![cfg(feature = "noodles")]
 //!
 //! 1. [`SamBuilder`] (all fields + all tag types) → noodles `RecordBuf` decode
 //! 2. [`UnmappedSamBuilder`] → noodles decode
@@ -11,7 +12,6 @@
 //! 4. Tag editor mutations → noodles tag verification
 //! 5. SIMD sequence extraction vs noodles sequence decode
 //! 6. Proptest random complete records → noodles full field verification
-#![cfg(feature = "noodles")]
 #![deny(unsafe_code)]
 #![allow(clippy::too_many_lines)] // test functions are intentionally exhaustive
 #![allow(clippy::cast_possible_truncation)] // test values are always in range

@@ -76,15 +76,13 @@
 //! - [`shared_try_step_write_new`] — Drain queue to reorder buffer, write in order
 
 use crossbeam_queue::ArrayQueue;
-use log::info;
 use parking_lot::Mutex;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use crate::progress::ProgressTracker;
+use tracing::info;
 
 use super::deadlock::{DeadlockAction, DeadlockState, QueueSnapshot, check_deadlock_and_restore};
 
@@ -314,7 +312,7 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
     // Main memory line with RSS vs tracked accuracy
     if breakdown.system_rss_gb > 0.0 {
         let pct = (breakdown.tracked_total_gb / breakdown.system_rss_gb * 100.0) as u32;
-        log::info!(
+        tracing::info!(
             "MEMORY: RSS={:.1}GB Tracked={:.1}GB ({}%) | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
             breakdown.system_rss_gb,
             breakdown.tracked_total_gb,
@@ -331,7 +329,7 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
             breakdown.infrastructure_gb * 1e3, // Convert GB to MB for display
         );
     } else {
-        log::info!(
+        tracing::info!(
             "MEMORY: Tracked={:.1}GB | Queue: Q1:{:.0}MB Q2:{:.0}MB Q3:{:.0}MB Q4:{:.1}GB Q5:{:.1}GB Q6:{:.0}MB Q7:{:.0}MB | Proc: Pos={:.1}GB Tmpl={:.1}GB | Infra={:.0}MB",
             breakdown.tracked_total_gb,
             breakdown.q1_mb,
@@ -351,7 +349,7 @@ pub fn log_comprehensive_memory_stats(stats: &PipelineStats) {
     if breakdown.system_rss_gb > 0.0 {
         let untracked_pct = ((breakdown.untracked_gb / breakdown.system_rss_gb) * 100.0) as u32;
         if breakdown.untracked_gb > 1.0 {
-            log::info!(
+            tracing::info!(
                 "   Untracked: {:.1}GB ({}%) = allocator fragmentation + noodles internals",
                 breakdown.untracked_gb,
                 untracked_pct,
@@ -385,7 +383,7 @@ pub fn start_memory_monitor(
                     && current_rss < last_rss
                     && peak_rss > 4_000_000_000
                 {
-                    log::info!("=== MIMALLOC STATS AT PEAK (no mi_collect) ===");
+                    tracing::info!("=== MIMALLOC STATS AT PEAK (no mi_collect) ===");
                     crate::sort::memory_probe::print_mi_stats();
                     stats_printed = true;
                 }
@@ -688,9 +686,6 @@ impl StepResult {
         matches!(self, StepResult::Success)
     }
 }
-
-/// Progress logging interval for the 7-step pipeline.
-pub const PROGRESS_LOG_INTERVAL: u64 = 1_000_000;
 
 /// Memory threshold for scheduler backpressure signaling (512 MB).
 ///
@@ -1751,8 +1746,8 @@ pub struct OutputPipelineQueues<G, P: MemoryEstimate> {
     pub items_written: AtomicU64,
     /// Flag indicating pipeline is draining (input complete, finishing up).
     pub draining: AtomicBool,
-    /// Progress tracker for logging.
-    pub progress: ProgressTracker,
+    /// Stage name used to emit `progress::records_out` events.
+    pub progress_stage: String,
 
     // ========== Performance Statistics ==========
     /// Optional performance statistics collector.
@@ -1766,7 +1761,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
     /// - `queue_capacity`: Capacity for all `ArrayQueue`s
     /// - `output`: Output writer (will be wrapped in Mutex)
     /// - `stats`: Optional performance statistics collector
-    /// - `progress_name`: Name for the progress tracker (e.g., "Processed records")
+    /// - `progress_name`: Stage name used when emitting `progress::records_out` events.
     /// - `queue_memory_limit`: Memory limit for the write reorder buffer in bytes (0 = 512 MiB default)
     #[must_use]
     pub fn new(
@@ -1794,7 +1789,7 @@ impl<G: Send, P: Send + MemoryEstimate> OutputPipelineQueues<G, P> {
             error: Mutex::new(None),
             items_written: AtomicU64::new(0),
             draining: AtomicBool::new(false),
-            progress: ProgressTracker::new(progress_name).with_interval(PROGRESS_LOG_INTERVAL),
+            progress_stage: progress_name.to_string(),
             stats,
         }
     }
@@ -2123,8 +2118,8 @@ pub trait PipelineLifecycle {
     /// Get reference to optional pipeline statistics.
     fn stats(&self) -> Option<&PipelineStats>;
 
-    /// Get reference to the progress tracker.
-    fn progress(&self) -> &ProgressTracker;
+    /// Stage name used when emitting `progress::records_out` events.
+    fn progress_stage(&self) -> &str;
 
     /// Get the number of items written.
     fn items_written(&self) -> u64;

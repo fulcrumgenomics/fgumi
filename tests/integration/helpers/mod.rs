@@ -9,6 +9,11 @@
 
 pub mod assertions;
 pub mod bam_generator;
+pub mod grouped_bam_fixture;
+pub mod mi_determinism_fixture;
+pub mod references;
+pub mod stage_harness;
+pub mod thread_registry;
 
 pub use assertions::*;
 pub use bam_generator::*;

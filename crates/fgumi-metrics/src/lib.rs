@@ -8,15 +8,18 @@
 //! - [`rejection`] module for rejection reason tracking
 //! - [`writer`] module for TSV file output
 
-#[cfg(feature = "clip")]
 pub mod clip;
 pub mod consensus;
 pub mod correct;
+pub mod downsampling;
 pub mod duplex;
 pub mod group;
+pub mod inline_collector;
+pub mod intervals;
 pub mod rejection;
 pub mod shared;
 pub mod simplex;
+pub mod template_info;
 pub mod writer;
 
 use serde::{Deserialize, Serialize};
@@ -86,18 +89,21 @@ pub trait ProcessingMetrics {
 }
 
 // Re-export commonly used types
-#[cfg(feature = "clip")]
 pub use clip::{ClipCounts, ClippingMetrics, ClippingMetricsCollection, ReadType};
 pub use consensus::{ConsensusKvMetric, ConsensusMetrics};
 pub use correct::UmiCorrectionMetrics;
+pub use downsampling::{DOWNSAMPLING_FRACTIONS, compute_hash_fraction};
 pub use duplex::{
     DuplexFamilySizeMetric, DuplexMetricsCollector, DuplexUmiMetric, DuplexYieldMetric,
     FamilySizeMetric,
 };
 pub use group::{FamilySizeMetrics, PositionGroupSizeMetrics, UmiGroupingMetrics};
+pub use inline_collector::{InlineCollector, InlineMetricsCollector, MetricsCollector};
+pub use intervals::{Interval, overlaps_intervals, parse_intervals};
 pub use rejection::{RejectionReason, format_count};
 pub use shared::UmiMetric;
 pub use simplex::{SimplexFamilySizeMetric, SimplexMetricsCollector, SimplexYieldMetric};
+pub use template_info::{ReadInfoKey, TemplateInfo, TemplateMetadata, compute_template_metadata};
 pub use writer::{read_metrics, read_metrics_auto, write_metrics};
 
 #[cfg(test)]

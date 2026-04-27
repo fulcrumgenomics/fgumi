@@ -12,14 +12,14 @@ use clap::Parser;
 use fgumi_raw_bam::{
     RawRecord, extract_sequence_into, quality_scores_slice, read_name as raw_read_name,
 };
-use log::info;
 use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
+use tracing::info;
 
 use crate::commands::command::Command;
 
-/// Lookup table for Phred to Phred+33 ASCII conversion (clamped to 126)
-static QUAL_TO_ASCII: [u8; 256] = {
+/// Lookup table for Phred to Phred+33 ASCII conversion (clamped to 126).
+pub(crate) static QUAL_TO_ASCII: [u8; 256] = {
     let mut table = [0u8; 256];
     let mut i = 0;
     while i < 256 {
@@ -30,8 +30,8 @@ static QUAL_TO_ASCII: [u8; 256] = {
     table
 };
 
-/// Lookup table for base complement (A<->T, C<->G, others->N)
-static COMPLEMENT: [u8; 256] = {
+/// Lookup table for base complement (A<->T, C<->G, others->N).
+pub(crate) static COMPLEMENT: [u8; 256] = {
     let mut table = [b'N'; 256];
     table[b'A' as usize] = b'T';
     table[b'a' as usize] = b'T';

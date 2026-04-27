@@ -22,13 +22,15 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Install bwa and samtools
+        run: sudo apt-get update && sudo apt-get install -y bwa samtools
       - name: Install nextest
         uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
         with:
           tool: nextest
       - name: Unit tests
         run: cargo ci-test
-  
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +56,8 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Install bwa and samtools
+        run: sudo apt-get update && sudo apt-get install -y bwa samtools
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
         with:
@@ -63,7 +67,7 @@ jobs:
         with:
           tool: nextest
       - name: Generate coverage
-        run: cargo llvm-cov nextest --features compare,simulate,profile-adjacency --no-tests=pass --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --features compare,simulate --no-tests=pass --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
@@ -87,6 +91,12 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+    # cargo-audit and cargo-deny run cargo metadata under the hood; the
+    # workflow-level RUSTC_WRAPPER=sccache would make them invoke a binary
+    # that isn't installed in this job (no compilation happens here). Unset
+    # the wrapper for the whole job so neither tool needs sccache.
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -94,8 +104,14 @@ jobs:
         uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458 # v2.75.19
         with:
           tool: cargo-audit
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-deny
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit
+      - name: Deny check (license, advisory, bans, sources)
+        run: cargo deny check
 
   publish-dry-run:
     runs-on: ubuntu-latest
@@ -133,11 +149,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: cargo check --workspace --no-default-features --all-targets
         # The regular test/lint jobs run with default features enabled, which
         # pulls in every optional dependency transitively. That hides two
@@ -152,3 +168,32 @@ jobs:
         # (lib + tests + benches) with no default features to surface
         # regressions at PR time.
         run: cargo check --workspace --no-default-features --all-targets
+
+  feature-flags:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: default
+            flags: ""
+          - name: all
+            flags: "--all-features"
+          - name: compare
+            flags: "--features compare"
+          - name: simulate
+            flags: "--features simulate"
+          - name: memory-debug
+            flags: "--features memory-debug"
+    name: feature-flags (${{ matrix.features.name }})
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Build
+        run: cargo build --workspace ${{ matrix.features.flags }}
+      - name: Check (all targets)
+        run: cargo check --workspace --all-targets ${{ matrix.features.flags }}

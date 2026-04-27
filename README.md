@@ -58,6 +58,28 @@ The diagram shows the workflow from FASTQ files to filtered consensus reads:
 - **Green**: CODEC consensus
 - **Orange**: Optional UMI correction for fixed UMI sets
 
+## Quickstart
+
+Run the full UMI pipeline in one command:
+
+```bash
+fgumi runall \
+    --start-from extract \
+    --input r1.fastq.gz r2.fastq.gz \
+    --extract::sample SAMPLE --extract::library LIB \
+    --extract::read-structures 8M+T 8M+T \
+    --reference hs38DH.fa \
+    --output consensus.bam
+```
+
+`runall` streams through extract -> align -> zipper -> sort -> group -> consensus -> filter
+in memory without writing intermediate BAMs. Use `--start-from` to enter the pipeline at
+a later stage (e.g. `sort`, `zipper`, or `group`) when you already have partial outputs,
+and `--stop-after` to halt early (e.g. after `sort` for a sorted BAM).
+
+See the [`runall` chapter](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/runall.md)
+in the user guide for the full flag reference, entry points, and stage-specific tuning.
+
 ## Resources
 
 * [Documentation](https://docs.rs/fgumi)
@@ -140,77 +162,13 @@ For detailed usage of each command, run:
 fgumi <command> --help
 ```
 
-### Basic Workflow
-
-1. **Extract UMIs** from FASTQ:
-```bash
-fgumi extract \
-  --inputs R1.fastq.gz R2.fastq.gz \
-  --read-structures +T +M \
-  --output unaligned.bam \
-  --sample MySample \
-  --library MyLibrary
-```
-
-2. **(Optional) Correct UMIs** for fixed UMI sets:
-```bash
-fgumi correct \
-  --input unaligned.bam \
-  --output corrected.bam \
-  --umi-files umis.txt \
-  --min-distance 1
-```
-
-3. **Align and sort** reads using fgumi fastq + zipper + sort pipeline:
-```bash
-fgumi fastq --input unaligned.bam \
-  | bwa mem -p ref.fa - \
-  | fgumi zipper --unmapped unaligned.bam \
-  | fgumi sort --output sorted.bam --order template-coordinate
-```
-
-4. **Group** reads by UMI:
-```bash
-fgumi group \
-  --input sorted.bam \
-  --output grouped.bam \
-  --strategy paired   # for duplex workflows
-  # or --strategy adjacency for simplex/codec workflows
-```
-
-5. **Call consensus** reads:
-```bash
-# Simplex consensus
-fgumi simplex \
-  --input grouped.bam \
-  --output consensus.bam
-
-# Or duplex consensus
-fgumi duplex \
-  --input grouped.bam \
-  --output duplex.bam
-
-# Or codec consensus
-fgumi codec \
-  --input grouped.bam \
-  --output codec_consensus.bam
-```
-
-6. **(Optional) Collect duplex metrics**:
-```bash
-fgumi duplex-metrics \
-  --input grouped.bam \
-  --output metrics
-```
-
-7. **Filter** consensus reads:
-```bash
-fgumi filter \
-  --input consensus.bam \
-  --output filtered.bam \
-  --ref ref.fa \
-  --min-reads 1,1,1
-```
+The recommended way to run the end-to-end pipeline is `fgumi runall` (see
+[Quickstart](#quickstart) above). If you need to run individual stages
+—for debugging, custom alignment, or integration into a workflow manager
+(Nextflow/Snakemake)—see the
+[Best Practice Pipeline](https://github.com/fulcrumgenomics/fgumi/blob/main/docs/src/guide/best-practices.md)
+chapter in the user guide for the step-by-step chain
+(`extract` -> `fastq` -> aligner -> `zipper` -> `sort` -> `group` -> consensus -> `filter`).
 
 ## Performance Options
 

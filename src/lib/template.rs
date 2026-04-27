@@ -876,6 +876,78 @@ impl<R: std::io::Read> Iterator for TemplateIterator<R> {
     }
 }
 
+/// Template iterator that consumes any iterator yielding `Result<RawRecord>`
+/// and groups consecutive same-queryname records into templates.
+///
+/// Used by callers that already hold a record iterator (e.g. an `AlignAndMerge`
+/// stage consuming raw BAM chunks over a channel) rather than a raw BAM reader.
+/// The input must be queryname-sorted or queryname-grouped.
+pub struct TemplateIterFromRecords<I>
+where
+    I: Iterator<Item = Result<RawRecord>>,
+{
+    inner: I,
+    pending: Option<RawRecord>,
+    exhausted: bool,
+}
+
+impl<I> TemplateIterFromRecords<I>
+where
+    I: Iterator<Item = Result<RawRecord>>,
+{
+    /// Create a new template iterator that pulls records from `inner`.
+    pub fn new(inner: I) -> Self {
+        Self { inner, pending: None, exhausted: false }
+    }
+}
+
+impl<I> Iterator for TemplateIterFromRecords<I>
+where
+    I: Iterator<Item = Result<RawRecord>>,
+{
+    type Item = Result<Template>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.exhausted && self.pending.is_none() {
+            return None;
+        }
+
+        let mut batch: Vec<RawRecord> = Vec::with_capacity(2);
+        if let Some(peeked) = self.pending.take() {
+            batch.push(peeked);
+        }
+
+        loop {
+            if self.exhausted {
+                break;
+            }
+            match self.inner.next() {
+                None => {
+                    self.exhausted = true;
+                    break;
+                }
+                Some(Ok(rec)) => {
+                    if batch.is_empty() {
+                        batch.push(rec);
+                    } else {
+                        let first_name = fgumi_raw_bam::read_name(&batch[0]).to_vec();
+                        let name = fgumi_raw_bam::read_name(&rec).to_vec();
+                        if name == first_name {
+                            batch.push(rec);
+                        } else {
+                            self.pending = Some(rec);
+                            break;
+                        }
+                    }
+                }
+                Some(Err(e)) => return Some(Err(e)),
+            }
+        }
+
+        if batch.is_empty() { None } else { Some(Template::from_records(batch)) }
+    }
+}
+
 // ============================================================================
 // MemoryEstimate Implementations
 // ============================================================================

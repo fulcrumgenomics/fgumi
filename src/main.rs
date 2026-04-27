@@ -10,7 +10,6 @@ const STYLES: Styles = Styles::styled()
     .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
     .placeholder(AnsiColor::Cyan.on_default());
-use env_logger::Env;
 use fgumi_lib::commands::clip::Clip;
 #[cfg(feature = "codec")]
 use fgumi_lib::commands::codec::Codec;
@@ -30,6 +29,7 @@ use fgumi_lib::commands::filter::Filter;
 use fgumi_lib::commands::group::GroupReadsByUmi;
 use fgumi_lib::commands::merge::Merge;
 use fgumi_lib::commands::review::Review;
+use fgumi_lib::commands::runall::Runall;
 #[cfg(feature = "simplex")]
 use fgumi_lib::commands::simplex::Simplex;
 #[cfg(feature = "simplex")]
@@ -38,7 +38,7 @@ use fgumi_lib::commands::simplex_metrics::SimplexMetrics;
 use fgumi_lib::commands::simulate::Simulate;
 use fgumi_lib::commands::sort::Sort;
 use fgumi_lib::commands::zipper::Zipper;
-use log::info;
+use tracing::info;
 
 /// Commands that require feature flags to be enabled.
 /// Format: (`command_name`, `feature_name`)
@@ -59,16 +59,29 @@ const FEATURE_GATED_COMMANDS: &[(&str, &str)] = &[
     ("simulate", "simulate"),
 ];
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static GLOBAL: dhat::Alloc = dhat::Alloc;
-
-#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Initialize the global tracing subscriber.
+///
+/// Uses the `RUST_LOG` env var as the filter if present; otherwise falls
+/// back to `default_level` (`"info"` or `"debug"` depending on `--verbose`).
+/// The format layer writes `target: message` with timestamps to stderr,
+/// matching the prior `env_logger` output shape closely enough for
+/// log-scraping tests.
+fn init_logging(default_level: &str) {
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(true).with_writer(std::io::stderr))
+        .init();
+}
+
 #[derive(Parser, Debug)]
-#[command(styles = STYLES)]
+#[command(styles = STYLES, version, long_version = fgumi_lib::version::long_version_str())]
 struct Args {
     /// Enable verbose (debug-level) logging. Equivalent to setting `RUST_LOG=debug`.
     #[arg(short, long, global = true)]
@@ -78,9 +91,13 @@ struct Args {
 }
 
 #[derive(Parser, Debug)]
-#[command(version)]
+#[command(version, long_version = fgumi_lib::version::long_version_str())]
 #[allow(clippy::large_enum_variant)]
 enum Subcommand {
+    // End-to-end pipeline
+    #[command(display_order = 0)]
+    Runall(Runall),
+
     // Grouping
     #[command(display_order = 1)]
     Extract(Extract),
@@ -144,6 +161,7 @@ enum Subcommand {
 impl Subcommand {
     fn execute(&self, command_line: &str) -> Result<()> {
         match self {
+            Self::Runall(cmd) => cmd.execute(command_line),
             Self::Extract(cmd) => cmd.execute(command_line),
             Self::Correct(cmd) => cmd.execute(command_line),
             Self::Fastq(cmd) => cmd.execute(command_line),
@@ -175,9 +193,6 @@ impl Subcommand {
 }
 
 fn main() -> Result<()> {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
     // Capture full command line BEFORE clap parsing for @PG records
     let command_line = std::env::args().collect::<Vec<_>>().join(" ");
 
@@ -202,7 +217,7 @@ fn main() -> Result<()> {
     };
 
     let default_level = if args.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
+    init_logging(default_level);
 
     info!("Running fgumi version {}", fgumi_lib::version::VERSION.as_str());
     args.subcommand.execute(&command_line)

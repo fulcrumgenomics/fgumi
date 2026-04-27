@@ -5,14 +5,13 @@
 
 use crate::commands::common::parse_bool;
 use crate::logging::OperationTimer;
-use crate::progress::ProgressTracker;
 use crate::validation::validate_file_exists;
 use anyhow::Result;
 use clap::Parser;
-use log::info;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use tracing::info;
 
 use crate::commands::command::Command;
 
@@ -173,7 +172,6 @@ impl Command for CompareMetrics {
 
         let mut differences: Vec<String> = Vec::new();
         let mut line_num = 0usize;
-        let progress = ProgressTracker::new("Compared lines").with_interval(100_000);
 
         // Stream through both files simultaneously
         loop {
@@ -183,7 +181,7 @@ impl Command for CompareMetrics {
             match (line1, line2) {
                 (Some(Ok(l1)), Some(Ok(l2))) => {
                     line_num += 1;
-                    progress.log_if_needed(1);
+                    crate::progress::records_out("compare_metrics", 1);
 
                     let fields1: Vec<&str> =
                         l1.trim_end_matches(['\n', '\r']).split('\t').collect();
@@ -252,7 +250,6 @@ impl Command for CompareMetrics {
             }
         }
 
-        progress.log_final();
         let is_equal = differences.is_empty();
 
         if !self.quiet {

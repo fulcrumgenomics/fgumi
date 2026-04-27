@@ -14,7 +14,6 @@ pub mod testutil;
 
 #[cfg(feature = "noodles")]
 pub mod indexed_reader;
-
 #[cfg(feature = "noodles")]
 pub mod noodles_compat;
 

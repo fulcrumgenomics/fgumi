@@ -17,7 +17,6 @@ use crate::overlapping_consensus::{
     AgreementStrategy, CorrectionStats, DisagreementStrategy, OverlappingBasesConsensusCaller,
     apply_overlapping_consensus,
 };
-use crate::progress::ProgressTracker;
 use crate::read_info::LibraryIndex;
 use crate::unified_pipeline::{
     GroupKeyConfig, Grouper, MemoryEstimate, run_bam_pipeline_from_reader,
@@ -32,12 +31,12 @@ use crate::sam::{SamTag, header_as_unsorted};
 use crate::vanilla_consensus_caller::{VanillaUmiConsensusCaller, VanillaUmiConsensusOptions};
 use parking_lot::Mutex;
 
-use log::info;
 use noodles::sam::Header;
 use noodles::sam::alignment::record::data::field::Tag;
 use std::io;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
+use tracing::info;
 
 use crate::commands::command::Command;
 use crate::commands::common::{
@@ -89,6 +88,22 @@ struct CollectedSimplexMetrics {
     /// Number of MI groups processed
     groups_processed: u64,
 }
+
+const SIMPLEX_EXAMPLES: &str = r"EXAMPLES:
+    # Basic simplex consensus (retain singletons)
+    fgumi simplex -i grouped.bam -o consensus.bam --min-reads 1
+
+    # Require at least 2 reads to form a consensus; write rejects
+    fgumi simplex -i grouped.bam -o consensus.bam \
+        --min-reads 2 \
+        --rejects rejected.bam \
+        --stats consensus.stats.tsv
+
+    # Methylation-aware consensus (EM-Seq)
+    fgumi simplex -i grouped.bam -o consensus.bam \
+        --min-reads 1 \
+        --methylation-mode em-seq --ref ref.fa
+";
 
 /// Calls simplex consensus sequences from reads with the same unique molecular tag.
 #[derive(Debug, Parser)]
@@ -153,7 +168,8 @@ And those that have a value per base:
 
 The per base depths and errors are both capped at 32,767. In all cases no-calls (Ns) and bases below the
 --min-input-base-quality are not counted in tag value calculations.
-"#
+"#,
+    after_help = SIMPLEX_EXAMPLES,
 )]
 pub struct Simplex {
     /// Input/output BAM file paths
@@ -224,6 +240,10 @@ impl Command for Simplex {
 
         // Validate inputs
         self.io.validate()?;
+
+        let _progress_guard = crate::progress::init(crate::progress::Mode::Auto);
+        crate::progress::pipeline_started("simplex", None);
+        crate::progress::stage_started("simplex", None);
 
         if let Some(max) = self.max_reads {
             if max < self.min_reads {
@@ -296,6 +316,8 @@ impl Command for Simplex {
                 methylation_mode,
             );
             timer.log_completion(0); // Completion logged in execute_threads_mode
+            crate::progress::stage_finished("simplex");
+            crate::progress::pipeline_finished(result.is_ok());
             return result;
         }
 
@@ -365,7 +387,6 @@ impl Command for Simplex {
 
         // Track progress (count records written, not UMI groups)
         let mut record_count: usize = 0;
-        let progress = ProgressTracker::new("Processed records").with_interval(1_000_000);
 
         // Use the raw_reader opened above (single input open).
         let raw_record_iter = std::iter::from_fn(move || {
@@ -420,7 +441,7 @@ impl Command for Simplex {
                 caller.clear_rejected_reads();
             }
 
-            progress.log_if_needed(batch_size as u64);
+            crate::progress::records_out("simplex", batch_size as u64);
         }
 
         // For single-threaded, use the caller's stats and merge overlapping stats
@@ -429,7 +450,7 @@ impl Command for Simplex {
             merged_overlapping_stats.merge(oc.stats());
         }
 
-        progress.log_final();
+        crate::progress::records_written(record_count as u64);
 
         // Finish the buffered writer (flush remaining records and wait for writer thread)
         writer.into_inner().finish().context("Failed to finish output BAM")?;
@@ -464,6 +485,8 @@ impl Command for Simplex {
             info!("Rejected reads written successfully");
         }
 
+        crate::progress::stage_finished("simplex");
+        crate::progress::pipeline_finished(true);
         Ok(())
     }
 }

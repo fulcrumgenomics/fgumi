@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use fgumi_raw_bam::{RawRecord, SamBuilder, flags as raw_flags};
-use log::info;
 use noodles::sam::header::Header;
 use rand::{Rng, RngExt};
 use rayon::prelude::*;
@@ -20,6 +19,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use tracing::info;
 
 /// Generate unmapped BAM and UMI includelist for `fgumi correct`.
 #[derive(Parser, Debug)]
