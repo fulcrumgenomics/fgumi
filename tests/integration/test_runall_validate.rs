@@ -159,41 +159,11 @@ fn runall_duplex_consensus_with_adjacency_strategy_fails_validation() {
     );
 }
 
-/// `--consensus simplex --group::strategy paired` is rejected — paired MIs
-/// confuse simplex consensus (each molecule splits into two MI groups).
-#[test]
-fn runall_simplex_consensus_with_paired_strategy_fails_validation() {
-    let tmp = TempDir::new().unwrap();
-    let in_bam = tmp.path().join("in.bam");
-    std::fs::write(&in_bam, b"not a real bam").unwrap();
-    let out_bam = tmp.path().join("out.bam");
-
-    let (ok, stderr) = run_runall(&[
-        "--start-from",
-        "group",
-        "--stop-after",
-        "filter",
-        "--input",
-        in_bam.to_str().unwrap(),
-        "--output",
-        out_bam.to_str().unwrap(),
-        "--consensus",
-        "simplex",
-        "--group::strategy",
-        "paired",
-        "--filter::min-reads",
-        "1",
-    ]);
-    assert!(!ok, "simplex + paired must fail validation; stderr:\n{stderr}");
-    assert!(
-        stderr.contains("incompatible with --group::strategy paired"),
-        "stderr should call out the simplex/codec+paired mismatch; got:\n{stderr}"
-    );
-}
-
-/// `--consensus codec --group::strategy paired` is rejected for the same
-/// reason as simplex — codec.rs explicitly says "must use adjacency or
-/// identity (NOT paired)".
+/// `--consensus codec --group::strategy paired` is rejected — codec.rs
+/// explicitly says "must use adjacency or identity (NOT paired)".
+/// (simplex+paired is intentionally allowed: simplex treats /A and /B as
+/// independent MI groups, which is the contract exercised by
+/// `test_runall_group_output_records::*_threads_4` on paired-UMI fixtures.)
 #[cfg(feature = "codec")]
 #[test]
 fn runall_codec_consensus_with_paired_strategy_fails_validation() {
@@ -220,7 +190,7 @@ fn runall_codec_consensus_with_paired_strategy_fails_validation() {
     ]);
     assert!(!ok, "codec + paired must fail validation; stderr:\n{stderr}");
     assert!(
-        stderr.contains("incompatible with --group::strategy paired"),
+        stderr.contains("--consensus codec is incompatible with --group::strategy paired"),
         "stderr should call out the codec+paired mismatch; got:\n{stderr}"
     );
 }

@@ -248,19 +248,21 @@ impl Runall {
             }
 
             // The group stage runs whenever the plan reaches consensus, and the
-            // strategy GroupAssign uses must produce MI tags compatible with the
-            // consensus caller — runall overwrites pre-existing MI tags under
+            // strategy GroupAssign uses must produce MI tags the consensus
+            // caller can handle — runall overwrites pre-existing MI tags under
             // --start-from group, so the input's tags are always replaced.
             //
-            //   - duplex: requires `paired` (produces /A and /B-suffixed MIs)
-            //   - simplex / codec: must NOT use `paired` (the /A /B suffix
-            //     splits each molecule into two MI groups, which neither
-            //     simplex nor codec consensus understand; codec.rs explicitly
-            //     calls out `must use adjacency or identity (NOT paired)`)
+            //   - duplex: requires `paired` (consensus rejects records whose
+            //     MI tags lack /A or /B suffixes)
+            //   - codec: must NOT use `paired` (codec.rs is explicit:
+            //     "must use adjacency or identity (NOT paired)")
+            //   - simplex: any strategy is valid (paired-strategy MIs split
+            //     each molecule into two independent MI groups, which simplex
+            //     consensuses independently — exercised by
+            //     test_runall_group_output_records on paired-UMI fixtures)
             //
-            // Without this check, mismatched plans only fail deep inside the
-            // consensus stage's tag-validation step ("MI tag '1' without /A or
-            // /B suffix" / "unexpected /A suffix on MI tag"), after the entire
+            // Without this check, mismatched plans fail deep inside the
+            // consensus stage's tag-validation step after the entire
             // group + MI-assign work has already run.
             match (self.consensus_mode, self.group_opts.group_strategy) {
                 (ConsensusMode::Duplex, Strategy::Paired) => {}
@@ -270,15 +272,12 @@ impl Runall {
                      duplex consensus calling expects). Got --group::strategy {:?}.",
                     other
                 ),
-                (ConsensusMode::Simplex | ConsensusMode::Codec, Strategy::Paired) => {
-                    anyhow::bail!(
-                        "--consensus {:?} is incompatible with --group::strategy paired \
-                         (paired strategy emits /A and /B-suffixed MI tags that only \
-                         duplex consensus understands). Use --group::strategy adjacency \
-                         or identity.",
-                        self.consensus_mode
-                    )
-                }
+                (ConsensusMode::Codec, Strategy::Paired) => anyhow::bail!(
+                    "--consensus codec is incompatible with --group::strategy paired \
+                     (codec must use adjacency or identity grouping; paired splits \
+                     each molecule into /A and /B groups which codec does not handle). \
+                     Use --group::strategy adjacency or identity."
+                ),
                 _ => {}
             }
         }
