@@ -415,11 +415,8 @@ pub(crate) fn run_filter(input: &Path, out: &Path) {
 /// for spelling out every flag (start/stop, inputs, output, stage flags, etc.)
 /// because each pipechain test has its own argument shape.
 pub(crate) fn run_runall(args: &[&str]) {
-    let output = Command::new(fgumi_bin())
-        .arg("runall")
-        .args(args)
-        .output()
-        .expect("spawn fgumi runall");
+    let output =
+        Command::new(fgumi_bin()).arg("runall").args(args).output().expect("spawn fgumi runall");
     assert!(
         output.status.success(),
         "fgumi runall {} failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
@@ -436,14 +433,7 @@ pub(crate) fn run_runall(args: &[&str]) {
 /// dumps the comparator's stdout/stderr so the test failure message is useful.
 pub(crate) fn compare_bams(a: &Path, b: &Path, command: &str) -> bool {
     let output = Command::new(fgumi_bin())
-        .args([
-            "compare",
-            "bams",
-            a.to_str().unwrap(),
-            b.to_str().unwrap(),
-            "--command",
-            command,
-        ])
+        .args(["compare", "bams", a.to_str().unwrap(), b.to_str().unwrap(), "--command", command])
         .output()
         .expect("spawn fgumi compare bams");
     if !output.status.success() {
