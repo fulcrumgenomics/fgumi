@@ -18,3 +18,8 @@ pub mod test_group;
 pub mod test_sort;
 #[cfg(feature = "compare")]
 pub mod test_zipper;
+
+#[cfg(all(feature = "compare", feature = "simulate"))]
+pub mod pipechain_helpers;
+#[cfg(all(feature = "compare", feature = "simulate"))]
+pub mod test_pipechain_combinations;
