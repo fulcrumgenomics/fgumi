@@ -267,32 +267,56 @@ impl SpecialStage for AlignAndMerge {
                 // line up with the saved mapped stream.
                 #[cfg(feature = "runall-reorder-aligner-input")]
                 {
+                    use crate::runall::engine::backoff::Backoff;
                     use crate::runall::engine::reorder::ReorderBuffer;
                     let mut reorder: ReorderBuffer<SerializedBatch> = ReorderBuffer::new();
                     let mut input_drained = false;
+                    let mut backoff = Backoff::new();
 
                     'outer: loop {
                         if cancel_a.is_cancelled() {
                             break;
                         }
 
+                        // Periodic drain check: do this BEFORE pop_ready so
+                        // we notice an upstream-close cascade even when the
+                        // reorder buffer is permanently stuck at a gap. The
+                        // previous code only checked is_drained inside the
+                        // input.pop() None arm, which meant a missing ordinal
+                        // (impossible if the upstream-close cascade fires
+                        // before all ordinals arrive — e.g. cancellation,
+                        // a dropped batch, or a stalled producer worker)
+                        // would busy-spin Thread A forever, holding
+                        // unmapped_tx open and preventing thread_c from
+                        // draining mapped_rx. That cascades into the
+                        // entire downstream pipeline (Sort, Group, ...)
+                        // never seeing EOF on its input queue.
+                        if !input_drained && input.is_drained() {
+                            input_drained = true;
+                        }
+
                         if let Some(batch) = reorder.pop_ready() {
                             if !process_batch(batch)? {
                                 break 'outer;
                             }
+                            backoff.reset();
                             continue;
                         }
 
                         if input_drained {
                             if !reorder.is_empty() {
-                                // Upstream pipelines that feed AlignAndMerge
-                                // emit contiguous 0..N ordinals today, so a
-                                // non-empty reorder buffer at drain would
-                                // indicate a new gap-producing stage —
-                                // log so a future regression is visible.
-                                tracing::debug!(
+                                // Upstream emitted a non-contiguous ordinal
+                                // stream (e.g. some upstream stage suppressed
+                                // a batch on empty output, or a worker
+                                // exited mid-processing). Log the count and
+                                // exit gracefully — the stranded items are
+                                // unrecoverable since we can never know which
+                                // ordinals they should fill.
+                                tracing::warn!(
                                     "AlignAndMerge: {} batch(es) stranded in reorder \
-                                     buffer after input drain (ordinal gap upstream)",
+                                     buffer after input drain (ordinal gap upstream); \
+                                     {} of those batches will be dropped",
+                                    reorder.len(),
                                     reorder.len(),
                                 );
                             }
@@ -309,13 +333,17 @@ impl SpecialStage for AlignAndMerge {
                                 // makes the same choice.
                                 let ordinal = item.item.ordinal;
                                 reorder.push(ordinal, item.item);
+                                backoff.reset();
                             }
                             None => {
-                                if input.is_drained() {
-                                    input_drained = true;
-                                } else {
-                                    thread::yield_now();
-                                }
+                                // Use snooze (vs. yield_now): on a deadlocked
+                                // pop_ready=None loop, yield_now burns a CPU
+                                // core; snooze parks the thread with
+                                // exponential backoff so a stuck Thread A
+                                // costs ~nothing while still staying
+                                // responsive to upstream progress and the
+                                // cancel signal at the loop top.
+                                backoff.snooze();
                             }
                         }
                     }
