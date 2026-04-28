@@ -77,26 +77,36 @@ impl<T> StageQueue<T> {
         }
     }
 
-    /// Attempt to push an item. Returns `Err(item)` if the queue is full
-    /// (slot, per-queue memory, or global memory limit).
+    /// Attempt to push an item. Returns `Err(item)` on backpressure: slot
+    /// capacity, per-queue memory aggregate, or global memory limit.
+    ///
+    /// `queue_limit_bytes` bounds *aggregate* queue contents, not the size of
+    /// any individual item. A single item exceeding the limit is still
+    /// admitted when the queue is empty — otherwise `push_until_cancelled`
+    /// would deadlock, since `0 + bytes > queue_limit_bytes` is permanent
+    /// (no consumer pop can resolve it). Subsequent pushes wait for the
+    /// outsized item to drain. This matters for stages like
+    /// `PositionBatchStage` that emit one batch per position group: a
+    /// high-coverage region can produce a batch larger than the tightened
+    /// per-queue limit used by the consensus path.
     ///
     /// Memory reservations go through [`MemoryTracker::try_add`] so the global
     /// limit is enforced atomically — concurrent producers across all queues
-    /// race on the same CAS. A failed reservation returns the item to the
-    /// caller unchanged.
+    /// race on the same CAS. A failed reservation returns the item unchanged.
     ///
     /// # Errors
     ///
-    /// Returns the item if the queue has reached any of: the slot capacity,
-    /// the per-queue memory limit, or the global memory limit.
+    /// Returns the item on any of: slot capacity full, queue non-empty and
+    /// adding the item would exceed the per-queue memory limit, or the
+    /// global memory reservation fails.
     pub fn push(&self, item: SequencedItem<T>) -> Result<(), SequencedItem<T>> {
         let bytes = item.memory_estimate;
+        // `saturating_add` defends against a transient racy overcount (pop
+        // updates `queue_bytes` after popping, which can briefly wrap near
+        // zero under heavy concurrent pool traffic) so we don't panic on
+        // overflow in debug builds.
         let current = self.queue_bytes.load(Ordering::Relaxed);
-        // Use `saturating_add` so a transient racy overcount (pop updates
-        // `queue_bytes` after popping, which can briefly wrap near zero
-        // under heavy concurrent pool traffic) doesn't panic on overflow
-        // in debug builds.
-        if current.saturating_add(bytes) > self.queue_limit_bytes {
+        if current > 0 && current.saturating_add(bytes) > self.queue_limit_bytes {
             return Err(item);
         }
         // Reserve global bytes BEFORE touching the underlying queue. If we
@@ -344,6 +354,52 @@ mod tests {
         // 4 + 4 = 8 used, next push of 4 bytes would push total to 12 > 10.
         let rejected = q.push(SequencedItem::new(2, 3, 4)).unwrap_err();
         assert_eq!(rejected.item, 3);
+    }
+
+    /// Regression: an item whose own byte estimate exceeds the per-queue
+    /// memory limit must still be admitted when the queue is empty.
+    /// Without this rule, `push_until_cancelled` deadlocks the pipeline —
+    /// `0 + bytes > queue_limit_bytes` is permanent and no consumer pop can
+    /// resolve it. Triggered in practice by stages that emit one batch per
+    /// position group (e.g. `PositionBatchStage`) when a high-coverage
+    /// region produces a batch larger than the tightened per-queue limit
+    /// used by the consensus path.
+    #[test]
+    fn test_push_admits_oversize_first_item_when_queue_empty() {
+        let q: StageQueue<u32> = StageQueue::new("test", 100, 10, make_tracker());
+        // A single 1000-byte item — 100x the per-queue limit — must push.
+        q.push(SequencedItem::new(0, 1, 1000)).unwrap();
+        assert_eq!(q.len(), 1);
+        // The aggregate byte counter reflects the oversized item.
+        let popped = q.pop().unwrap();
+        assert_eq!(popped.item, 1);
+        assert_eq!(popped.memory_estimate, 1000);
+    }
+
+    /// Once the oversized item is in the queue, the next push must respect
+    /// the per-queue limit again — we only relax the rule when `current == 0`.
+    #[test]
+    fn test_push_rejects_second_item_after_oversize_first() {
+        let q: StageQueue<u32> = StageQueue::new("test", 100, 10, make_tracker());
+        q.push(SequencedItem::new(0, 1, 1000)).unwrap();
+        // Queue is at 1000 bytes (10x over limit). Anything else must be
+        // rejected — we don't want pile-on while an oversize item drains.
+        let rejected = q.push(SequencedItem::new(1, 2, 4)).unwrap_err();
+        assert_eq!(rejected.item, 2);
+    }
+
+    /// `push_until_cancelled` must not deadlock when handed an oversize
+    /// first item. End-to-end check of the deadlock fix at the helper level.
+    #[test]
+    fn test_push_until_cancelled_admits_oversize_first_item() {
+        let q: Arc<StageQueue<u32>> = Arc::new(StageQueue::new("test", 100, 10, make_tracker()));
+        let cancel = super::super::cancel::CancelToken::new();
+        // Queue empty, item 100x the per-queue limit. With the bug, this
+        // would loop forever in `push_until_cancelled`; with the fix it
+        // returns Ok.
+        let result = q.push_until_cancelled(SequencedItem::new(0, 42, 1000), &cancel);
+        assert!(result.is_ok());
+        assert_eq!(q.len(), 1);
     }
 
     #[test]
