@@ -233,7 +233,7 @@ mod tests {
             .flags(0)
             .sequence(b"A")
             .qualities(&[30])
-            .add_string_tag(*b"MI", local_mi_value.as_bytes());
+            .add_string_tag(*crate::sam::SamTag::MI, local_mi_value.as_bytes());
         b.build().into_inner()
     }
 
@@ -253,7 +253,7 @@ mod tests {
             ],
             ordinal,
             position_key: (0, 0),
-            assign_tag: *b"MI",
+            assign_tag: *crate::sam::SamTag::MI,
         }
     }
 
@@ -263,8 +263,8 @@ mod tests {
         iter_length_prefixed(&group.data)
             .map(|r| {
                 let rec = r.expect("valid record");
-                let mi =
-                    fgumi_raw_bam::find_string_tag_in_record(rec, *b"MI").expect("MI tag present");
+                let mi = fgumi_raw_bam::find_string_tag_in_record(rec, crate::sam::SamTag::MI)
+                    .expect("MI tag present");
                 String::from_utf8(mi.to_vec()).unwrap()
             })
             .collect()
@@ -324,7 +324,7 @@ mod tests {
             ],
             ordinal: 0,
             position_key: (0, 0),
-            assign_tag: *b"MI",
+            assign_tag: *crate::sam::SamTag::MI,
         };
         let mut base: u64 = 10;
         apply_offset_in_place(&mut batch, &mut base).unwrap();

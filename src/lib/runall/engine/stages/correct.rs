@@ -289,7 +289,7 @@ mod tests {
     fn make_record_with_rx(rx: &[u8]) -> Vec<u8> {
         // Build aux bytes: "RX" tag + 'Z' type + rx_value + null terminator.
         let mut aux = Vec::with_capacity(3 + rx.len() + 1);
-        aux.extend_from_slice(b"RX");
+        aux.extend_from_slice(crate::sam::SamTag::RX.as_ref());
         aux.push(b'Z');
         aux.extend_from_slice(rx);
         aux.push(0);
@@ -379,8 +379,8 @@ mod tests {
         let block_size = u32::from_le_bytes(out.primary.data[0..4].try_into().unwrap()) as usize;
         let record = &out.primary.data[4..4 + block_size];
         let aux = crate::sort::bam_fields::aux_data_slice(record);
-        let rx = crate::sort::bam_fields::find_string_tag(aux, b"RX").unwrap();
-        let ox = crate::sort::bam_fields::find_string_tag(aux, b"OX").unwrap();
+        let rx = crate::sort::bam_fields::find_string_tag(aux, crate::sam::SamTag::RX).unwrap();
+        let ox = crate::sort::bam_fields::find_string_tag(aux, crate::sam::SamTag::OX).unwrap();
         assert_eq!(rx, b"AAAAAAAA");
         assert_eq!(ox, b"AAAAAAAC");
 
@@ -403,7 +403,7 @@ mod tests {
         let record = &out.primary.data[4..4 + block_size];
         let aux = crate::sort::bam_fields::aux_data_slice(record);
         assert!(
-            crate::sort::bam_fields::find_string_tag(aux, b"OX").is_none(),
+            crate::sort::bam_fields::find_string_tag(aux, crate::sam::SamTag::OX).is_none(),
             "OX must not be added when dont_store_original_umis=true"
         );
     }

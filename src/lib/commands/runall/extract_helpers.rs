@@ -67,11 +67,11 @@ impl Runall {
             cell_tag: *crate::sam::SamTag::CB,
             umi_qual_tag: None,
             cell_qual_tag: None,
-            single_tag: self
-                .extract_opts
-                .extract_single_tag
-                .as_ref()
-                .map(|t| t.as_bytes().try_into().unwrap_or(*b"BX")),
+            single_tag: self.extract_opts.extract_single_tag.as_ref().map(|t| {
+                t.as_bytes()
+                    .try_into()
+                    .expect("--extract::single-tag length validated by validate.rs")
+            }),
             annotate_read_names: self.extract_opts.extract_annotate_read_names,
             extract_umis_from_read_names: self.extract_opts.extract_extract_umis_from_read_names,
             store_sample_barcode_qualities: self

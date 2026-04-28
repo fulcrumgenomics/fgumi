@@ -163,8 +163,8 @@ mod tests {
     fn minimal_extract_params() -> ExtractParams {
         ExtractParams {
             read_group_id: "A".to_string(),
-            umi_tag: *b"RX",
-            cell_tag: *b"CB",
+            umi_tag: *crate::sam::SamTag::RX,
+            cell_tag: *crate::sam::SamTag::CB,
             umi_qual_tag: None,
             cell_qual_tag: None,
             single_tag: None,

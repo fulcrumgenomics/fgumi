@@ -509,9 +509,9 @@ mod tests {
         let stage = GroupAssignStage::new(
             Strategy::Identity,
             0,
-            *b"RX",
-            *b"MI",
-            GroupFilterConfig::with_defaults(*b"RX"),
+            *crate::sam::SamTag::RX,
+            *crate::sam::SamTag::MI,
+            GroupFilterConfig::with_defaults(*crate::sam::SamTag::RX),
         );
 
         let r1a = make_raw_record(b"readA", PAIRED_R1, b"ACGT");
@@ -535,9 +535,9 @@ mod tests {
         let stage = GroupAssignStage::new(
             Strategy::Identity,
             0,
-            *b"RX",
-            *b"MI",
-            GroupFilterConfig::with_defaults(*b"RX"),
+            *crate::sam::SamTag::RX,
+            *crate::sam::SamTag::MI,
+            GroupFilterConfig::with_defaults(*crate::sam::SamTag::RX),
         );
 
         let r1a = make_raw_record(b"readA", PAIRED_R1, b"AAAA");
@@ -559,9 +559,9 @@ mod tests {
         let stage = GroupAssignStage::new(
             Strategy::Identity,
             0,
-            *b"RX",
-            *b"MI",
-            GroupFilterConfig::with_defaults(*b"RX"),
+            *crate::sam::SamTag::RX,
+            *crate::sam::SamTag::MI,
+            GroupFilterConfig::with_defaults(*crate::sam::SamTag::RX),
         );
 
         let batch = mk_batch(&[], (0, 0));
@@ -575,9 +575,9 @@ mod tests {
         let stage = GroupAssignStage::new(
             Strategy::Identity,
             0,
-            *b"RX",
-            *b"MI",
-            GroupFilterConfig::with_defaults(*b"RX"),
+            *crate::sam::SamTag::RX,
+            *crate::sam::SamTag::MI,
+            GroupFilterConfig::with_defaults(*crate::sam::SamTag::RX),
         );
 
         // Build two MiGroups with known byte counts via serialize_records.
@@ -593,7 +593,7 @@ mod tests {
             ],
             ordinal: 0,
             position_key: (0, 0),
-            assign_tag: *b"MI",
+            assign_tag: *crate::sam::SamTag::MI,
         };
 
         // Expected: each record gets +4 bytes for the block_size prefix.

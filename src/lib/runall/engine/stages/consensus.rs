@@ -201,7 +201,7 @@ mod tests {
                     groups: vec![],
                     ordinal: 0,
                     position_key: (0, 0),
-                    assign_tag: *b"MI",
+                    assign_tag: *crate::sam::SamTag::MI,
                 },
                 &mut |v| {
                     captured = Some(v);

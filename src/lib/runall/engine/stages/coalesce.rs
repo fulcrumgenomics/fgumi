@@ -456,12 +456,16 @@ mod tests {
             groups: vec![g0, g1],
             ordinal: 0,
             position_key: (0, 0),
-            assign_tag: *b"MI",
+            assign_tag: *crate::sam::SamTag::MI,
         };
 
         let g2 = MiGroup { data: b"\x01C".to_vec(), record_count: 1, mi: 2, local_mi: None };
-        let mg1 =
-            MiGroupBatch { groups: vec![g2], ordinal: 1, position_key: (1, 0), assign_tag: *b"MI" };
+        let mg1 = MiGroupBatch {
+            groups: vec![g2],
+            ordinal: 1,
+            position_key: (1, 0),
+            assign_tag: *crate::sam::SamTag::MI,
+        };
 
         input.push(seq(1, mg1, 2)).unwrap();
         input.push(seq(0, mg0, 4)).unwrap();

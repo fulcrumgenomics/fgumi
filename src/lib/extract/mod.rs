@@ -468,7 +468,7 @@ pub fn make_raw_records(
             builder.build_record(&barcodes.final_read_name, flag, &template.seq, &numeric_quals);
         }
 
-        builder.append_string_tag(b"RG", params.read_group_id.as_bytes());
+        builder.append_string_tag(crate::sam::SamTag::RG, params.read_group_id.as_bytes());
 
         if !barcodes.cell_barcode.is_empty() {
             builder.append_string_tag(params.cell_tag, barcodes.cell_barcode.as_bytes());
@@ -481,11 +481,11 @@ pub fn make_raw_records(
         }
 
         if !barcodes.sample_barcode.is_empty() {
-            builder.append_string_tag(b"BC", barcodes.sample_barcode.as_bytes());
+            builder.append_string_tag(crate::sam::SamTag::BC, barcodes.sample_barcode.as_bytes());
         }
 
         if params.store_sample_barcode_qualities && !barcodes.sample_qual.is_empty() {
-            builder.append_string_tag(b"QT", barcodes.sample_qual.as_bytes());
+            builder.append_string_tag(crate::sam::SamTag::QT, barcodes.sample_qual.as_bytes());
         }
 
         if !barcodes.umi.is_empty() {
@@ -679,8 +679,8 @@ mod tests {
     fn test_params() -> ExtractParams {
         ExtractParams {
             read_group_id: "A".to_string(),
-            umi_tag: *b"RX",
-            cell_tag: *b"CB",
+            umi_tag: *crate::sam::SamTag::RX,
+            cell_tag: *crate::sam::SamTag::CB,
             umi_qual_tag: None,
             cell_qual_tag: None,
             single_tag: None,

@@ -882,7 +882,7 @@ fn filter_template_raw_tags(
                 continue;
             }
 
-            if check_mq && t == *b"MQ" {
+            if check_mq && t == *crate::sam::SamTag::MQ {
                 // Extract MQ value (common types: C/c/S/s/I/i)
                 found_mq = match val_type {
                     b'C' if p + 3 < aux.len() => Some(i64::from(aux[p + 3])),

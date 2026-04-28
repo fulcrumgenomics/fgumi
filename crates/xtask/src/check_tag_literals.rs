@@ -65,10 +65,14 @@ const DIR_ALLOWLIST: &[&str] = &[
 const PAYLOAD_ALLOWLIST: &[&[u8; 2]] = &[
     // ---- SAM header sub-fields (noodles `other_fields` map key convention) ----
     b"SO", b"GO", b"SS", // ---- Read-name fixtures ----
-    b"q1", b"q2", b"r0", b"r1", b"r2", b"r3", b"r4", b"rd",
+    b"q1", b"q2", b"r0", b"r1", b"r2", b"r3", b"r4", b"r5", b"rd",
     // ---- 2-bp DNA sequence fragments used in sequence/UMI tests ----
-    b"AA", b"AC", b"AG", b"AT", b"CA", b"CC", b"CG", b"GA", b"GC", b"GT", b"NN", b"TA", b"TC",
-    b"TT",
+    b"AA", b"AC", b"AG", b"AT", b"CA", b"CC", b"CG", b"GA", b"GC", b"GG", b"GT", b"NN", b"TA",
+    b"TC", b"TT",
+    // ---- Test-fixture sequence/quality strings used in fastq_pair stage tests ----
+    b"A1", b"A2", b"B1", b"B2", b"I1", b"I2", b"J1", b"J2",
+    // ---- Test-fixture secondary-stream payloads in coalesce stage tests ----
+    b"S1", b"S2",
     // ---- Opaque test-fixture tags (no SamTag constant) ----
     // X-prefixed tags used in SAM/BAM parser exercisers.
     b"XA", b"XC", b"XF", b"XH", b"XI", b"XN", b"XU", b"XV", b"XX", b"XY", b"X0", b"X1", b"X2",
