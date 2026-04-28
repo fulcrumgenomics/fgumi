@@ -826,9 +826,35 @@ fn run_worker_loop(
         // `producers_remaining` (initialized to `worker_threads`). When the
         // owner finishes and the input queue drains, non-owners must also
         // decrement their counter so the output queue eventually closes.
-        // They never attempt the stage, so this sweep is their only exit path.
+        //
+        // Two responsibilities here:
+        //   1. Flush any held_input/held_output for the stage. A non-owner
+        //      can end up holding an input for a Sequential stage when it
+        //      attempted that stage in drain mode (priorities_filtered
+        //      includes all stages then) and SequentialBusy stashed the
+        //      input. After drain mode clears, the non-owner no longer
+        //      sees the stage in its priorities, so the held item is
+        //      orphaned and try_exit_stage refuses to mark the stage
+        //      exited (holds_for_stage returns true). Calling
+        //      try_run_stage here gives the non-owner one more chance to
+        //      acquire the Sequential mutex (succeeds once the owner has
+        //      released it on its own exit) and process the held item,
+        //      clearing the hold and unblocking the cascade.
+        //   2. Mark the stage exited so the cascade close can fire.
         for (stage_idx, kind) in parallelism.iter().enumerate() {
             if *kind == Parallelism::Sequential && !state.scheduler.owns(stage_idx) {
+                if state.holds_for_stage(stage_idx) {
+                    let input = &queues[stage_idx];
+                    let output = &queues[stage_idx + 1];
+                    let _ = state.try_run_stage(
+                        stage_idx,
+                        &invokers[stage_idx],
+                        input,
+                        output,
+                        cancel,
+                        pool_stats,
+                    );
+                }
                 try_exit_stage(
                     stage_idx,
                     state,
