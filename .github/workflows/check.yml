@@ -44,6 +44,13 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Clippy check
         run: cargo ci-lint
+      - name: Bare SAM-tag byte literal check
+        # The xtask scanner runs locally as a pre-commit hook (see
+        # scripts/hooks/pre-commit). The same scanner has a unit test in
+        # crates/xtask/src/check_tag_literals.rs but `cargo ci-test` only
+        # exercises the root `fgumi` package, so the test never fires in CI.
+        # Run the binary directly here to enforce the contract on every PR.
+        run: cargo ci-tag-literals
 
   coverage:
     runs-on: ubuntu-latest
