@@ -1,6 +1,8 @@
 //! Integration tests for the `runall` pipeline (`pipeline` engine).
 
 #[cfg(feature = "compare")]
+pub mod parity_helpers;
+#[cfg(feature = "compare")]
 pub mod test_consensus_codec;
 #[cfg(feature = "compare")]
 pub mod test_consensus_duplex;
