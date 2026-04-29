@@ -257,11 +257,19 @@ impl SpecialStage for AlignAndMerge {
         //   - 2 BGZF workers wins at threads=4 (avoids over-subscription)
         //   - 4 BGZF workers wins at threads >= 8 (catches up with the
         //     decode pipeline)
-        // The defaults below pick `min(threads / 2, 4)` for BGZF workers
-        // and a fixed 4 for mergers. Both can be overridden via env vars
-        // for ad-hoc sweeps.
+        // To honor the spirit of `--threads` (= total CPU budget), both
+        // helper counts scale linearly with `pool_threads`:
+        //   - n_mergers = clamp(threads / 2, 1, 4)
+        //   - n_bgzf    = clamp(threads / 2, 1, 4)
+        // At threads=4 this gives 2+2 helpers; at threads=8 it gives 4+4
+        // (the upper-cap from the sweep). Without this scaling, a fixed
+        // `m=4, b=4` peaked at ~12.5 cores during the AlignAndMerge phase
+        // even though `--threads 4` was requested. The sweep showed
+        // `m=4 b=2` at threads=4 wins by 1.5s vs `m=2 b=2`, but we'd
+        // rather honor the budget than chase that 1.5s; users wanting
+        // it back can override via `FGUMI_N_MERGERS`.
         let pool_threads = self.pool_threads.max(1);
-        let default_n_mergers: usize = 4;
+        let default_n_mergers: usize = (pool_threads / 2).clamp(1, 4);
         let default_n_bgzf: usize = (pool_threads / 2).clamp(1, 4);
 
         // 1b. Detect whether the aligner emits BAM (BGZF magic) or SAM text.
