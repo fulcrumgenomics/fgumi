@@ -11,7 +11,21 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::helpers::grouped_bam_fixture::build_small_grouped_bam;
-use crate::helpers::references::{skip_or_fail, tool_on_path};
+use crate::helpers::references::{phix_reference, skip_or_fail, tool_on_path};
+
+/// Count records in a BAM via `samtools view -c`. Used as a guard so that a
+/// "determinism" check on two empty BAMs is rejected as a fixture failure
+/// rather than silently passing.
+fn count_bam_records(path: &Path) -> usize {
+    let output = Command::new("samtools")
+        .args(["view", "-c", path.to_str().unwrap()])
+        .output()
+        .expect("spawn samtools view -c");
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse::<usize>().unwrap_or(0)
+}
 
 fn fgumi_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fgumi")
@@ -79,61 +93,52 @@ fn runall_group_to_filter_is_deterministic() {
         a.len(),
         b.len()
     );
-}
 
-// ----------------------------------------------------------------------------
-// extract-to-sort determinism (requires bwa + samtools)
-// ----------------------------------------------------------------------------
-//
-// The helpers below mirror those in `tests/integration/runall/test_sort.rs`
-// (file-local there). We duplicate rather than lift out to keep this commit
-// small and focused — the duplication is confined to this single test.
-
-const DNA: [u8; 4] = [b'A', b'C', b'G', b'T'];
-
-fn ref_sequence() -> Vec<u8> {
-    (0..1000).map(|i| DNA[i % 4]).collect()
-}
-
-fn write_reference(path: &Path) {
-    let mut f = std::fs::File::create(path).unwrap();
-    writeln!(f, ">chr_test").unwrap();
-    let seq = ref_sequence();
-    for chunk in seq.chunks(80) {
-        f.write_all(chunk).unwrap();
-        writeln!(f).unwrap();
+    // Guard against a determinism pass on an empty BAM (two empty outputs are
+    // trivially equal). Re-write the second-run payload and check it carries
+    // at least one record.
+    let final_out = tmp.path().join("out_final.bam");
+    std::fs::write(&final_out, &b).unwrap();
+    if tool_on_path("samtools") {
+        assert!(
+            count_bam_records(&final_out) > 0,
+            "runall --start-from group produced 0 records — determinism \
+             check on an empty BAM is vacuous"
+        );
     }
 }
 
-fn bwa_index(ref_path: &Path) {
-    let output = Command::new("bwa")
-        .args(["index", ref_path.to_str().unwrap()])
-        .output()
-        .expect("spawn bwa index");
-    assert!(
-        output.status.success(),
-        "bwa index failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+// ----------------------------------------------------------------------------
+// extract-to-sort determinism (requires bwa + samtools + tracked PhiX ref)
+// ----------------------------------------------------------------------------
+
+const DNA: [u8; 4] = [b'A', b'C', b'G', b'T'];
+
+/// Read a single-contig FASTA file into a raw byte vector (sequence only,
+/// header line stripped, newlines removed).
+fn read_fasta_sequence(path: &Path) -> Vec<u8> {
+    let raw = std::fs::read_to_string(path).expect("read FASTA");
+    let mut seq = Vec::with_capacity(raw.len());
+    for line in raw.lines() {
+        if line.starts_with('>') {
+            continue;
+        }
+        seq.extend_from_slice(line.as_bytes());
+    }
+    assert!(!seq.is_empty(), "FASTA at {} contained no sequence", path.display());
+    seq
 }
 
-fn samtools_dict(ref_path: &Path) {
-    let dict_path = ref_path.with_extension("dict");
-    let output = Command::new("samtools")
-        .args(["dict", ref_path.to_str().unwrap(), "-o", dict_path.to_str().unwrap()])
-        .output()
-        .expect("spawn samtools dict");
-    assert!(
-        output.status.success(),
-        "samtools dict failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn write_paired_fastq(r1: &Path, r2: &Path, num_pairs: usize) {
+/// Generate paired FASTQs with an 8-base UMI prefix on R1. Read templates
+/// are sliced from `ref_seq` (the `PhiX` FASTA); `PhiX` is non-repetitive,
+/// so bwa-mem produces realistic alignments rather than uniform MAPQ=0
+/// records that the previous repetitive-ACGT reference yielded.
+fn write_paired_fastq(r1: &Path, r2: &Path, num_pairs: usize, ref_seq: &[u8]) {
     use flate2::{Compression, write::GzEncoder};
 
-    let ref_seq = ref_sequence();
+    let max_start = ref_seq.len().saturating_sub(70);
+    assert!(max_start > 0, "reference too short to slice 70bp read templates");
+
     let f1 = std::fs::File::create(r1).unwrap();
     let mut e1 = GzEncoder::new(f1, Compression::default());
     let f2 = std::fs::File::create(r2).unwrap();
@@ -141,7 +146,7 @@ fn write_paired_fastq(r1: &Path, r2: &Path, num_pairs: usize) {
 
     for i in 0..num_pairs {
         let umi: Vec<u8> = (0..8).map(|k| DNA[(i + k) % 4]).collect();
-        let start = (i * 7) % 900;
+        let start = (i * 53) % max_start;
         let r1_template: Vec<u8> = ref_seq[start..start + 50].to_vec();
         let r2_template: Vec<u8> = ref_seq[start + 20..start + 70]
             .iter()
@@ -179,19 +184,22 @@ fn runall_extract_to_sort_is_deterministic() {
         skip_or_fail("bwa or samtools not on PATH; skipping extract-to-sort determinism test");
         return;
     }
+    let Some(reference) = phix_reference() else {
+        skip_or_fail("PhiX reference not available; skipping extract-to-sort determinism test");
+        return;
+    };
 
     let tmp = tempfile::tempdir().unwrap();
-    let reference = tmp.path().join("ref.fa");
     let r1 = tmp.path().join("R1.fastq.gz");
     let r2 = tmp.path().join("R2.fastq.gz");
 
-    write_reference(&reference);
-    bwa_index(&reference);
-    samtools_dict(&reference);
-    write_paired_fastq(&r1, &r2, 50);
+    let ref_seq = read_fasta_sequence(&reference);
+    write_paired_fastq(&r1, &r2, 50, &ref_seq);
 
-    // Use relative paths via `current_dir` so the @PG CL field is identical
-    // across runs.
+    // Reference path is absolute (lives in the tracked test data directory),
+    // and is identical between the two runs in `run_twice_same_args`, so the
+    // @PG CL field stays byte-identical across runs.
+    let reference_str = reference.to_str().unwrap().to_string();
     let args: Vec<std::ffi::OsString> = vec![
         "runall".into(),
         "--start-from".into(),
@@ -211,7 +219,7 @@ fn runall_extract_to_sort_is_deterministic() {
         "8M+T".into(),
         "+T".into(),
         "--reference".into(),
-        "ref.fa".into(),
+        reference_str.into(),
         "--aligner::preset".into(),
         "bwa-mem".into(),
         "--aligner::threads".into(),
@@ -231,5 +239,19 @@ fn runall_extract_to_sort_is_deterministic() {
          (len_a={}, len_b={})",
         a.len(),
         b.len()
+    );
+
+    // Guard against vacuous determinism: the previous repetitive-ACGT
+    // reference made bwa-mem assign MAPQ=0 everywhere, and any downstream
+    // change that silently dropped every record would give a determinism
+    // pass on two empty BAMs. Re-write the second-run output and count its
+    // records to ensure at least the post-sort BAM has content.
+    let final_out = tmp.path().join("out_final.bam");
+    std::fs::write(&final_out, &b).unwrap();
+    assert!(
+        count_bam_records(&final_out) > 0,
+        "runall --start-from extract --stop-after sort produced 0 records — \
+         determinism check on an empty BAM is vacuous; check upstream stages \
+         (alignment, zipper, sort) for silent record loss"
     );
 }

@@ -2,71 +2,36 @@
 //! the equivalent standalone chain: `fgumi extract` | `fgumi fastq` | `bwa mem` |
 //! `fgumi zipper`.
 //!
-//! Requires `bwa` and `samtools` on PATH. Skips gracefully if either is
-//! missing. Compares via `fgumi compare bams --command zipper` so header @PG
-//! differences (expected between the two command lines) are ignored.
+//! Requires `bwa` and `samtools` on PATH plus the tracked `PhiX` reference at
+//! `tests/data/references/phix.fasta` (with bwa+samtools indexes). Skips
+//! gracefully if any prerequisite is missing. Compares via
+//! `fgumi compare bams --command zipper` so header @PG differences (expected
+//! between the two command lines) are ignored.
 
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+use super::parity_helpers::{assert_records_gt_zero, phix_reference_or_skip, read_fasta_sequence};
+
 fn fgumi_bin() -> &'static str {
     env!("CARGO_BIN_EXE_fgumi")
 }
 
-fn binary_available(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
-}
-
 const DNA: [u8; 4] = [b'A', b'C', b'G', b'T'];
 
-/// Reference sequence used by both `write_reference` and `write_paired_fastq`.
-fn ref_sequence() -> Vec<u8> {
-    (0..1000).map(|i| DNA[i % 4]).collect()
-}
-
-/// Write a tiny single-contig reference FASTA (1000 bp) to `path`.
-fn write_reference(path: &Path) {
-    let mut f = std::fs::File::create(path).unwrap();
-    writeln!(f, ">chr_test").unwrap();
-    let seq = ref_sequence();
-    for chunk in seq.chunks(80) {
-        f.write_all(chunk).unwrap();
-        writeln!(f).unwrap();
-    }
-}
-
-fn bwa_index(ref_path: &Path) {
-    let output = Command::new("bwa")
-        .args(["index", ref_path.to_str().unwrap()])
-        .output()
-        .expect("spawn bwa index");
-    assert!(
-        output.status.success(),
-        "bwa index failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn samtools_dict(ref_path: &Path) {
-    let dict_path = ref_path.with_extension("dict");
-    let output = Command::new("samtools")
-        .args(["dict", ref_path.to_str().unwrap(), "-o", dict_path.to_str().unwrap()])
-        .output()
-        .expect("spawn samtools dict");
-    assert!(
-        output.status.success(),
-        "samtools dict failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Write paired-end gzip FASTQ. R1 is 8bp UMI + 50bp from the reference, R2 is
-/// 50bp reverse-complement of a nearby region.
-fn write_paired_fastq(r1: &Path, r2: &Path, num_pairs: usize) {
+/// Write paired-end gzip FASTQ. R1 is 8bp UMI + 50bp from the reference, R2
+/// is 50bp reverse-complement of a nearby region. Read templates are sliced
+/// from `ref_seq` (the `PhiX` FASTA); `PhiX` is non-repetitive, so bwa-mem
+/// produces realistic alignments with MAPQ > 0 rather than the uniform
+/// MAPQ=0 / pos=0 records that the previous repetitive-ACGT reference
+/// yielded.
+fn write_paired_fastq(r1: &Path, r2: &Path, num_pairs: usize, ref_seq: &[u8]) {
     use flate2::{Compression, write::GzEncoder};
 
-    let ref_seq = ref_sequence();
+    let max_start = ref_seq.len().saturating_sub(70);
+    assert!(max_start > 0, "reference too short to slice 70bp read templates");
+
     let f1 = std::fs::File::create(r1).unwrap();
     let mut e1 = GzEncoder::new(f1, Compression::default());
     let f2 = std::fs::File::create(r2).unwrap();
@@ -74,7 +39,7 @@ fn write_paired_fastq(r1: &Path, r2: &Path, num_pairs: usize) {
 
     for i in 0..num_pairs {
         let umi: Vec<u8> = (0..8).map(|k| DNA[(i + k) % 4]).collect();
-        let start = (i * 7) % 900;
+        let start = (i * 53) % max_start;
         let r1_template: Vec<u8> = ref_seq[start..start + 50].to_vec();
         let r2_template: Vec<u8> = ref_seq[start + 20..start + 70]
             .iter()
@@ -250,17 +215,19 @@ fn compare_bams(a: &Path, b: &Path) -> bool {
 
 #[test]
 fn test_extract_to_zipper_v2_matches_v1() {
-    if !binary_available("bwa") {
-        eprintln!("SKIP: bwa not on PATH; skipping extract-to-zipper gate test");
+    if !crate::helpers::references::tool_on_path("bwa")
+        || !crate::helpers::references::tool_on_path("samtools")
+    {
+        crate::helpers::references::skip_or_fail(
+            "bwa/samtools not on PATH; skipping extract-to-zipper byte-identity gate",
+        );
         return;
     }
-    if !binary_available("samtools") {
-        eprintln!("SKIP: samtools not on PATH; skipping extract-to-zipper gate test");
+    let Some(reference) = phix_reference_or_skip("extract-to-zipper byte-identity gate") else {
         return;
-    }
+    };
 
     let tmp = tempfile::tempdir().unwrap();
-    let reference = tmp.path().join("ref.fa");
     let r1 = tmp.path().join("R1.fastq.gz");
     let r2 = tmp.path().join("R2.fastq.gz");
     let v1_out = tmp.path().join("v1.bam");
@@ -268,13 +235,14 @@ fn test_extract_to_zipper_v2_matches_v1() {
     let v1_tmp = tmp.path().join("v1_tmp");
     std::fs::create_dir_all(&v1_tmp).unwrap();
 
-    write_reference(&reference);
-    bwa_index(&reference);
-    samtools_dict(&reference);
-    write_paired_fastq(&r1, &r2, 50);
+    let ref_seq = read_fasta_sequence(&reference);
+    write_paired_fastq(&r1, &r2, 50, &ref_seq);
 
     run_v1_pipeline(&r1, &r2, &reference, &v1_out, &v1_tmp);
     run_v2_pipeline(&r1, &r2, &reference, &v2_out);
+
+    assert_records_gt_zero(&v1_out, "v1 standalone extract->zipper chain");
+    assert_records_gt_zero(&v2_out, "v2 runall --stop-after zipper");
 
     assert!(
         compare_bams(&v1_out, &v2_out),
